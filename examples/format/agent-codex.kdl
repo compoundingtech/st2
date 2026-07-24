@@ -1,0 +1,41 @@
+// examples/format/agent-codex.kdl — the canonical materialize format, CODEX harness.
+//
+// The CORRECT codex shape, and it differs from claude in three ways grounded in the harness:
+//   1. command: codex takes no --permission-mode; it uses --dangerously-bypass-approvals-and-sandbox.
+//   2. brief: codex reads AGENTS.md from cwd. It does NOT read .claude/rules or .st2/PERSONA.md. So a
+//      codex agent's ENTIRE brief — persona + bus instructions — must live in AGENTS.md. (render
+//      pre-composes _templates/AGENTS.md = persona + bus; materialize just copies it.)
+//   3. hooks: codex does NOT use Claude Code's .claude/settings.local.json hooks (SessionStart/
+//      PreCompact/StopFailure are Claude Code mechanisms). So there is NO hooks overlay for codex.
+//
+// This CORRECTS convoy, which rendered codex agents claude-shaped (an unused .claude overlay + NO
+// AGENTS.md) — so a convoy codex seat got no brief from any file it reads and ran on the boot prompt
+// alone. (st2 render already writes AGENTS.md; this format makes it the codex agent's real, sole home.)
+//
+// Placeholders: <host>/<identity>/<workspace>. Roots are st2-PROVIDED (no machine paths).
+
+agent "<identity>" {                       // e.g. "worker-codex"
+  host      "<host>"
+  workspace "<workspace>"
+  env { ST_AGENT "<host>.<identity>" }
+  command #"exec codex --dangerously-bypass-approvals-and-sandbox '<boot prompt>'"#
+  ding                                      // ding pokes the codex pty the same way (harness-agnostic)
+
+  // render{} = ORDERED, GATING pre-boot phase (same engine as claude; only the emitted files differ).
+  render {
+    // codex reads ONLY AGENTS.md → render composes persona + bus into _templates/AGENTS.md and we
+    // copy it in as the agent's whole brief (GATING). No .claude/rules, no settings.local.json.
+    copy        "_templates/AGENTS.md" "AGENTS.md"
+    // ADVISORY — hide the brief + runtime from git (definition = agent.kdl; resources/ = fabric-synced,
+    // git-ignored bus/context runtime):
+    git-exclude "AGENTS.md"
+    git-exclude "resources/"
+  }
+}
+
+// LIFECYCLE NOTE (open, honest): claude gets automatic re-drain + context rehydration on cold start /
+// resume / compact via its SessionStart hook. codex has NO such .claude hook, so a restarted codex
+// re-runs its boot ritual + rehydrates from AGENTS.md ONLY as driven by its boot prompt (cold start) —
+// there is no post-compact/resume auto-reminder equivalent yet. Whether codex exposes a native
+// lifecycle hook to close that gap needs verification (not guessed here). Until then, codex's boot
+// ritual is prompt/AGENTS.md-driven; the ding still pokes it on every new message the same as claude.

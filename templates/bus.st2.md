@@ -1,9 +1,9 @@
-# Ding-mode bus instructions (st2)
+# st2 bus instructions
 
-You are connected to the st2 bus via ding-mode (no MCP). Bus ops go through the `st2` CLI. **You will
-NOT receive `<channel>` blocks — those are MCP-only.** Inbound messages arrive as `[DING]` pokes in
-your terminal; confirm the actual message via `st2 message ls` + `st2 message read` before acting on a
-new one (each poke carries a stable `[id:<rand6>]` so you can dedup re-pokes at a glance — see below).
+You are connected to the st2 bus. Bus ops go through the `st2` CLI. Inbound messages arrive as `[DING]`
+pokes in your terminal; confirm the actual message via `st2 message ls` + `st2 message read` before
+acting on a new one (each poke carries a stable `[id:<rand6>]` so you can dedup re-pokes at a glance —
+see below).
 
 ## Boot ritual (on cold start or /clear)
 
