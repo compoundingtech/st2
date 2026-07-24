@@ -181,3 +181,28 @@ fn workspace_is_carried_into_task_targets_for_cwd_defaulting() {
     let plan = reconcile(std::slice::from_ref(&s), &[], HOST);
     assert_eq!(plan.launch[0].tasks[0].workspace.as_deref(), Some("/repos/w"));
 }
+
+#[test]
+fn declared_supervisor_is_the_single_source_for_the_spawn_environment() {
+    let mut t = task(TaskKind::Pty, "agent", Some("hetz.w"), Some("x"));
+    // A stale hand-authored value must not be able to disagree with the normative spec field.
+    t.env
+        .insert("ST_SUPERVISOR".into(), "stale-env-value".into());
+    let mut s = svc("w", Some(HOST), vec![t]);
+    s.supervisor = Some("lead".into());
+
+    let plan = reconcile(std::slice::from_ref(&s), &[], HOST);
+    assert_eq!(
+        plan.launch[0].tasks[0]
+            .env
+            .get("ST_SUPERVISOR")
+            .map(String::as_str),
+        Some("lead")
+    );
+
+    // Removing the declaration removes the derived variable, even if an old renderer still emits
+    // one. Absence must not preserve a phantom supervision relationship.
+    s.supervisor = None;
+    let plan = reconcile(std::slice::from_ref(&s), &[], HOST);
+    assert!(!plan.launch[0].tasks[0].env.contains_key("ST_SUPERVISOR"));
+}

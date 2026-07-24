@@ -63,6 +63,9 @@ st2 reads only the runner-normative subset — `identity`, `host`, `type`, `work
 - **cwd** — declared `cwd`, else `workspace`, else the spec dir.
 - **Expansion** — st2 expands `$VAR`/`${VAR}` in `env`/`cwd`/`tags` at spawn (unset → literal token);
   `$CATALOG` = the catalog root; the `command` is expanded by `sh -c` (R11).
+- **Supervisor environment** — `supervisor "lead"` is the single declaration; at spawn st2 derives
+  `ST_SUPERVISOR=lead` for the agent's tasks so lifecycle hooks can notify it without a duplicate
+  `env` entry.
 - **`restart{}`** — `attempts` within `interval`, `delay` spacing, `mode` (`fail` = park + surface;
   `delay` = keep restarting, rate-limited). Declared, so every runner behaves identically (R16).
 

@@ -509,9 +509,6 @@ pub fn compile_agent(
     }
     kdl.push_str("  env {\n");
     kdl.push_str(&format!("    ST_AGENT {}\n", kdl_str(&ir.bus_id())));
-    if let Some(supervisor) = &ir.supervisor {
-        kdl.push_str(&format!("    ST_SUPERVISOR {}\n", kdl_str(supervisor)));
-    }
     kdl.push_str("  }\n");
     kdl.push_str(&format!("  command {}\n", kdl_raw(&command)));
     kdl.push_str("  ding\n\n");

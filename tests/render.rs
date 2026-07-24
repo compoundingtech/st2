@@ -315,6 +315,8 @@ fn render_agent_from_flags_produces_a_runnable_catalog_with_verbatim_persona() {
             "gbpilot",
             "--harness",
             "claude",
+            "--supervisor",
+            "lead",
         ])
         .arg("--dir")
         .arg(&ws)
@@ -341,6 +343,13 @@ fn render_agent_from_flags_produces_a_runnable_catalog_with_verbatim_persona() {
         .find(|s| s.identity == "gb-sup")
         .expect("gb-sup rendered");
     assert_eq!(spec.host.as_deref(), Some("gbpilot"));
+    assert_eq!(spec.supervisor.as_deref(), Some("lead"));
+    let kdl = fs::read_to_string(catalog.join("agents/gbpilot/gb-sup/agent.kdl")).unwrap();
+    assert!(kdl.contains("supervisor \"lead\""));
+    assert!(
+        !kdl.contains("ST_SUPERVISOR"),
+        "the runner derives ST_SUPERVISOR from the supervisor field at spawn"
+    );
 
     assert!(
         !ws.join(".st2/PERSONA.md").exists(),

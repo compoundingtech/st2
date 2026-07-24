@@ -138,6 +138,15 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
             .iter()
             .filter_map(|t| {
                 let command = t.command.clone()?;
+                // `supervisor` is the single source of truth. Hooks and harnesses consume the
+                // derived environment variable, but catalog authors/renderers never need to
+                // duplicate the relationship in env{} (and cannot accidentally make it disagree).
+                let mut env = t.env.clone();
+                if let Some(supervisor) = &spec.supervisor {
+                    env.insert("ST_SUPERVISOR".to_string(), supervisor.clone());
+                } else {
+                    env.remove("ST_SUPERVISOR");
+                }
                 Some(TaskTarget {
                     kind: t.kind,
                     pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
@@ -147,7 +156,7 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
                     cwd: t.cwd.clone(),
                     workspace: spec.workspace.clone(),
                     tags: t.tags.clone(),
-                    env: t.env.clone(),
+                    env,
                     keep: t.keep || spec.keep,
                 })
             })
