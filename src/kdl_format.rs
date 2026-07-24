@@ -16,7 +16,7 @@ pub(crate) fn parse_kdl(text: &str) -> anyhow::Result<Vec<RawSpec>> {
     let mut specs = Vec::new();
     for node in doc.nodes() {
         if node.name().value() == "agent" {
-            specs.push(agent_node_to_raw(node));
+            specs.push(agent_node_to_raw(node)?);
         }
     }
     Ok(specs)
@@ -34,18 +34,28 @@ fn arg_bool(node: &KdlNode) -> bool {
 
 /// First positional argument as an integer.
 fn arg_u32(node: &KdlNode) -> Option<u32> {
-    node.get(0).and_then(|v| v.as_integer()).and_then(|i| u32::try_from(i).ok())
+    node.get(0)
+        .and_then(|v| v.as_integer())
+        .and_then(|i| u32::try_from(i).ok())
 }
 
-fn agent_node_to_raw(node: &KdlNode) -> RawSpec {
+fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
     let mut raw = RawSpec {
         identity: arg_string(node), // agent "<identity>" — may be overridden by an `identity` child
         ..Default::default()
     };
 
     let Some(children) = node.children() else {
-        return raw;
+        return Ok(raw);
     };
+
+    // Environment is an agent-level scope in the compact format and cascades into explicit legacy
+    // tasks too. Parse it first so declaration order does not change semantics.
+    for child in children.nodes() {
+        if child.name().value() == "env" {
+            raw.env.extend(env_node_to_raw(child));
+        }
+    }
 
     for child in children.nodes() {
         match child.name().value() {
@@ -57,6 +67,9 @@ fn agent_node_to_raw(node: &KdlNode) -> RawSpec {
             "retired" => raw.retired = arg_bool(child),
             "keep" => raw.keep = arg_bool(child),
             "restart" => raw.restart = Some(restart_node_to_raw(child)),
+            "command" => raw.command = arg_string(child),
+            "ding" => raw.ding = true,
+            "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {
                     raw.pty.insert(name, task_node_to_raw(child));
@@ -71,7 +84,19 @@ fn agent_node_to_raw(node: &KdlNode) -> RawSpec {
             _ => {}
         }
     }
-    raw
+    if raw.command.is_some() && raw.pty.contains_key("agent") {
+        anyhow::bail!(
+            "agent '{}' declares both compact `command` and `pty \"agent\"`; choose one form",
+            raw.identity.as_deref().unwrap_or("<unnamed>")
+        );
+    }
+    if raw.ding && raw.exec.contains_key("ding") {
+        anyhow::bail!(
+            "agent '{}' declares both compact `ding` and `exec \"ding\"`; choose one form",
+            raw.identity.as_deref().unwrap_or("<unnamed>")
+        );
+    }
+    Ok(raw)
 }
 
 fn restart_node_to_raw(node: &KdlNode) -> RawRestart {
@@ -113,16 +138,22 @@ fn task_node_to_raw(node: &KdlNode) -> RawTask {
             }
             // `env { KEY "value"; … }` — child nodes, name = key, first arg = value.
             "env" => {
-                if let Some(env_children) = child.children() {
-                    for e in env_children.nodes() {
-                        if let Some(val) = arg_string(e) {
-                            t.env.insert(e.name().value().to_string(), val);
-                        }
-                    }
-                }
+                t.env.extend(env_node_to_raw(child));
             }
             _ => {}
         }
     }
     t
+}
+
+fn env_node_to_raw(node: &KdlNode) -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            if let Some(value) = arg_string(child) {
+                env.insert(child.name().value().to_string(), value);
+            }
+        }
+    }
+    env
 }

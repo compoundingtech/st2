@@ -1,0 +1,519 @@
+//! Declarative workspace materialization for catalog `render {}` blocks.
+//!
+//! The runner stays harness-agnostic: these are generic, ordered file operations. Content operations
+//! gate an agent's boot; `git-exclude` is advisory and can never prevent a launch.
+
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result};
+use kdl::{KdlDocument, KdlNode};
+
+use crate::spec::AgentSpec;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderOp {
+    Copy {
+        source: String,
+        destination: String,
+    },
+    File {
+        destination: String,
+        content: String,
+    },
+    JsonUpsert {
+        destination: String,
+        content: String,
+    },
+    EnsureLine {
+        destination: String,
+        line: String,
+    },
+    GitExclude {
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RenderPlan {
+    pub ops: Vec<RenderOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MaterializeReport {
+    pub materialized: Vec<String>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    /// Bus ids whose gating render failed. Callers must not boot these agents.
+    pub failed_agents: HashSet<String>,
+}
+
+impl MaterializeReport {
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+fn string_args(node: &KdlNode) -> Vec<String> {
+    node.entries()
+        .iter()
+        .filter(|entry| entry.name().is_none())
+        .filter_map(|entry| entry.value().as_string().map(String::from))
+        .collect()
+}
+
+fn content_arg(node: &KdlNode) -> Option<String> {
+    string_args(node).get(1).cloned().or_else(|| {
+        node.children()?
+            .nodes()
+            .iter()
+            .find(|child| child.name().value() == "content")
+            .and_then(|child| child.get(0))
+            .and_then(|value| value.as_string())
+            .map(String::from)
+    })
+}
+
+fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
+    let mut plan = RenderPlan::default();
+    let Some(children) = node.children() else {
+        return Ok(plan);
+    };
+    for directive in children.nodes() {
+        let name = directive.name().value();
+        let args = string_args(directive);
+        match name {
+            "copy" => {
+                let [source, destination] = args.as_slice() else {
+                    anyhow::bail!(
+                        "agent '{agent}': copy expects `copy \"<source>\" \"<destination>\"`"
+                    );
+                };
+                plan.ops.push(RenderOp::Copy {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                });
+            }
+            "file" => {
+                let Some(destination) = args.first() else {
+                    anyhow::bail!("agent '{agent}': file needs a destination");
+                };
+                let content = content_arg(directive)
+                    .with_context(|| format!("agent '{agent}': file needs content"))?;
+                plan.ops.push(RenderOp::File {
+                    destination: destination.clone(),
+                    content,
+                });
+            }
+            "json-upsert" => {
+                let Some(destination) = args.first() else {
+                    anyhow::bail!("agent '{agent}': json-upsert needs a destination");
+                };
+                let content = content_arg(directive)
+                    .with_context(|| format!("agent '{agent}': json-upsert needs content"))?;
+                serde_json::from_str::<serde_json::Value>(&content).with_context(|| {
+                    format!("agent '{agent}': json-upsert content is not valid JSON")
+                })?;
+                plan.ops.push(RenderOp::JsonUpsert {
+                    destination: destination.clone(),
+                    content,
+                });
+            }
+            "ensure-line" => {
+                let [destination, line] = args.as_slice() else {
+                    anyhow::bail!(
+                        "agent '{agent}': ensure-line expects `ensure-line \"<file>\" \"<line>\"`"
+                    );
+                };
+                plan.ops.push(RenderOp::EnsureLine {
+                    destination: destination.clone(),
+                    line: line.clone(),
+                });
+            }
+            "git-exclude" => {
+                if args.is_empty() {
+                    anyhow::bail!("agent '{agent}': git-exclude needs at least one path");
+                }
+                plan.ops
+                    .extend(args.into_iter().map(|path| RenderOp::GitExclude { path }));
+            }
+            other => anyhow::bail!(
+                "agent '{agent}': unknown render directive '{other}' \
+                 (expected copy|file|json-upsert|ensure-line|git-exclude)"
+            ),
+        }
+    }
+    Ok(plan)
+}
+
+/// Parse the `render {}` belonging to `spec`. An absent block is a valid empty plan.
+pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
+    if spec.path.extension().and_then(|ext| ext.to_str()) != Some("kdl") {
+        return Ok(RenderPlan::default());
+    }
+    let text = fs::read_to_string(&spec.path)
+        .with_context(|| format!("reading {}", spec.path.display()))?;
+    let doc =
+        KdlDocument::parse(&text).map_err(|error| anyhow::anyhow!("KDL parse error: {error}"))?;
+    let agents: Vec<&KdlNode> = doc
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == "agent")
+        .collect();
+    let node = agents
+        .iter()
+        .copied()
+        .find(|node| {
+            node.get(0)
+                .and_then(|value| value.as_string())
+                .is_some_and(|identity| identity == spec.identity)
+        })
+        .or_else(|| (agents.len() == 1).then_some(agents[0]));
+    let Some(node) = node else {
+        anyhow::bail!(
+            "could not find agent '{}' in {}",
+            spec.identity,
+            spec.path.display()
+        );
+    };
+    let render = node
+        .children()
+        .into_iter()
+        .flat_map(|children| children.nodes())
+        .find(|child| child.name().value() == "render");
+    match render {
+        Some(render) => parse_render_node(render, &spec.identity),
+        None => Ok(RenderPlan::default()),
+    }
+}
+
+fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::from([
+        ("CATALOG".to_string(), root.display().to_string()),
+        ("ST_ROOT".to_string(), root.display().to_string()),
+        (
+            "PTY_ROOT".to_string(),
+            crate::run::effective_pty_root(root).display().to_string(),
+        ),
+        ("ST_AGENT".to_string(), spec.bus_id(this_host)),
+    ]);
+    if let Ok(path) = crate::hooks::hooks_dir() {
+        env.insert("ST_HOOKS".to_string(), path.display().to_string());
+    }
+    if let Some(task) = spec.tasks.iter().find(|task| task.name == "agent") {
+        for (key, value) in &task.env {
+            let expanded = crate::expand::expand_vars(value, |name| {
+                env.get(name).cloned().or_else(|| std::env::var(name).ok())
+            });
+            env.insert(key.clone(), expanded);
+        }
+    }
+    env
+}
+
+fn expand(input: &str, env: &BTreeMap<String, String>) -> String {
+    crate::expand::expand_vars(input, |name| {
+        env.get(name).cloned().or_else(|| std::env::var(name).ok())
+    })
+}
+
+fn destination(workspace: &Path, raw: &str, env: &BTreeMap<String, String>) -> Result<PathBuf> {
+    let raw = expand(raw, env);
+    let path = Path::new(&raw);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!("render destination '{raw}' must be a workspace-relative path without `..`");
+    }
+    Ok(workspace.join(path))
+}
+
+fn source(
+    root: &Path,
+    spec_dir: &Path,
+    raw: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<PathBuf> {
+    let raw = expand(raw, env);
+    let path = Path::new(&raw);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    // Canonical format uses catalog-rooted `_templates/...`; the already-blessed COS prototype uses
+    // paths relative to the agent file (`../../_templates/...`). Supporting both keeps that catalog
+    // portable without making the operation harness-aware.
+    let catalog_relative = root.join(path);
+    if catalog_relative.exists() {
+        return Ok(catalog_relative);
+    }
+    let spec_relative = spec_dir.join(path);
+    if spec_relative.exists() {
+        return Ok(spec_relative);
+    }
+    anyhow::bail!(
+        "copy source '{raw}' does not exist (tried {} and {})",
+        catalog_relative.display(),
+        spec_relative.display()
+    )
+}
+
+fn write_owned(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+fn ensure_line(path: &Path, line: &str) -> Result<bool> {
+    let mut contents = fs::read_to_string(path).unwrap_or_default();
+    if contents.lines().any(|existing| existing == line) {
+        return Ok(false);
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(line);
+    contents.push('\n');
+    write_owned(path, contents.as_bytes())?;
+    Ok(true)
+}
+
+fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                match target.get_mut(&key) {
+                    Some(existing) => deep_merge(existing, value),
+                    None => {
+                        target.insert(key, value);
+                    }
+                }
+            }
+        }
+        (target, patch) => *target = patch,
+    }
+}
+
+fn git_exclude(workspace: &Path, line: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .context("running git rev-parse")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{} is not a Git worktree: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8(output.stdout).context("git returned a non-UTF-8 exclude path")?;
+    let raw = raw.trim();
+    let path = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        workspace.join(raw)
+    };
+    ensure_line(&path, line)
+}
+
+/// Execute one agent's render plan in declaration order.
+pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
+    let plan = parse_plan(spec)?;
+    if plan.ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workspace_raw = spec
+        .workspace
+        .as_deref()
+        .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
+    let env = render_env(root, spec, this_host);
+    let workspace = PathBuf::from(expand(workspace_raw, &env));
+    if !workspace.is_dir() {
+        anyhow::bail!(
+            "agent '{}' workspace {} does not exist or is not a directory",
+            spec.identity,
+            workspace.display()
+        );
+    }
+    let spec_dir = spec.path.parent().unwrap_or(root);
+    let mut notes = Vec::new();
+    for op in plan.ops {
+        match op {
+            RenderOp::Copy {
+                source: raw_source,
+                destination: raw_destination,
+            } => {
+                let source = source(root, spec_dir, &raw_source, &env)?;
+                let destination = destination(&workspace, &raw_destination, &env)?;
+                let bytes = fs::read(&source)
+                    .with_context(|| format!("reading copy source {}", source.display()))?;
+                write_owned(&destination, &bytes)?;
+                notes.push(format!("{}: copied {}", spec.identity, raw_destination));
+            }
+            RenderOp::File {
+                destination: raw_destination,
+                content,
+            } => {
+                let destination = destination(&workspace, &raw_destination, &env)?;
+                write_owned(&destination, expand(&content, &env).as_bytes())?;
+                notes.push(format!("{}: wrote {}", spec.identity, raw_destination));
+            }
+            RenderOp::JsonUpsert {
+                destination: raw_destination,
+                content,
+            } => {
+                let destination = destination(&workspace, &raw_destination, &env)?;
+                let mut target = match fs::read_to_string(&destination) {
+                    Ok(existing) => serde_json::from_str(&existing).with_context(|| {
+                        format!("existing {} is not valid JSON", destination.display())
+                    })?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        serde_json::Value::Object(Default::default())
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let patch: serde_json::Value = serde_json::from_str(&expand(&content, &env))
+                    .with_context(|| {
+                        format!(
+                            "expanded json-upsert for '{}' is not valid JSON",
+                            spec.identity
+                        )
+                    })?;
+                deep_merge(&mut target, patch);
+                let mut bytes = serde_json::to_vec_pretty(&target)?;
+                bytes.push(b'\n');
+                write_owned(&destination, &bytes)?;
+                notes.push(format!("{}: upserted {}", spec.identity, raw_destination));
+            }
+            RenderOp::EnsureLine {
+                destination: raw_destination,
+                line,
+            } => {
+                let destination = destination(&workspace, &raw_destination, &env)?;
+                ensure_line(&destination, &expand(&line, &env))?;
+                notes.push(format!("{}: ensured {}", spec.identity, raw_destination));
+            }
+            RenderOp::GitExclude { path } => {
+                // Advisory by contract: leave a visible note, but never fail materialization/boot.
+                match git_exclude(&workspace, &expand(&path, &env)) {
+                    Ok(_) => notes.push(format!("{}: excluded {path}", spec.identity)),
+                    Err(error) => notes.push(format!(
+                        "WARN {}: could not git-exclude '{path}': {error}",
+                        spec.identity
+                    )),
+                }
+            }
+        }
+    }
+    Ok(notes)
+}
+
+/// Validate an agent's render declaration and all catalog-owned inputs without writing its workspace.
+pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<()> {
+    let plan = parse_plan(spec)?;
+    if plan.ops.is_empty() {
+        return Ok(());
+    }
+    let workspace_raw = spec
+        .workspace
+        .as_deref()
+        .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
+    let env = render_env(root, spec, this_host);
+    let workspace = PathBuf::from(expand(workspace_raw, &env));
+    let spec_dir = spec.path.parent().unwrap_or(root);
+    for op in plan.ops {
+        match op {
+            RenderOp::Copy {
+                source: raw_source,
+                destination: raw_destination,
+            } => {
+                source(root, spec_dir, &raw_source, &env)?;
+                destination(&workspace, &raw_destination, &env)?;
+            }
+            RenderOp::File {
+                destination: raw_destination,
+                ..
+            }
+            | RenderOp::JsonUpsert {
+                destination: raw_destination,
+                ..
+            }
+            | RenderOp::EnsureLine {
+                destination: raw_destination,
+                ..
+            } => {
+                destination(&workspace, &raw_destination, &env)?;
+            }
+            RenderOp::GitExclude { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Materialize every active agent assigned to `this_host`.
+pub fn materialize_catalog(root: &Path, specs: &[AgentSpec], this_host: &str) -> MaterializeReport {
+    let mut report = MaterializeReport::default();
+    for spec in specs {
+        if spec.retired || spec.resolved_host(this_host) != this_host {
+            continue;
+        }
+        let bus_id = spec.bus_id(this_host);
+        match materialize_agent(root, spec, this_host) {
+            Ok(notes) => {
+                for note in notes {
+                    if note.starts_with("WARN ") {
+                        report.warnings.push(note);
+                    } else {
+                        report.materialized.push(note);
+                    }
+                }
+            }
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("{}: {error:#}", spec.path.display()));
+                report.failed_agents.insert(bus_id);
+            }
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_merge_preserves_unrelated_keys_and_replaces_arrays() {
+        let mut target = serde_json::json!({
+            "keep": true,
+            "nested": {"left": 1, "replace": "old"},
+            "array": [1]
+        });
+        deep_merge(
+            &mut target,
+            serde_json::json!({
+                "nested": {"right": 2, "replace": "new"},
+                "array": [2]
+            }),
+        );
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "keep": true,
+                "nested": {"left": 1, "right": 2, "replace": "new"},
+                "array": [2]
+            })
+        );
+    }
+}

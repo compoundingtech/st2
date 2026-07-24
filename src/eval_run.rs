@@ -67,6 +67,50 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
         .collect()
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Wrap supervised eval seats so their natural exit code survives PTY metadata sweeping. A killed
+/// wrapper cannot write the marker, which deliberately remains distinguishable from a clean exit.
+fn add_eval_exit_markers(specs: &mut [AgentSpec], catalog: &Path) {
+    let marker_dir = catalog.join(".eval-exits");
+    let _ = std::fs::create_dir_all(&marker_dir);
+    for spec in specs {
+        let Some(task) = spec.tasks.iter_mut().find(|task| task.kind == TaskKind::Pty) else {
+            continue;
+        };
+        let Some(command) = task.command.take() else {
+            continue;
+        };
+        let marker = marker_dir.join(format!("{}.status", spec.identity));
+        let script = concat!(
+            "marker=$1; command=$2; rm -f \"$marker\"; ",
+            "sh -c \"$command\"; code=$?; ",
+            "tmp=\"$marker.$$\"; printf '%s\\n' \"$code\" > \"$tmp\"; ",
+            "mv \"$tmp\" \"$marker\"; exit \"$code\""
+        );
+        task.command = Some(format!(
+            "sh -c {} st2-exit-marker {} {}",
+            shell_single_quote(script),
+            shell_single_quote(&marker.display().to_string()),
+            shell_single_quote(&command)
+        ));
+    }
+}
+
+fn eval_exit_code(catalog: &Path, identity: &str) -> Option<i64> {
+    std::fs::read_to_string(
+        catalog
+            .join(".eval-exits")
+            .join(format!("{identity}.status")),
+    )
+    .ok()?
+    .trim()
+    .parse()
+    .ok()
+}
+
 /// Strip the LAUNCHER's agent-identity env so a spawned harness seat runs as a FRESH top-level agent,
 /// not a nested child. When `st2 eval`/`st2 up` is itself launched from INSIDE a claude/codex session
 /// (e.g. evals-claude running `st2 eval`), those session-identity vars (`CLAUDECODE`,
@@ -600,7 +644,10 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
         }
         (true, Vec::new())
     } else {
-        let specs = spec_to_agent_specs(&agents, host, catalog);
+        let mut specs = spec_to_agent_specs(&agents, host, catalog);
+        if eval.supervise {
+            add_eval_exit_markers(&mut specs, catalog);
+        }
         // Pre-trust each agent's workspace so a real claude seat never hangs on the trust dialog.
         let dirs: Vec<PathBuf> =
             agents.iter().filter_map(|a| a.workspace.as_deref()).map(|w| catalog.join(w)).collect();
@@ -648,33 +695,52 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                     // that was alive and is now dead non-cleanly (non-zero/killed/vanished) → crash-ding
                     // its supervisor chain. A clean exit (code 0) stays SILENT (a false ding on a routine
                     // finish is as bad as a missed crash).
-                    if let Ok(sessions) = supervise_runner.list_sessions() {
-                        let by_id: std::collections::HashMap<&str, &crate::reconcile::Session> =
-                            sessions.iter().map(|s| (s.pty_id.as_str(), s)).collect();
-                        for seat in &specs {
-                            let id = seat.identity.as_str(); // the seat's main pty session id == its identity
-                            match by_id.get(id) {
-                                Some(s) if s.alive => {
-                                    ever_alive.insert(id.to_string());
-                                    dinged.remove(id); // healthy again → re-arm for a future crash
-                                }
-                                found => {
-                                    let clean = matches!(found, Some(s) if s.exit_code == Some(0));
-                                    if ever_alive.contains(id) && !clean && !dinged.contains(id) {
-                                        crash_ding(&seat.identity, &specs, &bus);
-                                        dinged.insert(id.to_string());
+                    let report = match supervise_runner.list_sessions() {
+                        Ok(sessions) => {
+                            let by_id: std::collections::HashMap<
+                                &str,
+                                &crate::reconcile::Session,
+                            > = sessions.iter().map(|s| (s.pty_id.as_str(), s)).collect();
+                            for seat in &specs {
+                                let id = seat.identity.as_str(); // the seat's main pty session id == its identity
+                                match by_id.get(id) {
+                                    Some(s) if s.alive => {
+                                        ever_alive.insert(id.to_string());
+                                        dinged.remove(id); // healthy again → re-arm for a future crash
+                                    }
+                                    found => {
+                                        let clean =
+                                            matches!(found, Some(s) if s.exit_code == Some(0))
+                                                || eval_exit_code(catalog, id) == Some(0);
+                                        if ever_alive.contains(id)
+                                            && !clean
+                                            && !dinged.contains(id)
+                                        {
+                                            crash_ding(&seat.identity, &specs, &bus);
+                                            dinged.insert(id.to_string());
+                                        }
                                     }
                                 }
                             }
+                            // Use the SAME snapshot for reconciliation. A second list here could observe
+                            // and reap a just-cleanly-exited seat before the classifier records code 0.
+                            crate::run::reconcile_pass_specs_with_sessions(
+                                &specs,
+                                &sessions,
+                                host,
+                                &supervise_runner,
+                                &mut sup_cap,
+                                &mut sup_debounce,
+                            )
                         }
-                    }
-                    let report = crate::run::reconcile_pass_specs(
-                        &specs,
-                        host,
-                        &supervise_runner,
-                        &mut sup_cap,
-                        &mut sup_debounce,
-                    );
+                        Err(_) => crate::run::reconcile_pass_specs(
+                            &specs,
+                            host,
+                            &supervise_runner,
+                            &mut sup_cap,
+                            &mut sup_debounce,
+                        ),
+                    };
                     if !report.launched.is_empty() {
                         println!("== supervise: respawned {:?} from spec ==", report.launched);
                     }
@@ -797,14 +863,19 @@ fn run_bash_judge(
     run_env: &BTreeMap<String, String>,
 ) -> (bool, String) {
     use std::process::{Command, Stdio};
+    // `sh` reports the physical cwd on macOS (for example `/private/var/...`) even when tempfile
+    // handed us its symlinked spelling (`/var/...`). Export the same physical path so `$SPEC_DIR`
+    // remains a truthful explicit name for the judge's cwd on every platform.
+    let physical_spec_dir =
+        spec_dir.canonicalize().unwrap_or_else(|_| spec_dir.to_path_buf());
     let mut command = Command::new("sh");
     command
         .arg("-c")
         .arg(cmd)
-        .current_dir(spec_dir)
+        .current_dir(&physical_spec_dir)
         .env("CATALOG", catalog)
         .env("ST_ROOT", bus)
-        .env("SPEC_DIR", spec_dir)
+        .env("SPEC_DIR", &physical_spec_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // $RUNS_DIR + each $RUN_<id>_EXIT, so a judge can read the run steps' captured stdout/stderr/exit.

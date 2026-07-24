@@ -212,7 +212,7 @@ every task it spawns, so a running agent needs no flags.
 
 ```sh
 st2 message send hetz.cos-claude -m "M2.1 landed" --subject "status"   # → prints the filename
-st2 message ls                       # your inbox (--archive, --count, --from <id>)
+st2 message ls                       # your inbox (--archive, --count, --from <id>, --since <unix-ms>)
 st2 message read <file>              # formatted view (--raw for the verbatim file)
 st2 message reply <file> -m "ack"   # recipient + `re:` subject + in-reply-to derived from <file>
 st2 message archive <file>          # inbox → archive

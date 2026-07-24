@@ -1,42 +1,62 @@
-// examples/format/agent-claude.kdl — the canonical materialize format, CLAUDE harness.
+// Canonical compact agent declaration for the Claude Code harness.
 //
-// This documents the TARGET catalog format (the `render{}` materialize block). The materialize
-// milestone implements the parser + the primitive; this file is the format spec, generified:
-// <host>/<identity>/<workspace> are placeholders. Roots (CATALOG/ST_ROOT/PTY_ROOT/ST_HOOKS) are
-// st2-PROVIDED from the install layout — NO machine paths appear here, so the catalog is portable.
-//
-// Lives at catalog/<host>/<identity>/agent.kdl. The agent-id dir is the complete home: this manifest,
-// its `render{}` overlay, and (co-located) its runtime `resources/` (inbox/archive/context/links).
+// `st2 compile-agent` emits this shape. It keeps the persona and bus contract
+// in a catalog-owned `.st2/` overlay and adds a tiny Claude rules loader.
 
-agent "<identity>" {                       // e.g. "cos-claude"
-  host      "<host>"                        // e.g. "silber"
-  workspace "<workspace>"                   // the agent's repo/dir — its cwd
-  env { ST_AGENT "<host>.<identity>" }      // the only per-agent env; roots come from st2's layout
+agent "<identity>" {
+  host "<host>"
+  workspace "<workspace>"
+  env {
+    ST_AGENT "<host>.<identity>"
+  }
+
   command #"exec claude --permission-mode bypassPermissions '<boot prompt>'"#
-  ding                                      // built-in sidecar → `st2 ding --identity <host>.<identity> --root $ST_ROOT`
+  ding
 
-  // render{} = an ORDERED, GATING pre-boot phase. st2 up runs these in order BEFORE spawning the
-  // command; if any GATING directive fails, the command does NOT boot (no half-rendered agent).
   render {
-    // content (GATING) — the persona + bus instructions, copied from the catalog's _templates/ into
-    // the agent's git-excluded .st2/ overlay:
-    copy        "_templates/PERSONA.md"        ".st2/PERSONA.md"
-    copy        "_templates/bus.st2.md"        ".st2/bus.md"
-    // load them via Claude Code's cwd-loaded .claude/rules (idempotent append; never clobbers a user's loader):
-    ensure-line ".claude/rules/st2.md"         "@../../.st2/PERSONA.md"
-    ensure-line ".claude/rules/st2.md"         "@../../.st2/bus.md"
-    // boot hooks — deep-MERGED into claude's local settings so a user's own keys survive. The hook
-    // scripts are st2-shipped and referenced via $ST_HOOKS (no machine path, no per-workspace copy):
-    json-upsert ".claude/settings.local.json" {
-      content #"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","async":true,"asyncRewake":true,"command":"$ST_HOOKS/session-start.sh"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"$ST_HOOKS/pre-compact.sh"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$ST_HOOKS/stop-failure.sh"}]}]}}"#
-    }
-    // git-exclude (ADVISORY / non-gating) — keep the overlay + runtime out of the tracked surface, so
-    // the versioned/shareable definition is just agent.kdl (+ the persona source). A non-git workspace
-    // or an exclude failure never blocks boot. (`resources/` = the co-located bus + context runtime;
-    // it is synced by fabric but git-ignored — synced ≠ tracked.)
-    git-exclude ".st2/"
-    git-exclude ".claude/rules/st2.md"
-    git-exclude ".claude/settings.local.json"
-    git-exclude "resources/"
+    copy "_templates/<host>.<identity>.persona.md" ".st2/PERSONA.md"
+    copy "_templates/bus.st2.md" ".st2/bus.md"
+    ensure-line ".claude/rules/st2.md" "@../../.st2/PERSONA.md"
+    ensure-line ".claude/rules/st2.md" "@../../.st2/bus.md"
+    json-upsert ".claude/settings.local.json" #"""
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "asyncRewake": true,
+            "command": "$ST_HOOKS/claude-session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-pre-compact.sh"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-stop-failure.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+"""#
+    git-exclude ".st2/" ".claude/rules/st2.md" ".claude/settings.local.json"
   }
 }

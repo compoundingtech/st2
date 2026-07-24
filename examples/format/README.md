@@ -1,28 +1,38 @@
-# Canonical catalog format — the `render{}` materialize block
+# Canonical compact catalog format
 
-These two examples are the canonical documentation of the st2 catalog agent format with the declarative
-overlay (`render{}`), blessed on the prototype:
+These are the current declarative agent shapes emitted by `st2 compile-agent`
+(also available as `st2 build-agent`):
 
-- [`agent-claude.kdl`](agent-claude.kdl) — the **claude** harness shape.
-- [`agent-codex.kdl`](agent-codex.kdl) — the **codex** harness shape (correct codex form: brief in
-  `AGENTS.md`, no `.claude` overlay, no hooks — see the file for why it differs).
+- [`agent-claude.kdl`](agent-claude.kdl) uses Claude Code's rules loader and
+  native `SessionStart`, `PreCompact`, and `StopFailure` hooks.
+- [`agent-codex.kdl`](agent-codex.kdl) composes the persona and bus contract
+  into `AGENTS.md` and uses Codex's native `SessionStart`, `PreCompact`, and
+  `Stop` hooks.
 
-They are **generified** (`<host>`/`<identity>`/`<workspace>` placeholders) and carry **no machine
-paths**: st2 provides the roots (`CATALOG`/`ST_ROOT`/`PTY_ROOT`/`ST_HOOKS`) from its install layout, so
-the same catalog is portable across machines.
+The examples use `<host>`, `<identity>`, and `<workspace>` placeholders. st2
+provides `CATALOG`, `ST_ROOT`, `PTY_ROOT`, and `ST_HOOKS` when it starts a task,
+so generated hook declarations contain no machine-specific install paths.
 
-**Status:** this is the TARGET format. The `render{}` parser + the generic materialize primitive are
-built by the materialize milestone (see [`../../MATERIALIZE-PLAN.md`](../../MATERIALIZE-PLAN.md)); until
-then these files are the spec, not yet parsed by `st2 up`.
+## Lifecycle
 
-## The shape
+`compile-agent` is generation-only: it writes the compact `agent.kdl`,
+catalog-owned templates, and the agent's
+`resources/{inbox,archive,context,links}` directories. It does not change the
+workspace.
 
-- `agent "<identity>" { host; workspace; env { ST_AGENT }; command; ding }` — the run spec (an agent
-  IS its pty; `ding` is the built-in sidecar).
-- `render { … }` — an **ordered, gating** pre-boot phase. `st2 up` runs the directives in order before
-  spawning the command; a failed **gating** directive means the command does not boot (no half-rendered
-  agent). Directives: `copy` (byte copy), `file` (write + `$VAR`-expand), `json-upsert` (deep-merge JSON,
-  preserve user keys), `ensure-line` (idempotent append), `git-exclude` (**advisory**, non-gating).
-- The overlay is **st2-native**: `.st2/PERSONA.md`, `.st2/bus.md`, loader `.claude/rules/st2.md`.
-- The bus + context runtime is **co-located** at `<agent-dir>/resources/{inbox,archive,context,links}`
-  (synced by fabric, git-ignored — synced ≠ tracked).
+Use the same sequence for generated and hand-authored declarations:
+
+```sh
+st2 validate <catalog>
+st2 up <catalog> --host <host> --materialize-only
+st2 up <catalog> --host <host> --once
+```
+
+The `render { ... }` block is ordered. `copy`, `file`, `json-upsert`, and
+`ensure-line` are boot-gating operations; a failure prevents that agent from
+starting. `git-exclude` is advisory, so a non-Git workspace or exclusion
+failure does not prevent a boot.
+
+Materialization is idempotent. JSON values are deep-merged, existing unrelated
+settings survive, loader lines are added once, and generated workspace files
+are excluded without changing the repository's committed `.gitignore`.

@@ -30,7 +30,11 @@ use crate::spec::TaskKind;
 /// Resolve a task's working directory: declared `cwd` (expanded), else the agent's `workspace`
 /// (expanded), else the spec file's directory (spec.md §2). A relative value is joined to the spec
 /// dir; an absolute one replaces it.
-pub(crate) fn resolve_task_cwd(target: &TaskTarget, spec_dir: &Path, catalog_root: &Path) -> PathBuf {
+pub(crate) fn resolve_task_cwd(
+    target: &TaskTarget,
+    spec_dir: &Path,
+    catalog_root: &Path,
+) -> PathBuf {
     match target.cwd.as_deref().or(target.workspace.as_deref()) {
         Some(c) => spec_dir.join(crate::expand::expand_catalog(c, catalog_root)),
         None => spec_dir.to_path_buf(),
@@ -61,7 +65,10 @@ pub struct PtyCli {
 
 impl Default for PtyCli {
     fn default() -> Self {
-        Self { bin: "pty".to_string(), catalog_root: PathBuf::from(".") }
+        Self {
+            bin: "pty".to_string(),
+            catalog_root: PathBuf::from("."),
+        }
     }
 }
 
@@ -99,7 +106,10 @@ fn effective_pty_root_from(catalog_root: &Path, ambient: Option<std::ffi::OsStri
 impl PtyCli {
     /// A `PtyCli` rooted at `catalog_root` (used for `$CATALOG` expansion).
     pub fn new(catalog_root: PathBuf) -> Self {
-        Self { bin: "pty".to_string(), catalog_root }
+        Self {
+            bin: "pty".to_string(),
+            catalog_root,
+        }
     }
 
     /// Expand `$VAR`/`${VAR}` against the ambient env plus `$CATALOG` = the catalog root.
@@ -134,7 +144,12 @@ impl PtyCli {
         // the command's own `sh -c` expansion can reference it. PTY_ROOT resolves to the EFFECTIVE root
         // (an exported ambient one wins over the rendered `$CATALOG/pty`), so the session lands where
         // st2's own list/kill will look for it.
-        cmd.env("CATALOG", &self.catalog_root);
+        cmd.env("CATALOG", &self.catalog_root)
+            .env("ST_ROOT", &self.catalog_root)
+            .env("PTY_ROOT", effective_pty_root(&self.catalog_root));
+        if let Ok(path) = crate::hooks::hooks_dir() {
+            cmd.env("ST_HOOKS", path);
+        }
         for (k, v) in &target.env {
             if k == "PTY_ROOT" {
                 cmd.env("PTY_ROOT", effective_pty_root(&self.catalog_root));
@@ -155,13 +170,20 @@ impl Runner for PtyCli {
             .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
             .output()?;
         if !out.status.success() {
-            anyhow::bail!("`pty list --json` failed: {}", String::from_utf8_lossy(&out.stderr));
+            anyhow::bail!(
+                "`pty list --json` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
             .map_err(|e| anyhow::anyhow!("parsing `pty list --json`: {e}"))?;
         Ok(entries
             .into_iter()
-            .map(|e| Session { pty_id: e.name, alive: e.status == "running", exit_code: e.exit_code })
+            .map(|e| Session {
+                pty_id: e.name,
+                alive: e.status == "running",
+                exit_code: e.exit_code,
+            })
             .collect())
     }
 
@@ -223,7 +245,10 @@ impl Runner for PtyCli {
             .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
             .output()?;
         if !out.status.success() {
-            anyhow::bail!("`pty kill {pty_id}` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            anyhow::bail!(
+                "`pty kill {pty_id}` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -235,7 +260,10 @@ impl Runner for PtyCli {
             .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
             .output()?;
         if !out.status.success() {
-            anyhow::bail!("`pty rm {pty_id}` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            anyhow::bail!(
+                "`pty rm {pty_id}` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -332,7 +360,11 @@ pub struct CrashLoop {
 impl CrashLoop {
     /// The parked agent's bus id (`<host>.<identity>`), using `this_host` when the spec omits a host.
     pub fn agent_bus_id(&self, this_host: &str) -> String {
-        format!("{}.{}", self.host.as_deref().unwrap_or(this_host), self.identity)
+        format!(
+            "{}.{}",
+            self.host.as_deref().unwrap_or(this_host),
+            self.identity
+        )
     }
 }
 
@@ -380,12 +412,20 @@ impl UpReport {
 /// Execute a plan against a runner, folding results into `report` and consulting/updating the
 /// flapping-cap. Order matters: reap standalone corpses, then (cap-gated) reap-and-respawn each
 /// launch target, then kill teardowns. Per-op errors are collected, never fatal.
-pub fn execute(plan: &ReconcilePlan, runner: &dyn Runner, cap: &mut FlappingCap, report: &mut UpReport) {
+pub fn execute(
+    plan: &ReconcilePlan,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    report: &mut UpReport,
+) {
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
-    let launch_ids: HashSet<&str> =
-        plan.launch.iter().flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str())).collect();
+    let launch_ids: HashSet<&str> = plan
+        .launch
+        .iter()
+        .flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str()))
+        .collect();
     let gc_set: HashSet<&str> = plan.gc.iter().map(String::as_str).collect();
 
     for id in &plan.gc {
@@ -448,9 +488,15 @@ pub fn execute(plan: &ReconcilePlan, runner: &dyn Runner, cap: &mut FlappingCap,
         }
     }
 
-    report.adopted.extend(plan.adopt.iter().map(|s| s.identity.clone()));
-    report.other_host.extend(plan.other_host.iter().map(|s| s.identity.clone()));
-    report.unrunnable.extend(plan.unrunnable.iter().map(|s| s.identity.clone()));
+    report
+        .adopted
+        .extend(plan.adopt.iter().map(|s| s.identity.clone()));
+    report
+        .other_host
+        .extend(plan.other_host.iter().map(|s| s.identity.clone()));
+    report
+        .unrunnable
+        .extend(plan.unrunnable.iter().map(|s| s.identity.clone()));
 }
 
 /// The grace window for the liveness debounce (see [`LivenessDebounce`]): a task read not-alive but
@@ -474,7 +520,10 @@ pub struct LivenessDebounce {
 
 impl LivenessDebounce {
     pub fn new(grace: Duration) -> Self {
-        Self { last_alive: HashMap::new(), grace }
+        Self {
+            last_alive: HashMap::new(),
+            grace,
+        }
     }
 
     /// Record which ids are alive as of `now`, and forget ids not seen alive within the grace (bounds
@@ -485,12 +534,15 @@ impl LivenessDebounce {
                 self.last_alive.insert(s.pty_id.clone(), now);
             }
         }
-        self.last_alive.retain(|_, &mut t| now.duration_since(t) < self.grace);
+        self.last_alive
+            .retain(|_, &mut t| now.duration_since(t) < self.grace);
     }
 
     /// True if `id` was seen alive within the grace ending at `now` — a recent flicker, defer it.
     fn recently_alive(&self, id: &str, now: Instant) -> bool {
-        self.last_alive.get(id).is_some_and(|&t| now.duration_since(t) < self.grace)
+        self.last_alive
+            .get(id)
+            .is_some_and(|&t| now.duration_since(t) < self.grace)
     }
 
     /// Remove recently-alive ids from the plan's GC and launch sets (they're flickers, not real
@@ -533,20 +585,38 @@ fn reconcile_pass(
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
-        errors: found.errors.iter().map(|e| format!("{}: {}", e.path.display(), e.message)).collect(),
+        errors: found
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.message))
+            .collect(),
         ..Default::default()
     };
+
+    // Ordered, idempotent pre-boot materialization. A gating render failure removes only that agent
+    // from this pass; advisory git-exclude failures remain warnings and never block a launch.
+    let materialized = crate::materialize::materialize_catalog(root, &found.specs, this_host);
+    report.warnings.extend(materialized.warnings);
+    report.errors.extend(materialized.errors);
+    let eligible_specs: Vec<_> = found
+        .specs
+        .iter()
+        .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
+        .cloned()
+        .collect();
 
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
-            report.errors.push(format!("list sessions (pass skipped): {e}"));
+            report
+                .errors
+                .push(format!("list sessions (pass skipped): {e}"));
             return report;
         }
     };
     let now = Instant::now();
     debounce.observe(&sessions, now);
-    let mut plan = crate::reconcile(&found.specs, &sessions, this_host);
+    let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
     execute(&plan, runner, cap, &mut report);
     report
@@ -557,7 +627,13 @@ fn reconcile_pass(
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    Ok(reconcile_pass(root, this_host, runner, &mut FlappingCap::default(), &mut debounce))
+    Ok(reconcile_pass(
+        root,
+        this_host,
+        runner,
+        &mut FlappingCap::default(),
+        &mut debounce,
+    ))
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -579,13 +655,31 @@ pub fn reconcile_pass_specs(
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
-            report.errors.push(format!("list sessions (pass skipped): {e}"));
+            report
+                .errors
+                .push(format!("list sessions (pass skipped): {e}"));
             return report;
         }
     };
+    reconcile_pass_specs_with_sessions(specs, &sessions, this_host, runner, cap, debounce)
+}
+
+/// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
+/// this so crash classification and reconciliation see the same terminal state: otherwise a clean
+/// process can exit between two `pty list` calls, be reaped by the second call, then look like a
+/// vanished crash on the next tick.
+pub(crate) fn reconcile_pass_specs_with_sessions(
+    specs: &[crate::spec::AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
+    let mut report = UpReport::default();
     let now = Instant::now();
-    debounce.observe(&sessions, now);
-    let mut plan = crate::reconcile(specs, &sessions, this_host);
+    debounce.observe(sessions, now);
+    let mut plan = crate::reconcile(specs, sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
     execute(&plan, runner, cap, &mut report);
     report
@@ -593,9 +687,19 @@ pub fn reconcile_pass_specs(
 
 /// One reconcile pass over an in-memory spec team (`st2 up <spec> --once`). Throwaway cap+debounce
 /// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
-pub fn up_once_specs(specs: &[crate::spec::AgentSpec], this_host: &str, runner: &dyn Runner) -> UpReport {
+pub fn up_once_specs(
+    specs: &[crate::spec::AgentSpec],
+    this_host: &str,
+    runner: &dyn Runner,
+) -> UpReport {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    reconcile_pass_specs(specs, this_host, runner, &mut FlappingCap::default(), &mut debounce)
+    reconcile_pass_specs(
+        specs,
+        this_host,
+        runner,
+        &mut FlappingCap::default(),
+        &mut debounce,
+    )
 }
 
 /// Supervise an in-memory spec team: keep-alive + respawn on a timer, nomad-decoupled — the `convoy up`
@@ -642,7 +746,9 @@ pub fn up_loop_specs(
             break;
         }
     }
-    eprintln!("st2: stopping; leaving sessions running (agents are decoupled from the supervisor).");
+    eprintln!(
+        "st2: stopping; leaving sessions running (agents are decoupled from the supervisor)."
+    );
     Ok(())
 }
 
@@ -653,7 +759,11 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
-        errors: found.errors.iter().map(|e| format!("{}: {}", e.path.display(), e.message)).collect(),
+        errors: found
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.message))
+            .collect(),
         ..Default::default()
     };
     teardown_specs(&found.specs, this_host, runner, &mut report)?;
@@ -696,7 +806,10 @@ fn teardown_specs(
         }
         let bus_id = spec.bus_id(this_host);
         for task in &spec.tasks {
-            let id = task.id.clone().unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            let id = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
             if live.contains(&id) {
                 match runner.kill(&id) {
                     Ok(()) => report.torn_down.push(id),
@@ -773,7 +886,10 @@ pub fn up_loop(
         let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
-                eprintln!("st2: GAVE UP on '{}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. Fix the cause, then restart st2.", cl.pty_id);
+                eprintln!(
+                    "st2: GAVE UP on '{}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. Fix the cause, then restart st2.",
+                    cl.pty_id
+                );
                 surface_crash_loop(root, this_host, cl);
             }
         }
@@ -803,7 +919,9 @@ pub fn up_loop(
         }
     }
 
-    eprintln!("st2: stopping; leaving sessions running (agents are decoupled from the supervisor).");
+    eprintln!(
+        "st2: stopping; leaving sessions running (agents are decoupled from the supervisor)."
+    );
     Ok(())
 }
 
@@ -815,7 +933,10 @@ pub fn up_loop(
 pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
     let agent = cl.agent_bus_id(this_host);
     let Some(supervisor) = cl.supervisor.as_deref() else {
-        eprintln!("st2: crash-loop '{}' ({agent}) has no supervisor to notify.", cl.pty_id);
+        eprintln!(
+            "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
+            cl.pty_id
+        );
         return;
     };
     let Some(agent_dir) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
@@ -842,7 +963,10 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         &tags,
         &body,
     ) {
-        eprintln!("st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}", cl.pty_id);
+        eprintln!(
+            "st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}",
+            cl.pty_id
+        );
     }
 }
 
@@ -892,7 +1016,11 @@ mod tests {
     use crate::spec::{AgentSpec, JobType};
 
     fn sess(id: &str, alive: bool) -> Session {
-        Session { pty_id: id.to_string(), alive, exit_code: None }
+        Session {
+            pty_id: id.to_string(),
+            alive,
+            exit_code: None,
+        }
     }
 
     fn spec_fixture() -> AgentSpec {
@@ -920,7 +1048,10 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan.gc.push("hetz.demo.agent".into());
         let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(1));
-        assert!(plan.gc.is_empty(), "a recently-alive flicker must NOT be GC'd");
+        assert!(
+            plan.gc.is_empty(),
+            "a recently-alive flicker must NOT be GC'd"
+        );
         assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
 
         // CENTRAL anti-over-correction check: a STABLE death past the grace IS still reaped — the
@@ -928,7 +1059,11 @@ mod tests {
         let mut plan = ReconcilePlan::default();
         plan.gc.push("hetz.demo.agent".into());
         let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(11));
-        assert_eq!(plan.gc, vec!["hetz.demo.agent".to_string()], "a stable death must still be reaped");
+        assert_eq!(
+            plan.gc,
+            vec!["hetz.demo.agent".to_string()],
+            "a stable death must still be reaped"
+        );
         assert!(deferred.is_empty());
     }
 
@@ -937,11 +1072,18 @@ mod tests {
         let cat = std::path::Path::new("/deep/sandbox/st-root");
         // No ambient PTY_ROOT → the rendered default `<catalog>/pty`.
         assert_eq!(effective_pty_root_from(cat, None), cat.join("pty"));
-        assert_eq!(effective_pty_root_from(cat, Some("".into())), cat.join("pty"), "empty is treated as unset");
+        assert_eq!(
+            effective_pty_root_from(cat, Some("".into())),
+            cat.join("pty"),
+            "empty is treated as unset"
+        );
         // An exported ambient PTY_ROOT (e.g. an eval's short decoupled root) WINS — so a deep catalog
         // path can't blow the unix-socket limit, and spawn agrees with list/kill.
         let short = std::ffi::OsString::from("/tmp/stev-abc123");
-        assert_eq!(effective_pty_root_from(cat, Some(short)), std::path::PathBuf::from("/tmp/stev-abc123"));
+        assert_eq!(
+            effective_pty_root_from(cat, Some(short)),
+            std::path::PathBuf::from("/tmp/stev-abc123")
+        );
     }
 
     #[test]
@@ -966,9 +1108,15 @@ mod tests {
         // no noisy "already in use" re-launch of a live session.
         let spec = spec_fixture();
         let mut plan = ReconcilePlan::default();
-        plan.launch.push(Launch { spec: &spec, tasks: vec![target("hetz.demo.agent", "x")] });
+        plan.launch.push(Launch {
+            spec: &spec,
+            tasks: vec![target("hetz.demo.agent", "x")],
+        });
         let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(2));
-        assert!(plan.launch.is_empty(), "a recently-alive flicker must NOT be re-launched");
+        assert!(
+            plan.launch.is_empty(),
+            "a recently-alive flicker must NOT be re-launched"
+        );
         assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
     }
 
@@ -976,12 +1124,17 @@ mod tests {
     #[test]
     fn build_run_command_wraps_command_in_sh_c() {
         let cli = PtyCli::default();
-        let t = target("hetz.demo.agent", "exec claude --permission-mode bypassPermissions 'boot'");
+        let t = target(
+            "hetz.demo.agent",
+            "exec claude --permission-mode bypassPermissions 'boot'",
+        );
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
 
         assert_eq!(cmd.get_program(), OsStr::new("pty"));
-        let args: Vec<String> =
-            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         // Order: run -d --force --id <id> --cwd <cwd> -- sh -c <command>
         assert_eq!(&args[0..2], &["run", "-d"]);
         assert!(args.contains(&"--force".to_string()));
@@ -999,8 +1152,10 @@ mod tests {
         t.env.insert("ST_AGENT".into(), "hetz.demo-claude".into());
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
 
-        let args: Vec<String> =
-            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
         assert_eq!(args[cwd_pos + 1], "/cat/hetz/demo"); // no cwd, no workspace → spec dir
         let tag_pos = args.iter().position(|a| a == "--tag").unwrap();
@@ -1010,10 +1165,16 @@ mod tests {
         let envs: BTreeMap<String, Option<String>> = cmd
             .get_envs()
             .map(|(k, v)| {
-                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
             })
             .collect();
-        assert_eq!(envs.get("ST_AGENT"), Some(&Some("hetz.demo-claude".to_string())));
+        assert_eq!(
+            envs.get("ST_AGENT"),
+            Some(&Some("hetz.demo-claude".to_string()))
+        );
     }
 
     #[test]
@@ -1022,8 +1183,10 @@ mod tests {
         let mut t = target("hetz.demo.agent", "exec claude 'boot'");
         t.workspace = Some("/repos/demo".into()); // no task cwd → workspace (spec.md §2)
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
-        let args: Vec<String> =
-            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
         assert_eq!(args[cwd_pos + 1], "/repos/demo");
     }
@@ -1037,10 +1200,16 @@ mod tests {
         let envs: BTreeMap<String, Option<String>> = cmd
             .get_envs()
             .map(|(k, v)| {
-                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
             })
             .collect();
-        assert_eq!(envs.get("DATA"), Some(&Some("/my/catalog/evals/x".to_string())));
+        assert_eq!(
+            envs.get("DATA"),
+            Some(&Some("/my/catalog/evals/x".to_string()))
+        );
         assert_eq!(envs.get("CATALOG"), Some(&Some("/my/catalog".to_string())));
     }
 
@@ -1057,8 +1226,10 @@ mod tests {
         t.env.insert("ST_ROOT".into(), format!("${key}/smalltalk"));
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
 
-        let args: Vec<String> =
-            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         // cwd expanded (absolute → replaces the spec dir)
         let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
         assert_eq!(args[cwd_pos + 1], "/net/xyz/work");
@@ -1066,16 +1237,25 @@ mod tests {
         let tag_pos = args.iter().position(|a| a == "--tag").unwrap();
         assert_eq!(args[tag_pos + 1], "net=/net/xyz");
         // command left verbatim for sh -c to expand at spawn
-        assert_eq!(args.last().unwrap(), "exec claude $ST2_TEST_EXPAND_NET_9f3/go");
+        assert_eq!(
+            args.last().unwrap(),
+            "exec claude $ST2_TEST_EXPAND_NET_9f3/go"
+        );
 
         // env value expanded
         let envs: std::collections::BTreeMap<String, Option<String>> = cmd
             .get_envs()
             .map(|(k, v)| {
-                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
             })
             .collect();
-        assert_eq!(envs.get("ST_ROOT"), Some(&Some("/net/xyz/smalltalk".to_string())));
+        assert_eq!(
+            envs.get("ST_ROOT"),
+            Some(&Some("/net/xyz/smalltalk".to_string()))
+        );
 
         unsafe { std::env::remove_var(key) }
     }
@@ -1086,17 +1266,29 @@ mod tests {
         let mut t = target("x", "y");
         // relative cwd → joined onto the spec dir
         t.cwd = Some("sub".into());
-        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/cat/hetz/demo/sub"));
+        assert_eq!(
+            cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
+            Path::new("/cat/hetz/demo/sub")
+        );
         // absolute cwd → replaces
         t.cwd = Some("/repos/fabric".into());
-        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/repos/fabric"));
+        assert_eq!(
+            cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
+            Path::new("/repos/fabric")
+        );
         // no cwd but a workspace → workspace
         t.cwd = None;
         t.workspace = Some("/repos/ws".into());
-        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/repos/ws"));
+        assert_eq!(
+            cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
+            Path::new("/repos/ws")
+        );
         // neither → spec dir
         t.workspace = None;
-        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/cat/hetz/demo"));
+        assert_eq!(
+            cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
+            Path::new("/cat/hetz/demo")
+        );
     }
 
     #[test]

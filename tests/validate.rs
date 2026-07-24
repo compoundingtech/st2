@@ -33,6 +33,22 @@ fn a_well_formed_service_catalog_is_clean() {
     assert_eq!(r.agents, 1);
 }
 
+#[test]
+fn compact_agent_catalog_is_clean() {
+    let c = catalog(&[(
+        "Silber/cos/agent.kdl",
+        r#"agent "cos" {
+  host "Silber"
+  env { ST_AGENT "Silber.cos" }
+  command "codex"
+  ding
+}"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+}
+
 // ---- errors ----------------------------------------------------------------------------------
 
 #[test]
@@ -97,7 +113,12 @@ fn a_missing_external_path_is_only_a_warning() {
     )]);
     let r = validate(c.path());
     assert!(has(&r, "bad-path", Severity::Warn));
-    assert_eq!(r.errors(), 0, "a missing external workspace must not be an error: {:?}", r.issues);
+    assert_eq!(
+        r.errors(),
+        0,
+        "a missing external workspace must not be an error: {:?}",
+        r.issues
+    );
 }
 
 #[test]
@@ -125,16 +146,41 @@ fn a_catalog_rooted_path_that_exists_is_clean() {
 #[test]
 fn a_duplicate_bus_id_is_an_error() {
     let c = catalog(&[
-        ("hetz/one/agent.kdl", r#"agent "twin" { host "hetz"; type "service"; pty "agent" { command "a" } }"#),
-        ("hetz/two/agent.kdl", r#"agent "twin" { host "hetz"; type "service"; pty "agent" { command "b" } }"#),
+        (
+            "hetz/one/agent.kdl",
+            r#"agent "twin" { host "hetz"; type "service"; pty "agent" { command "a" } }"#,
+        ),
+        (
+            "hetz/two/agent.kdl",
+            r#"agent "twin" { host "hetz"; type "service"; pty "agent" { command "b" } }"#,
+        ),
     ]);
     assert!(has(&validate(c.path()), "dup-id", Severity::Error));
 }
 
 #[test]
 fn an_unrendered_service_is_not_runnable() {
-    let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; type "service" }"#)]);
+    let c = catalog(&[(
+        "hetz/w/agent.kdl",
+        r#"agent "w" { host "hetz"; type "service" }"#,
+    )]);
     assert!(has(&validate(c.path()), "not-runnable", Severity::Error));
+}
+
+#[test]
+fn a_missing_render_source_is_an_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let agent = format!(
+        r#"agent "w" {{
+  host "hetz"
+  workspace "{}"
+  command "x"
+  render {{ copy "_templates/missing.md" "AGENTS.md" }}
+}}"#,
+        workspace.path().display()
+    );
+    let c = catalog(&[("hetz/w/agent.kdl", &agent)]);
+    assert!(has(&validate(c.path()), "render-error", Severity::Error));
 }
 
 #[test]
@@ -144,7 +190,11 @@ fn a_nameless_task_is_an_error() {
         "hetz/w/agent.kdl",
         r#"agent "w" { host "hetz"; type "service"; pty { command "claude" } }"#,
     )]);
-    assert!(has(&validate(c.path()), "unknown-task-kind", Severity::Error));
+    assert!(has(
+        &validate(c.path()),
+        "unknown-task-kind",
+        Severity::Error
+    ));
 }
 
 // ---- warnings --------------------------------------------------------------------------------
@@ -157,7 +207,12 @@ fn a_dangling_supervisor_is_a_warning() {
     )]);
     let r = validate(c.path());
     assert!(has(&r, "dangling-supervisor", Severity::Warn));
-    assert_eq!(r.errors(), 0, "a dangling supervisor must not be an error: {:?}", r.issues);
+    assert_eq!(
+        r.errors(),
+        0,
+        "a dangling supervisor must not be an error: {:?}",
+        r.issues
+    );
 }
 
 #[test]
@@ -175,7 +230,11 @@ fn a_host_folder_mismatch_is_a_warning() {
         "folderhost/w/agent.kdl",
         r#"agent "w" { host "confighost"; type "service"; pty "agent" { command "x" } }"#,
     )]);
-    assert!(has(&validate(c.path()), "host-path-mismatch", Severity::Warn));
+    assert!(has(
+        &validate(c.path()),
+        "host-path-mismatch",
+        Severity::Warn
+    ));
 }
 
 #[test]
@@ -184,7 +243,11 @@ fn a_dangling_overlay_import_is_a_warning() {
     // Workspace with render's overlay shape, but the imported persona file is missing.
     let ws = d.path().join("ws");
     std::fs::create_dir_all(ws.join(".claude/rules")).unwrap();
-    std::fs::write(ws.join(".claude/rules/convoy.md"), "@../../.convoy/PERSONA.md\n").unwrap();
+    std::fs::write(
+        ws.join(".claude/rules/convoy.md"),
+        "@../../.convoy/PERSONA.md\n",
+    )
+    .unwrap();
     let agent = format!(
         r#"agent "w" {{ host "hetz"; type "service"; workspace {:?}; pty "agent" {{ command "x" }} }}"#,
         ws.display()
@@ -211,13 +274,20 @@ fn cli_exits_zero_on_a_clean_catalog() {
         r#"agent "w" { host "hetz"; type "service"; pty "agent" { command "x" } }"#,
     )]);
     let out = run_validate(&[c.path().as_os_str()]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]
 fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
     // An error catalog exits non-zero without --strict.
-    let err = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; type "srvice" }"#)]);
+    let err = catalog(&[(
+        "hetz/w/agent.kdl",
+        r#"agent "w" { host "hetz"; type "srvice" }"#,
+    )]);
     assert!(!run_validate(&[err.path().as_os_str()]).status.success());
 
     // A warning-only catalog exits 0 normally, 1 under --strict.
@@ -227,7 +297,11 @@ fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
     )]);
     assert!(run_validate(&[warn.path().as_os_str()]).status.success());
     let strict = std::ffi::OsStr::new("--strict");
-    assert!(!run_validate(&[warn.path().as_os_str(), strict]).status.success());
+    assert!(
+        !run_validate(&[warn.path().as_os_str(), strict])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -250,10 +324,17 @@ fn a_rendered_catalog_validates_without_errors() {
     let ir = tempfile::tempdir().unwrap();
     let fleet = std::fs::read_to_string("examples/ir/fleet.kdl")
         .unwrap()
-        .replace("/replace/with/a/real/repo/path", ws.path().to_str().unwrap());
+        .replace(
+            "/replace/with/a/real/repo/path",
+            ws.path().to_str().unwrap(),
+        );
     std::fs::write(ir.path().join("fleet.kdl"), fleet).unwrap();
     std::fs::create_dir_all(ir.path().join("personas")).unwrap();
-    std::fs::copy("examples/ir/personas/worker.md", ir.path().join("personas/worker.md")).unwrap();
+    std::fs::copy(
+        "examples/ir/personas/worker.md",
+        ir.path().join("personas/worker.md"),
+    )
+    .unwrap();
 
     let cat = tempfile::tempdir().unwrap();
     let render = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -262,7 +343,11 @@ fn a_rendered_catalog_validates_without_errors() {
         .arg(cat.path())
         .output()
         .unwrap();
-    assert!(render.status.success(), "render failed: {}", String::from_utf8_lossy(&render.stderr));
+    assert!(
+        render.status.success(),
+        "render failed: {}",
+        String::from_utf8_lossy(&render.stderr)
+    );
 
     let r = validate(cat.path());
     assert_eq!(r.errors(), 0, "rendered catalog has errors: {:?}", r.issues);

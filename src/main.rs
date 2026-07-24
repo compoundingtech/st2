@@ -42,6 +42,9 @@ enum Command {
         /// Do a single reconcile pass and exit, instead of looping.
         #[arg(long)]
         once: bool,
+        /// Materialize every local agent's render block and exit without reconciling or spawning.
+        #[arg(long, conflicts_with = "once")]
+        materialize_only: bool,
         /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
         /// immediately regardless).
         #[arg(long, default_value_t = 30)]
@@ -131,15 +134,15 @@ enum Command {
     },
     /// Un-declare an agent: delete its IR entry (`<ir-dir>/<identity>.kdl`). Re-compile + `st2 down`
     /// to stop a running instance.
-    Remove {
-        identity: String,
-        ir_dir: PathBuf,
-    },
-    /// Compile ONE agent from convoy-add-shaped flags STRAIGHT into a runnable catalog (agent.kdl +
-    /// persona overlay + bus dirs) — the imperative sibling of `st2 compile`, so a harness can author a
-    /// seat without hand-writing IR. `--persona` takes a composed persona FILE, installed verbatim (the
-    /// `--persona` contract). Follow with `st2 up --once` to launch. (Was `st2 render-agent`; kept as an alias.)
-    #[command(name = "compile-agent", visible_alias = "render-agent")]
+    Remove { identity: String, ir_dir: PathBuf },
+    /// Generate ONE compact agent from flags: catalog-owned agent.kdl, templates, and bus dirs.
+    /// The workspace remains untouched until `st2 up --materialize-only` (or a real `st2 up`) applies
+    /// the declaration. Harness-specific Claude/Codex hooks are included automatically. Also available
+    /// as `st2 build-agent` and the older `st2 render-agent` alias.
+    #[command(
+        name = "compile-agent",
+        visible_aliases = ["render-agent", "build-agent"]
+    )]
     RenderAgent {
         /// The catalog folder (the agent lands at `<catalog>/<host>/<identity>/`).
         catalog: PathBuf,
@@ -150,7 +153,7 @@ enum Command {
         /// The agent's workspace directory (its cwd).
         #[arg(long)]
         dir: String,
-        /// A composed persona FILE — installed verbatim as the persona overlay.
+        /// Persona source file to vendor into the catalog-owned overlay.
         #[arg(long)]
         persona: PathBuf,
         #[arg(long, default_value = "claude")]
@@ -364,6 +367,9 @@ enum ContextCmd {
         /// Print the working state and the decision log.
         #[arg(long)]
         full: bool,
+        /// Print `now.md` only when it is newer than this many seconds.
+        #[arg(long, value_name = "SECONDS")]
+        fresh_within: Option<u64>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -432,6 +438,9 @@ enum MessageCmd {
         /// Show only messages from this sender.
         #[arg(long = "from")]
         from: Option<String>,
+        /// Show only messages sent after this unix-millisecond timestamp.
+        #[arg(long)]
+        since: Option<u64>,
         /// Machine-readable JSON array.
         #[arg(long)]
         json: bool,
@@ -484,19 +493,36 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ls { root } => ls(&root),
-        Command::Up { root, host, once, interval } => up(&root, host, once, interval),
+        Command::Up {
+            root,
+            host,
+            once,
+            materialize_only,
+            interval,
+        } => up(&root, host, once, materialize_only, interval),
         Command::Message(cmd) => message_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
-        Command::Ding { session, identity, root, host, interval } => {
-            ding_cmd(session, identity, root, host, interval)
-        }
+        Command::Ding {
+            session,
+            identity,
+            root,
+            host,
+            interval,
+        } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
-        Command::Agents { catalog, status, json, enrich, ctx } => {
-            agents_cmd(catalog, status, json, enrich, ctx)
-        }
-        Command::Render { ir_dir, catalog_dir } => render_cmd(&ir_dir, &catalog_dir),
+        Command::Agents {
+            catalog,
+            status,
+            json,
+            enrich,
+            ctx,
+        } => agents_cmd(catalog, status, json, enrich, ctx),
+        Command::Render {
+            ir_dir,
+            catalog_dir,
+        } => render_cmd(&ir_dir, &catalog_dir),
         Command::Add {
             identity,
             ir_dir,
@@ -507,11 +533,25 @@ fn main() -> Result<()> {
             persona,
             workspace,
             supervisor,
-        } => add_cmd(&identity, &ir_dir, &role, &host, &harness, model, persona, &workspace, supervisor),
+        } => add_cmd(
+            &identity, &ir_dir, &role, &host, &harness, model, persona, &workspace, supervisor,
+        ),
         Command::Remove { identity, ir_dir } => remove_cmd(&identity, &ir_dir),
-        Command::RenderAgent { catalog, identity, role, dir, persona, harness, host, model, supervisor, extra_arg } => {
-            render_agent_cmd(&catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor, extra_arg)
-        }
+        Command::RenderAgent {
+            catalog,
+            identity,
+            role,
+            dir,
+            persona,
+            harness,
+            host,
+            model,
+            supervisor,
+            extra_arg,
+        } => render_agent_cmd(
+            &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
+            extra_arg,
+        ),
         Command::Down { root, host } => down_cmd(&root, host),
         Command::Env { root } => env_cmd(&root),
         Command::Pretrust { dirs, harness: _ } => pretrust_cmd(&dirs),
@@ -526,14 +566,17 @@ fn main() -> Result<()> {
 fn render_cmd(ir_dir: &Path, catalog_dir: &Path) -> Result<()> {
     let personas_dir = ir_dir.join("personas");
     let mut count = 0;
-    for entry in std::fs::read_dir(ir_dir).with_context(|| format!("reading IR dir {}", ir_dir.display()))? {
+    for entry in
+        std::fs::read_dir(ir_dir).with_context(|| format!("reading IR dir {}", ir_dir.display()))?
+    {
         let path = entry?.path();
         // IR files are the *.kdl at the top level; personas/ lives in a subdir.
         if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
             continue;
         }
         let text = std::fs::read_to_string(&path)?;
-        let agents = st2::render::parse_ir(&text).with_context(|| format!("parsing IR {}", path.display()))?;
+        let agents = st2::render::parse_ir(&text)
+            .with_context(|| format!("parsing IR {}", path.display()))?;
         for ir in &agents {
             let dir = st2::render::render_agent(ir, catalog_dir, &personas_dir)
                 .with_context(|| format!("rendering agent '{}'", ir.identity))?;
@@ -561,9 +604,6 @@ fn render_agent_cmd(
     extra_arg: Vec<String>,
 ) -> Result<()> {
     let host = host.unwrap_or_else(detect_host);
-    // The composed persona FILE is installed verbatim: `render_agent` reads `<personas_dir>/<name>.md`,
-    // so point personas_dir at the file's parent and use its stem as the persona name.
-    let personas_dir = persona.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     let persona_name = persona
         .file_stem()
         .and_then(|s| s.to_str())
@@ -581,11 +621,14 @@ fn render_agent_cmd(
         permissions: None,
         extra_args: extra_arg,
     };
-    let agent_dir = st2::render::render_agent(&ir, catalog, &personas_dir)
-        .with_context(|| format!("rendering agent '{identity}'"))?;
+    let agent_dir = st2::render::compile_agent(&ir, catalog, persona)
+        .with_context(|| format!("compiling agent '{identity}'"))?;
     println!(
-        "rendered {host}.{identity} → {}  (now: st2 up --once {} --host {host})",
+        "compiled {host}.{identity} → {}  \
+         (next: st2 validate {}; st2 up {} --host {host} --materialize-only; then st2 up {} --host {host} --once)",
         agent_dir.display(),
+        catalog.display(),
+        catalog.display(),
         catalog.display()
     );
     Ok(())
@@ -605,10 +648,15 @@ fn add_cmd(
 ) -> Result<()> {
     let path = ir_dir.join(format!("{identity}.kdl"));
     if path.exists() {
-        anyhow::bail!("agent '{identity}' is already declared at {}", path.display());
+        anyhow::bail!(
+            "agent '{identity}' is already declared at {}",
+            path.display()
+        );
     }
     std::fs::create_dir_all(ir_dir)?;
-    let mut s = format!("agent \"{identity}\" {{\n  host \"{host}\"\n  role \"{role}\"\n  harness \"{harness}\"\n");
+    let mut s = format!(
+        "agent \"{identity}\" {{\n  host \"{host}\"\n  role \"{role}\"\n  harness \"{harness}\"\n"
+    );
     if let Some(m) = &model {
         s.push_str(&format!("  model \"{m}\"\n"));
     }
@@ -621,9 +669,14 @@ fn add_cmd(
     }
     s.push_str("}\n");
     // Sanity: it must parse as IR before we write it.
-    st2::render::parse_ir(&s).with_context(|| format!("declared IR for '{identity}' does not parse"))?;
+    st2::render::parse_ir(&s)
+        .with_context(|| format!("declared IR for '{identity}' does not parse"))?;
     std::fs::write(&path, &s)?;
-    println!("declared {host}.{identity} → {}  (now: st2 compile {} <catalog>)", path.display(), ir_dir.display());
+    println!(
+        "declared {host}.{identity} → {}  (now: st2 compile {} <catalog>)",
+        path.display(),
+        ir_dir.display()
+    );
     Ok(())
 }
 
@@ -633,11 +686,16 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
     if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
         let (spec, spec_root) = st2::eval_run::load_spec(&spec_file)?;
         // Same host resolution as `st2 up <spec>`: --host › the spec's top-level host › OS hostname.
-        let this_host = host.or_else(|| spec.host.clone()).unwrap_or_else(detect_host);
+        let this_host = host
+            .or_else(|| spec.host.clone())
+            .unwrap_or_else(detect_host);
         let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &spec_root);
         let runner = SystemRunner::new(spec_root, exec_state_dir(&this_host));
         let report = st2::down_specs(&specs, &this_host, &runner)?;
-        println!("teardown of spec {} on host '{this_host}':", spec_file.display());
+        println!(
+            "teardown of spec {} on host '{this_host}':",
+            spec_file.display()
+        );
         print_report(&report);
         return Ok(());
     }
@@ -657,18 +715,27 @@ fn remove_cmd(identity: &str, ir_dir: &Path) -> Result<()> {
         anyhow::bail!("no IR entry for '{identity}' at {}", path.display());
     }
     std::fs::remove_file(&path)?;
-    println!("removed {}  (re-render + `st2 down` to stop a running instance)", path.display());
+    println!(
+        "removed {}  (re-render + `st2 down` to stop a running instance)",
+        path.display()
+    );
     Ok(())
 }
 
 fn eval_cmd(folder: &Path, host: Option<String>, keep: bool) -> Result<()> {
-    let spec_file = st2::eval_run::resolve_spec_path(folder)
-        .with_context(|| format!("{} is not an st2 spec (a *.kdl file, or a folder with one)", folder.display()))?;
+    let spec_file = st2::eval_run::resolve_spec_path(folder).with_context(|| {
+        format!(
+            "{} is not an st2 spec (a *.kdl file, or a folder with one)",
+            folder.display()
+        )
+    })?;
     let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
     let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
 
     if !report.done {
-        println!("(note: the team did not send a confirmation within max-timeout — judged the final state)");
+        println!(
+            "(note: the team did not send a confirmation within max-timeout — judged the final state)"
+        );
     }
     println!("\n== judges ==");
     let (mut pass, mut fail) = (0, 0);
@@ -683,9 +750,17 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool) -> Result<()> {
         } else {
             fail += 1;
         }
-        println!("  {} {}  ({})", if j.passed { "[PASS]" } else { "[FAIL]" }, j.name, j.detail);
+        println!(
+            "  {} {}  ({})",
+            if j.passed { "[PASS]" } else { "[FAIL]" },
+            j.name,
+            j.detail
+        );
     }
-    println!("SCORE: {pass} PASS / {fail} FAIL / {} gating judges", pass + fail);
+    println!(
+        "SCORE: {pass} PASS / {fail} FAIL / {} gating judges",
+        pass + fail
+    );
     if report.passed() {
         println!("VERDICT: PASS");
         Ok(())
@@ -800,31 +875,52 @@ fn env_cmd(root: &Path) -> Result<()> {
 
 fn pretrust_cmd(dirs: &[PathBuf]) -> Result<()> {
     let n = st2::pretrust::pretrust(dirs)?;
-    println!("pre-trusted {n} workspace{} in the claude config", if n == 1 { "" } else { "s" });
+    println!(
+        "pre-trusted {n} workspace{} in the claude config",
+        if n == 1 { "" } else { "s" }
+    );
     Ok(())
 }
 
 fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
     let this_host = host.unwrap_or_else(detect_host);
     let catalog = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    println!("st2 doctor — catalog {}, host '{this_host}'", catalog.display());
+    println!(
+        "st2 doctor — catalog {}, host '{this_host}'",
+        catalog.display()
+    );
     let mut problems = 0usize;
 
     // 1) The tools a running fleet needs.
     for tool in ["pty", "st"] {
-        report_check(&mut problems, tool_on_path(tool), &format!("`{tool}` on PATH"), "not found");
+        report_check(
+            &mut problems,
+            tool_on_path(tool),
+            &format!("`{tool}` on PATH"),
+            "not found",
+        );
     }
 
     // 2) A supervisor holding the host-lock (i.e. `st2 up` is running).
     match st2::HostLock::new(root, &this_host).live_owner() {
         Some(_) => report_check(&mut problems, true, "supervisor (st2 up) running", ""),
-        None => report_check(&mut problems, false, "supervisor (st2 up) running", "no live host-lock — run `st2 up`"),
+        None => report_check(
+            &mut problems,
+            false,
+            "supervisor (st2 up) running",
+            "no live host-lock — run `st2 up`",
+        ),
     }
 
     // 3) Per this-host agent: every task alive, and presence not rotted to `unknown`.
     let found = discover(&catalog);
     for e in &found.errors {
-        report_check(&mut problems, false, &format!("catalog file {}", e.path.display()), &e.message);
+        report_check(
+            &mut problems,
+            false,
+            &format!("catalog file {}", e.path.display()),
+            &e.message,
+        );
     }
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&this_host));
     let live: std::collections::HashSet<String> = runner
@@ -840,8 +936,16 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
         }
         let bus_id = spec.bus_id(&this_host);
         for task in &spec.tasks {
-            let id = task.id.clone().unwrap_or_else(|| format!("{bus_id}.{}", task.name));
-            report_check(&mut problems, live.contains(&id), &format!("{bus_id} task '{}' alive", task.name), "session dead/missing");
+            let id = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            report_check(
+                &mut problems,
+                live.contains(&id),
+                &format!("{bus_id} task '{}' alive", task.name),
+                "session dead/missing",
+            );
         }
         if let Some(dir) = spec.path.parent() {
             let state = st2::status::read_state(&st2::status::status_path(dir));
@@ -925,7 +1029,12 @@ fn agents_cmd(
         println!("{}", st2::agents::to_json(&rows, enrich));
     } else {
         for r in &rows {
-            println!("{}\t{}\t{}", r.identity, r.status.as_str(), r.name.as_deref().unwrap_or(""));
+            println!(
+                "{}\t{}\t{}",
+                r.identity,
+                r.status.as_str(),
+                r.name.as_deref().unwrap_or("")
+            );
         }
     }
     Ok(())
@@ -938,7 +1047,11 @@ fn ding_cmd(
     host: Option<String>,
     interval: u64,
 ) -> Result<()> {
-    let ctx = MsgCtx { root, as_id: identity, host };
+    let ctx = MsgCtx {
+        root,
+        as_id: identity,
+        host,
+    };
     let (catalog_root, this_host) = resolve_ctx(&ctx)?;
     let id = acting_id(&ctx)?;
     // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
@@ -951,8 +1064,15 @@ fn ding_cmd(
         .unwrap_or_else(|| catalog_root.join(&id));
     let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
     let status_path = st2::status::status_path(&agent_dir);
-    eprintln!("st2 ding: watching {}'s inbox ({}) → poking pty '{session}'", id, inbox.display());
-    let config = ding::DingConfig { poll: Duration::from_millis(interval), ..Default::default() };
+    eprintln!(
+        "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
+        id,
+        inbox.display()
+    );
+    let config = ding::DingConfig {
+        poll: Duration::from_millis(interval),
+        ..Default::default()
+    };
     ding::serve(&inbox, &status_path, &session, &config)
 }
 
@@ -990,7 +1110,9 @@ fn body_or_stdin(body: Option<String>) -> Result<String> {
         None => {
             use std::io::Read as _;
             let mut s = String::new();
-            std::io::stdin().read_to_string(&mut s).context("reading message body from stdin")?;
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .context("reading message body from stdin")?;
             Ok(s)
         }
     }
@@ -1007,7 +1129,14 @@ fn box_target(first: String, second: Option<String>, ctx: &MsgCtx) -> Result<(St
 
 fn message_cmd(cmd: MessageCmd) -> Result<()> {
     match cmd {
-        MessageCmd::Send { to, body, subject, in_reply_to, tags, ctx } => {
+        MessageCmd::Send {
+            to,
+            body,
+            subject,
+            in_reply_to,
+            tags,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
@@ -1023,7 +1152,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             println!("{filename}");
             Ok(())
         }
-        MessageCmd::Reply { filename, body, subject, ctx } => {
+        MessageCmd::Reply {
+            filename,
+            body,
+            subject,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let my_inbox = message::resolve_inbox(&root, &from, &host);
@@ -1047,7 +1181,15 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             println!("{sent}");
             Ok(())
         }
-        MessageCmd::Ls { identity, archive, count, from, json, ctx } => {
+        MessageCmd::Ls {
+            identity,
+            archive,
+            count,
+            from,
+            since,
+            json,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let id = match identity {
                 Some(id) => id,
@@ -1062,6 +1204,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             if let Some(sender) = &from {
                 msgs.retain(|m| m.from.as_deref() == Some(sender.as_str()));
             }
+            if let Some(cursor) = since {
+                msgs.retain(|m| m.ts_ms > cursor);
+            }
             if count {
                 println!("{}", msgs.len());
                 return Ok(());
@@ -1072,7 +1217,11 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 return Ok(());
             }
             let box_name = if archive { "archive" } else { "inbox" };
-            println!("# {} message{} in {id} {box_name}", msgs.len(), plural(msgs.len()));
+            println!(
+                "# {} message{} in {id} {box_name}",
+                msgs.len(),
+                plural(msgs.len())
+            );
             for m in &msgs {
                 let from = m.from.as_deref().unwrap_or("<unknown>");
                 let subj = m.subject.as_deref().unwrap_or("(no subject)");
@@ -1080,7 +1229,14 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             }
             Ok(())
         }
-        MessageCmd::Read { first, second, archive, raw, json, ctx } => {
+        MessageCmd::Read {
+            first,
+            second,
+            archive,
+            raw,
+            json,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
             let dir = if archive {
@@ -1122,19 +1278,31 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             println!("archived");
             Ok(())
         }
-        MessageCmd::Thread { first, second, tree, ctx } => {
+        MessageCmd::Thread {
+            first,
+            second,
+            tree,
+            ctx,
+        } => {
             let (root, _host) = resolve_ctx(&ctx)?;
             // `[identity] filename` — the identity is irrelevant (the walk is catalog-wide).
             let filename = second.unwrap_or(first);
             let mut entries = message::collect_thread(&root, &filename);
             if entries.is_empty() {
-                anyhow::bail!("no thread found for '{filename}' in catalog {}", root.display());
+                anyhow::bail!(
+                    "no thread found for '{filename}' in catalog {}",
+                    root.display()
+                );
             }
             if !tree {
                 entries.sort_by_key(|e| e.ts_ms); // flat chronological
             }
             for e in &entries {
-                let indent = if tree { "  ".repeat(e.depth) } else { String::new() };
+                let indent = if tree {
+                    "  ".repeat(e.depth)
+                } else {
+                    String::new()
+                };
                 let from = e.from.as_deref().unwrap_or("<unknown>");
                 let subj = e.subject.as_deref().unwrap_or("(no subject)");
                 println!("{indent}{}  from {from}  {subj}", e.filename);
@@ -1203,7 +1371,13 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
 fn context_cmd(cmd: ContextCmd) -> Result<()> {
     use st2::context::{self, View};
     match cmd {
-        ContextCmd::Read { identity, decisions, full, ctx } => {
+        ContextCmd::Read {
+            identity,
+            decisions,
+            full,
+            fresh_within,
+            ctx,
+        } => {
             let dir = resolve_context_dir(identity, &ctx)?;
             let view = if full {
                 View::Full
@@ -1212,17 +1386,30 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             } else {
                 View::Now
             };
-            print!("{}", context::read(&dir, view));
+            if fresh_within.is_some() && view != View::Now {
+                anyhow::bail!("--fresh-within cannot be combined with --decisions or --full");
+            }
+            let content = match fresh_within {
+                Some(seconds) => context::read_now_fresh(&dir, Duration::from_secs(seconds)),
+                None => context::read(&dir, view),
+            };
+            print!("{content}");
             Ok(())
         }
         ContextCmd::Write { identity, ctx } => {
             let dir = resolve_context_dir(identity, &ctx)?;
-            let content = std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
+            let content =
+                std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
             context::write_now(&dir, &content)?;
             eprintln!("context: wrote now.md ({} bytes)", content.len());
             Ok(())
         }
-        ContextCmd::Append { identity, decision, why, ctx } => {
+        ContextCmd::Append {
+            identity,
+            decision,
+            why,
+            ctx,
+        } => {
             let dir = resolve_context_dir(identity, &ctx)?;
             let filename = context::append_decision(&dir, &decision, &why)?;
             println!("{filename}");
@@ -1233,7 +1420,11 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
 
 fn service_cmd(cmd: ServiceCmd) -> Result<()> {
     match cmd {
-        ServiceCmd::Install { catalog, host, memory_max_mb } => {
+        ServiceCmd::Install {
+            catalog,
+            host,
+            memory_max_mb,
+        } => {
             let catalog = match catalog {
                 Some(c) => c,
                 None => catalog_root_for_env()?,
@@ -1247,11 +1438,29 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
 
 fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
-        ResourceCmd::Add { url, title, tags, relation, body_stdin, ctx } => {
+        ResourceCmd::Add {
+            url,
+            title,
+            tags,
+            relation,
+            body_stdin,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let dir = st2::resource::links_dir(&agent_dir_of(&root, &acting_id(&ctx)?, &host)?);
-            let body = if body_stdin { std::io::read_to_string(std::io::stdin())? } else { String::new() };
-            let f = st2::resource::add(&dir, &url, title.as_deref(), &tags, relation.as_deref(), &body)?;
+            let body = if body_stdin {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                String::new()
+            };
+            let f = st2::resource::add(
+                &dir,
+                &url,
+                title.as_deref(),
+                &tags,
+                relation.as_deref(),
+                &body,
+            )?;
             println!("{f}");
             Ok(())
         }
@@ -1294,7 +1503,10 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Remove { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            st2::resource::remove(&st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?), &filename)?;
+            st2::resource::remove(
+                &st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?),
+                &filename,
+            )?;
             println!("removed");
             Ok(())
         }
@@ -1332,7 +1544,9 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     }
     // Run host: --host (explicit) › the spec's top-level `host` › the OS hostname. The declared host
     // wins over the OS hostname so a per-host file ups its own slice even when they differ.
-    let this_host = host.or_else(|| spec.host.clone()).unwrap_or_else(detect_host);
+    let this_host = host
+        .or_else(|| spec.host.clone())
+        .unwrap_or_else(detect_host);
     // Seats boot as fresh top-level agents (strip the launcher's agent identity) and their bare
     // `st2 …` resolve to this binary (PATH prepend) — same prep `st2 eval` does.
     st2::eval_run::prepare_spawn_env();
@@ -1348,7 +1562,10 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
 
     if once {
         let report = st2::up_once_specs(&specs, &this_host, &runner);
-        println!("booted team from spec {} on host '{this_host}' (once):", spec_file.display());
+        println!(
+            "booted team from spec {} on host '{this_host}' (once):",
+            spec_file.display()
+        );
         print_report(&report);
         return Ok(());
     }
@@ -1362,24 +1579,75 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         spec_file.display(),
         specs.len()
     );
-    let result = st2::up_loop_specs(&specs, &root, &this_host, &runner, Duration::from_secs(interval), |report| {
-        if report.is_noteworthy() {
-            print_report(report);
-        }
-    });
+    let result = st2::up_loop_specs(
+        &specs,
+        &root,
+        &this_host,
+        &runner,
+        Duration::from_secs(interval),
+        |report| {
+            if report.is_noteworthy() {
+                print_report(report);
+            }
+        },
+    );
     lock.release();
     result
 }
 
-fn up(root: &Path, host: Option<String>, once: bool, interval: u64) -> Result<()> {
+fn up(
+    root: &Path,
+    host: Option<String>,
+    once: bool,
+    materialize_only: bool,
+    interval: u64,
+) -> Result<()> {
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
     if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
+        if materialize_only {
+            anyhow::bail!(
+                "--materialize-only is for folder catalogs with agent render{{}} blocks, not single-file specs"
+            );
+        }
         return up_spec_fleet(&spec_file, host, once, interval);
     }
     let this_host = host.unwrap_or_else(detect_host);
     // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    st2::hooks::ensure_installed().context("installing st2 lifecycle hooks")?;
+
+    if materialize_only {
+        let found = discover(&catalog_root);
+        for warning in &found.warnings {
+            eprintln!("warning: {warning}");
+        }
+        for error in &found.errors {
+            eprintln!("error: {}: {}", error.path.display(), error.message);
+        }
+        let report = st2::materialize::materialize_catalog(&catalog_root, &found.specs, &this_host);
+        for item in &report.materialized {
+            println!("{item}");
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+        for error in &report.errors {
+            eprintln!("error: {error}");
+        }
+        println!(
+            "materialized {} operation{} for host '{this_host}'; {} error{}",
+            report.materialized.len(),
+            plural(report.materialized.len()),
+            found.errors.len() + report.errors.len(),
+            plural(found.errors.len() + report.errors.len())
+        );
+        if !found.errors.is_empty() || !report.is_clean() {
+            anyhow::bail!("materialization failed");
+        }
+        return Ok(());
+    }
+
     let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
 
     // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
@@ -1403,12 +1671,21 @@ fn up(root: &Path, host: Option<String>, once: bool, interval: u64) -> Result<()
     }
     lock.acquire().context("acquiring host lock")?;
 
-    eprintln!("st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)", root.display());
-    let result = up_loop(root, &this_host, &runner, Duration::from_secs(interval), |report| {
-        if report.is_noteworthy() {
-            print_report(report);
-        }
-    });
+    eprintln!(
+        "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",
+        root.display()
+    );
+    let result = up_loop(
+        root,
+        &this_host,
+        &runner,
+        Duration::from_secs(interval),
+        |report| {
+            if report.is_noteworthy() {
+                print_report(report);
+            }
+        },
+    );
     lock.release();
     result
 }
@@ -1452,10 +1729,18 @@ fn ls(root: &Path) -> Result<()> {
             spec.host.as_deref().unwrap_or("<none>"),
             spec.agents.len(),
             if spec.agents.len() == 1 { "" } else { "s" },
-            if spec.eval.is_some() { ", + eval block" } else { "" },
+            if spec.eval.is_some() {
+                ", + eval block"
+            } else {
+                ""
+            },
         );
         for a in &spec.agents {
-            println!("  {}  ws={}", a.id, a.workspace.as_deref().unwrap_or("<none>"));
+            println!(
+                "  {}  ws={}",
+                a.id,
+                a.workspace.as_deref().unwrap_or("<none>")
+            );
             println!("      command: {}", a.command);
             for ex in &a.execs {
                 println!("      + exec {}: {}", ex.id, ex.command);
@@ -1473,7 +1758,11 @@ fn ls(root: &Path) -> Result<()> {
         let kind = match spec.job_type {
             st2::JobType::Service => "service",
         };
-        let runnable = if spec.is_runnable() { "" } else { "  [UNRENDERED: no task command]" };
+        let runnable = if spec.is_runnable() {
+            ""
+        } else {
+            "  [UNRENDERED: no task command]"
+        };
         let retired = if spec.retired { "  [retired]" } else { "" };
         println!(
             "{host}.{ident}  [{kind}] ({n} task{plural}){runnable}{retired}\n    {path}",

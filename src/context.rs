@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::message;
 
@@ -57,8 +58,28 @@ pub fn read(context_dir: &Path, view: View) -> String {
                 parts.push(dec.trim_end().to_string());
             }
             let joined = parts.join("\n");
-            if joined.is_empty() { joined } else { format!("{joined}\n") }
+            if joined.is_empty() {
+                joined
+            } else {
+                format!("{joined}\n")
+            }
         }
+    }
+}
+
+/// Read `now.md` only when its mtime is younger than `max_age`. Missing, unreadable, or stale state
+/// returns empty text so lifecycle hooks can safely omit it.
+pub fn read_now_fresh(context_dir: &Path, max_age: Duration) -> String {
+    let path = now_file(context_dir);
+    let fresh = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < max_age);
+    if fresh {
+        read_if_present(&path)
+    } else {
+        String::new()
     }
 }
 
@@ -135,7 +156,11 @@ fn trim_trailing_period(s: &str) -> &str {
 fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".ctx.tmp-{}-{}", std::process::id(), message::now_ms()));
+    let tmp = dir.join(format!(
+        ".ctx.tmp-{}-{}",
+        std::process::id(),
+        message::now_ms()
+    ));
     fs::write(&tmp, content)?;
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
@@ -183,13 +208,23 @@ mod tests {
         let dir = context_dir(tmp.path());
         write_now(&dir, "mid-refactor: step 3 of 5\n").unwrap();
         assert_eq!(read(&dir, View::Now), "mid-refactor: step 3 of 5\n");
+        assert_eq!(
+            read_now_fresh(&dir, Duration::from_secs(60)),
+            "mid-refactor: step 3 of 5\n"
+        );
+        assert_eq!(read_now_fresh(&dir, Duration::ZERO), "");
     }
 
     #[test]
     fn append_decisions_are_ordered_bullets() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = context_dir(tmp.path());
-        append_decision(&dir, "use hook-enforced perms", "never prompts an autonomous pty").unwrap();
+        append_decision(
+            &dir,
+            "use hook-enforced perms",
+            "never prompts an autonomous pty",
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         append_decision(&dir, "defer shims", "scope enforcement is follow-on").unwrap();
 
@@ -197,7 +232,9 @@ mod tests {
         let lines: Vec<&str> = dec.lines().collect();
         assert_eq!(lines.len(), 2);
         // Format + chronological order.
-        assert!(lines[0].contains("use hook-enforced perms. why: never prompts an autonomous pty."));
+        assert!(
+            lines[0].contains("use hook-enforced perms. why: never prompts an autonomous pty.")
+        );
         assert!(lines[1].contains("defer shims. why: scope enforcement is follow-on."));
         assert!(lines[0].starts_with("- 2")); // ISO timestamp
 

@@ -117,7 +117,11 @@ impl Default for Restart {
 impl AgentSpec {
     /// The bus id this spec compiles to — `<host>.<identity>` — using `this_host` when `host` is unset.
     pub fn bus_id(&self, this_host: &str) -> String {
-        format!("{}.{}", self.host.as_deref().unwrap_or(this_host), self.identity)
+        format!(
+            "{}.{}",
+            self.host.as_deref().unwrap_or(this_host),
+            self.identity
+        )
     }
 
     /// The host that should run this spec, defaulting to `this_host` when unset.
@@ -148,7 +152,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         Some(i) => (&s[..i], &s[i..]),
         None => (s, "s"), // bare number → seconds
     };
-    let n: u64 = num.trim().parse().map_err(|_| format!("bad duration number in '{s}'"))?;
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad duration number in '{s}'"))?;
     let secs = match unit.trim() {
         "s" | "sec" | "secs" => n,
         "m" | "min" | "mins" => n * 60,
@@ -177,6 +184,14 @@ pub(crate) struct RawSpec {
     #[serde(default)]
     pub keep: bool,
     pub restart: Option<RawRestart>,
+    /// Compact catalog form: the agent itself is one pty carrying this command.
+    pub command: Option<String>,
+    /// Compact catalog form: environment inherited by the agent pty and every sidecar.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Compact catalog form: include the built-in `st2 ding` sidecar.
+    #[serde(default)]
+    pub ding: bool,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
     #[serde(default)]
     pub pty: BTreeMap<String, RawTask>,
@@ -211,8 +226,14 @@ impl RawRestart {
         let d = Restart::default();
         Restart {
             attempts: self.attempts.unwrap_or(d.attempts),
-            interval: self.interval.and_then(|s| parse_duration(&s).ok()).unwrap_or(d.interval),
-            delay: self.delay.and_then(|s| parse_duration(&s).ok()).unwrap_or(d.delay),
+            interval: self
+                .interval
+                .and_then(|s| parse_duration(&s).ok())
+                .unwrap_or(d.interval),
+            delay: self
+                .delay
+                .and_then(|s| parse_duration(&s).ok())
+                .unwrap_or(d.delay),
             mode: match self.mode.as_deref() {
                 Some("fail") => RestartMode::Fail,
                 Some("delay") => RestartMode::Delay,
@@ -228,18 +249,55 @@ impl RawSpec {
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
             || self.job_type.is_some()
+            || self.command.is_some()
+            || self.ding
             || !self.pty.is_empty()
             || !self.exec.is_empty()
     }
 
     /// Lower into an [`AgentSpec`], with `identity`/`host` resolved from the path when content omits them.
-    pub(crate) fn into_agent_spec(self, identity: String, host: Option<String>, path: PathBuf) -> AgentSpec {
+    pub(crate) fn into_agent_spec(
+        self,
+        identity: String,
+        host: Option<String>,
+        path: PathBuf,
+    ) -> AgentSpec {
+        let bus_id = format!("{}.{}", host.as_deref().unwrap_or_default(), identity)
+            .trim_start_matches('.')
+            .to_string();
         let mut tasks: Vec<Task> = Vec::new();
         for (name, t) in self.pty {
-            tasks.push(t.lower(TaskKind::Pty, name));
+            tasks.push(t.lower(TaskKind::Pty, name, &self.env));
         }
         for (name, t) in self.exec {
-            tasks.push(t.lower(TaskKind::Exec, name));
+            tasks.push(t.lower(TaskKind::Exec, name, &self.env));
+        }
+        if let Some(command) = self.command {
+            let mut tags = BTreeMap::new();
+            tags.insert("role".to_string(), "agent".to_string());
+            tasks.push(Task {
+                kind: TaskKind::Pty,
+                name: "agent".to_string(),
+                // An agent IS its pty: ding defaults its poke target to this same bus id.
+                id: Some(bus_id.clone()),
+                command: Some(command),
+                cwd: None,
+                tags,
+                env: self.env.clone(),
+                keep: false,
+            });
+        }
+        if self.ding {
+            tasks.push(Task {
+                kind: TaskKind::Exec,
+                name: "ding".to_string(),
+                id: Some(format!("{bus_id}.ding")),
+                command: Some(format!("st2 ding --identity {bus_id} --root $ST_ROOT")),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: self.env,
+                keep: false,
+            });
         }
         tasks.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -262,7 +320,14 @@ impl RawSpec {
 }
 
 impl RawTask {
-    pub(crate) fn lower(self, kind: TaskKind, name: String) -> Task {
+    pub(crate) fn lower(
+        self,
+        kind: TaskKind,
+        name: String,
+        inherited_env: &BTreeMap<String, String>,
+    ) -> Task {
+        let mut env = inherited_env.clone();
+        env.extend(self.env);
         Task {
             kind,
             name,
@@ -270,7 +335,7 @@ impl RawTask {
             command: self.command,
             cwd: self.cwd,
             tags: self.tags,
-            env: self.env,
+            env,
             keep: self.keep,
         }
     }

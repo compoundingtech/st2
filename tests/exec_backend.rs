@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ fn exec_target(id: &str, command: &str) -> TaskTarget {
 }
 
 /// tty_nr from /proc/<pid>/stat (0 == no controlling terminal).
+#[cfg(target_os = "linux")]
 fn tty_nr(pid: i32) -> Option<i64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm (field 2) is parenthesized and may contain spaces — split after the last ')'.
@@ -135,7 +137,20 @@ fn exec_auto_logs_stdout_and_stderr_to_catalog_logs() {
     backend.remove(id).ok();
 }
 
+/// macOS has no `/proc`; `ps` prints `??` when a process has no controlling terminal.
+#[cfg(target_os = "macos")]
+fn tty_nr(pid: i32) -> Option<i64> {
+    let output = Command::new("ps")
+        .args(["-o", "tty=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let tty = String::from_utf8_lossy(&output.stdout);
+    let tty = tty.trim();
+    Some(i64::from(!matches!(tty, "" | "?" | "??")))
+}
+
 /// The process-group field (2) of `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
 fn pgrp(pid: i32) -> Option<i32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after = stat.rsplit_once(") ")?.1;
@@ -143,6 +158,7 @@ fn pgrp(pid: i32) -> Option<i32> {
 }
 
 /// Every live pid whose process group is `pgid` (== the setsid leader's pid for an exec task).
+#[cfg(target_os = "linux")]
 fn group_members(pgid: i32) -> Vec<i32> {
     let mut out = Vec::new();
     for e in fs::read_dir("/proc").unwrap().flatten() {
@@ -153,6 +169,23 @@ fn group_members(pgid: i32) -> Vec<i32> {
         }
     }
     out
+}
+
+#[cfg(target_os = "macos")]
+fn group_members(pgid: i32) -> Vec<i32> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,pgid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<i32>().ok()?;
+            let candidate = fields.next()?.parse::<i32>().ok()?;
+            (candidate == pgid).then_some(pid)
+        })
+        .collect()
 }
 
 /// Teardown must reap the WHOLE task, not just the recorded leader: a `sh -c` wrapper (dash forks a

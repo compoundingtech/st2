@@ -32,7 +32,10 @@ pub struct ExecBackend {
 
 impl ExecBackend {
     pub fn new(state_dir: PathBuf, catalog_root: PathBuf) -> Self {
-        Self { state_dir, catalog_root }
+        Self {
+            state_dir,
+            catalog_root,
+        }
     }
 
     fn pid_path(&self, id: &str) -> PathBuf {
@@ -54,25 +57,43 @@ impl ExecBackend {
         if let Some(parent) = log_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let log = fs::File::options().create(true).append(true).open(&log_file)?;
+        let log = fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&log_file)?;
 
         // Spawn the task into its own isolation domain (R21b): on systemd Linux, its own transient
         // scope (own cgroup, sibling of the transport unit) so a transport/supervisor cgroup-cascade
         // kill cannot take it; elsewhere a plain pass-through detached by the `setsid` below. Env, cwd,
         // and stdio set here reach the task in both modes.
         let unit = crate::isolate::scope_unit(&target.pty_id);
-        let mut cmd = crate::isolate::wrap(&unit, OsStr::new("sh"), &[OsStr::new("-c"), OsStr::new(&target.command)]);
+        let mut cmd = crate::isolate::wrap(
+            &unit,
+            OsStr::new("sh"),
+            &[OsStr::new("-c"), OsStr::new(&target.command)],
+        );
         cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
-            .env("CATALOG", &self.catalog_root);
+            .env("CATALOG", &self.catalog_root)
+            .env("ST_ROOT", &self.catalog_root)
+            .env(
+                "PTY_ROOT",
+                crate::run::effective_pty_root(&self.catalog_root),
+            );
+        if let Ok(path) = crate::hooks::hooks_dir() {
+            cmd.env("ST_HOOKS", path);
+        }
         for (k, v) in &target.env {
             // PTY_ROOT resolves to the EFFECTIVE root (an exported ambient one wins over the rendered
             // `$CATALOG/pty`) so a ding — an exec task that reads PTY_ROOT to find the pty it pokes —
             // targets the same partition st2's pty ops use.
             if k == "PTY_ROOT" {
-                cmd.env("PTY_ROOT", crate::run::effective_pty_root(&self.catalog_root));
+                cmd.env(
+                    "PTY_ROOT",
+                    crate::run::effective_pty_root(&self.catalog_root),
+                );
             } else {
                 cmd.env(k, crate::expand::expand_catalog(v, &self.catalog_root));
             }
@@ -108,8 +129,12 @@ impl ExecBackend {
             if path.extension().and_then(|e| e.to_str()) != Some("pid") {
                 continue;
             }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            let Some(pid) = fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok())
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(pid) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
             else {
                 continue;
             };
@@ -118,7 +143,11 @@ impl ExecBackend {
                 let mut status = 0;
                 libc::waitpid(pid, &mut status, libc::WNOHANG);
             }
-            out.push(Session { pty_id: id.to_string(), alive: process_alive(pid), exit_code: None });
+            out.push(Session {
+                pty_id: id.to_string(),
+                alive: process_alive(pid),
+                exit_code: None,
+            });
         }
         Ok(out)
     }
@@ -155,6 +184,8 @@ impl ExecBackend {
     fn read_pid(&self, id: &str) -> anyhow::Result<i32> {
         let raw = fs::read_to_string(self.pid_path(id))
             .map_err(|e| anyhow::anyhow!("reading pid for exec '{id}': {e}"))?;
-        raw.trim().parse::<i32>().map_err(|_| anyhow::anyhow!("bad pid file for exec '{id}'"))
+        raw.trim()
+            .parse::<i32>()
+            .map_err(|_| anyhow::anyhow!("bad pid file for exec '{id}'"))
     }
 }

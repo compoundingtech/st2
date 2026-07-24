@@ -64,10 +64,18 @@ agent "fabric-claude" {
 #[test]
 fn parses_full_kdl_service_job() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/silber/fabric-claude/agent.kdl", FULL_KDL);
+    write(
+        tmp.path(),
+        "agents/silber/fabric-claude/agent.kdl",
+        FULL_KDL,
+    );
 
     let found = discover(tmp.path());
-    assert!(found.errors.is_empty(), "unexpected errors: {:?}", found.errors);
+    assert!(
+        found.errors.is_empty(),
+        "unexpected errors: {:?}",
+        found.errors
+    );
     assert_eq!(found.specs.len(), 1);
     let s = &found.specs[0];
 
@@ -92,7 +100,10 @@ fn parses_full_kdl_service_job() {
     assert_eq!(agent.id.as_deref(), Some("silber.fabric-claude"));
     assert!(agent.command.as_deref().unwrap().starts_with("exec claude"));
     assert_eq!(agent.tags.get("role").map(String::as_str), Some("agent"));
-    assert_eq!(agent.env.get("ST_ROOT").map(String::as_str), Some("$CATALOG/smalltalk"));
+    assert_eq!(
+        agent.env.get("ST_ROOT").map(String::as_str),
+        Some("$CATALOG/smalltalk")
+    );
 
     let ding = s.tasks.iter().find(|t| t.name == "ding").unwrap();
     assert_eq!(ding.kind, TaskKind::Exec);
@@ -100,6 +111,75 @@ fn parses_full_kdl_service_job() {
     assert!(ding.command.as_deref().unwrap().starts_with("st ding"));
 
     assert!(s.is_runnable());
+}
+
+#[test]
+fn compact_agent_command_and_ding_lower_to_native_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/Silber/cos/agent.kdl",
+        r#"
+agent "cos" {
+  host "Silber"
+  workspace "/Volumes/SSD/src/github.com/myobie/cos"
+  env { ST_AGENT "Silber.cos" }
+  command "exec codex boot"
+  ding
+}
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(
+        found.errors.is_empty(),
+        "unexpected errors: {:?}",
+        found.errors
+    );
+    let spec = &found.specs[0];
+    assert_eq!(spec.tasks.len(), 2);
+
+    let agent = spec.tasks.iter().find(|t| t.name == "agent").unwrap();
+    assert_eq!(agent.kind, TaskKind::Pty);
+    assert_eq!(agent.id.as_deref(), Some("Silber.cos"));
+    assert_eq!(agent.command.as_deref(), Some("exec codex boot"));
+    assert_eq!(
+        agent.env.get("ST_AGENT").map(String::as_str),
+        Some("Silber.cos")
+    );
+
+    let ding = spec.tasks.iter().find(|t| t.name == "ding").unwrap();
+    assert_eq!(ding.kind, TaskKind::Exec);
+    assert_eq!(ding.id.as_deref(), Some("Silber.cos.ding"));
+    assert_eq!(
+        ding.command.as_deref(),
+        Some("st2 ding --identity Silber.cos --root $ST_ROOT")
+    );
+    assert_eq!(
+        ding.env.get("ST_AGENT").map(String::as_str),
+        Some("Silber.cos")
+    );
+}
+
+#[test]
+fn compact_and_explicit_agent_task_forms_cannot_be_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/ambiguous/agent.kdl",
+        r#"agent "ambiguous" {
+  host "hetz"
+  command "compact"
+  pty "agent" { command "explicit" }
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert_eq!(found.errors.len(), 1);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("declares both compact `command`")
+    );
 }
 
 #[test]
@@ -133,8 +213,14 @@ command = "st ding hetz.fetcher"
     assert_eq!(s.job_type, JobType::Service);
     assert_eq!(s.restart.clone().unwrap().mode, st2::RestartMode::Delay);
     assert_eq!(s.tasks.len(), 2);
-    assert_eq!(s.tasks.iter().find(|t| t.name == "agent").unwrap().kind, TaskKind::Pty);
-    assert_eq!(s.tasks.iter().find(|t| t.name == "ding").unwrap().kind, TaskKind::Exec);
+    assert_eq!(
+        s.tasks.iter().find(|t| t.name == "agent").unwrap().kind,
+        TaskKind::Pty
+    );
+    assert_eq!(
+        s.tasks.iter().find(|t| t.name == "ding").unwrap().kind,
+        TaskKind::Exec
+    );
 }
 
 #[test]
@@ -156,7 +242,11 @@ fn parses_json_service_job() {
 #[test]
 fn type_defaults_to_service() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/svc/agent.toml", "identity=\"svc\"\n[pty.agent]\ncommand=\"x\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/svc/agent.toml",
+        "identity=\"svc\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
 
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
@@ -167,7 +257,11 @@ fn type_defaults_to_service() {
 fn path_supplies_identity_and_host_when_content_omits_them() {
     let tmp = tempfile::tempdir().unwrap();
     let minimal = "type \"service\"\npty \"agent\" { command \"exec claude 'boot'\" }";
-    write(tmp.path(), "agents/hetz/st2-claude/agent.kdl", &format!("agent {{\n{minimal}\n}}"));
+    write(
+        tmp.path(),
+        "agents/hetz/st2-claude/agent.kdl",
+        &format!("agent {{\n{minimal}\n}}"),
+    );
 
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
@@ -195,15 +289,28 @@ command = "exec claude 'boot'"
     assert_eq!(s.identity, "real-name");
     assert_eq!(s.host.as_deref(), Some("real-host"));
     assert_eq!(found.warnings.len(), 2);
-    assert!(found.warnings.iter().any(|w| w.contains("identity mismatch")));
+    assert!(
+        found
+            .warnings
+            .iter()
+            .any(|w| w.contains("identity mismatch"))
+    );
     assert!(found.warnings.iter().any(|w| w.contains("host mismatch")));
 }
 
 #[test]
 fn malformed_file_is_collected_as_error_and_does_not_halt_the_walk() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/good/agent.toml", "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/hetz/bad/agent.toml", "identity = \"broken\"\nthis is not valid =");
+    write(
+        tmp.path(),
+        "agents/hetz/good/agent.toml",
+        "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/bad/agent.toml",
+        "identity = \"broken\"\nthis is not valid =",
+    );
 
     let found = discover(tmp.path());
     assert_eq!(found.specs.len(), 1);
@@ -215,7 +322,11 @@ fn malformed_file_is_collected_as_error_and_does_not_halt_the_walk() {
 #[test]
 fn malformed_kdl_is_collected_as_error() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/bad/agent.kdl", "agent \"broken\" { this is { not valid");
+    write(
+        tmp.path(),
+        "agents/hetz/bad/agent.kdl",
+        "agent \"broken\" { this is { not valid",
+    );
     let found = discover(tmp.path());
     assert!(found.specs.is_empty());
     assert_eq!(found.errors.len(), 1);
@@ -225,8 +336,16 @@ fn malformed_kdl_is_collected_as_error() {
 #[test]
 fn non_spec_files_are_skipped_silently() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/x/package.json", r#"{"name":"x","version":"1.0.0"}"#);
-    write(tmp.path(), "agents/hetz/x/agent.toml", "identity=\"x\"\n[pty.agent]\ncommand=\"c\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/x/package.json",
+        r#"{"name":"x","version":"1.0.0"}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/x/agent.toml",
+        "identity=\"x\"\n[pty.agent]\ncommand=\"c\"\n",
+    );
 
     let found = discover(tmp.path());
     assert_eq!(found.specs.len(), 1, "only the real job, not package.json");
@@ -257,7 +376,11 @@ command = "exec claude 'boot'"
     write(tmp.path(), "agents/hetz/rendered/agent.toml", toml);
 
     let found = discover(tmp.path());
-    assert!(found.errors.is_empty(), "render-only fields must not error: {:?}", found.errors);
+    assert!(
+        found.errors.is_empty(),
+        "render-only fields must not error: {:?}",
+        found.errors
+    );
     assert_eq!(found.specs.len(), 1);
     assert_eq!(found.specs[0].tasks.len(), 1);
 }
@@ -265,7 +388,11 @@ command = "exec claude 'boot'"
 #[test]
 fn unrendered_job_without_command_is_flagged_not_runnable() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/needs-render/agent.toml", "identity=\"needs-render\"\ntype=\"service\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/needs-render/agent.toml",
+        "identity=\"needs-render\"\ntype=\"service\"\n",
+    );
     let found = discover(tmp.path());
     assert_eq!(found.specs.len(), 1);
     assert!(!found.specs[0].is_runnable());
@@ -313,10 +440,18 @@ fn nonexistent_root_yields_empty_not_error() {
 #[test]
 fn hidden_runner_state_and_resources_are_ignored() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/a/agent.toml", "identity=\"a\"\n[pty.agent]\ncommand=\"x\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/a/agent.toml",
+        "identity=\"a\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
     // dot-prefixed runner state (R03) + a resource message — neither is a spec.
     write(tmp.path(), ".st2.hetz.lock", "12345");
-    write(tmp.path(), "agents/hetz/a/resources/inbox/1784-abc.md", "a message");
+    write(
+        tmp.path(),
+        "agents/hetz/a/resources/inbox/1784-abc.md",
+        "a message",
+    );
 
     let found = discover(tmp.path());
     assert_eq!(found.specs.len(), 1);

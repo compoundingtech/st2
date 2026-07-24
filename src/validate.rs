@@ -60,10 +60,22 @@ pub struct Issue {
 
 impl Issue {
     fn error(code: &'static str, path: String, agent: Option<String>, message: String) -> Self {
-        Issue { severity: Severity::Error, code, path, agent, message }
+        Issue {
+            severity: Severity::Error,
+            code,
+            path,
+            agent,
+            message,
+        }
     }
     fn warn(code: &'static str, path: String, agent: Option<String>, message: String) -> Self {
-        Issue { severity: Severity::Warn, code, path, agent, message }
+        Issue {
+            severity: Severity::Warn,
+            code,
+            path,
+            agent,
+            message,
+        }
     }
 }
 
@@ -77,10 +89,16 @@ pub struct Report {
 
 impl Report {
     pub fn errors(&self) -> usize {
-        self.issues.iter().filter(|i| i.severity == Severity::Error).count()
+        self.issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error)
+            .count()
     }
     pub fn warnings(&self) -> usize {
-        self.issues.iter().filter(|i| i.severity == Severity::Warn).count()
+        self.issues
+            .iter()
+            .filter(|i| i.severity == Severity::Warn)
+            .count()
     }
 }
 
@@ -95,7 +113,10 @@ pub fn validate(root: &Path) -> Report {
     // 1. Files that looked like specs but did not parse/resolve — discovery already caught these.
     for e in &d.errors {
         let (code, message) = if e.message.contains("no identity") {
-            ("no-identity", "spec has no identity in content or path".to_string())
+            (
+                "no-identity",
+                "spec has no identity in content or path".to_string(),
+            )
         } else {
             ("parse-error", e.message.clone())
         };
@@ -148,7 +169,11 @@ pub fn validate(root: &Path) -> Report {
                 "dup-id",
                 rp.clone(),
                 ag.clone(),
-                format!("duplicate agent id '{}' (also declared in {})", bid, rel(root, &prev)),
+                format!(
+                    "duplicate agent id '{}' (also declared in {})",
+                    bid,
+                    rel(root, &prev)
+                ),
             ));
         }
 
@@ -161,7 +186,10 @@ pub fn validate(root: &Path) -> Report {
                 "id-path-mismatch",
                 rp.clone(),
                 ag.clone(),
-                format!("identity '{}' differs from folder '{pid}' (content wins)", s.identity),
+                format!(
+                    "identity '{}' differs from folder '{pid}' (content wins)",
+                    s.identity
+                ),
             ));
         }
         if let (Some(h), Some(ph)) = (&s.host, &path_host)
@@ -208,9 +236,20 @@ pub fn validate(root: &Path) -> Report {
 
         // Overlay lint: render's persona overlay `@import`s must resolve (WARN — render concern).
         issues.extend(overlay_lint(&rp, &ag, s));
+
+        // Declarative render is a pre-boot gate: malformed directives, unsafe destinations, or a
+        // missing catalog-owned copy source would prevent this agent from booting.
+        if let Err(error) =
+            crate::materialize::validate_agent(root, s, s.host.as_deref().unwrap_or(""))
+        {
+            issues.push(Issue::error("render-error", rp, ag, format!("{error:#}")));
+        }
     }
 
-    Report { issues, agents: d.specs.len() }
+    Report {
+        issues,
+        agents: d.specs.len(),
+    }
 }
 
 /// Catalog-relative display path, falling back to the full path.
@@ -238,7 +277,9 @@ fn path_fields(s: &AgentSpec) -> Vec<(String, String)> {
 /// final-spec paths are absolute or $CATALOG-rooted, never relative) and must exist.
 fn check_path(root: &Path, rp: &str, ag: &Option<String>, field: &str, raw: &str) -> Option<Issue> {
     let root_s = root.to_string_lossy();
-    let expanded = raw.replace("${CATALOG}", &root_s).replace("$CATALOG", &root_s);
+    let expanded = raw
+        .replace("${CATALOG}", &root_s)
+        .replace("$CATALOG", &root_s);
     if expanded.contains('$') {
         return None; // another variable — cannot resolve without runtime env; do not guess
     }
@@ -248,7 +289,9 @@ fn check_path(root: &Path, rp: &str, ag: &Option<String>, field: &str, raw: &str
             "bad-path",
             rp.to_string(),
             ag.clone(),
-            format!("{field} '{raw}' is relative (final-spec paths must be absolute or $CATALOG-rooted)"),
+            format!(
+                "{field} '{raw}' is relative (final-spec paths must be absolute or $CATALOG-rooted)"
+            ),
         ));
     }
     if !p.exists() {
@@ -257,7 +300,12 @@ fn check_path(root: &Path, rp: &str, ag: &Option<String>, field: &str, raw: &str
         // on the host running `validate` — a nix build gate legitimately validates a catalog whose
         // workspace is cloned on a different run host — so that is advisory (WARN), not a failure.
         return Some(if p.starts_with(root) {
-            Issue::error("bad-path", rp.to_string(), ag.clone(), format!("{field} '{raw}' does not exist"))
+            Issue::error(
+                "bad-path",
+                rp.to_string(),
+                ag.clone(),
+                format!("{field} '{raw}' does not exist"),
+            )
         } else {
             Issue::warn(
                 "bad-path",
@@ -325,7 +373,9 @@ fn overlay_lint(rp: &str, ag: &Option<String>, s: &AgentSpec) -> Vec<Issue> {
         if rule.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let Ok(body) = fs::read_to_string(&rule) else { continue };
+        let Ok(body) = fs::read_to_string(&rule) else {
+            continue;
+        };
         for line in body.lines() {
             let line = line.trim();
             if let Some(target) = line.strip_prefix('@')
@@ -338,7 +388,10 @@ fn overlay_lint(rp: &str, ag: &Option<String>, s: &AgentSpec) -> Vec<Issue> {
                         "dangling-import",
                         rp.to_string(),
                         ag.clone(),
-                        format!("overlay {} imports '{target}', which does not exist", rule.display()),
+                        format!(
+                            "overlay {} imports '{target}', which does not exist",
+                            rule.display()
+                        ),
                     ));
                 }
             }

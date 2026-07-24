@@ -15,10 +15,12 @@
 //! now a safe thing to install.
 
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
-    process::Command,
 };
+
+#[cfg(target_os = "linux")]
+use std::{fs, process::Command};
 
 use anyhow::{Context, Result, bail};
 

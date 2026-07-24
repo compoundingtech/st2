@@ -29,6 +29,7 @@ const HARNESS_SUFFIXES: &[&str] = &["-claude", "-codex", "-opencode", "-pi"];
 /// rendered agent reads identical operating instructions (behavior-neutral). The neutrality test
 /// diffs this against convoy's fresh render; a drift there means update this vendored copy.
 const DING_BUS_MD: &str = include_str!("../templates/DING-BUS.md");
+const BUS_ST2_MD: &str = include_str!("../templates/bus.st2.md");
 
 /// A parsed IR agent declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,22 +108,74 @@ impl IrAgent {
     /// the standing posture for every role; the model rides through verbatim (no alias translation).
     pub fn agent_command(&self) -> anyhow::Result<String> {
         let boot = boot_prompt(&self.role);
-        let model = self.model.as_deref().map(|m| format!(" --model '{m}'")).unwrap_or_default();
+        let model = self
+            .model
+            .as_deref()
+            .map(|m| format!(" --model '{m}'"))
+            .unwrap_or_default();
         // Extra harness args (e.g. `--plugin-dir <dir>`) go BEFORE the boot prompt, shell-quoted so a
         // path with spaces/metacharacters stays one argv token. Empty → byte-neutral with convoy.
-        let extra: String = self.extra_args.iter().map(|a| format!(" {}", shell_single_quote(a))).collect();
+        let extra: String = self
+            .extra_args
+            .iter()
+            .map(|a| format!(" {}", shell_single_quote(a)))
+            .collect();
         match self.harness.as_str() {
-            "claude" => Ok(format!("exec claude --permission-mode bypassPermissions{model}{extra} '{boot}'")),
+            "claude" => Ok(format!(
+                "exec claude --permission-mode bypassPermissions{model}{extra} '{boot}'"
+            )),
             // codex takes no --permission-mode; it uses bypass-approvals+sandbox instead.
-            "codex" => Ok(format!("exec codex --dangerously-bypass-approvals-and-sandbox{model}{extra} '{boot}'")),
-            other => anyhow::bail!("render: harness '{other}' not supported yet (M3.1: claude, codex)"),
+            "codex" => Ok(format!(
+                "exec codex --dangerously-bypass-approvals-and-sandbox{model}{extra} '{boot}'"
+            )),
+            other => {
+                anyhow::bail!("render: harness '{other}' not supported yet (M3.1: claude, codex)")
+            }
         }
     }
 
     /// The `exec "ding"` command — `st ding` on the smalltalk bus (behavior-neutral; the native
     /// `st2 ding` / unified-inbox cutover is M6). `$CATALOG` is expanded by st2 at spawn.
     pub fn ding_command(&self) -> String {
-        format!("st ding {} --identity {} --root $CATALOG/smalltalk", self.session_id(), self.bus_id())
+        format!(
+            "st ding {} --identity {} --root $CATALOG/smalltalk",
+            self.session_id(),
+            self.bus_id()
+        )
+    }
+
+    /// Native compact-catalog harness command. Codex hook trust is explicitly bypassed because the
+    /// project hook file is generated from st2-owned declarations and scripts for unattended seats.
+    pub fn native_agent_command(&self) -> anyhow::Result<String> {
+        let boot = if self.role == "chief-of-staff" {
+            "You just cold-started. Read AGENTS.md and run your st2 boot ritual now: set status available and drain your inbox. Resume durable context if present, then stand by for work delivered via ding."
+        } else {
+            "You just cold-started. Run your st2 boot ritual now: set status available and drain your inbox. Resume durable context if present, then stand by for work delivered via ding."
+        };
+        let model = self
+            .model
+            .as_deref()
+            .map(|model| format!(" --model {}", shell_single_quote(model)))
+            .unwrap_or_default();
+        let extra: String = self
+            .extra_args
+            .iter()
+            .map(|arg| format!(" {}", shell_single_quote(arg)))
+            .collect();
+        match self.harness.as_str() {
+            "claude" => Ok(format!(
+                "exec claude --permission-mode bypassPermissions{model}{extra} {}",
+                shell_single_quote(boot)
+            )),
+            "codex" => Ok(format!(
+                "exec codex --dangerously-bypass-approvals-and-sandbox \
+                 --dangerously-bypass-hook-trust{model}{extra} {}",
+                shell_single_quote(boot)
+            )),
+            other => anyhow::bail!(
+                "compile-agent: harness '{other}' is not supported (expected claude or codex)"
+            ),
+        }
     }
 }
 
@@ -143,7 +196,11 @@ fn agent_short(identity: &str) -> &str {
 }
 
 fn boot_prompt(role: &str) -> &'static str {
-    if role == "chief-of-staff" { BOOT_COS } else { BOOT_WORKER }
+    if role == "chief-of-staff" {
+        BOOT_COS
+    } else {
+        BOOT_WORKER
+    }
 }
 
 /// Parse an IR document (KDL) into its agent declarations. A `permissions{}` child is ignored (M3.2).
@@ -160,8 +217,15 @@ pub fn parse_ir(text: &str) -> anyhow::Result<Vec<IrAgent>> {
             .map(String::from)
             .ok_or_else(|| anyhow::anyhow!("IR: an `agent` node needs a name (the identity)"))?;
 
-        let (mut host, mut role, mut harness, mut model, mut persona, mut workspace, mut supervisor) =
-            (None, None, None, None, None, None, None);
+        let (
+            mut host,
+            mut role,
+            mut harness,
+            mut model,
+            mut persona,
+            mut workspace,
+            mut supervisor,
+        ) = (None, None, None, None, None, None, None);
         let mut permissions = None;
         if let Some(children) = node.children() {
             for c in children.nodes() {
@@ -180,7 +244,9 @@ pub fn parse_ir(text: &str) -> anyhow::Result<Vec<IrAgent>> {
             }
         }
         let need = |f: Option<String>, name: &str| {
-            f.ok_or_else(|| anyhow::anyhow!("IR agent '{identity}': missing required field `{name}`"))
+            f.ok_or_else(|| {
+                anyhow::anyhow!("IR agent '{identity}': missing required field `{name}`")
+            })
         };
         let role = need(role, "role")?;
         // persona defaults to the role's persona file when unspecified (convoy: baseFile(role)).
@@ -203,8 +269,13 @@ pub fn parse_ir(text: &str) -> anyhow::Result<Vec<IrAgent>> {
 
 /// Parse a `permissions{}` block. `spawn` defaults to `true` (allowed).
 fn parse_permissions(node: &kdl::KdlNode) -> IrPermissions {
-    let mut p = IrPermissions { spawn: true, ..Default::default() };
-    let Some(children) = node.children() else { return p };
+    let mut p = IrPermissions {
+        spawn: true,
+        ..Default::default()
+    };
+    let Some(children) = node.children() else {
+        return p;
+    };
     for c in children.nodes() {
         match c.name().value() {
             "tools" => {
@@ -232,7 +303,10 @@ fn parse_permissions(node: &kdl::KdlNode) -> IrPermissions {
                             .find(|n| n.name().value() == "scope-repo")
                             .and_then(|n| n.get(0).and_then(|v| v.as_string()).map(String::from))
                     });
-                    p.shims.push(Shim { name: name.to_string(), scope_repo });
+                    p.shims.push(Shim {
+                        name: name.to_string(),
+                        scope_repo,
+                    });
                 }
             }
             _ => {}
@@ -257,7 +331,12 @@ fn path_scopes(node: &kdl::KdlNode) -> Vec<String> {
         return args;
     }
     node.children()
-        .map(|ch| ch.nodes().iter().map(|n| n.name().value().to_string()).collect())
+        .map(|ch| {
+            ch.nodes()
+                .iter()
+                .map(|n| n.name().value().to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -316,6 +395,171 @@ fn kdl_raw(s: &str) -> String {
     format!("#\"{s}\"#")
 }
 
+fn kdl_multiline_raw(s: &str) -> String {
+    format!("#\"\"\"\n{s}\n\"\"\"#")
+}
+
+fn native_hook_json(harness: &str) -> serde_json::Value {
+    match harness {
+        "codex" => serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "$ST_HOOKS/codex-session-start.sh",
+                        "timeout": 5,
+                        "statusMessage": "Restoring st2 context"
+                    }]
+                }],
+                "PreCompact": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "$ST_HOOKS/codex-pre-compact.sh",
+                        "timeout": 5,
+                        "statusMessage": "Checkpointing st2 context"
+                    }]
+                }],
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "$ST_HOOKS/codex-stop.sh",
+                        "timeout": 5
+                    }]
+                }]
+            }
+        }),
+        "claude" => serde_json::json!({
+            "$schema": "https://json.schemastore.org/claude-code-settings.json",
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "async": true,
+                        "asyncRewake": true,
+                        "command": "$ST_HOOKS/claude-session-start.sh"
+                    }]
+                }],
+                "PreCompact": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "$ST_HOOKS/claude-pre-compact.sh"
+                    }]
+                }],
+                "StopFailure": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "$ST_HOOKS/claude-stop-failure.sh"
+                    }]
+                }]
+            }
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Emit the blessed compact catalog format for one agent. This is GENERATE-only: templates and
+/// `agent.kdl` are written into the catalog, while the workspace remains untouched until
+/// `st2 up --materialize-only` or a real `st2 up` executes the render block.
+pub fn compile_agent(
+    ir: &IrAgent,
+    catalog_root: &Path,
+    persona_file: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    if !matches!(ir.harness.as_str(), "claude" | "codex") {
+        anyhow::bail!(
+            "compile-agent: harness '{}' is not supported (expected claude or codex)",
+            ir.harness
+        );
+    }
+    let persona = fs::read_to_string(persona_file).map_err(|error| {
+        anyhow::anyhow!(
+            "reading persona {} for '{}': {error}",
+            persona_file.display(),
+            ir.identity
+        )
+    })?;
+
+    let templates = catalog_root.join("_templates");
+    fs::create_dir_all(&templates)?;
+    let prefix = format!("{}.{}", ir.host, ir.identity);
+    let persona_name = format!("{prefix}.persona.md");
+    let agents_name = format!("{prefix}.AGENTS.md");
+    let bus_name = "bus.st2.md";
+    fs::write(templates.join(&persona_name), &persona)?;
+    fs::write(templates.join(bus_name), BUS_ST2_MD)?;
+    if ir.harness == "codex" {
+        let mut agents = persona;
+        if !agents.ends_with('\n') {
+            agents.push('\n');
+        }
+        agents.push_str("\n---\n\n");
+        agents.push_str(BUS_ST2_MD);
+        fs::write(templates.join(&agents_name), agents)?;
+    }
+
+    let command = ir.native_agent_command()?;
+    let hooks = serde_json::to_string_pretty(&native_hook_json(&ir.harness))?;
+    let mut kdl = String::new();
+    kdl.push_str("// Generated by `st2 compile-agent`. Edit the source/persona and recompile.\n");
+    kdl.push_str(&format!("agent {} {{\n", kdl_str(&ir.identity)));
+    kdl.push_str(&format!("  host {}\n", kdl_str(&ir.host)));
+    kdl.push_str(&format!("  workspace {}\n", kdl_str(&ir.workspace)));
+    if let Some(supervisor) = &ir.supervisor {
+        kdl.push_str(&format!("  supervisor {}\n", kdl_str(supervisor)));
+    }
+    kdl.push_str("  env {\n");
+    kdl.push_str(&format!("    ST_AGENT {}\n", kdl_str(&ir.bus_id())));
+    if let Some(supervisor) = &ir.supervisor {
+        kdl.push_str(&format!("    ST_SUPERVISOR {}\n", kdl_str(supervisor)));
+    }
+    kdl.push_str("  }\n");
+    kdl.push_str(&format!("  command {}\n", kdl_raw(&command)));
+    kdl.push_str("  ding\n\n");
+    kdl.push_str("  render {\n");
+    if ir.harness == "codex" {
+        kdl.push_str(&format!(
+            "    copy {} \"AGENTS.md\"\n",
+            kdl_str(&format!("_templates/{agents_name}"))
+        ));
+        kdl.push_str(&format!(
+            "    json-upsert \".codex/hooks.json\" {}\n",
+            kdl_multiline_raw(&hooks)
+        ));
+        kdl.push_str("    git-exclude \"AGENTS.md\" \".codex/hooks.json\"\n");
+    } else {
+        kdl.push_str(&format!(
+            "    copy {} \".st2/PERSONA.md\"\n",
+            kdl_str(&format!("_templates/{persona_name}"))
+        ));
+        kdl.push_str(&format!(
+            "    copy {} \".st2/bus.md\"\n",
+            kdl_str(&format!("_templates/{bus_name}"))
+        ));
+        kdl.push_str("    ensure-line \".claude/rules/st2.md\" \"@../../.st2/PERSONA.md\"\n");
+        kdl.push_str("    ensure-line \".claude/rules/st2.md\" \"@../../.st2/bus.md\"\n");
+        kdl.push_str(&format!(
+            "    json-upsert \".claude/settings.local.json\" {}\n",
+            kdl_multiline_raw(&hooks)
+        ));
+        kdl.push_str(
+            "    git-exclude \".st2/\" \".claude/rules/st2.md\" \".claude/settings.local.json\"\n",
+        );
+    }
+    kdl.push_str("  }\n");
+    kdl.push_str("}\n");
+
+    let agent_dir = catalog_root
+        .join("agents")
+        .join(&ir.host)
+        .join(&ir.identity);
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(agent_dir.join("agent.kdl"), kdl)?;
+    for kind in ["inbox", "archive", "context", "links"] {
+        fs::create_dir_all(agent_dir.join("resources").join(kind))?;
+    }
+    Ok(agent_dir)
+}
+
 /// The PreToolUse tool-gate hook template. `__ALLOW__`/`__DENY__` are replaced with this agent's
 /// space-separated tool lists. It BLOCKS a disallowed tool via `permissionDecision: deny` — which
 /// blocks WITHOUT prompting, so an autonomous `bypassPermissions` agent never hangs — and records
@@ -347,7 +591,9 @@ exit 0
 
 /// Bake this agent's allow/deny tool lists into the PreToolUse gate hook.
 fn render_permissions_hook(allow: &[String], deny: &[String]) -> String {
-    PERM_HOOK_TEMPLATE.replace("__ALLOW__", &allow.join(" ")).replace("__DENY__", &deny.join(" "))
+    PERM_HOOK_TEMPLATE
+        .replace("__ALLOW__", &allow.join(" "))
+        .replace("__DENY__", &deny.join(" "))
 }
 
 /// A minimal `.claude/settings.json` that ONLY registers the PreToolUse hook — no `permissions`
@@ -418,7 +664,10 @@ fn write_persona_overlay(ir: &IrAgent, personas_dir: &Path) -> anyhow::Result<()
     fs::create_dir_all(&claude_dir)?;
     match resolve_smalltalk_hooks() {
         Some((st_bin, hooks)) => {
-            fs::write(claude_dir.join("settings.local.json"), render_settings_local_json(&st_bin, &hooks))?;
+            fs::write(
+                claude_dir.join("settings.local.json"),
+                render_settings_local_json(&st_bin, &hooks),
+            )?;
         }
         None => eprintln!(
             "st2 render: `st` not on PATH — skipping settings.local.json boot hooks for '{}'",
@@ -442,7 +691,11 @@ fn write_persona_overlay(ir: &IrAgent, personas_dir: &Path) -> anyhow::Result<()
     }
     fs::write(&loader, content)?;
 
-    let mut excludes = vec![".convoy/", ".claude/rules/convoy.md", ".claude/settings.local.json"];
+    let mut excludes = vec![
+        ".convoy/",
+        ".claude/rules/convoy.md",
+        ".claude/settings.local.json",
+    ];
     // Codex reads AGENTS.md from cwd — it does NOT load `.claude/rules` or `.convoy/PERSONA.md`. So a
     // codex seat gets its brief ONLY via AGENTS.md: install the composed persona there, VERBATIM (the
     // `--persona` contract that preserves the eval's SHA-pinned composition byte-for-byte). The claude
@@ -477,7 +730,10 @@ fn write_permissions_overlay(ir: &IrAgent, p: &IrPermissions) -> anyhow::Result<
     fs::write(&hook_path, render_permissions_hook(&p.tools_allow, &deny))?;
     set_executable(&hook_path);
 
-    fs::write(ws.join(".claude").join("settings.json"), render_settings_json(&hook_path.to_string_lossy()))?;
+    fs::write(
+        ws.join(".claude").join("settings.json"),
+        render_settings_json(&hook_path.to_string_lossy()),
+    )?;
 
     exclude_from_git(ws, &[".claude/settings.json", ".claude/hooks/"]);
     Ok(())
@@ -487,9 +743,14 @@ fn write_permissions_overlay(ir: &IrAgent, p: &IrPermissions) -> anyhow::Result<
 /// smalltalk hook scripts. `None` if `st` isn't on PATH or the hooks dir isn't there.
 fn resolve_smalltalk_hooks() -> Option<(String, std::path::PathBuf)> {
     let path = std::env::var_os("PATH")?;
-    let st = std::env::split_paths(&path).map(|d| d.join("st")).find(|p| p.is_file())?;
+    let st = std::env::split_paths(&path)
+        .map(|d| d.join("st"))
+        .find(|p| p.is_file())?;
     let st_real = fs::canonicalize(&st).ok()?;
-    let hooks = st_real.parent()?.parent()?.join("examples/claude-code/hooks"); // <smalltalk>/bin/st → hooks
+    let hooks = st_real
+        .parent()?
+        .parent()?
+        .join("examples/claude-code/hooks"); // <smalltalk>/bin/st → hooks
     hooks
         .join("session-start.sh")
         .is_file()
@@ -526,7 +787,9 @@ fn set_executable(path: &Path) {
 /// overlay never shows up in the agent repo's `git status`. Idempotent.
 fn exclude_from_git(workspace: &Path, patterns: &[&str]) {
     let exclude = workspace.join(".git").join("info").join("exclude");
-    let Some(parent) = exclude.parent() else { return };
+    let Some(parent) = exclude.parent() else {
+        return;
+    };
     if !parent.exists() {
         return; // not a git repo (no .git/info) — nothing to exclude
     }
@@ -583,7 +846,11 @@ mod tests {
         // No model → no --model flag.
         let mut b = worker();
         b.model = None;
-        assert!(b.agent_command().unwrap().starts_with("exec claude --permission-mode bypassPermissions 'You just"));
+        assert!(
+            b.agent_command()
+                .unwrap()
+                .starts_with("exec claude --permission-mode bypassPermissions 'You just")
+        );
         // CoS gets the CoS boot prompt.
         let mut c = worker();
         c.role = "chief-of-staff".into();
@@ -612,7 +879,11 @@ mod tests {
         let mut d = worker();
         d.harness = "codex".into();
         d.extra_args = vec!["--cd".into(), "/x".into()];
-        assert!(d.agent_command().unwrap().contains("--dangerously-bypass-approvals-and-sandbox --model 'opus' '--cd' '/x' '"));
+        assert!(
+            d.agent_command().unwrap().contains(
+                "--dangerously-bypass-approvals-and-sandbox --model 'opus' '--cd' '/x' '"
+            )
+        );
     }
 
     #[test]
@@ -675,7 +946,10 @@ mod tests {
     #[test]
     fn permissions_hook_blocks_disallowed_tools_without_prompting() {
         // spawn #false folds into deny; allow-list means anything unlisted is blocked.
-        let hook = render_permissions_hook(&["Read".into(), "Edit".into()], &["WebSearch".into(), "Agent".into()]);
+        let hook = render_permissions_hook(
+            &["Read".into(), "Edit".into()],
+            &["WebSearch".into(), "Agent".into()],
+        );
         assert!(hook.contains(r#"ALLOW="Read Edit""#));
         assert!(hook.contains(r#"DENY="WebSearch Agent""#));
         // It DENIES (blocks, never asks — an autonomous pty can't answer a prompt).
@@ -684,8 +958,14 @@ mod tests {
         // settings.json ONLY registers the hook — no permissions allow/ask block.
         let settings: serde_json::Value =
             serde_json::from_str(&render_settings_json("/w/.claude/hooks/permissions.sh")).unwrap();
-        assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"], "command");
-        assert!(settings.get("permissions").is_none(), "no allowlist that would prompt");
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"],
+            "command"
+        );
+        assert!(
+            settings.get("permissions").is_none(),
+            "no allowlist that would prompt"
+        );
     }
 
     #[test]
