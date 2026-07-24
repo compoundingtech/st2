@@ -1459,5 +1459,9 @@ mod tests {
         assert_eq!(shepherd_decision(11, None, true), ShepherdDecision::Skip);
         assert!(SHEPHERD_PROMPT.contains("not an inbox event"));
         assert!(!SHEPHERD_PROMPT.contains("Check your inbox"));
+        assert!(command_invokes_codex("exec codex --dangerously-bypass-approvals-and-sandbox 'x'"));
+        assert!(command_invokes_codex("/opt/bin/codex --model x"));
+        assert!(!command_invokes_codex("echo codex"));
+        assert!(!command_invokes_codex("claude codex"));
     }
 }
