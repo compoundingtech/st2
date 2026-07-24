@@ -16,7 +16,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::ding::Poker as DingPoker;
-use crate::spec::AgentSpec;
+use crate::spec::{AgentSpec, TaskKind};
 
 pub(crate) const SHEPHERD_PROMPT: &str = "[ST2 LOCAL TICK] Run the scheduled local machine-root \
 health sweep: inspect catalog/service/fabric/PTY state, safe drift, and report incidents. This is \
@@ -197,7 +197,7 @@ fn select_target(specs: &[AgentSpec], this_host: &str) -> Result<Target, Fault> 
             if !spec
                 .tasks
                 .iter()
-                .filter(|task| task.name == "agent")
+                .filter(|task| task.name == "agent" && task.kind == TaskKind::Pty)
                 .filter_map(|task| task.command.as_deref())
                 .any(command_invokes_codex)
             {
@@ -991,6 +991,13 @@ mod tests {
         });
         assert!(matches!(
             select_target(&[wrong_agent], "node"),
+            Err(Fault::NonCodexRoot { .. })
+        ));
+
+        let mut exec_agent = root("exec-root", "exec codex");
+        exec_agent.tasks[0].kind = TaskKind::Exec;
+        assert!(matches!(
+            select_target(&[exec_agent], "node"),
             Err(Fault::NonCodexRoot { .. })
         ));
     }
