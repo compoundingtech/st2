@@ -11,6 +11,14 @@ Plan-first gate: this is the scope; **build only after the format is blessed + t
 
 ## The `render{}` block (directives)
 
+`render{}` is KEPT (not flattened) because it is a **phase GATE**, not just grouping: an ORDERED
+pre-boot materialize phase. `st2 up` runs its directives in declaration order and, if any GATING
+directive fails, does NOT spawn the command (no half-rendered agent booting broken). `git-exclude` lives
+INSIDE `render{}` as the one BEST-EFFORT (non-gating) member — the content directives (copy/file/
+ensure-line) write the actual persona/hooks so their failure = broken agent → they gate; `git-exclude`
+only hides the overlay from git, so a failure or a non-git workspace is cosmetic (untracked overlay),
+never a reason to block boot.
+
 Inside a catalog `agent.kdl`, a `render { … }` block of generic materialize directives:
 
 - `copy "<src>" "<dest>"` — byte-for-byte copy. `<src>` is catalog-relative (e.g.
@@ -19,6 +27,12 @@ Inside a catalog `agent.kdl`, a `render { … }` block of generic materialize di
 - `file "<dest>" { content "<text>" }` — write `<text>`, with `$VAR` expansion via the **existing
   env-cascade** (`$CATALOG`/`$ST_ROOT`/`$ST_AGENT`/…, same `expand_catalog` st2 already runs on
   env/cwd/tags). For the small templated files (settings.json, permissions.sh).
+  - **Clobber policy is per-file + deliberate:** a pure render-OWNED file overwrites (PERSONA.md,
+    DING-BUS.md, AGENTS.md, the hook scripts). A file a USER may also edit — notably
+    `.claude/settings.local.json` (claude's local, git-ignored settings) and `.claude/settings.json` —
+    must be **MERGED**: st2 injects/updates only its own block (the hooks / permissions keys) and
+    preserves the user's other keys, never blind-overwrites. So `file{}` needs a merge mode for JSON
+    (deep-merge the declared keys) vs a plain-write mode; policy is chosen per directive/file.
 - `ensure-line "<dest>" "<line>"` — idempotent append-if-absent. For the `.claude/rules/convoy.md`
   `@`-import lines (must not clobber a user's loader, must not duplicate on re-up).
 - `git-exclude "<path>"` — its own directive (maintainer's instinct: the `.git/info/exclude` append is
@@ -58,10 +72,16 @@ Vendored static sources live in `<catalog>/_templates/` (the `copy` sources).
    injection), but resolving via st2's own paths and shelling out to **`st2`** verbs, not smalltalk's
    `st`. Materialize them into `<workspace>/.claude/hooks/` via `copy`, and reference them
    **workspace-relative** in `settings.local.json` → zero machine path, zero external dependency.
-5. **Systematic `st` → `st2` pass in agent-facing text** — boot prompts, the DING-BUS template, and the
-   hook scripts all reference the old `st` CLI; st2 subsumes the bus verb-for-verb (see the CLI surface
-   below), so vendor an **st2** DING-BUS template + st2 boot prompts + the st2-native hooks. Composes
-   with item 4.
+5. **Systematic `st` → `st2` pass in agent-facing text — the native templates are canonical FROM st2.**
+   st2 owns producing the canonical st2-native templates; the catalog vendors them into `_templates/`:
+   - **`st2` DING-BUS.md** — DONE: `templates/DING-BUS.st2.md` (st verbs → st2, `--priority` dropped,
+     spawn section rewritten to the st2 declarative story: no `convoy add`/`st launch` — declare in the
+     catalog via `st2 add`/`st2 render`/`st2 render-agent` and the running `st2 up` reconciles it in).
+     NOTE: the `[DING]` poke-line LITERAL still reads "new smalltalk message" (wire-compatible in
+     `ding.rs`) — the doc says so; an st2-native rename of that literal is a small pending follow-up
+     (touches the ding wire text — do it carefully, agents pattern-match the line).
+   - **st2-native hook scripts** — item 4 (produced when the milestone builds).
+   - boot prompts — the catalog owner does these on the prototype (`st2 status`, etc.).
 6. **Tests** — materialize each directive incl. idempotency on re-up; render emits the correct block +
    `_templates/`; a rendered catalog boots and materializes the overlay; **neutrality**: the
    materialized overlay is byte-identical to what render-writes-directly produced today (behavior
