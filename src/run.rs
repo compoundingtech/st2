@@ -17,14 +17,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::ding::Poker;
 use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
 use crate::spec::TaskKind;
 
@@ -655,7 +654,10 @@ fn gate_codex_launches<'a, F>(
         let Some(agent) = launch
             .tasks
             .iter()
-            .find(|target| target.name == "agent" && command_invokes_codex(&target.command))
+            .find(|target| {
+                target.name == "agent"
+                    && crate::shepherd::command_invokes_codex(&target.command)
+            })
         else {
             continue;
         };
@@ -680,82 +682,59 @@ fn gate_codex_launches<'a, F>(
     }
 }
 
-/// Recognize the exact command shape st2's renderers emit, with an absolute binary path accepted for
-/// operator-authored specs. This intentionally does not guess through arbitrary shell pipelines.
-fn command_invokes_codex(command: &str) -> bool {
-    let command = command.trim();
-    let command = command.strip_prefix("exec ").unwrap_or(command).trim_start();
-    let Some(program) = command.split_ascii_whitespace().next() else {
-        return false;
-    };
-    Path::new(program)
-        .file_name()
-        .is_some_and(|name| name == "codex")
-}
-
 /// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    let report = reconcile_pass(
+    let mut shepherd_runtime = crate::shepherd::Runtime::default();
+    let clock = crate::shepherd::SystemClock;
+    let mut store = crate::shepherd::FilesystemStore::new(root);
+    let mut poker = crate::shepherd::PtyPoker;
+    let mut reporter = crate::shepherd::StderrReporter;
+    let report = reconcile_and_shepherd_pass(
         root,
         this_host,
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
+        &mut shepherd_runtime,
+        &clock,
+        &mut store,
+        &mut poker,
+        &mut reporter,
     );
-    shepherd_tick(root, this_host);
     Ok(report)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShepherdDecision { Skip, Due }
-const SHEPHERD_PROMPT: &str = "[ST2 LOCAL TICK] Run the scheduled local machine-root health sweep: inspect catalog/service/fabric/PTY state, safe drift, and report incidents. This is not an inbox event and must not poll the inbox.";
-
-#[allow(dead_code)]
-trait ShepherdStore { fn attempt(&mut self, key: &str, now: u64) -> bool; fn delivered(&mut self, key: &str, bucket: u64) -> bool; }
-#[allow(dead_code)]
-fn shepherd_pass<S: ShepherdStore, P: FnMut() -> bool>(store: &mut S, key: &str, bucket: u64, now: u64, dnd: bool, mut poke: P) -> ShepherdDecision {
-    if dnd || store.delivered(key, bucket) || !store.attempt(key, now) { return ShepherdDecision::Skip; }
-    if poke() { let _ = store.delivered(key, bucket); }
-    ShepherdDecision::Due
-}
-
-/// Injectable delivery/state seam shared by one-shot and supervised shepherd passes.
-fn shepherd_attempt<P, W>(bucket: u64, last: Option<u64>, dnd: bool, mut poke: P, mut write: W) -> ShepherdDecision
-where P: FnMut() -> bool, W: FnMut(u64) -> bool {
-    if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return ShepherdDecision::Skip; }
-    if !poke() { return ShepherdDecision::Due; }
-    let _ = write(bucket);
-    ShepherdDecision::Due
-}
-
-fn shepherd_decision(bucket: u64, last: Option<u64>, dnd: bool) -> ShepherdDecision {
-    if dnd || last == Some(bucket) { ShepherdDecision::Skip } else { ShepherdDecision::Due }
-}
-
-fn shepherd_tick(root: &Path, this_host: &str) {
-    const CADENCE: u64 = 2 * 60 * 60;
-    let bucket = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / CADENCE;
-    let d = crate::discovery::discover(root);
-    let roots: Vec<_> = d.specs.iter().filter(|s| s.host.as_deref().unwrap_or(this_host) == this_host && s.role.as_deref() == Some("root") && s.tasks.iter().any(|t| t.command.as_deref().is_some_and(command_invokes_codex)) && !s.retired).collect();
-    if roots.len() != 1 { eprintln!("st2: shepherd disabled on {this_host}: expected exactly one local Codex role=root, found {}", roots.len()); return; }
-    let spec = roots[0];
-    let dir = spec.path.parent().unwrap_or(root);
-    let dnd = crate::status::read_state(&crate::status::status_path(dir)) == crate::status::State::Dnd;
-    let marker = root.join(format!(".st2-shepherd-{}-{}-bucket", this_host, spec.identity));
-    let attempt = root.join(format!(".st2-shepherd-{}-{}-attempt", this_host, spec.identity));
-    if let Ok(raw) = std::fs::read_to_string(&attempt)
-        && raw.trim().parse::<u64>().ok().is_some_and(|t| SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(t) < 300) { return; }
-    let last = std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u64>().ok());
-    if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return; }
-    let bus_id = format!("{}.{}", this_host, spec.identity);
-    let _ = std::fs::write(&attempt, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().to_string());
-    let delivered = std::cell::Cell::new(false);
-    shepherd_attempt(bucket, last, dnd,
-        || { let ok = crate::ding::PtyPoker::new(&bus_id).poke(SHEPHERD_PROMPT).is_ok(); delivered.set(ok); ok },
-        |b| { let ok = std::fs::write(&marker, b.to_string()).is_ok(); if ok && delivered.get() { let _ = std::fs::remove_file(&attempt); } ok });
+/// The one catalog pass used by both one-shot and long-running supervision. Keeping shepherding in
+/// this adapter guarantees reconcile still runs when shepherd selection or delivery faults, while
+/// making the entire shepherd transition injectable for multi-pass and fresh-runtime tests.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_and_shepherd_pass(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    shepherd_runtime: &mut crate::shepherd::Runtime,
+    clock: &dyn crate::shepherd::Clock,
+    store: &mut dyn crate::shepherd::Store,
+    poker: &mut dyn crate::shepherd::Poker,
+    reporter: &mut dyn crate::shepherd::Reporter,
+) -> UpReport {
+    let report = reconcile_pass(root, this_host, runner, cap, debounce);
+    let found = crate::discover(root);
+    crate::shepherd::run_pass(
+        &found.specs,
+        this_host,
+        shepherd_runtime,
+        clock,
+        store,
+        poker,
+        reporter,
+    );
+    report
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -998,6 +977,11 @@ pub fn up_loop(
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    let mut shepherd_runtime = crate::shepherd::Runtime::default();
+    let clock = crate::shepherd::SystemClock;
+    let mut shepherd_store = crate::shepherd::FilesystemStore::new(root);
+    let mut shepherd_poker = crate::shepherd::PtyPoker;
+    let mut shepherd_reporter = crate::shepherd::StderrReporter;
 
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
@@ -1005,8 +989,18 @@ pub fn up_loop(
     let mut reported_flapping: HashSet<String> = HashSet::new();
 
     loop {
-        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
-        shepherd_tick(root, this_host);
+        let report = reconcile_and_shepherd_pass(
+            root,
+            this_host,
+            runner,
+            &mut cap,
+            &mut debounce,
+            &mut shepherd_runtime,
+            &clock,
+            &mut shepherd_store,
+            &mut shepherd_poker,
+            &mut shepherd_reporter,
+        );
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1244,6 +1238,132 @@ mod tests {
         assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
     }
 
+    #[test]
+    fn codex_pretrust_batches_every_new_workspace_once() {
+        let mut left = spec_fixture();
+        left.identity = "left".into();
+        left.path = PathBuf::from("/catalog/node/left/agent.kdl");
+        let mut right = spec_fixture();
+        right.identity = "right".into();
+        right.path = PathBuf::from("/catalog/node/right/agent.kdl");
+        let mut left_agent = target("node.left.agent", "exec codex --model gpt-5");
+        left_agent.workspace = Some("/workspaces/shared".into());
+        let mut right_agent = target("node.right.agent", "/opt/bin/codex --model gpt-5");
+        right_agent.workspace = Some("/workspaces/shared".into());
+        let mut plan = ReconcilePlan::default();
+        plan.launch.push(Launch {
+            spec: &left,
+            tasks: vec![left_agent],
+        });
+        plan.launch.push(Launch {
+            spec: &right,
+            tasks: vec![right_agent],
+        });
+        let captured = RefCell::new(Vec::new());
+
+        gate_codex_launches(
+            Path::new("/catalog"),
+            &mut plan,
+            &mut UpReport::default(),
+            |workspaces| {
+                captured.borrow_mut().extend_from_slice(workspaces);
+                Ok(workspaces.len())
+            },
+        );
+
+        assert_eq!(
+            captured.into_inner(),
+            [PathBuf::from("/workspaces/shared")],
+            "all affected workspaces are passed in one deduplicated batch"
+        );
+        assert_eq!(plan.launch.len(), 2);
+    }
+
+    #[test]
+    fn codex_pretrust_failure_suppresses_every_affected_agent_and_sidecar() {
+        let mut left = spec_fixture();
+        left.identity = "left".into();
+        left.path = PathBuf::from("/catalog/node/left/agent.kdl");
+        let mut right = spec_fixture();
+        right.identity = "right".into();
+        right.path = PathBuf::from("/catalog/node/right/agent.kdl");
+        let mut other = spec_fixture();
+        other.identity = "other".into();
+        other.path = PathBuf::from("/catalog/node/other/agent.kdl");
+
+        let mut left_agent = target("node.left.agent", "exec codex");
+        left_agent.workspace = Some("/workspaces/left".into());
+        let mut left_ding = target("node.left.ding", "st2 ding");
+        left_ding.name = "ding".into();
+        let mut right_agent = target("node.right.agent", "/opt/bin/codex --model gpt-5");
+        right_agent.workspace = Some("/workspaces/right".into());
+        let mut right_ding = target("node.right.ding", "st2 ding");
+        right_ding.name = "ding".into();
+        let non_codex = target("node.other.agent", "exec claude");
+        let mut plan = ReconcilePlan::default();
+        plan.launch.push(Launch {
+            spec: &left,
+            tasks: vec![left_agent, left_ding],
+        });
+        plan.launch.push(Launch {
+            spec: &right,
+            tasks: vec![right_agent, right_ding],
+        });
+        plan.launch.push(Launch {
+            spec: &other,
+            tasks: vec![non_codex],
+        });
+        let mut report = UpReport::default();
+
+        gate_codex_launches(Path::new("/catalog"), &mut plan, &mut report, |workspaces| {
+            assert_eq!(
+                workspaces,
+                [
+                    PathBuf::from("/workspaces/left"),
+                    PathBuf::from("/workspaces/right")
+                ]
+            );
+            anyhow::bail!("read-only Codex config")
+        });
+
+        assert_eq!(
+            plan.launch
+                .iter()
+                .map(|launch| launch.spec.identity.as_str())
+                .collect::<Vec<_>>(),
+            ["other"],
+            "both Codex agents and all their sidecars fail closed"
+        );
+        assert_eq!(plan.launch[0].tasks[0].pty_id, "node.other.agent");
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("left, right"));
+        assert!(report.errors[0].contains("launch suppressed"));
+    }
+
+    #[test]
+    fn codex_pretrust_does_not_touch_adopted_agents_or_sidecar_only_repairs() {
+        let mut spec = spec_fixture();
+        spec.identity = "root".into();
+        let mut ding = target("node.root.ding", "st2 ding");
+        ding.name = "ding".into();
+        let mut plan = ReconcilePlan::default();
+        plan.adopt.push(&spec);
+        plan.launch.push(Launch {
+            spec: &spec,
+            tasks: vec![ding],
+        });
+        let mut report = UpReport::default();
+
+        gate_codex_launches(Path::new("/catalog"), &mut plan, &mut report, |_| {
+            panic!("an already-live Codex agent must not enter the pretrust gate")
+        });
+
+        assert_eq!(plan.adopt, [&spec]);
+        assert_eq!(plan.launch.len(), 1);
+        assert_eq!(plan.launch[0].tasks[0].name, "ding");
+        assert!(report.errors.is_empty());
+    }
+
     /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
     /// and the owning agent's bus identity as its human-facing name.
     #[test]
@@ -1472,28 +1592,97 @@ mod tests {
     }
 
     #[test]
-    fn shepherd_scheduler_is_due_once_per_bucket_and_respects_dnd() {
-        assert_eq!(shepherd_decision(10, None, false), ShepherdDecision::Due);
-        assert_eq!(shepherd_decision(10, Some(10), false), ShepherdDecision::Skip);
-        assert_eq!(shepherd_decision(11, Some(10), false), ShepherdDecision::Due);
-        assert_eq!(shepherd_decision(11, None, true), ShepherdDecision::Skip);
-        assert!(SHEPHERD_PROMPT.contains("not an inbox event"));
-        assert!(!SHEPHERD_PROMPT.contains("Check your inbox"));
-        assert!(command_invokes_codex("exec codex --dangerously-bypass-approvals-and-sandbox 'x'"));
-        assert!(command_invokes_codex("/opt/bin/codex --model x"));
-        assert!(!command_invokes_codex("echo codex"));
-        assert!(!command_invokes_codex("claude codex"));
-        let calls = std::cell::Cell::new(0);
-        assert_eq!(shepherd_attempt(1, None, false, || { calls.set(calls.get()+1); true }, |_| true), ShepherdDecision::Due);
-        assert_eq!(calls.get(), 1);
-        assert_eq!(shepherd_attempt(1, Some(1), false, || { calls.set(calls.get()+1); true }, |_| true), ShepherdDecision::Skip);
-        assert_eq!(calls.get(), 1);
-        assert_eq!(shepherd_attempt(2, None, false, || false, |_| true), ShepherdDecision::Due);
-        assert_eq!(shepherd_attempt(2, None, true, || { panic!("dnd poke") }, |_| true), ShepherdDecision::Skip);
-        struct S { a: bool, d: bool }
-        impl ShepherdStore for S { fn attempt(&mut self, _: &str, _: u64) -> bool { let old=self.a; self.a=true; !old } fn delivered(&mut self, _: &str, _: u64) -> bool { self.d } }
-        let mut s=S{a:false,d:false}; let n=std::cell::Cell::new(0);
-        assert_eq!(shepherd_pass(&mut s,"h.root",1,10,false,||{n.set(n.get()+1);true}), ShepherdDecision::Due);
-        s.d=true; assert_eq!(shepherd_pass(&mut s,"h.root",1,11,false,||{n.set(n.get()+1);true}), ShepherdDecision::Skip); assert_eq!(n.get(),1);
+    fn reconcile_and_shepherd_pass_keeps_reconciling_when_shepherd_faults() {
+        struct RecordingRunner {
+            spawned: RefCell<Vec<String>>,
+        }
+        impl Runner for RecordingRunner {
+            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+                Ok(Vec::new())
+            }
+            fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+                self.spawned.borrow_mut().push(target.pty_id.clone());
+                Ok(())
+            }
+            fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        struct Clock;
+        impl crate::shepherd::Clock for Clock {
+            fn now_secs(&self) -> u64 {
+                1
+            }
+        }
+        struct Store;
+        impl crate::shepherd::Store for Store {
+            fn is_dnd(&mut self, _agent_dir: &Path) -> bool {
+                false
+            }
+            fn load(
+                &mut self,
+                _key: &crate::shepherd::ShepherdKey,
+            ) -> anyhow::Result<crate::shepherd::PersistedState> {
+                Ok(crate::shepherd::PersistedState::default())
+            }
+            fn save(
+                &mut self,
+                _key: &crate::shepherd::ShepherdKey,
+                _state: crate::shepherd::PersistedState,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        struct NoPoke;
+        impl crate::shepherd::Poker for NoPoke {
+            fn poke(&mut self, _session: &str, _text: &str) -> anyhow::Result<()> {
+                panic!("a missing root must fault before poke")
+            }
+        }
+        #[derive(Default)]
+        struct Reports(Vec<String>);
+        impl crate::shepherd::Reporter for Reports {
+            fn report(&mut self, fault: &crate::shepherd::Fault) {
+                self.0.push(fault.to_string());
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents/node/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "identity=\"worker\"\nhost=\"node\"\nrole=\"worker\"\n[pty.agent]\ncommand=\"exec claude\"\n",
+        )
+        .unwrap();
+        let runner = RecordingRunner {
+            spawned: RefCell::new(Vec::new()),
+        };
+        let mut runtime = crate::shepherd::Runtime::default();
+        let mut store = Store;
+        let mut poker = NoPoke;
+        let mut reports = Reports::default();
+
+        let report = reconcile_and_shepherd_pass(
+            tmp.path(),
+            "node",
+            &runner,
+            &mut FlappingCap::default(),
+            &mut LivenessDebounce::new(DEBOUNCE_GRACE),
+            &mut runtime,
+            &Clock,
+            &mut store,
+            &mut poker,
+            &mut reports,
+        );
+
+        assert_eq!(report.launched, ["node.worker.agent"]);
+        assert_eq!(runner.spawned.borrow().as_slice(), ["node.worker.agent"]);
+        assert_eq!(reports.0.len(), 1);
+        assert!(reports.0[0].contains("no active local role=root"));
     }
+
 }
