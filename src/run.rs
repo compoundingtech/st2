@@ -135,6 +135,9 @@ impl PtyCli {
             .arg("-d") // detached: leave it running in the background
             .arg("--force") // st2 itself may run inside a pty session; allow nesting
             .args(["--id", &target.pty_id])
+            // Keep the adoption key task-specific, but make the human-facing label the
+            // owning agent's stable bus identity instead of pty's auto-derived `<cwd>-sh` label.
+            .args(["--name", &target.bus_id])
             .arg("--cwd")
             .arg(&cwd);
         for (k, v) in &target.tags {
@@ -1123,7 +1126,8 @@ mod tests {
         assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
     }
 
-    /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id.
+    /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
+    /// and the owning agent's bus identity as its human-facing name.
     #[test]
     fn build_run_command_wraps_command_in_sh_c() {
         let cli = PtyCli::default();
@@ -1138,11 +1142,13 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        // Order: run -d --force --id <id> --cwd <cwd> -- sh -c <command>
+        // Order: run -d --force --id <id> --name <bus-id> --cwd <cwd> -- sh -c <command>
         assert_eq!(&args[0..2], &["run", "-d"]);
         assert!(args.contains(&"--force".to_string()));
         let id_pos = args.iter().position(|a| a == "--id").unwrap();
         assert_eq!(args[id_pos + 1], "hetz.demo.agent");
+        let name_pos = args.iter().position(|a| a == "--name").unwrap();
+        assert_eq!(args[name_pos + 1], "hetz.demo");
         let sep = args.iter().position(|a| a == "--").unwrap();
         assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
     }

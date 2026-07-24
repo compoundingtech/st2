@@ -199,6 +199,82 @@ fn pty_gate(test: &str) -> bool {
     false
 }
 
+#[test]
+fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle() {
+    if !pty_gate("pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle") {
+        return;
+    }
+    let fx = Fixture::new();
+    fx.write_agent("cos", "pty", false);
+    fx.write_agent("st2", "pty", false);
+
+    let launched = fx.up_once();
+    assert!(
+        launched.contains("nomadtest.cos.task") && launched.contains("nomadtest.st2.task"),
+        "both agent sessions must launch; output:\n{launched}"
+    );
+
+    let listed = Command::new("pty")
+        .env("PTY_ROOT", &fx.pty_root)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "`pty list --json` failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let sessions: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let display_name = |id: &str| {
+        sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["name"] == id)
+            .and_then(|session| session["displayName"].as_str())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        display_name("nomadtest.cos.task").as_deref(),
+        Some("nomadtest.cos")
+    );
+    assert_eq!(
+        display_name("nomadtest.st2.task").as_deref(),
+        Some("nomadtest.st2")
+    );
+
+    let adopted = fx.up_once();
+    assert!(
+        adopted.contains("adopted (2): cos, st2") && !adopted.contains("launched"),
+        "a second runner pass must adopt both named sessions without duplicates; output:\n{adopted}"
+    );
+
+    let down = fx
+        .st2()
+        .arg("down")
+        .arg(&fx.catalog)
+        .args(["--host", HOST])
+        .output()
+        .unwrap();
+    assert!(
+        down.status.success(),
+        "`st2 down` failed: {}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    let down_out = String::from_utf8_lossy(&down.stdout);
+    assert!(
+        down_out.contains("torn down (2): nomadtest.cos.task, nomadtest.st2.task"),
+        "down must tear down both sessions by lifecycle id; output:\n{down_out}"
+    );
+    for identity in ["cos", "st2"] {
+        let pidfile = fx.task_pidfile("pty", identity);
+        assert!(
+            poll_until(DEATH_TIMEOUT, || !read_alive(&pidfile)),
+            "down did not stop {identity}'s pty session"
+        );
+    }
+}
+
 // ── the guarantee: killing the runner leaves the task alive; a fresh runner adopts it ─────────────
 
 fn runner_death_survives_and_readopts(kind: &str, signal: &str) {
