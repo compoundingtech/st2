@@ -110,7 +110,7 @@ fn st2_up_refuses_an_eval_only_file() {
     std::fs::create_dir_all(&cell).unwrap();
     std::fs::write(
         cell.join("cell.kdl"),
-        "eval {\n  max-timeout \"5s\"\n  run { step \"x\" { command \"true\" } }\n  judges { judge \"ok\" { exec \"true\" } }\n}\n",
+        "eval {\n  max-timeout \"5s\"\n  run \"x\" { command \"true\" }\n  judges { judge \"ok\" { exec \"true\" } }\n}\n",
     )
     .unwrap();
     let out = Command::new(bin)

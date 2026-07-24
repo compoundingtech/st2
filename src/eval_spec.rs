@@ -178,34 +178,20 @@ fn child_arg(node: &KdlNode, name: &str) -> Option<String> {
         .and_then(arg)
 }
 
-/// Parse the `run` stage into one or more [`RunStep`]s, appended in order. Two forms:
-/// - FLAT (preferred): `run "label" { command "…"; … }` — the `run` node IS one step; its arg is the
-///   label and the body holds the command directly (no nested `step`). Multiple `run "label"` nodes in
-///   the eval block run in sequence.
-/// - LEGACY: `run { step "id" { … } … }` — a wrapper whose `step` children are the steps.
+/// Parse a flat `run "label" { … }` node into one [`RunStep`], appended in order. The `run` node IS
+/// one step: its arg is the label, its body holds the command directly. Multiple `run "label"` nodes in
+/// the eval block run in file order. (The old nested `run { step … }` wrapper was retired once every
+/// cell moved to the flat form — a `run` with no label is now an error.)
 fn parse_run_stage(node: &KdlNode, out: &mut Vec<RunStep>) -> anyhow::Result<()> {
-    if let Some(label) = arg(node) {
-        // Flat: the run node itself is the step.
-        out.push(parse_step_body(node, label)?);
-        return Ok(());
-    }
-    let Some(ch) = node.children() else { return Ok(()) };
-    for c in ch.nodes() {
-        if c.name().value() != "step" {
-            anyhow::bail!(
-                "run: unexpected node '{}' (write `run \"label\" {{ command … }}`, or nest `step`)",
-                c.name().value()
-            );
-        }
-        let id = arg(c).ok_or_else(|| anyhow::anyhow!("run step needs a name"))?;
-        out.push(parse_step_body(c, id)?);
-    }
+    let label = arg(node)
+        .ok_or_else(|| anyhow::anyhow!("run needs a label: write `run \"label\" {{ command … }}`"))?;
+    out.push(parse_step_body(node, label)?);
     Ok(())
 }
 
-/// Parse a run step's BODY (shared by the flat `run "id" { … }` and legacy `step "id" { … }` forms):
-/// `{ workspace; command; env{}; unset "V" …; retry{}; allow-nonzero }`. By default the step must
-/// exit 0; `allow-nonzero` opts out. `require-exit 0` is still accepted (it now just affirms the default).
+/// Parse a flat `run "id" { … }` node's BODY: `{ workspace; command; env{}; unset "V" …; retry{};
+/// allow-nonzero }`. By default the step must exit 0; `allow-nonzero` opts out. `require-exit 0` is
+/// still accepted (it now just affirms the default).
 fn parse_step_body(node: &KdlNode, id: String) -> anyhow::Result<RunStep> {
     let ch = node.children().ok_or_else(|| anyhow::anyhow!("run step '{id}' is empty"))?;
     let mut workspace = None;
@@ -828,7 +814,7 @@ team "mix" {
     fn judge_signal_flag_is_opt_in() {
         // A bare `signal` directive marks a judge show-but-don't-gate; absent → a normal gating judge.
         let spec = parse_spec(
-            "eval {\n  max-timeout \"5s\"\n  run { step \"s\" { command \"true\" } }\n  \
+            "eval {\n  max-timeout \"5s\"\n  run \"s\" { command \"true\" }\n  \
              judges { judge \"gate\" { exec \"true\" }\n            judge \"sig\" { signal; exec \"true\" } }\n}\n",
         )
         .unwrap();
@@ -869,19 +855,15 @@ team "mix" {
     }
 
     #[test]
-    fn legacy_nested_run_step_form_still_parses() {
-        // Back-compat: the older `run { step "id" { … } }` wrapper still works, and `require-exit 0` is
-        // accepted as a (now-redundant) affirmation of the default must-exit-0.
-        let spec = parse_spec(
-            "eval {\n  max-timeout \"2m\"\n  run {\n    \
-             step \"render\" { command \"st2 render x\"; require-exit 0 }\n  }\n  \
+    fn nested_run_step_form_is_rejected() {
+        // The old `run { step … }` wrapper was retired: a `run` with no label is now an error
+        // (every cell uses the flat `run "label" { … }` form).
+        let err = parse_spec(
+            "eval {\n  max-timeout \"2m\"\n  run {\n    step \"render\" { command \"x\" }\n  }\n  \
              judges { judge \"ok\" { exec \"true\" } }\n}\n",
         )
-        .unwrap();
-        let ev = spec.eval.unwrap();
-        assert_eq!(ev.run_steps.len(), 1);
-        assert_eq!(ev.run_steps[0].id, "render");
-        assert!(!ev.run_steps[0].allow_nonzero);
+        .unwrap_err();
+        assert!(err.to_string().contains("run needs a label"), "{err}");
     }
 
     #[test]
