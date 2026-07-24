@@ -36,6 +36,15 @@ Vendored static sources live in `<catalog>/_templates/` (the `copy` sources).
    ensure-line / git-exclude append), idempotent (safe on every reconcile pass). Generic file I/O — no
    persona/harness knowledge. This is the one (mild) expansion of `st2 up`: today it is read-only on the
    catalog + spawn-only; now it also writes the declared overlay into the workspace.
+
+2b. **Render-only / dry-run path (the cheap test surface)** — expose the primitive STANDALONE so the
+   overlay can be materialized WITHOUT booting an agent (no pty, no claude, zero token cost): a
+   `st2 materialize <catalog> [--host]` (or `st2 up --materialize-only`) that runs step 2 for each
+   agent and stops — no reconcile, no spawn. This is how the format is verified: materialize → diff the
+   workspace against convoy's output, at zero cost. It is also what every materialize test uses (temp
+   dirs + file assertions, never a live agent). **Budget constraint (maintainer): no eval RUNS / no
+   fresh-team boots until after Sunday** — so this render-only path + its file-diff tests are the
+   near-term buildable/verifiable surface; any agent-booting test is held until after Sunday.
 3. **Render emits blocks** — `st2 render`/`render-agent` change from writing the overlay directly →
    emitting the `render{}` block into `agent.kdl` + vendoring the static files into `_templates/`. The
    overlay *content* is unchanged; it moves from render-writes-workspace to kdl-declares →
