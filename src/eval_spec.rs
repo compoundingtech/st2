@@ -295,7 +295,9 @@ fn cascade(parent: &BTreeMap<String, String>, child: &BTreeMap<String, String>) 
 pub fn ding_exec(agent_id: &str) -> SpecExec {
     SpecExec {
         id: format!("{agent_id}.ding"),
-        command: format!("st2 ding {agent_id} --identity {agent_id} --root $ST_ROOT"),
+        // Identity-only: `st2 ding` defaults its poke target to `--identity` (an agent IS its pty), so
+        // the redundant positional is dropped.
+        command: format!("st2 ding --identity {agent_id} --root $ST_ROOT"),
         env: BTreeMap::new(),
     }
 }
@@ -675,7 +677,7 @@ eval {
         // against the cascaded $ST_ROOT; it inherits the agent env.
         assert_eq!(sup.execs.len(), 1);
         assert_eq!(sup.execs[0].id, "mix.sup.ding");
-        assert_eq!(sup.execs[0].command, "st2 ding mix.sup --identity mix.sup --root $ST_ROOT");
+        assert_eq!(sup.execs[0].command, "st2 ding --identity mix.sup --root $ST_ROOT");
         assert_eq!(sup.execs[0].env.get("ST_AGENT").unwrap(), "mix.sup"); // inherited
 
         // Eval block.

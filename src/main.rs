@@ -67,9 +67,12 @@ enum Command {
     /// the runner's job now); it is the exact same command.
     #[command(visible_alias = "ping")]
     Ding {
-        /// The target pty session to poke (a `pty` session ref).
-        session: String,
-        /// Whose inbox to watch — bus id or identity. Defaults to `$ST_AGENT`.
+        /// The target pty session to poke (a `pty` session ref). Optional — defaults to `--identity`
+        /// (an agent IS its pty, so the session to poke is the identity), so `st2 ding --identity X`
+        /// is the common form.
+        session: Option<String>,
+        /// Whose inbox to watch — bus id or identity. Defaults to `$ST_AGENT`. Also the default poke
+        /// target when no positional session is given.
         #[arg(long)]
         identity: Option<String>,
         /// Catalog root. Defaults to `$CATALOG`.
@@ -485,7 +488,7 @@ fn main() -> Result<()> {
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
         Command::Ding { session, identity, root, host, interval } => {
-            ding_cmd(&session, identity, root, host, interval)
+            ding_cmd(session, identity, root, host, interval)
         }
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Agents { catalog, status, json, enrich, ctx } => {
@@ -927,7 +930,7 @@ fn agents_cmd(
 }
 
 fn ding_cmd(
-    session: &str,
+    session: Option<String>,
     identity: Option<String>,
     root: Option<PathBuf>,
     host: Option<String>,
@@ -936,6 +939,10 @@ fn ding_cmd(
     let ctx = MsgCtx { root, as_id: identity, host };
     let (catalog_root, this_host) = resolve_ctx(&ctx)?;
     let id = acting_id(&ctx)?;
+    // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
+    // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
+    // optional). An explicit positional still overrides for the rare non-agent case.
+    let session = session.unwrap_or_else(|| id.clone());
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
@@ -944,7 +951,7 @@ fn ding_cmd(
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!("st2 ding: watching {}'s inbox ({}) → poking pty '{session}'", id, inbox.display());
     let config = ding::DingConfig { poll: Duration::from_millis(interval), ..Default::default() };
-    ding::serve(&inbox, &status_path, session, &config)
+    ding::serve(&inbox, &status_path, &session, &config)
 }
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.

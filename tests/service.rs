@@ -33,12 +33,18 @@ fn service_exposes_install_status_uninstall() {
 
 #[test]
 fn ping_is_an_alias_for_ding() {
-    // `st2 ping` must dispatch to the ding handler: with no <session> it fails with ding's own
-    // "required arguments were not provided: <SESSION>" — NOT an "unrecognized subcommand" error.
+    // `st2 ping` resolves to the ding command: its --help IS the ding help (mentions the inbox watch).
+    let help = st2().args(["ping", "--help"]).output().unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("inbox"), "ping --help should be the ding help; got: {text}");
+
+    // And a bare `st2 ping` dispatches INTO the ding handler (past clap) — it reaches ding's runtime
+    // catalog-root requirement, not an "unrecognized subcommand" clap error.
     let out = st2().arg("ping").output().unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("SESSION"), "ping should be the ding command; got: {err}");
+    assert!(err.contains("catalog root"), "ping should reach the ding handler; got: {err}");
     assert!(
         !err.to_lowercase().contains("unrecognized"),
         "ping should be a recognized alias; got: {err}"
