@@ -726,10 +726,15 @@ fn shepherd_tick(root: &Path, this_host: &str) {
     let dir = spec.path.parent().unwrap_or(root);
     let dnd = crate::status::read_state(&crate::status::status_path(dir)) == crate::status::State::Dnd;
     let marker = root.join(format!(".st2-shepherd-{}-{}-bucket", this_host, spec.identity));
+    let attempt = root.join(format!(".st2-shepherd-{}-{}-attempt", this_host, spec.identity));
+    if let Ok(raw) = std::fs::read_to_string(&attempt)
+        && raw.trim().parse::<u64>().ok().is_some_and(|t| SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(t) < 300) { return; }
     let last = std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u64>().ok());
     if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return; }
     let bus_id = format!("{}.{}", this_host, spec.identity);
-    if crate::ding::PtyPoker::new(bus_id).poke("[ST2 LOCAL TICK] Check your inbox and resume unfinished durable work; this is a local shepherd tick.").is_ok() { let _ = std::fs::write(marker, bucket.to_string()); }
+    let _ = std::fs::write(&attempt, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().to_string());
+    if crate::ding::PtyPoker::new(bus_id).poke("[ST2 LOCAL TICK] Check your inbox and resume unfinished durable work; this is a local shepherd tick.").is_ok()
+        && std::fs::write(&marker, bucket.to_string()).is_ok() { let _ = std::fs::remove_file(attempt); }
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
