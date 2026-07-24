@@ -61,6 +61,7 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
         match child.name().value() {
             "identity" => raw.identity = arg_string(child).or(raw.identity),
             "host" => raw.host = arg_string(child),
+            "role" => raw.role = arg_string(child),
             "type" => raw.job_type = arg_string(child),
             "workspace" => raw.workspace = arg_string(child),
             "supervisor" => raw.supervisor = arg_string(child),

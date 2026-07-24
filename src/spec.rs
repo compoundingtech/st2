@@ -24,6 +24,8 @@ pub struct AgentSpec {
     pub identity: String,
     /// Which machine runs this agent. `None` → resolved to the path's host / this machine.
     pub host: Option<String>,
+    /// Optional declared persona role (used by local shepherding; ignored for execution).
+    pub role: Option<String>,
     /// `service` (long-running, respawns) — the only job type. Defaults to service.
     pub job_type: JobType,
     /// The repo/worktree; **defaults each task's cwd** (spec.md §2).
@@ -175,6 +177,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 pub(crate) struct RawSpec {
     pub identity: Option<String>,
     pub host: Option<String>,
+    pub role: Option<String>,
     #[serde(rename = "type")]
     pub job_type: Option<String>,
     pub workspace: Option<String>,
@@ -307,6 +310,7 @@ impl RawSpec {
         AgentSpec {
             identity,
             host,
+            role: self.role,
             job_type,
             workspace: self.workspace,
             supervisor: self.supervisor,

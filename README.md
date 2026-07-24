@@ -152,7 +152,7 @@ On a headless host (like hetz) install the supervisor as a systemd-user unit —
 replacement for `convoy-up.service`:
 
 ```sh
-st2 service install --catalog <catalog> [--host <h>] [--memory-max-mb N] # write, enable, start
+st2 service install --catalog <catalog> [--host <h>] [--pty-root <path>] [--memory-max-mb N]
 st2 service status                                               # systemctl --user status st2.service
 st2 service uninstall                                            # stop, disable, remove (idempotent)
 ```
@@ -163,6 +163,11 @@ The unit runs `st2 up --catalog <catalog>` with `Restart=on-failure`. This is sa
 supervisor loop — the agents survive and a fresh supervisor adopts them
 ([`tests/nomad_survival.rs`](tests/nomad_survival.rs),
 [`tests/transport_isolation.rs`](tests/transport_isolation.rs)).
+
+The unit records the install command's `PATH`, so user-local `pty` and harness binaries remain
+available under systemd's otherwise sparse environment. `--pty-root` records an explicit
+machine-local registry when a runner swap must adopt existing sessions; omit it for the
+`<catalog>/pty` default. Never place that registry in a cross-machine file-sync lane.
 
 **Linux-only, by design.** macOS stays **manual** — the maintainer runs `st2 up` themselves there, because a
 launchd-owned process can't inherit his GUI/keychain (TCC) trust. `st2 service` bails loud on

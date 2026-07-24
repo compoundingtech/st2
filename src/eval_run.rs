@@ -54,6 +54,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
             AgentSpec {
                 identity: a.id.clone(),
                 host: Some(host.to_string()),
+                role: None,
                 job_type: JobType::Service,
                 workspace: a.workspace.clone(),
                 supervisor: a.supervisor.clone(),

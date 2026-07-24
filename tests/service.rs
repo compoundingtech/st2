@@ -32,6 +32,15 @@ fn service_exposes_install_status_uninstall() {
 }
 
 #[test]
+fn install_exposes_a_machine_local_pty_root() {
+    let out = st2().args(["service", "install", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--pty-root"), "{help}");
+    assert!(help.contains("legacy runner"), "{help}");
+}
+
+#[test]
 fn ping_is_an_alias_for_ding() {
     // `st2 ping` resolves to the ding command: its --help IS the ding help (mentions the inbox watch).
     let help = st2().args(["ping", "--help"]).output().unwrap();

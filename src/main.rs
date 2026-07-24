@@ -327,6 +327,10 @@ enum ServiceCmd {
         /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
         #[arg(long)]
         host: Option<String>,
+        /// Machine-local pty registry to export as PTY_ROOT in the unit. Omit to use
+        /// `<catalog>/pty`. Useful when adopting live sessions from a legacy runner.
+        #[arg(long)]
+        pty_root: Option<PathBuf>,
         /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
         #[arg(long = "memory-max-mb", default_value_t = st2::service::DEFAULT_MEMORY_MAX_MB)]
         memory_max_mb: u64,
@@ -1536,13 +1540,14 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
         ServiceCmd::Install {
             catalog,
             host,
+            pty_root,
             memory_max_mb,
         } => {
             let catalog = match catalog {
                 Some(c) => c,
                 None => catalog_root_for_env()?,
             };
-            st2::service::install(&catalog, host, memory_max_mb)
+            st2::service::install(&catalog, host, pty_root, memory_max_mb)
         }
         ServiceCmd::Status => st2::service::status(),
         ServiceCmd::Uninstall => st2::service::uninstall(),

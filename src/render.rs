@@ -18,7 +18,7 @@ use kdl::KdlDocument;
 
 /// Convoy's boot prompt for every non-CoS role (verbatim; apostrophe-free by design so it is
 /// single-quote-safe on the command line).
-const BOOT_WORKER: &str = "You just cold-started. Run your boot ritual now: set your st status to available and drain your inbox (read, act on, and archive each message). Then stand by for work delivered via ding.";
+const BOOT_WORKER: &str = "You just cold-started. Run your boot ritual now: set your st status to available and drain your inbox (read, act on, and archive each message). Resume any unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains.";
 /// Convoy's boot prompt for `chief-of-staff` (verbatim).
 const BOOT_COS: &str = "You just cold-started. Run your boot ritual (set status available, drain inbox). If this is a fresh network with no populated private cos repo, run your first-run interview now, per your persona.";
 
@@ -148,9 +148,9 @@ impl IrAgent {
     /// project hook file is generated from st2-owned declarations and scripts for unattended seats.
     pub fn native_agent_command(&self) -> anyhow::Result<String> {
         let boot = if self.role == "chief-of-staff" {
-            "You just cold-started. Read AGENTS.md and run your st2 boot ritual now: set status available and drain your inbox. Resume durable context if present, then stand by for work delivered via ding."
+            "You just cold-started. Read AGENTS.md and run your st2 boot ritual now: set status available and drain your inbox. Resume any unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
         } else {
-            "You just cold-started. Run your st2 boot ritual now: set status available and drain your inbox. Resume durable context if present, then stand by for work delivered via ding."
+            "You just cold-started. Run your st2 boot ritual now: set status available and drain your inbox. Resume any unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
         };
         let model = self
             .model
@@ -838,7 +838,7 @@ mod tests {
         let a = worker();
         assert_eq!(
             a.agent_command().unwrap(),
-            "exec claude --permission-mode bypassPermissions --model 'opus' 'You just cold-started. Run your boot ritual now: set your st status to available and drain your inbox (read, act on, and archive each message). Then stand by for work delivered via ding.'"
+            "exec claude --permission-mode bypassPermissions --model 'opus' 'You just cold-started. Run your boot ritual now: set your st status to available and drain your inbox (read, act on, and archive each message). Resume any unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains.'"
         );
         // No model → no --model flag.
         let mut b = worker();

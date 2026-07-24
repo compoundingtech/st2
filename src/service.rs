@@ -39,6 +39,13 @@ pub struct ServiceSpec {
     catalog: PathBuf,
     /// Baked `--host`; `None` lets `st2 up` auto-detect the hostname (matching a manual `st2 up`).
     host: Option<String>,
+    /// Explicit command search path inherited by st2 and every task it launches. A systemd user
+    /// manager normally has only system directories on PATH, while pty/Codex commonly live under
+    /// user-local or version-manager directories.
+    path: String,
+    /// Optional machine-local pty registry. This is deliberately independent of the synced catalog:
+    /// a runner swap can adopt live sessions from a legacy registry without syncing pid/socket state.
+    pty_root: Option<PathBuf>,
     memory_max_mb: u64,
 }
 
@@ -47,12 +54,28 @@ impl ServiceSpec {
         exe: impl Into<PathBuf>,
         catalog: impl Into<PathBuf>,
         host: Option<String>,
+        path: impl Into<String>,
+        pty_root: Option<PathBuf>,
         memory_max_mb: u64,
     ) -> Result<Self> {
         if memory_max_mb == 0 {
             bail!("--memory-max-mb must be greater than zero");
         }
-        Ok(Self { exe: exe.into(), catalog: catalog.into(), host, memory_max_mb })
+        let path = path.into();
+        if path.is_empty() {
+            bail!("service PATH cannot be empty");
+        }
+        if pty_root.as_ref().is_some_and(|root| !root.is_absolute()) {
+            bail!("--pty-root must be an absolute path");
+        }
+        Ok(Self {
+            exe: exe.into(),
+            catalog: catalog.into(),
+            host,
+            path,
+            pty_root,
+            memory_max_mb,
+        })
     }
 
     /// The `ExecStart` argv: `<st2> up --catalog <catalog> [--host <h>]`.
@@ -71,9 +94,16 @@ impl ServiceSpec {
     }
 }
 
-/// `st2 service install [--catalog <catalog>] [--host H] [--memory-max-mb N]`.
-pub fn install(catalog: &Path, host: Option<String>, memory_max_mb: u64) -> Result<()> {
+/// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
+/// [--memory-max-mb N]`.
+pub fn install(
+    catalog: &Path,
+    host: Option<String>,
+    pty_root: Option<PathBuf>,
+    memory_max_mb: u64,
+) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
+    let path = service_path(&exe)?;
     // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must exist
     // now (you install the service against a rendered catalog, not a future one).
     let catalog = catalog.canonicalize().with_context(|| {
@@ -82,7 +112,13 @@ pub fn install(catalog: &Path, host: Option<String>, memory_max_mb: u64) -> Resu
             catalog.display()
         )
     })?;
-    let spec = ServiceSpec::new(exe, &catalog, host, memory_max_mb)?;
+    let pty_root = pty_root
+        .map(|root| {
+            root.canonicalize()
+                .with_context(|| format!("pty root {} does not exist", root.display()))
+        })
+        .transpose()?;
+    let spec = ServiceSpec::new(exe, &catalog, host, path, pty_root, memory_max_mb)?;
 
     install_systemd_user(&spec)?;
 
@@ -92,8 +128,28 @@ pub fn install(catalog: &Path, host: Option<String>, memory_max_mb: u64) -> Resu
         Some(h) => println!("host\t{h}"),
         None => println!("host\t(auto-detected at runtime)"),
     }
+    match &spec.pty_root {
+        Some(root) => println!("pty-root\t{}", root.display()),
+        None => println!("pty-root\t{}/pty (catalog default)", catalog.display()),
+    }
     println!("memory-max-mb\t{memory_max_mb}");
     Ok(())
+}
+
+/// Persist the invoking PATH in the unit, prepending the installed st2 directory when necessary.
+/// This makes the unit independent of systemd's sparse manager environment while retaining the
+/// exact version-manager/user-local directories the operator verified at install time.
+fn service_path(exe: &Path) -> Result<String> {
+    let ambient = env::var_os("PATH").context("PATH is not set")?;
+    let mut entries: Vec<PathBuf> = env::split_paths(&ambient).collect();
+    if let Some(parent) = exe.parent()
+        && !entries.iter().any(|entry| entry == parent)
+    {
+        entries.insert(0, parent.to_path_buf());
+    }
+    env::join_paths(entries)
+        .context("service PATH contains an unsupported byte")
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// `st2 service status` — show the unit's systemd status.
@@ -211,6 +267,8 @@ After=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
+Environment={}\n\
+{}\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
@@ -219,6 +277,14 @@ WorkingDirectory={}\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
+        systemd_quote_arg(&format!("PATH={}", spec.path)),
+        spec.pty_root
+            .as_ref()
+            .map(|root| format!(
+                "Environment={}\n",
+                systemd_quote_arg(&format!("PTY_ROOT={}", root.display()))
+            ))
+            .unwrap_or_default(),
         spec.memory_max_mb,
         systemd_quote_arg(&spec.catalog.display().to_string())
     )
@@ -260,6 +326,8 @@ mod tests {
             "/home/user/.cargo/bin/st2",
             "/home/user/catalog",
             None,
+            "/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin",
+            None,
             DEFAULT_MEMORY_MAX_MB,
         )?;
 
@@ -274,6 +342,10 @@ mod tests {
         assert!(unit.contains("RestartSec=5s"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("WorkingDirectory=/home/user/catalog"));
+        assert!(unit.contains(
+            "Environment=PATH=/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin"
+        ));
+        assert!(!unit.contains("Environment=PTY_ROOT="));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("replaces convoy-up.service"));
         Ok(())
@@ -285,6 +357,8 @@ mod tests {
             "/usr/local/bin/st2",
             "/srv/catalog",
             Some("hetz".to_string()),
+            "/usr/local/bin:/usr/bin",
+            Some(PathBuf::from("/srv/legacy-pty")),
             512,
         )?;
 
@@ -294,6 +368,7 @@ mod tests {
             unit.contains("ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz")
         );
         assert!(unit.contains("MemoryMax=512M"));
+        assert!(unit.contains("Environment=PTY_ROOT=/srv/legacy-pty"));
         Ok(())
     }
 
@@ -303,6 +378,8 @@ mod tests {
             "/opt/st2 tools/st2",
             "/srv/cat 100%",
             None,
+            "/opt/st2 tools:/usr/bin",
+            Some(PathBuf::from("/srv/pty 100%")),
             256,
         )?;
 
@@ -312,12 +389,31 @@ mod tests {
             unit.contains("ExecStart=\"/opt/st2 tools/st2\" up --catalog \"/srv/cat 100%%\"")
         );
         assert!(unit.contains("WorkingDirectory=\"/srv/cat 100%%\""));
+        assert!(unit.contains("Environment=\"PATH=/opt/st2 tools:/usr/bin\""));
+        assert!(unit.contains("Environment=\"PTY_ROOT=/srv/pty 100%%\""));
         Ok(())
     }
 
     #[test]
     fn zero_memory_max_is_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, 0).unwrap_err();
+        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0).unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn empty_path_and_relative_pty_root_are_rejected() {
+        let err = ServiceSpec::new("/bin/st2", "/cat", None, "", None, 1).unwrap_err();
+        assert!(err.to_string().contains("PATH cannot be empty"));
+
+        let err = ServiceSpec::new(
+            "/bin/st2",
+            "/cat",
+            None,
+            "/bin",
+            Some(PathBuf::from("relative")),
+            1,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("absolute"));
     }
 }

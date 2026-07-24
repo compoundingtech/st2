@@ -41,6 +41,13 @@ pub fn pretrust(dirs: &[PathBuf]) -> Result<usize> {
     Ok(n)
 }
 
+/// Pre-trust workspaces for Codex only. Reconciliation uses this immediately before launching a
+/// missing Codex agent task, so a synced declaration cannot park on the interactive workspace-trust
+/// prompt. Keeping this Codex-specific avoids touching Claude configuration during a Codex rollout.
+pub fn pretrust_codex(dirs: &[PathBuf]) -> Result<usize> {
+    pretrust_codex_at(&codex_config_path()?, dirs)
+}
+
 /// The codex config file: `$CODEX_HOME/config.toml` if set, else `~/.codex/config.toml`.
 fn codex_config_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CODEX_HOME") {

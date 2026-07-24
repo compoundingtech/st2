@@ -17,13 +17,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
+use crate::ding::Poker;
 use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
 use crate::spec::TaskKind;
 
@@ -629,8 +630,67 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
+    gate_codex_launches(root, &mut plan, &mut report, crate::pretrust::pretrust_codex);
     execute(&plan, runner, cap, &mut report);
     report
+}
+
+/// A missing Codex agent must be trusted before its pty exists. Codex's bypass flags do not bypass
+/// the workspace-trust prompt; without this gate a remotely synced declaration appears launched but
+/// is really parked waiting for a human keystroke. Batch every workspace into one atomic config
+/// update, and fail closed: if trust cannot be established, suppress the affected agent launches
+/// (including their sidecars) and surface the error. Already-live/adopted agents never enter this
+/// path.
+fn gate_codex_launches<'a, F>(
+    catalog_root: &Path,
+    plan: &mut ReconcilePlan<'a>,
+    report: &mut UpReport,
+    pretrust: F,
+) where
+    F: FnOnce(&[PathBuf]) -> anyhow::Result<usize>,
+{
+    let mut workspaces = Vec::new();
+    let mut gated_agents = Vec::new();
+    for launch in &plan.launch {
+        let Some(agent) = launch
+            .tasks
+            .iter()
+            .find(|target| target.name == "agent" && command_invokes_codex(&target.command))
+        else {
+            continue;
+        };
+        let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
+        let workspace = resolve_task_cwd(agent, spec_dir, catalog_root);
+        if !workspaces.contains(&workspace) {
+            workspaces.push(workspace);
+        }
+        gated_agents.push(launch.spec.identity.clone());
+    }
+    if workspaces.is_empty() {
+        return;
+    }
+
+    if let Err(error) = pretrust(&workspaces) {
+        plan.launch
+            .retain(|launch| !gated_agents.contains(&launch.spec.identity));
+        report.errors.push(format!(
+            "pretrust Codex workspace(s) for {}: {error}; launch suppressed",
+            gated_agents.join(", ")
+        ));
+    }
+}
+
+/// Recognize the exact command shape st2's renderers emit, with an absolute binary path accepted for
+/// operator-authored specs. This intentionally does not guess through arbitrary shell pipelines.
+fn command_invokes_codex(command: &str) -> bool {
+    let command = command.trim();
+    let command = command.strip_prefix("exec ").unwrap_or(command).trim_start();
+    let Some(program) = command.split_ascii_whitespace().next() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "codex")
 }
 
 /// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
@@ -638,13 +698,30 @@ fn reconcile_pass(
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    Ok(reconcile_pass(
+    let report = reconcile_pass(
         root,
         this_host,
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
-    ))
+    );
+    shepherd_tick(root, this_host);
+    Ok(report)
+}
+
+fn shepherd_tick(root: &Path, this_host: &str) {
+    const CADENCE: u64 = 2 * 60 * 60;
+    let bucket = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / CADENCE;
+    let d = crate::discovery::discover(root);
+    let roots: Vec<_> = d.specs.iter().filter(|s| s.host.as_deref().unwrap_or(this_host) == this_host && s.role.as_deref() == Some("root") && s.tasks.iter().any(|t| t.command.as_deref().is_some_and(|c| c.contains("codex"))) && !s.retired).collect();
+    if roots.len() != 1 { return; }
+    let spec = roots[0];
+    let dir = spec.path.parent().unwrap_or(root);
+    if crate::status::read_state(&crate::status::status_path(dir)) == crate::status::State::Dnd { return; }
+    let marker = root.join(".st2-shepherd-bucket");
+    if std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(bucket) { return; }
+    let bus_id = format!("{}.{}", this_host, spec.identity);
+    if crate::ding::PtyPoker::new(bus_id).poke("[ST2 LOCAL TICK] Check your inbox and resume unfinished durable work; this is a local shepherd tick.").is_ok() { let _ = std::fs::write(marker, bucket.to_string()); }
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -895,6 +972,7 @@ pub fn up_loop(
 
     loop {
         let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
+        shepherd_tick(root, this_host);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1038,6 +1116,7 @@ mod tests {
         AgentSpec {
             identity: "demo".into(),
             host: Some("hetz".into()),
+            role: None,
             job_type: JobType::Service,
             workspace: None,
             supervisor: None,

@@ -23,6 +23,7 @@ fn spec(identity: &str, host: Option<&str>, job_type: JobType, retired: bool, ta
     AgentSpec {
         identity: identity.to_string(),
         host: host.map(String::from),
+        role: None,
         job_type,
         workspace: None,
         supervisor: None,
