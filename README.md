@@ -38,6 +38,27 @@ Discovery is **content-based**: st2 slurps `agents/**/*.{kdl,toml,json}`, and a 
 carries agent-shaped content. The path supplies `host`+`id` as defaults; spec content wins; a mismatch
 warns. **Dot-prefixed names are runner-state** and are skipped (R03).
 
+### Selecting the catalog
+
+Every catalog-aware command uses the same selection order:
+
+1. `--catalog <path>`
+2. `$CATALOG`
+3. `${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`
+
+That makes the default network path-free:
+
+```sh
+st2 agents
+st2 validate --strict
+st2 pty ls
+st2 up --once
+```
+
+Use `--catalog` anywhere in the command when targeting another network, for example
+`st2 agents --catalog /srv/st2/catalog`. The older positional catalog arguments and bus-level
+`--root` flags remain accepted for compatibility.
+
 ## The job — `agent.kdl`
 
 ```kdl
@@ -131,12 +152,12 @@ On a headless host (like hetz) install the supervisor as a systemd-user unit —
 replacement for `convoy-up.service`:
 
 ```sh
-st2 service install <catalog> [--host <h>] [--memory-max-mb N]   # write st2.service, enable, start
+st2 service install --catalog <catalog> [--host <h>] [--memory-max-mb N] # write, enable, start
 st2 service status                                               # systemctl --user status st2.service
 st2 service uninstall                                            # stop, disable, remove (idempotent)
 ```
 
-The unit runs `st2 up <catalog>` with `Restart=on-failure`. This is safe in a way
+The unit runs `st2 up --catalog <catalog>` with `Restart=on-failure`. This is safe in a way
 `convoy-up.service` never was: st2 spawns every task in its own transient scope (a **sibling** of
 `st2.service`, see [`src/isolate.rs`](src/isolate.rs)), so restarting the service reaps only the
 supervisor loop — the agents survive and a fresh supervisor adopts them
@@ -152,9 +173,9 @@ non-systemd hosts.
 ```sh
 cargo build
 cargo test                          # 162 tests
-./target/debug/st2 ls examples/catalog
-./target/debug/st2 up examples/catalog --host demo --once   # launch a few demo agents
-./target/debug/st2 up examples/catalog --host demo          # supervise (Ctrl-C to stop)
+./target/debug/st2 ls --catalog examples/catalog
+./target/debug/st2 up --catalog examples/catalog --host demo --once   # launch a few demo agents
+./target/debug/st2 up --catalog examples/catalog --host demo          # supervise (Ctrl-C to stop)
 ```
 
 The `pty` binary must be on `PATH` for the full suite: the pty-path Nomad-decoupling gate
@@ -184,12 +205,12 @@ cp examples/ir/personas/worker.md "$D/ir/personas/"
 sed "s|/replace/with/a/real/repo/path|$D/repo|" examples/ir/fleet.kdl > "$D/ir/fleet.kdl"
 
 # 2. Render → a runnable catalog + the workspace overlay (.claude/, .convoy/; git-excluded).
-st2 render "$D/ir" "$D/catalog"
-st2 ls     "$D/catalog"                 # the runner sees a runnable 2-task agent
+st2 render "$D/ir" --catalog "$D/catalog"
+st2 ls --catalog "$D/catalog"           # the runner sees a runnable 2-task agent
 
 # 3. Supervise — the agent boots (`exec claude …`) and talks on the smalltalk bus.
 #    Needs `claude` + `st` + `pty` on PATH (the same tools convoy uses).
-st2 up "$D/catalog"
+st2 up --catalog "$D/catalog"
 ```
 
 In another shell, watch + talk to it (the bus verbs read `$CATALOG`):
@@ -210,8 +231,8 @@ Rendered agents wire **identically to convoy** (proven byte-for-byte in
 The bus is just files: a message is a `<unix-ms>-<rand6>.md` markdown file (YAML frontmatter + body)
 written into the recipient's `<catalog>/<host>/<identity>/resources/inbox/`. The recipient is the
 path; `from` is in the frontmatter; archiving is an inbox→archive rename. Nothing is mutated after
-write. The root defaults to `$CATALOG` and the acting identity to `$ST_AGENT` — both set by st2 on
-every task it spawns, so a running agent needs no flags.
+write. The root follows `--catalog`, `$CATALOG`, then the default catalog; the acting identity
+defaults to `$ST_AGENT`. st2 sets both for every task it spawns, so a running agent needs no flags.
 
 ```sh
 st2 message send hetz.cos-claude -m "M2.1 landed" --subject "status"   # → prints the filename

@@ -20,6 +20,10 @@ use st2::{
     about = "Harness-agnostic runner over a unified catalog+inbox folder"
 )]
 struct Cli {
+    /// Catalog (or single-file fleet spec) to use. Defaults to $CATALOG, then
+    /// ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog.
+    #[arg(long = "catalog", global = true, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -28,14 +32,18 @@ struct Cli {
 enum Command {
     /// Discover and print every agent spec under a catalog+inbox folder.
     Ls {
-        /// The unified catalog+inbox folder to slurp.
-        root: PathBuf,
+        /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
+        /// default st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
     },
     /// Supervise a catalog+inbox folder: reconcile on a folder-watch + timer, keeping each agent's
     /// ptys running. With --once, do a single pass and exit.
     Up {
-        /// The unified catalog+inbox folder to slurp.
-        root: PathBuf,
+        /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
+        /// default st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
         /// Host to filter on (which agents this machine runs). Defaults to the local hostname.
         #[arg(long)]
         host: Option<String>,
@@ -79,7 +87,7 @@ enum Command {
         #[arg(long)]
         identity: Option<String>,
         /// Catalog root. Defaults to `$CATALOG`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
         /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
         #[arg(long)]
@@ -106,8 +114,10 @@ enum Command {
     Render {
         /// IR input folder — `*.kdl` agent declarations, with `personas/<persona>.md` alongside.
         ir_dir: PathBuf,
-        /// Catalog output folder.
-        catalog_dir: PathBuf,
+        /// Legacy positional catalog output folder. Prefer --catalog; defaults to $CATALOG, then
+        /// the default st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        catalog_dir: Option<PathBuf>,
     },
     /// Declare a new agent: author its IR entry (`<ir-dir>/<identity>.kdl`). No render, no launch —
     /// then `st2 compile` materializes it and `st2 up` runs it.
@@ -144,8 +154,10 @@ enum Command {
         visible_aliases = ["render-agent", "build-agent"]
     )]
     RenderAgent {
-        /// The catalog folder (the agent lands at `<catalog>/<host>/<identity>/`).
-        catalog: PathBuf,
+        /// Legacy positional catalog folder. Prefer --catalog; defaults to $CATALOG, then the
+        /// default st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        catalog: Option<PathBuf>,
         #[arg(long)]
         identity: String,
         #[arg(long, default_value = "worker")]
@@ -174,17 +186,21 @@ enum Command {
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
     /// tasks (stopping/crashing st2 never does). Idempotent.
     Down {
-        /// The catalog folder.
-        root: PathBuf,
+        /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
+        /// default st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
         /// Host to tear down. Defaults to the local hostname.
         #[arg(long)]
         host: Option<String>,
     },
-    /// Print shell exports for a catalog's bus — `eval "$(st2 env <catalog>)"` sets `CATALOG`/
+    /// Print shell exports for a catalog's bus — `eval "$(st2 env --catalog <catalog>)"` sets `CATALOG`/
     /// `ST_ROOT`/`PTY_ROOT` so `st`/`pty` target the catalog's bus.
     Env {
-        /// The catalog folder.
-        root: PathBuf,
+        /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
+        /// st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
     },
     /// Pre-trust agent workspaces in the claude config (`$CLAUDE_CONFIG_DIR/.claude.json` else
     /// `~/.claude.json`) BEFORE they boot, so a kick-driven `claude` never hangs on the "Is this a
@@ -215,9 +231,10 @@ enum Command {
         keep: bool,
     },
     /// Run `pty` against this catalog's bus with the env auto-set, so pty subcommands and the
-    /// interactive UI work without `eval "$(st2 env <catalog>)"` first. The catalog root is `$CATALOG`
-    /// if already set, else the current directory; `CATALOG`/`ST_ROOT`/`PTY_ROOT` are exported for the
-    /// child exactly as `st2 env` would. No arguments launches the interactive pty UI.
+    /// interactive UI work without `eval "$(st2 env --catalog <catalog>)"` first. Catalog selection follows
+    /// `--catalog`, `$CATALOG`, then the default st2 catalog. `CATALOG`/`ST_ROOT`/`PTY_ROOT` are
+    /// exported for the child exactly as `st2 env` would. No arguments launches the interactive pty
+    /// UI.
     Pty {
         /// Arguments passed through to `pty` verbatim (e.g. `ls`, `peek <session>`). None → the UI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -225,8 +242,8 @@ enum Command {
     },
     /// Drop into `$SHELL` with this catalog's bus env set (`CATALOG`/`ST_ROOT`/`PTY_ROOT`), so `pty`,
     /// `st`, and anything else target the catalog for the whole session without `eval "$(st2 env …)"`.
-    /// The general form of `st2 pty`. Root is `$CATALOG` if set, else cwd; extra args go to the shell
-    /// (e.g. `st2 shell -c "pty ls"`).
+    /// The general form of `st2 pty`. Catalog selection follows `--catalog`, `$CATALOG`, then the
+    /// default st2 catalog; extra args go to the shell (e.g. `st2 shell -c "pty ls"`).
     Shell {
         /// Arguments passed through to `$SHELL` verbatim. None → an interactive shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -237,8 +254,10 @@ enum Command {
     /// a stable code; exits non-zero on any ERROR (`--strict` also fails on warnings). `--json` emits
     /// machine output for a renderer's build gate.
     Validate {
-        /// The catalog folder.
-        root: PathBuf,
+        /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
+        /// st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
         /// Fail (non-zero exit) on warnings too, not just errors.
         #[arg(long)]
         strict: bool,
@@ -249,8 +268,10 @@ enum Command {
     /// Health check for a running catalog: tools on PATH, a supervisor holding the lock, each agent's
     /// task alive, and presence fresh (not rotted to `unknown`) or parked. Exits non-zero on problems.
     Doctor {
-        /// The catalog folder.
-        root: PathBuf,
+        /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
+        /// st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
         /// Host to check. Defaults to the local hostname.
         #[arg(long)]
         host: Option<String>,
@@ -259,6 +280,7 @@ enum Command {
     /// byte-compatible with smalltalk's `st agents`.
     Agents {
         /// The catalog folder (like `st2 ls`/`up`). Falls back to `--root`/`$CATALOG`.
+        #[arg(conflicts_with = "catalog_path")]
         catalog: Option<PathBuf>,
         /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
         #[arg(long = "status")]
@@ -279,8 +301,9 @@ enum Command {
 /// running agent needs no flags.
 #[derive(Args)]
 struct MsgCtx {
-    /// Catalog root. Defaults to `$CATALOG` (set by st2 on every task it spawns).
-    #[arg(long)]
+    /// Legacy catalog/bus root override. Prefer global `--catalog`; defaults to `$CATALOG`, then the
+    /// default st2 catalog.
+    #[arg(long, conflicts_with = "catalog_path")]
     root: Option<PathBuf>,
     /// The acting identity — who the message is `from` / whose inbox is "mine". Defaults to
     /// `$ST_AGENT`.
@@ -294,11 +317,12 @@ struct MsgCtx {
 #[derive(Subcommand)]
 enum ServiceCmd {
     /// Write the `st2.service` systemd-user unit, enable it (start on boot), and start it now.
-    /// Idempotent — safe to re-run. The unit runs `st2 up <catalog>`; agents spawn in sibling
+    /// Idempotent — safe to re-run. The unit runs `st2 up --catalog <catalog>`; agents spawn in sibling
     /// scopes, so a service restart never cascades to them.
     Install {
-        /// Catalog (or spec-file) path for `st2 up`. Defaults to `$CATALOG`, else the cwd. Resolved
-        /// to an absolute path — it must exist at install time.
+        /// Legacy positional catalog/spec path for `st2 up`. Prefer --catalog; defaults to
+        /// `$CATALOG`, then the default st2 catalog. It must exist at install time.
+        #[arg(conflicts_with = "catalog_path")]
         catalog: Option<PathBuf>,
         /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
         #[arg(long)]
@@ -490,16 +514,27 @@ enum MessageCmd {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Ls { root } => ls(&root),
+    let Cli {
+        catalog_path,
+        command,
+    } = Cli::parse();
+    initialize_catalog_env(catalog_path.as_deref())?;
+
+    match command {
+        Command::Ls { root } => {
+            let root = catalog_arg(root)?;
+            ls(&root)
+        }
         Command::Up {
             root,
             host,
             once,
             materialize_only,
             interval,
-        } => up(&root, host, once, materialize_only, interval),
+        } => {
+            let root = catalog_arg(root)?;
+            up(&root, host, once, materialize_only, interval)
+        }
         Command::Message(cmd) => message_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
@@ -522,7 +557,10 @@ fn main() -> Result<()> {
         Command::Render {
             ir_dir,
             catalog_dir,
-        } => render_cmd(&ir_dir, &catalog_dir),
+        } => {
+            let catalog_dir = catalog_arg(catalog_dir)?;
+            render_cmd(&ir_dir, &catalog_dir)
+        }
         Command::Add {
             identity,
             ir_dir,
@@ -548,18 +586,41 @@ fn main() -> Result<()> {
             model,
             supervisor,
             extra_arg,
-        } => render_agent_cmd(
-            &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
-            extra_arg,
-        ),
-        Command::Down { root, host } => down_cmd(&root, host),
-        Command::Env { root } => env_cmd(&root),
+        } => {
+            let catalog = catalog_arg(catalog)?;
+            render_agent_cmd(
+                &catalog,
+                &identity,
+                &role,
+                &dir,
+                &persona,
+                &harness,
+                host,
+                model,
+                supervisor,
+                extra_arg,
+            )
+        }
+        Command::Down { root, host } => {
+            let root = catalog_arg(root)?;
+            down_cmd(&root, host)
+        }
+        Command::Env { root } => {
+            let root = catalog_arg(root)?;
+            env_cmd(&root)
+        }
         Command::Pretrust { dirs, harness: _ } => pretrust_cmd(&dirs),
         Command::Eval { folder, host, keep } => eval_cmd(&folder, host, keep),
-        Command::Validate { root, strict, json } => validate_cmd(&root, strict, json),
+        Command::Validate { root, strict, json } => {
+            let root = catalog_arg(root)?;
+            validate_cmd(&root, strict, json)
+        }
         Command::Pty { args } => pty_cmd(&args),
         Command::Shell { args } => shell_cmd(&args),
-        Command::Doctor { root, host } => doctor_cmd(&root, host),
+        Command::Doctor { root, host } => {
+            let root = catalog_arg(root)?;
+            doctor_cmd(&root, host)
+        }
     }
 }
 
@@ -625,7 +686,7 @@ fn render_agent_cmd(
         .with_context(|| format!("compiling agent '{identity}'"))?;
     println!(
         "compiled {host}.{identity} → {}  \
-         (next: st2 validate {}; st2 up {} --host {host} --materialize-only; then st2 up {} --host {host} --once)",
+         (next: st2 validate --catalog {}; st2 up --catalog {} --host {host} --materialize-only; then st2 up --catalog {} --host {host} --once)",
         agent_dir.display(),
         catalog.display(),
         catalog.display(),
@@ -673,7 +734,7 @@ fn add_cmd(
         .with_context(|| format!("declared IR for '{identity}' does not parse"))?;
     std::fs::write(&path, &s)?;
     println!(
-        "declared {host}.{identity} → {}  (now: st2 compile {} <catalog>)",
+        "declared {host}.{identity} → {}  (now: st2 compile {} --catalog <catalog>)",
         path.display(),
         ir_dir.display()
     );
@@ -816,13 +877,67 @@ fn validate_cmd(root: &Path, strict: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The catalog root for the bus env: `$CATALOG` if already set, else the current directory. Same
-/// roots `st2 env` derives — the shared basis for `st2 pty` and `st2 shell`.
-fn catalog_root_for_env() -> Result<PathBuf> {
-    let root = std::env::var_os("CATALOG")
+/// The standard user catalog: `${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`.
+fn default_catalog_root() -> Option<PathBuf> {
+    nonempty_env_path("XDG_STATE_HOME")
+        .map(|state| state.join("st2/default/catalog"))
+        .or_else(|| {
+            nonempty_env_path("HOME")
+                .map(|home| home.join(".local/state/st2/default/catalog"))
+        })
+}
+
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir().context("resolving the current directory")?);
-    Ok(root.canonicalize().unwrap_or(root))
+}
+
+/// Make even a not-yet-created output catalog absolute, so a later cwd change cannot retarget it.
+fn absolute_catalog_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving the current directory")?
+            .join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
+/// Seed `$CATALOG` once for every command. An explicit global flag wins over an inherited env var;
+/// without either, the standard per-user catalog becomes the process default.
+fn initialize_catalog_env(explicit: Option<&Path>) -> Result<()> {
+    let selected = explicit
+        .map(Path::to_path_buf)
+        .or_else(|| nonempty_env_path("CATALOG"))
+        .or_else(default_catalog_root);
+    if let Some(path) = selected {
+        let path = absolute_catalog_path(&path)?;
+        // SAFETY: this is the first action after single-threaded CLI parsing, before any worker
+        // threads or child processes exist.
+        unsafe { std::env::set_var("CATALOG", path) };
+    }
+    Ok(())
+}
+
+/// Resolve an optional legacy positional path, otherwise use the shared catalog selection.
+fn catalog_arg(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(path) => absolute_catalog_path(&path),
+        None => catalog_root_for_env(),
+    }
+}
+
+/// The selected catalog root for bus-aware commands: `$CATALOG`, then the standard user catalog.
+/// `main` initializes `$CATALOG` from global `--catalog` before dispatch.
+fn catalog_root_for_env() -> Result<PathBuf> {
+    let root = nonempty_env_path("CATALOG")
+        .or_else(default_catalog_root)
+        .context(
+            "no catalog selected: pass --catalog, set $CATALOG, or set $XDG_STATE_HOME/$HOME",
+        )?;
+    absolute_catalog_path(&root)
 }
 
 /// Set `CATALOG`/`ST_ROOT`/`PTY_ROOT` on a child so `st`/`pty` target this catalog's bus — the same
@@ -865,7 +980,7 @@ fn shell_cmd(args: &[String]) -> Result<()> {
 fn env_cmd(root: &Path) -> Result<()> {
     let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let c = c.display();
-    // The same roots st2 sets on every task it spawns; `eval "$(st2 env <catalog>)"` makes st/pty
+    // The same roots st2 sets on every task it spawns; `eval "$(st2 env --catalog <catalog>)"` makes st/pty
     // target this catalog's bus.
     println!("export CATALOG={c}");
     println!("export ST_ROOT={c}/smalltalk");
@@ -1078,12 +1193,10 @@ fn ding_cmd(
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.
 fn resolve_ctx(ctx: &MsgCtx) -> Result<(PathBuf, String)> {
-    let root = ctx
-        .root
-        .clone()
-        .or_else(|| std::env::var_os("CATALOG").map(PathBuf::from))
-        .context("no catalog root: pass --root or run where $CATALOG is set")?;
-    let root = root.canonicalize().unwrap_or(root);
+    let root = match &ctx.root {
+        Some(root) => absolute_catalog_path(root)?,
+        None => catalog_root_for_env()?,
+    };
     let host = ctx.host.clone().unwrap_or_else(detect_host);
     Ok((root, host))
 }
@@ -1528,7 +1641,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// `st2 up <single-file-spec>` — supervise the spec's top-level team as a fleet: keep-alive + respawn,
-/// nomad-decoupled, exactly like `st2 up <catalog>` (the `convoy up` replacement). `--once` does a
+/// nomad-decoupled, exactly like `st2 up --catalog <catalog>` (the `convoy up` replacement). `--once` does a
 /// single boot pass; otherwise it supervises on a timer under a host lock until Ctrl-C.
 fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u64) -> Result<()> {
     let (spec, root) = st2::eval_run::load_spec(spec_file)?;

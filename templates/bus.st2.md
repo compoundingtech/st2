@@ -55,9 +55,9 @@ the catalog, and the already-running `st2 up` reconciles it in on its next pass 
 ```sh
 # author the agent's IR entry, then materialize its agent.kdl + workspace overlay:
 st2 add <identity> <ir-dir> --role <r> --host <h> --workspace <w> [--persona <p>] [--supervisor <s>]
-st2 compile <ir-dir> <catalog>
+st2 compile <ir-dir> --catalog "$CATALOG"
 # — or compile one agent straight into the catalog (imperative sibling of `st2 compile`):
-st2 compile-agent --identity <id> --dir <workspace> --persona <file> [--role <r>] [--host <h>] <catalog>
+st2 compile-agent --identity <id> --dir <workspace> --persona <file> [--role <r>] [--host <h>] --catalog "$CATALOG"
 ```
 
 The running `st2 up` then boots it — no separate launch step. **If you are a worker: you do NOT add
@@ -89,5 +89,7 @@ Resources:
 Adding agents (supervisor/CoS): `st2 add` / `st2 compile` / `st2 compile-agent` (see above) — declarative;
 `st2 up` reconciles it in.
 
-Shared ctx flags on bus ops: `--root` (default `$CATALOG`), `--as <identity>` (default `$ST_AGENT`),
-`--host`. Every command supports `--help`.
+Catalog selection on every catalog-aware command: `--catalog <path>` → `$CATALOG` →
+`${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`. Bus ops retain `--root` as a legacy
+flat-bus/catalog override. Other shared bus flags: `--as <identity>` (default `$ST_AGENT`), `--host`.
+Every command supports `--help`.

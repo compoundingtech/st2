@@ -55,11 +55,12 @@ impl ServiceSpec {
         Ok(Self { exe: exe.into(), catalog: catalog.into(), host, memory_max_mb })
     }
 
-    /// The `ExecStart` argv: `<st2> up <catalog> [--host <h>]`.
+    /// The `ExecStart` argv: `<st2> up --catalog <catalog> [--host <h>]`.
     fn program_arguments(&self) -> Vec<String> {
         let mut args = vec![
             self.exe.display().to_string(),
             "up".to_string(),
+            "--catalog".to_string(),
             self.catalog.display().to_string(),
         ];
         if let Some(host) = &self.host {
@@ -70,7 +71,7 @@ impl ServiceSpec {
     }
 }
 
-/// `st2 service install [<catalog>] [--host H] [--memory-max-mb N]`.
+/// `st2 service install [--catalog <catalog>] [--host H] [--memory-max-mb N]`.
 pub fn install(catalog: &Path, host: Option<String>, memory_max_mb: u64) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
     // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must exist
@@ -164,7 +165,7 @@ fn uninstall_systemd_user() -> Result<()> {
 fn unsupported() -> Result<()> {
     bail!(
         "st2 service is Linux/systemd-user only (headless hosts like hetz). On macOS, run \
-         `st2 up <catalog>` yourself — the Mac stays manual for TCC reasons (a launchd-owned \
+         `st2 up --catalog <catalog>` yourself — the Mac stays manual for TCC reasons (a launchd-owned \
          process can't inherit your GUI/keychain trust)."
     )
 }
@@ -264,7 +265,9 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(unit.contains("ExecStart=/home/user/.cargo/bin/st2 up /home/user/catalog"));
+        assert!(
+            unit.contains("ExecStart=/home/user/.cargo/bin/st2 up --catalog /home/user/catalog")
+        );
         // No --host baked when unset → st2 up auto-detects, same as a manual run.
         assert!(!unit.contains("--host"));
         assert!(unit.contains("Restart=on-failure"));
@@ -287,7 +290,9 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(unit.contains("ExecStart=/usr/local/bin/st2 up /srv/catalog --host hetz"));
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz")
+        );
         assert!(unit.contains("MemoryMax=512M"));
         Ok(())
     }
@@ -303,7 +308,9 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(unit.contains("ExecStart=\"/opt/st2 tools/st2\" up \"/srv/cat 100%%\""));
+        assert!(
+            unit.contains("ExecStart=\"/opt/st2 tools/st2\" up --catalog \"/srv/cat 100%%\"")
+        );
         assert!(unit.contains("WorkingDirectory=\"/srv/cat 100%%\""));
         Ok(())
     }

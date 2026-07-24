@@ -39,12 +39,22 @@ fn ping_is_an_alias_for_ding() {
     let text = String::from_utf8_lossy(&help.stdout);
     assert!(text.contains("inbox"), "ping --help should be the ding help; got: {text}");
 
-    // And a bare `st2 ping` dispatches INTO the ding handler (past clap) — it reaches ding's runtime
-    // catalog-root requirement, not an "unrecognized subcommand" clap error.
-    let out = st2().arg("ping").output().unwrap();
+    // And a bare `st2 ping` dispatches INTO the ding handler (past clap). Catalog selection now has
+    // an XDG default, so the next required runtime input is the acting identity.
+    let state = tempfile::tempdir().unwrap();
+    let out = st2()
+        .arg("ping")
+        .env("XDG_STATE_HOME", state.path())
+        .env_remove("CATALOG")
+        .env_remove("ST_AGENT")
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("catalog root"), "ping should reach the ding handler; got: {err}");
+    assert!(
+        err.contains("acting identity"),
+        "ping should reach the ding handler; got: {err}"
+    );
     assert!(
         !err.to_lowercase().contains("unrecognized"),
         "ping should be a recognized alias; got: {err}"
