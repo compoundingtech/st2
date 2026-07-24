@@ -452,6 +452,13 @@ fn hidden_runner_state_and_resources_are_ignored() {
         "agents/hetz/a/resources/inbox/1784-abc.md",
         "a message",
     );
+    // The canonical PTY_ROOT is `<catalog>/pty`. Its session JSON contains command/cwd fields and
+    // must never be mistaken for a catalog agent declaration.
+    write(
+        tmp.path(),
+        "pty/hetz.a.json",
+        r#"{"name":"hetz.a","status":"running","command":"sh -c x","cwd":"/tmp"}"#,
+    );
 
     let found = discover(tmp.path());
     assert_eq!(found.specs.len(), 1);

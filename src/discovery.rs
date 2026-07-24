@@ -37,7 +37,7 @@ const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 pub fn discover(root: &Path) -> Discovered {
     let mut out = Discovered::default();
     let mut files = Vec::new();
-    collect_spec_files(root, &mut files);
+    collect_spec_files(root, root, &mut files);
     files.sort();
     for path in files {
         match load_specs(root, &path) {
@@ -51,9 +51,11 @@ pub fn discover(root: &Path) -> Discovered {
     out
 }
 
-/// Recursively gather candidate spec files, skipping dotfiles/dotdirs (`.git`, hidden config) and
-/// anything that isn't one of [`SPEC_EXTS`]. Unreadable directories are skipped, not fatal.
-fn collect_spec_files(dir: &Path, acc: &mut Vec<PathBuf>) {
+/// Recursively gather candidate spec files, skipping dotfiles/dotdirs (`.git`, hidden config), the
+/// top-level `pty/` runtime registry, and anything that isn't one of [`SPEC_EXTS`]. `pty` session
+/// metadata includes JSON that can resemble an agent spec; it is runner state, never catalog input.
+/// Unreadable directories are skipped, not fatal.
+fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -70,7 +72,10 @@ fn collect_spec_files(dir: &Path, acc: &mut Vec<PathBuf>) {
             Err(_) => continue,
         };
         if ft.is_dir() {
-            collect_spec_files(&path, acc);
+            if path == root.join("pty") {
+                continue;
+            }
+            collect_spec_files(root, &path, acc);
         } else if ft.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && SPEC_EXTS.contains(&ext)

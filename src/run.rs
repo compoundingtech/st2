@@ -143,10 +143,13 @@ impl PtyCli {
         // Per-task env, $-expanded (nothing shell-expands these downstream). $CATALOG is also set so
         // the command's own `sh -c` expansion can reference it. PTY_ROOT resolves to the EFFECTIVE root
         // (an exported ambient one wins over the rendered `$CATALOG/pty`), so the session lands where
-        // st2's own list/kill will look for it.
+        // st2's own list/kill will look for it. A PTY task always gets a real terminal type even when
+        // st2 itself was started headlessly with `TERM=dumb`; harness TUIs otherwise stop at a prompt.
+        // An explicit task `env { TERM "..." }` below still wins.
         cmd.env("CATALOG", &self.catalog_root)
             .env("ST_ROOT", &self.catalog_root)
-            .env("PTY_ROOT", effective_pty_root(&self.catalog_root));
+            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+            .env("TERM", "xterm-256color");
         if let Ok(path) = crate::hooks::hooks_dir() {
             cmd.env("ST_HOOKS", path);
         }
@@ -1175,6 +1178,25 @@ mod tests {
             envs.get("ST_AGENT"),
             Some(&Some("hetz.demo-claude".to_string()))
         );
+        assert_eq!(
+            envs.get("TERM"),
+            Some(&Some("xterm-256color".to_string())),
+            "headless st2 launches must not pass TERM=dumb into an interactive harness"
+        );
+    }
+
+    #[test]
+    fn build_run_command_allows_a_task_to_override_the_default_term() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo.agent", "exec codex 'boot'");
+        t.env.insert("TERM".into(), "screen-256color".into());
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let term = cmd
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("TERM"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(term.as_deref(), Some("screen-256color"));
     }
 
     #[test]
