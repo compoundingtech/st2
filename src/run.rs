@@ -713,6 +713,15 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 enum ShepherdDecision { Skip, Due }
 const SHEPHERD_PROMPT: &str = "[ST2 LOCAL TICK] Run the scheduled local machine-root health sweep: inspect catalog/service/fabric/PTY state, safe drift, and report incidents. This is not an inbox event and must not poll the inbox.";
 
+/// Injectable delivery/state seam shared by one-shot and supervised shepherd passes.
+fn shepherd_attempt<P, W>(bucket: u64, last: Option<u64>, dnd: bool, mut poke: P, mut write: W) -> ShepherdDecision
+where P: FnMut() -> bool, W: FnMut(u64) -> bool {
+    if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return ShepherdDecision::Skip; }
+    if !poke() { return ShepherdDecision::Due; }
+    let _ = write(bucket);
+    ShepherdDecision::Due
+}
+
 fn shepherd_decision(bucket: u64, last: Option<u64>, dnd: bool) -> ShepherdDecision {
     if dnd || last == Some(bucket) { ShepherdDecision::Skip } else { ShepherdDecision::Due }
 }
@@ -734,8 +743,10 @@ fn shepherd_tick(root: &Path, this_host: &str) {
     if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return; }
     let bus_id = format!("{}.{}", this_host, spec.identity);
     let _ = std::fs::write(&attempt, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().to_string());
-    if crate::ding::PtyPoker::new(bus_id).poke(SHEPHERD_PROMPT).is_ok()
-        && std::fs::write(&marker, bucket.to_string()).is_ok() { let _ = std::fs::remove_file(attempt); }
+    let delivered = std::cell::Cell::new(false);
+    shepherd_attempt(bucket, last, dnd,
+        || { let ok = crate::ding::PtyPoker::new(&bus_id).poke(SHEPHERD_PROMPT).is_ok(); delivered.set(ok); ok },
+        |b| { let ok = std::fs::write(&marker, b.to_string()).is_ok(); if ok && delivered.get() { let _ = std::fs::remove_file(&attempt); } ok });
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -1463,5 +1474,12 @@ mod tests {
         assert!(command_invokes_codex("/opt/bin/codex --model x"));
         assert!(!command_invokes_codex("echo codex"));
         assert!(!command_invokes_codex("claude codex"));
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(shepherd_attempt(1, None, false, || { calls.set(calls.get()+1); true }, |_| true), ShepherdDecision::Due);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(shepherd_attempt(1, Some(1), false, || { calls.set(calls.get()+1); true }, |_| true), ShepherdDecision::Skip);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(shepherd_attempt(2, None, false, || false, |_| true), ShepherdDecision::Due);
+        assert_eq!(shepherd_attempt(2, None, true, || { panic!("dnd poke") }, |_| true), ShepherdDecision::Skip);
     }
 }
