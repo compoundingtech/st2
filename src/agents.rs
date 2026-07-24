@@ -1,0 +1,175 @@
+//! The agent roster (M2.3): the data behind `st2 agents`. Enumerates the catalog's agents with their
+//! presence status, and optionally last-activity + inbox count. The CLI's JSON is byte-compatible
+//! with smalltalk's `st agents --json [--enrich]` (`{identity, status, name}` / `+{lastActivity,
+//! inbox}`) so existing tooling — cos shepherd sweeps, jq — is a drop-in.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+use crate::message;
+use crate::status::{self, State};
+
+/// One roster row: everything `st2 agents [--enrich]` can report about an agent.
+#[derive(Debug, Clone)]
+pub struct AgentRow {
+    /// The bus id — `<host>.<identity>` (the folder-name form smalltalk reports as `identity`).
+    pub identity: String,
+    /// Effective presence (derived: stale → `unknown`, etc.).
+    pub status: State,
+    /// Optional display name (`<agent_dir>/name`), else `None`.
+    pub name: Option<String>,
+    /// Newest mtime (unix ms) across the agent's inbox, archive, and status file; `None` if nothing
+    /// has been touched. `--enrich` only.
+    pub last_activity_ms: Option<f64>,
+    /// Count of canonical message files in the agent's inbox. `--enrich` only.
+    pub inbox: usize,
+}
+
+/// Every agent in the catalog, sorted by bus id, with presence + enrich data computed. Read-only:
+/// walks discovered specs and each agent's resources, mutating nothing.
+pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
+    let found = crate::discover(catalog_root);
+    let mut rows: Vec<AgentRow> = found
+        .specs
+        .iter()
+        .filter_map(|s| {
+            let agent_dir = s.path.parent()?;
+            Some(AgentRow {
+                identity: s.bus_id(this_host),
+                status: status::read_state(&status::status_path(agent_dir)),
+                name: read_name(agent_dir),
+                last_activity_ms: newest_mtime_ms(agent_dir),
+                inbox: inbox_count(agent_dir),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.identity.cmp(&b.identity));
+    rows
+}
+
+/// `st2 agents --json` row. Field ORDER + names are the wire contract — they byte-match smalltalk's
+/// `st agents --json`.
+#[derive(Serialize)]
+struct SummaryJson<'a> {
+    identity: &'a str,
+    status: &'a str,
+    name: Option<&'a str>,
+}
+
+/// `st2 agents --json --enrich` row (adds `lastActivity` + `inbox`, matching smalltalk's order).
+#[derive(Serialize)]
+struct EnrichedJson<'a> {
+    identity: &'a str,
+    status: &'a str,
+    name: Option<&'a str>,
+    #[serde(rename = "lastActivity")]
+    last_activity: Option<f64>,
+    inbox: usize,
+}
+
+/// Serialize a roster to the JSON `st2 agents --json [--enrich]` emits — byte-compatible with
+/// smalltalk's `st agents --json [--enrich]` (this is the parity contract).
+pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
+    if enrich {
+        let out: Vec<EnrichedJson> = rows
+            .iter()
+            .map(|r| EnrichedJson {
+                identity: &r.identity,
+                status: r.status.as_str(),
+                name: r.name.as_deref(),
+                last_activity: r.last_activity_ms,
+                inbox: r.inbox,
+            })
+            .collect();
+        serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
+    } else {
+        let out: Vec<SummaryJson> = rows
+            .iter()
+            .map(|r| SummaryJson { identity: &r.identity, status: r.status.as_str(), name: r.name.as_deref() })
+            .collect();
+        serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+/// `<agent_dir>/name` first line, if non-empty.
+fn read_name(agent_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(agent_dir.join("name")).ok()?;
+    let first = raw.lines().next().unwrap_or("").trim();
+    (!first.is_empty()).then(|| first.to_string())
+}
+
+/// Count canonical `<unix-ms>-<rand6>.md` files in the agent's `resources/inbox`.
+fn inbox_count(agent_dir: &Path) -> usize {
+    let dir = message::inbox_dir(agent_dir);
+    match fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| message::is_message_filename(&e.file_name().to_string_lossy()))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Newest mtime (unix ms) across the agent's inbox files, archive files, and status file (mirrors
+/// smalltalk's `computeLastActivity`). `None` if none of those exist.
+fn newest_mtime_ms(agent_dir: &Path) -> Option<f64> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for dir in [message::inbox_dir(agent_dir), message::archive_dir(agent_dir)] {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            candidates.extend(rd.flatten().map(|e| e.path()));
+        }
+    }
+    candidates.push(status::status_path(agent_dir));
+
+    let mut newest: Option<SystemTime> = None;
+    for p in candidates {
+        if let Ok(m) = fs::metadata(&p)
+            && let Ok(t) = m.modified()
+            && newest.is_none_or(|n| t > n)
+        {
+            newest = Some(t);
+        }
+    }
+    newest
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64() * 1000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(identity: &str, status: State, name: Option<&str>, last: Option<f64>, inbox: usize) -> AgentRow {
+        AgentRow {
+            identity: identity.to_string(),
+            status,
+            name: name.map(str::to_string),
+            last_activity_ms: last,
+            inbox,
+        }
+    }
+
+    /// The JSON `st2 agents --json` emits must byte-match smalltalk's shape: field names, order, and
+    /// null handling. This is the `agents --json` parity contract (see INVARIANTS.md).
+    #[test]
+    fn agents_json_is_byte_compatible_with_smalltalk() {
+        let rows = [
+            row("hetz.cos-claude", State::Available, None, Some(1784653027733.6138), 1),
+            row("hetz.st2-claude", State::Busy, Some("owner"), None, 0),
+        ];
+
+        assert_eq!(
+            to_json(&rows, false),
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner"}]"#
+        );
+        assert_eq!(
+            to_json(&rows, true),
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"lastActivity":1784653027733.6138,"inbox":1},{"identity":"hetz.st2-claude","status":"busy","name":"owner","lastActivity":null,"inbox":0}]"#
+        );
+        // Empty roster is `[]`, not `null`.
+        assert_eq!(to_json(&[], true), "[]");
+    }
+}

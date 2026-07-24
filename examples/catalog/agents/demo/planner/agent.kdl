@@ -1,0 +1,30 @@
+// A service agent in the canonical VRS KDL format (spec.md §2).
+// `host "demo"` and `identity "planner"` also come from the path; spelled out for clarity.
+agent "planner" {
+  host      "demo"
+  type      "service"
+  workspace "/tmp"
+  supervisor "root"
+  restart { attempts 3; interval "60s"; delay "2s"; mode "delay" }
+
+  // The agent process — a pty (allocates a terminal, like a real harness). In production this is
+  // `exec claude …`; here a harmless heartbeat so the demo runs. st2 runs it verbatim under `sh -c`.
+  pty "agent" {
+    id      "demo.planner"
+    command #"while true; do echo "[planner] working… $(date +%T)"; sleep 10; done"#
+    env {
+      ST_AGENT "demo.planner"
+      DATA_DIR "$CATALOG/data/planner"   // $CATALOG is expanded by st2 at spawn
+    }
+  }
+
+  // The ding sidecar — an exec task (terminal-free, R09). In production:
+  //   st ding demo.planner --identity demo.planner-claude --root $CATALOG/…
+  exec "ding" {
+    id      "demo.planner.ding"
+    command #"while true; do echo "[planner.ding] would watch resources/inbox/"; sleep 30; done"#
+    keep #true
+  }
+
+  meta { tier "worker" }   // inert — ignored by every runner
+}

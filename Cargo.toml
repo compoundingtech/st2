@@ -1,0 +1,31 @@
+[package]
+name = "st2"
+version = "0.1.0"
+edition = "2024"
+description = "Harness-agnostic runner: reconcile a unified catalog+inbox folder of rendered agent specs, keep their ptys running, and deliver messages by moving inbox files."
+license = "MIT"
+
+[[bin]]
+name = "st2"
+path = "src/main.rs"
+
+[lib]
+name = "st2"
+path = "src/lib.rs"
+
+[dependencies]
+# Sync by design, mirroring convoy-rust: the runner is I/O-light (shell-outs to `pty` + a
+# folder watch + a sleep), so no tokio. Deps grow per milestone; M0 needs only parse + CLI.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+kdl = "6"
+libc = "0.2"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"
+toml = "0.9"

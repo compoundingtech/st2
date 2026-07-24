@@ -1,0 +1,1095 @@
+//! Runtime for the st2 spec (P2+): boot a spec's team, and (P3/P4) run its `eval` + judges. The
+//! team-boot REUSES the existing reconcile/execute machinery — a parsed [`Spec`] is mapped to in-memory
+//! [`AgentSpec`]s (each agent → a pty task for its command + an exec task per `exec` block), then
+//! `reconcile` + `execute` spawn them (isolated, teardown-clean) exactly as `st2 up <catalog>` does.
+//! No catalog discovery: the one spec file IS the source.
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+
+use crate::eval_spec::{Check, Eval, Judge, JudgeKind, RunStep, Spec, SpecAgent, parse_spec};
+use crate::expand::expand_catalog;
+use crate::flapping::FlappingCap;
+use crate::reconcile::reconcile;
+use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
+use crate::spec::{AgentSpec, JobType, Task, TaskKind};
+
+/// Map a parsed spec's agents into in-memory [`AgentSpec`]s rooted at `root` (which becomes `$CATALOG`
+/// and the base for each agent's `workspace`/cwd). Each agent's own `command` is a `pty` task keyed by
+/// the agent id; each `exec` block is an `exec` task keyed by its id. Env is already cascaded.
+pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec<AgentSpec> {
+    // `spec.path.parent()` is the cwd/`$CATALOG` base in reconcile/execute → point it at `root`.
+    let path = root.join("spec.kdl");
+    agents
+        .iter()
+        .map(|a| {
+            let mut tasks = Vec::new();
+            let mut ptags = BTreeMap::new();
+            ptags.insert("role".to_string(), "agent".to_string());
+            tasks.push(Task {
+                kind: TaskKind::Pty,
+                name: "agent".to_string(),
+                id: Some(a.id.clone()), // explicit id → the session is exactly the agent id (mix.sup)
+                command: Some(a.command.clone()),
+                cwd: None, // → the agent's workspace (resolved relative to `root`)
+                tags: ptags,
+                env: a.env.clone(),
+                keep: false,
+            });
+            for ex in &a.execs {
+                tasks.push(Task {
+                    kind: TaskKind::Exec,
+                    name: ex.id.clone(),
+                    id: Some(ex.id.clone()),
+                    command: Some(ex.command.clone()),
+                    cwd: None,
+                    tags: BTreeMap::new(),
+                    env: ex.env.clone(),
+                    keep: false,
+                });
+            }
+            AgentSpec {
+                identity: a.id.clone(),
+                host: Some(host.to_string()),
+                job_type: JobType::Service,
+                workspace: a.workspace.clone(),
+                supervisor: a.supervisor.clone(),
+                retired: false,
+                keep: false,
+                restart: None,
+                tasks,
+                path: path.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Strip the LAUNCHER's agent-identity env so a spawned harness seat runs as a FRESH top-level agent,
+/// not a nested child. When `st2 eval`/`st2 up` is itself launched from INSIDE a claude/codex session
+/// (e.g. evals-claude running `st2 eval`), those session-identity vars (`CLAUDECODE`,
+/// `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, …) leak into the seats and make a nested claude behave as a
+/// child/one-shot — it exits after the boot turn instead of staying interactive (the seat-persistence
+/// failure). The fleet's claude, spawned by convoy (no parent agent), never has these; this matches it.
+/// `ANTHROPIC_*` (API creds) is deliberately kept — only the per-session identity is stripped.
+fn sanitize_agent_env() {
+    let should_strip = |k: &str| {
+        matches!(k, "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "AI_AGENT")
+            || k.starts_with("CLAUDE_CODE_")
+            || k.starts_with("CODEX_")
+    };
+    let victims: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| should_strip(k))
+        .collect();
+    // SAFETY: called before spawning seats, single-threaded (same contract as the PTY_ROOT/PATH sets).
+    for k in victims {
+        unsafe { std::env::remove_var(&k) };
+    }
+}
+
+/// One boot pass: reconcile the in-memory specs against live sessions and spawn what's missing
+/// (adopting anything already alive). `root` roots `$CATALOG`; sessions land in the effective PTY_ROOT.
+pub fn boot_team(agent_specs: &[AgentSpec], host: &str, root: &Path) -> Result<UpReport> {
+    sanitize_agent_env(); // seats must boot as fresh top-level agents, not nested children of the launcher
+    // HERMETIC exec state: `<catalog>/exec`, NOT the shared per-host `exec_state_dir(host)`. The eval's
+    // PTY_ROOT is already hermetic, but exec-task state (the dings) lived in a per-HOST dir — so an
+    // eval's `list_sessions()` unioned OTHER concurrent evals' + the LIVE FLEET's exec tasks, and its
+    // supervise/teardown sweep could reap them (cross-eval corruption + fleet ding-flapping). Rooting it
+    // under the catalog makes every eval fully isolated — it can only ever see/reap its OWN sessions.
+    let runner = SystemRunner::new(root.to_path_buf(), root.join("exec"));
+    let sessions = runner.list_sessions().context("listing pty sessions")?;
+    let plan = reconcile(agent_specs, &sessions, host);
+    let mut report = UpReport::default();
+    let mut cap = FlappingCap::default();
+    execute(&plan, &runner, &mut cap, &mut report);
+    Ok(report)
+}
+
+/// Resolve a spec argument to `(spec-file, root-dir)`: a `*.kdl` FILE → that file (root = its dir); a
+/// DIR with exactly one top-level `*.kdl` that parses as a spec → that file (root = the dir). Returns
+/// `None` if it's not a spec (so `st2 up` falls back to catalog discovery).
+pub fn resolve_spec_path(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return (path.extension().is_some_and(|x| x == "kdl")).then(|| path.to_path_buf());
+    }
+    if path.is_dir() {
+        let kdls: Vec<PathBuf> = std::fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "kdl"))
+            .collect();
+        if let [one] = kdls.as_slice() {
+            // Confirm it parses as a spec (vs a stray .kdl in a catalog dir).
+            if std::fs::read_to_string(one).ok().and_then(|t| parse_spec(&t).ok()).is_some() {
+                return Some(one.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Load + parse a spec file, returning `(Spec, root)` where `root` is the spec's folder (`$CATALOG`
+/// and the base for `workspace`/cwd/`copy`/`content` resolution).
+pub fn load_spec(spec_file: &Path) -> Result<(Spec, PathBuf)> {
+    let text = std::fs::read_to_string(spec_file)
+        .with_context(|| format!("reading spec {}", spec_file.display()))?;
+    let spec = parse_spec(&text)?;
+    let root = spec_file
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = root.canonicalize().unwrap_or(root);
+    Ok((spec, root))
+}
+
+/// Prepare the launcher's env before spawning harness seats: (1) strip the launcher's agent-identity
+/// vars so each seat boots as a FRESH top-level agent, not a nested child (see [`sanitize_agent_env`]),
+/// and (2) prepend THIS binary's dir to PATH so the seats' bare `st2 ding`/`st2 message` resolve to the
+/// same st2 as the runner (not a stale ambient install). Called by `st2 up <spec>` (fleet) and mirrored
+/// by `st2 eval`. Idempotent; single-threaded contract (before any seat spawns).
+pub fn prepare_spawn_env() {
+    sanitize_agent_env();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{path}", dir.display())) };
+    }
+}
+
+// ── P3: the `st2 eval` flow ───────────────────────────────────────────────────────────────────────
+
+/// The outcome of an eval run: whether the team reached "done", plus every judge's result. The
+/// verdict is all-must-pass over the judges (done is informational — the judges are the truth, so a
+/// timeout still grades the final state and simply fails the judges it should).
+#[derive(Debug, Clone)]
+pub struct EvalReport {
+    /// The team reached the done signal (a sup→requester confirmation post-dating a worker report).
+    pub done: bool,
+    /// Every judge, in declared order (no short-circuit — a full legible report).
+    pub judges: Vec<JudgeResult>,
+    /// The whole-eval timeout that bounded the wait.
+    pub timeout: Duration,
+}
+
+impl EvalReport {
+    /// PASS iff there is at least one judge and every judge passed (all-must-pass).
+    pub fn passed(&self) -> bool {
+        // A pass requires at least one GATING (non-signal) judge, and every gating judge passing.
+        // Signal judges run + show but never gate; an eval with only signal judges asserts nothing.
+        let mut gating = self.judges.iter().filter(|j| !j.signal).peekable();
+        gating.peek().is_some() && gating.all(|j| j.passed)
+    }
+}
+
+/// One judge's outcome.
+#[derive(Debug, Clone)]
+pub struct JudgeResult {
+    pub name: String,
+    pub passed: bool,
+    /// A short human-readable reason (what passed/failed) — for the legible report.
+    pub detail: String,
+    /// A SIGNAL result (from a `signal` judge): shown in the report but NOT counted toward the verdict.
+    pub signal: bool,
+}
+
+/// Recursively copy `src`'s CONTENTS into `dst`, renaming any directory named `_git` → `.git`. A
+/// committed fixture ships its repo db as `_git` (a real `.git` would nest as a gitlink); this
+/// reconstructs a working repo in the run catalog with the working tree left as readable files.
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry?;
+        let from = entry.path();
+        let name = entry.file_name();
+        let dst_name = if name == "_git" { std::ffi::OsString::from(".git") } else { name };
+        let to = dst.join(&dst_name);
+        if entry.file_type()?.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The bus root — the spec's top-level `ST_ROOT` with `$CATALOG` expanded, else `<catalog>/smalltalk`.
+fn bus_root(spec: &Spec, catalog: &Path) -> PathBuf {
+    match spec.env.get("ST_ROOT") {
+        Some(v) => PathBuf::from(expand_catalog(v, catalog)),
+        None => catalog.join("smalltalk"),
+    }
+}
+
+/// The kickoff content — a file (relative to the spec folder) if it exists, else inline text.
+fn resolve_content(content: &str, spec_dir: &Path) -> Result<String> {
+    let candidate = spec_dir.join(content);
+    if candidate.is_file() {
+        std::fs::read_to_string(&candidate).with_context(|| format!("reading kickoff content {}", candidate.display()))
+    } else {
+        Ok(content.to_string())
+    }
+}
+
+/// Whether a message `from:` header is `id` (tolerant of a `<prefix>.id` form, though the st2 spec
+/// uses bare team-dotted ids).
+fn from_is(from: Option<&str>, id: &str) -> bool {
+    from.is_some_and(|f| f == id || f.ends_with(&format!(".{id}")))
+}
+
+/// Wait for the DONE signal, message-driven (not grade-poll): a `sup → requester` confirmation whose
+/// timestamp POST-DATES a `worker → sup` report (Q1(b) — the same discriminator the graders use, so an
+/// early "on it" ack from the sup can't fire it). Bounded by `timeout`. Returns whether done fired.
+fn wait_done(
+    bus: &Path,
+    sup: &str,
+    requester: &str,
+    workers: &[String],
+    timeout: Duration,
+    on_tick: &mut dyn FnMut(),
+) -> bool {
+    let sup_inbox = bus.join(sup).join("inbox");
+    let sup_archive = bus.join(sup).join("archive");
+    let req_inbox = bus.join(requester).join("inbox");
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Earliest worker→sup report (a message from a worker seat). Scan the sup's inbox AND archive:
+        // DING-BUS mandates "archive a message the moment you act on it", so a well-behaved sup MOVES the
+        // report inbox→archive the instant it acts. Scanning inbox-only makes the done-signal a race
+        // against the sup's archiving — a fully-closed loop hangs to max-timeout because the report left
+        // the inbox. (The confirmation side reads the requester's inbox, which is safe — the requester is
+        // a passive eval-runner seed that never archives.)
+        let sup_msgs = crate::message::list_dir(&sup_inbox).unwrap_or_default();
+        let sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
+        let report_ts = sup_msgs
+            .iter()
+            .chain(sup_archived.iter())
+            .filter(|m| workers.iter().any(|w| from_is(m.from.as_deref(), w)))
+            .map(|m| m.ts_ms)
+            .min();
+        if let Some(rt) = report_ts {
+            // A sup→requester confirmation at-or-after that report = the real done (not a bare ack).
+            let confirmed = crate::message::list_dir(&req_inbox)
+                .unwrap_or_default()
+                .iter()
+                .any(|m| from_is(m.from.as_deref(), sup) && m.ts_ms >= rt);
+            if confirmed {
+                return true;
+            }
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        // A per-tick hook: under `supervise`, this respawns any dead team seat FROM SPEC (full env) so a
+        // fault-injected restart/crash recovers mid-run. A no-op for a boot-once (unsupervised) eval.
+        on_tick();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Fail-fast boot gate: a seat whose command exits immediately (127 harness-not-on-PATH, or a crash at
+/// startup) must fail the eval LOUDLY now, not leave it hanging until `max-timeout` waiting for a
+/// confirmation that can never come. Poll briefly for all seats to be live — a real seat is up within
+/// ~1s; a dead-at-boot one never is (tolerant of a slow start + a transient pty-list flicker).
+fn boot_gate(agents: &[SpecAgent], specs: &[AgentSpec], host: &str, catalog: &Path) -> Result<()> {
+    let runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
+    let want: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = runner.list_sessions().unwrap_or_default();
+        let alive: HashSet<&str> = sessions.iter().filter(|s| s.alive).map(|s| s.pty_id.as_str()).collect();
+        let dead: Vec<&str> = want.iter().copied().filter(|id| !alive.contains(id)).collect();
+        if dead.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            teardown_team(specs, host, catalog, false); // boot failure → no runtime seats yet
+            anyhow::bail!(
+                "seat(s) {dead:?} exited at boot — the command didn't stay running (harness not on PATH, \
+                 e.g. claude/codex not installed, or a crash at startup). Failing fast instead of hanging \
+                 until the eval's max-timeout."
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Tear down the team (nomad-safe): mark the specs retired and reconcile → the runner kills the live
+/// sessions (process-group kill). Best-effort — an eval always tears down, no zombie seats.
+///
+/// `reap_all` (set under `supervise`): after the declared teardown, ALSO reap every remaining session
+/// in the eval's hermetic PTY_ROOT — the RUNTIME-spawned seats that are NOT in the spec (e.g. a
+/// team-standup specialist the CoS spun up mid-run). `teardown_team` alone only reaps DECLARED seats, so
+/// a runtime seat would leak as an orphan; since the PTY_ROOT is hermetic to this eval, anything still
+/// alive is ours to clean. Killing an already-dead declared session is a harmless no-op.
+fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
+    let retired: Vec<AgentSpec> = specs
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.retired = true;
+            s
+        })
+        .collect();
+    let runner = SystemRunner::new(root.to_path_buf(), root.join("exec"));
+    if let Ok(sessions) = runner.list_sessions() {
+        let plan = reconcile(&retired, &sessions, host);
+        let mut report = UpReport::default();
+        let mut cap = FlappingCap::default();
+        execute(&plan, &runner, &mut cap, &mut report);
+    }
+    if reap_all
+        && let Ok(remaining) = runner.list_sessions()
+    {
+        for s in &remaining {
+            let _ = runner.kill(&s.pty_id);
+            let _ = runner.remove(&s.pty_id);
+        }
+    }
+}
+
+/// `st2 eval <folder>` — run the eval end to end: mint a hermetic temp catalog, copy the fixture
+/// (`_git`→`.git`), boot the base team + eval-only agents, pretrust their workspaces, deliver the
+/// kickoff, wait for the sup's confirmation (post-dating a worker report) or `max-timeout`, tear down.
+/// (P4 runs the judges after done and returns the verdict.) The temp catalog is removed on the way out.
+pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<EvalReport> {
+    let (spec, spec_dir) = load_spec(spec_file)?;
+    let eval = spec.eval.clone().ok_or_else(|| {
+        anyhow::anyhow!("{} has no `eval {{}}` block — use `st2 up` to just boot the team", spec_file.display())
+    })?;
+    // --host (explicit) › the spec's top-level `host` › the OS hostname.
+    let host = host.or_else(|| spec.host.clone()).unwrap_or_else(detect_host);
+
+    // Hermetic temp catalog + PTY_ROOT. Setting PTY_ROOT OVERRIDES any inherited ambient, so eval
+    // sessions can NEVER leak into a live/prod pty registry (isolation by construction).
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&catalog);
+    std::fs::create_dir_all(&catalog)?;
+    // SAFETY: st2 eval is single-threaded up to the boot; set before any seat spawns.
+    unsafe { std::env::set_var("PTY_ROOT", catalog.join("pty")) };
+    // Root exec-task state under the catalog too, so ANY st2 sub-invocation spawned INSIDE the eval — a
+    // run-step's `st2 up`, a seat's bare `st2` — resolves `exec_state_dir(host)` = $XDG_STATE_HOME/st2/…
+    // to an EVAL-LOCAL dir, not the shared per-host (live-fleet) one. The in-process eval path is already
+    // hermetic (boot_team/tick use <catalog>/exec directly); this extends that isolation to spawned
+    // sub-processes so a sub-`st2 up --host X` can't see or reap another eval's or the fleet's exec tasks.
+    unsafe { std::env::set_var("XDG_STATE_HOME", catalog.join("state")) };
+
+    // Make the eval SELF-CONSISTENT on the st2 binary: the spec's bare `st2 ding`/`st2 message` commands
+    // are PATH-resolved, so a STALE `st2` earlier on PATH (e.g. an old `cargo install`) would run the
+    // wrong version in the sidecars even when `st2 eval` itself is fresh — the ding-wake failure mode.
+    // Prepend THIS binary's dir so every bare `st2` in the eval resolves to the same binary as the runner.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{path}", dir.display())) };
+    }
+
+    let result = run_eval_inner(&spec, &eval, &spec_dir, &catalog, &host);
+    // Seats are already torn down inside run_eval_inner (no leaks). `--keep` preserves the catalog
+    // files (worker repo base..HEAD, judge outputs, bus) for post-run inspection — e.g. a gate
+    // reproduction reading the folder before it's "real"; otherwise the hermetic catalog is removed.
+    if keep {
+        println!("catalog preserved (--keep): {}", catalog.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&catalog);
+    }
+    result
+}
+
+/// Run the eval's `run { }` stage: its command steps, sequentially (declaration order), BEFORE judging.
+/// Each step is `sh -c <command>` with cwd = its `workspace` in the catalog and env = the top-level
+/// cascade + per-step `env` − `unset` (plus `$CATALOG`, `$RUNS_DIR`, and every earlier step's
+/// `$RUN_<id>_EXIT`), retried on non-zero per its policy. stdout/stderr/exit are captured to
+/// `$CATALOG/.runs/<id>.{out,err,exit}` for the judges to read. By DEFAULT a non-zero final exit
+/// contributes a FAILING synthetic judge result (a step must succeed); an `allow-nonzero` step opts out,
+/// leaving the exit for a judge to assert. (No per-step timeout yet: these are deterministic terminating
+/// commands; a hard timeout is a follow-up seam.)
+fn run_steps(
+    steps: &[RunStep],
+    catalog: &Path,
+    top_env: &BTreeMap<String, String>,
+) -> (Vec<JudgeResult>, BTreeMap<String, String>) {
+    use std::process::Command;
+    let mut results = Vec::new();
+    // The env the JUDGES also get: $RUNS_DIR + each step's $RUN_<id>_EXIT (so a bash judge can read the
+    // captures). Empty when there are no run steps.
+    let mut judge_env: BTreeMap<String, String> = BTreeMap::new();
+    if steps.is_empty() {
+        return (results, judge_env);
+    }
+    let runs_dir = catalog.join(".runs");
+    let _ = std::fs::create_dir_all(&runs_dir);
+    judge_env.insert("RUNS_DIR".to_string(), runs_dir.display().to_string());
+    // Unified, judge-greppable command logs: `<catalog>/logs/<label>.log` (same dir the exec sidecars
+    // auto-log to). Judges get `$LOGS_DIR` so a judge can review/assert a run step's output by log.
+    let logs_dir = catalog.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    judge_env.insert("LOGS_DIR".to_string(), logs_dir.display().to_string());
+    let mut runtime: BTreeMap<String, String> = BTreeMap::new(); // RUN_<id>_EXIT, accumulated across steps
+
+    for step in steps {
+        // Effective env: the cascade + per-step override − unset. Values are `$CATALOG`-expanded.
+        let mut env = top_env.clone();
+        env.extend(step.env.clone());
+        for u in &step.unset {
+            env.remove(u);
+        }
+        let cwd = match &step.workspace {
+            Some(w) => catalog.join(expand_catalog(w, catalog)),
+            None => catalog.to_path_buf(),
+        };
+        let (attempts, backoff) =
+            step.retry.as_ref().map(|r| (r.attempts.max(1), r.delay)).unwrap_or((1, Duration::ZERO));
+
+        let mut exit = -1;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        for attempt in 0..attempts {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(&step.command)
+                .current_dir(&cwd)
+                .env("CATALOG", catalog)
+                .env("RUNS_DIR", &runs_dir);
+            for (k, v) in &env {
+                cmd.env(k, expand_catalog(v, catalog));
+            }
+            for (k, v) in &runtime {
+                cmd.env(k, v);
+            }
+            match cmd.output() {
+                Ok(o) => {
+                    exit = o.status.code().unwrap_or(-1);
+                    out = o.stdout;
+                    err = o.stderr;
+                }
+                Err(e) => {
+                    exit = -1;
+                    err = format!("run step spawn failed: {e}").into_bytes();
+                }
+            }
+            if exit == 0 {
+                break; // success — no more retries
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(backoff);
+            }
+        }
+
+        let _ = std::fs::write(runs_dir.join(format!("{}.out", step.id)), &out);
+        let _ = std::fs::write(runs_dir.join(format!("{}.err", step.id)), &err);
+        let _ = std::fs::write(runs_dir.join(format!("{}.exit", step.id)), exit.to_string());
+        // Also a unified, judge-greppable combined log (stdout then stderr) named after the run label.
+        let mut combined = out.clone();
+        combined.extend_from_slice(&err);
+        let _ = std::fs::write(logs_dir.join(format!("{}.log", step.id)), &combined);
+        runtime.insert(format!("RUN_{}_EXIT", env_key(&step.id)), exit.to_string());
+        println!("== run step {} → exit {}{} ==", step.id, exit, if step.allow_nonzero { " (allow-nonzero)" } else { "" });
+
+        if !step.allow_nonzero {
+            // Default: a run step must succeed. A non-zero final exit hard-fails the verdict as a
+            // gating synthetic judge. `allow-nonzero` steps skip this — the exit is the judges' to assert.
+            results.push(JudgeResult {
+                name: format!("step:{} exit 0", step.id),
+                passed: exit == 0,
+                detail: format!("exit {exit}"),
+                signal: false, // a must-succeed step GATES the verdict
+            });
+        }
+    }
+    // Hand the judges $RUNS_DIR + every $RUN_<id>_EXIT.
+    judge_env.extend(runtime);
+    (results, judge_env)
+}
+
+/// Snapshot each agent's terminal output to `<catalog>/logs/<id>.log` (plain-text full scrollback via
+/// `pty peek`), so judges can review/assert an agent's output by log. Best-effort: `pty` has no
+/// continuous plain-text log, so this is the scrollback captured at judge time — enough to inspect a
+/// wedged/finished agent's history. A truly continuous agent log would need a `pty` feature.
+fn dump_agent_logs(agents: &[SpecAgent], catalog: &Path) {
+    if agents.is_empty() {
+        return;
+    }
+    let logs_dir = catalog.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let pty_root = crate::run::effective_pty_root(catalog);
+    for a in agents {
+        let out = std::process::Command::new("pty")
+            .args(["peek", "--full", "--plain", &a.id])
+            .env("PTY_ROOT", &pty_root)
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+            && !o.stdout.is_empty()
+        {
+            let _ = std::fs::write(logs_dir.join(format!("{}.log", a.id)), &o.stdout);
+        }
+    }
+}
+
+/// An env-var-safe form of a step id (non-alphanumerics → `_`), for `RUN_<id>_EXIT`.
+fn env_key(id: &str) -> String {
+    id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
+/// The supervisor chain of `seat_id`, walked transitively via each agent's `supervisor` field to the
+/// root (whose supervisor is `None` — the cos). Returns the ancestor ids, nearest first. A cycle or a
+/// supervisor that names no declared agent terminates the walk (the named id is still included — we ding
+/// its inbox regardless of whether it is a booted seat).
+fn supervisor_chain(seat_id: &str, specs: &[AgentSpec]) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current = specs.iter().find(|s| s.identity == seat_id).and_then(|s| s.supervisor.clone());
+    while let Some(sup) = current {
+        if !seen.insert(sup.clone()) {
+            break; // cycle guard
+        }
+        chain.push(sup.clone());
+        current = specs.iter().find(|s| s.identity == sup).and_then(|s| s.supervisor.clone());
+    }
+    chain
+}
+
+/// Emit a crash-ding for a crashed seat: a `worker crash: <id>` bus message to EVERY ancestor in its
+/// supervisor chain (the direct supervisor up to the cos root) — so the whole supervision chain learns
+/// the worker died without polling. A seat with no supervisor has nothing to notify.
+fn crash_ding(seat_id: &str, specs: &[AgentSpec], bus: &Path) {
+    let chain = supervisor_chain(seat_id, specs);
+    if chain.is_empty() {
+        return;
+    }
+    let subject = format!("worker crash: {seat_id}");
+    let body = format!(
+        "Worker '{seat_id}' crashed — its pty session died non-cleanly (non-zero exit / killed / vanished). \
+         st2 respawned it from spec; surfacing the crash up the supervision chain."
+    );
+    for ancestor in &chain {
+        let inbox = bus.join(ancestor).join("inbox");
+        let _ = crate::message::send_to_inbox(&inbox, "st2", Some(&subject), None, &[], &body);
+        println!("== crash-ding: {seat_id} → {ancestor} ==");
+    }
+}
+
+fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, host: &str) -> Result<EvalReport> {
+    // Copy the fixture's CONTENTS into the catalog root (the start world), _git → .git.
+    if let Some(copy) = &eval.copy {
+        let src = spec_dir.join(copy);
+        copy_tree(&src, catalog).with_context(|| format!("copying fixture {}", src.display()))?;
+    }
+
+    let bus = bus_root(spec, catalog);
+    let requester = eval.message.as_ref().map(|m| m.from.clone()).unwrap_or_else(|| "eval-runner".to_string());
+
+    // The run{} stage runs to completion BEFORE judging — the WHOLE work of a team-less eval, or setup
+    // before a team. must-exit-0 failures come back as failing synthetic judge results (folded into
+    // the verdict); `run_env` ($RUNS_DIR + each $RUN_<id>_EXIT) is handed to the judges to read captures.
+    let (mut judges, run_env) = run_steps(&eval.run_steps, catalog, &spec.env);
+
+    // The base team + eval-only agents. An eval with NONE is TEAM-LESS: the jobs are the work.
+    let mut agents = spec.agents.clone();
+    agents.extend(eval.agents.clone());
+
+    let (done, specs) = if agents.is_empty() {
+        // TEAM-LESS: nothing to boot, kick off, or wait on — the run steps did the work → straight to judging.
+        if !eval.run_steps.is_empty() {
+            println!("== team-less eval: {} run step(s) ran → judging ==", eval.run_steps.len());
+        }
+        (true, Vec::new())
+    } else {
+        let specs = spec_to_agent_specs(&agents, host, catalog);
+        // Pre-trust each agent's workspace so a real claude seat never hangs on the trust dialog.
+        let dirs: Vec<PathBuf> =
+            agents.iter().filter_map(|a| a.workspace.as_deref()).map(|w| catalog.join(w)).collect();
+        if !dirs.is_empty() {
+            let _ = crate::pretrust::pretrust(&dirs);
+        }
+
+        println!("== boot team ({} agents) ==", specs.len());
+        boot_team(&specs, host, catalog)?;
+        boot_gate(&agents, &specs, host, catalog)?;
+
+        // Deliver the kickoff onto the bus the seats' dings watch (ST_ROOT), from the requester.
+        let msg = eval.message.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("a team eval needs a message{{}} kickoff (only a team-less eval may omit it)")
+        })?;
+        let body = resolve_content(&msg.content, spec_dir)?;
+        let to_inbox = bus.join(&msg.to).join("inbox");
+        crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
+            .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
+        println!("== kickoff → {} (from {}) ==", msg.to, msg.from);
+
+        let sup = msg.to.clone();
+        let workers: Vec<String> = spec.agents.iter().map(|a| a.id.clone()).filter(|id| *id != sup).collect();
+        println!(
+            "== waiting for {sup}→{} confirmation post-dating a worker report (≤{:?}) ==",
+            msg.from, eval.max_timeout
+        );
+
+        // `supervise`: each wait tick, respawn any dead seat FROM SPEC (full env → rejoins cold). Carry a
+        // FlappingCap + LivenessDebounce ACROSS ticks so a fault-injected kill is respawned exactly ONCE
+        // (cap rate-limits; debounce absorbs a transient `pty list` misread). Scoped so the tick's borrow
+        // of `specs` ends before we hand `specs` to teardown.
+        let done = {
+            let supervise_runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
+            let mut sup_cap = crate::flapping::FlappingCap::default();
+            let mut sup_debounce = crate::run::LivenessDebounce::new(Duration::from_secs(2));
+            // Crash-ding state: only a seat that was EVER alive counts as a crash when it later dies (a
+            // not-yet-booted seat is not a crash); `dinged` dedups so one crash = one ding until the seat
+            // is alive again.
+            let mut ever_alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut dinged: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut tick = || {
+                if eval.supervise {
+                    // Detect crashes BEFORE respawn (reconcile reaps the dead session): a declared seat
+                    // that was alive and is now dead non-cleanly (non-zero/killed/vanished) → crash-ding
+                    // its supervisor chain. A clean exit (code 0) stays SILENT (a false ding on a routine
+                    // finish is as bad as a missed crash).
+                    if let Ok(sessions) = supervise_runner.list_sessions() {
+                        let by_id: std::collections::HashMap<&str, &crate::reconcile::Session> =
+                            sessions.iter().map(|s| (s.pty_id.as_str(), s)).collect();
+                        for seat in &specs {
+                            let id = seat.identity.as_str(); // the seat's main pty session id == its identity
+                            match by_id.get(id) {
+                                Some(s) if s.alive => {
+                                    ever_alive.insert(id.to_string());
+                                    dinged.remove(id); // healthy again → re-arm for a future crash
+                                }
+                                found => {
+                                    let clean = matches!(found, Some(s) if s.exit_code == Some(0));
+                                    if ever_alive.contains(id) && !clean && !dinged.contains(id) {
+                                        crash_ding(&seat.identity, &specs, &bus);
+                                        dinged.insert(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let report = crate::run::reconcile_pass_specs(
+                        &specs,
+                        host,
+                        &supervise_runner,
+                        &mut sup_cap,
+                        &mut sup_debounce,
+                    );
+                    if !report.launched.is_empty() {
+                        println!("== supervise: respawned {:?} from spec ==", report.launched);
+                    }
+                }
+            };
+            wait_done(&bus, &sup, &msg.from, &workers, eval.max_timeout, &mut tick)
+        };
+
+        if done {
+            println!("== team signalled done — judging ==");
+        } else {
+            println!("== max-timeout: no confirmation within {:?} — judging the final state ==", eval.max_timeout);
+        }
+        (done, specs)
+    };
+
+    // Snapshot each agent's terminal output to logs/<id>.log so judges can review/assert an agent's
+    // output by log (alongside the run-step + exec sidecar logs already there). Done BEFORE teardown so
+    // the sessions are still peekable.
+    dump_agent_logs(&agents, catalog);
+
+    // Judges: the run-step gate results first, then the declared judges (all must pass). Judge BEFORE
+    // teardown — an ask-agent judge needs its judge agent still alive to answer.
+    judges.extend(run_judges(&eval.judges, spec_dir, catalog, &bus, &requester, &run_env));
+    // Under `supervise`, reap runtime-spawned seats too (team-standup) — not just the declared team.
+    teardown_team(&specs, host, catalog, eval.supervise);
+    Ok(EvalReport { done, judges, timeout: eval.max_timeout })
+}
+
+// ── P4: the judge engine (all-must-pass; declarative / bash / ask-agent; per-judge timeout) ─────────
+
+/// Run every judge in declared order (NO short-circuit — a full legible report). Each judge is one
+/// flavor with an optional per-judge timeout (default 120s). `run_env` ($RUNS_DIR + each $RUN_<id>_EXIT)
+/// is exported into bash judges so they can read the run steps' captured stdout/stderr/exit.
+pub fn run_judges(
+    judges: &[Judge],
+    spec_dir: &Path,
+    catalog: &Path,
+    bus: &Path,
+    requester: &str,
+    run_env: &BTreeMap<String, String>,
+) -> Vec<JudgeResult> {
+    let default_timeout = Duration::from_secs(120);
+    judges
+        .iter()
+        .map(|j| {
+            let timeout = j.timeout.unwrap_or(default_timeout);
+            let (passed, detail) = match &j.kind {
+                JudgeKind::Declarative(checks) => run_declarative(checks, catalog),
+                JudgeKind::Bash(cmd) => run_bash_judge(cmd, spec_dir, catalog, bus, timeout, run_env),
+                JudgeKind::Ask { agent, prompt } => run_ask_judge(agent, prompt, bus, requester, timeout),
+            };
+            JudgeResult { name: j.name.clone(), passed, detail, signal: j.signal }
+        })
+        .collect()
+}
+
+/// All declarative checks must hold. Paths are relative to the catalog root (the copied world).
+fn run_declarative(checks: &[Check], catalog: &Path) -> (bool, String) {
+    for c in checks {
+        let (ok, why) = match c {
+            Check::FileHas { path, text } => {
+                let body = std::fs::read_to_string(catalog.join(path)).unwrap_or_default();
+                (body.contains(text.as_str()), format!("{path} has {text:?}"))
+            }
+            Check::FileLacks { path, text } => {
+                let body = std::fs::read_to_string(catalog.join(path)).unwrap_or_default();
+                (!body.contains(text.as_str()), format!("{path} lacks {text:?}"))
+            }
+            Check::JsonField { path, field, value } => {
+                let got = std::fs::read_to_string(catalog.join(path))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| v.get(field).and_then(|f| f.as_str().map(String::from)));
+                (got.as_deref() == Some(value.as_str()), format!("{path} field {field} is {value:?} (got {got:?})"))
+            }
+            Check::Committed { path } => {
+                let ok = is_committed_clean(catalog, path);
+                (ok, format!("{path} committed + clean"))
+            }
+        };
+        if !ok {
+            return (false, format!("FAILED: {why}"));
+        }
+    }
+    (true, format!("{} check(s) passed", checks.len()))
+}
+
+/// `committed "p"`: the path is tracked AND has no uncommitted changes, in the repo that owns it.
+fn is_committed_clean(catalog: &Path, path: &str) -> bool {
+    // Find the repo root (nearest ancestor with a `.git`) of the target.
+    let target = catalog.join(path);
+    let mut repo = target.parent();
+    while let Some(dir) = repo {
+        if dir.join(".git").exists() {
+            let rel = target.strip_prefix(dir).unwrap_or(&target);
+            let tracked = std::process::Command::new("git")
+                .arg("-C").arg(dir).args(["ls-files", "--error-unmatch"]).arg(rel)
+                .output().map(|o| o.status.success()).unwrap_or(false);
+            let clean = std::process::Command::new("git")
+                .arg("-C").arg(dir).args(["status", "--porcelain", "--"]).arg(rel)
+                .output().map(|o| o.stdout.is_empty()).unwrap_or(false);
+            return tracked && clean;
+        }
+        repo = dir.parent();
+    }
+    false
+}
+
+/// A bash judge: `sh -c <cmd>` with CWD = the SPEC FOLDER (so `./judges/x.sh` resolves — judge scripts
+/// live beside the spec and are NOT copied into the catalog), while the sandbox/world is reached via
+/// `$CATALOG` and the bus via `$ST_ROOT` (both exported; `$SPEC_DIR` too for an explicit reference).
+/// Exit 0 = pass; `bash …`/shebangs honored (no forced POSIX sh). Bounded by the per-judge timeout.
+fn run_bash_judge(
+    cmd: &str,
+    spec_dir: &Path,
+    catalog: &Path,
+    bus: &Path,
+    timeout: Duration,
+    run_env: &BTreeMap<String, String>,
+) -> (bool, String) {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(spec_dir)
+        .env("CATALOG", catalog)
+        .env("ST_ROOT", bus)
+        .env("SPEC_DIR", spec_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // $RUNS_DIR + each $RUN_<id>_EXIT, so a judge can read the run steps' captured stdout/stderr/exit.
+    for (k, v) in run_env {
+        command.env(k, v);
+    }
+    let child = command.spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return (false, format!("spawn failed: {e}")),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (status.success(), format!("exit {}", status.code().unwrap_or(-1))),
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    return (false, format!("timed out after {timeout:?}"));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return (false, format!("wait failed: {e}")),
+        }
+    }
+}
+
+/// An ask-agent judge: message the judge agent the prompt, wait for its reply (post the ask) in the
+/// requester's inbox within the timeout, and read PASS/FAIL out of it.
+fn run_ask_judge(agent: &str, prompt: &str, bus: &Path, requester: &str, timeout: Duration) -> (bool, String) {
+    let ask_ts = now_ms();
+    let to_inbox = bus.join(agent).join("inbox");
+    if let Err(e) = crate::message::send_to_inbox(&to_inbox, requester, Some("judge"), None, &[], prompt) {
+        return (false, format!("could not ask judge '{agent}': {e}"));
+    }
+    let req_inbox = bus.join(requester).join("inbox");
+    let deadline = Instant::now() + timeout;
+    loop {
+        // The judge's reply = a message from <agent> in the requester's inbox at/after the ask.
+        if let Some(reply) = crate::message::list_dir(&req_inbox)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| from_is(m.from.as_deref(), agent) && m.ts_ms >= ask_ts)
+        {
+            let body = std::fs::read_to_string(req_inbox.join(&reply.filename)).unwrap_or_default();
+            return match parse_pass_fail(&body) {
+                Some(true) => (true, "judge replied PASS".to_string()),
+                Some(false) => (false, "judge replied FAIL".to_string()),
+                None => (false, "judge reply had no PASS/FAIL".to_string()),
+            };
+        }
+        if Instant::now() > deadline {
+            return (false, format!("judge '{agent}' did not reply within {timeout:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Read PASS/FAIL from a judge reply: whichever of `PASS`/`FAIL` appears FIRST wins (case-insensitive).
+fn parse_pass_fail(reply: &str) -> Option<bool> {
+    let up = reply.to_uppercase();
+    match (up.find("PASS"), up.find("FAIL")) {
+        (Some(p), Some(f)) => Some(p < f),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (None, None) => None,
+    }
+}
+
+/// Current unix-ms (used to bound an ask reply to messages that post-date the ask).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_judges_do_not_gate_the_verdict() {
+        let j = |name: &str, passed: bool, signal: bool| JudgeResult {
+            name: name.into(),
+            passed,
+            detail: String::new(),
+            signal,
+        };
+        let report = |judges: Vec<JudgeResult>| EvalReport { done: true, judges, timeout: Duration::ZERO };
+        // A FAILING signal judge does NOT gate a passing gating judge.
+        assert!(report(vec![j("gate", true, false), j("sig", false, true)]).passed());
+        // A failing GATING judge does gate.
+        assert!(!report(vec![j("gate", false, false), j("sig", true, true)]).passed());
+        // Only signal judges (nothing gating) → NOT a pass (asserts nothing).
+        assert!(!report(vec![j("sig", true, true)]).passed());
+    }
+
+    #[test]
+    fn maps_agents_to_pty_plus_exec_tasks_keyed_by_id() {
+        let spec = parse_spec(
+            r#"
+            env { ST_ROOT "$CATALOG/smalltalk" }
+            team "mix" {
+              agent "sup" {
+                workspace "./sup"
+                env { ST_AGENT "mix.sup" }
+                command "exec claude 'boot'"
+                exec "mix.sup.ding" { command "st2 ding mix.sup --identity mix.sup --root $CATALOG/smalltalk" }
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        let root = Path::new("/tmp/eval-root");
+        let specs = spec_to_agent_specs(&spec.agents, "local", root);
+        assert_eq!(specs.len(), 1);
+        let a = &specs[0];
+        assert_eq!(a.identity, "mix.sup");
+        assert_eq!(a.host.as_deref(), Some("local"));
+        assert_eq!(a.job_type, JobType::Service);
+        assert_eq!(a.workspace.as_deref(), Some("./sup"));
+        // spec.path.parent() must be `root` (the cwd/$CATALOG base).
+        assert_eq!(a.path.parent().unwrap(), root);
+        // Task 0 = the agent's own command as a pty keyed by the agent id.
+        assert!(matches!(a.tasks[0].kind, TaskKind::Pty));
+        assert_eq!(a.tasks[0].id.as_deref(), Some("mix.sup"));
+        assert_eq!(a.tasks[0].command.as_deref(), Some("exec claude 'boot'"));
+        assert_eq!(a.tasks[0].env.get("ST_ROOT").unwrap(), "$CATALOG/smalltalk"); // cascaded
+        assert_eq!(a.tasks[0].env.get("ST_AGENT").unwrap(), "mix.sup");
+        // Task 1 = the ding exec keyed by its id, inheriting the agent env.
+        assert!(matches!(a.tasks[1].kind, TaskKind::Exec));
+        assert_eq!(a.tasks[1].id.as_deref(), Some("mix.sup.ding"));
+        assert!(a.tasks[1].command.as_deref().unwrap().starts_with("st2 ding mix.sup"));
+        assert_eq!(a.tasks[1].env.get("ST_AGENT").unwrap(), "mix.sup"); // inherited into the exec
+    }
+
+    fn seed_msg(inbox: &Path, ts: u64, rand: &str, from: &str) {
+        std::fs::create_dir_all(inbox).unwrap();
+        std::fs::write(inbox.join(format!("{ts:013}-{rand}.md")), format!("---\nfrom: {from}\n---\nbody\n")).unwrap();
+    }
+
+    #[test]
+    fn copy_tree_renames_git_and_keeps_the_working_tree() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("worker/_git")).unwrap();
+        std::fs::write(src.path().join("worker/_git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(src.path().join("worker/LICENSE"), "proprietary\n").unwrap();
+        copy_tree(src.path(), dst.path()).unwrap();
+        assert!(dst.path().join("worker/.git/HEAD").is_file(), ".git materialized from _git");
+        assert!(!dst.path().join("worker/_git").exists(), "_git renamed away");
+        assert_eq!(std::fs::read_to_string(dst.path().join("worker/LICENSE")).unwrap(), "proprietary\n");
+    }
+
+    #[test]
+    fn resolve_content_reads_a_file_else_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("task.md"), "the task\n").unwrap();
+        assert_eq!(resolve_content("./task.md", dir.path()).unwrap(), "the task\n");
+        assert_eq!(resolve_content("just do it inline", dir.path()).unwrap(), "just do it inline");
+    }
+
+    #[test]
+    fn wait_done_fires_only_on_a_confirmation_post_dating_a_worker_report() {
+        let bus = tempfile::tempdir().unwrap();
+        let root = bus.path();
+        let (sup, req) = ("mix.sup", "requester");
+        let workers = vec!["mix.worker".to_string()];
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        // No worker report → never fires (bounded timeout).
+        assert!(!wait_done(root, sup, req, &workers, Duration::from_millis(100), noop));
+        // A worker→sup report at t=2000 + a sup→requester confirm that PRE-dates it (t=1000) → false
+        // (the early "on it" ack the discriminator exists to reject).
+        seed_msg(&root.join(sup).join("inbox"), 1_700_000_002_000, "aaaaaa", "mix.worker");
+        seed_msg(&root.join(req).join("inbox"), 1_700_000_001_000, "bbbbbb", "mix.sup");
+        assert!(!wait_done(root, sup, req, &workers, Duration::from_millis(100), noop));
+        // A confirm that POST-dates the report (t=3000) → done.
+        seed_msg(&root.join(req).join("inbox"), 1_700_000_003_000, "cccccc", "mix.sup");
+        assert!(wait_done(root, sup, req, &workers, Duration::from_millis(2000), noop));
+    }
+
+    #[test]
+    fn wait_done_finds_a_worker_report_the_sup_already_archived() {
+        // DING-BUS mandates archive-on-act, so a well-behaved sup MOVES the worker report inbox→archive
+        // the instant it acts. The done-signal must still fire by scanning the archive — not hang to
+        // max-timeout because the report left the inbox (the ghost-bug-codex flake evals-claude found).
+        let bus = tempfile::tempdir().unwrap();
+        let root = bus.path();
+        let (sup, req) = ("mix.sup", "requester");
+        let workers = vec!["mix.worker".to_string()];
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        // The report is ONLY in the sup's archive (inbox is empty — the sup archived on-act); the confirm
+        // post-dates it in the requester's inbox → the loop closed → done must fire.
+        seed_msg(&root.join(sup).join("archive"), 1_700_000_002_000, "aaaaaa", "mix.worker");
+        seed_msg(&root.join(req).join("inbox"), 1_700_000_003_000, "cccccc", "mix.sup");
+        assert!(
+            wait_done(root, sup, req, &workers, Duration::from_millis(2000), noop),
+            "an archived worker report must still be seen (else archive-on-act hygiene hangs the eval)"
+        );
+    }
+
+    #[test]
+    fn wait_done_runs_the_supervise_tick_while_waiting() {
+        // Under `supervise`, wait_done calls its per-tick hook each poll — that hook is what respawns a
+        // dead seat (via up_once_specs, proven separately). Here: no done signal → it times out, and the
+        // tick must have run at least once during the wait.
+        let bus = tempfile::tempdir().unwrap();
+        let ticks = std::cell::Cell::new(0u32);
+        let mut tick = || ticks.set(ticks.get() + 1);
+        let fired = wait_done(bus.path(), "sup", "req", &["w".to_string()], Duration::from_millis(400), &mut tick);
+        assert!(!fired, "no confirmation was seeded → must time out");
+        assert!(ticks.get() >= 1, "the supervise tick must run during the wait");
+    }
+
+    #[test]
+    fn bus_root_expands_st_root_else_defaults() {
+        let s = parse_spec("env { ST_ROOT \"$CATALOG/bus\" }\nagent \"a\" { command \"run\" }").unwrap();
+        assert_eq!(bus_root(&s, Path::new("/tmp/cat")), PathBuf::from("/tmp/cat/bus"));
+        let s2 = parse_spec(r#"agent "a" { command "run" }"#).unwrap();
+        assert_eq!(bus_root(&s2, Path::new("/tmp/cat")), PathBuf::from("/tmp/cat/smalltalk"));
+    }
+
+    #[test]
+    fn parse_pass_fail_takes_the_first_token() {
+        assert_eq!(parse_pass_fail("PASS — cites the real commit"), Some(true));
+        assert_eq!(parse_pass_fail("FAIL — vague 'done!'"), Some(false));
+        assert_eq!(parse_pass_fail("PASS, though it could FAIL on edge cases"), Some(true)); // PASS first
+        assert_eq!(parse_pass_fail("verdict: fail, because…"), Some(false));
+        assert_eq!(parse_pass_fail("no verdict here"), None);
+    }
+
+    #[test]
+    fn declarative_checks_file_json() {
+        let cat = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cat.path().join("worker")).unwrap();
+        std::fs::write(cat.path().join("worker/LICENSE"), "Permission is hereby granted, free of charge\n").unwrap();
+        std::fs::write(cat.path().join("worker/package.json"), r#"{"name":"w","license":"MIT"}"#).unwrap();
+        let ok = [
+            Check::FileHas { path: "worker/LICENSE".into(), text: "Permission is hereby granted".into() },
+            Check::FileLacks { path: "worker/LICENSE".into(), text: "proprietary".into() },
+            Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: "MIT".into() },
+        ];
+        assert!(run_declarative(&ok, cat.path()).0);
+        // A wrong json value fails.
+        let bad = [Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: "GPL".into() }];
+        assert!(!run_declarative(&bad, cat.path()).0);
+        // FileHas on a missing file fails.
+        let missing = [Check::FileHas { path: "worker/NOPE".into(), text: "x".into() }];
+        assert!(!run_declarative(&missing, cat.path()).0);
+    }
+
+    #[test]
+    fn bash_judge_exit_code_and_timeout() {
+        let spec = tempfile::tempdir().unwrap();
+        let cat = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let (s, c, b) = (spec.path(), cat.path(), bus.path());
+        let je = &BTreeMap::new();
+        assert!(run_bash_judge("exit 0", s, c, b, Duration::from_secs(5), je).0);
+        assert!(!run_bash_judge("exit 1", s, c, b, Duration::from_secs(5), je).0);
+        // A grader that hangs past its timeout is killed → fail.
+        assert!(!run_bash_judge("sleep 30", s, c, b, Duration::from_millis(300), je).0);
+        // CWD is the SPEC folder (so ./judges/x.sh resolves); $CATALOG/$ST_ROOT reach the sandbox+bus.
+        std::fs::create_dir_all(s.join("judges")).unwrap();
+        std::fs::write(s.join("judges/ok.sh"), "#!/bin/sh\ntest -n \"$CATALOG\" && test -n \"$ST_ROOT\"\n").unwrap();
+        assert!(run_bash_judge("test \"$(pwd)\" = \"$SPEC_DIR\"", s, c, b, Duration::from_secs(5), je).0);
+        assert!(run_bash_judge("sh ./judges/ok.sh", s, c, b, Duration::from_secs(5), je).0, "./judges resolves from CWD=spec");
+    }
+
+    #[test]
+    fn resolve_spec_path_file_dir_and_non_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A bare .kdl file → spec.
+        let f = tmp.path().join("thing.kdl");
+        std::fs::write(&f, r#"agent "a" { command "run" }"#).unwrap();
+        assert_eq!(resolve_spec_path(&f), Some(f.clone()));
+        // A dir with one top-level parseable .kdl → that file.
+        assert_eq!(resolve_spec_path(tmp.path()), Some(f.clone()));
+        // A dir whose only .kdl does NOT parse as a spec → None (fall back to catalog).
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp2.path().join("bad.kdl"), "this is (not kdl").unwrap();
+        assert_eq!(resolve_spec_path(tmp2.path()), None);
+        // An empty dir → None.
+        let tmp3 = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_spec_path(tmp3.path()), None);
+    }
+}

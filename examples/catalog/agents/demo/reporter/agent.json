@@ -1,0 +1,12 @@
+{
+  "type": "service",
+  "workspace": "/tmp",
+  "supervisor": "root",
+  "pty": {
+    "agent": {
+      "id": "demo.reporter",
+      "command": "while true; do echo \"[reporter] summarizing…\"; sleep 15; done",
+      "env": { "ST_AGENT": "demo.reporter" }
+    }
+  }
+}

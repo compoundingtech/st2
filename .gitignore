@@ -1,0 +1,8 @@
+/target
+
+# Per-agent runtime overlay (rendered per clone; machine-specific, never product).
+.convoy/
+.claude/
+
+# Local scratch note.
+.ding-bus-quoting-note.md

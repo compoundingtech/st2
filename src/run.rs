@@ -1,0 +1,1108 @@
+//! Execution (M2/M3) — the side-effecting half that turns a reconcile plan into real pty operations,
+//! plus the supervisor loop that reconciles on a folder-watch + timer.
+//!
+//! Everything st2 does to the world goes through the [`Runner`] trait: list sessions, spawn a pty
+//! from its explicit command, kill a session, remove a dead one. The production [`PtyCli`] shells out
+//! to the `pty` CLI; tests swap in a fake, so plan execution is verified without spawning a single
+//! real process. st2 stays harness-agnostic here too — it runs the spec's `command` verbatim under
+//! `sh -c` and never inspects it.
+//!
+//! The loop is decoupled Nomad-style: stopping st2 never tears down its agents — they are detached
+//! pty sessions and keep running; only a `retired` spec tears an agent down.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+
+use crate::exec_backend::ExecBackend;
+use crate::flapping::FlappingCap;
+use crate::message;
+use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
+use crate::spec::TaskKind;
+
+/// Resolve a task's working directory: declared `cwd` (expanded), else the agent's `workspace`
+/// (expanded), else the spec file's directory (spec.md §2). A relative value is joined to the spec
+/// dir; an absolute one replaces it.
+pub(crate) fn resolve_task_cwd(target: &TaskTarget, spec_dir: &Path, catalog_root: &Path) -> PathBuf {
+    match target.cwd.as_deref().or(target.workspace.as_deref()) {
+        Some(c) => spec_dir.join(crate::expand::expand_catalog(c, catalog_root)),
+        None => spec_dir.to_path_buf(),
+    }
+}
+
+/// The set of task operations st2 needs. Abstracted so execution is testable against a fake.
+pub trait Runner {
+    /// ACTUAL state: every task session the runner can see (unioned across backends).
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>>;
+    /// Spawn `target` in the background from its explicit command. `spec_dir` is the spec file's
+    /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
+    fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
+    /// SIGTERM a running session.
+    fn kill(&self, pty_id: &str) -> anyhow::Result<()>;
+    /// Remove an exited session's files (garbage-collect).
+    fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
+}
+
+/// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
+/// tasks here; the terminal-free `exec` backend lands in M1b — R09.)
+pub struct PtyCli {
+    /// The `pty` binary (defaults to `pty` on PATH).
+    bin: String,
+    /// The catalog root — the value of `$CATALOG` during `$`-expansion (spec.md §2 / R11).
+    catalog_root: PathBuf,
+}
+
+impl Default for PtyCli {
+    fn default() -> Self {
+        Self { bin: "pty".to_string(), catalog_root: PathBuf::from(".") }
+    }
+}
+
+/// One entry of `pty list --json` — only the fields st2 needs.
+#[derive(Debug, Deserialize)]
+struct PtyListEntry {
+    /// The pinned session id (matches `--id`), st2's key back to a declared task.
+    name: String,
+    /// `running` | `exited` | `vanished`.
+    status: String,
+    /// The process exit code once `exited` (absent while running or `vanished`).
+    #[serde(rename = "exitCode", default)]
+    exit_code: Option<i64>,
+}
+
+/// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
+/// e.g. an eval run's short `/tmp/stev-<runid>` that dodges the 104-byte unix-socket-path limit that a
+/// deep `<catalog>/pty` would blow — else the rendered default `<catalog>/pty`. Applied uniformly to
+/// spawn AND list/kill so st2 always manages sessions where it put them (this is why `st2 down` failed
+/// to reap pty agents in the eval pilot: spawn honored the rendered root but list/kill inherited a
+/// different ambient one). Mirrors how convoy / `pty` honor a direct `$PTY_ROOT` verbatim.
+pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
+    effective_pty_root_from(catalog_root, std::env::var_os("PTY_ROOT"))
+}
+
+/// The testable core of [`effective_pty_root`] — the ambient value is injected rather than read from
+/// the process env, so tests don't race on the global environment.
+fn effective_pty_root_from(catalog_root: &Path, ambient: Option<std::ffi::OsString>) -> PathBuf {
+    match ambient {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => catalog_root.join("pty"),
+    }
+}
+
+impl PtyCli {
+    /// A `PtyCli` rooted at `catalog_root` (used for `$CATALOG` expansion).
+    pub fn new(catalog_root: PathBuf) -> Self {
+        Self { bin: "pty".to_string(), catalog_root }
+    }
+
+    /// Expand `$VAR`/`${VAR}` against the ambient env plus `$CATALOG` = the catalog root.
+    fn expand(&self, s: &str) -> String {
+        crate::expand::expand_catalog(s, &self.catalog_root)
+    }
+
+    /// Resolve a task's working directory (see [`resolve_task_cwd`]).
+    fn resolve_cwd(&self, target: &TaskTarget, spec_dir: &Path) -> PathBuf {
+        resolve_task_cwd(target, spec_dir, &self.catalog_root)
+    }
+
+    /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
+    /// env can be unit-tested without spawning anything.
+    ///
+    /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
+    /// values, and `cwd` — because `pty` passes the child env through verbatim. The `command` is left
+    /// unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
+        let cwd = self.resolve_cwd(target, spec_dir);
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg("run")
+            .arg("-d") // detached: leave it running in the background
+            .arg("--force") // st2 itself may run inside a pty session; allow nesting
+            .args(["--id", &target.pty_id])
+            .arg("--cwd")
+            .arg(&cwd);
+        for (k, v) in &target.tags {
+            cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
+        }
+        // Per-task env, $-expanded (nothing shell-expands these downstream). $CATALOG is also set so
+        // the command's own `sh -c` expansion can reference it. PTY_ROOT resolves to the EFFECTIVE root
+        // (an exported ambient one wins over the rendered `$CATALOG/pty`), so the session lands where
+        // st2's own list/kill will look for it.
+        cmd.env("CATALOG", &self.catalog_root);
+        for (k, v) in &target.env {
+            if k == "PTY_ROOT" {
+                cmd.env("PTY_ROOT", effective_pty_root(&self.catalog_root));
+            } else {
+                cmd.env(k, self.expand(v));
+            }
+        }
+        // Run the command verbatim under a shell — st2 never parses or splits it.
+        cmd.arg("--").arg("sh").arg("-c").arg(&target.command);
+        cmd
+    }
+}
+
+impl Runner for PtyCli {
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        let out = Command::new(&self.bin)
+            .args(["list", "--json"])
+            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("`pty list --json` failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
+            .map_err(|e| anyhow::anyhow!("parsing `pty list --json`: {e}"))?;
+        Ok(entries
+            .into_iter()
+            .map(|e| Session { pty_id: e.name, alive: e.status == "running", exit_code: e.exit_code })
+            .collect())
+    }
+
+    fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
+        // Isolate the pty session in its own scope (R21b): `systemd-run --scope` wraps the `pty run`
+        // invocation, and because the per-session `pty-daemon` inherits the caller's cgroup (a
+        // double-fork does not move cgroups), the daemon + session land in the scope — a sibling of
+        // the transport unit that a transport/supervisor cgroup-cascade cannot reach. Pass-through on
+        // non-systemd hosts. The inner argv (built + unit-tested by `build_run_command`) is wrapped
+        // verbatim and its env re-applied so it reaches `pty` (and thus the session) through the scope.
+        let inner = self.build_run_command(target, spec_dir);
+        let program = inner.get_program().to_os_string();
+        let args: Vec<OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
+        let arg_refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+        let unit = crate::isolate::scope_unit(&target.pty_id);
+        let envs: Vec<(OsString, OsString)> = inner
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+            .collect();
+
+        // Atomic reap-then-respawn: a session id JUST reaped in this same pass (execute's
+        // reap-then-respawn after a hard-kill) can linger microseconds in the per-session pty daemon —
+        // `pty rm` frees the registry entry but the daemon's socket/lock isn't released yet, so an
+        // immediate `pty run` fails "id already in use". Reap the lingering corpse + brief backoff +
+        // retry closes the window WITHIN the pass, instead of leaving `--once` to error and relying on a
+        // later loop cycle to self-heal (loop mode did; `--once` had one shot). Bounded; on a persistent
+        // failure it surfaces the error unchanged.
+        const SPAWN_ATTEMPTS: u32 = 4;
+        let mut last_err = String::new();
+        for attempt in 0..SPAWN_ATTEMPTS {
+            let mut cmd = crate::isolate::wrap(&unit, program.as_os_str(), &arg_refs);
+            for (k, v) in &envs {
+                cmd.env(k, v);
+            }
+            let out = cmd.output()?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let corpse_race = last_err.contains("already in use");
+            if !corpse_race || attempt + 1 == SPAWN_ATTEMPTS {
+                break;
+            }
+            // A lingering corpse blocks the id — reap it, then back off before retrying.
+            let _ = Command::new(&self.bin)
+                .arg("rm")
+                .arg(&target.pty_id)
+                .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+                .output();
+            std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
+        }
+        anyhow::bail!("spawning pty '{}' failed: {last_err}", target.pty_id);
+    }
+
+    fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
+        let out = Command::new(&self.bin)
+            .arg("kill")
+            .arg(pty_id)
+            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("`pty kill {pty_id}` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    fn remove(&self, pty_id: &str) -> anyhow::Result<()> {
+        let out = Command::new(&self.bin)
+            .arg("rm")
+            .arg(pty_id)
+            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("`pty rm {pty_id}` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+}
+
+/// The production [`Runner`]: routes `pty` tasks to the `pty` CLI and `exec` tasks to the
+/// terminal-free [`ExecBackend`], presenting one unified session view. kill/remove route by the kind
+/// recorded during the last `list_sessions` (with a both-backends fallback).
+pub struct SystemRunner {
+    pty: PtyCli,
+    exec: ExecBackend,
+    /// id → kind, refreshed each `list_sessions`, so kill/remove hit the right backend.
+    index: RefCell<HashMap<String, TaskKind>>,
+}
+
+impl SystemRunner {
+    /// `catalog_root` roots `$CATALOG`; `exec_state_dir` is where exec pids/logs live (machine-local).
+    pub fn new(catalog_root: PathBuf, exec_state_dir: PathBuf) -> Self {
+        Self {
+            pty: PtyCli::new(catalog_root.clone()),
+            exec: ExecBackend::new(exec_state_dir, catalog_root),
+            index: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl Runner for SystemRunner {
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        let mut idx = self.index.borrow_mut();
+        idx.clear();
+        let mut all = self.pty.list_sessions()?;
+        for s in &all {
+            idx.insert(s.pty_id.clone(), TaskKind::Pty);
+        }
+        let ex = self.exec.list()?;
+        for s in &ex {
+            idx.insert(s.pty_id.clone(), TaskKind::Exec);
+        }
+        all.extend(ex);
+        Ok(all)
+    }
+
+    fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
+        match target.kind {
+            TaskKind::Pty => self.pty.spawn(target, spec_dir),
+            TaskKind::Exec => self.exec.spawn(target, spec_dir),
+        }
+    }
+
+    fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
+        match self.index.borrow().get(pty_id) {
+            Some(TaskKind::Exec) => self.exec.kill(pty_id),
+            Some(TaskKind::Pty) => self.pty.kill(pty_id),
+            None => self.pty.kill(pty_id).or_else(|_| self.exec.kill(pty_id)),
+        }
+    }
+
+    fn remove(&self, pty_id: &str) -> anyhow::Result<()> {
+        match self.index.borrow().get(pty_id) {
+            Some(TaskKind::Exec) => self.exec.remove(pty_id),
+            Some(TaskKind::Pty) => self.pty.remove(pty_id),
+            None => {
+                let _ = self.pty.remove(pty_id);
+                let _ = self.exec.remove(pty_id);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The machine-local runner-state dir for a host's exec tasks: `$XDG_STATE_HOME/st2/<host>/exec`
+/// (falling back to `~/.local/state`). Not synced — pids are host-local.
+pub fn exec_state_dir(host: &str) -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("st2").join(host).join("exec")
+}
+
+/// A task st2 gave up restarting (crash-looped past its `restart{}` policy, mode=fail) — carries what
+/// the supervisor loop needs to SURFACE it: the parked task, its agent, and who to notify (M2.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashLoop {
+    /// The parked task's pty id.
+    pub pty_id: String,
+    /// The owning agent's identity and (declared) host — resolved to a bus id when surfacing.
+    pub identity: String,
+    pub host: Option<String>,
+    /// The agent's `supervisor` (from its spec), the crash-ding recipient. `None` → nobody to notify.
+    pub supervisor: Option<String>,
+}
+
+impl CrashLoop {
+    /// The parked agent's bus id (`<host>.<identity>`), using `this_host` when the spec omits a host.
+    pub fn agent_bus_id(&self, this_host: &str) -> String {
+        format!("{}.{}", self.host.as_deref().unwrap_or(this_host), self.identity)
+    }
+}
+
+/// Owned, human-readable summary of one reconcile+execute pass (no borrows of the plan/specs).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UpReport {
+    /// pty ids spawned this pass.
+    pub launched: Vec<String>,
+    /// pty ids torn down (retired agents) this pass.
+    pub torn_down: Vec<String>,
+    /// pty ids garbage-collected (dead, non-`keep`) this pass.
+    pub gc: Vec<String>,
+    /// pty ids whose GC/relaunch was DEFERRED this pass by the liveness debounce — a task that read
+    /// not-alive but was alive within the grace window, i.e. a transient `pty list` flicker under load,
+    /// left alone rather than destructively reaped (R21c). Not "noteworthy" (it's a no-op by design).
+    pub deferred: Vec<String>,
+    /// pty ids the flapping-cap refused to (re)launch this pass (parked / crash-looping).
+    pub flapping: Vec<String>,
+    /// Rich crash-loop records (a superset of `flapping`) — the source for supervisor surfacing.
+    pub crash_loops: Vec<CrashLoop>,
+    /// identities adopted (already fully present).
+    pub adopted: Vec<String>,
+    /// identities skipped as belonging to another host.
+    pub other_host: Vec<String>,
+    /// identities with no runnable task (unrendered).
+    pub unrunnable: Vec<String>,
+    /// discovery warnings (mismatches, …).
+    pub warnings: Vec<String>,
+    /// discovery + execution errors (non-fatal; collected).
+    pub errors: Vec<String>,
+}
+
+impl UpReport {
+    /// True when the pass actually changed something (or hit an error) — used to keep the loop's log
+    /// quiet on no-op ticks.
+    pub fn is_noteworthy(&self) -> bool {
+        !self.launched.is_empty()
+            || !self.torn_down.is_empty()
+            || !self.gc.is_empty()
+            || !self.flapping.is_empty()
+            || !self.errors.is_empty()
+    }
+}
+
+/// Execute a plan against a runner, folding results into `report` and consulting/updating the
+/// flapping-cap. Order matters: reap standalone corpses, then (cap-gated) reap-and-respawn each
+/// launch target, then kill teardowns. Per-op errors are collected, never fatal.
+pub fn execute(plan: &ReconcilePlan, runner: &dyn Runner, cap: &mut FlappingCap, report: &mut UpReport) {
+    // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
+    // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
+    // dead sessions) is reaped here.
+    let launch_ids: HashSet<&str> =
+        plan.launch.iter().flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str())).collect();
+    let gc_set: HashSet<&str> = plan.gc.iter().map(String::as_str).collect();
+
+    for id in &plan.gc {
+        if launch_ids.contains(id.as_str()) {
+            continue; // reaped in the launch loop, gated by the cap
+        }
+        match runner.remove(id) {
+            Ok(()) => report.gc.push(id.clone()),
+            Err(e) => report.errors.push(format!("rm {id}: {e}")),
+        }
+    }
+
+    for launch in &plan.launch {
+        let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
+        let policy = launch.spec.restart_policy();
+        for target in &launch.tasks {
+            let now = Instant::now();
+            match cap.decide(&target.pty_id, now, &policy) {
+                crate::flapping::RestartDecision::Allow => {}
+                crate::flapping::RestartDecision::GaveUp => {
+                    // Parked (mode=fail exhausted): surface it, leave the corpse as evidence.
+                    if !report.flapping.contains(&target.pty_id) {
+                        report.flapping.push(target.pty_id.clone());
+                        report.crash_loops.push(CrashLoop {
+                            pty_id: target.pty_id.clone(),
+                            identity: launch.spec.identity.clone(),
+                            host: launch.spec.host.clone(),
+                            supervisor: launch.spec.supervisor.clone(),
+                        });
+                    }
+                    continue;
+                }
+                // Delaying / RateLimited: transient — skip quietly, retry a later pass, keep the corpse.
+                crate::flapping::RestartDecision::Delaying
+                | crate::flapping::RestartDecision::RateLimited => continue,
+            }
+            // Reap the corpse first (a dead session blocks respawn), then respawn.
+            if gc_set.contains(target.pty_id.as_str()) {
+                match runner.remove(&target.pty_id) {
+                    Ok(()) => report.gc.push(target.pty_id.clone()),
+                    Err(e) => report.errors.push(format!("rm {}: {e}", target.pty_id)),
+                }
+            }
+            match runner.spawn(target, spec_dir) {
+                Ok(()) => {
+                    cap.record(&target.pty_id, now);
+                    report.launched.push(target.pty_id.clone());
+                }
+                Err(e) => report.errors.push(format!("spawn {}: {e}", target.pty_id)),
+            }
+        }
+    }
+
+    for td in &plan.teardown {
+        for id in &td.pty_ids {
+            match runner.kill(id) {
+                Ok(()) => report.torn_down.push(id.clone()),
+                Err(e) => report.errors.push(format!("kill {id}: {e}")),
+            }
+        }
+    }
+
+    report.adopted.extend(plan.adopt.iter().map(|s| s.identity.clone()));
+    report.other_host.extend(plan.other_host.iter().map(|s| s.identity.clone()));
+    report.unrunnable.extend(plan.unrunnable.iter().map(|s| s.identity.clone()));
+}
+
+/// The grace window for the liveness debounce (see [`LivenessDebounce`]): a task read not-alive but
+/// alive within this window is treated as a transient `pty list` flicker and left alone, not reaped.
+/// ~10s comfortably covers a load-induced misread burst while a genuinely-dead task is still reaped
+/// only one grace-window late.
+const DEBOUNCE_GRACE: Duration = Duration::from_secs(10);
+
+/// Absorbs transient `pty list` misreports so the reconcile loop never destructively GCs a HEALTHY
+/// agent (R21c). Under concurrent multi-agent pty load (e.g. an eval run), `pty list --json` can
+/// momentarily report a live session as not-running; reconcile would then classify it `Dead` → `pty
+/// rm` (destroys the session) + re-launch. This tracks the last time each id was seen ALIVE; a task
+/// that reads not-alive but was alive within [`DEBOUNCE_GRACE`] is a flicker — its GC and re-launch
+/// are DEFERRED (left alone) until it reads not-alive continuously past the grace (a stable death,
+/// which is then reaped normally). It defers BOTH the destructive GC and the noisy "already in use"
+/// re-launch. A never-seen task (a genuinely-new launch) is never deferred.
+pub struct LivenessDebounce {
+    last_alive: HashMap<String, Instant>,
+    grace: Duration,
+}
+
+impl LivenessDebounce {
+    pub fn new(grace: Duration) -> Self {
+        Self { last_alive: HashMap::new(), grace }
+    }
+
+    /// Record which ids are alive as of `now`, and forget ids not seen alive within the grace (bounds
+    /// memory; a long-dead id past the grace is no longer debounced anyway).
+    fn observe(&mut self, sessions: &[Session], now: Instant) {
+        for s in sessions {
+            if s.alive {
+                self.last_alive.insert(s.pty_id.clone(), now);
+            }
+        }
+        self.last_alive.retain(|_, &mut t| now.duration_since(t) < self.grace);
+    }
+
+    /// True if `id` was seen alive within the grace ending at `now` — a recent flicker, defer it.
+    fn recently_alive(&self, id: &str, now: Instant) -> bool {
+        self.last_alive.get(id).is_some_and(|&t| now.duration_since(t) < self.grace)
+    }
+
+    /// Remove recently-alive ids from the plan's GC and launch sets (they're flickers, not real
+    /// deaths). Returns the deferred ids for the report. Genuinely-dead (past-grace) and never-seen
+    /// (new) tasks are left in the plan and handled normally.
+    fn defer_flickers(&self, plan: &mut ReconcilePlan, now: Instant) -> Vec<String> {
+        let mut deferred = Vec::new();
+        plan.gc.retain(|id| {
+            let flicker = self.recently_alive(id, now);
+            if flicker {
+                deferred.push(id.clone());
+            }
+            !flicker
+        });
+        for launch in &mut plan.launch {
+            launch.tasks.retain(|t| {
+                let flicker = self.recently_alive(&t.pty_id, now);
+                if flicker && !deferred.contains(&t.pty_id) {
+                    deferred.push(t.pty_id.clone());
+                }
+                !flicker
+            });
+        }
+        plan.launch.retain(|l| !l.tasks.is_empty());
+        deferred
+    }
+}
+
+/// One full reconcile pass: discover → list actual → reconcile → execute. On a `pty list` failure the
+/// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
+/// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
+/// `debounce` carries per-id liveness so a transient not-alive flicker isn't destructively reaped.
+fn reconcile_pass(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
+    let found = crate::discover(root);
+    let mut report = UpReport {
+        warnings: found.warnings.clone(),
+        errors: found.errors.iter().map(|e| format!("{}: {}", e.path.display(), e.message)).collect(),
+        ..Default::default()
+    };
+
+    let sessions = match runner.list_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            report.errors.push(format!("list sessions (pass skipped): {e}"));
+            return report;
+        }
+    };
+    let now = Instant::now();
+    debounce.observe(&sessions, now);
+    let mut plan = crate::reconcile(&found.specs, &sessions, this_host);
+    report.deferred = debounce.defer_flickers(&mut plan, now);
+    execute(&plan, runner, cap, &mut report);
+    report
+}
+
+/// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
+/// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
+/// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
+pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    Ok(reconcile_pass(root, this_host, runner, &mut FlappingCap::default(), &mut debounce))
+}
+
+/// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
+/// discovered catalog — the `st2 up <spec>` path. Same reconcile/execute/flapping/liveness-debounce
+/// core; `this_host` filters, `cap`/`debounce` carry state across passes.
+/// One supervised pass over an in-memory spec team, carrying `cap`+`debounce` across calls (so a
+/// respawn is flicker-tolerant AND flapping-capped). The `st2 up <spec>` loop uses it per interval; the
+/// `supervise` eval calls it per wait-tick so a fault-injected dead seat is respawned FROM SPEC exactly
+/// once (the carried cap rate-limits a same-episode second respawn; the carried debounce absorbs a
+/// transient `pty list` misread of a healthy seat).
+pub fn reconcile_pass_specs(
+    specs: &[crate::spec::AgentSpec],
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
+    let mut report = UpReport::default();
+    let sessions = match runner.list_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            report.errors.push(format!("list sessions (pass skipped): {e}"));
+            return report;
+        }
+    };
+    let now = Instant::now();
+    debounce.observe(&sessions, now);
+    let mut plan = crate::reconcile(specs, &sessions, this_host);
+    report.deferred = debounce.defer_flickers(&mut plan, now);
+    execute(&plan, runner, cap, &mut report);
+    report
+}
+
+/// One reconcile pass over an in-memory spec team (`st2 up <spec> --once`). Throwaway cap+debounce
+/// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
+pub fn up_once_specs(specs: &[crate::spec::AgentSpec], this_host: &str, runner: &dyn Runner) -> UpReport {
+    let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    reconcile_pass_specs(specs, this_host, runner, &mut FlappingCap::default(), &mut debounce)
+}
+
+/// Supervise an in-memory spec team: keep-alive + respawn on a timer, nomad-decoupled — the `convoy up`
+/// replacement for a single-file st2 spec, behaving exactly like [`up_loop`] over a catalog (same
+/// FlappingCap, LivenessDebounce, crash-loop surfacing, and "stop leaves sessions running"). Timer-only
+/// (a spec is one static file — no folder to watch; edit + restart to change it). `root` roots
+/// `$CATALOG` + crash-loop surfacing. Runs until SIGINT/SIGTERM.
+pub fn up_loop_specs(
+    specs: &[crate::spec::AgentSpec],
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    mut on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    install_signal_handler();
+    let mut cap = FlappingCap::default();
+    let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    let mut reported_flapping: HashSet<String> = HashSet::new();
+    loop {
+        let report = reconcile_pass_specs(specs, this_host, runner, &mut cap, &mut debounce);
+        for cl in &report.crash_loops {
+            if reported_flapping.insert(cl.pty_id.clone()) {
+                eprintln!(
+                    "st2: GAVE UP on '{}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. Fix the cause, then restart st2.",
+                    cl.pty_id
+                );
+                surface_crash_loop(root, this_host, cl);
+            }
+        }
+        on_report(&report);
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+        // Sleep the interval in 250ms slices so Ctrl-C is responsive (timer-only; no fs-watch).
+        let slices = (interval.as_millis() / 250).max(1);
+        for _ in 0..slices {
+            if STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    eprintln!("st2: stopping; leaving sessions running (agents are decoupled from the supervisor).");
+    Ok(())
+}
+
+/// Explicit teardown (`st2 down`) — kill EVERY live task of this host's catalog agents. This is the
+/// one operation that ends tasks (the Nomad model: stopping the supervisor never does). Idempotent:
+/// tasks already gone are simply not in the live set. Per-kill errors are collected, never fatal.
+pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let found = crate::discover(root);
+    let mut report = UpReport {
+        warnings: found.warnings.clone(),
+        errors: found.errors.iter().map(|e| format!("{}: {}", e.path.display(), e.message)).collect(),
+        ..Default::default()
+    };
+    teardown_specs(&found.specs, this_host, runner, &mut report)?;
+    Ok(report)
+}
+
+/// `st2 down` for a single-file team spec: tear down the declared team's live sessions on this host.
+/// The symmetric verb to `up`/`ls` over a spec — the "stop the fleet cleanly" step of the swap runbook.
+/// Sessions persist across an `st2 up` supervisor exit (nomad-decoupled), so this is how you actually
+/// stop them. `specs` are the already-resolved [`AgentSpec`]s (from `spec_to_agent_specs`).
+pub fn down_specs(
+    specs: &[crate::spec::AgentSpec],
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    let mut report = UpReport::default();
+    teardown_specs(specs, this_host, runner, &mut report)?;
+    Ok(report)
+}
+
+/// Shared teardown core: kill every live task session declared on this host. Task session ids are
+/// derived identically to how reconcile spawns them (explicit `task.id`, else `<bus_id>.<task>`), so
+/// the catalog `down` and the spec `down_specs` tear down exactly what `up`/`up_*_specs` launched.
+fn teardown_specs(
+    specs: &[crate::spec::AgentSpec],
+    this_host: &str,
+    runner: &dyn Runner,
+    report: &mut UpReport,
+) -> anyhow::Result<()> {
+    let live: HashSet<String> = runner
+        .list_sessions()?
+        .into_iter()
+        .filter(|s| s.alive)
+        .map(|s| s.pty_id)
+        .collect();
+    for spec in specs {
+        if spec.resolved_host(this_host) != this_host {
+            report.other_host.push(spec.identity.clone());
+            continue;
+        }
+        let bus_id = spec.bus_id(this_host);
+        for task in &spec.tasks {
+            let id = task.id.clone().unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            if live.contains(&id) {
+                match runner.kill(&id) {
+                    Ok(()) => report.torn_down.push(id),
+                    Err(e) => report.errors.push(format!("kill {id}: {e}")),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---- The supervisor loop (M3) ----------------------------------------------------------------
+
+/// Set by SIGINT/SIGTERM to break the loop cleanly (agents keep running — they're decoupled).
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_sig: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handler() {
+    // A plain `signal()` handler is enough to flip an atomic flag; no reentrant work is done here.
+    // Cast through a fn pointer (not the zero-sized fn item) to the C handler type.
+    let handler = on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+/// Best-effort recursive watcher over the catalog folder: sends `()` on any change so an edited /
+/// dropped / retired spec reconciles immediately. Returns `None` (timer-only fallback) if the
+/// platform or dir can't be watched. (Inbox writes also fire it — harmless, reconcile is idempotent.)
+fn watch_folder(dir: &Path, tx: Sender<()>) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = tx.send(());
+        }
+    })
+    .ok()?;
+    watcher.watch(dir, RecursiveMode::Recursive).ok()?;
+    Some(watcher)
+}
+
+fn drain(rx: &Receiver<()>) {
+    while rx.try_recv().is_ok() {}
+}
+
+/// The supervisor loop: reconcile on a timer AND on folder changes until interrupted. The fs-watch is
+/// best-effort; the `interval` timer is the always-on fallback. `on_report` is called once per pass
+/// (e.g. to log a summary). Returns when a stop signal arrives — agents are left running.
+pub fn up_loop(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    mut on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    install_signal_handler();
+    let (tx, rx) = channel::<()>();
+    let _watcher = watch_folder(root, tx);
+    let mut cap = FlappingCap::default();
+    // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
+    // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
+    let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+
+    // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
+    // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
+    // watching the log.
+    let mut reported_flapping: HashSet<String> = HashSet::new();
+
+    loop {
+        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
+        for cl in &report.crash_loops {
+            if reported_flapping.insert(cl.pty_id.clone()) {
+                eprintln!("st2: GAVE UP on '{}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. Fix the cause, then restart st2.", cl.pty_id);
+                surface_crash_loop(root, this_host, cl);
+            }
+        }
+        on_report(&report);
+
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Sleep the interval in 250ms slices, waking early on a folder change or a stop signal.
+        let slices = (interval.as_millis() / 250).max(1);
+        for _ in 0..slices {
+            if STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(()) => {
+                    drain(&rx); // coalesce a burst of events into one pass
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if STOP.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+
+    eprintln!("st2: stopping; leaving sessions running (agents are decoupled from the supervisor).");
+    Ok(())
+}
+
+/// Surface a crash-loop to the parked agent's `supervisor` over the native bus (M2.4): a one-shot
+/// `crash-loop`-tagged message, so a crash-looping agent isn't only an stderr line the operator has to
+/// be watching (the exact miss that let a 45-min outage run). Best-effort — a missing supervisor,
+/// an unresolvable supervisor, or a send failure is logged, never fatal. Dedup (once per park) is the
+/// caller's job.
+pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
+    let agent = cl.agent_bus_id(this_host);
+    let Some(supervisor) = cl.supervisor.as_deref() else {
+        eprintln!("st2: crash-loop '{}' ({agent}) has no supervisor to notify.", cl.pty_id);
+        return;
+    };
+    let Some(agent_dir) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
+        eprintln!(
+            "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
+            cl.pty_id
+        );
+        return;
+    };
+    let subject = format!("crash-loop: {agent} parked");
+    let body = format!(
+        "st2 gave up restarting task '{}' (agent {agent}) — it crash-looped past its restart{{}} \
+         policy (mode=fail) and is parked. Its last dead session is left as evidence. Investigate the \
+         cause, then restart st2 to unpark it.",
+        cl.pty_id
+    );
+    let from = format!("st2.{this_host}"); // the runner is the sender
+    let tags = ["crash-loop".to_string()];
+    if let Err(e) = message::send_to_inbox(
+        &message::inbox_dir(&agent_dir),
+        &from,
+        Some(&subject),
+        None,
+        &tags,
+        &body,
+    ) {
+        eprintln!("st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}", cl.pty_id);
+    }
+}
+
+/// Best-effort detection of this machine's short hostname (the catalog's host segment), used as the
+/// default reconcile host filter. Falls back to `localhost` if it can't be determined.
+pub fn detect_host() -> String {
+    // `hostname` is ubiquitous; take the first dotted label (short name, e.g. `hetz`).
+    if let Ok(out) = Command::new("hostname").output()
+        && out.status.success()
+    {
+        let full = String::from_utf8_lossy(&out.stdout);
+        if let Some(short) = full.trim().split('.').next()
+            && !short.is_empty()
+        {
+            return short.to_string();
+        }
+    }
+    "localhost".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::TaskKind;
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+
+    fn target(id: &str, cmd: &str) -> TaskTarget {
+        TaskTarget {
+            kind: TaskKind::Pty,
+            pty_id: id.to_string(),
+            bus_id: "hetz.demo".to_string(),
+            name: "agent".to_string(),
+            command: cmd.to_string(),
+            cwd: None,
+            workspace: None,
+            tags: BTreeMap::new(),
+            env: BTreeMap::new(),
+            keep: false,
+        }
+    }
+
+    // ── liveness debounce (R21c): a transient `pty list` not-alive flicker under load must not
+    //    destructively GC/relaunch a HEALTHY agent; a stable death must still be reaped ──────────────
+
+    use crate::reconcile::Launch;
+    use crate::spec::{AgentSpec, JobType};
+
+    fn sess(id: &str, alive: bool) -> Session {
+        Session { pty_id: id.to_string(), alive, exit_code: None }
+    }
+
+    fn spec_fixture() -> AgentSpec {
+        AgentSpec {
+            identity: "demo".into(),
+            host: Some("hetz".into()),
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            retired: false,
+            keep: false,
+            restart: None,
+            tasks: vec![],
+            path: std::path::PathBuf::from("/x"),
+        }
+    }
+
+    #[test]
+    fn debounce_absorbs_a_gc_flicker_but_reaps_a_stable_death() {
+        let t0 = Instant::now();
+        let mut db = LivenessDebounce::new(Duration::from_secs(10));
+        db.observe(&[sess("hetz.demo.agent", true)], t0);
+
+        // Flicker: reads not-alive 1s later but was alive within the grace → deferred (left running).
+        let mut plan = ReconcilePlan::default();
+        plan.gc.push("hetz.demo.agent".into());
+        let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(1));
+        assert!(plan.gc.is_empty(), "a recently-alive flicker must NOT be GC'd");
+        assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
+
+        // CENTRAL anti-over-correction check: a STABLE death past the grace IS still reaped — the
+        // debounce must never MASK a real death.
+        let mut plan = ReconcilePlan::default();
+        plan.gc.push("hetz.demo.agent".into());
+        let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(11));
+        assert_eq!(plan.gc, vec!["hetz.demo.agent".to_string()], "a stable death must still be reaped");
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn effective_pty_root_prefers_an_exported_ambient_root_else_catalog_pty() {
+        let cat = std::path::Path::new("/deep/sandbox/st-root");
+        // No ambient PTY_ROOT → the rendered default `<catalog>/pty`.
+        assert_eq!(effective_pty_root_from(cat, None), cat.join("pty"));
+        assert_eq!(effective_pty_root_from(cat, Some("".into())), cat.join("pty"), "empty is treated as unset");
+        // An exported ambient PTY_ROOT (e.g. an eval's short decoupled root) WINS — so a deep catalog
+        // path can't blow the unix-socket limit, and spawn agrees with list/kill.
+        let short = std::ffi::OsString::from("/tmp/stev-abc123");
+        assert_eq!(effective_pty_root_from(cat, Some(short)), std::path::PathBuf::from("/tmp/stev-abc123"));
+    }
+
+    #[test]
+    fn debounce_never_defers_a_never_seen_task() {
+        let t0 = Instant::now();
+        let db = LivenessDebounce::new(Duration::from_secs(10));
+        // A genuinely-new target (never observed alive) is handled immediately, not deferred.
+        let mut plan = ReconcilePlan::default();
+        plan.gc.push("hetz.brandnew.agent".into());
+        let deferred = db.defer_flickers(&mut plan, t0);
+        assert_eq!(plan.gc, vec!["hetz.brandnew.agent".to_string()]);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn debounce_defers_a_flickering_launch_target_too() {
+        let t0 = Instant::now();
+        let mut db = LivenessDebounce::new(Duration::from_secs(10));
+        db.observe(&[sess("hetz.demo.agent", true)], t0);
+
+        // The same recently-alive id showing up as a launch target (Absent/Dead) is also deferred —
+        // no noisy "already in use" re-launch of a live session.
+        let spec = spec_fixture();
+        let mut plan = ReconcilePlan::default();
+        plan.launch.push(Launch { spec: &spec, tasks: vec![target("hetz.demo.agent", "x")] });
+        let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(2));
+        assert!(plan.launch.is_empty(), "a recently-alive flicker must NOT be re-launched");
+        assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
+    }
+
+    /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id.
+    #[test]
+    fn build_run_command_wraps_command_in_sh_c() {
+        let cli = PtyCli::default();
+        let t = target("hetz.demo.agent", "exec claude --permission-mode bypassPermissions 'boot'");
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+
+        assert_eq!(cmd.get_program(), OsStr::new("pty"));
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        // Order: run -d --force --id <id> --cwd <cwd> -- sh -c <command>
+        assert_eq!(&args[0..2], &["run", "-d"]);
+        assert!(args.contains(&"--force".to_string()));
+        let id_pos = args.iter().position(|a| a == "--id").unwrap();
+        assert_eq!(args[id_pos + 1], "hetz.demo.agent");
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
+    }
+
+    #[test]
+    fn build_run_command_defaults_cwd_to_spec_dir_and_passes_tags_and_env() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo.agent", "exec claude 'boot'");
+        t.tags.insert("role".into(), "agent".into());
+        t.env.insert("ST_AGENT".into(), "hetz.demo-claude".into());
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
+        assert_eq!(args[cwd_pos + 1], "/cat/hetz/demo"); // no cwd, no workspace → spec dir
+        let tag_pos = args.iter().position(|a| a == "--tag").unwrap();
+        assert_eq!(args[tag_pos + 1], "role=agent");
+
+        // env injected onto the child process
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        assert_eq!(envs.get("ST_AGENT"), Some(&Some("hetz.demo-claude".to_string())));
+    }
+
+    #[test]
+    fn build_run_command_defaults_cwd_to_workspace_when_task_cwd_absent() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo.agent", "exec claude 'boot'");
+        t.workspace = Some("/repos/demo".into()); // no task cwd → workspace (spec.md §2)
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
+        assert_eq!(args[cwd_pos + 1], "/repos/demo");
+    }
+
+    #[test]
+    fn build_run_command_expands_catalog_var_and_sets_it_in_env() {
+        let cli = PtyCli::new(PathBuf::from("/my/catalog"));
+        let mut t = target("hetz.demo.agent", "run");
+        t.env.insert("DATA".into(), "$CATALOG/evals/x".into());
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        assert_eq!(envs.get("DATA"), Some(&Some("/my/catalog/evals/x".to_string())));
+        assert_eq!(envs.get("CATALOG"), Some(&Some("/my/catalog".to_string())));
+    }
+
+    #[test]
+    fn build_run_command_expands_vars_in_env_cwd_and_tags_but_not_command() {
+        // Unique var name so the process-global set_var can't collide with a parallel test.
+        let key = "ST2_TEST_EXPAND_NET_9f3";
+        unsafe { std::env::set_var(key, "/net/xyz") }
+
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo.agent", "exec claude $ST2_TEST_EXPAND_NET_9f3/go");
+        t.cwd = Some(format!("${key}/work"));
+        t.tags.insert("net".into(), format!("${key}"));
+        t.env.insert("ST_ROOT".into(), format!("${key}/smalltalk"));
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        // cwd expanded (absolute → replaces the spec dir)
+        let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
+        assert_eq!(args[cwd_pos + 1], "/net/xyz/work");
+        // tag value expanded
+        let tag_pos = args.iter().position(|a| a == "--tag").unwrap();
+        assert_eq!(args[tag_pos + 1], "net=/net/xyz");
+        // command left verbatim for sh -c to expand at spawn
+        assert_eq!(args.last().unwrap(), "exec claude $ST2_TEST_EXPAND_NET_9f3/go");
+
+        // env value expanded
+        let envs: std::collections::BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        assert_eq!(envs.get("ST_ROOT"), Some(&Some("/net/xyz/smalltalk".to_string())));
+
+        unsafe { std::env::remove_var(key) }
+    }
+
+    #[test]
+    fn resolve_cwd_honors_relative_absolute_workspace_and_default() {
+        let cli = PtyCli::default();
+        let mut t = target("x", "y");
+        // relative cwd → joined onto the spec dir
+        t.cwd = Some("sub".into());
+        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/cat/hetz/demo/sub"));
+        // absolute cwd → replaces
+        t.cwd = Some("/repos/fabric".into());
+        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/repos/fabric"));
+        // no cwd but a workspace → workspace
+        t.cwd = None;
+        t.workspace = Some("/repos/ws".into());
+        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/repos/ws"));
+        // neither → spec dir
+        t.workspace = None;
+        assert_eq!(cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")), Path::new("/cat/hetz/demo"));
+    }
+
+    #[test]
+    fn detect_host_returns_a_nonempty_short_name() {
+        let h = detect_host();
+        assert!(!h.is_empty());
+        assert!(!h.contains('.'), "short name only, got {h}");
+    }
+}

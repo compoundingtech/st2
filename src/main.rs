@@ -1,0 +1,1494 @@
+//! st2 CLI. M0 exposes a single read-only command — `st2 ls <root>` — that slurps a catalog+inbox
+//! folder and prints what it discovered (specs, warnings, errors). Reconcile/run land in later
+//! milestones; this is the smoke test that discovery works end to end against a real folder.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+
+use st2::{
+    HostLock, Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message,
+    up_loop, up_once,
+};
+
+#[derive(Parser)]
+#[command(
+    name = "st2",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ST2_GIT_SHA"), ")"),
+    about = "Harness-agnostic runner over a unified catalog+inbox folder"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Discover and print every agent spec under a catalog+inbox folder.
+    Ls {
+        /// The unified catalog+inbox folder to slurp.
+        root: PathBuf,
+    },
+    /// Supervise a catalog+inbox folder: reconcile on a folder-watch + timer, keeping each agent's
+    /// ptys running. With --once, do a single pass and exit.
+    Up {
+        /// The unified catalog+inbox folder to slurp.
+        root: PathBuf,
+        /// Host to filter on (which agents this machine runs). Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Do a single reconcile pass and exit, instead of looping.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
+        /// immediately regardless).
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+    },
+    /// Native message bus (VRS §5): send/list/read/archive/reply over agents' `resources/inbox`.
+    /// The wire format (a `<unix-ms>-<rand6>.md` markdown file) is smalltalk-compatible.
+    #[command(subcommand)]
+    Message(MessageCmd),
+    /// An agent's working-state context (lossless-restart, smalltalk-compatible): read/write/append.
+    #[command(subcommand)]
+    Context(ContextCmd),
+    /// An agent's linked resources (high-value output a peer can find): add/ls/read/remove.
+    #[command(subcommand)]
+    Resource(ResourceCmd),
+    /// Install `st2 up` as a systemd-user service (headless Linux — the `convoy-up.service`
+    /// replacement). macOS stays manual (TCC). Subcommands: install / status / uninstall.
+    #[command(subcommand)]
+    Service(ServiceCmd),
+    /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
+    /// message. Long-running — st2 keeps it alive as a task alongside the agent. Exits when the target
+    /// pty session is gone. `st2 ping` is an alias (the maintainer is renaming ding → ping, since dinging is
+    /// the runner's job now); it is the exact same command.
+    #[command(visible_alias = "ping")]
+    Ding {
+        /// The target pty session to poke (a `pty` session ref).
+        session: String,
+        /// Whose inbox to watch — bus id or identity. Defaults to `$ST_AGENT`.
+        #[arg(long)]
+        identity: Option<String>,
+        /// Catalog root. Defaults to `$CATALOG`.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Poll/liveness cadence in milliseconds (folder changes poke immediately regardless).
+        #[arg(long, default_value_t = 1000)]
+        interval: u64,
+    },
+    /// Get or set an agent's presence status. No `--set` prints the status; no identity means yours
+    /// (`$ST_AGENT`). Settable: offline | available | busy | away | dnd (`unknown` is derived).
+    Status {
+        /// Whose status — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
+        identity: Option<String>,
+        /// Set your status to this state instead of printing it.
+        #[arg(long = "set")]
+        set: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Render an IR folder into a runnable catalog: for each IR `agent`, write `<catalog>/<host>/
+    /// <identity>/agent.kdl` (behavior-neutral wiring), materialize the persona overlay into the
+    /// agent's workspace, and create its smalltalk bus dirs.
+    Render {
+        /// IR input folder — `*.kdl` agent declarations, with `personas/<persona>.md` alongside.
+        ir_dir: PathBuf,
+        /// Catalog output folder.
+        catalog_dir: PathBuf,
+    },
+    /// Declare a new agent: author its IR entry (`<ir-dir>/<identity>.kdl`). No render, no launch —
+    /// then `st2 render` materializes it and `st2 up` runs it.
+    Add {
+        /// The agent identity (e.g. `fabric-claude`).
+        identity: String,
+        /// IR folder to write the entry into.
+        ir_dir: PathBuf,
+        #[arg(long, default_value = "worker")]
+        role: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value = "claude")]
+        harness: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// Persona basename (defaults to the role).
+        #[arg(long)]
+        persona: Option<String>,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        supervisor: Option<String>,
+    },
+    /// Un-declare an agent: delete its IR entry (`<ir-dir>/<identity>.kdl`). Re-render + `st2 down`
+    /// to stop a running instance.
+    Remove {
+        identity: String,
+        ir_dir: PathBuf,
+    },
+    /// Render ONE agent from convoy-add-shaped flags STRAIGHT into a runnable catalog (agent.kdl +
+    /// persona overlay + bus dirs) — the imperative sibling of `st2 render`, so a harness can author a
+    /// seat without hand-writing IR. `--persona` takes a composed persona FILE, installed verbatim (the
+    /// `--persona` contract). Mirrors `convoy add`; follow with `st2 up --once` to launch.
+    RenderAgent {
+        /// The catalog folder (the agent lands at `<catalog>/<host>/<identity>/`).
+        catalog: PathBuf,
+        #[arg(long)]
+        identity: String,
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// The agent's workspace directory (its cwd).
+        #[arg(long)]
+        dir: String,
+        /// A composed persona FILE — installed verbatim as the persona overlay.
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long, default_value = "claude")]
+        harness: String,
+        /// Host (defaults to the local hostname).
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        supervisor: Option<String>,
+        /// Extra harness arg spliced into the seat's `exec claude/codex …` command before the boot
+        /// prompt (repeatable, hyphen values allowed) — e.g. `--extra-arg=--plugin-dir
+        /// --extra-arg=/path`. The st2 analog of a per-seat command edit; omit for a normal seat.
+        #[arg(long = "extra-arg", allow_hyphen_values = true)]
+        extra_arg: Vec<String>,
+    },
+    /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
+    /// tasks (stopping/crashing st2 never does). Idempotent.
+    Down {
+        /// The catalog folder.
+        root: PathBuf,
+        /// Host to tear down. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Print shell exports for a catalog's bus — `eval "$(st2 env <catalog>)"` sets `CATALOG`/
+    /// `ST_ROOT`/`PTY_ROOT` so `st`/`pty` target the catalog's bus.
+    Env {
+        /// The catalog folder.
+        root: PathBuf,
+    },
+    /// Pre-trust agent workspaces in the claude config (`$CLAUDE_CONFIG_DIR/.claude.json` else
+    /// `~/.claude.json`) BEFORE they boot, so a kick-driven `claude` never hangs on the "Is this a
+    /// project you trust?" dialog. One atomic batch write for all dirs closes the multi-spawn trust
+    /// race; merges into existing entries (never clobbers). Run it before `st2 up`, like `convoy
+    /// pretrust`.
+    Pretrust {
+        /// Workspace directories to mark trusted.
+        #[arg(required = true)]
+        dirs: Vec<PathBuf>,
+        /// Accepted for `convoy pretrust` drop-in compatibility and IGNORED — `st2 pretrust` already
+        /// marks each dir trusted for BOTH claude and codex, so it needs no harness hint.
+        #[arg(long)]
+        harness: Option<String>,
+    },
+    /// Run an st2-spec eval end to end: copy the fixture, boot the team + judges, deliver the
+    /// kickoff, wait for the sup's confirmation, run the judges → verdict. `st2 eval ./cells/<name>/`.
+    Eval {
+        /// The eval folder (or its `.kdl` spec file).
+        folder: PathBuf,
+        /// Host. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Preserve the run's temp catalog instead of deleting it — for inspecting the worker repo
+        /// (`base..HEAD`), the judge outputs, and the bus after the run (e.g. a gate reproduction).
+        /// Seats are still torn down (no leaks). Also honored via `ST2_EVAL_KEEP`.
+        #[arg(long)]
+        keep: bool,
+    },
+    /// Run `pty` against this catalog's bus with the env auto-set, so pty subcommands and the
+    /// interactive UI work without `eval "$(st2 env <catalog>)"` first. The catalog root is `$CATALOG`
+    /// if already set, else the current directory; `CATALOG`/`ST_ROOT`/`PTY_ROOT` are exported for the
+    /// child exactly as `st2 env` would. No arguments launches the interactive pty UI.
+    Pty {
+        /// Arguments passed through to `pty` verbatim (e.g. `ls`, `peek <session>`). None → the UI.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Drop into `$SHELL` with this catalog's bus env set (`CATALOG`/`ST_ROOT`/`PTY_ROOT`), so `pty`,
+    /// `st`, and anything else target the catalog for the whole session without `eval "$(st2 env …)"`.
+    /// The general form of `st2 pty`. Root is `$CATALOG` if set, else cwd; extra args go to the shell
+    /// (e.g. `st2 shell -c "pty ls"`).
+    Shell {
+        /// Arguments passed through to `$SHELL` verbatim. None → an interactive shell.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Validate a rendered catalog against the runner contract (spec fields, folder layout, paths)
+    /// so any renderer can confirm it hit the spec before running. One line per issue with
+    /// a stable code; exits non-zero on any ERROR (`--strict` also fails on warnings). `--json` emits
+    /// machine output for a renderer's build gate.
+    Validate {
+        /// The catalog folder.
+        root: PathBuf,
+        /// Fail (non-zero exit) on warnings too, not just errors.
+        #[arg(long)]
+        strict: bool,
+        /// Emit the report as JSON instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Health check for a running catalog: tools on PATH, a supervisor holding the lock, each agent's
+    /// task alive, and presence fresh (not rotted to `unknown`) or parked. Exits non-zero on problems.
+    Doctor {
+        /// The catalog folder.
+        root: PathBuf,
+        /// Host to check. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// List every agent in the catalog with its presence status (roster). `--json [--enrich]` is
+    /// byte-compatible with smalltalk's `st agents`.
+    Agents {
+        /// The catalog folder (like `st2 ls`/`up`). Falls back to `--root`/`$CATALOG`.
+        catalog: Option<PathBuf>,
+        /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
+        #[arg(long = "status")]
+        status: Option<String>,
+        /// Machine-readable JSON array.
+        #[arg(long)]
+        json: bool,
+        /// With `--json`, add `lastActivity` + `inbox` count per agent.
+        #[arg(long)]
+        enrich: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
+/// Shared context for message subcommands: where the catalog is, who "I" am, and the local host.
+/// Defaults come from the same env st2 sets on every task it spawns (`$CATALOG`, `$ST_AGENT`), so a
+/// running agent needs no flags.
+#[derive(Args)]
+struct MsgCtx {
+    /// Catalog root. Defaults to `$CATALOG` (set by st2 on every task it spawns).
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// The acting identity — who the message is `from` / whose inbox is "mine". Defaults to
+    /// `$ST_AGENT`.
+    #[arg(long = "as")]
+    as_id: Option<String>,
+    /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Write the `st2.service` systemd-user unit, enable it (start on boot), and start it now.
+    /// Idempotent — safe to re-run. The unit runs `st2 up <catalog>`; agents spawn in sibling
+    /// scopes, so a service restart never cascades to them.
+    Install {
+        /// Catalog (or spec-file) path for `st2 up`. Defaults to `$CATALOG`, else the cwd. Resolved
+        /// to an absolute path — it must exist at install time.
+        catalog: Option<PathBuf>,
+        /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
+        #[arg(long)]
+        host: Option<String>,
+        /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
+        #[arg(long = "memory-max-mb", default_value_t = st2::service::DEFAULT_MEMORY_MAX_MB)]
+        memory_max_mb: u64,
+    },
+    /// Show the `st2.service` systemd status.
+    Status,
+    /// Stop, disable, and remove the `st2.service` unit. Idempotent.
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ResourceCmd {
+    /// Link a resource (a URL you produced or reference) into your resource list.
+    Add {
+        /// The resource URL (any `scheme:` — http/https/file/pty/…).
+        url: String,
+        #[arg(long)]
+        title: Option<String>,
+        /// Comma-separated tags.
+        #[arg(long = "tag", value_delimiter = ',')]
+        tags: Vec<String>,
+        /// A relation label (e.g. `output`, `reference`).
+        #[arg(long)]
+        relation: Option<String>,
+        /// Read a body/notes from stdin.
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// List an agent's resources. Defaults to your own.
+    Ls {
+        identity: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Read one resource. With a leading identity, from that agent; otherwise your own.
+    Read {
+        first: String,
+        second: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Remove one resource.
+    Remove {
+        first: String,
+        second: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextCmd {
+    /// Print an agent's context. Default = `now.md` (working state); `--decisions` the log; `--full` both.
+    Read {
+        /// Whose context — bus id or identity. Defaults to you (`$ST_AGENT`).
+        identity: Option<String>,
+        /// Print the decision log instead of the working state.
+        #[arg(long)]
+        decisions: bool,
+        /// Print the working state and the decision log.
+        #[arg(long)]
+        full: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Overwrite an agent's working state (`now.md`) from stdin.
+    Write {
+        identity: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Append a single decision (with its reasoning) to the log.
+    Append {
+        identity: Option<String>,
+        /// The decision — a single line.
+        #[arg(long)]
+        decision: String,
+        /// Why — a single line.
+        #[arg(long)]
+        why: String,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessageCmd {
+    /// Send a new message to a recipient's inbox.
+    Send {
+        /// Recipient: a bus id (`<host>.<identity>`) or a bare identity in the catalog.
+        to: String,
+        /// The message body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long = "in-reply-to")]
+        in_reply_to: Option<String>,
+        /// Comma-separated tags.
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Reply to a message in your inbox — recipient and threading are derived from it.
+    Reply {
+        /// The message filename in your inbox to reply to.
+        filename: String,
+        /// The reply body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        /// Override the subject (defaults to `re: <original subject>`).
+        #[arg(long)]
+        subject: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// List an inbox (or `--archive`), sorted by send time. Defaults to your own.
+    Ls {
+        /// Whose inbox — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
+        identity: Option<String>,
+        /// List the archive instead of the inbox.
+        #[arg(long)]
+        archive: bool,
+        /// Print only the message count.
+        #[arg(long)]
+        count: bool,
+        /// Show only messages from this sender.
+        #[arg(long = "from")]
+        from: Option<String>,
+        /// Machine-readable JSON array.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Read one message. With a leading identity, read from that agent's box; otherwise your own.
+    Read {
+        /// Either the message filename, or an identity followed by a filename.
+        first: String,
+        /// The message filename (when `first` is an identity).
+        second: Option<String>,
+        /// Read from the archive instead of the inbox.
+        #[arg(long)]
+        archive: bool,
+        /// Print the file verbatim (frontmatter + body), not a formatted view.
+        #[arg(long)]
+        raw: bool,
+        /// Machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Archive one message (inbox → archive). Defaults to your own inbox.
+    Archive {
+        /// Either the message filename, or an identity followed by a filename.
+        first: String,
+        /// The message filename (when `first` is an identity).
+        second: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Show a message's thread — the message + everything replying to it (transitively), across the
+    /// catalog. `--tree` indents by reply depth; otherwise flat chronological.
+    Thread {
+        /// Either the message filename, or an identity followed by a filename.
+        first: String,
+        /// The message filename (when `first` is an identity).
+        second: Option<String>,
+        /// Indented hierarchical output instead of flat chronological.
+        #[arg(long)]
+        tree: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Ls { root } => ls(&root),
+        Command::Up { root, host, once, interval } => up(&root, host, once, interval),
+        Command::Message(cmd) => message_cmd(cmd),
+        Command::Context(cmd) => context_cmd(cmd),
+        Command::Resource(cmd) => resource_cmd(cmd),
+        Command::Service(cmd) => service_cmd(cmd),
+        Command::Ding { session, identity, root, host, interval } => {
+            ding_cmd(&session, identity, root, host, interval)
+        }
+        Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Agents { catalog, status, json, enrich, ctx } => {
+            agents_cmd(catalog, status, json, enrich, ctx)
+        }
+        Command::Render { ir_dir, catalog_dir } => render_cmd(&ir_dir, &catalog_dir),
+        Command::Add {
+            identity,
+            ir_dir,
+            role,
+            host,
+            harness,
+            model,
+            persona,
+            workspace,
+            supervisor,
+        } => add_cmd(&identity, &ir_dir, &role, &host, &harness, model, persona, &workspace, supervisor),
+        Command::Remove { identity, ir_dir } => remove_cmd(&identity, &ir_dir),
+        Command::RenderAgent { catalog, identity, role, dir, persona, harness, host, model, supervisor, extra_arg } => {
+            render_agent_cmd(&catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor, extra_arg)
+        }
+        Command::Down { root, host } => down_cmd(&root, host),
+        Command::Env { root } => env_cmd(&root),
+        Command::Pretrust { dirs, harness: _ } => pretrust_cmd(&dirs),
+        Command::Eval { folder, host, keep } => eval_cmd(&folder, host, keep),
+        Command::Validate { root, strict, json } => validate_cmd(&root, strict, json),
+        Command::Pty { args } => pty_cmd(&args),
+        Command::Shell { args } => shell_cmd(&args),
+        Command::Doctor { root, host } => doctor_cmd(&root, host),
+    }
+}
+
+fn render_cmd(ir_dir: &Path, catalog_dir: &Path) -> Result<()> {
+    let personas_dir = ir_dir.join("personas");
+    let mut count = 0;
+    for entry in std::fs::read_dir(ir_dir).with_context(|| format!("reading IR dir {}", ir_dir.display()))? {
+        let path = entry?.path();
+        // IR files are the *.kdl at the top level; personas/ lives in a subdir.
+        if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let agents = st2::render::parse_ir(&text).with_context(|| format!("parsing IR {}", path.display()))?;
+        for ir in &agents {
+            let dir = st2::render::render_agent(ir, catalog_dir, &personas_dir)
+                .with_context(|| format!("rendering agent '{}'", ir.identity))?;
+            println!("rendered {} → {}", ir.bus_id(), dir.display());
+            count += 1;
+        }
+    }
+    if count == 0 {
+        println!("no IR agents (`*.kdl`) found under {}", ir_dir.display());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_agent_cmd(
+    catalog: &Path,
+    identity: &str,
+    role: &str,
+    dir: &str,
+    persona: &Path,
+    harness: &str,
+    host: Option<String>,
+    model: Option<String>,
+    supervisor: Option<String>,
+    extra_arg: Vec<String>,
+) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    // The composed persona FILE is installed verbatim: `render_agent` reads `<personas_dir>/<name>.md`,
+    // so point personas_dir at the file's parent and use its stem as the persona name.
+    let personas_dir = persona.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let persona_name = persona
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("persona path {} has no file stem", persona.display()))?
+        .to_string();
+    let ir = st2::render::IrAgent {
+        identity: identity.to_string(),
+        host: host.clone(),
+        role: role.to_string(),
+        harness: harness.to_string(),
+        model,
+        persona: persona_name,
+        workspace: dir.to_string(),
+        supervisor,
+        permissions: None,
+        extra_args: extra_arg,
+    };
+    let agent_dir = st2::render::render_agent(&ir, catalog, &personas_dir)
+        .with_context(|| format!("rendering agent '{identity}'"))?;
+    println!(
+        "rendered {host}.{identity} → {}  (now: st2 up --once {} --host {host})",
+        agent_dir.display(),
+        catalog.display()
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_cmd(
+    identity: &str,
+    ir_dir: &Path,
+    role: &str,
+    host: &str,
+    harness: &str,
+    model: Option<String>,
+    persona: Option<String>,
+    workspace: &str,
+    supervisor: Option<String>,
+) -> Result<()> {
+    let path = ir_dir.join(format!("{identity}.kdl"));
+    if path.exists() {
+        anyhow::bail!("agent '{identity}' is already declared at {}", path.display());
+    }
+    std::fs::create_dir_all(ir_dir)?;
+    let mut s = format!("agent \"{identity}\" {{\n  host \"{host}\"\n  role \"{role}\"\n  harness \"{harness}\"\n");
+    if let Some(m) = &model {
+        s.push_str(&format!("  model \"{m}\"\n"));
+    }
+    if let Some(p) = &persona {
+        s.push_str(&format!("  persona \"{p}\"\n"));
+    }
+    s.push_str(&format!("  workspace \"{workspace}\"\n"));
+    if let Some(sup) = &supervisor {
+        s.push_str(&format!("  supervisor \"{sup}\"\n"));
+    }
+    s.push_str("}\n");
+    // Sanity: it must parse as IR before we write it.
+    st2::render::parse_ir(&s).with_context(|| format!("declared IR for '{identity}' does not parse"))?;
+    std::fs::write(&path, &s)?;
+    println!("declared {host}.{identity} → {}  (now: st2 render {} <catalog>)", path.display(), ir_dir.display());
+    Ok(())
+}
+
+fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    // A single-file team spec: tear down the DECLARED team's sessions (symmetric with `st2 up`/`st2 ls`
+    // over a spec — the "stop the fleet cleanly" verb). A catalog dir falls through to catalog teardown.
+    if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
+        let (spec, spec_root) = st2::eval_run::load_spec(&spec_file)?;
+        // Same host resolution as `st2 up <spec>`: --host › the spec's top-level host › OS hostname.
+        let this_host = host.or_else(|| spec.host.clone()).unwrap_or_else(detect_host);
+        let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &spec_root);
+        let runner = SystemRunner::new(spec_root, exec_state_dir(&this_host));
+        let report = st2::down_specs(&specs, &this_host, &runner)?;
+        println!("teardown of spec {} on host '{this_host}':", spec_file.display());
+        print_report(&report);
+        return Ok(());
+    }
+
+    let this_host = host.unwrap_or_else(detect_host);
+    let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
+    let report = st2::down(root, &this_host, &runner)?;
+    println!("teardown on host '{this_host}':");
+    print_report(&report);
+    Ok(())
+}
+
+fn remove_cmd(identity: &str, ir_dir: &Path) -> Result<()> {
+    let path = ir_dir.join(format!("{identity}.kdl"));
+    if !path.exists() {
+        anyhow::bail!("no IR entry for '{identity}' at {}", path.display());
+    }
+    std::fs::remove_file(&path)?;
+    println!("removed {}  (re-render + `st2 down` to stop a running instance)", path.display());
+    Ok(())
+}
+
+fn eval_cmd(folder: &Path, host: Option<String>, keep: bool) -> Result<()> {
+    let spec_file = st2::eval_run::resolve_spec_path(folder)
+        .with_context(|| format!("{} is not an st2 spec (a *.kdl file, or a folder with one)", folder.display()))?;
+    let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
+    let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
+
+    if !report.done {
+        println!("(note: the team did not send a confirmation within max-timeout — judged the final state)");
+    }
+    println!("\n== judges ==");
+    let (mut pass, mut fail) = (0, 0);
+    for j in &report.judges {
+        if j.signal {
+            // Show-but-don't-gate: runs + prints, but never counts toward SCORE/verdict.
+            println!("  [SIGNAL] {}  ({})", j.name, j.detail);
+            continue;
+        }
+        if j.passed {
+            pass += 1;
+        } else {
+            fail += 1;
+        }
+        println!("  {} {}  ({})", if j.passed { "[PASS]" } else { "[FAIL]" }, j.name, j.detail);
+    }
+    println!("SCORE: {pass} PASS / {fail} FAIL / {} gating judges", pass + fail);
+    if report.passed() {
+        println!("VERDICT: PASS");
+        Ok(())
+    } else {
+        anyhow::bail!("VERDICT: FAIL")
+    }
+}
+
+fn validate_cmd(root: &Path, strict: bool, json: bool) -> Result<()> {
+    let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let report = st2::validate::validate(&catalog_root);
+    let (errors, warnings) = (report.errors(), report.warnings());
+
+    if json {
+        let issues: Vec<serde_json::Value> = report
+            .issues
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "severity": i.severity.tag(),
+                    "code": i.code,
+                    "path": i.path,
+                    "agent": i.agent,
+                    "message": i.message,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "issues": issues,
+            "agents": report.agents,
+            "errors": errors,
+            "warnings": warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        for i in &report.issues {
+            println!("{}  {}: {}", i.severity.label(), i.path, i.message);
+        }
+        println!(
+            "─ {errors} error{}, {warnings} warning{} across {} agent{}",
+            plural(errors),
+            plural(warnings),
+            report.agents,
+            plural(report.agents),
+        );
+    }
+
+    // Exit non-zero on any error; under --strict, warnings fail too. Use a clean process exit so a
+    // scriptable caller does not also get anyhow's "Error:" line after the report it already printed.
+    if errors > 0 || (strict && warnings > 0) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The catalog root for the bus env: `$CATALOG` if already set, else the current directory. Same
+/// roots `st2 env` derives — the shared basis for `st2 pty` and `st2 shell`.
+fn catalog_root_for_env() -> Result<PathBuf> {
+    let root = std::env::var_os("CATALOG")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir().context("resolving the current directory")?);
+    Ok(root.canonicalize().unwrap_or(root))
+}
+
+/// Set `CATALOG`/`ST_ROOT`/`PTY_ROOT` on a child so `st`/`pty` target this catalog's bus — the same
+/// exports `st2 env` prints.
+fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
+    cmd.env("CATALOG", root)
+        .env("ST_ROOT", root.join("smalltalk"))
+        .env("PTY_ROOT", root.join("pty"));
+}
+
+/// `st2 pty [<pty-args>…]` — a thin pass-through to `pty` with the catalog's bus env pre-set, so
+/// the maintainer never has to `eval "$(st2 env …)"` first. **Replaces** this process with `pty` (via exec)
+/// so the interactive UI keeps the tty, signals, and exit code.
+fn pty_cmd(args: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let root = catalog_root_for_env()?;
+    let mut cmd = std::process::Command::new("pty");
+    cmd.args(args);
+    with_bus_env(&mut cmd, &root);
+    // exec() only returns on failure (e.g. `pty` not on PATH).
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("failed to exec `pty`: {err}"))
+}
+
+/// `st2 shell [<args>…]` — drop into `$SHELL` with the catalog's bus env set, so `pty`/`st`/anything
+/// target the catalog for the whole session without re-`eval`. The general form of `st2 pty`.
+fn shell_cmd(args: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let root = catalog_root_for_env()?;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(args);
+    with_bus_env(&mut cmd, &root);
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("failed to exec `{shell}`: {err}"))
+}
+
+fn env_cmd(root: &Path) -> Result<()> {
+    let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let c = c.display();
+    // The same roots st2 sets on every task it spawns; `eval "$(st2 env <catalog>)"` makes st/pty
+    // target this catalog's bus.
+    println!("export CATALOG={c}");
+    println!("export ST_ROOT={c}/smalltalk");
+    println!("export PTY_ROOT={c}/pty");
+    Ok(())
+}
+
+fn pretrust_cmd(dirs: &[PathBuf]) -> Result<()> {
+    let n = st2::pretrust::pretrust(dirs)?;
+    println!("pre-trusted {n} workspace{} in the claude config", if n == 1 { "" } else { "s" });
+    Ok(())
+}
+
+fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    let this_host = host.unwrap_or_else(detect_host);
+    let catalog = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    println!("st2 doctor — catalog {}, host '{this_host}'", catalog.display());
+    let mut problems = 0usize;
+
+    // 1) The tools a running fleet needs.
+    for tool in ["pty", "st"] {
+        report_check(&mut problems, tool_on_path(tool), &format!("`{tool}` on PATH"), "not found");
+    }
+
+    // 2) A supervisor holding the host-lock (i.e. `st2 up` is running).
+    match st2::HostLock::new(root, &this_host).live_owner() {
+        Some(_) => report_check(&mut problems, true, "supervisor (st2 up) running", ""),
+        None => report_check(&mut problems, false, "supervisor (st2 up) running", "no live host-lock — run `st2 up`"),
+    }
+
+    // 3) Per this-host agent: every task alive, and presence not rotted to `unknown`.
+    let found = discover(&catalog);
+    for e in &found.errors {
+        report_check(&mut problems, false, &format!("catalog file {}", e.path.display()), &e.message);
+    }
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&this_host));
+    let live: std::collections::HashSet<String> = runner
+        .list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.alive)
+        .map(|s| s.pty_id)
+        .collect();
+    for spec in &found.specs {
+        if spec.resolved_host(&this_host) != this_host {
+            continue;
+        }
+        let bus_id = spec.bus_id(&this_host);
+        for task in &spec.tasks {
+            let id = task.id.clone().unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            report_check(&mut problems, live.contains(&id), &format!("{bus_id} task '{}' alive", task.name), "session dead/missing");
+        }
+        if let Some(dir) = spec.path.parent() {
+            let state = st2::status::read_state(&st2::status::status_path(dir));
+            let fresh = state != st2::status::State::Unknown;
+            report_check(
+                &mut problems,
+                fresh,
+                &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
+                "rotted to `unknown` — is its ding refreshing?",
+            );
+        }
+    }
+
+    if problems == 0 {
+        println!("\n✓ all checks passed");
+        Ok(())
+    } else {
+        anyhow::bail!("{problems} problem(s) found")
+    }
+}
+
+fn tool_on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
+        .unwrap_or(false)
+}
+
+fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
+    if ok {
+        println!("  ✓ {label}");
+    } else {
+        *problems += 1;
+        if detail.is_empty() {
+            println!("  ✗ {label}");
+        } else {
+            println!("  ✗ {label} — {detail}");
+        }
+    }
+}
+
+fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Result<()> {
+    let (root, host) = resolve_ctx(&ctx)?;
+    let id = match identity {
+        Some(i) => i,
+        None => acting_id(&ctx)?,
+    };
+    let sp = st2::status::status_path(&agent_dir_of(&root, &id, &host)?);
+    match set {
+        None => println!("{}", st2::status::read_state(&sp).as_str()),
+        Some(word) => {
+            let state = st2::status::State::parse_settable(&word).with_context(|| {
+                format!("invalid state '{word}' (settable: offline|available|busy|away|dnd)")
+            })?;
+            st2::status::set_state(&sp, state)?;
+            println!("status: {}", state.as_str());
+        }
+    }
+    Ok(())
+}
+
+fn agents_cmd(
+    catalog: Option<PathBuf>,
+    status_filter: Option<String>,
+    json: bool,
+    enrich: bool,
+    mut ctx: MsgCtx,
+) -> Result<()> {
+    if enrich && !json {
+        anyhow::bail!("--enrich requires --json");
+    }
+    // A positional catalog (like `st2 ls`) takes precedence over `--root`/`$CATALOG`.
+    if catalog.is_some() {
+        ctx.root = catalog;
+    }
+    let (root, host) = resolve_ctx(&ctx)?;
+    let mut rows = st2::agents::roster(&root, &host);
+    if let Some(f) = &status_filter {
+        rows.retain(|r| r.status.as_str() == f);
+    }
+    if json {
+        println!("{}", st2::agents::to_json(&rows, enrich));
+    } else {
+        for r in &rows {
+            println!("{}\t{}\t{}", r.identity, r.status.as_str(), r.name.as_deref().unwrap_or(""));
+        }
+    }
+    Ok(())
+}
+
+fn ding_cmd(
+    session: &str,
+    identity: Option<String>,
+    root: Option<PathBuf>,
+    host: Option<String>,
+    interval: u64,
+) -> Result<()> {
+    let ctx = MsgCtx { root, as_id: identity, host };
+    let (catalog_root, this_host) = resolve_ctx(&ctx)?;
+    let id = acting_id(&ctx)?;
+    // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
+    // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
+    let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
+        .unwrap_or_else(|| catalog_root.join(&id));
+    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
+    let status_path = st2::status::status_path(&agent_dir);
+    eprintln!("st2 ding: watching {}'s inbox ({}) → poking pty '{session}'", id, inbox.display());
+    let config = ding::DingConfig { poll: Duration::from_millis(interval), ..Default::default() };
+    ding::serve(&inbox, &status_path, session, &config)
+}
+
+/// Resolve the catalog root and local host from a message subcommand's shared context.
+fn resolve_ctx(ctx: &MsgCtx) -> Result<(PathBuf, String)> {
+    let root = ctx
+        .root
+        .clone()
+        .or_else(|| std::env::var_os("CATALOG").map(PathBuf::from))
+        .context("no catalog root: pass --root or run where $CATALOG is set")?;
+    let root = root.canonicalize().unwrap_or(root);
+    let host = ctx.host.clone().unwrap_or_else(detect_host);
+    Ok((root, host))
+}
+
+/// The acting identity (`from` / whose inbox is "mine"): `--as`, else `$ST_AGENT`.
+fn acting_id(ctx: &MsgCtx) -> Result<String> {
+    ctx.as_id
+        .clone()
+        .or_else(|| std::env::var("ST_AGENT").ok())
+        .filter(|s| !s.is_empty())
+        .context("no acting identity: pass --as or set $ST_AGENT")
+}
+
+/// Resolve a recipient/identity to its agent folder in the catalog, or a clear error.
+fn agent_dir_of(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
+    message::resolve_agent_dir(root, id, host)
+        .with_context(|| format!("no agent '{id}' found in catalog {}", root.display()))
+}
+
+/// Body from `-m`, else stdin (so `st2 message send x < file` works).
+fn body_or_stdin(body: Option<String>) -> Result<String> {
+    match body {
+        Some(b) => Ok(b),
+        None => {
+            use std::io::Read as _;
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).context("reading message body from stdin")?;
+            Ok(s)
+        }
+    }
+}
+
+/// `[identity] <filename>` positionals: if `second` is present, `first` is the identity; otherwise
+/// `first` is the filename and the box belongs to the acting identity.
+fn box_target(first: String, second: Option<String>, ctx: &MsgCtx) -> Result<(String, String)> {
+    match second {
+        Some(filename) => Ok((first, filename)),
+        None => Ok((acting_id(ctx)?, first)),
+    }
+}
+
+fn message_cmd(cmd: MessageCmd) -> Result<()> {
+    match cmd {
+        MessageCmd::Send { to, body, subject, in_reply_to, tags, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let from = acting_id(&ctx)?;
+            let body = body_or_stdin(body)?;
+            let dir = message::resolve_inbox(&root, &to, &host);
+            let filename = message::send_to_inbox(
+                &dir,
+                &from,
+                subject.as_deref(),
+                in_reply_to.as_deref(),
+                &tags,
+                &body,
+            )?;
+            println!("{filename}");
+            Ok(())
+        }
+        MessageCmd::Reply { filename, body, subject, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let from = acting_id(&ctx)?;
+            let my_inbox = message::resolve_inbox(&root, &from, &host);
+            let original = message::read_msg(&my_inbox, &filename)
+                .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
+            let to = original
+                .from
+                .clone()
+                .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
+            let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
+            let body = body_or_stdin(body)?;
+            let dir = message::resolve_inbox(&root, &to, &host);
+            let sent = message::send_to_inbox(
+                &dir,
+                &from,
+                subject.as_deref(),
+                Some(&filename),
+                &[],
+                &body,
+            )?;
+            println!("{sent}");
+            Ok(())
+        }
+        MessageCmd::Ls { identity, archive, count, from, json, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(id) => id,
+                None => acting_id(&ctx)?,
+            };
+            let dir = if archive {
+                message::resolve_archive(&root, &id, &host)
+            } else {
+                message::resolve_inbox(&root, &id, &host)
+            };
+            let mut msgs = message::list_dir(&dir)?;
+            if let Some(sender) = &from {
+                msgs.retain(|m| m.from.as_deref() == Some(sender.as_str()));
+            }
+            if count {
+                println!("{}", msgs.len());
+                return Ok(());
+            }
+            if json {
+                let items: Vec<LsItemJson> = msgs.iter().map(LsItemJson::from).collect();
+                println!("{}", serde_json::to_string(&items)?);
+                return Ok(());
+            }
+            let box_name = if archive { "archive" } else { "inbox" };
+            println!("# {} message{} in {id} {box_name}", msgs.len(), plural(msgs.len()));
+            for m in &msgs {
+                let from = m.from.as_deref().unwrap_or("<unknown>");
+                let subj = m.subject.as_deref().unwrap_or("(no subject)");
+                println!("{}  from {from}  {subj}", m.filename);
+            }
+            Ok(())
+        }
+        MessageCmd::Read { first, second, archive, raw, json, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (id, filename) = box_target(first, second, &ctx)?;
+            let dir = if archive {
+                message::resolve_archive(&root, &id, &host)
+            } else {
+                message::resolve_inbox(&root, &id, &host)
+            };
+            if raw {
+                print!("{}", std::fs::read_to_string(dir.join(&filename))?);
+                return Ok(());
+            }
+            let m = message::read_msg(&dir, &filename)?;
+            if json {
+                println!("{}", serde_json::to_string(&MessageJson::from(&m))?);
+                return Ok(());
+            }
+            println!("from:        {}", m.from.as_deref().unwrap_or("<unknown>"));
+            if let Some(s) = &m.subject {
+                println!("subject:     {s}");
+            }
+            if let Some(irt) = &m.in_reply_to {
+                println!("in-reply-to: {irt}");
+            }
+            if !m.tags.is_empty() {
+                println!("tags:        {}", m.tags.join(", "));
+            }
+            println!();
+            print!("{}", m.body);
+            Ok(())
+        }
+        MessageCmd::Archive { first, second, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (id, filename) = box_target(first, second, &ctx)?;
+            message::archive_msg(
+                &message::resolve_inbox(&root, &id, &host),
+                &message::resolve_archive(&root, &id, &host),
+                &filename,
+            )?;
+            println!("archived");
+            Ok(())
+        }
+        MessageCmd::Thread { first, second, tree, ctx } => {
+            let (root, _host) = resolve_ctx(&ctx)?;
+            // `[identity] filename` — the identity is irrelevant (the walk is catalog-wide).
+            let filename = second.unwrap_or(first);
+            let mut entries = message::collect_thread(&root, &filename);
+            if entries.is_empty() {
+                anyhow::bail!("no thread found for '{filename}' in catalog {}", root.display());
+            }
+            if !tree {
+                entries.sort_by_key(|e| e.ts_ms); // flat chronological
+            }
+            for e in &entries {
+                let indent = if tree { "  ".repeat(e.depth) } else { String::new() };
+                let from = e.from.as_deref().unwrap_or("<unknown>");
+                let subj = e.subject.as_deref().unwrap_or("(no subject)");
+                println!("{indent}{}  from {from}  {subj}", e.filename);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `st2 message ls --json` row (byte-compatible with smalltalk's `st message ls --json`).
+#[derive(serde::Serialize)]
+struct LsItemJson<'a> {
+    filename: &'a str,
+    ts: u64,
+    from: Option<&'a str>,
+    subject: Option<&'a str>,
+    #[serde(rename = "inReplyTo")]
+    in_reply_to: Option<&'a str>,
+    tags: &'a [String],
+    priority: Option<&'a str>,
+}
+
+impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
+    fn from(m: &'a st2::message::Message) -> Self {
+        LsItemJson {
+            filename: &m.filename,
+            ts: m.ts_ms,
+            from: m.from.as_deref(),
+            subject: m.subject.as_deref(),
+            in_reply_to: m.in_reply_to.as_deref(),
+            tags: &m.tags,
+            priority: m.priority.as_deref(),
+        }
+    }
+}
+
+/// `st2 message read --json` — the full message.
+#[derive(serde::Serialize)]
+struct MessageJson<'a> {
+    filename: &'a str,
+    ts: u64,
+    from: Option<&'a str>,
+    subject: Option<&'a str>,
+    #[serde(rename = "inReplyTo")]
+    in_reply_to: Option<&'a str>,
+    tags: &'a [String],
+    priority: Option<&'a str>,
+    body: &'a str,
+}
+
+impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
+    fn from(m: &'a st2::message::Message) -> Self {
+        MessageJson {
+            filename: &m.filename,
+            ts: m.ts_ms,
+            from: m.from.as_deref(),
+            subject: m.subject.as_deref(),
+            in_reply_to: m.in_reply_to.as_deref(),
+            tags: &m.tags,
+            priority: m.priority.as_deref(),
+            body: &m.body,
+        }
+    }
+}
+
+fn context_cmd(cmd: ContextCmd) -> Result<()> {
+    use st2::context::{self, View};
+    match cmd {
+        ContextCmd::Read { identity, decisions, full, ctx } => {
+            let dir = resolve_context_dir(identity, &ctx)?;
+            let view = if full {
+                View::Full
+            } else if decisions {
+                View::Decisions
+            } else {
+                View::Now
+            };
+            print!("{}", context::read(&dir, view));
+            Ok(())
+        }
+        ContextCmd::Write { identity, ctx } => {
+            let dir = resolve_context_dir(identity, &ctx)?;
+            let content = std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
+            context::write_now(&dir, &content)?;
+            eprintln!("context: wrote now.md ({} bytes)", content.len());
+            Ok(())
+        }
+        ContextCmd::Append { identity, decision, why, ctx } => {
+            let dir = resolve_context_dir(identity, &ctx)?;
+            let filename = context::append_decision(&dir, &decision, &why)?;
+            println!("{filename}");
+            Ok(())
+        }
+    }
+}
+
+fn service_cmd(cmd: ServiceCmd) -> Result<()> {
+    match cmd {
+        ServiceCmd::Install { catalog, host, memory_max_mb } => {
+            let catalog = match catalog {
+                Some(c) => c,
+                None => catalog_root_for_env()?,
+            };
+            st2::service::install(&catalog, host, memory_max_mb)
+        }
+        ServiceCmd::Status => st2::service::status(),
+        ServiceCmd::Uninstall => st2::service::uninstall(),
+    }
+}
+
+fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
+    match cmd {
+        ResourceCmd::Add { url, title, tags, relation, body_stdin, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let dir = st2::resource::links_dir(&agent_dir_of(&root, &acting_id(&ctx)?, &host)?);
+            let body = if body_stdin { std::io::read_to_string(std::io::stdin())? } else { String::new() };
+            let f = st2::resource::add(&dir, &url, title.as_deref(), &tags, relation.as_deref(), &body)?;
+            println!("{f}");
+            Ok(())
+        }
+        ResourceCmd::Ls { identity, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(i) => i,
+                None => acting_id(&ctx)?,
+            };
+            let dir = st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?);
+            let items = st2::resource::list(&dir);
+            println!("# {} resource{} for {id}", items.len(), plural(items.len()));
+            for r in &items {
+                let title = r.title.as_deref().unwrap_or("");
+                println!("{}  {}  {title}", r.filename, r.url);
+            }
+            Ok(())
+        }
+        ResourceCmd::Read { first, second, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (id, filename) = box_target(first, second, &ctx)?;
+            let dir = st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?);
+            let r = st2::resource::read(&dir, &filename)?;
+            println!("url:      {}", r.url);
+            if let Some(t) = &r.title {
+                println!("title:    {t}");
+            }
+            if !r.tags.is_empty() {
+                println!("tags:     {}", r.tags.join(", "));
+            }
+            if let Some(rel) = &r.relation {
+                println!("relation: {rel}");
+            }
+            if !r.body.is_empty() {
+                println!();
+                print!("{}", r.body);
+            }
+            Ok(())
+        }
+        ResourceCmd::Remove { first, second, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (id, filename) = box_target(first, second, &ctx)?;
+            st2::resource::remove(&st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?), &filename)?;
+            println!("removed");
+            Ok(())
+        }
+    }
+}
+
+/// Resolve an agent's context dir (`<agent_dir>/resources/context`). Identity defaults to `$ST_AGENT`.
+fn resolve_context_dir(identity: Option<String>, ctx: &MsgCtx) -> Result<PathBuf> {
+    let (root, host) = resolve_ctx(ctx)?;
+    let id = match identity {
+        Some(i) => i,
+        None => acting_id(ctx)?,
+    };
+    Ok(st2::context::context_dir(&agent_dir_of(&root, &id, &host)?))
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// `st2 up <single-file-spec>` — supervise the spec's top-level team as a fleet: keep-alive + respawn,
+/// nomad-decoupled, exactly like `st2 up <catalog>` (the `convoy up` replacement). `--once` does a
+/// single boot pass; otherwise it supervises on a timer under a host lock until Ctrl-C.
+fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u64) -> Result<()> {
+    let (spec, root) = st2::eval_run::load_spec(spec_file)?;
+    // File-level taxonomy (the maintainer): a file with NO agents is an eval-only ("job") file — it has nothing
+    // to supervise; it is run to a verdict via `st2 eval`, not `st2 up`. Refuse it here with a pointer.
+    if spec.agents.is_empty() {
+        anyhow::bail!(
+            "{} declares no agents — it is an eval-only file (run it with `st2 eval {}`), not a fleet to \
+             supervise with `st2 up`",
+            spec_file.display(),
+            spec_file.display()
+        );
+    }
+    // Run host: --host (explicit) › the spec's top-level `host` › the OS hostname. The declared host
+    // wins over the OS hostname so a per-host file ups its own slice even when they differ.
+    let this_host = host.or_else(|| spec.host.clone()).unwrap_or_else(detect_host);
+    // Seats boot as fresh top-level agents (strip the launcher's agent identity) and their bare
+    // `st2 …` resolve to this binary (PATH prepend) — same prep `st2 eval` does.
+    st2::eval_run::prepare_spawn_env();
+    let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
+    let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
+
+    // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
+    let lock = HostLock::new(&root, &this_host);
+    if let Some(owner) = lock.live_owner() {
+        eprintln!("st2: {}", lock.busy_warning(owner));
+        std::process::exit(1);
+    }
+
+    if once {
+        let report = st2::up_once_specs(&specs, &this_host, &runner);
+        println!("booted team from spec {} on host '{this_host}' (once):", spec_file.display());
+        print_report(&report);
+        return Ok(());
+    }
+
+    if lock.has_stale_lock() {
+        eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
+    }
+    lock.acquire().context("acquiring host lock")?;
+    eprintln!(
+        "st2: supervising spec {} on host '{this_host}' ({} agents; reconcile every {interval}s; Ctrl-C to stop)",
+        spec_file.display(),
+        specs.len()
+    );
+    let result = st2::up_loop_specs(&specs, &root, &this_host, &runner, Duration::from_secs(interval), |report| {
+        if report.is_noteworthy() {
+            print_report(report);
+        }
+    });
+    lock.release();
+    result
+}
+
+fn up(root: &Path, host: Option<String>, once: bool, interval: u64) -> Result<()> {
+    // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
+    // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
+    if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
+        return up_spec_fleet(&spec_file, host, once, interval);
+    }
+    let this_host = host.unwrap_or_else(detect_host);
+    // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
+    let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
+
+    // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
+    // the lock (it would double-spawn) — but it does NOT take the lock itself (that would clobber the
+    // loop's pid file); only the loop acquires + holds it.
+    let lock = HostLock::new(root, &this_host);
+    if let Some(owner) = lock.live_owner() {
+        eprintln!("st2: {}", lock.busy_warning(owner));
+        std::process::exit(1);
+    }
+
+    if once {
+        let report = up_once(root, &this_host, &runner)?;
+        println!("reconcile pass on host '{this_host}':");
+        print_report(&report);
+        return Ok(());
+    }
+
+    if lock.has_stale_lock() {
+        eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
+    }
+    lock.acquire().context("acquiring host lock")?;
+
+    eprintln!("st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)", root.display());
+    let result = up_loop(root, &this_host, &runner, Duration::from_secs(interval), |report| {
+        if report.is_noteworthy() {
+            print_report(report);
+        }
+    });
+    lock.release();
+    result
+}
+
+fn print_report(report: &UpReport) {
+    report_line("launched", &report.launched);
+    report_line("torn down", &report.torn_down);
+    report_line("gc", &report.gc);
+    report_line("flapping", &report.flapping);
+    report_line("adopted", &report.adopted);
+    report_line("other-host", &report.other_host);
+    report_line("unrunnable", &report.unrunnable);
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    for e in &report.errors {
+        eprintln!("error: {e}");
+    }
+}
+
+fn report_line(label: &str, items: &[String]) {
+    if !items.is_empty() {
+        println!("  {label} ({}): {}", items.len(), items.join(", "));
+    }
+}
+
+fn ls(root: &Path) -> Result<()> {
+    // A single-file st2 spec: PREVIEW the declared team WITHOUT booting (a safe validate/inspect path
+    // before `st2 up`). A catalog dir has no top-level spec .kdl, so it falls through to discovery.
+    if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
+        let (spec, _dir) = st2::eval_run::load_spec(&spec_file)?;
+        // File-level taxonomy: no agents = an eval-only file → `st2 eval`; agents = a fleet → `st2 up`.
+        let classification = if spec.agents.is_empty() {
+            "eval-only → st2 eval"
+        } else {
+            "agents → st2 up"
+        };
+        println!(
+            "spec {}  [{classification}]  (host {}; {} agent{}{})",
+            spec_file.display(),
+            spec.host.as_deref().unwrap_or("<none>"),
+            spec.agents.len(),
+            if spec.agents.len() == 1 { "" } else { "s" },
+            if spec.eval.is_some() { ", + eval block" } else { "" },
+        );
+        for a in &spec.agents {
+            println!("  {}  ws={}", a.id, a.workspace.as_deref().unwrap_or("<none>"));
+            println!("      command: {}", a.command);
+            for ex in &a.execs {
+                println!("      + exec {}: {}", ex.id, ex.command);
+            }
+        }
+        return Ok(());
+    }
+    let found = discover(root);
+
+    if found.specs.is_empty() {
+        println!("no specs found under {}", root.display());
+    }
+    for spec in &found.specs {
+        let host = spec.host.as_deref().unwrap_or("<this-host>");
+        let kind = match spec.job_type {
+            st2::JobType::Service => "service",
+        };
+        let runnable = if spec.is_runnable() { "" } else { "  [UNRENDERED: no task command]" };
+        let retired = if spec.retired { "  [retired]" } else { "" };
+        println!(
+            "{host}.{ident}  [{kind}] ({n} task{plural}){runnable}{retired}\n    {path}",
+            ident = spec.identity,
+            n = spec.tasks.len(),
+            plural = if spec.tasks.len() == 1 { "" } else { "s" },
+            path = spec.path.display(),
+        );
+        for task in &spec.tasks {
+            let tk = match task.kind {
+                st2::TaskKind::Pty => "pty",
+                st2::TaskKind::Exec => "exec",
+            };
+            let cmd = task.command.as_deref().unwrap_or("<none>");
+            println!("      - {tk} {name}: {cmd}", name = task.name);
+        }
+    }
+
+    for w in &found.warnings {
+        eprintln!("warning: {w}");
+    }
+    for e in &found.errors {
+        eprintln!("error: {}: {}", e.path.display(), e.message);
+    }
+
+    Ok(())
+}

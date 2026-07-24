@@ -1,0 +1,194 @@
+//! M1b correctness net: the terminal-free `exec` backend (R09) against real short-lived processes.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::thread::sleep;
+use std::time::Duration;
+
+use st2::exec_backend::ExecBackend;
+use st2::host_lock::process_alive;
+use st2::reconcile::TaskTarget;
+use st2::spec::TaskKind;
+
+fn exec_target(id: &str, command: &str) -> TaskTarget {
+    TaskTarget {
+        kind: TaskKind::Exec,
+        pty_id: id.to_string(),
+        bus_id: "hetz.demo".to_string(),
+        name: "ding".to_string(),
+        command: command.to_string(),
+        cwd: None,
+        workspace: None,
+        tags: BTreeMap::new(),
+        env: BTreeMap::new(),
+        keep: false,
+    }
+}
+
+/// tty_nr from /proc/<pid>/stat (0 == no controlling terminal).
+fn tty_nr(pid: i32) -> Option<i64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may contain spaces — split after the last ')'.
+    let after = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // after ')': state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
+    fields.get(4).and_then(|s| s.parse::<i64>().ok())
+}
+
+fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+    for _ in 0..50 {
+        if cond() {
+            return true;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    cond()
+}
+
+#[test]
+fn exec_spawns_terminal_free_process_tracks_liveness_kills_and_cleans_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let catalog = tmp.path().join("catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    let backend = ExecBackend::new(state.clone(), catalog.clone());
+
+    let id = "hetz.demo.ding";
+    let target = exec_target(id, "sleep 30");
+    backend.spawn(&target, tmp.path()).unwrap();
+
+    // pid file recorded
+    let pid_path = state.join(format!("{id}.pid"));
+    assert!(pid_path.exists(), "pid file written");
+    let pid: i32 = fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+
+    // liveness: alive
+    let sessions = backend.list().unwrap();
+    assert!(sessions.iter().any(|s| s.pty_id == id && s.alive), "reported alive");
+
+    // R09: the process has NO controlling terminal.
+    assert_eq!(tty_nr(pid), Some(0), "exec process must be terminal-free");
+
+    // kill → becomes dead
+    backend.kill(id).unwrap();
+    assert!(
+        wait_until(|| backend.list().unwrap().iter().any(|s| s.pty_id == id && !s.alive)),
+        "reported dead after kill"
+    );
+
+    // remove clears runner-state
+    backend.remove(id).unwrap();
+    assert!(!pid_path.exists(), "pid file removed");
+    assert!(backend.list().unwrap().iter().all(|s| s.pty_id != id));
+}
+
+#[test]
+fn exec_expands_catalog_in_env_and_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let catalog = tmp.path().join("catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    let backend = ExecBackend::new(state, catalog.clone());
+
+    let out = tmp.path().join("out.txt");
+    // $CATALOG in the command (sh -c expands it via the injected CATALOG env) and an env value.
+    let mut target =
+        exec_target("hetz.demo.probe", &format!("printf '%s|%s' \"$CATALOG\" \"$DATA\" > {}", out.display()));
+    target.env.insert("DATA".into(), "$CATALOG/x".into());
+    backend.spawn(&target, tmp.path()).unwrap();
+
+    assert!(wait_until(|| out.exists() && !fs::read_to_string(&out).unwrap().is_empty()));
+    let got = fs::read_to_string(&out).unwrap();
+    let cat = catalog.display().to_string();
+    assert_eq!(got, format!("{cat}|{cat}/x"));
+
+    backend.kill("hetz.demo.probe").ok();
+    backend.remove("hetz.demo.probe").ok();
+}
+
+/// Auto-log observability: a detached exec's stdout AND stderr must be captured to a discoverable
+/// `<catalog>/logs/<label>.log`, so a wedged/crashed sidecar (like a stuck ding) is inspectable after
+/// the fact instead of vanishing. Proven through the real isolate/scope wrapper.
+#[test]
+fn exec_auto_logs_stdout_and_stderr_to_catalog_logs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let catalog = tmp.path().join("catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    let backend = ExecBackend::new(state, catalog.clone());
+
+    let id = "hetz.demo.ding";
+    backend
+        .spawn(&exec_target(id, "echo OUT_LINE; echo ERR_LINE 1>&2"), tmp.path())
+        .unwrap();
+
+    let log = catalog.join("logs").join(format!("{id}.log"));
+    assert!(
+        wait_until(|| {
+            let s = fs::read_to_string(&log).unwrap_or_default();
+            s.contains("OUT_LINE") && s.contains("ERR_LINE")
+        }),
+        "exec stdout+stderr must be captured to {}; got: {:?}",
+        log.display(),
+        fs::read_to_string(&log).ok()
+    );
+    backend.remove(id).ok();
+}
+
+/// The process-group field (2) of `/proc/<pid>/stat`.
+fn pgrp(pid: i32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(") ")?.1;
+    after.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Every live pid whose process group is `pgid` (== the setsid leader's pid for an exec task).
+fn group_members(pgid: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    for e in fs::read_dir("/proc").unwrap().flatten() {
+        if let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok())
+            && pgrp(pid) == Some(pgid)
+        {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Teardown must reap the WHOLE task, not just the recorded leader: a `sh -c` wrapper (dash forks a
+/// bare command) or a compound command leaves children that would otherwise be orphaned. The exec
+/// backend puts each task in its own `setsid` group and kills the group — proven here with a task that
+/// forks extra children.
+#[test]
+fn exec_kill_reaps_the_whole_process_group_not_just_the_leader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let catalog = tmp.path().join("catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    let backend = ExecBackend::new(state.clone(), catalog.clone());
+
+    let id = "hetz.demo.forky";
+    // dash backgrounds one sleep and foregrounds another → leader (dash) + 2 child sleeps, all in the
+    // one setsid group, distinct pids. A kill-the-leader-only teardown would orphan the sleeps.
+    backend.spawn(&exec_target(id, "sleep 45 & sleep 45"), tmp.path()).unwrap();
+    let leader: i32 = fs::read_to_string(state.join(format!("{id}.pid"))).unwrap().trim().parse().unwrap();
+
+    assert!(
+        wait_until(|| group_members(leader).len() >= 2),
+        "expected a multi-process group (leader + forked child); members: {:?}",
+        group_members(leader)
+    );
+    let members = group_members(leader);
+
+    backend.kill(id).unwrap();
+
+    // Every member dies. `backend.list()` reaps the leader zombie (our own child) each poll so its pid
+    // stops reading as alive; the forked sleeps reparent to init, which reaps them.
+    assert!(
+        wait_until(|| {
+            let _ = backend.list();
+            members.iter().all(|&p| !process_alive(p))
+        }),
+        "explicit teardown left group members alive: {members:?}"
+    );
+}

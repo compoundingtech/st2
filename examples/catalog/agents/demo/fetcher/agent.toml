@@ -1,0 +1,16 @@
+# A service agent in TOML — a single pty task. identity "fetcher" + host "demo" come from the path.
+type      = "service"
+workspace = "/tmp"
+supervisor = "root"
+
+[restart]
+attempts = 5
+interval = "60s"
+mode = "delay"
+
+[pty.agent]
+id      = "demo.fetcher"
+command = "while true; do echo \"[fetcher] polling…\"; sleep 12; done"
+
+[pty.agent.env]
+ST_AGENT = "demo.fetcher"

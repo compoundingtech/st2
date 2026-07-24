@@ -1,0 +1,332 @@
+//! P3+P4 end-to-end (the benign internal-proof milestone): `st2 eval <folder>` runs a whole eval
+//! folder → VERDICT through the real binary. Benign shell "agents" choreograph the real flow on the
+//! FLAT eval bus via `st2 message` (exercising the flat-bus bridge): kick → worker→sup report →
+//! sup→requester confirmation (post-dating the report), then the judge engine grades the deliverable.
+//! No real harness; st2 eval mints its own hermetic catalog + PTY_ROOT (never touches the live fleet).
+//!
+//! Needs `pty` on PATH — HARD failure if absent unless ST2_ALLOW_PTY_SKIP is set.
+
+use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+fn pty_available() -> bool {
+    Command::new("pty").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[test]
+fn st2_eval_runs_a_benign_folder_to_a_pass_verdict() {
+    if !pty_available() {
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH — can't run an eval. Set ST2_ALLOW_PTY_SKIP=1 to skip."
+        );
+        eprintln!("SKIP st2_eval_runs_a_benign_folder_to_a_pass_verdict: `pty` not on PATH");
+        return;
+    }
+
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    std::fs::create_dir_all(fixture.join("scripts")).unwrap();
+    std::fs::create_dir_all(fixture.join("sup")).unwrap();
+    std::fs::create_dir_all(fixture.join("worker")).unwrap();
+
+    // The spec: a 2-agent team + an eval that copies the fixture, kicks off the sup, and judges the
+    // deliverable. Benign polling agents (no ding) — they use `st2 message` on the flat bus (ST_ROOT).
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+team "t" {
+  agent "sup" {
+    workspace "./sup"
+    env { ST_AGENT "t.sup" }
+    command "sh $CATALOG/scripts/sup.sh"
+  }
+  agent "worker" {
+    workspace "./worker"
+    env { ST_AGENT "t.worker" }
+    command "sh $CATALOG/scripts/worker.sh"
+  }
+}
+eval {
+  copy "./fixture"
+  message { from "requester"; to "t.sup"; content "relicense the widget" }
+  max-timeout "30s"
+  judges {
+    judge "deliverable exists" { exec "test -f $CATALOG/worker/DONE" }
+    judge "deliverable content" { file "worker/DONE" has "resolved" }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    // worker: on boot, do the work (write the deliverable) + report to the sup.
+    std::fs::write(
+        fixture.join("scripts/worker.sh"),
+        r#"#!/bin/sh
+sleep 0.4
+mkdir -p "$CATALOG/worker"
+echo "resolved by t.worker" > "$CATALOG/worker/DONE"
+st2 message send t.sup --root "$ST_ROOT" --as t.worker -m "worker done" >/dev/null 2>&1
+sleep 60
+"#,
+    )
+    .unwrap();
+    // sup: wait for the kick, then the worker's report, then confirm to the requester (post-dating it).
+    std::fs::write(
+        fixture.join("scripts/sup.sh"),
+        r#"#!/bin/sh
+for _ in $(seq 1 150); do
+  n=$(st2 message ls t.sup --root "$ST_ROOT" --from requester --count 2>/dev/null || echo 0)
+  [ "$n" -gt 0 ] && break
+  sleep 0.2
+done
+for _ in $(seq 1 150); do
+  n=$(st2 message ls t.sup --root "$ST_ROOT" --from t.worker --count 2>/dev/null || echo 0)
+  [ "$n" -gt 0 ] && break
+  sleep 0.2
+done
+st2 message send requester --root "$ST_ROOT" --as t.sup -m "done + verified: worker relicensed, commit clean" >/dev/null 2>&1
+sleep 60
+"#,
+    )
+    .unwrap();
+
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let out = Command::new(bin)
+        .args(["eval"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("team signalled done"),
+        "the flow didn't reach done (kick → worker report → sup confirm):\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
+    assert!(stdout.contains("VERDICT: PASS"), "expected PASS:\n--stdout--\n{stdout}\n--stderr--\n{stderr}");
+    assert!(out.status.success(), "exit non-zero:\n{stdout}\n{stderr}");
+    // Both judges (bash + declarative) passed.
+    assert!(stdout.contains("SCORE: 2 PASS / 0 FAIL"), "expected 2/0:\n{stdout}");
+}
+
+/// Under `supervise`, teardown reaps RUNTIME-spawned seats too (the team-standup pattern: a seat spins
+/// up an undeclared peer mid-run), not just the declared team. The seat spawns an undeclared `rtpeer`
+/// into the eval's hermetic PTY_ROOT; after the eval, no orphan carrying the peer's marker survives.
+#[test]
+fn supervise_teardown_reaps_a_runtime_spawned_seat() {
+    if !pty_available() {
+        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        eprintln!("SKIP supervise_teardown_reaps_a_runtime_spawned_seat: `pty` not on PATH");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    std::fs::create_dir_all(&cell).unwrap();
+    // The seat spawns an UNDECLARED peer (unique marker `sleep 778899001122`) into the PTY_ROOT, then
+    // `exec`s its own sleep (so the seat process does NOT carry the peer's marker — the check is
+    // unambiguous). No done signal → the eval times out → supervised teardown must reap BOTH.
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+agent "sup" { env { ST_AGENT "sup" }; command "sh -c 'pty run -d --id rtpeer -- sleep 778899001122; exec sleep 778899003344'" }
+eval {
+  message { from "runner"; to "sup"; content "go" }
+  max-timeout "6s"
+  supervise
+  judges { judge "trivial" { exec "exit 0" } }
+}
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let out = Command::new(bin)
+        .args(["eval"])
+        .arg(&cell)
+        .env("PATH", &path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .output()
+        .unwrap();
+    // The eval timed out and tore down. The runtime peer's `sleep 778899001122` must be gone (reaped by
+    // the PTY_ROOT-scoped sweep) — if it leaked, pgrep finds the surviving orphan.
+    let alive = Command::new("pgrep").args(["-f", "778899001122"]).output().unwrap();
+    let found = String::from_utf8_lossy(&alive.stdout).trim().to_string();
+    // Clean up any straggler (the peer if it leaked, and the declared seat's sleep) before asserting.
+    let _ = Command::new("pkill").args(["-9", "-f", "778899001122"]).status();
+    let _ = Command::new("pkill").args(["-9", "-f", "778899003344"]).status();
+    assert!(
+        found.is_empty(),
+        "runtime-spawned seat leaked after supervise teardown (surviving pids: {found})\n--stdout--\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A TEAM-LESS eval (no agents, no kickoff) runs its `run` steps to completion, captures each step's
+/// stdout/stderr/exit for the judges, and the judges own the verdict. By DEFAULT a step must exit 0 (so
+/// `make` gates the verdict); `allow-nonzero` opts a step out (so `probe`'s deliberate exit 3 is fine
+/// and a judge asserts it). Flat run-collapse form. No `pty` needed (no seats are booted).
+#[test]
+fn team_less_run_stage_captures_and_judges() {
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    std::fs::create_dir_all(&cell).unwrap();
+    // `make` succeeds (the default must-exit-0 gate) and writes a file; `probe` deliberately exits 3 with
+    // `allow-nonzero`, so that is NOT a failure — the judges assert the file, probe's captured exit (via
+    // $RUNS_DIR and $RUN_<id>_EXIT), and probe's captured stdout. Written in the flat run-collapse form.
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+env { ST_ROOT "$CATALOG/smalltalk" }
+eval {
+  max-timeout "20s"
+  run "make"  { command "echo hi > $CATALOG/out.txt" }
+  run "probe" { command "echo scanning; exit 3"; allow-nonzero }
+  judges {
+    judge "file-made"    { exec "test -f $CATALOG/out.txt" }
+    judge "probe-exit3"  { exec "test \"$(cat $RUNS_DIR/probe.exit)\" = 3" }
+    judge "probe-stdout" { exec "grep -q scanning $RUNS_DIR/probe.out" }
+    judge "exit-var"     { exec "test \"$RUN_probe_EXIT\" = 3" }
+    judge "probe-log"    { exec "grep -q scanning $LOGS_DIR/probe.log" }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let out = Command::new(bin)
+        .args(["eval"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("team-less eval: 2 run step(s)"), "not the team-less path:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("run step probe → exit 3"), "probe's non-zero exit not captured:\n{stdout}");
+    assert!(
+        stdout.contains("SCORE: 6 PASS / 0 FAIL"),
+        "team-less run-stage eval should be 6/0 (make must-exit-0 gate + 5 judges incl. $LOGS_DIR):\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
+    assert!(stdout.contains("VERDICT: PASS") && out.status.success(), "expected PASS:\n{stdout}\n{stderr}");
+}
+
+/// crash-ding: under `supervise`, a seat that CRASHES (non-zero/killed/vanished) is respawned AND its
+/// crash escalates up the supervisor chain — a "worker crash: <id>" bus ding to the direct supervisor
+/// AND the root cos (walking the `supervisor` field transitively). A seat that exits CLEANLY (0) stays
+/// SILENT (a false ding on a routine finish fails as hard as a missed crash). Keys on the pty session
+/// dying → harness-agnostic. Needs `pty` (seats boot).
+#[test]
+fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
+    if !pty_available() {
+        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        eprintln!("SKIP supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit: `pty` not on PATH");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    std::fs::create_dir_all(&cell).unwrap();
+    // Chain: cd.worker → cd.sup → cd.cos (root). worker CRASHES (exit 1) → ding up to sup AND cos;
+    // `clean` exits 0 → stays silent. sup/cos idle. No done signal → times out (bounded).
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+team "cd" {
+  agent "worker" { supervisor "cd.sup"; env { ST_AGENT "cd.worker" }; command "sh -c 'sleep 2; exit 1'" }
+  agent "clean"  { supervisor "cd.cos"; env { ST_AGENT "cd.clean" }; command "sh -c 'sleep 2; exit 0'" }
+  agent "sup"    { supervisor "cd.cos"; env { ST_AGENT "cd.sup" }; command "sleep 100000" }
+  agent "cos"    { env { ST_AGENT "cd.cos" }; command "sleep 100000" }
+}
+eval { message { from "runner"; to "cd.sup"; content "go" }; max-timeout "8s"; supervise; judges { judge "ok" { exec "true" } } }
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let out = Command::new(bin)
+        .args(["eval"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // (b) the crash escalates to BOTH the direct supervisor and the root cos.
+    assert!(stdout.contains("crash-ding: cd.worker → cd.sup"), "crash didn't ding the supervisor:\n{stdout}");
+    assert!(stdout.contains("crash-ding: cd.worker → cd.cos"), "crash didn't reach the root cos:\n{stdout}");
+    // (c) the clean-exit seat produces NO ding.
+    assert!(!stdout.contains("crash-ding: cd.clean"), "a clean exit (0) must NOT crash-ding:\n{stdout}");
+
+    // Clean up any survivors (sup/cos sleeps + per-task scopes).
+    for id in ["cd.worker", "cd.clean", "cd.sup", "cd.cos"] {
+        let _ = Command::new("pkill").args(["-9", "-f", &format!("ST_AGENT={id}")]).status();
+    }
+    let _ = Command::new("pkill").args(["-9", "-f", "sleep 100000"]).status();
+    if let Ok(o) = Command::new("systemctl").args(["--user", "list-units", "--no-legend", "st2-cd.*"]).output() {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some(unit) = line.split_whitespace().next() {
+                let _ = Command::new("systemctl").args(["--user", "stop", unit]).status();
+            }
+        }
+    }
+}
+
+/// A seat whose command exits at boot (127 command-not-found, crash) must fail the eval FAST + loudly,
+/// NOT hang until max-timeout waiting for a confirmation that can never come. (CoS robustness finding.)
+#[test]
+fn st2_eval_fails_fast_when_a_seat_exits_at_boot() {
+    if !pty_available() {
+        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        eprintln!("SKIP st2_eval_fails_fast_when_a_seat_exits_at_boot: `pty` not on PATH");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    std::fs::create_dir_all(cell.join("fixture")).unwrap();
+    // A seat command that doesn't exist → the pty session exits ~immediately. max-timeout is huge, so a
+    // hang would take 10 min; fail-fast must make this return in seconds.
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+agent "bad" { env { ST_AGENT "bad" }; command "definitely-not-a-real-binary-xyz123" }
+eval {
+  copy "./fixture"
+  message { from "requester"; to "bad"; content "go" }
+  max-timeout "600s"
+  judges { judge "t" { exec "true" } }
+}
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let start = Instant::now();
+    let out = Command::new(bin)
+        .args(["eval"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "a dead-at-boot seat must fail the eval:\n{combined}");
+    assert!(combined.contains("exited at boot"), "expected a clear fail-fast error:\n{combined}");
+    assert!(elapsed < Duration::from_secs(60), "must fail FAST, not wait max-timeout — took {elapsed:?}");
+}
