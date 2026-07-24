@@ -2,20 +2,21 @@
 
 Scope for the self-contained-catalog milestone (maintainer-picked): express the agent's workspace
 overlay (persona, bus instructions, hooks, permissions) as **declarative directives in `agent.kdl`**
-(a `render{}` block), materialized by the **RENDER family** (`st2 render` / `render-agent`).
+(a `render{}` block), executed by `st2 up` at boot.
 
-**Where materialize lives (maintainer correction — load-bearing): in RENDER, NOT in `st2 up`.**
-- `st2 render` / `render-agent` — the ONLY thing that writes workspaces — CONSUMES the `render{}` block
-  and materializes the overlay. (It also EMITS the block when rendering from IR — render owns the block
-  end-to-end: emit it into `agent.kdl`, and materialize it into the workspace.)
-- `st2 up` stays **UNCHANGED** — pure read-the-kdl + boot (read-only on the catalog, spawn-only, NO
-  workspace side-effects, its current nature). It IGNORES the `render{}` block (materialize already
-  happened at render time), exactly as it ignores every other render-only field.
-- Workflow = **render-then-run** (plan/apply): `st2 render` materializes → `st2 up` boots. The
-  render-only verification path is therefore just `st2 render` itself (it naturally does not boot).
+**The two roles (maintainer-clarified):**
+- `st2 render-agent` / `st2 render` = the **GENERATOR (compiler)**. Harness-aware (knows claude vs
+  codex), it PRODUCES `catalog/<host>/<id>/agent.kdl` from identity/role/harness and writes the
+  harness-appropriate `render{}` block into it. It does NOT materialize the overlay.
+- `st2 up` = the **EXECUTOR (runtime)**. It reads + executes the whole `agent.kdl` INCLUDING the
+  `render{}` block — materializing the overlay into the workspace (generic file ops: copy / write /
+  merge / ensure-line / git-exclude; it NEVER learns what a persona or a hook is) — THEN boots. **The
+  materialize primitive lives HERE.** This is what keeps the runner render-AGNOSTIC while still
+  self-provisioning the workspace: up executes generic directives, not persona/hook knowledge.
 
-This keeps the runner **dumb** and the renderer **smart**, and preserves the render-agnostic invariant
-by construction — `st2 up` gains nothing.
+**Naming caution (maintainer):** `st2 render` (GENERATE the kdl) must not collide with materialize
+(EXECUTE the render block). Keep the verbs distinct — the no-boot materialize path is `st2 up
+--materialize-only` (an `up` mode), NOT a `render` verb.
 
 Plan-first gate: this is the scope. The format is now BLESSED; **build only after this plan is approved.**
 Canonical format examples (claude + codex) live in [`examples/format/`](examples/format/).
@@ -23,13 +24,12 @@ Canonical format examples (claude + codex) live in [`examples/format/`](examples
 ## The `render{}` block (directives)
 
 `render{}` is KEPT (not flattened) because it is a **phase GATE**, not just grouping: an ORDERED
-materialize phase run by RENDER. `st2 render` runs its directives in declaration order and, if any
-GATING directive fails, the **render FAILS** (non-zero, surfaced) — the workspace is left un-provisioned
-so the render-then-run flow stops before boot (no half-rendered agent gets booted later). `git-exclude`
-lives INSIDE `render{}` as the one BEST-EFFORT (non-gating) member — the content directives (copy/file/
-ensure-line) write the actual persona/hooks so their failure = broken agent → they gate the render;
-`git-exclude` only hides the overlay from git, so a failure or a non-git workspace is cosmetic
-(untracked overlay), never a reason to fail the render.
+pre-boot materialize phase. `st2 up` runs its directives in declaration order and, if any GATING
+directive fails, does NOT spawn the command (no half-rendered agent booting broken). `git-exclude` lives
+INSIDE `render{}` as the one BEST-EFFORT (non-gating) member — the content directives (copy/file/
+ensure-line) write the actual persona/hooks so their failure = broken agent → they gate; `git-exclude`
+only hides the overlay from git, so a failure or a non-git workspace is cosmetic (untracked overlay),
+never a reason to block boot.
 
 Inside a catalog `agent.kdl`, a `render { … }` block of generic materialize directives. All overlay
 paths are **st2-native** — `.st2/…` (NOT `.convoy/…`), and the loader is `.claude/rules/st2.md`:
@@ -122,25 +122,27 @@ layout is its own sub-work, sequenced with (or just before) the overlay material
 
 ## Work items (each test-tied)
 
-1. **Parser** — `render{}` + the five directives (copy/file/json-upsert/ensure-line/git-exclude) in
-   `kdl_format`/`discovery` (the catalog format). `render{}` is consumed by RENDER's materialize step;
-   `st2 up`'s runner subset ignores it (like every render-only field) — reconcile never sees it.
-2. **Materialize primitive — in the RENDER family (NOT `st2 up`).** A generic
-   `materialize_overlay(agent, workspace)` that executes the `render{}` directives (copy bytes /
-   write-with-env-expand / json-deep-merge / ensure-line / git-exclude append) in order, gating on the
-   gating directives, idempotent. Generic file I/O — no persona/harness knowledge. Called by `st2 render`
-   / `render-agent` (which already write workspaces). **`st2 up` is UNCHANGED — it never materializes.**
-2b. **The cheap test/verify surface is just `st2 render`** — render naturally materializes WITHOUT
-   booting (no pty, no claude, zero token cost). So verification = `st2 render` → diff the workspace
-   against convoy's output, at zero cost; every materialize test uses temp dirs + file assertions, never
-   a live agent. (No separate `st2 up --materialize-only` / `st2 materialize` command needed — dropped;
-   render IS the no-boot path.) **Budget (maintainer): no eval RUNS / fresh-team boots until after
-   Sunday** — the render-golden + render-then-diff tests are the whole near-term surface; any
-   agent-booting test is held until after Sunday.
+1. **Parser** — `render{}` + the five directives (copy/file/json-upsert/ensure-line/git-exclude) in `kdl_format`/`discovery` (the catalog format).
+   Render-only fields stay ignored by the runner subset; `render{}` is consumed by the new materialize
+   step, not by reconcile.
+2. **Materialize primitive** — a generic `materialize_overlay(agent, workspace)` run in `st2 up`'s boot
+   path *before* spawning the pty: execute each directive (copy bytes / write-with-env-expand /
+   json-deep-merge / ensure-line / git-exclude append), idempotent (safe on every reconcile pass). Generic file I/O — no
+   persona/harness knowledge. This is the one (mild) expansion of `st2 up`: today it is read-only on the
+   catalog + spawn-only; now it also writes the declared overlay into the workspace.
+
+2b. **Materialize-only / dry-run path (the cheap test surface)** — the executor's no-boot mode:
+   **`st2 up --materialize-only`** runs step 2 (execute the `render{}` block) for each agent and STOPS —
+   no reconcile, no spawn, no pty, no claude, zero token cost. (Named as an `up` mode per the naming
+   caution — it does NOT collide with `st2 render` the generator.) This is how the format is verified:
+   materialize → diff the workspace against convoy's output, at zero cost; every materialize test uses
+   temp dirs + file assertions, never a live agent. **Budget constraint (maintainer): no eval RUNS / no
+   fresh-team boots until after Sunday** — so this materialize-only path + its file-diff tests are the
+   near-term buildable/verifiable surface; any agent-booting test is held until after Sunday.
 3. **Render emits blocks** — `st2 render`/`render-agent` change from writing the overlay directly →
    emitting the `render{}` block into `agent.kdl` + vendoring the static files into `_templates/` (for
    codex, render pre-composes `_templates/AGENTS.md` = persona + bus). The overlay *content* is
-   unchanged; it moves from render-writes-workspace-directly to render-emits-block-then-render-materializes-it (up never involved).
+   unchanged; it moves from render-writes-workspace to kdl-declares → up-materializes.
    - **GOLDEN-FILE test (maintainer insight, zero eval cost):** the two committed examples
      [`examples/format/agent-{claude,codex}.kdl`] ARE the render-agent fixtures. The test invokes
      render-agent with a fixed generified IR (identity/role/host/workspace/harness) and asserts its
@@ -170,15 +172,16 @@ layout is its own sub-work, sequenced with (or just before) the overlay material
    - **st2-native hook scripts** — item 4 (produced when the milestone builds).
    - boot prompts — the catalog owner does these on the prototype (`st2 status`, etc.).
 6. **Tests** — materialize each directive incl. idempotency on re-up; render emits the correct block +
-   `_templates/`; `st2 render` materializes the overlay (NO boot); **neutrality**: the materialized overlay is
-   byte-identical to what render-writes-directly produces today (behavior preserved); st2 up is
-   UNCHANGED (a test asserts up never writes the workspace); st2-native hooks reference `$ST_HOOKS` (no machine path).
+   `_templates/`; a rendered catalog boots and materializes the overlay; **neutrality**: the
+   materialized overlay is byte-identical to what render-writes-directly produced today (behavior
+   preserved); st2-native hooks reference workspace-relative paths (no machine path).
 
 ## Open questions (settle before/at build)
 
 - **Layout confirm**: the `<state>/<network>/{catalog,smalltalk,pty,run}` tree + `$ST_HOOKS` location —
   confirm the exact paths + the `<network>` selector (env? `st2 up` flag? default "default"). Decides
   catalog portability.
+- **When to materialize**: every reconcile pass (cheap, idempotent) vs first-boot-only.
 - **st2-native hook behavior parity**: replicate smalltalk's session-start `now.md`-injection exactly, or
   simplify to the boot-ritual reminder? (Grounded at build time against the smalltalk scripts.)
 - **`--priority` on `st2 message send`**: not implemented (deferred). If the fleet's templates use it,
@@ -188,11 +191,9 @@ layout is its own sub-work, sequenced with (or just before) the overlay material
 
 ## Invariants
 
-Don't touch reconcile/teardown/wire-format/presence (INVARIANTS.md). Materialize lives in RENDER; **st2 up
-is UNCHANGED** (read-only on the catalog + spawn-only, no workspace side-effects — the invariant holds by
-construction, not by a careful new step). Neutrality test: render's materialized overlay == what render
-writes directly today. If it earns a row, it's "self-contained-catalog materialization is behavior-neutral
-(and st2 up gains no workspace side-effects)", proven by that test.
+Don't touch reconcile/teardown/wire-format/presence (INVARIANTS.md). The materialize step is additive +
+behavior-neutral; add a neutrality test (materialized overlay == render-direct overlay). If it earns a
+row, it's "self-contained-catalog materialization is behavior-neutral", proven by that test.
 
 ## st2 bus command surface (for the `st` → `st2` template pass)
 
