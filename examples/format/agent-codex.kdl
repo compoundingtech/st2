@@ -10,7 +10,7 @@
 //
 // This CORRECTS convoy, which rendered codex agents claude-shaped (an unused .claude overlay + NO
 // AGENTS.md) — so a convoy codex seat got no brief from any file it reads and ran on the boot prompt
-// alone. (st2 render already writes AGENTS.md; this format makes it the codex agent's real, sole home.)
+// alone. (st2 compile already writes AGENTS.md; this format makes it the codex agent's real, sole home.)
 //
 // Placeholders: <host>/<identity>/<workspace>. Roots are st2-PROVIDED (no machine paths).
 

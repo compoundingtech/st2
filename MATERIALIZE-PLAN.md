@@ -5,7 +5,7 @@ overlay (persona, bus instructions, hooks, permissions) as **declarative directi
 (a `render{}` block), executed by `st2 up` at boot.
 
 **The two roles (maintainer-clarified):**
-- `st2 render-agent` / `st2 render` = the **GENERATOR (compiler)**. Harness-aware (knows claude vs
+- `st2 compile-agent` / `st2 compile` = the **GENERATOR (compiler)**. Harness-aware (knows claude vs
   codex), it PRODUCES `catalog/<host>/<id>/agent.kdl` from identity/role/harness and writes the
   harness-appropriate `render{}` block into it. It does NOT materialize the overlay.
 - `st2 up` = the **EXECUTOR (runtime)**. It reads + executes the whole `agent.kdl` INCLUDING the
@@ -14,9 +14,9 @@ overlay (persona, bus instructions, hooks, permissions) as **declarative directi
   materialize primitive lives HERE.** This is what keeps the runner render-AGNOSTIC while still
   self-provisioning the workspace: up executes generic directives, not persona/hook knowledge.
 
-**Naming caution (maintainer):** `st2 render` (GENERATE the kdl) must not collide with materialize
+**Naming caution (maintainer):** `st2 compile` (GENERATE the kdl) must not collide with materialize
 (EXECUTE the render block). Keep the verbs distinct — the no-boot materialize path is `st2 up
---materialize-only` (an `up` mode), NOT a `render` verb.
+--materialize-only` (an `up` mode) — an EXECUTE verb, never named `compile` (that is GENERATE).
 
 Plan-first gate: this is the scope. The format is now BLESSED; **build only after this plan is approved.**
 Canonical format examples (claude + codex) live in [`examples/format/`](examples/format/).
@@ -134,20 +134,20 @@ layout is its own sub-work, sequenced with (or just before) the overlay material
 2b. **Materialize-only / dry-run path (the cheap test surface)** — the executor's no-boot mode:
    **`st2 up --materialize-only`** runs step 2 (execute the `render{}` block) for each agent and STOPS —
    no reconcile, no spawn, no pty, no claude, zero token cost. (Named as an `up` mode per the naming
-   caution — it does NOT collide with `st2 render` the generator.) This is how the format is verified:
+   caution — it does NOT collide with `st2 compile` the generator.) This is how the format is verified:
    materialize → diff the workspace against convoy's output, at zero cost; every materialize test uses
    temp dirs + file assertions, never a live agent. **Budget constraint (maintainer): no eval RUNS / no
    fresh-team boots until after Sunday** — so this materialize-only path + its file-diff tests are the
    near-term buildable/verifiable surface; any agent-booting test is held until after Sunday.
-3. **Render emits blocks** — `st2 render`/`render-agent` change from writing the overlay directly →
+3. **Render emits blocks** — `st2 compile`/`compile-agent` change from writing the overlay directly →
    emitting the `render{}` block into `agent.kdl` + vendoring the static files into `_templates/` (for
    codex, render pre-composes `_templates/AGENTS.md` = persona + bus). The overlay *content* is
    unchanged; it moves from render-writes-workspace to kdl-declares → up-materializes.
    - **GOLDEN-FILE test (maintainer insight, zero eval cost):** the two committed examples
-     [`examples/format/agent-{claude,codex}.kdl`] ARE the render-agent fixtures. The test invokes
-     render-agent with a fixed generified IR (identity/role/host/workspace/harness) and asserts its
+     [`examples/format/agent-{claude,codex}.kdl`] ARE the compile-agent fixtures. The test invokes
+     compile-agent with a fixed generified IR (identity/role/host/workspace/harness) and asserts its
      output EQUALS the example (per harness) — a pure generator unit test, no boot. Composes with 2b:
-     the golden-file test proves render-agent EMITS the right blocks; the render-only materialize test
+     the golden-file test proves compile-agent EMITS the right blocks; the render-only materialize test
      proves `st2 up` EXECUTES them into the workspace. Both halves proven with NO eval runs → so we
      likely do NOT need a booted eval cell for the render path at all.
 4. **The hard edge: st2-native hooks (decouple from smalltalk's external install).** Today
@@ -165,7 +165,7 @@ layout is its own sub-work, sequenced with (or just before) the overlay material
    st2 owns producing the canonical st2-native templates; the catalog vendors them into `_templates/`:
    - **`st2` bus.md** — DONE: `templates/bus.st2.md` (was DING-BUS.st2.md; renamed + the ding-mode/MCP framing dropped — ding-only now, `[DING]` kept only as the poke name) (st verbs → st2, `--priority` dropped,
      spawn section rewritten to the st2 declarative story: no `convoy add`/`st launch` — declare in the
-     catalog via `st2 add`/`st2 render`/`st2 render-agent` and the running `st2 up` reconciles it in).
+     catalog via `st2 add`/`st2 compile`/`st2 compile-agent` and the running `st2 up` reconciles it in).
      NOTE: the `[DING]` poke-line LITERAL still reads "new smalltalk message" (wire-compatible in
      `ding.rs`) — the doc says so; an st2-native rename of that literal is a small pending follow-up
      (touches the ding wire text — do it carefully, agents pattern-match the line).

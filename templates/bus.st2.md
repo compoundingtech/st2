@@ -55,9 +55,9 @@ the catalog, and the already-running `st2 up` reconciles it in on its next pass 
 ```sh
 # author the agent's IR entry, then materialize its agent.kdl + workspace overlay:
 st2 add <identity> <ir-dir> --role <r> --host <h> --workspace <w> [--persona <p>] [--supervisor <s>]
-st2 render <ir-dir> <catalog>
-# — or render one agent straight into the catalog (imperative sibling of `st2 render`):
-st2 render-agent --identity <id> --dir <workspace> --persona <file> [--role <r>] [--host <h>] <catalog>
+st2 compile <ir-dir> <catalog>
+# — or compile one agent straight into the catalog (imperative sibling of `st2 compile`):
+st2 compile-agent --identity <id> --dir <workspace> --persona <file> [--role <r>] [--host <h>] <catalog>
 ```
 
 The running `st2 up` then boots it — no separate launch step. **If you are a worker: you do NOT add
@@ -86,7 +86,7 @@ Resources:
 - `st2 resource add <url> [--title T] [--tag T,T] [--relation R]`
 - `st2 resource ls [<identity>]` · `st2 resource read [<identity>] <ref>` · `st2 resource remove [<identity>] <ref>`
 
-Adding agents (supervisor/CoS): `st2 add` / `st2 render` / `st2 render-agent` (see above) — declarative;
+Adding agents (supervisor/CoS): `st2 add` / `st2 compile` / `st2 compile-agent` (see above) — declarative;
 `st2 up` reconciles it in.
 
 Shared ctx flags on bus ops: `--root` (default `$CATALOG`), `--as <identity>` (default `$ST_AGENT`),

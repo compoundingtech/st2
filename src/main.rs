@@ -96,9 +96,10 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// Render an IR folder into a runnable catalog: for each IR `agent`, write `<catalog>/<host>/
+    /// Compile an IR folder into a runnable catalog: for each IR `agent`, write `<catalog>/<host>/
     /// <identity>/agent.kdl` (behavior-neutral wiring), materialize the persona overlay into the
-    /// agent's workspace, and create its smalltalk bus dirs.
+    /// agent's workspace, and create its bus dirs. (Was `st2 render`; `render` kept as an alias.)
+    #[command(name = "compile", visible_alias = "render")]
     Render {
         /// IR input folder — `*.kdl` agent declarations, with `personas/<persona>.md` alongside.
         ir_dir: PathBuf,
@@ -106,7 +107,7 @@ enum Command {
         catalog_dir: PathBuf,
     },
     /// Declare a new agent: author its IR entry (`<ir-dir>/<identity>.kdl`). No render, no launch —
-    /// then `st2 render` materializes it and `st2 up` runs it.
+    /// then `st2 compile` materializes it and `st2 up` runs it.
     Add {
         /// The agent identity (e.g. `fabric-claude`).
         identity: String,
@@ -128,16 +129,17 @@ enum Command {
         #[arg(long)]
         supervisor: Option<String>,
     },
-    /// Un-declare an agent: delete its IR entry (`<ir-dir>/<identity>.kdl`). Re-render + `st2 down`
+    /// Un-declare an agent: delete its IR entry (`<ir-dir>/<identity>.kdl`). Re-compile + `st2 down`
     /// to stop a running instance.
     Remove {
         identity: String,
         ir_dir: PathBuf,
     },
-    /// Render ONE agent from convoy-add-shaped flags STRAIGHT into a runnable catalog (agent.kdl +
-    /// persona overlay + bus dirs) — the imperative sibling of `st2 render`, so a harness can author a
+    /// Compile ONE agent from convoy-add-shaped flags STRAIGHT into a runnable catalog (agent.kdl +
+    /// persona overlay + bus dirs) — the imperative sibling of `st2 compile`, so a harness can author a
     /// seat without hand-writing IR. `--persona` takes a composed persona FILE, installed verbatim (the
-    /// `--persona` contract). Mirrors `convoy add`; follow with `st2 up --once` to launch.
+    /// `--persona` contract). Follow with `st2 up --once` to launch. (Was `st2 render-agent`; kept as an alias.)
+    #[command(name = "compile-agent", visible_alias = "render-agent")]
     RenderAgent {
         /// The catalog folder (the agent lands at `<catalog>/<host>/<identity>/`).
         catalog: PathBuf,
@@ -621,7 +623,7 @@ fn add_cmd(
     // Sanity: it must parse as IR before we write it.
     st2::render::parse_ir(&s).with_context(|| format!("declared IR for '{identity}' does not parse"))?;
     std::fs::write(&path, &s)?;
-    println!("declared {host}.{identity} → {}  (now: st2 render {} <catalog>)", path.display(), ir_dir.display());
+    println!("declared {host}.{identity} → {}  (now: st2 compile {} <catalog>)", path.display(), ir_dir.display());
     Ok(())
 }
 
