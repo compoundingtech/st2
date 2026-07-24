@@ -75,6 +75,21 @@ impl Fixture {
         std::fs::write(path, kdl).unwrap();
     }
 
+    /// Write a compact agent whose primary pty id is exactly its bus identity — the shape emitted
+    /// by current `compile-agent` catalogs.
+    fn write_compact_agent(&self, identity: &str) {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}"));
+        let kdl = format!(
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{HOST}\"\n  \
+             type \"service\"\n  command \"{TASK_CMD}\"\n}}\n"
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+    }
+
     /// The pidfile whose liveness == "the task is running": the exec child's pid, or the pty daemon's
     /// pid (which owns the session). Both survive st2's death when the property holds.
     fn task_pidfile(&self, kind: &str, identity: &str) -> PathBuf {
@@ -205,12 +220,12 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
         return;
     }
     let fx = Fixture::new();
-    fx.write_agent("cos", "pty", false);
+    fx.write_compact_agent("cos");
     fx.write_agent("st2", "pty", false);
 
     let launched = fx.up_once();
     assert!(
-        launched.contains("nomadtest.cos.task") && launched.contains("nomadtest.st2.task"),
+        launched.contains("nomadtest.cos") && launched.contains("nomadtest.st2.task"),
         "both agent sessions must launch; output:\n{launched}"
     );
 
@@ -235,8 +250,9 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
             .map(str::to_owned)
     };
     assert_eq!(
-        display_name("nomadtest.cos.task").as_deref(),
-        Some("nomadtest.cos")
+        display_name("nomadtest.cos"),
+        None,
+        "when the lifecycle id is already the identity, pty must fall back to it without an equal alias"
     );
     assert_eq!(
         display_name("nomadtest.st2.task").as_deref(),
@@ -263,14 +279,14 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
     );
     let down_out = String::from_utf8_lossy(&down.stdout);
     assert!(
-        down_out.contains("torn down (2): nomadtest.cos.task, nomadtest.st2.task"),
+        down_out.contains("torn down (2): nomadtest.cos, nomadtest.st2.task"),
         "down must tear down both sessions by lifecycle id; output:\n{down_out}"
     );
-    for identity in ["cos", "st2"] {
-        let pidfile = fx.task_pidfile("pty", identity);
+    for session_id in ["nomadtest.cos", "nomadtest.st2.task"] {
+        let pidfile = fx.pty_root.join(format!("{session_id}.pid"));
         assert!(
             poll_until(DEATH_TIMEOUT, || !read_alive(&pidfile)),
-            "down did not stop {identity}'s pty session"
+            "down did not stop {session_id}"
         );
     }
 }

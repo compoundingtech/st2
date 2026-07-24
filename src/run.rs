@@ -134,12 +134,17 @@ impl PtyCli {
         cmd.arg("run")
             .arg("-d") // detached: leave it running in the background
             .arg("--force") // st2 itself may run inside a pty session; allow nesting
-            .args(["--id", &target.pty_id])
-            // Keep the adoption key task-specific, but make the human-facing label the
-            // owning agent's stable bus identity instead of pty's auto-derived `<cwd>-sh` label.
-            .args(["--name", &target.bus_id])
-            .arg("--cwd")
-            .arg(&cwd);
+            .args(["--id", &target.pty_id]);
+        // Keep the adoption key task-specific, but make a differing human-facing label the owning
+        // agent's stable bus identity instead of pty's auto-derived `<cwd>-sh` label. When the
+        // lifecycle id already IS that identity, suppress pty's automatic `<cwd>-sh` alias: pty
+        // rejects displayName == id, and no displayName makes the UI fall back to the stable id.
+        if target.pty_id == target.bus_id {
+            cmd.arg("--no-display-name");
+        } else {
+            cmd.args(["--name", &target.bus_id]);
+        }
+        cmd.arg("--cwd").arg(&cwd);
         for (k, v) in &target.tags {
             cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
         }
@@ -1151,6 +1156,33 @@ mod tests {
         assert_eq!(args[name_pos + 1], "hetz.demo");
         let sep = args.iter().position(|a| a == "--").unwrap();
         assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
+    }
+
+    #[test]
+    fn build_run_command_omits_an_alias_equal_to_the_lifecycle_id() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo", "exec codex 'boot'");
+        t.bus_id = t.pty_id.clone();
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args.iter()
+                .position(|arg| arg == "--id")
+                .map(|position| args[position + 1].as_str()),
+            Some("hetz.demo")
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--name"),
+            "pty rejects a display name equal to the stable session id"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--no-display-name"),
+            "without this flag pty would create an unrelated automatic alias"
+        );
     }
 
     #[test]
