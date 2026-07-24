@@ -711,6 +711,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShepherdDecision { Skip, Due }
+const SHEPHERD_PROMPT: &str = "[ST2 LOCAL TICK] Run the scheduled local machine-root health sweep: inspect catalog/service/fabric/PTY state, safe drift, and report incidents. This is not an inbox event and must not poll the inbox.";
 
 fn shepherd_decision(bucket: u64, last: Option<u64>, dnd: bool) -> ShepherdDecision {
     if dnd || last == Some(bucket) { ShepherdDecision::Skip } else { ShepherdDecision::Due }
@@ -733,7 +734,7 @@ fn shepherd_tick(root: &Path, this_host: &str) {
     if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return; }
     let bus_id = format!("{}.{}", this_host, spec.identity);
     let _ = std::fs::write(&attempt, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().to_string());
-    if crate::ding::PtyPoker::new(bus_id).poke("[ST2 LOCAL TICK] Check your inbox and resume unfinished durable work; this is a local shepherd tick.").is_ok()
+    if crate::ding::PtyPoker::new(bus_id).poke(SHEPHERD_PROMPT).is_ok()
         && std::fs::write(&marker, bucket.to_string()).is_ok() { let _ = std::fs::remove_file(attempt); }
 }
 
@@ -1456,5 +1457,7 @@ mod tests {
         assert_eq!(shepherd_decision(10, Some(10), false), ShepherdDecision::Skip);
         assert_eq!(shepherd_decision(11, Some(10), false), ShepherdDecision::Due);
         assert_eq!(shepherd_decision(11, None, true), ShepherdDecision::Skip);
+        assert!(SHEPHERD_PROMPT.contains("not an inbox event"));
+        assert!(!SHEPHERD_PROMPT.contains("Check your inbox"));
     }
 }
