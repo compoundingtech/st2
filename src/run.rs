@@ -709,17 +709,25 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
     Ok(report)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShepherdDecision { Skip, Due }
+
+fn shepherd_decision(bucket: u64, last: Option<u64>, dnd: bool) -> ShepherdDecision {
+    if dnd || last == Some(bucket) { ShepherdDecision::Skip } else { ShepherdDecision::Due }
+}
+
 fn shepherd_tick(root: &Path, this_host: &str) {
     const CADENCE: u64 = 2 * 60 * 60;
     let bucket = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / CADENCE;
     let d = crate::discovery::discover(root);
-    let roots: Vec<_> = d.specs.iter().filter(|s| s.host.as_deref().unwrap_or(this_host) == this_host && s.role.as_deref() == Some("root") && s.tasks.iter().any(|t| t.command.as_deref().is_some_and(|c| c.contains("codex"))) && !s.retired).collect();
-    if roots.len() != 1 { return; }
+    let roots: Vec<_> = d.specs.iter().filter(|s| s.host.as_deref().unwrap_or(this_host) == this_host && s.role.as_deref() == Some("root") && s.tasks.iter().any(|t| t.command.as_deref().is_some_and(command_invokes_codex)) && !s.retired).collect();
+    if roots.len() != 1 { eprintln!("st2: shepherd disabled on {this_host}: expected exactly one local Codex role=root, found {}", roots.len()); return; }
     let spec = roots[0];
     let dir = spec.path.parent().unwrap_or(root);
-    if crate::status::read_state(&crate::status::status_path(dir)) == crate::status::State::Dnd { return; }
-    let marker = root.join(".st2-shepherd-bucket");
-    if std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(bucket) { return; }
+    let dnd = crate::status::read_state(&crate::status::status_path(dir)) == crate::status::State::Dnd;
+    let marker = root.join(format!(".st2-shepherd-{}-{}-bucket", this_host, spec.identity));
+    let last = std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    if shepherd_decision(bucket, last, dnd) == ShepherdDecision::Skip { return; }
     let bus_id = format!("{}.{}", this_host, spec.identity);
     if crate::ding::PtyPoker::new(bus_id).poke("[ST2 LOCAL TICK] Check your inbox and resume unfinished durable work; this is a local shepherd tick.").is_ok() { let _ = std::fs::write(marker, bucket.to_string()); }
 }
@@ -1435,5 +1443,13 @@ mod tests {
         let h = detect_host();
         assert!(!h.is_empty());
         assert!(!h.contains('.'), "short name only, got {h}");
+    }
+
+    #[test]
+    fn shepherd_scheduler_is_due_once_per_bucket_and_respects_dnd() {
+        assert_eq!(shepherd_decision(10, None, false), ShepherdDecision::Due);
+        assert_eq!(shepherd_decision(10, Some(10), false), ShepherdDecision::Skip);
+        assert_eq!(shepherd_decision(11, Some(10), false), ShepherdDecision::Due);
+        assert_eq!(shepherd_decision(11, None, true), ShepherdDecision::Skip);
     }
 }
