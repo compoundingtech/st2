@@ -713,6 +713,15 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 enum ShepherdDecision { Skip, Due }
 const SHEPHERD_PROMPT: &str = "[ST2 LOCAL TICK] Run the scheduled local machine-root health sweep: inspect catalog/service/fabric/PTY state, safe drift, and report incidents. This is not an inbox event and must not poll the inbox.";
 
+#[allow(dead_code)]
+trait ShepherdStore { fn attempt(&mut self, key: &str, now: u64) -> bool; fn delivered(&mut self, key: &str, bucket: u64) -> bool; }
+#[allow(dead_code)]
+fn shepherd_pass<S: ShepherdStore, P: FnMut() -> bool>(store: &mut S, key: &str, bucket: u64, now: u64, dnd: bool, mut poke: P) -> ShepherdDecision {
+    if dnd || store.delivered(key, bucket) || !store.attempt(key, now) { return ShepherdDecision::Skip; }
+    if poke() { let _ = store.delivered(key, bucket); }
+    ShepherdDecision::Due
+}
+
 /// Injectable delivery/state seam shared by one-shot and supervised shepherd passes.
 fn shepherd_attempt<P, W>(bucket: u64, last: Option<u64>, dnd: bool, mut poke: P, mut write: W) -> ShepherdDecision
 where P: FnMut() -> bool, W: FnMut(u64) -> bool {
@@ -1481,5 +1490,10 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(shepherd_attempt(2, None, false, || false, |_| true), ShepherdDecision::Due);
         assert_eq!(shepherd_attempt(2, None, true, || { panic!("dnd poke") }, |_| true), ShepherdDecision::Skip);
+        struct S { a: bool, d: bool }
+        impl ShepherdStore for S { fn attempt(&mut self, _: &str, _: u64) -> bool { let old=self.a; self.a=true; !old } fn delivered(&mut self, _: &str, _: u64) -> bool { self.d } }
+        let mut s=S{a:false,d:false}; let n=std::cell::Cell::new(0);
+        assert_eq!(shepherd_pass(&mut s,"h.root",1,10,false,||{n.set(n.get()+1);true}), ShepherdDecision::Due);
+        s.d=true; assert_eq!(shepherd_pass(&mut s,"h.root",1,11,false,||{n.set(n.get()+1);true}), ShepherdDecision::Skip); assert_eq!(n.get(),1);
     }
 }
