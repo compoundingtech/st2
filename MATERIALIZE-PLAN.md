@@ -19,35 +19,72 @@ ensure-line) write the actual persona/hooks so their failure = broken agent → 
 only hides the overlay from git, so a failure or a non-git workspace is cosmetic (untracked overlay),
 never a reason to block boot.
 
-Inside a catalog `agent.kdl`, a `render { … }` block of generic materialize directives:
+Inside a catalog `agent.kdl`, a `render { … }` block of generic materialize directives. All overlay
+paths are **st2-native** — `.st2/…` (NOT `.convoy/…`), and the loader is `.claude/rules/st2.md`:
 
-- `copy "<src>" "<dest>"` — byte-for-byte copy. `<src>` is catalog-relative (e.g.
-  `_templates/DING-BUS.md`); `<dest>` is workspace-relative. For the big static files (persona,
-  DING-BUS, AGENTS.md). Overwrite semantics TBD (see open Qs).
-- `file "<dest>" { content "<text>" }` — write `<text>`, with `$VAR` expansion via the **existing
-  env-cascade** (`$CATALOG`/`$ST_ROOT`/`$ST_AGENT`/…, same `expand_catalog` st2 already runs on
-  env/cwd/tags). For the small templated files (settings.json, permissions.sh).
-  - **Clobber policy is per-file + deliberate:** a pure render-OWNED file overwrites (PERSONA.md,
-    DING-BUS.md, AGENTS.md, the hook scripts). A file a USER may also edit — notably
-    `.claude/settings.local.json` (claude's local, git-ignored settings) and `.claude/settings.json` —
-    must be **MERGED**: st2 injects/updates only its own block (the hooks / permissions keys) and
-    preserves the user's other keys, never blind-overwrites. So `file{}` needs a merge mode for JSON
-    (deep-merge the declared keys) vs a plain-write mode; policy is chosen per directive/file.
-- `ensure-line "<dest>" "<line>"` — idempotent append-if-absent. For the `.claude/rules/convoy.md`
-  `@`-import lines (must not clobber a user's loader, must not duplicate on re-up).
-- `git-exclude "<path>"` — its own directive (maintainer's instinct: the `.git/info/exclude` append is
-  special). Append `<path>` to `<workspace>/.git/info/exclude`, git-repo-conditional, idempotent.
+- `copy "<src>" "<dest>"` — byte-for-byte copy. `<src>` catalog-relative (e.g.
+  `_templates/DING-BUS.md`); `<dest>` workspace-relative. **GATING.** Render-OWNED static files
+  (`.st2/PERSONA.md`, `.st2/DING-BUS.md`, `AGENTS.md` for codex). Overwrite (render is source of truth).
+- `file "<dest>" { content "<text>" }` — write `<text>` with `$VAR` expansion via the **existing
+  env-cascade** (`$CATALOG`/`$ST_ROOT`/`$ST_AGENT`/`$ST_HOOKS`, same `expand_catalog`). **GATING.**
+  Render-OWNED non-JSON templated files (e.g. `permissions.sh`). Overwrite.
+- `json-upsert "<dest>" { content "<json>" }` — **NEW (maintainer).** DEEP-MERGE the JSON into an
+  existing file, preserving the user's other keys; create if absent. **GATING.** This is how the
+  user-shared `.claude/settings.local.json` (boot hooks) and `.claude/settings.json` (permissions hook)
+  are handled — MERGE, never clobber (they are claude-local settings a user may also edit). Replaces
+  `file{}` for JSON.
+- `ensure-line "<dest>" "<line>"` — idempotent append-if-absent. **GATING.** The `.claude/rules/st2.md`
+  `@`-import lines (`@../../.st2/PERSONA.md`, `@../../.st2/DING-BUS.md`) — must not clobber a user's
+  loader, must not duplicate on re-up.
+- `git-exclude "<path>"` — its own directive, INSIDE `render{}`, **ADVISORY (non-gating).** Append
+  `<path>` to `<workspace>/.git/info/exclude`; git-repo-conditional, idempotent; a failure or a non-git
+  workspace never blocks boot. Excludes `.st2/`, `.claude/rules/st2.md`, `.claude/settings.local.json`,
+  `AGENTS.md`.
+
+(`.claude-session-id` is DROPPED — unused off `--resume`, no hook references it.)
 
 Vendored static sources live in `<catalog>/_templates/` (the `copy` sources).
 
+## Install/state layout + sync boundary (roots are st2-PROVIDED, not kdl-hardcoded)
+
+The kdl no longer hardcodes `ST_ROOT="$CATALOG/smalltalk"` / `PTY_ROOT="$CATALOG/pty"`. **st2 provides
+all roots from its install/state layout**, so the catalog is PORTABLE across machines (same synced
+catalog + each machine's st2 supplies its own local runtime roots). Proposed layout (per the maintainer):
+
+```
+~/.local/state/st2/<network>/         # <network> = "default" or the network name
+  catalog/     # SYNCED (fabric) — agent.kdl declarations, personas/, resources    → $CATALOG
+  smalltalk/   # SYNCED (fabric) — the message bus (inbox/archive per agent)        → $ST_ROOT
+  pty/         # LOCAL           — live pty sessions (sockets/pids/scrollback)       → $PTY_ROOT
+  run/         # LOCAL           — exec-task state, logs, .runs (machine runtime)
+<st2-install-owned>/hooks/            # LOCAL — st2-shipped native hook scripts       → $ST_HOOKS
+```
+
+**The sync boundary (the load-bearing call):**
+- **SYNCED** (portable = the shared network): `catalog/` (the declarations + personas + resources) and
+  `smalltalk/` (the bus — so agents on ANY machine share the conversation; cross-host messaging already
+  relies on this, and the append-only `<unix-ms>-<rand6>.md` wire makes concurrent writes conflict-free).
+- **LOCAL** (machine-specific runtime, MUST NOT sync): `pty/` (sockets/pids are meaningless + harmful
+  across machines), `run/` (exec state, the auto-log `logs/`, `.runs`), and the hooks (`$ST_HOOKS`,
+  per-install). **This means the auto-log `logs/` + eval `exec/` state must move OUT of `$CATALOG` into
+  the LOCAL `run/` root** (today they sit under the catalog — if the catalog syncs, they'd sync, which
+  is wrong). That is a required consequence of this layout, not just the overlay work.
+- st2 sets on every seat: `CATALOG`, `ST_ROOT`, `PTY_ROOT`, `ST_HOOKS` — from the layout, so no machine
+  path ever appears in the kdl or the overlay. (`$ST_HOOKS/<hook>.sh` is how `settings.local.json`
+  references the hooks — see item 4.)
+
+Cross-cutting note: this touches where roots are set today (`run.rs`/`eval_run.rs` currently derive
+`ST_ROOT`/`PTY_ROOT` from `$CATALOG`; evals root exec-state + logs under the catalog). Realizing the
+layout is its own sub-work, sequenced with (or just before) the overlay materialization.
+
 ## Work items (each test-tied)
 
-1. **Parser** — `render{}` + the four directives in `kdl_format`/`discovery` (the catalog format).
+1. **Parser** — `render{}` + the five directives (copy/file/json-upsert/ensure-line/git-exclude) in `kdl_format`/`discovery` (the catalog format).
    Render-only fields stay ignored by the runner subset; `render{}` is consumed by the new materialize
    step, not by reconcile.
 2. **Materialize primitive** — a generic `materialize_overlay(agent, workspace)` run in `st2 up`'s boot
    path *before* spawning the pty: execute each directive (copy bytes / write-with-env-expand /
-   ensure-line / git-exclude append), idempotent (safe on every reconcile pass). Generic file I/O — no
+   json-deep-merge / ensure-line / git-exclude append), idempotent (safe on every reconcile pass). Generic file I/O — no
    persona/harness knowledge. This is the one (mild) expansion of `st2 up`: today it is read-only on the
    catalog + spawn-only; now it also writes the declared overlay into the workspace.
 
@@ -64,14 +101,16 @@ Vendored static sources live in `<catalog>/_templates/` (the `copy` sources).
    overlay *content* is unchanged; it moves from render-writes-workspace to kdl-declares →
    up-materializes.
 4. **The hard edge: st2-native hooks (decouple from smalltalk's external install).** Today
-   `settings.local.json` bakes an **absolute machine path** to smalltalk's install hook scripts
-   (`ST_BIN=<abs st> <abs smalltalk>/examples/claude-code/hooks/<hook>.sh`) — machine-specific AND an
-   external dependency, so it cannot be self-contained. Fix: vendor **st2-native** hook scripts
-   (`session-start`/`pre-compact`/`stop-failure`) into st2's `templates/`, replicating the behavior
-   (boot-ritual system-reminder on cold start / resume / compact + last-working-state `context/now.md`
-   injection), but resolving via st2's own paths and shelling out to **`st2`** verbs, not smalltalk's
-   `st`. Materialize them into `<workspace>/.claude/hooks/` via `copy`, and reference them
-   **workspace-relative** in `settings.local.json` → zero machine path, zero external dependency.
+   `settings.local.json` bakes an ABSOLUTE machine path to smalltalk's install hook scripts
+   (`ST_BIN=<abs st> <abs smalltalk>/…/hooks/<hook>.sh`) — machine-specific AND an external dependency.
+   Fix (decisions 5–6): **DROP `ST_BIN`** (st2 IS the bin — the hooks call bare `st2`, resolved via the
+   seat PATH `st2 up` already sets). **st2 SHIPS the native hook scripts** and PROVIDES **`$ST_HOOKS`**
+   (a root from the install layout above), so `settings.local.json` references `$ST_HOOKS/<hook>.sh` —
+   no per-workspace copy, no machine path in the kdl. The 3 scripts (session-start / pre-compact /
+   stop-failure) replicate the behavior (boot-ritual reminder + `context/now.md` injection +
+   crash-notify) but shell out to `st2`, not `st`. Produced (canonical, from st2) when the milestone
+   builds. `settings.local.json` (+ `settings.json`) are written via `json-upsert` so a user's own keys
+   survive.
 5. **Systematic `st` → `st2` pass in agent-facing text — the native templates are canonical FROM st2.**
    st2 owns producing the canonical st2-native templates; the catalog vendors them into `_templates/`:
    - **`st2` DING-BUS.md** — DONE: `templates/DING-BUS.st2.md` (st verbs → st2, `--priority` dropped,
@@ -89,13 +128,16 @@ Vendored static sources live in `<catalog>/_templates/` (the `copy` sources).
 
 ## Open questions (settle before/at build)
 
-- **Overwrite vs only-if-absent** for `copy`/`file` on re-up: overwrite (render is source of truth) or
-  skip-if-present (respect local edits)? `ensure-line`/`git-exclude` are already append-idempotent.
+- **Layout confirm**: the `<state>/<network>/{catalog,smalltalk,pty,run}` tree + `$ST_HOOKS` location —
+  confirm the exact paths + the `<network>` selector (env? `st2 up` flag? default "default"). Decides
+  catalog portability.
 - **When to materialize**: every reconcile pass (cheap, idempotent) vs first-boot-only.
-- **st2-native hook behavior parity**: replicate smalltalk's session-start now.md-injection exactly, or
+- **st2-native hook behavior parity**: replicate smalltalk's session-start `now.md`-injection exactly, or
   simplify to the boot-ritual reminder? (Grounded at build time against the smalltalk scripts.)
 - **`--priority` on `st2 message send`**: not implemented (deferred). If the fleet's templates use it,
   add it as a small pre-req.
+- (RESOLVED) clobber policy → `json-upsert` (merge) for JSON, overwrite for render-owned files.
+- (RESOLVED) `render{}` block vs flat → kept as the ordered gating phase; `git-exclude` inside, advisory.
 
 ## Invariants
 
@@ -120,4 +162,5 @@ st2 subsumes smalltalk's bus verb-for-verb (built wire-compatible). Mapping is `
 - `st2 ding --identity <id> --root <root>` (**identity-only now**; positional session optional;
   `st2 ping` is the alias)
 - Shared ctx flags: `--root` (default `$CATALOG`), `--as` (acting identity, default `$ST_AGENT`),
-  `--host`. Env unchanged: `ST_AGENT` / `ST_ROOT` / `CATALOG` / `PTY_ROOT`.
+  `--host`. Roots are st2-PROVIDED (from the install layout): `CATALOG` / `ST_ROOT` / `PTY_ROOT` /
+  `ST_HOOKS` (+ `ST_AGENT` per agent). No `ST_BIN` (st2 IS the bin).
