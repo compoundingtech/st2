@@ -343,6 +343,7 @@ fn render_agent_from_flags_produces_a_runnable_catalog_with_verbatim_persona() {
         .find(|s| s.identity == "gb-sup")
         .expect("gb-sup rendered");
     assert_eq!(spec.host.as_deref(), Some("gbpilot"));
+    assert_eq!(spec.role.as_deref(), Some("supervisor"));
     assert_eq!(spec.supervisor.as_deref(), Some("lead"));
     let kdl = fs::read_to_string(catalog.join("agents/gbpilot/gb-sup/agent.kdl")).unwrap();
     assert!(kdl.contains("supervisor \"lead\""));
