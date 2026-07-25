@@ -430,11 +430,35 @@ fn strip_ansi(input: &str) -> String {
         match bytes[i] {
             b'[' => {
                 i += 1;
+                let params_start = i;
+                let mut final_byte = None;
                 while i < bytes.len() {
                     let byte = bytes[i];
                     i += 1;
                     if (0x40..=0x7e).contains(&byte) {
+                        final_byte = Some(byte);
                         break;
+                    }
+                }
+                // `pty peek` may encode visible spaces as a bounded cursor-forward CSI instead of
+                // literal bytes. Preserve that rendered text for exact staged-composer comparison;
+                // unsupported/private/huge sequences still disappear and therefore fail closed.
+                if final_byte == Some(b'C') {
+                    let params = &bytes[params_start..i.saturating_sub(1)];
+                    let width = if params.is_empty() {
+                        Some(1)
+                    } else if params.iter().all(u8::is_ascii_digit) {
+                        std::str::from_utf8(params)
+                            .ok()
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .map(|value| value.max(1))
+                    } else {
+                        None
+                    };
+                    if let Some(width) = width.filter(|width| *width <= 512) {
+                        for _ in 0..width {
+                            out.push(' ');
+                        }
                     }
                 }
             }
@@ -835,6 +859,7 @@ mod tests {
     }
 
     fn current_macos_staged_codex_screen(text: &str) -> String {
+        let text = text.replace(' ', "\x1b[1C");
         format!(
             "\x1b[1m›\x1b[1C\x1b[0m{text}\r\n\r\n\
              \x1b[2Cgpt-5.6-sol xhigh · /workspace"
@@ -927,6 +952,24 @@ mod tests {
         ] {
             assert_eq!(classify_pane(&human, expected), PaneState::Blocked);
         }
+    }
+
+    #[test]
+    fn ansi_cursor_forward_is_rendered_as_bounded_spaces() {
+        assert_eq!(
+            strip_ansi("one\x1b[1Ctwo\x1b[Cthree\x1b[2Cfour"),
+            "one two three  four"
+        );
+        assert_eq!(
+            strip_ansi("one\x1b[513Ctwo"),
+            "onetwo",
+            "huge cursor motion is not expanded"
+        );
+        assert_eq!(
+            strip_ansi("one\x1b[?1Ctwo"),
+            "onetwo",
+            "private cursor modes are not interpreted as composer spaces"
+        );
     }
 
     #[test]
