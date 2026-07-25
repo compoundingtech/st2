@@ -304,8 +304,17 @@ fn guarded_poke(
     }
 }
 
-const CODEX_EMPTY_COMPOSER: &str = "\x1b[1;22m›\x1b[1C\x1b[22;2m";
-const CODEX_TYPED_COMPOSERS: [&str; 2] = ["\x1b[1;22m›\x1b[1C\x1b[0m", "\x1b[1;2m› \x1b[0m"];
+const CODEX_EMPTY_COMPOSERS: [&str; 3] = [
+    "\x1b[1;22m›\x1b[1C\x1b[22;2m",
+    "\x1b[1m›\x1b[1C\x1b[22;2m",
+    "\x1b[1m›\x1b[22m \x1b[2m",
+];
+const CODEX_TYPED_COMPOSERS: [&str; 4] = [
+    "\x1b[1;22m›\x1b[1C\x1b[0m",
+    "\x1b[1;2m› \x1b[0m",
+    "\x1b[1m›\x1b[1C\x1b[0m",
+    "\x1b[1m›\x1b[22m ",
+];
 
 /// Fail-closed Codex pane classifier.
 ///
@@ -360,9 +369,14 @@ fn looks_like_choice_menu(plain: &str) -> bool {
 }
 
 fn bottom_codex_composer(screen: &str) -> Option<CodexComposer> {
-    let empty = screen
-        .rfind(CODEX_EMPTY_COMPOSER)
-        .map(|start| (start, CODEX_EMPTY_COMPOSER.len(), true));
+    let empty = CODEX_EMPTY_COMPOSERS
+        .iter()
+        .filter_map(|marker| {
+            screen
+                .rfind(marker)
+                .map(|start| (start, marker.len(), true))
+        })
+        .max_by_key(|(start, _, _)| *start);
     let typed = CODEX_TYPED_COMPOSERS
         .iter()
         .filter_map(|marker| {
@@ -371,16 +385,22 @@ fn bottom_codex_composer(screen: &str) -> Option<CodexComposer> {
                 .map(|start| (start, marker.len(), false))
         })
         .max_by_key(|(start, _, _)| *start);
-    let (start, marker_len, empty) = empty
-        .into_iter()
-        .chain(typed)
-        .max_by_key(|(start, _, _)| *start)?;
+    // The current Linux typed prefix is also the prefix of its empty-placeholder form. When both
+    // begin at the same bottom-most composer, the longer exact empty marker is authoritative.
+    let (start, marker_len, empty) = match (empty, typed) {
+        (Some(empty), Some(typed)) if empty.0 >= typed.0 => empty,
+        (_, Some(typed)) => typed,
+        (Some(empty), None) => empty,
+        (None, None) => return None,
+    };
     if empty {
         return Some(CodexComposer::Empty);
     }
     let tail = &screen[start + marker_len..];
     let input = tail
-        .split_once("\r\n\r\n")
+        .split_once("\r\n \x1b[")
+        .or_else(|| tail.split_once("\n \x1b["))
+        .or_else(|| tail.split_once("\r\n\r\n"))
         .or_else(|| tail.split_once("\n\n"))
         .map(|(input, _)| input)
         .unwrap_or(tail);
@@ -808,6 +828,35 @@ mod tests {
         )
     }
 
+    fn current_macos_idle_codex_screen() -> String {
+        "\x1b[1m›\x1b[1C\x1b[22;2mImprove documentation in @filename\r\n\r\n\
+         \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+            .to_string()
+    }
+
+    fn current_macos_staged_codex_screen(text: &str) -> String {
+        format!(
+            "\x1b[1m›\x1b[1C\x1b[0m{text}\r\n\r\n\
+             \x1b[2Cgpt-5.6-sol xhigh · /workspace"
+        )
+    }
+
+    fn current_linux_idle_codex_screen() -> String {
+        "\x1b[48;5;234m \x1b[79X\r\n\
+         \x1b[1m›\x1b[22m \x1b[2mImplement {feature}\x1b[59X\r\n\
+         \x1b[22m \x1b[79X\r\n"
+            .to_string()
+    }
+
+    fn current_linux_staged_codex_screen(text: &str) -> String {
+        format!(
+            "\x1b[48;5;234m \x1b[79X\r\n\
+             \x1b[1m›\x1b[22m {text}\x1b[48X\r\n\
+             \x20\x1b[79X\r\n\
+             \x1b[0m\x1b[2C\x1b[2mtab to queue message\x1b[0m"
+        )
+    }
+
     fn modal_codex_screen(text: &str) -> String {
         format!(
             "\x1b[1;2m› \x1b[0m{text}\r\n\r\n\r\n\
@@ -849,6 +898,35 @@ mod tests {
         );
         assert_eq!(classify_pane(&human, expected), PaneState::Blocked);
         assert_eq!(classify_pane(&working, expected), PaneState::Blocked);
+    }
+
+    #[test]
+    fn current_codex_renderer_variants_preserve_idle_staged_and_human_distinctions() {
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+
+        for idle in [
+            current_macos_idle_codex_screen(),
+            current_linux_idle_codex_screen(),
+        ] {
+            assert_eq!(classify_pane(&idle, expected), PaneState::Idle);
+        }
+        for (renderer, staged) in [
+            ("macOS", current_macos_staged_codex_screen(expected)),
+            ("Linux", current_linux_staged_codex_screen(expected)),
+        ] {
+            assert_eq!(
+                classify_pane(&staged, expected),
+                PaneState::Staged,
+                "{renderer} staged composer"
+            );
+        }
+        for human in [
+            current_macos_staged_codex_screen("half-written human request"),
+            current_linux_staged_codex_screen("half-written human request"),
+        ] {
+            assert_eq!(classify_pane(&human, expected), PaneState::Blocked);
+        }
     }
 
     #[test]
