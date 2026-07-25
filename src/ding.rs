@@ -47,8 +47,16 @@ pub fn poke_id(filename: &str) -> &str {
 /// format smalltalk emits and every agent's `DING-BUS.md` pattern-matches. Empty/missing `subject`
 /// and `from` degrade to `(no subject)` / `unknown`.
 pub fn poke_text(msg: &Message) -> String {
-    let subject = msg.subject.as_deref().filter(|s| !s.is_empty()).unwrap_or("(no subject)");
-    let from = msg.from.as_deref().filter(|s| !s.is_empty()).unwrap_or("unknown");
+    let subject = msg
+        .subject
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(no subject)");
+    let from = msg
+        .from
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
     format!(
         "[DING] new smalltalk message: [id:{}] {subject} (from {from}); check your inbox",
         poke_id(&msg.filename)
@@ -87,13 +95,18 @@ pub struct PtyPoker {
 
 impl PtyPoker {
     pub fn new(session: impl Into<String>) -> Self {
-        Self { bin: "pty".to_string(), session: session.into() }
+        Self {
+            bin: "pty".to_string(),
+            session: session.into(),
+        }
     }
 }
 
 impl Poker for PtyPoker {
     fn poke(&self, text: &str) -> anyhow::Result<()> {
-        let out = Command::new(&self.bin).args(pty_send_args(&self.session, text)).output()?;
+        let out = Command::new(&self.bin)
+            .args(pty_send_args(&self.session, text))
+            .output()?;
         if !out.status.success() {
             anyhow::bail!(
                 "`pty send {}` failed: {}",
@@ -113,8 +126,12 @@ impl Poker for PtyPoker {
 /// agrees with how `pty` itself decides a session is live.
 pub fn session_alive(session: &str) -> bool {
     let pidfile = pty_session_dir().join(format!("{session}.pid"));
-    let Ok(raw) = std::fs::read_to_string(&pidfile) else { return false };
-    let Ok(pid) = raw.trim().parse::<i32>() else { return false };
+    let Ok(raw) = std::fs::read_to_string(&pidfile) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
     // signal 0 = existence + permission probe, no signal delivered.
     pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
 }
@@ -134,7 +151,9 @@ fn pty_session_dir() -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Refuse to start if the `pty` binary isn't reachable — a ding that can't reach `pty` delivers
@@ -147,14 +166,17 @@ pub fn probe_pty_on_path() -> anyhow::Result<()> {
     }
 }
 
-/// The messages in `inbox_dir` not in `seen`, in send order — updating `seen` to exactly the inbox's
-/// current contents (so archived/removed files drop out and never re-poke). The first call seeds
+/// The logically unread messages in `inbox_dir` not in `seen`, in send order — updating `seen` to
+/// exactly that set. A same-named sibling archive receipt suppresses a raw inbox copy restored by an
+/// eventually-consistent sync, so archive remove/reappear races never re-poke. The first call seeds
 /// `seen` and returns the whole backlog; callers discard that to get push-only-on-new semantics.
 pub fn new_arrivals(inbox_dir: &Path, seen: &mut HashSet<String>) -> Vec<Message> {
-    let msgs = message::list_dir(inbox_dir).unwrap_or_default(); // sorted by (ts_ms, filename)
+    let msgs = message::list_inbox(inbox_dir).unwrap_or_default(); // sorted by (ts_ms, filename)
     let current: HashSet<&str> = msgs.iter().map(|m| m.filename.as_str()).collect();
     seen.retain(|f| current.contains(f.as_str()));
-    msgs.into_iter().filter(|m| seen.insert(m.filename.clone())).collect()
+    msgs.into_iter()
+        .filter(|m| seen.insert(m.filename.clone()))
+        .collect()
 }
 
 /// Consecutive liveness misses tolerated before the ding gives up on a session it has seen alive
@@ -192,7 +214,11 @@ impl SessionWatch {
             return WatchStep::Poll; // startup grace — still waiting for the target to register
         }
         self.misses += 1;
-        if self.misses >= SESSION_GONE_DEBOUNCE_MISSES { WatchStep::Gone } else { WatchStep::Poll }
+        if self.misses >= SESSION_GONE_DEBOUNCE_MISSES {
+            WatchStep::Gone
+        } else {
+            WatchStep::Poll
+        }
     }
 }
 
@@ -208,7 +234,10 @@ pub struct DingConfig {
 
 impl Default for DingConfig {
     fn default() -> Self {
-        Self { poll: Duration::from_millis(1000), status_refresh: status::STATUS_REFRESH }
+        Self {
+            poll: Duration::from_millis(1000),
+            status_refresh: status::STATUS_REFRESH,
+        }
     }
 }
 
@@ -227,7 +256,11 @@ pub fn run_ding(
     // smalltalk-ding). Watch the inbox if it exists, else its parent (`resources/`) so we still catch
     // the inbox dir being created. Best-effort — the poll timer is the real correctness guarantee.
     let (tx, rx) = channel::<()>();
-    let watch_at = if inbox_dir.exists() { inbox_dir } else { inbox_dir.parent().unwrap_or(inbox_dir) };
+    let watch_at = if inbox_dir.exists() {
+        inbox_dir
+    } else {
+        inbox_dir.parent().unwrap_or(inbox_dir)
+    };
     let _watcher = watch_dir(watch_at, tx);
 
     // Seed: everything already in the inbox is already-seen (no startup poke storm; the agent's boot
@@ -269,7 +302,9 @@ pub fn run_ding(
                 }
             }
         } else if !watch.seen_alive && !logged_waiting {
-            eprintln!("st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone.");
+            eprintln!(
+                "st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone."
+            );
             logged_waiting = true;
         }
         // Wait for a folder change or the poll timeout, then coalesce a burst into one scan.
@@ -380,7 +415,16 @@ mod tests {
         let args = pty_send_args("my-session", "[DING] hi");
         assert_eq!(
             args,
-            vec!["send", "my-session", "--with-delay", "0.5", "--seq", "[DING] hi", "--seq", "key:return"]
+            vec![
+                "send",
+                "my-session",
+                "--with-delay",
+                "0.5",
+                "--seq",
+                "[DING] hi",
+                "--seq",
+                "key:return"
+            ]
         );
     }
 
@@ -433,7 +477,10 @@ mod tests {
         let inbox = tmp.path().join("resources").join("inbox");
         let sp = crate::status::status_path(tmp.path()); // missing initially
         let stop = AtomicBool::new(false);
-        let config = DingConfig { poll: Duration::from_millis(5), status_refresh: Duration::from_millis(0) };
+        let config = DingConfig {
+            poll: Duration::from_millis(5),
+            status_refresh: Duration::from_millis(0),
+        };
 
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -444,7 +491,10 @@ mod tests {
             run_ding(&inbox, Some(&sp), &AlivePoker, &config, &stop).unwrap();
         });
 
-        assert_eq!(crate::status::read_state(&sp), crate::status::State::Available);
+        assert_eq!(
+            crate::status::read_state(&sp),
+            crate::status::State::Available
+        );
     }
 
     #[test]
@@ -470,5 +520,36 @@ mod tests {
         std::fs::remove_file(inbox.join(&f1)).unwrap();
         assert!(new_arrivals(&inbox, &mut seen).is_empty());
         assert!(seen.contains(&f2) && !seen.contains(&f1));
+    }
+
+    #[test]
+    fn archived_receipt_suppresses_remove_reappear_and_restart_pokes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let archive = tmp.path().join("resources").join("archive");
+        let filename = send_to_inbox(&inbox, "alice", Some("once"), None, &[], "hi").unwrap();
+
+        let mut seen = HashSet::new();
+        assert_eq!(new_arrivals(&inbox, &mut seen).len(), 1);
+        crate::message::archive_msg(&inbox, &archive, &filename).unwrap();
+        let bytes = std::fs::read(archive.join(&filename)).unwrap();
+
+        // The normal removal prunes the filename from the running ding's volatile set.
+        assert!(new_arrivals(&inbox, &mut seen).is_empty());
+        assert!(!seen.contains(&filename));
+
+        // A stale replica restores, disappears, and restores again. The durable receipt wins every
+        // time, including after a ding restart with a brand-new in-memory `seen` set.
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join(&filename), &bytes).unwrap();
+        assert!(new_arrivals(&inbox, &mut seen).is_empty());
+        std::fs::remove_file(inbox.join(&filename)).unwrap();
+        assert!(new_arrivals(&inbox, &mut seen).is_empty());
+        std::fs::write(inbox.join(&filename), &bytes).unwrap();
+        assert!(new_arrivals(&inbox, &mut seen).is_empty());
+
+        let mut restarted_seen = HashSet::new();
+        assert!(new_arrivals(&inbox, &mut restarted_seen).is_empty());
+        assert!(restarted_seen.is_empty());
     }
 }

@@ -30,36 +30,93 @@ fn agent_kdl(identity: &str, host: &str) -> String {
 fn roster_projects_presence_name_and_enrich_across_the_catalog() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "hetz/st2-claude/agent.kdl", &agent_kdl("st2-claude", "hetz"));
-    write(root, "hetz/cos-claude/agent.kdl", &agent_kdl("cos-claude", "hetz"));
-    write(root, "silber/fabric-claude/agent.kdl", &agent_kdl("fabric-claude", "silber"));
+    write(
+        root,
+        "hetz/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "hetz"),
+    );
+    write(
+        root,
+        "hetz/cos-claude/agent.kdl",
+        &agent_kdl("cos-claude", "hetz"),
+    );
+    write(
+        root,
+        "silber/fabric-claude/agent.kdl",
+        &agent_kdl("fabric-claude", "silber"),
+    );
 
     // Presence: st2-claude busy, cos-claude available, fabric-claude unset (→ offline). A display name
     // and an inbox message for st2-claude.
     set_state(&status_path(&root.join("hetz/st2-claude")), State::Busy).unwrap();
-    set_state(&status_path(&root.join("hetz/cos-claude")), State::Available).unwrap();
+    set_state(
+        &status_path(&root.join("hetz/cos-claude")),
+        State::Available,
+    )
+    .unwrap();
     write(root, "hetz/st2-claude/name", "st2 owner\n");
-    send_to_inbox(&st2::message::inbox_dir(&root.join("hetz/st2-claude")), "hetz.cos-claude", None, None, &[], "hi")
-        .unwrap();
+    send_to_inbox(
+        &st2::message::inbox_dir(&root.join("hetz/st2-claude")),
+        "hetz.cos-claude",
+        None,
+        None,
+        &[],
+        "hi",
+    )
+    .unwrap();
+    let restored = send_to_inbox(
+        &st2::message::inbox_dir(&root.join("hetz/st2-claude")),
+        "hetz.cos-claude",
+        Some("already handled"),
+        None,
+        &[],
+        "must not count twice",
+    )
+    .unwrap();
+    let archive = st2::message::archive_dir(&root.join("hetz/st2-claude"));
+    fs::create_dir_all(&archive).unwrap();
+    fs::copy(
+        st2::message::inbox_dir(&root.join("hetz/st2-claude")).join(&restored),
+        archive.join(&restored),
+    )
+    .unwrap();
 
     let rows = roster(root, "hetz");
     // Sorted by bus id, spanning hosts.
     let ids: Vec<&str> = rows.iter().map(|r| r.identity.as_str()).collect();
-    assert_eq!(ids, ["hetz.cos-claude", "hetz.st2-claude", "silber.fabric-claude"]);
+    assert_eq!(
+        ids,
+        ["hetz.cos-claude", "hetz.st2-claude", "silber.fabric-claude"]
+    );
 
-    let st2c = rows.iter().find(|r| r.identity == "hetz.st2-claude").unwrap();
+    let st2c = rows
+        .iter()
+        .find(|r| r.identity == "hetz.st2-claude")
+        .unwrap();
     assert_eq!(st2c.status, State::Busy);
     assert_eq!(st2c.name.as_deref(), Some("st2 owner"));
-    assert_eq!(st2c.inbox, 1);
-    assert!(st2c.last_activity_ms.is_some(), "an agent with a status + inbox has activity");
+    assert_eq!(
+        st2c.inbox, 1,
+        "the same-filename archive receipt suppresses the raw inbox duplicate"
+    );
+    assert!(
+        st2c.last_activity_ms.is_some(),
+        "an agent with a status + inbox has activity"
+    );
 
-    let cos = rows.iter().find(|r| r.identity == "hetz.cos-claude").unwrap();
+    let cos = rows
+        .iter()
+        .find(|r| r.identity == "hetz.cos-claude")
+        .unwrap();
     assert_eq!(cos.status, State::Available);
     assert_eq!(cos.name, None);
     assert_eq!(cos.inbox, 0);
 
     // fabric-claude: no status file, nothing touched → offline, no activity.
-    let fab = rows.iter().find(|r| r.identity == "silber.fabric-claude").unwrap();
+    let fab = rows
+        .iter()
+        .find(|r| r.identity == "silber.fabric-claude")
+        .unwrap();
     assert_eq!(fab.status, State::Offline);
     assert_eq!(fab.last_activity_ms, None);
 }

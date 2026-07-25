@@ -55,3 +55,47 @@ fn since_is_strict_and_composes_with_other_list_filters() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
 }
+
+#[test]
+fn archived_filename_wins_over_a_restored_raw_inbox_copy_in_all_list_modes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("bob/inbox");
+    let archive = tmp.path().join("bob/archive");
+    let filename = "1700000000000-aaaaaa.md";
+    write_message(&inbox, 1_700_000_000_000, "aaaaaa", "alice");
+    fs::create_dir_all(&archive).unwrap();
+    fs::copy(inbox.join(filename), archive.join(filename)).unwrap();
+
+    let out = list(tmp.path(), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("# 0 messages in bob inbox"));
+
+    let out = list(tmp.path(), &["--count"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+
+    let out = list(tmp.path(), &["--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+
+    // The receipt remains visible when the operator explicitly lists the archive.
+    let out = list(tmp.path(), &["--archive", "--count"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}

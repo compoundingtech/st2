@@ -88,7 +88,11 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
     } else {
         let out: Vec<SummaryJson> = rows
             .iter()
-            .map(|r| SummaryJson { identity: &r.identity, status: r.status.as_str(), name: r.name.as_deref() })
+            .map(|r| SummaryJson {
+                identity: &r.identity,
+                status: r.status.as_str(),
+                name: r.name.as_deref(),
+            })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
     }
@@ -101,23 +105,22 @@ fn read_name(agent_dir: &Path) -> Option<String> {
     (!first.is_empty()).then(|| first.to_string())
 }
 
-/// Count canonical `<unix-ms>-<rand6>.md` files in the agent's `resources/inbox`.
+/// Count logically unread messages in the agent's `resources/inbox`. A same-filename archive receipt
+/// suppresses a raw inbox duplicate restored by eventually-consistent sync.
 fn inbox_count(agent_dir: &Path) -> usize {
-    let dir = message::inbox_dir(agent_dir);
-    match fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .flatten()
-            .filter(|e| message::is_message_filename(&e.file_name().to_string_lossy()))
-            .count(),
-        Err(_) => 0,
-    }
+    message::list_inbox(&message::inbox_dir(agent_dir))
+        .map(|msgs| msgs.len())
+        .unwrap_or(0)
 }
 
 /// Newest mtime (unix ms) across the agent's inbox files, archive files, and status file (mirrors
 /// smalltalk's `computeLastActivity`). `None` if none of those exist.
 fn newest_mtime_ms(agent_dir: &Path) -> Option<f64> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for dir in [message::inbox_dir(agent_dir), message::archive_dir(agent_dir)] {
+    for dir in [
+        message::inbox_dir(agent_dir),
+        message::archive_dir(agent_dir),
+    ] {
         if let Ok(rd) = fs::read_dir(&dir) {
             candidates.extend(rd.flatten().map(|e| e.path()));
         }
@@ -142,7 +145,13 @@ fn newest_mtime_ms(agent_dir: &Path) -> Option<f64> {
 mod tests {
     use super::*;
 
-    fn row(identity: &str, status: State, name: Option<&str>, last: Option<f64>, inbox: usize) -> AgentRow {
+    fn row(
+        identity: &str,
+        status: State,
+        name: Option<&str>,
+        last: Option<f64>,
+        inbox: usize,
+    ) -> AgentRow {
         AgentRow {
             identity: identity.to_string(),
             status,
@@ -157,7 +166,13 @@ mod tests {
     #[test]
     fn agents_json_is_byte_compatible_with_smalltalk() {
         let rows = [
-            row("hetz.cos-claude", State::Available, None, Some(1784653027733.6138), 1),
+            row(
+                "hetz.cos-claude",
+                State::Available,
+                None,
+                Some(1784653027733.6138),
+                1,
+            ),
             row("hetz.st2-claude", State::Busy, Some("owner"), None, 0),
         ];
 

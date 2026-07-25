@@ -3,9 +3,11 @@
 //! st2 owns messaging directly now: a message is a markdown file with YAML frontmatter, named
 //! `<unix-ms>-<rand6>.md`, written into the recipient agent's `resources/inbox/` (VRS §5). The
 //! **recipient is implied by the path**; `from` lives in the frontmatter; the filename's ms prefix is
-//! the send time. Send = write the file. Archive = rename inbox→archive. Nobody mutates a file after
-//! creation (append-only + rename-only). The on-disk format is kept wire-compatible with smalltalk so
-//! the two interoperate during the migration and tooling/agents port cleanly.
+//! the send time. Send = write the file. Archive = move inbox→archive. Nobody mutates a file after
+//! creation. An archive copy is also a durable receipt: if an eventually-consistent file sync briefly
+//! restores the same filename in the inbox, inbox readers suppress the duplicate and a repeated
+//! archive removes it without overwriting the receipt. The on-disk format is kept wire-compatible
+//! with smalltalk so the two interoperate during the migration and tooling/agents port cleanly.
 //!
 //! This module is location-agnostic: it operates on an inbox/agent directory a caller resolves (from
 //! the catalog for VRS-native, or `$ST_ROOT` for a compat shim).
@@ -45,7 +47,10 @@ pub struct Message {
 
 /// Current unix time in milliseconds.
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A fresh canonical `<unix-ms>-<rand6>.md` filename (the shared grammar — messages AND context
@@ -57,27 +62,40 @@ pub fn new_filename() -> String {
 /// Six Crockford-base32 chars from `/dev/urandom` (falls back to a time-derived value).
 fn rand6() -> String {
     let mut buf = [0u8; 6];
-    let ok = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    let ok = fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
     if !ok {
         // Degenerate fallback — mix the ns clock so it isn't all-zeros.
-        let n = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (n >> (i * 8)) as u8;
         }
     }
-    buf.iter().map(|b| CROCKFORD[(*b as usize) % 32] as char).collect()
+    buf.iter()
+        .map(|b| CROCKFORD[(*b as usize) % 32] as char)
+        .collect()
 }
 
 /// True if `name` matches the frozen bus grammar `^[0-9]{13}-[0-9a-z]{6}\.md$` (smalltalk LAYOUT-004).
 /// The reader accepts the FULL `[0-9a-z]` rand6 alphabet — st2 generates a Crockford subset, but a
 /// peer/smalltalk message may use any lowercase alnum and dropping those would lose real messages.
 pub fn is_message_filename(name: &str) -> bool {
-    let Some(stem) = name.strip_suffix(".md") else { return false };
-    let Some((ts, rand)) = stem.split_once('-') else { return false };
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let Some((ts, rand)) = stem.split_once('-') else {
+        return false;
+    };
     ts.len() == 13
         && ts.bytes().all(|b| b.is_ascii_digit())
         && rand.len() == 6
-        && rand.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        && rand
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
 }
 
 /// Render a message file's contents (frontmatter + body).
@@ -126,7 +144,9 @@ fn parse_message(filename: &str, contents: &str) -> Message {
     };
 
     // Frontmatter is an opening `---` line … a closing `---` line.
-    let rest = contents.strip_prefix("---\n").or_else(|| contents.strip_prefix("---\r\n"));
+    let rest = contents
+        .strip_prefix("---\n")
+        .or_else(|| contents.strip_prefix("---\r\n"));
     if let Some(rest) = rest
         && let Some(end) = rest.find("\n---")
     {
@@ -135,13 +155,21 @@ fn parse_message(filename: &str, contents: &str) -> Message {
         let after = &rest[end + 1..]; // at the `---` line
         let body = after.split_once('\n').map(|x| x.1).unwrap_or("");
         for line in front.lines() {
-            let Some((k, v)) = line.split_once(':') else { continue };
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
             let v = v.trim();
             match k.trim() {
                 "from" => msg.from = Some(v.to_string()),
                 "subject" => msg.subject = Some(v.to_string()),
                 "in-reply-to" => msg.in_reply_to = Some(v.to_string()),
-                "tags" => msg.tags = v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+                "tags" => {
+                    msg.tags = v
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                }
                 "priority" => msg.priority = Some(v.to_string()),
                 _ => {}
             }
@@ -174,7 +202,10 @@ pub fn send_to_inbox(
             return Ok(filename);
         }
     }
-    anyhow::bail!("could not allocate a unique message filename in {}", inbox_dir.display())
+    anyhow::bail!(
+        "could not allocate a unique message filename in {}",
+        inbox_dir.display()
+    )
 }
 
 /// List the canonical messages in `dir` (inbox or archive), sorted by send time. Non-message files
@@ -196,8 +227,31 @@ pub fn list_dir(dir: &Path) -> anyhow::Result<Vec<Message>> {
     // Primary order is send time; the `<rand6>` suffix is a deterministic tiebreak so two messages
     // that land in the same millisecond still list in a stable, reproducible order (the wire format
     // can't recover true send-order within a millisecond — this at least isn't `read_dir`-arbitrary).
-    msgs.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.filename.cmp(&b.filename)));
+    msgs.sort_by(|a, b| {
+        a.ts_ms
+            .cmp(&b.ts_ms)
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
     Ok(msgs)
+}
+
+/// List messages that are logically present in `inbox_dir`.
+///
+/// The sibling `archive/` is a durable handled-message receipt. Eventually-consistent sync can
+/// briefly restore an inbox file after a local inbox→archive move but before the delete tombstone
+/// converges. If the same canonical filename already exists in archive, the archived copy wins and
+/// the raw inbox duplicate is not unread work.
+pub fn list_inbox(inbox_dir: &Path) -> anyhow::Result<Vec<Message>> {
+    let archive_dir = sibling_archive_dir(inbox_dir);
+    let mut msgs = list_dir(inbox_dir)?;
+    msgs.retain(|msg| !archive_dir.join(&msg.filename).is_file());
+    Ok(msgs)
+}
+
+/// The archive directory paired with an inbox. Both native
+/// `resources/{inbox,archive}` and flat `<identity>/{inbox,archive}` layouts use sibling boxes.
+fn sibling_archive_dir(inbox_dir: &Path) -> PathBuf {
+    inbox_dir.parent().unwrap_or(inbox_dir).join("archive")
 }
 
 /// Read one message file from `dir`.
@@ -282,7 +336,9 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
     let found = crate::discover(catalog_root);
     let mut all: HashMap<String, Message> = HashMap::new();
     for spec in &found.specs {
-        let Some(dir) = spec.path.parent() else { continue };
+        let Some(dir) = spec.path.parent() else {
+            continue;
+        };
         for d in [inbox_dir(dir), archive_dir(dir)] {
             for m in list_dir(&d).unwrap_or_default() {
                 all.entry(m.filename.clone()).or_insert(m);
@@ -343,12 +399,40 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
     out
 }
 
-/// Archive: rename `<agent_dir>/inbox/<filename>` → `<agent_dir>/archive/<filename>`.
+/// Archive `filename` from inbox to archive.
+///
+/// Idempotency matters on an eventually-consistent bus: if archive already contains the filename,
+/// it is the durable receipt and wins. Remove only a duplicate inbox copy, never overwrite the
+/// archived file. A source that disappeared concurrently is also success when the receipt exists.
 pub fn archive_msg(inbox_dir: &Path, archive_dir: &Path, filename: &str) -> anyhow::Result<()> {
     fs::create_dir_all(archive_dir)?;
-    fs::rename(inbox_dir.join(filename), archive_dir.join(filename))
-        .map_err(|e| anyhow::anyhow!("archiving {filename}: {e}"))?;
-    Ok(())
+    let source = inbox_dir.join(filename);
+    let receipt = archive_dir.join(filename);
+
+    if receipt.is_file() {
+        return remove_inbox_duplicate(&source, filename);
+    }
+
+    // Link first, then unlink the source: unlike rename on Unix, hard-link creation never replaces a
+    // destination that raced us into existence. The two boxes are siblings on one filesystem in
+    // both supported layouts, so this gives archive-wins semantics without a clobber window.
+    match fs::hard_link(&source, &receipt) {
+        Ok(()) => remove_inbox_duplicate(&source, filename),
+        // A sync writer may create the receipt between our check and link attempt. If so, preserve
+        // that receipt and clean only the duplicate source.
+        Err(_) if receipt.is_file() => remove_inbox_duplicate(&source, filename),
+        Err(e) => Err(anyhow::anyhow!("archiving {filename}: {e}")),
+    }
+}
+
+fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {
+    match fs::remove_file(source) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "removing archived inbox duplicate {filename}: {e}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -432,12 +516,52 @@ mod tests {
     }
 
     #[test]
+    fn archive_receipt_suppresses_and_idempotently_cleans_a_restored_inbox_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        let archive = tmp.path().join("archive");
+        let filename =
+            send_to_inbox(&inbox, "alice", Some("once"), None, &[], "handle once").unwrap();
+
+        archive_msg(&inbox, &archive, &filename).unwrap();
+        let receipt = fs::read(archive.join(&filename)).unwrap();
+
+        // Simulate a sync race restoring the old Present entry after the local archive.
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(inbox.join(&filename), b"stale inbox replica must not win").unwrap();
+        assert_eq!(
+            list_dir(&inbox).unwrap().len(),
+            1,
+            "the raw replica is present"
+        );
+        assert!(
+            list_inbox(&inbox).unwrap().is_empty(),
+            "the archive receipt suppresses it"
+        );
+
+        // Repeating archive is safe: preserve the first receipt and remove only the duplicate.
+        archive_msg(&inbox, &archive, &filename).unwrap();
+        assert!(!inbox.join(&filename).exists());
+        assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);
+
+        // Source already absent + receipt present is idempotent success too.
+        archive_msg(&inbox, &archive, &filename).unwrap();
+        assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);
+    }
+
+    #[test]
     fn resolve_inbox_falls_back_to_the_flat_bus_when_catalog_less() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // No catalog under root → the flat smalltalk-style bus (<root>/<id>/inbox|archive).
-        assert_eq!(resolve_inbox(root, "mix.sup", "h"), root.join("mix.sup").join("inbox"));
-        assert_eq!(resolve_archive(root, "mix.sup", "h"), root.join("mix.sup").join("archive"));
+        assert_eq!(
+            resolve_inbox(root, "mix.sup", "h"),
+            root.join("mix.sup").join("inbox")
+        );
+        assert_eq!(
+            resolve_archive(root, "mix.sup", "h"),
+            root.join("mix.sup").join("archive")
+        );
         // A discoverable native catalog agent → its resources/inbox.
         let ad = root.join("h").join("mix.sup");
         std::fs::create_dir_all(&ad).unwrap();
@@ -446,6 +570,9 @@ mod tests {
             "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
         )
         .unwrap();
-        assert_eq!(resolve_inbox(root, "mix.sup", "h"), ad.join("resources").join("inbox"));
+        assert_eq!(
+            resolve_inbox(root, "mix.sup", "h"),
+            ad.join("resources").join("inbox")
+        );
     }
 }

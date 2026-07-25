@@ -235,9 +235,12 @@ Rendered agents wire **identically to convoy** (proven byte-for-byte in
 
 The bus is just files: a message is a `<unix-ms>-<rand6>.md` markdown file (YAML frontmatter + body)
 written into the recipient's `<catalog>/<host>/<identity>/resources/inbox/`. The recipient is the
-path; `from` is in the frontmatter; archiving is an inbox→archive rename. Nothing is mutated after
-write. The root follows `--catalog`, `$CATALOG`, then the default catalog; the acting identity
-defaults to `$ST_AGENT`. st2 sets both for every task it spawns, so a running agent needs no flags.
+path; `from` is in the frontmatter; archiving moves inbox→archive. Nothing is mutated after write.
+The archive filename is a durable handled-message receipt: if eventually-consistent sync briefly
+restores the same raw inbox filename, inbox listing/counting and ding suppress it, and repeating
+`archive` removes only the duplicate while preserving the archived copy. The root follows
+`--catalog`, `$CATALOG`, then the default catalog; the acting identity defaults to `$ST_AGENT`. st2
+sets both for every task it spawns, so a running agent needs no flags.
 
 ```sh
 st2 message send hetz.cos-claude -m "M2.1 landed" --subject "status"   # → prints the filename

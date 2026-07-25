@@ -593,15 +593,7 @@ fn main() -> Result<()> {
         } => {
             let catalog = catalog_arg(catalog)?;
             render_agent_cmd(
-                &catalog,
-                &identity,
-                &role,
-                &dir,
-                &persona,
-                &harness,
-                host,
-                model,
-                supervisor,
+                &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
                 extra_arg,
             )
         }
@@ -886,8 +878,7 @@ fn default_catalog_root() -> Option<PathBuf> {
     nonempty_env_path("XDG_STATE_HOME")
         .map(|state| state.join("st2/default/catalog"))
         .or_else(|| {
-            nonempty_env_path("HOME")
-                .map(|home| home.join(".local/state/st2/default/catalog"))
+            nonempty_env_path("HOME").map(|home| home.join(".local/state/st2/default/catalog"))
         })
 }
 
@@ -1312,12 +1303,11 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(id) => id,
                 None => acting_id(&ctx)?,
             };
-            let dir = if archive {
-                message::resolve_archive(&root, &id, &host)
+            let mut msgs = if archive {
+                message::list_dir(&message::resolve_archive(&root, &id, &host))?
             } else {
-                message::resolve_inbox(&root, &id, &host)
+                message::list_inbox(&message::resolve_inbox(&root, &id, &host))?
             };
-            let mut msgs = message::list_dir(&dir)?;
             if let Some(sender) = &from {
                 msgs.retain(|m| m.from.as_deref() == Some(sender.as_str()));
             }
