@@ -1,17 +1,17 @@
 //! The ding sidecar (M2.2): a native watcher over an agent's `resources/inbox` that pokes the agent's
 //! pty on every new message arrival — st2's replacement for smalltalk's external `st ding`.
 //!
-//! It is wire-identical to the thing it replaces, so a running agent's `[DING]` handling is unchanged:
-//! the same `[DING] new smalltalk message: [id:<rand6>] <subject> (from <sender>); check your inbox`
-//! line, injected with the same `pty send <session> --with-delay 0.5 --seq <text> --seq key:return`
-//! (text first, a beat, then Enter — so a bracketed-paste TUI commits the text before the return).
+//! The notice text is wire-identical to the thing it replaces, so a running agent's `[DING]`
+//! handling is unchanged:
+//! `[DING] new smalltalk message: [id:<rand6>] <subject> (from <sender>); check your inbox`.
 //!
-//! **Scope (M2.2) is push-on-arrival: watch → poke.** The heavier smalltalk-ding behaviors are
-//! deliberately deferred as we build toward the evals gate:
-//!   - status-aware buffering (hold while busy/dnd, flush on available) — needs the M2.3 status
-//!     projection to exist first;
-//!   - the pane-typing guard (peek before injecting so we don't clobber a human mid-keystroke);
-//!   - the periodic tidy / drift summary.
+//! Delivery is deliberately safer than the old unconditional text-then-Enter sequence. For a Codex
+//! pane, DING bracketed-pastes the notice without Enter, waits for the TUI to settle, peeks again,
+//! and submits only when the exact notice is still in an otherwise-idle composer. A model-choice
+//! modal, an active turn, a human draft, or an unreadable pane defers the message in memory; `busy`
+//! and `dnd` status do likewise. The inbox file remains the durable source of truth while deferred.
+//! This closes the race where Codex opened a choice modal during the old 0.5-second gap and the
+//! unconditional trailing Return selected the modal's default action.
 //!
 //! It DOES run the brief-023 presence refresh: while the agent's pty is alive it re-writes the
 //! agent's own `status` file on a cadence (preserving the value) so a healthy-but-idle agent never
@@ -22,11 +22,12 @@
 //! that arrive after the ding starts are poked. A periodic full-backlog re-scan (for messages that
 //! landed while the ding was down) is part of that deferred set.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::message::{self, Message};
@@ -63,8 +64,8 @@ pub fn poke_text(msg: &Message) -> String {
     )
 }
 
-/// The `pty send` argv for one poke: the text as a `--seq` chunk, then `key:return`, with a `0.5s`
-/// gap so the terminal commits the text before the Enter. Split out for wire-shape testing.
+/// The legacy `pty send` argv for a non-Codex pane: text, then `key:return`, with a `0.5s` gap.
+/// Codex instead uses [`pty_stage_args`] followed by a guarded [`pty_submit_args`].
 pub fn pty_send_args(session: &str, text: &str) -> Vec<String> {
     vec![
         "send".into(),
@@ -78,11 +79,72 @@ pub fn pty_send_args(session: &str, text: &str) -> Vec<String> {
     ]
 }
 
+/// Bracketed-paste a DING notice without submitting it. Keeping Enter out of this command is the
+/// safety boundary: Codex can open a modal after the text lands without that modal receiving Return.
+pub fn pty_stage_args(session: &str, text: &str) -> Vec<String> {
+    vec!["send".into(), session.into(), "--paste".into(), text.into()]
+}
+
+/// Submit text that a post-stage pane inspection proved is still the exact DING notice.
+pub fn pty_submit_args(session: &str) -> Vec<String> {
+    vec![
+        "send".into(),
+        session.into(),
+        "--seq".into(),
+        "key:return".into(),
+    ]
+}
+
+/// One delivery attempt either reached the target or was deliberately deferred because the target
+/// pane/status was not safe. Deferred work stays in the in-memory queue and the durable inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PokeOutcome {
+    Delivered,
+    Deferred,
+}
+
+/// How a target terminal accepts a poke. Unknown or unrendered agent commands default to the
+/// fail-closed Codex guard; only a positively identified legacy harness gets the old combined
+/// text-plus-Return injection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeliveryMode {
+    #[default]
+    CodexGuarded,
+    Legacy,
+}
+
+impl DeliveryMode {
+    /// Select the legacy path only for the exact Claude command shape emitted by the renderer (or an
+    /// absolute Claude binary path). A missing, wrapped, or unfamiliar command remains guarded.
+    pub fn for_agent_command(command: Option<&str>) -> Self {
+        if command.is_some_and(|command| command_invokes(command, "claude")) {
+            Self::Legacy
+        } else {
+            Self::CodexGuarded
+        }
+    }
+}
+
+fn command_invokes(command: &str, expected: &str) -> bool {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("exec ")
+        .unwrap_or(command)
+        .trim_start();
+    let Some(program) = command.split_ascii_whitespace().next() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == expected)
+}
+
 /// How the ding delivers a poke and checks liveness — abstracted so the watch loop is testable
 /// without a real `pty`. Production shells out to the `pty` binary.
 pub trait Poker {
-    /// Inject `text` (then Enter) into the target pty session.
-    fn poke(&self, text: &str) -> anyhow::Result<()>;
+    /// Try to inject and submit `text`. Unsafe pane state returns [`PokeOutcome::Deferred`] without
+    /// sending Return; transport/inspection failures are errors and are retried by the watch loop.
+    fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
     /// True while the target pty session still exists — the ding exits cleanly once it's gone.
     fn session_alive(&self) -> bool;
 }
@@ -91,25 +153,33 @@ pub trait Poker {
 pub struct PtyPoker {
     bin: String,
     session: String,
+    mode: DeliveryMode,
 }
 
 impl PtyPoker {
+    /// Construct a fail-closed poker. This is the safe default for Codex and for an unknown target.
     pub fn new(session: impl Into<String>) -> Self {
         Self {
             bin: "pty".to_string(),
             session: session.into(),
+            mode: DeliveryMode::CodexGuarded,
         }
     }
-}
 
-impl Poker for PtyPoker {
-    fn poke(&self, text: &str) -> anyhow::Result<()> {
-        let out = Command::new(&self.bin)
-            .args(pty_send_args(&self.session, text))
-            .output()?;
+    /// Construct a poker for a positively identified legacy terminal harness.
+    pub fn new_legacy(session: impl Into<String>) -> Self {
+        Self {
+            bin: "pty".to_string(),
+            session: session.into(),
+            mode: DeliveryMode::Legacy,
+        }
+    }
+
+    fn run(&self, args: Vec<String>, operation: &str) -> anyhow::Result<()> {
+        let out = Command::new(&self.bin).args(args).output()?;
         if !out.status.success() {
             anyhow::bail!(
-                "`pty send {}` failed: {}",
+                "`pty {operation} {}` failed: {}",
                 self.session,
                 String::from_utf8_lossy(&out.stderr).trim()
             );
@@ -117,9 +187,255 @@ impl Poker for PtyPoker {
         Ok(())
     }
 
+    fn peek(&self) -> anyhow::Result<String> {
+        let out = Command::new(&self.bin)
+            .args(["peek", self.session.as_str()])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty peek {}` failed: {}",
+                self.session,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        String::from_utf8(out.stdout)
+            .map_err(|e| anyhow::anyhow!("`pty peek {}` returned non-UTF-8: {e}", self.session))
+    }
+
+    /// Central production safety path shared by inbox DING and scheduled shepherd prompts.
+    ///
+    /// `before_submit` runs after the final safe-pane inspection and immediately before the only
+    /// command containing Return. Shepherd uses it to persist its attempt without consuming
+    /// backoff for a neutral pane deferral; inbox DING passes a no-op.
+    pub fn poke_with(
+        &self,
+        text: &str,
+        before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<PokeOutcome> {
+        if self.mode == DeliveryMode::Legacy {
+            return legacy_poke(
+                &mut || self.run(pty_send_args(&self.session, text), "send"),
+                before_submit,
+            );
+        }
+        guarded_poke(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_stage_args(&self.session, text), "send"),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || thread::sleep(Duration::from_millis(500)),
+            before_submit,
+        )
+    }
+}
+
+impl Poker for PtyPoker {
+    fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+        self.poke_with(text, &mut || Ok(()))
+    }
+
     fn session_alive(&self) -> bool {
         session_alive(&self.session)
     }
+}
+
+/// What the rendered target pane says is safe to do with one exact notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneState {
+    /// Codex is idle and its composer contains only a dim placeholder.
+    Idle,
+    /// The exact expected DING notice is staged in the Codex composer, with no modal/active turn.
+    Staged,
+    /// Codex is active, modal, holding human input, or otherwise ambiguous. Never send Return.
+    Blocked,
+    /// No recognized Codex state was found. Guarded delivery fails closed.
+    Unknown,
+}
+
+enum CodexComposer {
+    Empty,
+    Typed(String),
+}
+
+fn legacy_poke(
+    send: &mut dyn FnMut() -> anyhow::Result<()>,
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    before_submit()?;
+    send()?;
+    Ok(PokeOutcome::Delivered)
+}
+
+/// Guarded two-phase delivery with injected PTY operations for deterministic regression tests.
+fn guarded_poke(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    stage: &mut dyn FnMut() -> anyhow::Result<()>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    settle: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    match classify_pane(&peek()?, text) {
+        PaneState::Blocked => Ok(PokeOutcome::Deferred),
+        PaneState::Staged => {
+            before_submit()?;
+            submit()?;
+            Ok(PokeOutcome::Delivered)
+        }
+        PaneState::Idle => {
+            stage()?;
+            settle();
+            match classify_pane(&peek()?, text) {
+                PaneState::Staged => {
+                    before_submit()?;
+                    submit()?;
+                    Ok(PokeOutcome::Delivered)
+                }
+                // This includes the incident window: a Codex model-choice modal appeared after
+                // paste but before Return. Leave the exact notice staged and retry when safe.
+                PaneState::Blocked | PaneState::Idle | PaneState::Unknown => {
+                    Ok(PokeOutcome::Deferred)
+                }
+            }
+        }
+        // A transiently blank or partially rendered Codex pane can contain no recognizable
+        // signature. The configured Codex/unknown path still fails closed.
+        PaneState::Unknown => Ok(PokeOutcome::Deferred),
+    }
+}
+
+const CODEX_EMPTY_COMPOSER: &str = "\x1b[1;22m›\x1b[1C\x1b[22;2m";
+const CODEX_TYPED_COMPOSERS: [&str; 2] = ["\x1b[1;22m›\x1b[1C\x1b[0m", "\x1b[1;2m› \x1b[0m"];
+
+/// Fail-closed Codex pane classifier.
+///
+/// The ANSI distinction is load-bearing: Codex renders an empty placeholder dim (`22;2m`) and real
+/// composer input normally (`0m`). Plain text alone cannot distinguish a human draft from the
+/// rotating placeholder, and Codex keeps the empty composer visible while a turn is running.
+fn classify_pane(screen: &str, expected: &str) -> PaneState {
+    let plain = strip_ansi(screen);
+    let modal = plain.contains("Our systems are thinking a bit more")
+        || plain.contains("Retry with a faster model")
+        || looks_like_choice_menu(&plain);
+    let active = plain.contains("Working (")
+        || plain.contains("esc to interrupt")
+        || plain.contains("Messages to be submitted after next tool call")
+        || plain.contains("press esc to interrupt and send");
+    if modal || active {
+        return PaneState::Blocked;
+    }
+
+    match bottom_codex_composer(screen) {
+        Some(CodexComposer::Empty) => return PaneState::Idle,
+        Some(CodexComposer::Typed(input)) => {
+            return if collapse_whitespace(&input) == collapse_whitespace(expected) {
+                PaneState::Staged
+            } else {
+                PaneState::Blocked
+            };
+        }
+        None => {}
+    }
+
+    // A Codex footer/prompt/modal signature that we don't understand is not permission to press
+    // Return. This makes future Codex TUI states safe by default.
+    if plain.contains("gpt-")
+        || plain.contains("Codex")
+        || plain.lines().any(|line| line.trim_start().starts_with('›'))
+    {
+        PaneState::Blocked
+    } else {
+        PaneState::Unknown
+    }
+}
+
+fn looks_like_choice_menu(plain: &str) -> bool {
+    let mut first = false;
+    let mut later = false;
+    for line in plain.lines().map(str::trim_start) {
+        first |= line.starts_with("› 1.") || line.starts_with("> 1.");
+        later |= line.starts_with("2.") || line.starts_with("3.");
+    }
+    first && later
+}
+
+fn bottom_codex_composer(screen: &str) -> Option<CodexComposer> {
+    let empty = screen
+        .rfind(CODEX_EMPTY_COMPOSER)
+        .map(|start| (start, CODEX_EMPTY_COMPOSER.len(), true));
+    let typed = CODEX_TYPED_COMPOSERS
+        .iter()
+        .filter_map(|marker| {
+            screen
+                .rfind(marker)
+                .map(|start| (start, marker.len(), false))
+        })
+        .max_by_key(|(start, _, _)| *start);
+    let (start, marker_len, empty) = empty
+        .into_iter()
+        .chain(typed)
+        .max_by_key(|(start, _, _)| *start)?;
+    if empty {
+        return Some(CodexComposer::Empty);
+    }
+    let tail = &screen[start + marker_len..];
+    let input = tail
+        .split_once("\r\n\r\n")
+        .or_else(|| tail.split_once("\n\n"))
+        .map(|(input, _)| input)
+        .unwrap_or(tail);
+    Some(CodexComposer::Typed(strip_ansi(input)))
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text.
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            let ch = input[i..].chars().next().expect("valid UTF-8 boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() {
+                    let byte = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            b']' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// `<pty-session-dir>/<session>.pid` + `kill(pid, 0)`; any miss → gone. Cheap (no `pty` fork) and it
@@ -230,6 +546,8 @@ pub struct DingConfig {
     /// How often to re-write the agent's `status` to bump its mtime (while the pty is alive), so a
     /// live agent stays out of the `unknown` staleness window.
     pub status_refresh: Duration,
+    /// Pane-delivery strategy. Defaults to fail-closed Codex guarding.
+    pub delivery_mode: DeliveryMode,
 }
 
 impl Default for DingConfig {
@@ -237,13 +555,15 @@ impl Default for DingConfig {
         Self {
             poll: Duration::from_millis(1000),
             status_refresh: status::STATUS_REFRESH,
+            delivery_mode: DeliveryMode::CodexGuarded,
         }
     }
 }
 
 /// Watch `inbox_dir` and poke `poker` on each new arrival until `stop` is set or the target session is
-/// gone. Existing inbox contents are seeded as already-seen (no startup poke storm). Poke failures are
-/// non-fatal (logged to stderr) — a transient `pty send` hiccup must not kill the sidecar.
+/// gone. Existing inbox contents are seeded as already-seen (no startup poke storm). Unsafe pane or
+/// `busy`/`dnd` status defers in FIFO order; transport failures retain the head for retry. A message
+/// archived while deferred is pruned before delivery.
 pub fn run_ding(
     inbox_dir: &Path,
     status_path: Option<&Path>,
@@ -275,6 +595,7 @@ pub fn run_ding(
     let mut watch = SessionWatch::default();
     let mut logged_waiting = false;
     let mut last_refresh: Option<Instant> = None;
+    let mut pending = VecDeque::new();
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -293,14 +614,13 @@ pub fn run_ding(
                 let _ = status::refresh(sp); // best-effort — a hiccup must not kill the sidecar
                 last_refresh = Some(Instant::now());
             }
-            // Only poke once the target is up: arrivals during the startup race stay unseen (we skip
-            // the scan) and are poked on the first live pass, so nothing is lost to the launch gap.
+            // Only scan once the target is up: arrivals during the startup race stay unseen and are
+            // queued on the first live pass, so nothing is lost to the launch gap.
             for msg in new_arrivals(inbox_dir, &mut seen) {
-                let text = poke_text(&msg);
-                if let Err(e) = poker.poke(&text) {
-                    eprintln!("st2 ding: {e}");
-                }
+                pending.push_back(msg);
             }
+            prune_archived_pending(inbox_dir, &mut pending);
+            flush_pending(status_path, &mut pending, poker);
         } else if !watch.seen_alive && !logged_waiting {
             eprintln!(
                 "st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone."
@@ -319,6 +639,38 @@ pub fn run_ding(
         }
     }
     Ok(())
+}
+
+fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<Message>) {
+    let Ok(current) = message::list_inbox(inbox_dir) else {
+        return;
+    };
+    let filenames: HashSet<&str> = current.iter().map(|msg| msg.filename.as_str()).collect();
+    pending.retain(|msg| filenames.contains(msg.filename.as_str()));
+}
+
+fn flush_pending(status_path: Option<&Path>, pending: &mut VecDeque<Message>, poker: &dyn Poker) {
+    if status_path.is_some_and(|path| {
+        matches!(
+            status::read_state(path),
+            status::State::Busy | status::State::Dnd
+        )
+    }) {
+        return;
+    }
+
+    while let Some(msg) = pending.front() {
+        match poker.poke(&poke_text(msg)) {
+            Ok(PokeOutcome::Delivered) => {
+                pending.pop_front();
+            }
+            Ok(PokeOutcome::Deferred) => break,
+            Err(e) => {
+                eprintln!("st2 ding: {e}");
+                break;
+            }
+        }
+    }
 }
 
 /// Set by SIGINT/SIGTERM so `st2 ding` exits cleanly when st2 tears the sidecar down.
@@ -347,7 +699,10 @@ pub fn serve(
 ) -> anyhow::Result<()> {
     probe_pty_on_path()?;
     install_signal_handler();
-    let poker = PtyPoker::new(session.to_string());
+    let poker = match config.delivery_mode {
+        DeliveryMode::CodexGuarded => PtyPoker::new(session),
+        DeliveryMode::Legacy => PtyPoker::new_legacy(session),
+    };
     run_ding(inbox_dir, Some(status_path), &poker, config, &STOP)
 }
 
@@ -411,7 +766,7 @@ mod tests {
 
     #[test]
     fn pty_send_args_wire_shape() {
-        // Must match smalltalk-ding byte-for-byte: text `--seq`, then `key:return`, gapped 0.5s.
+        // Retained only for a pane with no Codex signature.
         let args = pty_send_args("my-session", "[DING] hi");
         assert_eq!(
             args,
@@ -426,6 +781,332 @@ mod tests {
                 "key:return"
             ]
         );
+    }
+
+    #[test]
+    fn codex_stage_never_contains_return_and_submit_is_bare_return() {
+        assert_eq!(
+            pty_stage_args("my-session", "[DING] hi"),
+            vec!["send", "my-session", "--paste", "[DING] hi"]
+        );
+        assert_eq!(
+            pty_submit_args("my-session"),
+            vec!["send", "my-session", "--seq", "key:return"]
+        );
+    }
+
+    fn idle_codex_screen() -> String {
+        "\x1b[1;22m›\x1b[1C\x1b[22;2mExplain this codebase\r\n\r\n\
+         \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+            .to_string()
+    }
+
+    fn staged_codex_screen(text: &str) -> String {
+        format!(
+            "\x1b[1;22m›\x1b[1C\x1b[0m{text}\r\n\r\n\
+             \x1b[2C\x1b[2mtab to queue message\x1b[0m"
+        )
+    }
+
+    fn modal_codex_screen(text: &str) -> String {
+        format!(
+            "\x1b[1;2m› \x1b[0m{text}\r\n\r\n\r\n\
+             \x1b[2C\x1b[1mOur systems are thinking a bit more about this request before responding.\r\n\
+             \x1b[2C\x1b[22;2mHang tight or retry with a faster model for a quicker response.\r\n\r\n\
+             \x1b[0m› 1. Retry with a faster model\r\n\
+             \x1b[2C2. Dismiss and keep waiting\r\n\
+             \x1b[2C3. Learn more\r\n"
+        )
+    }
+
+    #[test]
+    fn codex_choice_modal_blocks_return_even_when_ding_text_is_staged() {
+        let expected =
+            "[DING] new smalltalk message: [id:k0ygwh] safety (from cos); check your inbox";
+        assert_eq!(
+            classify_pane(&modal_codex_screen(expected), expected),
+            PaneState::Blocked
+        );
+    }
+
+    #[test]
+    fn codex_idle_staged_and_human_typing_states_are_distinct() {
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let human = staged_codex_screen("half-written human request");
+        let working = format!(
+            "• Working (42s • esc to interrupt)\r\n\r\n{}",
+            staged_codex_screen(expected)
+        );
+
+        assert_eq!(
+            classify_pane(&idle_codex_screen(), expected),
+            PaneState::Idle
+        );
+        assert_eq!(
+            classify_pane(&staged_codex_screen(expected), expected),
+            PaneState::Staged
+        );
+        assert_eq!(classify_pane(&human, expected), PaneState::Blocked);
+        assert_eq!(classify_pane(&working, expected), PaneState::Blocked);
+    }
+
+    #[test]
+    fn bottom_most_composer_marker_wins_over_historical_typed_content() {
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let screen = format!(
+            "{}\r\n{}",
+            staged_codex_screen("old human prompt"),
+            idle_codex_screen()
+        );
+
+        assert_eq!(classify_pane(&screen, expected), PaneState::Idle);
+    }
+
+    #[test]
+    fn post_paste_modal_or_composer_mismatch_defers_without_return_then_submits_when_safe() {
+        use std::cell::{Cell, RefCell};
+
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        for blocked_after_paste in [
+            modal_codex_screen(expected),
+            staged_codex_screen("human changed the composer"),
+        ] {
+            let screens = RefCell::new(VecDeque::from([idle_codex_screen(), blocked_after_paste]));
+            let actions = RefCell::new(Vec::new());
+            let before = Cell::new(0);
+            let outcome = guarded_poke(
+                expected,
+                &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+                &mut || {
+                    actions.borrow_mut().push("paste");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || {},
+                &mut || {
+                    before.set(before.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(outcome, PokeOutcome::Deferred);
+            assert_eq!(actions.borrow().as_slice(), ["paste"]);
+            assert_eq!(before.get(), 0, "no durable attempt before a safe submit");
+
+            let mut safe_screen = VecDeque::from([staged_codex_screen(expected)]);
+            let outcome = guarded_poke(
+                expected,
+                &mut || Ok(safe_screen.pop_front().unwrap()),
+                &mut || unreachable!("the exact text is already staged"),
+                &mut || {
+                    actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || {},
+                &mut || {
+                    before.set(before.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, PokeOutcome::Delivered);
+            assert_eq!(actions.borrow().as_slice(), ["paste", "return"]);
+            assert_eq!(before.get(), 1);
+        }
+
+        let peek_count = Cell::new(0);
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let outcome = guarded_poke(
+            expected,
+            &mut || {
+                let count = peek_count.get();
+                peek_count.set(count + 1);
+                if count == 0 {
+                    Ok(idle_codex_screen())
+                } else {
+                    anyhow::bail!("post-paste peek unavailable")
+                }
+            },
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(outcome.is_err(), "a failed re-peek must fail closed");
+        assert_eq!(actions.borrow().as_slice(), ["paste"]);
+        assert_eq!(before.get(), 0);
+    }
+
+    #[test]
+    fn pre_paste_modal_active_draft_and_peek_failure_fail_closed() {
+        use std::cell::{Cell, RefCell};
+
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let screens = [
+            modal_codex_screen(expected),
+            format!(
+                "• Working (2s • esc to interrupt)\r\n{}",
+                idle_codex_screen()
+            ),
+            staged_codex_screen("human draft"),
+        ];
+        for screen in screens {
+            let actions = RefCell::new(Vec::new());
+            let before = Cell::new(0);
+            let outcome = guarded_poke(
+                expected,
+                &mut || Ok(screen.clone()),
+                &mut || {
+                    actions.borrow_mut().push("paste");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || {},
+                &mut || {
+                    before.set(before.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, PokeOutcome::Deferred);
+            assert!(actions.borrow().is_empty());
+            assert_eq!(before.get(), 0);
+        }
+
+        let actions = RefCell::new(Vec::new());
+        assert!(
+            guarded_poke(
+                expected,
+                &mut || anyhow::bail!("peek unavailable"),
+                &mut || {
+                    actions.borrow_mut().push("paste");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || {},
+                &mut || Ok(()),
+            )
+            .is_err()
+        );
+        assert!(actions.borrow().is_empty());
+    }
+
+    #[test]
+    fn ordinary_idle_codex_poke_round_trips_paste_repeek_then_return() {
+        use std::cell::{Cell, RefCell};
+
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let screens = RefCell::new(VecDeque::from([
+            idle_codex_screen(),
+            staged_codex_screen(expected),
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let outcome = guarded_poke(
+            expected,
+            &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, PokeOutcome::Delivered);
+        assert_eq!(actions.borrow().as_slice(), ["paste", "return"]);
+        assert_eq!(before.get(), 1);
+    }
+
+    #[test]
+    fn ambiguous_screen_fails_closed_unless_legacy_harness_is_explicit() {
+        use std::cell::{Cell, RefCell};
+
+        assert_eq!(
+            DeliveryMode::for_agent_command(None),
+            DeliveryMode::CodexGuarded
+        );
+        assert_eq!(
+            DeliveryMode::for_agent_command(Some("exec codex --model gpt-5.6-sol")),
+            DeliveryMode::CodexGuarded
+        );
+        assert_eq!(
+            DeliveryMode::for_agent_command(Some("exec /opt/bin/claude --dangerously-skip")),
+            DeliveryMode::Legacy
+        );
+        assert_eq!(
+            DeliveryMode::for_agent_command(Some("sh -c 'claude'")),
+            DeliveryMode::CodexGuarded,
+            "wrapped or unfamiliar commands cannot opt into unconditional Return"
+        );
+
+        let expected =
+            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let outcome = guarded_poke(
+            expected,
+            &mut || Ok(String::new()),
+            &mut || unreachable!("ambiguous screen must not stage"),
+            &mut || unreachable!("ambiguous screen must not submit"),
+            &mut || {},
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Deferred);
+        assert!(actions.borrow().is_empty());
+        assert_eq!(before.get(), 0);
+
+        let outcome = legacy_poke(
+            &mut || {
+                actions.borrow_mut().push("legacy");
+                Ok(())
+            },
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Delivered);
+        assert_eq!(actions.borrow().as_slice(), ["legacy"]);
+        assert_eq!(before.get(), 1);
     }
 
     #[test]
@@ -465,8 +1146,8 @@ mod tests {
     fn run_ding_refreshes_presence_while_alive() {
         struct AlivePoker;
         impl Poker for AlivePoker {
-            fn poke(&self, _: &str) -> anyhow::Result<()> {
-                Ok(())
+            fn poke(&self, _: &str) -> anyhow::Result<PokeOutcome> {
+                Ok(PokeOutcome::Delivered)
             }
             fn session_alive(&self) -> bool {
                 true
@@ -480,6 +1161,7 @@ mod tests {
         let config = DingConfig {
             poll: Duration::from_millis(5),
             status_refresh: Duration::from_millis(0),
+            delivery_mode: DeliveryMode::CodexGuarded,
         };
 
         std::thread::scope(|s| {
@@ -494,6 +1176,77 @@ mod tests {
         assert_eq!(
             crate::status::read_state(&sp),
             crate::status::State::Available
+        );
+    }
+
+    #[test]
+    fn deferred_fifo_delivers_once_when_safe_and_dnd_is_untouched() {
+        use std::sync::Mutex;
+
+        struct ScriptedPoker {
+            outcomes: Mutex<VecDeque<PokeOutcome>>,
+            calls: Mutex<Vec<String>>,
+        }
+        impl Poker for ScriptedPoker {
+            fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+                self.calls.lock().unwrap().push(text.to_string());
+                Ok(self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(PokeOutcome::Delivered))
+            }
+            fn session_alive(&self) -> bool {
+                true
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = crate::status::status_path(tmp.path());
+        crate::status::set_state(&sp, crate::status::State::Dnd).unwrap();
+        let first = msg("1700000000000-abc123.md", "alice", Some("first"));
+        let second = msg("1700000000001-def456.md", "bob", Some("second"));
+        let first_text = poke_text(&first);
+        let second_text = poke_text(&second);
+        let mut pending = VecDeque::from([first, second]);
+        let poker = ScriptedPoker {
+            outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Deferred,
+                PokeOutcome::Delivered,
+                PokeOutcome::Delivered,
+            ])),
+            calls: Mutex::new(Vec::new()),
+        };
+
+        flush_pending(Some(&sp), &mut pending, &poker);
+        assert_eq!(pending.len(), 2);
+        assert!(poker.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            crate::status::read_state(&sp),
+            crate::status::State::Dnd,
+            "delivery gating must not alter dnd"
+        );
+
+        crate::status::set_state(&sp, crate::status::State::Available).unwrap();
+        flush_pending(Some(&sp), &mut pending, &poker);
+        assert_eq!(pending.len(), 2, "unsafe head remains queued");
+        {
+            let calls = poker.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0], first_text,
+                "the later arrival cannot pass a deferred head"
+            );
+        }
+
+        flush_pending(Some(&sp), &mut pending, &poker);
+        assert!(pending.is_empty(), "both messages deliver once safe");
+        flush_pending(Some(&sp), &mut pending, &poker);
+        assert_eq!(
+            poker.calls.lock().unwrap().as_slice(),
+            [first_text.clone(), first_text, second_text],
+            "the head retries once, the tail follows, and delivered work is never repeated"
         );
     }
 

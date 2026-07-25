@@ -100,9 +100,11 @@ st2 reads only the runner-normative subset — `identity`, `host`, `type`, `work
     `resources/inbox` (VRS §5), wire-compatible `<unix-ms>-<rand6>.md` files, catalog-native
     recipient resolution (`$CATALOG`/`$ST_AGENT` defaults).
   - **M2.2** ✅ the ding sidecar: `st2 ding <session>` watches an agent's `resources/inbox` and pokes
-    its pty (`[DING] new smalltalk message: …`) on each new arrival — wire-identical to smalltalk's
-    `st ding` (same line, same `pty send --seq … --seq key:return` injection), with a startup grace +
-    miss-debounce so a launch race doesn't kill it.
+    its pty (`[DING] new smalltalk message: …`) on each new arrival. The notice line is wire-identical
+    to smalltalk's `st ding`; Codex submission is guarded and two-phase (paste without Enter, settle +
+    re-peek, then Return only for the exact staged notice). Modal/active/typed panes and `busy`/`dnd`
+    status defer FIFO without dropping the inbox-backed message. Startup grace + miss-debounce keep a
+    launch race from killing the sidecar.
   - **M2.3** ✅ presence status + roster: `st2 status [--set]` (a per-agent `status` file — one of
     `offline|available|busy|away|dnd`, with `unknown` derived from mtime staleness >15 min) and
     `st2 agents [--status] [--json [--enrich]]` (byte-compatible with `st agents --json`). The **ding
@@ -252,7 +254,10 @@ st2 message archive <file>          # inbox → archive
 
 The **ding sidecar** turns a new message into a terminal poke. st2 keeps one running per agent (a
 task alongside the agent's pty); it watches the inbox and injects `[DING] new smalltalk message: …`
-into the agent's pty on each arrival:
+into the agent's pty on each arrival. For Codex, it bracketed-pastes the notice without Enter and
+re-checks the pane after the settle gap. It sends Return only when the exact notice is still staged
+in an idle composer; choice modals, active turns, human drafts, peek failures, `busy`, and `dnd`
+defer delivery without removing the message from its durable inbox:
 
 ```sh
 st2 ding <pty-session> --identity <id>   # long-running; exits when the target session is gone

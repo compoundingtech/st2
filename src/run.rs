@@ -1638,7 +1638,12 @@ mod tests {
         }
         struct NoPoke;
         impl crate::shepherd::Poker for NoPoke {
-            fn poke(&mut self, _session: &str, _text: &str) -> anyhow::Result<()> {
+            fn poke(
+                &mut self,
+                _session: &str,
+                _text: &str,
+                _before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+            ) -> anyhow::Result<crate::ding::PokeOutcome> {
                 panic!("a missing root must fault before poke")
             }
         }

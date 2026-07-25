@@ -72,10 +72,11 @@ enum Command {
     /// replacement). macOS stays manual (TCC). Subcommands: install / status / uninstall.
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
-    /// message. Long-running — st2 keeps it alive as a task alongside the agent. Exits when the target
-    /// pty session is gone. `st2 ping` is an alias (the maintainer is renaming ding → ping, since dinging is
-    /// the runner's job now); it is the exact same command.
+    /// The ding sidecar: watch an agent's `resources/inbox` and safely poke its pty (`[DING] …`) on
+    /// each new message. Codex modal/typing panes and busy/dnd status defer FIFO. Long-running — st2
+    /// keeps it alive as a task alongside the agent. Exits when the target pty session is gone.
+    /// `st2 ping` is an alias (the maintainer is renaming ding → ping, since dinging is the runner's
+    /// job now); it is the exact same command.
     #[command(visible_alias = "ping")]
     Ding {
         /// The target pty session to poke (a `pty` session ref). Optional — defaults to `--identity`
@@ -1174,6 +1175,7 @@ fn ding_cmd(
         .unwrap_or_else(|| catalog_root.join(&id));
     let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
     let status_path = st2::status::status_path(&agent_dir);
+    let delivery_mode = ding_delivery_mode(&catalog_root, &id, &this_host);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
         id,
@@ -1181,9 +1183,35 @@ fn ding_cmd(
     );
     let config = ding::DingConfig {
         poll: Duration::from_millis(interval),
+        delivery_mode,
         ..Default::default()
     };
     ding::serve(&inbox, &status_path, &session, &config)
+}
+
+/// Keep the legacy combined text-plus-Return path only for a rendered Claude agent. Missing,
+/// ambiguous, or custom harness commands use the fail-closed Codex guard.
+fn ding_delivery_mode(root: &Path, id: &str, this_host: &str) -> ding::DeliveryMode {
+    let command = discover(root)
+        .specs
+        .into_iter()
+        .find(|spec| {
+            spec.bus_id(this_host) == id
+                || (spec.identity == id && spec.resolved_host(this_host) == this_host)
+        })
+        .and_then(|spec| {
+            spec.tasks
+                .iter()
+                .find(|task| task.kind == st2::TaskKind::Pty && task.name == "agent")
+                .or_else(|| {
+                    spec.tasks
+                        .iter()
+                        .find(|task| task.kind == st2::TaskKind::Pty)
+                })
+                .and_then(|task| task.command.as_deref())
+                .map(str::to_owned)
+        });
+    ding::DeliveryMode::for_agent_command(command.as_deref())
 }
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.
