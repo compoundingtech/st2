@@ -7,11 +7,19 @@
 //! Needs `pty` on PATH — HARD failure if absent unless ST2_ALLOW_PTY_SKIP is set.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn pty_available() -> bool {
     Command::new("pty").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -145,14 +153,18 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat() {
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
     std::fs::create_dir_all(&cell).unwrap();
-    // The seat spawns an UNDECLARED peer (unique marker `sleep 778899001122`) into the PTY_ROOT, then
-    // `exec`s its own sleep (so the seat process does NOT carry the peer's marker — the check is
-    // unambiguous). No done signal → the eval times out → supervised teardown must reap BOTH.
+    // The seat spawns an UNDECLARED peer into this eval's hermetic PTY_ROOT and records that peer's
+    // daemon pid inside the preserved eval catalog. No done signal → the eval times out → supervised
+    // teardown must reap both the declared seat and the runtime peer. The proof below uses only this
+    // invocation's root + exact pid; concurrent evals cannot be observed or killed.
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
-agent "sup" { env { ST_AGENT "sup" }; command "sh -c 'pty run -d --id rtpeer -- sleep 778899001122; exec sleep 778899003344'" }
+agent "sup" {
+  env { ST_AGENT "sup" }
+  command "sh -c 'pty run -d --id rtpeer -- sleep 100000; for _ in $(seq 1 100); do test -s $PTY_ROOT/rtpeer.pid && break; sleep 0.05; done; cat $PTY_ROOT/rtpeer.pid > $CATALOG/runtime-peer.pid; exec sleep 100000'"
+}
 eval {
   message { from "runner"; to "sup"; content "go" }
   max-timeout "6s"
@@ -163,27 +175,66 @@ eval {
     )
     .unwrap();
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
-    let out = Command::new(bin)
-        .args(["eval"])
+    let child = Command::new(bin)
+        .args(["eval", "--keep"])
         .arg(&cell)
         .env("PATH", &path)
         .env_remove("CATALOG")
         .env_remove("ST_ROOT")
         .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(&format!(
+            "catalog preserved (--keep): {}",
+            catalog.display()
+        )),
+        "eval did not preserve its expected per-process catalog:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
+
+    let peer_pid: i32 = std::fs::read_to_string(catalog.join("runtime-peer.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let peer_alive = unsafe { libc::kill(peer_pid, 0) == 0 };
+    if peer_alive {
+        // Failure cleanup stays inside this invocation's PTY root; never scan or kill by a global
+        // command marker. Preserve the pre-cleanup observation for the assertion below.
+        let _ = Command::new("pty")
+            .args(["--root"])
+            .arg(catalog.join("pty"))
+            .args(["kill", "rtpeer"])
+            .status();
+    }
+    let sessions = Command::new("pty")
+        .args(["--root"])
+        .arg(catalog.join("pty"))
+        .args(["list", "--json"])
         .output()
         .unwrap();
-    // The eval timed out and tore down. The runtime peer's `sleep 778899001122` must be gone (reaped by
-    // the PTY_ROOT-scoped sweep) — if it leaked, pgrep finds the surviving orphan.
-    let alive = Command::new("pgrep").args(["-f", "778899001122"]).output().unwrap();
-    let found = String::from_utf8_lossy(&alive.stdout).trim().to_string();
-    // Clean up any straggler (the peer if it leaked, and the declared seat's sleep) before asserting.
-    let _ = Command::new("pkill").args(["-9", "-f", "778899001122"]).status();
-    let _ = Command::new("pkill").args(["-9", "-f", "778899003344"]).status();
     assert!(
-        found.is_empty(),
-        "runtime-spawned seat leaked after supervise teardown (surviving pids: {found})\n--stdout--\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        sessions.status.success(),
+        "could not inspect the eval-scoped PTY registry:\n{}",
+        String::from_utf8_lossy(&sessions.stderr)
+    );
+    let session_json: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
+    assert!(
+        !peer_alive
+            && !catalog.join("pty/rtpeer.pid").exists()
+            && session_json
+                .as_array()
+                .is_some_and(|sessions| sessions.iter().all(|session| session["name"] != "rtpeer")),
+        "runtime-spawned seat leaked after supervise teardown (pid {peer_pid}, registry {session_json}):\n\
+         --stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
 }
 
