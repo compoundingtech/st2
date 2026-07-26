@@ -1,7 +1,5 @@
-// Canonical compact agent declaration for the Claude Code harness.
-//
-// `st2 compile-agent` emits this shape. It keeps the persona and bus contract
-// in a catalog-owned `.st2/` overlay and adds a tiny Claude rules loader.
+// Canonical hand-authored declaration for a Claude Code agent. It keeps the persona and native bus
+// contract in a catalog-owned `.st2/` overlay and adds a small Claude rules loader.
 
 agent "<identity>" {
   host "<host>"

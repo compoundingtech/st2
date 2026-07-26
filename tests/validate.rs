@@ -317,7 +317,7 @@ fn cli_json_is_well_formed() {
 fn a_hand_authored_native_catalog_validates_without_errors() {
     let workspace = tempfile::tempdir().unwrap();
     let catalog = tempfile::tempdir().unwrap();
-    let declaration = include_str!("../examples/format/agent-codex.kdl")
+    let declaration = include_str!("../examples/native/agent-codex.kdl")
         .replace("<identity>", "worker")
         .replace("<host>", "h")
         .replace("<workspace>", workspace.path().to_str().unwrap());

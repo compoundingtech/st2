@@ -19,7 +19,7 @@ overlay (persona, bus instructions, hooks, permissions) as **declarative directi
 --materialize-only` (an `up` mode) — an EXECUTE verb, never named `compile` (that is GENERATE).
 
 Plan-first gate: this is the scope. The format is now BLESSED; **build only after this plan is approved.**
-Canonical format examples (claude + codex) live in [`examples/format/`](examples/format/).
+Canonical format examples (claude + codex) live in [`examples/native/`](examples/native/).
 
 ## The `render{}` block (directives)
 
@@ -144,7 +144,7 @@ layout is its own sub-work, sequenced with (or just before) the overlay material
    codex, render pre-composes `_templates/AGENTS.md` = persona + bus). The overlay *content* is
    unchanged; it moves from render-writes-workspace to kdl-declares → up-materializes.
    - **GOLDEN-FILE test (maintainer insight, zero eval cost):** the two committed examples
-     [`examples/format/agent-{claude,codex}.kdl`] ARE the compile-agent fixtures. The test invokes
+     [`examples/native/agent-{claude,codex}.kdl`] ARE the compile-agent fixtures. The test invokes
      compile-agent with a fixed generified IR (identity/role/host/workspace/harness) and asserts its
      output EQUALS the example (per harness) — a pure generator unit test, no boot. Composes with 2b:
      the golden-file test proves compile-agent EMITS the right blocks; the render-only materialize test

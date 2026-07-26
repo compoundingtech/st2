@@ -1,6 +1,4 @@
-// Canonical compact agent declaration for the Codex harness.
-//
-// `st2 compile-agent` emits this shape. The persona and st2 bus contract are
+// Canonical hand-authored declaration for a Codex agent. The persona and native bus contract are
 // pre-composed into AGENTS.md because Codex loads it from the workspace.
 
 agent "<identity>" {

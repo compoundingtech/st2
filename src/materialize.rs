@@ -272,17 +272,38 @@ fn write_owned(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
-fn ensure_line(path: &Path, line: &str) -> Result<bool> {
-    let mut contents = fs::read_to_string(path).unwrap_or_default();
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn ensure_line_bytes(current: Option<&[u8]>, line: &str, path: &Path) -> Result<Vec<u8>> {
+    let mut contents = match current {
+        Some(bytes) => String::from_utf8(bytes.to_vec())
+            .with_context(|| format!("existing {} is not UTF-8", path.display()))?,
+        None => String::new(),
+    };
     if contents.lines().any(|existing| existing == line) {
-        return Ok(false);
+        return Ok(contents.into_bytes());
     }
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
     }
     contents.push_str(line);
     contents.push('\n');
-    write_owned(path, contents.as_bytes())?;
+    Ok(contents.into_bytes())
+}
+
+fn ensure_line(path: &Path, line: &str) -> Result<bool> {
+    let current = read_optional(path)?;
+    let contents = ensure_line_bytes(current.as_deref(), line, path)?;
+    if current.as_deref() == Some(contents.as_slice()) {
+        return Ok(false);
+    }
+    write_owned(path, &contents)?;
     Ok(true)
 }
 
@@ -326,6 +347,60 @@ fn git_exclude(workspace: &Path, line: &str) -> Result<bool> {
     ensure_line(&path, line)
 }
 
+fn is_git_tracked(workspace: &Path, relative: &Path) -> Result<bool> {
+    let probe = Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .context("running git rev-parse for materialization safety")?;
+    if !probe.status.success() {
+        let has_git_marker = workspace
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists());
+        if has_git_marker {
+            anyhow::bail!(
+                "could not determine Git worktree state for {}: {}",
+                workspace.display(),
+                String::from_utf8_lossy(&probe.stderr).trim()
+            );
+        }
+        return Ok(false);
+    }
+
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(relative)
+        .output()
+        .context("running git ls-files for materialization safety")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    anyhow::bail!(
+        "could not determine whether {} is tracked: {}",
+        relative.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+enum PreparedOp {
+    Write {
+        destination: PathBuf,
+        bytes: Vec<u8>,
+        note: String,
+    },
+    Note(String),
+    GitExclude {
+        path: String,
+        expanded: String,
+    },
+}
+
 /// Execute one agent's render plan in declaration order.
 pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
     let plan = parse_plan(spec)?;
@@ -346,7 +421,9 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         );
     }
     let spec_dir = spec.path.parent().unwrap_or(root);
-    let mut notes = Vec::new();
+    let mut virtual_files = BTreeMap::<PathBuf, Vec<u8>>::new();
+    let mut changed_targets = BTreeMap::<PathBuf, String>::new();
+    let mut prepared = Vec::new();
     for op in plan.ops {
         match op {
             RenderOp::Copy {
@@ -357,30 +434,63 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                 let destination = destination(&workspace, &raw_destination, &env)?;
                 let bytes = fs::read(&source)
                     .with_context(|| format!("reading copy source {}", source.display()))?;
-                write_owned(&destination, &bytes)?;
-                notes.push(format!("{}: copied {}", spec.identity, raw_destination));
+                let current = virtual_files
+                    .get(&destination)
+                    .cloned()
+                    .map(Some)
+                    .unwrap_or(read_optional(&destination)?);
+                let note = format!("{}: copied {}", spec.identity, raw_destination);
+                if current.as_deref() == Some(bytes.as_slice()) {
+                    prepared.push(PreparedOp::Note(note));
+                } else {
+                    changed_targets.insert(destination.clone(), raw_destination);
+                    prepared.push(PreparedOp::Write {
+                        destination: destination.clone(),
+                        bytes: bytes.clone(),
+                        note,
+                    });
+                }
+                virtual_files.insert(destination, bytes);
             }
             RenderOp::File {
                 destination: raw_destination,
                 content,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
-                write_owned(&destination, expand(&content, &env).as_bytes())?;
-                notes.push(format!("{}: wrote {}", spec.identity, raw_destination));
+                let bytes = expand(&content, &env).into_bytes();
+                let current = virtual_files
+                    .get(&destination)
+                    .cloned()
+                    .map(Some)
+                    .unwrap_or(read_optional(&destination)?);
+                let note = format!("{}: wrote {}", spec.identity, raw_destination);
+                if current.as_deref() == Some(bytes.as_slice()) {
+                    prepared.push(PreparedOp::Note(note));
+                } else {
+                    changed_targets.insert(destination.clone(), raw_destination);
+                    prepared.push(PreparedOp::Write {
+                        destination: destination.clone(),
+                        bytes: bytes.clone(),
+                        note,
+                    });
+                }
+                virtual_files.insert(destination, bytes);
             }
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
-                let mut target = match fs::read_to_string(&destination) {
-                    Ok(existing) => serde_json::from_str(&existing).with_context(|| {
+                let current = virtual_files
+                    .get(&destination)
+                    .cloned()
+                    .map(Some)
+                    .unwrap_or(read_optional(&destination)?);
+                let mut target = match current.as_deref() {
+                    Some(existing) => serde_json::from_slice(existing).with_context(|| {
                         format!("existing {} is not valid JSON", destination.display())
                     })?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        serde_json::Value::Object(Default::default())
-                    }
-                    Err(error) => return Err(error.into()),
+                    None => serde_json::Value::Object(Default::default()),
                 };
                 let patch: serde_json::Value = serde_json::from_str(&expand(&content, &env))
                     .with_context(|| {
@@ -392,20 +502,86 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                 deep_merge(&mut target, patch);
                 let mut bytes = serde_json::to_vec_pretty(&target)?;
                 bytes.push(b'\n');
-                write_owned(&destination, &bytes)?;
-                notes.push(format!("{}: upserted {}", spec.identity, raw_destination));
+                let note = format!("{}: upserted {}", spec.identity, raw_destination);
+                if current.as_deref() == Some(bytes.as_slice()) {
+                    prepared.push(PreparedOp::Note(note));
+                } else {
+                    changed_targets.insert(destination.clone(), raw_destination);
+                    prepared.push(PreparedOp::Write {
+                        destination: destination.clone(),
+                        bytes: bytes.clone(),
+                        note,
+                    });
+                }
+                virtual_files.insert(destination, bytes);
             }
             RenderOp::EnsureLine {
                 destination: raw_destination,
                 line,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
-                ensure_line(&destination, &expand(&line, &env))?;
-                notes.push(format!("{}: ensured {}", spec.identity, raw_destination));
+                let current = virtual_files
+                    .get(&destination)
+                    .cloned()
+                    .map(Some)
+                    .unwrap_or(read_optional(&destination)?);
+                let bytes =
+                    ensure_line_bytes(current.as_deref(), &expand(&line, &env), &destination)?;
+                let note = format!("{}: ensured {}", spec.identity, raw_destination);
+                if current.as_deref() == Some(bytes.as_slice()) {
+                    prepared.push(PreparedOp::Note(note));
+                } else {
+                    changed_targets.insert(destination.clone(), raw_destination);
+                    prepared.push(PreparedOp::Write {
+                        destination: destination.clone(),
+                        bytes: bytes.clone(),
+                        note,
+                    });
+                }
+                virtual_files.insert(destination, bytes);
             }
             RenderOp::GitExclude { path } => {
+                prepared.push(PreparedOp::GitExclude {
+                    expanded: expand(&path, &env),
+                    path,
+                });
+            }
+        }
+    }
+
+    for (target, raw_destination) in &changed_targets {
+        let relative = target.strip_prefix(&workspace).with_context(|| {
+            format!(
+                "render destination {} escaped workspace {}",
+                target.display(),
+                workspace.display()
+            )
+        })?;
+        if is_git_tracked(&workspace, relative)? {
+            anyhow::bail!(
+                "agent '{}': refusing to change tracked workspace target '{}' ({})",
+                spec.identity,
+                raw_destination,
+                target.display()
+            );
+        }
+    }
+
+    let mut notes = Vec::new();
+    for op in prepared {
+        match op {
+            PreparedOp::Write {
+                destination,
+                bytes,
+                note,
+            } => {
+                write_owned(&destination, &bytes)?;
+                notes.push(note);
+            }
+            PreparedOp::Note(note) => notes.push(note),
+            PreparedOp::GitExclude { path, expanded } => {
                 // Advisory by contract: leave a visible note, but never fail materialization/boot.
-                match git_exclude(&workspace, &expand(&path, &env)) {
+                match git_exclude(&workspace, &expanded) {
                     Ok(_) => notes.push(format!("{}: excluded {path}", spec.identity)),
                     Err(error) => notes.push(format!(
                         "WARN {}: could not git-exclude '{path}': {error}",

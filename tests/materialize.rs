@@ -35,6 +35,25 @@ fn agent_kdl(workspace: &Path, render: &str) -> String {
     )
 }
 
+fn init_git(workspace: &Path) {
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .arg(workspace)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn track(workspace: &Path, path: &str) {
+    let status = Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["add", "--", path])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 #[test]
 fn every_directive_materializes_in_order_and_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -108,6 +127,123 @@ fn every_directive_materializes_in_order_and_is_idempotent() {
         1
     );
     assert_eq!(exclude.lines().filter(|line| *line == ".st2/").count(), 1);
+}
+
+#[test]
+fn every_content_directive_refuses_to_change_a_tracked_target_before_any_write() {
+    for (name, initial, directive, template) in [
+        (
+            "copy",
+            "old\n",
+            r#"copy "_templates/replacement" "target""#,
+            Some("new\n"),
+        ),
+        ("file", "old\n", r#"file "target" "new\n""#, None),
+        (
+            "json-upsert",
+            "{\"keep\":true}\n",
+            r##"json-upsert "target" #"{"added":true}"#"##,
+            None,
+        ),
+        (
+            "ensure-line",
+            "old\n",
+            r#"ensure-line "target" "new""#,
+            None,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        init_git(&workspace);
+        write(&workspace.join("target"), initial);
+        track(&workspace, "target");
+        if let Some(contents) = template {
+            write(&catalog.join("_templates/replacement"), contents);
+        }
+        write(
+            &catalog.join("agents/Silber/cos/agent.kdl"),
+            agent_kdl(
+                &workspace,
+                &format!("    {directive}\n    file \"must-not-exist\" \"blocked with {name}\""),
+            ),
+        );
+
+        let found = discover(&catalog);
+        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        assert_eq!(report.errors.len(), 1, "{name}: {:?}", report.errors);
+        assert!(
+            report.errors[0].contains("tracked workspace target"),
+            "{name}: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("target")).unwrap(),
+            initial,
+            "{name} changed the tracked target"
+        );
+        assert!(
+            !workspace.join("must-not-exist").exists(),
+            "{name} wrote a later operation after the gate failed"
+        );
+    }
+}
+
+#[test]
+fn byte_identical_tracked_target_is_allowed_without_modification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    init_git(&workspace);
+    write(&workspace.join("AGENTS.md"), "same\n");
+    track(&workspace, "AGENTS.md");
+    write(&catalog.join("_templates/AGENTS.md"), "same\n");
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
+    );
+
+    let found = discover(&catalog);
+    let before = fs::metadata(workspace.join("AGENTS.md"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let after = fs::metadata(workspace.join("AGENTS.md"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(report.is_clean(), "{:?}", report.errors);
+    assert_eq!(before, after, "identical target was needlessly rewritten");
+}
+
+#[test]
+fn untracked_and_non_git_targets_remain_materializable() {
+    for git in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        if git {
+            init_git(&workspace);
+        }
+        write(&workspace.join("AGENTS.md"), "old\n");
+        write(&catalog.join("_templates/AGENTS.md"), "new\n");
+        write(
+            &catalog.join("agents/Silber/cos/agent.kdl"),
+            agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
+        );
+
+        let found = discover(&catalog);
+        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        assert!(report.is_clean(), "git={git}: {:?}", report.errors);
+        assert_eq!(
+            fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+            "new\n"
+        );
+    }
 }
 
 #[test]

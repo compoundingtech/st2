@@ -9,10 +9,10 @@ use st2::discover;
 #[test]
 fn canonical_hand_authored_examples_parse() {
     for (name, text) in [
-        ("codex", include_str!("../examples/format/agent-codex.kdl")),
+        ("codex", include_str!("../examples/native/agent-codex.kdl")),
         (
             "claude",
-            include_str!("../examples/format/agent-claude.kdl"),
+            include_str!("../examples/native/agent-claude.kdl"),
         ),
     ] {
         let catalog = tempfile::tempdir().unwrap();
