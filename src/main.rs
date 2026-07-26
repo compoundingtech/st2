@@ -224,7 +224,8 @@ enum Command {
         json: bool,
     },
     /// Health check for a running catalog: tools on PATH, a supervisor holding the lock, each agent's
-    /// task alive, and presence fresh (not rotted to `unknown`) or parked. Exits non-zero on problems.
+    /// task alive, and presence actually written and fresh (present, and not rotted to `unknown`).
+    /// Exits non-zero on problems.
     Doctor {
         /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
         /// st2 catalog.
@@ -948,14 +949,28 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
             );
         }
         if let Some(dir) = spec.path.parent() {
-            let state = st2::status::read_state(&st2::status::status_path(dir));
-            let fresh = state != st2::status::State::Unknown;
-            report_check(
-                &mut problems,
-                fresh,
-                &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
-                "rotted to `unknown` — is its ding refreshing?",
-            );
+            // A missing status file is not a fresh one. `read_state` is deliberately permissive and
+            // maps missing → `offline`, which is indistinguishable from an agent that deliberately
+            // set itself offline — so checking only for `unknown` passes an agent whose presence
+            // nothing has ever written, and reports it as fresh.
+            let path = st2::status::status_path(dir);
+            if path.exists() {
+                let state = st2::status::read_state(&path);
+                let fresh = state != st2::status::State::Unknown;
+                report_check(
+                    &mut problems,
+                    fresh,
+                    &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
+                    "rotted to `unknown` — is its ding refreshing?",
+                );
+            } else {
+                report_check(
+                    &mut problems,
+                    false,
+                    &format!("{bus_id} presence written"),
+                    "no `status` file — nothing is maintaining this agent's presence",
+                );
+            }
         }
     }
 
