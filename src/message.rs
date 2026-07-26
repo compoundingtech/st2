@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
@@ -183,6 +184,11 @@ fn parse_message(filename: &str, contents: &str) -> Message {
 
 /// Send: write a new message file into `inbox_dir`, returning its filename. Creates `inbox_dir` if
 /// missing; retries on the astronomically-unlikely filename collision.
+///
+/// The message is materialized atomically (tmp sibling + rename), the same way a status write is:
+/// writing straight to the final name truncates in place, so a concurrent [`list_dir`] can observe
+/// the file at zero length under a name that already matches [`is_message_filename`] and read it
+/// back as a message with no `from`/`subject`.
 pub fn send_to_inbox(
     inbox_dir: &Path,
     from: &str,
@@ -193,17 +199,38 @@ pub fn send_to_inbox(
 ) -> anyhow::Result<String> {
     fs::create_dir_all(inbox_dir)?;
     let contents = render_message(from, subject, in_reply_to, tags, body);
+    // The tmp name deliberately does not match `is_message_filename`, so a reader scanning the
+    // inbox mid-write skips it rather than parsing a partial file.
+    let tmp = inbox_dir.join(tmp_name());
+    fs::write(&tmp, &contents)?;
     for _ in 0..8 {
         let filename = new_filename();
         let path = inbox_dir.join(&filename);
         if !path.exists() {
-            fs::write(&path, &contents)?;
+            // rename over the target — atomic within the same directory.
+            if let Err(e) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp); // best-effort cleanup
+                return Err(e.into());
+            }
             return Ok(filename);
         }
     }
+    let _ = fs::remove_file(&tmp); // best-effort cleanup
     anyhow::bail!(
         "could not allocate a unique message filename in {}",
         inbox_dir.display()
+    )
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A per-send-unique temp filename (pid + a process-local counter — no collisions within a process,
+/// and the pid separates processes).
+fn tmp_name() -> String {
+    format!(
+        ".message.tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }
 

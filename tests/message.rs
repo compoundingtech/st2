@@ -142,3 +142,53 @@ fn reply_threads_back_to_the_original_sender() {
     assert_eq!(got.in_reply_to.as_deref(), Some(original.as_str()));
     assert_eq!(got.subject.as_deref(), Some("re: M2 kick"));
 }
+
+/// A concurrent reader must never observe a half-materialized message. `fs::write` truncates in
+/// place under the final `<unix-ms>-<rand6>.md` name, so a reader that scans the inbox between the
+/// `open(O_CREAT|O_TRUNC)` and the `write` sees a zero-length file — and `parse_message` needs a
+/// closing `---`, so that reads back as a message with no `from`/`subject` (the "(from unknown)"
+/// DING). Each send gets a fresh inbox so this isolates the write window: nothing is ever removed.
+/// The large body only widens the window; the race does not depend on size.
+#[test]
+fn a_concurrent_reader_never_observes_a_half_written_message() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let body = "x".repeat(4 * 1024 * 1024);
+    let sends = 40usize;
+
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let reader = {
+        let (root, cursor, done) = (root.clone(), Arc::clone(&cursor), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut partial = 0usize;
+            while !done.load(Ordering::Relaxed) {
+                let inbox = root.join(format!("inbox-{}", cursor.load(Ordering::Relaxed)));
+                for m in list_dir(&inbox).unwrap() {
+                    if m.from.is_none() {
+                        partial += 1;
+                    }
+                }
+            }
+            partial
+        })
+    };
+
+    for i in 0..sends {
+        let inbox = root.join(format!("inbox-{i}"));
+        fs::create_dir_all(&inbox).unwrap();
+        cursor.store(i, Ordering::Relaxed);
+        send_to_inbox(&inbox, "alice", Some(&format!("big {i}")), None, &[], &body).unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+
+    let partial = reader.join().unwrap();
+    assert_eq!(
+        partial, 0,
+        "reader saw {partial} message(s) with no `from` — the inbox write is not atomic"
+    );
+}
