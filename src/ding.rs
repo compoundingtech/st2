@@ -10,9 +10,11 @@
 //! `Create a plan? … esc dismiss` prompt has a bounded recovery: after a second identical
 //! inspection, DING sends only Escape, re-inspects, and still sends Return only for the exact staged
 //! notice. Every other modal, an active turn, a human draft, or an unreadable pane defers the message
-//! in memory; `busy` and `dnd` status do likewise. The inbox file remains the durable source of truth
-//! while deferred. This closes the race where Codex opened a choice modal during the 0.5-second gap
-//! and an unconditional trailing Return selected the modal's default action.
+//! in memory; `busy` and `dnd` status do likewise. If the pane changes only after DING pasted the
+//! exact notice, DING retains explicit ownership and later retries only a guarded Return — never
+//! another paste or modal dismissal — until that payload is safely idle or changes. This closes the
+//! race where Codex opened a choice modal during the 0.5-second gap and an unconditional trailing
+//! Return selected the modal's default action.
 //!
 //! It DOES run the brief-023 presence refresh: while the agent's pty is alive it re-writes the
 //! agent's own `status` file on a cadence (preserving the value) so a healthy-but-idle agent never
@@ -108,11 +110,15 @@ pub fn pty_dismiss_plan_modal_args(session: &str) -> Vec<String> {
     ]
 }
 
-/// One delivery attempt either reached the target or was deliberately deferred because the target
-/// pane/status was not safe. Deferred work stays in the in-memory queue and the durable inbox.
+/// One delivery attempt either reached the target, pasted an exact payload without submitting it,
+/// or performed no owned input because the target pane/status was not safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PokeOutcome {
     Delivered,
+    /// This attempt pasted the exact payload, but a post-paste pane change made Return unsafe.
+    /// The caller owns that staged payload until a guarded retry delivers it or proves it changed.
+    Staged,
+    /// No exact payload staged by this attempt remains owned by the caller.
     Deferred,
 }
 
@@ -155,9 +161,17 @@ fn command_invokes(command: &str, expected: &str) -> bool {
 /// How the ding delivers a poke and checks liveness — abstracted so the watch loop is testable
 /// without a real `pty`. Production shells out to the `pty` binary.
 pub trait Poker {
-    /// Try to inject and submit `text`. Unsafe pane state returns [`PokeOutcome::Deferred`] without
-    /// sending Return; transport/inspection failures are errors and are retried by the watch loop.
+    /// Try to inject and submit `text`. Unsafe pre-stage pane state returns
+    /// [`PokeOutcome::Deferred`] with zero input. A post-paste unsafe state returns
+    /// [`PokeOutcome::Staged`] only when the exact payload remains in the composer.
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
+    /// Retry one payload that a prior [`Poker::poke`] returned as [`PokeOutcome::Staged`].
+    /// This path may submit the exact safely idle payload, but must never paste, restage, or dismiss
+    /// a modal. [`PokeOutcome::Deferred`] means the exact payload disappeared or changed, so the
+    /// caller must clear its ownership without input.
+    fn retry_staged(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
+        Ok(PokeOutcome::Deferred)
+    }
     /// On sidecar startup, recover at most one notice whose visible stable DING id names exactly one
     /// message in the seeded unread backlog. The default is inert for fake and legacy pokers.
     fn recover_seeded(&self, _backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
@@ -258,6 +272,18 @@ impl Poker for PtyPoker {
         self.poke_with(text, &mut || Ok(()))
     }
 
+    fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+        if self.mode != DeliveryMode::CodexGuarded {
+            return Ok(PokeOutcome::Deferred);
+        }
+        guarded_retry_staged(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || Ok(()),
+        )
+    }
+
     fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
         if self.mode != DeliveryMode::CodexGuarded || backlog.is_empty() {
             return Ok(PokeOutcome::Deferred);
@@ -316,7 +342,7 @@ fn guarded_poke(
     match classify_pane(&peek()?, text) {
         PaneState::Blocked => Ok(PokeOutcome::Deferred),
         PaneState::DismissiblePlanModal => recover_plan_modal(
-            text,
+            StagedPayload { text, owned: false },
             peek,
             stage,
             dismiss_plan_modal,
@@ -332,14 +358,15 @@ fn guarded_poke(
         PaneState::Idle => {
             stage()?;
             settle();
-            match classify_pane(&peek()?, text) {
+            let screen = peek()?;
+            match classify_pane(&screen, text) {
                 PaneState::Staged => {
                     before_submit()?;
                     submit()?;
                     Ok(PokeOutcome::Delivered)
                 }
                 PaneState::DismissiblePlanModal => recover_plan_modal(
-                    text,
+                    StagedPayload { text, owned: true },
                     peek,
                     stage,
                     dismiss_plan_modal,
@@ -350,7 +377,11 @@ fn guarded_poke(
                 // This includes the incident window: a Codex model-choice modal appeared after
                 // paste but before Return. Leave the exact notice staged and retry when safe.
                 PaneState::Blocked | PaneState::Idle | PaneState::Unknown => {
-                    Ok(PokeOutcome::Deferred)
+                    if exact_composer_payload(&screen, text) {
+                        Ok(PokeOutcome::Staged)
+                    } else {
+                        Ok(PokeOutcome::Deferred)
+                    }
                 }
             }
         }
@@ -360,12 +391,41 @@ fn guarded_poke(
     }
 }
 
+/// Retry only an exact payload already staged by this sidecar. Unlike [`guarded_poke`], this path
+/// never pastes, restages, or dismisses a modal. A changed or missing payload releases ownership
+/// without input; an exact but active/modal payload remains owned until a later safe pass.
+fn guarded_retry_staged(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    let screen = peek()?;
+    if !exact_composer_payload(&screen, text) {
+        return Ok(PokeOutcome::Deferred);
+    }
+    if classify_pane(&screen, text) != PaneState::Staged {
+        return Ok(PokeOutcome::Staged);
+    }
+
+    before_submit()?;
+    submit()?;
+    Ok(PokeOutcome::Delivered)
+}
+
+/// One exact composer payload plus whether this delivery attempt pasted it.
+struct StagedPayload<'a> {
+    text: &'a str,
+    owned: bool,
+}
+
 /// Recover one stable, exact Codex plan prompt without polling or ever sending Return to the modal.
 ///
 /// The modal must survive a second inspection before Escape. After dismissal, an exact staged
-/// notice can submit immediately; an empty composer can be restaged once. Any other state defers.
+/// notice can submit immediately; an empty composer can be restaged once. If this attempt already
+/// pasted the exact payload, an unsafe post-paste state remains explicitly owned.
 fn recover_plan_modal(
-    text: &str,
+    payload: StagedPayload<'_>,
     peek: &mut dyn FnMut() -> anyhow::Result<String>,
     stage: &mut dyn FnMut() -> anyhow::Result<()>,
     dismiss_plan_modal: &mut dyn FnMut() -> anyhow::Result<()>,
@@ -373,14 +433,24 @@ fn recover_plan_modal(
     settle: &mut dyn FnMut(),
     before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<PokeOutcome> {
+    let StagedPayload {
+        text,
+        owned: owns_staged,
+    } = payload;
     settle();
-    if classify_pane(&peek()?, text) != PaneState::DismissiblePlanModal {
-        return Ok(PokeOutcome::Deferred);
+    let screen = peek()?;
+    if classify_pane(&screen, text) != PaneState::DismissiblePlanModal {
+        return Ok(if owns_staged && exact_composer_payload(&screen, text) {
+            PokeOutcome::Staged
+        } else {
+            PokeOutcome::Deferred
+        });
     }
 
     dismiss_plan_modal()?;
     settle();
-    match classify_pane(&peek()?, text) {
+    let screen = peek()?;
+    match classify_pane(&screen, text) {
         PaneState::Staged => {
             before_submit()?;
             submit()?;
@@ -389,15 +459,24 @@ fn recover_plan_modal(
         PaneState::Idle => {
             stage()?;
             settle();
-            if classify_pane(&peek()?, text) != PaneState::Staged {
-                return Ok(PokeOutcome::Deferred);
+            let screen = peek()?;
+            if classify_pane(&screen, text) == PaneState::Staged {
+                before_submit()?;
+                submit()?;
+                return Ok(PokeOutcome::Delivered);
             }
-            before_submit()?;
-            submit()?;
-            Ok(PokeOutcome::Delivered)
+            Ok(if exact_composer_payload(&screen, text) {
+                PokeOutcome::Staged
+            } else {
+                PokeOutcome::Deferred
+            })
         }
         PaneState::DismissiblePlanModal | PaneState::Blocked | PaneState::Unknown => {
-            Ok(PokeOutcome::Deferred)
+            Ok(if owns_staged && exact_composer_payload(&screen, text) {
+                PokeOutcome::Staged
+            } else {
+                PokeOutcome::Deferred
+            })
         }
     }
 }
@@ -469,6 +548,13 @@ fn classify_pane(screen: &str, expected: &str) -> PaneState {
     } else {
         PaneState::Unknown
     }
+}
+
+fn exact_composer_payload(screen: &str, expected: &str) -> bool {
+    matches!(
+        located_bottom_codex_composer(screen),
+        Some((_, CodexComposer::Typed(input))) if input == expected
+    )
 }
 
 fn looks_like_dismissible_plan_modal(plain: &str) -> bool {
@@ -923,7 +1009,7 @@ pub fn run_ding(
                             "st2 ding: resumed one exact staged message from the seeded inbox."
                         );
                     }
-                    Ok(PokeOutcome::Deferred) => {}
+                    Ok(PokeOutcome::Staged | PokeOutcome::Deferred) => {}
                     Err(error) => {
                         eprintln!("st2 ding: seeded staged-message recovery failed: {error}")
                     }
@@ -931,9 +1017,11 @@ pub fn run_ding(
             }
             // Only scan once the target is up: arrivals during the startup race stay unseen and are
             // queued on the first live pass, so nothing is lost to the launch gap.
-            for msg in new_arrivals(inbox_dir, &mut seen) {
-                pending.push_back(msg);
-            }
+            pending.extend(
+                new_arrivals(inbox_dir, &mut seen)
+                    .into_iter()
+                    .map(PendingMessage::new),
+            );
             prune_archived_pending(inbox_dir, &mut pending);
             flush_pending(status_path, &mut pending, poker);
         } else if !watch.seen_alive && !logged_waiting {
@@ -965,12 +1053,32 @@ fn retain_current_messages(inbox_dir: &Path, messages: &mut Vec<Message>) {
     messages.retain(|msg| filenames.contains(msg.filename.as_str()));
 }
 
-fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<Message>) {
+#[derive(Debug)]
+struct PendingMessage {
+    message: Message,
+    staged: bool,
+    in_inbox: bool,
+}
+
+impl PendingMessage {
+    fn new(message: Message) -> Self {
+        Self {
+            message,
+            staged: false,
+            in_inbox: true,
+        }
+    }
+}
+
+fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<PendingMessage>) {
     let Ok(current) = message::list_inbox(inbox_dir) else {
         return;
     };
     let filenames: HashSet<&str> = current.iter().map(|msg| msg.filename.as_str()).collect();
-    pending.retain(|msg| filenames.contains(msg.filename.as_str()));
+    for queued in pending.iter_mut() {
+        queued.in_inbox = filenames.contains(queued.message.filename.as_str());
+    }
+    pending.retain(|pending| pending.staged || pending.in_inbox);
 }
 
 fn delivery_suppressed(status_path: Option<&Path>) -> bool {
@@ -982,14 +1090,39 @@ fn delivery_suppressed(status_path: Option<&Path>) -> bool {
     })
 }
 
-fn flush_pending(status_path: Option<&Path>, pending: &mut VecDeque<Message>, poker: &dyn Poker) {
+fn flush_pending(
+    status_path: Option<&Path>,
+    pending: &mut VecDeque<PendingMessage>,
+    poker: &dyn Poker,
+) {
     if delivery_suppressed(status_path) {
         return;
     }
 
-    while let Some(msg) = pending.front() {
-        match poker.poke(&poke_text(msg)) {
+    while let Some(head) = pending.front_mut() {
+        let text = poke_text(&head.message);
+        let was_staged = head.staged;
+        let outcome = if was_staged {
+            poker.retry_staged(&text)
+        } else {
+            poker.poke(&text)
+        };
+        match outcome {
             Ok(PokeOutcome::Delivered) => {
+                pending.pop_front();
+            }
+            Ok(PokeOutcome::Staged) => {
+                head.staged = true;
+                break;
+            }
+            Ok(PokeOutcome::Deferred) if was_staged => {
+                // The exact owned payload disappeared or changed. Release ownership without input.
+                // An archived message is now gone; an unread one stays queued for a later fresh
+                // guarded attempt, but never in this same pass.
+                if head.in_inbox {
+                    head.staged = false;
+                    break;
+                }
                 pending.pop_front();
             }
             Ok(PokeOutcome::Deferred) => break,
@@ -1056,6 +1189,7 @@ fn drain(rx: &Receiver<()>) {
 mod tests {
     use super::*;
     use crate::message::send_to_inbox;
+    use std::sync::Mutex;
 
     fn msg(filename: &str, from: &str, subject: Option<&str>) -> Message {
         Message {
@@ -1067,6 +1201,39 @@ mod tests {
             tags: vec![],
             priority: None,
             body: String::new(),
+        }
+    }
+
+    struct OwnershipPoker {
+        poke_outcomes: Mutex<VecDeque<PokeOutcome>>,
+        retry_outcomes: Mutex<VecDeque<PokeOutcome>>,
+        pokes: Mutex<Vec<String>>,
+        retries: Mutex<Vec<String>>,
+    }
+
+    impl Poker for OwnershipPoker {
+        fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+            self.pokes.lock().unwrap().push(text.to_string());
+            Ok(self
+                .poke_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected fresh poke"))
+        }
+
+        fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+            self.retries.lock().unwrap().push(text.to_string());
+            Ok(self
+                .retry_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected staged retry"))
+        }
+
+        fn session_alive(&self) -> bool {
+            true
         }
     }
 
@@ -1575,15 +1742,28 @@ mod tests {
     }
 
     #[test]
-    fn post_paste_modal_or_composer_mismatch_defers_without_return_then_submits_when_safe() {
+    fn post_paste_exact_payload_is_owned_until_safe_but_changed_text_is_not() {
         use std::cell::{Cell, RefCell};
 
         let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
-        for blocked_after_paste in [
-            modal_codex_screen(expected),
-            staged_codex_screen("human changed the composer"),
+        for (blocked_after_paste, expected_outcome) in [
+            (modal_codex_screen(expected), PokeOutcome::Staged),
+            (
+                format!(
+                    "• Working (2s • esc to interrupt)\r\n{}",
+                    staged_codex_screen(expected)
+                ),
+                PokeOutcome::Staged,
+            ),
+            (
+                staged_codex_screen("human changed the composer"),
+                PokeOutcome::Deferred,
+            ),
         ] {
-            let screens = RefCell::new(VecDeque::from([idle_codex_screen(), blocked_after_paste]));
+            let screens = RefCell::new(VecDeque::from([
+                idle_codex_screen(),
+                blocked_after_paste.clone(),
+            ]));
             let actions = RefCell::new(Vec::new());
             let before = Cell::new(0);
             let outcome = guarded_poke(
@@ -1606,30 +1786,72 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(outcome, PokeOutcome::Deferred);
+            assert_eq!(outcome, expected_outcome);
             assert_eq!(actions.borrow().as_slice(), ["paste"]);
             assert_eq!(before.get(), 0, "no durable attempt before a safe submit");
 
-            let mut safe_screen = VecDeque::from([staged_codex_screen(expected)]);
-            let outcome = guarded_poke(
+            if expected_outcome == PokeOutcome::Staged {
+                let outcome = guarded_retry_staged(
+                    expected,
+                    &mut || Ok(blocked_after_paste.clone()),
+                    &mut || {
+                        actions.borrow_mut().push("return");
+                        Ok(())
+                    },
+                    &mut || {
+                        before.set(before.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(outcome, PokeOutcome::Staged);
+                assert_eq!(actions.borrow().as_slice(), ["paste"]);
+                assert_eq!(before.get(), 0);
+
+                let outcome = guarded_retry_staged(
+                    expected,
+                    &mut || Ok(staged_codex_screen(expected)),
+                    &mut || {
+                        actions.borrow_mut().push("return");
+                        Ok(())
+                    },
+                    &mut || {
+                        before.set(before.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(outcome, PokeOutcome::Delivered);
+                assert_eq!(actions.borrow().as_slice(), ["paste", "return"]);
+                assert_eq!(before.get(), 1);
+            } else {
+                assert_eq!(actions.borrow().as_slice(), ["paste"]);
+                assert_eq!(before.get(), 0);
+            }
+        }
+
+        for disappeared in [
+            idle_codex_screen(),
+            staged_codex_screen("human changed the composer"),
+        ] {
+            let actions = RefCell::new(Vec::new());
+            let before = Cell::new(0);
+            let outcome = guarded_retry_staged(
                 expected,
-                &mut || Ok(safe_screen.pop_front().unwrap()),
-                &mut || unreachable!("the exact text is already staged"),
-                &mut || unreachable!("there is no plan modal"),
+                &mut || Ok(disappeared.clone()),
                 &mut || {
                     actions.borrow_mut().push("return");
                     Ok(())
                 },
-                &mut || {},
                 &mut || {
                     before.set(before.get() + 1);
                     Ok(())
                 },
             )
             .unwrap();
-            assert_eq!(outcome, PokeOutcome::Delivered);
-            assert_eq!(actions.borrow().as_slice(), ["paste", "return"]);
-            assert_eq!(before.get(), 1);
+            assert_eq!(outcome, PokeOutcome::Deferred);
+            assert!(actions.borrow().is_empty());
+            assert_eq!(before.get(), 0);
         }
 
         let peek_count = Cell::new(0);
@@ -1704,6 +1926,72 @@ mod tests {
 
         assert_eq!(outcome, PokeOutcome::Delivered);
         assert_eq!(actions.borrow().as_slice(), ["paste", "escape", "return"]);
+        assert_eq!(before.get(), 1);
+    }
+
+    #[test]
+    fn post_paste_plan_recovery_retains_exact_unsafe_payload_for_return_only_retry() {
+        use std::cell::{Cell, RefCell};
+
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
+        let unsafe_exact = format!(
+            "• Working (2s • esc to interrupt)\r\n{}",
+            staged_codex_screen(expected)
+        );
+        let screens = RefCell::new(VecDeque::from([
+            idle_codex_screen(),
+            plan_modal_codex_screen(expected),
+            plan_modal_codex_screen(expected),
+            unsafe_exact,
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let outcome = guarded_poke(
+            expected,
+            &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("escape");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, PokeOutcome::Staged);
+        assert_eq!(actions.borrow().as_slice(), ["paste", "escape"]);
+        assert_eq!(before.get(), 0);
+
+        let outcome = guarded_retry_staged(
+            expected,
+            &mut || Ok(staged_codex_screen(expected)),
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Delivered);
+        assert_eq!(
+            actions.borrow().as_slice(),
+            ["paste", "escape", "return"],
+            "an owned retry never pastes, restages, or dismisses"
+        );
         assert_eq!(before.get(), 1);
     }
 
@@ -2187,8 +2475,6 @@ mod tests {
 
     #[test]
     fn deferred_fifo_delivers_once_when_safe_and_dnd_is_untouched() {
-        use std::sync::Mutex;
-
         struct ScriptedPoker {
             outcomes: Mutex<VecDeque<PokeOutcome>>,
             calls: Mutex<Vec<String>>,
@@ -2215,7 +2501,7 @@ mod tests {
         let second = msg("1700000000001-def456.md", "bob", Some("second"));
         let first_text = poke_text(&first);
         let second_text = poke_text(&second);
-        let mut pending = VecDeque::from([first, second]);
+        let mut pending = VecDeque::from([PendingMessage::new(first), PendingMessage::new(second)]);
         let poker = ScriptedPoker {
             outcomes: Mutex::new(VecDeque::from([
                 PokeOutcome::Deferred,
@@ -2254,6 +2540,200 @@ mod tests {
             [first_text.clone(), first_text, second_text],
             "the head retries once, the tail follows, and delivered work is never repeated"
         );
+    }
+
+    #[test]
+    fn archived_staged_head_keeps_fifo_ownership_without_repaste() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let archive = tmp.path().join("resources").join("archive");
+        send_to_inbox(&inbox, "alice", Some("first"), None, &[], "one").unwrap();
+        send_to_inbox(&inbox, "bob", Some("second"), None, &[], "two").unwrap();
+
+        let messages = message::list_inbox(&inbox).unwrap();
+        assert_eq!(messages.len(), 2);
+        let first_filename = messages[0].filename.clone();
+        let first_text = poke_text(&messages[0]);
+        let second_text = poke_text(&messages[1]);
+        let mut pending = messages
+            .into_iter()
+            .map(PendingMessage::new)
+            .collect::<VecDeque<_>>();
+        let poker = OwnershipPoker {
+            poke_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Delivered,
+            ])),
+            retry_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Delivered,
+            ])),
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 2);
+        assert!(pending.front().unwrap().staged);
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first_text)
+        );
+        assert!(poker.retries.lock().unwrap().is_empty());
+
+        message::archive_msg(&inbox, &archive, &first_filename).unwrap();
+        prune_archived_pending(&inbox, &mut pending);
+        assert_eq!(
+            pending.len(),
+            2,
+            "only an exactly staged head survives its archive receipt"
+        );
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 2, "an unsafe exact retry holds the FIFO");
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first_text)
+        );
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first_text)
+        );
+
+        flush_pending(None, &mut pending, &poker);
+        assert!(pending.is_empty());
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [first_text.clone(), second_text],
+            "the archived head is never pasted again and the tail waits for its delivery"
+        );
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            [first_text.clone(), first_text],
+            "only the owned head uses the return-only retry path"
+        );
+    }
+
+    #[test]
+    fn changed_archived_staged_head_releases_fifo_without_repaste() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let archive = tmp.path().join("resources").join("archive");
+        send_to_inbox(&inbox, "alice", Some("first"), None, &[], "one").unwrap();
+        send_to_inbox(&inbox, "bob", Some("second"), None, &[], "two").unwrap();
+
+        let messages = message::list_inbox(&inbox).unwrap();
+        let first_filename = messages[0].filename.clone();
+        let first_text = poke_text(&messages[0]);
+        let second_text = poke_text(&messages[1]);
+        let mut pending = messages
+            .into_iter()
+            .map(PendingMessage::new)
+            .collect::<VecDeque<_>>();
+        let poker = OwnershipPoker {
+            poke_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Delivered,
+            ])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Deferred])),
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        message::archive_msg(&inbox, &archive, &first_filename).unwrap();
+        prune_archived_pending(&inbox, &mut pending);
+        flush_pending(None, &mut pending, &poker);
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [first_text.clone(), second_text],
+            "a changed archived head is released rather than pasted again"
+        );
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            [first_text],
+            "ownership is checked once before the unread tail proceeds"
+        );
+    }
+
+    #[test]
+    fn changed_unread_staged_head_releases_ownership_but_stays_fifo_queued() {
+        let first = msg("1700000000000-abc123.md", "alice", Some("first"));
+        let second = msg("1700000000001-def456.md", "bob", Some("second"));
+        let first_text = poke_text(&first);
+        let second_text = poke_text(&second);
+        let mut pending = VecDeque::from([PendingMessage::new(first), PendingMessage::new(second)]);
+        let poker = OwnershipPoker {
+            poke_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Deferred,
+                PokeOutcome::Delivered,
+                PokeOutcome::Delivered,
+            ])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Deferred])),
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        assert!(pending.front().unwrap().staged);
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 2);
+        assert!(!pending.front().unwrap().staged);
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first_text),
+            "ownership loss performs no fresh input in the same pass"
+        );
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            std::slice::from_ref(&first_text)
+        );
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 2, "the unread unsafe head still holds FIFO");
+        flush_pending(None, &mut pending, &poker);
+        assert!(pending.is_empty());
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [
+                first_text.clone(),
+                first_text.clone(),
+                first_text,
+                second_text
+            ]
+        );
+    }
+
+    #[test]
+    fn archived_unstaged_pending_is_pruned_without_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let archive = tmp.path().join("resources").join("archive");
+        let filename =
+            send_to_inbox(&inbox, "alice", Some("already handled"), None, &[], "one").unwrap();
+        let mut pending = message::list_inbox(&inbox)
+            .unwrap()
+            .into_iter()
+            .map(PendingMessage::new)
+            .collect::<VecDeque<_>>();
+        message::archive_msg(&inbox, &archive, &filename).unwrap();
+
+        prune_archived_pending(&inbox, &mut pending);
+        assert!(pending.is_empty());
+
+        let poker = OwnershipPoker {
+            poke_outcomes: Mutex::new(VecDeque::new()),
+            retry_outcomes: Mutex::new(VecDeque::new()),
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+        };
+        flush_pending(None, &mut pending, &poker);
+        assert!(poker.pokes.lock().unwrap().is_empty());
+        assert!(poker.retries.lock().unwrap().is_empty());
     }
 
     #[test]

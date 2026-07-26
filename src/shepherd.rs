@@ -307,7 +307,7 @@ pub(crate) fn run_pass(
             key: key.clone(),
             error: error.to_string(),
         })?;
-        if poke == PokeOutcome::Deferred {
+        if poke != PokeOutcome::Delivered {
             return Ok(Outcome::Skipped {
                 key: key.clone(),
                 reason: SkipReason::UnsafePane,
@@ -517,6 +517,7 @@ mod tests {
         calls: Vec<String>,
         failures: usize,
         deferrals: usize,
+        stagings: usize,
         events: Rc<RefCell<Vec<String>>>,
     }
 
@@ -530,6 +531,10 @@ mod tests {
             if self.deferrals > 0 {
                 self.deferrals -= 1;
                 return Ok(PokeOutcome::Deferred);
+            }
+            if self.stagings > 0 {
+                self.stagings -= 1;
+                return Ok(PokeOutcome::Staged);
             }
             before_submit()?;
             self.events.borrow_mut().push("poke".into());
@@ -807,6 +812,66 @@ mod tests {
             ["save-attempt", "poke", "save-delivered"]
         );
         assert_eq!(poker.calls.len(), 1);
+    }
+
+    #[test]
+    fn shepherd_staged_pane_is_not_latched_or_backed_off_before_safe_submit() {
+        let specs = [root("root", "exec codex")];
+        let now = CADENCE_SECS * 3;
+        let key = ShepherdKey::new("node", "root");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::default();
+        let mut store = FakeStore {
+            events: Rc::clone(&events),
+            ..Default::default()
+        };
+        let mut poker = FakePoker {
+            stagings: 1,
+            events: Rc::clone(&events),
+            ..Default::default()
+        };
+        let mut reporter = FakeReporter::default();
+
+        assert!(matches!(
+            pass(
+                &specs,
+                now,
+                &mut runtime,
+                &mut store,
+                &mut poker,
+                &mut reporter
+            ),
+            Outcome::Skipped {
+                reason: SkipReason::UnsafePane,
+                ..
+            }
+        ));
+        assert_eq!(
+            store.states.get(&key).copied().unwrap_or_default(),
+            PersistedState::default(),
+            "a pasted but unsubmitted prompt is not a durable attempt or delivery"
+        );
+        assert!(runtime.delivered.is_empty());
+        assert!(events.borrow().is_empty());
+        assert!(poker.calls.is_empty());
+
+        assert!(matches!(
+            pass(
+                &specs,
+                now + 1,
+                &mut runtime,
+                &mut store,
+                &mut poker,
+                &mut reporter
+            ),
+            Outcome::Delivered { bucket: 3, .. }
+        ));
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["save-attempt", "poke", "save-delivered"]
+        );
+        assert_eq!(poker.calls.len(), 1);
+        assert!(reporter.0.is_empty());
     }
 
     #[test]
