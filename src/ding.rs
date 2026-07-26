@@ -1830,12 +1830,15 @@ mod tests {
 
     #[test]
     fn startup_recovers_seeded_backlog_once_only_after_dnd_clears() {
-        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, Mutex, mpsc};
 
-        #[derive(Default)]
         struct RecoveryPoker {
             recoveries: Mutex<Vec<Vec<String>>>,
             ordinary_pokes: Mutex<Vec<String>>,
+            live_probes: AtomicUsize,
+            second_probe: Barrier,
+            recovered: mpsc::SyncSender<()>,
         }
         impl Poker for RecoveryPoker {
             fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
@@ -1847,9 +1850,16 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(backlog.iter().map(|msg| msg.filename.clone()).collect());
+                self.recovered.send(()).unwrap();
                 Ok(PokeOutcome::Delivered)
             }
             fn session_alive(&self) -> bool {
+                if self.live_probes.fetch_add(1, Ordering::SeqCst) == 1 {
+                    // The test thread now knows one complete dnd-gated pass happened. Hold the
+                    // second pass here until it changes status to available.
+                    self.second_probe.wait();
+                    self.second_probe.wait();
+                }
                 true
             }
         }
@@ -1860,27 +1870,47 @@ mod tests {
         crate::status::set_state(&status_path, crate::status::State::Dnd).unwrap();
         let selected = send_to_inbox(&inbox, "alice", Some("seeded"), None, &[], "hi").unwrap();
         let silent = send_to_inbox(&inbox, "bob", Some("also seeded"), None, &[], "yo").unwrap();
+        let mut expected_seed_order = vec![selected, silent];
+        expected_seed_order.sort();
         let stop = AtomicBool::new(false);
-        let poker = RecoveryPoker::default();
+        let (recovered_tx, recovered_rx) = mpsc::sync_channel(1);
+        let poker = RecoveryPoker {
+            recoveries: Mutex::new(Vec::new()),
+            ordinary_pokes: Mutex::new(Vec::new()),
+            live_probes: AtomicUsize::new(0),
+            second_probe: Barrier::new(2),
+            recovered: recovered_tx,
+        };
         let config = DingConfig {
-            poll: Duration::from_millis(5),
+            poll: Duration::from_millis(1),
             status_refresh: Duration::from_secs(60),
             delivery_mode: DeliveryMode::CodexGuarded,
         };
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(20));
-                crate::status::set_state(&status_path, crate::status::State::Available).unwrap();
-                std::thread::sleep(Duration::from_millis(40));
-                stop.store(true, Ordering::SeqCst);
+            let thread_poker = &poker;
+            let thread_status_path = &status_path;
+            let thread_stop = &stop;
+            scope.spawn(move || {
+                thread_poker.second_probe.wait();
+                assert!(
+                    thread_poker.recoveries.lock().unwrap().is_empty(),
+                    "dnd must suppress seeded recovery on the first complete pass"
+                );
+                crate::status::set_state(thread_status_path, crate::status::State::Available)
+                    .unwrap();
+                thread_poker.second_probe.wait();
+                recovered_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("available pass did not recover seeded backlog");
+                thread_stop.store(true, Ordering::SeqCst);
             });
             run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
         });
 
         assert_eq!(
             poker.recoveries.lock().unwrap().as_slice(),
-            [vec![selected, silent]],
+            [expected_seed_order],
             "the complete seeded backlog is offered for exact matching once"
         );
         assert!(

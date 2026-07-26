@@ -112,6 +112,9 @@ sleep 60
         .args(["eval"])
         .arg(&cell)
         .env("PATH", path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .output()
         .unwrap();
@@ -164,6 +167,9 @@ eval {
         .args(["eval"])
         .arg(&cell)
         .env("PATH", &path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .output()
         .unwrap();
@@ -219,6 +225,9 @@ eval {
         .args(["eval"])
         .arg(&cell)
         .env("PATH", path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .output()
         .unwrap();
@@ -271,13 +280,23 @@ eval { message { from "runner"; to "cd.sup"; content "go" }; max-timeout "8s"; s
         .args(["eval"])
         .arg(&cell)
         .env("PATH", path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     // (b) the crash escalates to BOTH the direct supervisor and the root cos.
-    assert!(stdout.contains("crash-ding: cd.worker → cd.sup"), "crash didn't ding the supervisor:\n{stdout}");
-    assert!(stdout.contains("crash-ding: cd.worker → cd.cos"), "crash didn't reach the root cos:\n{stdout}");
+    assert!(
+        stdout.contains("crash-ding: cd.worker → cd.sup"),
+        "crash didn't ding the supervisor:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
+    assert!(
+        stdout.contains("crash-ding: cd.worker → cd.cos"),
+        "crash didn't reach the root cos:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
     // (c) the clean-exit seat produces NO ding.
     assert!(!stdout.contains("crash-ding: cd.clean"), "a clean exit (0) must NOT crash-ding:\n{stdout}");
 
@@ -331,6 +350,9 @@ eval {
         .args(["eval"])
         .arg(&cell)
         .env("PATH", path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .output()
         .unwrap();
