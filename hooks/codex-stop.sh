@@ -52,10 +52,7 @@ additional="$(printf '%s' "$items_json" | jq -r --arg count "$count" '
 ')"
 
 jq -n --arg text "$additional" '{
-  continue: true,
-  hookSpecificOutput: {
-    hookEventName: "Stop",
-    additionalContext: $text
-  }
+  decision: "block",
+  reason: $text
 }'
 exit 0

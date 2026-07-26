@@ -78,6 +78,19 @@ fn jq_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+fn stop_reason(output: &Output) -> String {
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let object = json.as_object().unwrap();
+    assert_eq!(object.len(), 2);
+    assert_eq!(json["decision"], "block");
+    assert!(object.contains_key("reason"));
+    assert!(!object.contains_key("continue"));
+    assert!(!object.contains_key("hookSpecificOutput"));
+    json["reason"].as_str().unwrap().to_string()
+}
+
 #[test]
 fn session_start_emits_current_codex_context_envelope() {
     if !jq_available() {
@@ -147,19 +160,12 @@ fn stop_uses_since_cursor_and_emits_only_new_messages() {
     .unwrap();
 
     let first = fixture.run("codex-stop.sh");
-    assert!(first.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(json["hookSpecificOutput"]["hookEventName"], "Stop");
-    assert!(
-        json["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("first")
-    );
+    assert!(stop_reason(&first).contains("first"));
 
     let quiet = fixture.run("codex-stop.sh");
     assert!(quiet.status.success());
     assert!(quiet.stdout.is_empty());
+    assert!(quiet.stderr.is_empty());
 
     std::thread::sleep(Duration::from_millis(3));
     message::send_to_inbox(
@@ -172,10 +178,29 @@ fn stop_uses_since_cursor_and_emits_only_new_messages() {
     )
     .unwrap();
     let second = fixture.run("codex-stop.sh");
-    let json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
-    let additional = json["hookSpecificOutput"]["additionalContext"]
-        .as_str()
+    let reason = stop_reason(&second);
+    assert!(reason.contains("second"));
+    assert!(!reason.contains("first"));
+}
+
+#[test]
+fn stop_fails_open_without_required_commands() {
+    let fixture = Fixture::new();
+    let output = Command::new("/bin/bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("hooks")
+                .join("codex-stop.sh"),
+        )
+        .env("PATH", fixture._tmp.path().join("missing-bin"))
+        .env("ST_ROOT", &fixture.catalog)
+        .env("CATALOG", &fixture.catalog)
+        .env("ST_AGENT", "Silber.cos")
+        .env("XDG_STATE_HOME", &fixture.state)
+        .output()
         .unwrap();
-    assert!(additional.contains("second"));
-    assert!(!additional.contains("first"));
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
