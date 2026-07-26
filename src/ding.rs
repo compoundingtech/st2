@@ -122,6 +122,18 @@ pub enum PokeOutcome {
     Deferred,
 }
 
+/// One-shot startup recovery either submitted the visible seeded notice, owns its exact staged
+/// payload for the ordinary FIFO to finish, or performed no owned input.
+#[derive(Debug)]
+pub enum SeededRecovery {
+    /// The exact visible seeded notice was safely submitted.
+    Delivered,
+    /// Startup recovery pasted or restaged this exact matched notice but could not safely submit it.
+    Staged { message: Message, text: String },
+    /// Startup recovery performed no owned input.
+    Deferred,
+}
+
 /// How a target terminal accepts a poke. Unknown or unrendered agent commands default to the
 /// fail-closed Codex guard; only a positively identified legacy harness gets the old combined
 /// text-plus-Return injection.
@@ -173,9 +185,10 @@ pub trait Poker {
         Ok(PokeOutcome::Deferred)
     }
     /// On sidecar startup, recover at most one notice whose visible stable DING id names exactly one
-    /// message in the seeded unread backlog. The default is inert for fake and legacy pokers.
-    fn recover_seeded(&self, _backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
-        Ok(PokeOutcome::Deferred)
+    /// message in the seeded unread backlog. If recovery owns staged input, the outcome carries that
+    /// exact message and visible text into the ordinary FIFO. The default is inert.
+    fn recover_seeded(&self, _backlog: &[Message]) -> anyhow::Result<SeededRecovery> {
+        Ok(SeededRecovery::Deferred)
     }
     /// True while the target pty session still exists — the ding exits cleanly once it's gone.
     fn session_alive(&self) -> bool;
@@ -284,20 +297,37 @@ impl Poker for PtyPoker {
         )
     }
 
-    fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
+    fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<SeededRecovery> {
         if self.mode != DeliveryMode::CodexGuarded || backlog.is_empty() {
-            return Ok(PokeOutcome::Deferred);
+            return Ok(SeededRecovery::Deferred);
         }
-        let screen = self.peek()?;
-        let Some(text) = exact_staged_backlog_notice(&screen, backlog) else {
-            return Ok(PokeOutcome::Deferred);
-        };
-        self.poke_with(&text, &mut || Ok(()))
+        recover_seeded_with(backlog, &mut || self.peek(), &mut |text| {
+            self.poke_with(text, &mut || Ok(()))
+        })
     }
 
     fn session_alive(&self) -> bool {
         session_alive(&self.session)
     }
+}
+
+fn recover_seeded_with(
+    backlog: &[Message],
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    poke: &mut dyn FnMut(&str) -> anyhow::Result<PokeOutcome>,
+) -> anyhow::Result<SeededRecovery> {
+    let screen = peek()?;
+    let Some((message, text)) = exact_staged_backlog_match(&screen, backlog) else {
+        return Ok(SeededRecovery::Deferred);
+    };
+    Ok(match poke(&text)? {
+        PokeOutcome::Delivered => SeededRecovery::Delivered,
+        PokeOutcome::Staged => SeededRecovery::Staged {
+            message: message.clone(),
+            text,
+        },
+        PokeOutcome::Deferred => SeededRecovery::Deferred,
+    })
 }
 
 /// What the rendered target pane says is safe to do with one exact notice.
@@ -565,7 +595,10 @@ fn looks_like_dismissible_plan_modal(plain: &str) -> bool {
 /// exactly one backlog message. Descriptive words are deliberately non-authoritative across rolling
 /// binary versions; the entire visible composer becomes the exact expected text for the subsequent
 /// guarded re-inspection. Ambiguity still fails closed.
-fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<String> {
+fn exact_staged_backlog_match<'a>(
+    screen: &str,
+    backlog: &'a [Message],
+) -> Option<(&'a Message, String)> {
     let (_, CodexComposer::Typed(input)) = located_bottom_codex_composer(screen)? else {
         return None;
     };
@@ -598,7 +631,12 @@ fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<Stri
     let marker = format!("[id:{id}]");
     let expected = poke_text(message);
     let (_, expected_tail) = expected.split_once(&marker)?;
-    (visible_tail == expected_tail).then_some(visible)
+    (visible_tail == expected_tail).then_some((message, visible))
+}
+
+#[cfg(test)]
+fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<String> {
+    exact_staged_backlog_match(screen, backlog).map(|(_, text)| text)
 }
 
 fn visible_staged_ding_parts(visible: &str) -> Option<(&str, &str)> {
@@ -945,9 +983,10 @@ impl Default for DingConfig {
 /// Watch `inbox_dir` and poke `poker` on each new arrival until `stop` is set or the target session is
 /// gone. Existing inbox contents are seeded as already-seen (no startup poke storm). On the first
 /// live/available pass only, one seeded message may resume if a visible bottom-composer DING has a
-/// stable id naming exactly one unread backlog file. Unsafe pane or `busy`/`dnd` status defers in FIFO
-/// order; transport failures retain the head for retry. A message archived while deferred is pruned
-/// before delivery.
+/// stable id naming exactly one unread backlog file. If startup recovery owns a pasted exact payload,
+/// that identity becomes the staged FIFO head before post-start arrivals. Unsafe pane or `busy`/`dnd`
+/// status defers in FIFO order; transport failures retain the head for retry. Archive receipts prune
+/// unowned work, while an exact staged owner remains until guarded delivery or ownership release.
 pub fn run_ding(
     inbox_dir: &Path,
     status_path: Option<&Path>,
@@ -1004,12 +1043,15 @@ pub fn run_ding(
             {
                 retain_current_messages(inbox_dir, &mut backlog);
                 match poker.recover_seeded(&backlog) {
-                    Ok(PokeOutcome::Delivered) => {
+                    Ok(SeededRecovery::Delivered) => {
                         eprintln!(
                             "st2 ding: resumed one exact staged message from the seeded inbox."
                         );
                     }
-                    Ok(PokeOutcome::Staged | PokeOutcome::Deferred) => {}
+                    Ok(SeededRecovery::Staged { message, text }) => {
+                        pending.push_front(PendingMessage::seeded(message, text));
+                    }
+                    Ok(SeededRecovery::Deferred) => {}
                     Err(error) => {
                         eprintln!("st2 ding: seeded staged-message recovery failed: {error}")
                     }
@@ -1056,16 +1098,33 @@ fn retain_current_messages(inbox_dir: &Path, messages: &mut Vec<Message>) {
 #[derive(Debug)]
 struct PendingMessage {
     message: Message,
-    staged: bool,
+    staged_text: Option<String>,
     in_inbox: bool,
+    origin: PendingOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOrigin {
+    Arrival,
+    Seeded,
 }
 
 impl PendingMessage {
     fn new(message: Message) -> Self {
         Self {
             message,
-            staged: false,
+            staged_text: None,
             in_inbox: true,
+            origin: PendingOrigin::Arrival,
+        }
+    }
+
+    fn seeded(message: Message, text: String) -> Self {
+        Self {
+            message,
+            staged_text: Some(text),
+            in_inbox: true,
+            origin: PendingOrigin::Seeded,
         }
     }
 }
@@ -1078,7 +1137,7 @@ fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<PendingMessag
     for queued in pending.iter_mut() {
         queued.in_inbox = filenames.contains(queued.message.filename.as_str());
     }
-    pending.retain(|pending| pending.staged || pending.in_inbox);
+    pending.retain(|pending| pending.staged_text.is_some() || pending.in_inbox);
 }
 
 fn delivery_suppressed(status_path: Option<&Path>) -> bool {
@@ -1100,8 +1159,9 @@ fn flush_pending(
     }
 
     while let Some(head) = pending.front_mut() {
-        let text = poke_text(&head.message);
-        let was_staged = head.staged;
+        let staged_text = head.staged_text.clone();
+        let was_staged = staged_text.is_some();
+        let text = staged_text.unwrap_or_else(|| poke_text(&head.message));
         let outcome = if was_staged {
             poker.retry_staged(&text)
         } else {
@@ -1112,15 +1172,15 @@ fn flush_pending(
                 pending.pop_front();
             }
             Ok(PokeOutcome::Staged) => {
-                head.staged = true;
+                head.staged_text = Some(text);
                 break;
             }
             Ok(PokeOutcome::Deferred) if was_staged => {
                 // The exact owned payload disappeared or changed. Release ownership without input.
-                // An archived message is now gone; an unread one stays queued for a later fresh
-                // guarded attempt, but never in this same pass.
-                if head.in_inbox {
-                    head.staged = false;
+                // An archived message is now gone. An ordinary unread arrival stays queued for a
+                // later fresh guarded attempt, but seeded startup backlog is never replayed.
+                if head.in_inbox && head.origin == PendingOrigin::Arrival {
+                    head.staged_text = None;
                     break;
                 }
                 pending.pop_front();
@@ -1437,6 +1497,103 @@ mod tests {
             PaneState::Staged,
             "a historical plan prompt above the bottom composer is not a live modal"
         );
+    }
+
+    #[test]
+    fn seeded_recovery_carries_exact_restaged_payload_into_return_only_retry() {
+        use std::cell::{Cell, RefCell};
+
+        let message = msg("1714826789012-k0ygwh.md", "cos", Some("safety"));
+        let canonical = poke_text(&message);
+        let marker = "[id:k0ygwh]";
+        let (_, tail) = canonical.split_once(marker).unwrap();
+        let visible = format!("[DING] rolling startup notice {marker}{tail}");
+        let poke_screens = RefCell::new(VecDeque::from([
+            plan_modal_codex_screen(&visible),
+            plan_modal_codex_screen(&visible),
+            idle_codex_screen(),
+            format!(
+                "• Working (2s • esc to interrupt)\r\n{}",
+                staged_codex_screen(&visible)
+            ),
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let recovery = recover_seeded_with(
+            std::slice::from_ref(&message),
+            &mut || Ok(plan_modal_codex_screen(&visible)),
+            &mut |text| {
+                assert_eq!(text, visible);
+                guarded_poke(
+                    text,
+                    &mut || Ok(poke_screens.borrow_mut().pop_front().unwrap()),
+                    &mut || {
+                        actions.borrow_mut().push("paste");
+                        Ok(())
+                    },
+                    &mut || {
+                        actions.borrow_mut().push("escape");
+                        Ok(())
+                    },
+                    &mut || {
+                        actions.borrow_mut().push("return");
+                        Ok(())
+                    },
+                    &mut || {},
+                    &mut || {
+                        before.set(before.get() + 1);
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .unwrap();
+
+        let SeededRecovery::Staged {
+            message: owned,
+            text,
+        } = recovery
+        else {
+            panic!("post-restage unsafe state must carry seeded ownership");
+        };
+        assert_eq!(owned.filename, message.filename);
+        assert_eq!(text, visible);
+        assert_eq!(actions.borrow().as_slice(), ["escape", "paste"]);
+        assert_eq!(before.get(), 0);
+
+        let outcome = guarded_retry_staged(
+            &text,
+            &mut || Ok(modal_codex_screen(&text)),
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Staged);
+        assert_eq!(actions.borrow().as_slice(), ["escape", "paste"]);
+        assert_eq!(before.get(), 0);
+
+        let outcome = guarded_retry_staged(
+            &text,
+            &mut || Ok(staged_codex_screen(&text)),
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Delivered);
+        assert_eq!(actions.borrow().as_slice(), ["escape", "paste", "return"]);
+        assert_eq!(before.get(), 1);
     }
 
     #[test]
@@ -2377,13 +2534,13 @@ mod tests {
                 self.ordinary_pokes.lock().unwrap().push(text.to_string());
                 Ok(PokeOutcome::Delivered)
             }
-            fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
+            fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<SeededRecovery> {
                 self.recoveries
                     .lock()
                     .unwrap()
                     .push(backlog.iter().map(|msg| msg.filename.clone()).collect());
                 self.recovered.send(()).unwrap();
-                Ok(PokeOutcome::Delivered)
+                Ok(SeededRecovery::Delivered)
             }
             fn session_alive(&self) -> bool {
                 if self.live_probes.fetch_add(1, Ordering::SeqCst) == 1 {
@@ -2449,6 +2606,209 @@ mod tests {
             poker.ordinary_pokes.lock().unwrap().is_empty(),
             "startup recovery never replays the backlog as ordinary arrivals"
         );
+    }
+
+    #[test]
+    fn seeded_staged_archive_retries_exact_text_without_repaste_before_new_arrivals() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, mpsc};
+
+        struct SeededOwnershipPoker {
+            actions: Mutex<Vec<String>>,
+            ordinary_pokes: Mutex<Vec<String>>,
+            recoveries: AtomicUsize,
+            retries: AtomicUsize,
+            staged: mpsc::SyncSender<()>,
+            release_recovery: Barrier,
+            unsafe_held: mpsc::SyncSender<()>,
+            tail_delivered: mpsc::SyncSender<()>,
+        }
+
+        impl Poker for SeededOwnershipPoker {
+            fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+                self.actions.lock().unwrap().push("poke-tail".into());
+                self.ordinary_pokes.lock().unwrap().push(text.to_string());
+                self.tail_delivered.send(()).unwrap();
+                Ok(PokeOutcome::Delivered)
+            }
+
+            fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+                assert!(
+                    text.starts_with("[DING] rolling startup notice "),
+                    "the exact seeded visible text, not a regenerated description, must be retried"
+                );
+                match self.retries.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        self.unsafe_held.send(()).unwrap();
+                        Ok(PokeOutcome::Staged)
+                    }
+                    1 => {
+                        self.actions.lock().unwrap().push("return".into());
+                        Ok(PokeOutcome::Delivered)
+                    }
+                    _ => panic!("a delivered seeded owner must never retry"),
+                }
+            }
+
+            fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<SeededRecovery> {
+                assert_eq!(backlog.len(), 1);
+                self.recoveries.fetch_add(1, Ordering::SeqCst);
+                let message = backlog[0].clone();
+                let canonical = poke_text(&message);
+                let marker = format!("[id:{}]", poke_id(&message.filename));
+                let (_, tail) = canonical.split_once(&marker).unwrap();
+                let text = format!("[DING] rolling startup notice {marker}{tail}");
+                self.actions.lock().unwrap().push("paste".into());
+                self.staged.send(()).unwrap();
+                self.release_recovery.wait();
+                Ok(SeededRecovery::Staged { message, text })
+            }
+
+            fn session_alive(&self) -> bool {
+                true
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let archive = tmp.path().join("resources").join("archive");
+        let seeded_filename =
+            send_to_inbox(&inbox, "alice", Some("seeded"), None, &[], "one").unwrap();
+        let stop = AtomicBool::new(false);
+        let (staged_tx, staged_rx) = mpsc::sync_channel(1);
+        let (unsafe_tx, unsafe_rx) = mpsc::sync_channel(1);
+        let (tail_tx, tail_rx) = mpsc::sync_channel(1);
+        let poker = SeededOwnershipPoker {
+            actions: Mutex::new(Vec::new()),
+            ordinary_pokes: Mutex::new(Vec::new()),
+            recoveries: AtomicUsize::new(0),
+            retries: AtomicUsize::new(0),
+            staged: staged_tx,
+            release_recovery: Barrier::new(2),
+            unsafe_held: unsafe_tx,
+            tail_delivered: tail_tx,
+        };
+        let config = DingConfig {
+            poll: Duration::from_millis(1),
+            status_refresh: Duration::from_secs(60),
+            delivery_mode: DeliveryMode::CodexGuarded,
+        };
+
+        std::thread::scope(|scope| {
+            let control_stop = &stop;
+            let control_poker = &poker;
+            let control_inbox = &inbox;
+            let control_archive = &archive;
+            let control_seeded = &seeded_filename;
+            scope.spawn(move || {
+                staged_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("seeded recovery did not stage");
+                message::archive_msg(control_inbox, control_archive, control_seeded).unwrap();
+                send_to_inbox(
+                    control_inbox,
+                    "bob",
+                    Some("post-start arrival"),
+                    None,
+                    &[],
+                    "two",
+                )
+                .unwrap();
+                control_poker.release_recovery.wait();
+                unsafe_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("archived staged head was not held while unsafe");
+                tail_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("post-start tail did not follow the seeded head");
+                control_stop.store(true, Ordering::SeqCst);
+            });
+            run_ding(&inbox, None, &poker, &config, &stop).unwrap();
+        });
+
+        assert_eq!(poker.recoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(poker.retries.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            poker.actions.lock().unwrap().as_slice(),
+            ["paste", "return", "poke-tail"],
+            "archive retention holds FIFO and the seeded owner receives no second paste or dismissal"
+        );
+        let ordinary = poker.ordinary_pokes.lock().unwrap();
+        assert_eq!(ordinary.len(), 1);
+        assert!(ordinary[0].contains("post-start arrival"));
+        assert!(archive.join(seeded_filename).is_file());
+    }
+
+    #[test]
+    fn changed_or_deferred_seeded_payload_never_replays_unread_startup_backlog() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct ReleasedSeededPoker {
+            stage: bool,
+            live_probes: AtomicUsize,
+            recoveries: AtomicUsize,
+            retries: AtomicUsize,
+            ordinary_pokes: Mutex<Vec<String>>,
+        }
+
+        impl Poker for ReleasedSeededPoker {
+            fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+                self.ordinary_pokes.lock().unwrap().push(text.to_string());
+                Ok(PokeOutcome::Delivered)
+            }
+
+            fn retry_staged(&self, _: &str) -> anyhow::Result<PokeOutcome> {
+                assert!(self.stage, "true Deferred recovery owns no retry");
+                assert_eq!(self.retries.fetch_add(1, Ordering::SeqCst), 0);
+                Ok(PokeOutcome::Deferred)
+            }
+
+            fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<SeededRecovery> {
+                assert_eq!(self.recoveries.fetch_add(1, Ordering::SeqCst), 0);
+                assert_eq!(backlog.len(), 1);
+                Ok(if self.stage {
+                    SeededRecovery::Staged {
+                        message: backlog[0].clone(),
+                        text: poke_text(&backlog[0]),
+                    }
+                } else {
+                    SeededRecovery::Deferred
+                })
+            }
+
+            fn session_alive(&self) -> bool {
+                self.live_probes.fetch_add(1, Ordering::SeqCst) < 4
+            }
+        }
+
+        for stage in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let inbox = tmp.path().join("resources").join("inbox");
+            let filename =
+                send_to_inbox(&inbox, "alice", Some("still unread"), None, &[], "one").unwrap();
+            let poker = ReleasedSeededPoker {
+                stage,
+                live_probes: AtomicUsize::new(0),
+                recoveries: AtomicUsize::new(0),
+                retries: AtomicUsize::new(0),
+                ordinary_pokes: Mutex::new(Vec::new()),
+            };
+            let config = DingConfig {
+                poll: Duration::from_millis(1),
+                status_refresh: Duration::from_secs(60),
+                delivery_mode: DeliveryMode::CodexGuarded,
+            };
+
+            run_ding(&inbox, None, &poker, &config, &AtomicBool::new(false)).unwrap();
+
+            assert_eq!(poker.recoveries.load(Ordering::SeqCst), 1);
+            assert_eq!(poker.retries.load(Ordering::SeqCst), usize::from(stage));
+            assert!(
+                poker.ordinary_pokes.lock().unwrap().is_empty(),
+                "released or deferred startup backlog must not become an ordinary arrival"
+            );
+            assert_eq!(message::list_inbox(&inbox).unwrap()[0].filename, filename);
+        }
     }
 
     #[test]
@@ -2574,7 +2934,7 @@ mod tests {
 
         flush_pending(None, &mut pending, &poker);
         assert_eq!(pending.len(), 2);
-        assert!(pending.front().unwrap().staged);
+        assert!(pending.front().unwrap().staged_text.is_some());
         assert_eq!(
             poker.pokes.lock().unwrap().as_slice(),
             std::slice::from_ref(&first_text)
@@ -2679,10 +3039,10 @@ mod tests {
         };
 
         flush_pending(None, &mut pending, &poker);
-        assert!(pending.front().unwrap().staged);
+        assert!(pending.front().unwrap().staged_text.is_some());
         flush_pending(None, &mut pending, &poker);
         assert_eq!(pending.len(), 2);
-        assert!(!pending.front().unwrap().staged);
+        assert!(pending.front().unwrap().staged_text.is_none());
         assert_eq!(
             poker.pokes.lock().unwrap().as_slice(),
             std::slice::from_ref(&first_text),
