@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn pin_hooks(mut command: Command, hooks_root: &Path) -> Command {
@@ -17,6 +17,37 @@ fn command(hooks_root: &Path) -> Command {
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn write_claude_hook_agent(catalog: &Path, workspace: &Path) {
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(workspace).unwrap();
+    fs::write(
+        declaration,
+        format!(
+            r####"agent "worker" {{
+  host "h"
+  workspace "{}"
+  env {{ ST_AGENT "h.worker" }}
+  command "exec claude"
+  render {{
+    json-upsert ".claude/settings.local.json" #"""
+{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"$ST_HOOKS/claude-session-start.sh"}}]}}]}}}}
+"""#
+  }}
+}}
+"####,
+            workspace.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn selected_set_dir(hooks_root: &Path) -> PathBuf {
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(hooks_root.join("current.json")).unwrap()).unwrap();
+    hooks_root.join(receipt["directory"].as_str().unwrap())
 }
 
 #[test]
@@ -182,6 +213,147 @@ fn codex_materialization_verifies_before_writing_and_renders_a_versioned_path() 
         .unwrap();
     assert!(hook.starts_with(&format!("{}/sets/sha256-", hooks_root.display())));
     assert!(hook.ends_with("/codex-stop.sh"));
+}
+
+#[test]
+fn claude_hook_materialization_rejects_a_missing_receipt_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
+    write_claude_hook_agent(&catalog, &workspace);
+
+    let blocked = command(&hooks_root)
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "h", "--materialize-only"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(!blocked.status.success(), "{stderr}");
+    assert!(stderr.contains("render plan references $ST_HOOKS"), "{stderr}");
+    assert!(!workspace.join(".claude/settings.local.json").exists());
+    assert!(
+        !hooks_root.exists(),
+        "Claude preflight must verify only and never install hooks"
+    );
+}
+
+#[test]
+fn claude_hook_materialization_rejects_a_stale_set_without_rewriting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
+    write_claude_hook_agent(&catalog, &workspace);
+    let settings = workspace.join(".claude/settings.local.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let original_settings = b"{\"keep\":true}\n";
+    fs::write(&settings, original_settings).unwrap();
+
+    assert!(
+        command(&hooks_root)
+            .args(["hooks", "install"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let hook = selected_set_dir(&hooks_root).join("claude-session-start.sh");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+
+    let blocked = command(&hooks_root)
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "h", "--materialize-only"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(!blocked.status.success(), "{stderr}");
+    assert!(stderr.contains("content mismatch"), "{stderr}");
+    assert_eq!(
+        fs::read(&settings).unwrap(),
+        original_settings,
+        "stale hooks must fail before changing existing Claude settings"
+    );
+    assert_eq!(
+        fs::read_to_string(&hook).unwrap(),
+        "#!/bin/sh\nexit 1\n",
+        "materialization must not repair an immutable hook set"
+    );
+}
+
+#[test]
+fn claude_hook_materialization_accepts_a_valid_receipt_and_renders_a_versioned_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
+    write_claude_hook_agent(&catalog, &workspace);
+
+    assert!(
+        command(&hooks_root)
+            .args(["hooks", "install"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let materialized = command(&hooks_root)
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "h", "--materialize-only"])
+        .output()
+        .unwrap();
+    assert!(
+        materialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&materialized.stderr)
+    );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    let hook = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(hook.starts_with(&format!("{}/sets/sha256-", hooks_root.display())));
+    assert!(hook.ends_with("/claude-session-start.sh"));
+}
+
+#[test]
+fn hook_free_claude_materialization_does_not_require_a_receipt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        declaration,
+        format!(
+            "agent \"worker\" {{\n  host \"h\"\n  workspace \"{}\"\n  \
+             command \"exec claude\"\n  render {{ file \"proof\" \"hook-free\" }}\n}}\n",
+            workspace.display()
+        ),
+    )
+    .unwrap();
+
+    let materialized = command(&hooks_root)
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "h", "--materialize-only"])
+        .output()
+        .unwrap();
+    assert!(
+        materialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&materialized.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("proof")).unwrap(),
+        "hook-free"
+    );
+    assert!(!hooks_root.exists());
 }
 
 #[test]

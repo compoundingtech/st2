@@ -1,6 +1,6 @@
 //! The agent roster (M2.3): the data behind `st2 agents`. Enumerates the catalog's agents with their
-//! presence status, and optionally last-activity + inbox count. The JSON field names, order, and
-//! null handling are a stable machine-readable contract.
+//! presence status and retirement state, and optionally last-activity + inbox count. The JSON field
+//! names, order, and null handling are a stable machine-readable contract.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,8 @@ pub struct AgentRow {
     pub status: State,
     /// Optional display name (`<agent_dir>/name`), else `None`.
     pub name: Option<String>,
+    /// Whether the declaration is explicitly retired. Presence remains a separate runtime signal.
+    pub retired: bool,
     /// Newest mtime (unix ms) across the agent's inbox, archive, and status file; `None` if nothing
     /// has been touched. `--enrich` only.
     pub last_activity_ms: Option<f64>,
@@ -40,6 +42,7 @@ pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
                 identity: s.bus_id(this_host),
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: read_name(agent_dir),
+                retired: s.retired,
                 last_activity_ms: newest_mtime_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
             })
@@ -55,6 +58,7 @@ struct SummaryJson<'a> {
     identity: &'a str,
     status: &'a str,
     name: Option<&'a str>,
+    retired: bool,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -63,6 +67,7 @@ struct EnrichedJson<'a> {
     identity: &'a str,
     status: &'a str,
     name: Option<&'a str>,
+    retired: bool,
     #[serde(rename = "lastActivity")]
     last_activity: Option<f64>,
     inbox: usize,
@@ -77,6 +82,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 identity: &r.identity,
                 status: r.status.as_str(),
                 name: r.name.as_deref(),
+                retired: r.retired,
                 last_activity: r.last_activity_ms,
                 inbox: r.inbox,
             })
@@ -89,6 +95,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 identity: &r.identity,
                 status: r.status.as_str(),
                 name: r.name.as_deref(),
+                retired: r.retired,
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -146,6 +153,7 @@ mod tests {
         identity: &str,
         status: State,
         name: Option<&str>,
+        retired: bool,
         last: Option<f64>,
         inbox: usize,
     ) -> AgentRow {
@@ -153,6 +161,7 @@ mod tests {
             identity: identity.to_string(),
             status,
             name: name.map(str::to_string),
+            retired,
             last_activity_ms: last,
             inbox,
         }
@@ -166,19 +175,20 @@ mod tests {
                 "hetz.cos-claude",
                 State::Available,
                 None,
+                false,
                 Some(1784653027733.6138),
                 1,
             ),
-            row("hetz.st2-claude", State::Busy, Some("owner"), None, 0),
+            row("hetz.st2-claude", State::Busy, Some("owner"), true, None, 0),
         ];
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner"}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"retired":false},{"identity":"hetz.st2-claude","status":"busy","name":"owner","retired":true}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"lastActivity":1784653027733.6138,"inbox":1},{"identity":"hetz.st2-claude","status":"busy","name":"owner","lastActivity":null,"inbox":0}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"retired":false,"lastActivity":1784653027733.6138,"inbox":1},{"identity":"hetz.st2-claude","status":"busy","name":"owner","retired":true,"lastActivity":null,"inbox":0}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");

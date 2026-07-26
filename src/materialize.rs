@@ -41,6 +41,57 @@ pub struct RenderPlan {
     pub ops: Vec<RenderOp>,
 }
 
+fn references_variable(input: &str, variable: &str) -> bool {
+    // Use a marker absent from the input so this observes an actual substitution, not merely a
+    // lookup callback (which the expander may consult while preserving a malformed token).
+    let mut marker = "\0st2-render-variable\0".to_string();
+    while input.contains(&marker) {
+        marker.push('\0');
+    }
+    crate::expand::expand_vars(input, |name| {
+        (name == variable).then(|| marker.clone())
+    })
+    .contains(&marker)
+}
+
+impl RenderOp {
+    fn references_variable(&self, variable: &str) -> bool {
+        match self {
+            Self::Copy {
+                source,
+                destination,
+            } => {
+                references_variable(source, variable)
+                    || references_variable(destination, variable)
+            }
+            Self::File {
+                destination,
+                content,
+            }
+            | Self::JsonUpsert {
+                destination,
+                content,
+            } => {
+                references_variable(destination, variable)
+                    || references_variable(content, variable)
+            }
+            Self::EnsureLine { destination, line } => {
+                references_variable(destination, variable)
+                    || references_variable(line, variable)
+            }
+            Self::GitExclude { path } => references_variable(path, variable),
+        }
+    }
+}
+
+impl RenderPlan {
+    fn references_variable(&self, variable: &str) -> bool {
+        self.ops
+            .iter()
+            .any(|operation| operation.references_variable(variable))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MaterializeReport {
     pub materialized: Vec<String>,
@@ -407,6 +458,14 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
     if plan.ops.is_empty() {
         return Ok(Vec::new());
     }
+    if plan.references_variable("ST_HOOKS") {
+        crate::hooks::verify_installed().with_context(|| {
+            format!(
+                "agent '{}' render plan references $ST_HOOKS, but the lifecycle hook receipt is not verified",
+                spec.identity
+            )
+        })?;
+    }
     let workspace_raw = spec
         .workspace
         .as_deref()
@@ -670,6 +729,34 @@ pub fn materialize_catalog(root: &Path, specs: &[AgentSpec], this_host: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_dependency_detection_uses_the_expansion_grammar() {
+        let plan = RenderPlan {
+            ops: vec![RenderOp::File {
+                destination: "settings".to_string(),
+                content: "${ST_HOOKS}/claude-stop-failure.sh".to_string(),
+            }],
+        };
+        assert!(plan.references_variable("ST_HOOKS"));
+
+        for literal in [
+            "$$ST_HOOKS/escaped",
+            "$ST_HOOKS_SUFFIX/not-the-hook-root",
+            "${ST_HOOKS",
+        ] {
+            let plan = RenderPlan {
+                ops: vec![RenderOp::File {
+                    destination: "settings".to_string(),
+                    content: literal.to_string(),
+                }],
+            };
+            assert!(
+                !plan.references_variable("ST_HOOKS"),
+                "{literal} is not an expandable ST_HOOKS reference"
+            );
+        }
+    }
 
     #[test]
     fn deep_merge_preserves_unrelated_keys_and_replaces_arrays() {

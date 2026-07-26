@@ -36,6 +36,7 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
     let hooks_root = tmp.path().join("hooks");
+    let state = tmp.path().join("state");
     let persona = tmp.path().join("supervisor.md");
     let persona_body = "# Supervisor\n\nCoordinate the task.\n";
     fs::create_dir_all(&workspace).unwrap();
@@ -100,12 +101,23 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
         "{}",
         String::from_utf8_lossy(&validate.stdout)
     );
+    let install = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["hooks", "install"])
+        .env("ST_HOOKS", &hooks_root)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
     let materialize = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("up")
         .arg(&catalog)
         .args(["--host", "h", "--materialize-only"])
         .env("ST_HOOKS", &hooks_root)
-        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_STATE_HOME", &state)
         .output()
         .unwrap();
     assert!(

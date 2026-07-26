@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use st2::agents::roster;
@@ -21,6 +22,13 @@ fn agent_kdl(identity: &str, host: &str) -> String {
     format!(
         "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{host}\"\n  \
          type \"service\"\n  pty \"agent\" {{ command \"exec claude boot\" }}\n}}\n"
+    )
+}
+
+fn retired_agent_kdl(identity: &str, host: &str) -> String {
+    agent_kdl(identity, host).replace(
+        "  type \"service\"\n",
+        "  type \"service\"\n  retired #true\n",
     )
 }
 
@@ -95,6 +103,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
         .unwrap();
     assert_eq!(st2c.status, State::Busy);
     assert_eq!(st2c.name.as_deref(), Some("st2 owner"));
+    assert!(!st2c.retired);
     assert_eq!(
         st2c.inbox, 1,
         "the same-filename archive receipt suppresses the raw inbox duplicate"
@@ -110,6 +119,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
         .unwrap();
     assert_eq!(cos.status, State::Available);
     assert_eq!(cos.name, None);
+    assert!(!cos.retired);
     assert_eq!(cos.inbox, 0);
 
     // fabric-claude: no status file, nothing touched → offline, no activity.
@@ -118,7 +128,72 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
         .find(|r| r.identity == "silber.fabric-claude")
         .unwrap();
     assert_eq!(fab.status, State::Offline);
+    assert!(!fab.retired);
     assert_eq!(fab.last_activity_ms, None);
+}
+
+#[test]
+fn roster_json_and_human_output_distinguish_retirement_from_presence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "h/live/agent.kdl", &agent_kdl("live", "h"));
+    write(
+        root,
+        "h/retired/agent.kdl",
+        &retired_agent_kdl("retired", "h"),
+    );
+    set_state(&status_path(&root.join("h/live")), State::Available).unwrap();
+    set_state(&status_path(&root.join("h/retired")), State::Busy).unwrap();
+
+    let rows = roster(root, "h");
+    assert!(
+        !rows
+            .iter()
+            .find(|row| row.identity == "h.live")
+            .unwrap()
+            .retired
+    );
+    let retired = rows.iter().find(|row| row.identity == "h.retired").unwrap();
+    assert!(retired.retired);
+    assert_eq!(
+        retired.status,
+        State::Busy,
+        "retirement is declaration state, not a replacement presence value"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--json", "--enrich"])
+        .output()
+        .unwrap();
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(rows[0]["identity"], "h.live");
+    assert_eq!(rows[0]["retired"], false);
+    assert_eq!(rows[1]["identity"], "h.retired");
+    assert_eq!(rows[1]["status"], "busy");
+    assert_eq!(rows[1]["retired"], true);
+
+    let human = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h"])
+        .output()
+        .unwrap();
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        "h.live\tavailable\t\nh.retired\tbusy\t\t[retired]\n"
+    );
 }
 
 /// A status file older than the stale window projects as `unknown` in the roster, no matter its value.

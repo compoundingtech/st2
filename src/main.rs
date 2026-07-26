@@ -234,8 +234,8 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
-    /// List every agent in the catalog with its presence status (roster). `--json [--enrich]` is
-    /// stable machine-readable roster.
+    /// List every agent in the catalog with presence and retirement state. `--json [--enrich]` is
+    /// the stable machine-readable roster.
     Agents {
         /// The catalog folder (like `st2 ls`/`up`). Falls back to `--root`/`$CATALOG`.
         #[arg(conflicts_with = "catalog_path")]
@@ -243,7 +243,7 @@ enum Command {
         /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
         #[arg(long = "status")]
         status: Option<String>,
-        /// Machine-readable JSON array.
+        /// Machine-readable JSON array, including a `retired` boolean.
         #[arg(long)]
         json: bool,
         /// With `--json`, add `lastActivity` + `inbox` count per agent.
@@ -1038,11 +1038,13 @@ fn agents_cmd(
         println!("{}", st2::agents::to_json(&rows, enrich));
     } else {
         for r in &rows {
+            let retired = if r.retired { "\t[retired]" } else { "" };
             println!(
-                "{}\t{}\t{}",
+                "{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
-                r.name.as_deref().unwrap_or("")
+                r.name.as_deref().unwrap_or(""),
+                retired,
             );
         }
     }

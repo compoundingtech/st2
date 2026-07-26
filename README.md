@@ -37,8 +37,10 @@ location.
 
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
-and workspace materialization verify that receipt but never create, refresh, or rewrite hooks.
-An intentional rollback to an older set requires `st2 hooks install --allow-downgrade`.
+verifies that receipt for Codex launches; any local workspace render that actually references
+`$ST_HOOKS` verifies it before writing. Hook-free materialization does not require an installed
+set. These checks never create, refresh, or rewrite hooks. An intentional rollback to an older set
+requires `st2 hooks install --allow-downgrade`.
 
 `ST_HOOKS` overrides the machine-local hook root for installation, verification, and managed tasks.
 During materialization, hook commands such as `$ST_HOOKS/codex-stop.sh` resolve to the selected
@@ -142,6 +144,11 @@ st2 message archive <filename>
 st2 agents --json --enrich
 st2 context read --full
 ```
+
+The roster includes retired declarations instead of silently conflating them with runtime
+presence. Both JSON shapes contain an additive `retired` boolean; `--enrich` additionally supplies
+`lastActivity` and `inbox`. Human output leaves active rows unchanged and appends `[retired]` to a
+retired row.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
