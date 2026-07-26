@@ -515,17 +515,10 @@ fn visible_staged_ding_parts(visible: &str) -> Option<(&str, &str)> {
     let (id, suffix) = after_marker.split_once(']')?;
     if description.trim().is_empty()
         || id.len() != 6
-        || !id.bytes().all(|byte| {
-            matches!(
-                byte,
-                b'0'..=b'9'
-                    | b'a'..=b'h'
-                    | b'j'..=b'k'
-                    | b'm'..=b'n'
-                    | b'p'..=b't'
-                    | b'v'..=b'z'
-            )
-        })
+        // Match the durable reader grammar, not only the narrower alphabet used for new ids.
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
         || suffix.contains("[id:")
     {
         return None;
@@ -1231,7 +1224,7 @@ mod tests {
             rolling_notice.replace("safety", "human-edited subject"),
             rolling_notice.replace("(from cos)", "(from mallory)"),
             format!("{rolling_notice} extra tail"),
-            rolling_notice.replace("[id:k0ygwh]", "[id:iiiiii]"),
+            rolling_notice.replace("[id:k0ygwh]", "[id:ABC123]"),
             rolling_notice.replace("new ", "new \u{0}"),
         ] {
             assert_eq!(
@@ -1264,6 +1257,18 @@ mod tests {
             ),
             Some(default_rolling.to_string()),
             "message-derived defaults are part of the authoritative tail"
+        );
+
+        let accepted_legacy_id = msg("1714826789015-iiiiii.md", "cos", Some("legacy id"));
+        let accepted_legacy_notice =
+            "[DING] rolling words [id:iiiiii] legacy id (from cos); check your inbox";
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen(accepted_legacy_notice),
+                &[accepted_legacy_id]
+            ),
+            Some(accepted_legacy_notice.to_string()),
+            "recovery follows the full durable reader grammar, not only the generator subset"
         );
     }
 
