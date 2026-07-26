@@ -34,22 +34,24 @@ fn st2_eval_runs_a_benign_folder_to_a_pass_verdict() {
     std::fs::create_dir_all(fixture.join("sup")).unwrap();
     std::fs::create_dir_all(fixture.join("worker")).unwrap();
 
-    // The spec: a 2-agent team + an eval that copies the fixture, kicks off the sup, and judges the
-    // deliverable. Benign polling agents (no ding) — they use `st2 message` on the flat bus (ST_ROOT).
+    // Native-default topology: no authored ST_ROOT. The kickoff, polling agents, built-in bare dings,
+    // requester confirmation, and judges must all resolve the same flat catalog bus.
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
-env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+env { PTY_ROOT "$CATALOG/pty" }
 team "t" {
   agent "sup" {
     workspace "./sup"
     env { ST_AGENT "t.sup" }
     command "sh $CATALOG/scripts/sup.sh"
+    ding
   }
   agent "worker" {
     workspace "./worker"
     env { ST_AGENT "t.worker" }
     command "sh $CATALOG/scripts/worker.sh"
+    ding
   }
 }
 eval {
@@ -59,6 +61,12 @@ eval {
   judges {
     judge "deliverable exists" { exec "test -f $CATALOG/worker/DONE" }
     judge "deliverable content" { file "worker/DONE" has "resolved" }
+    judge "one native bus root" {
+      exec "test \"$ST_ROOT\" = \"$CATALOG\" && test \"$(cat $CATALOG/sup/ST_ROOT)\" = \"$CATALOG\" && test \"$(cat $CATALOG/worker/ST_ROOT)\" = \"$CATALOG\""
+    }
+    judge "no legacy split bus" {
+      exec "test ! -e $CATALOG/smalltalk/t.sup/inbox && test ! -e $CATALOG/smalltalk/t.worker/inbox && test ! -e $CATALOG/smalltalk/requester/inbox"
+    }
   }
 }
 "#,
@@ -71,6 +79,7 @@ eval {
         r#"#!/bin/sh
 sleep 0.4
 mkdir -p "$CATALOG/worker"
+printf '%s\n' "$ST_ROOT" > "$CATALOG/worker/ST_ROOT"
 echo "resolved by t.worker" > "$CATALOG/worker/DONE"
 st2 message send t.sup --root "$ST_ROOT" --as t.worker -m "worker done" >/dev/null 2>&1
 sleep 60
@@ -81,6 +90,7 @@ sleep 60
     std::fs::write(
         fixture.join("scripts/sup.sh"),
         r#"#!/bin/sh
+printf '%s\n' "$ST_ROOT" > "$CATALOG/sup/ST_ROOT"
 for _ in $(seq 1 150); do
   n=$(st2 message ls t.sup --root "$ST_ROOT" --from requester --count 2>/dev/null || echo 0)
   [ "$n" -gt 0 ] && break
@@ -114,7 +124,7 @@ sleep 60
     assert!(stdout.contains("VERDICT: PASS"), "expected PASS:\n--stdout--\n{stdout}\n--stderr--\n{stderr}");
     assert!(out.status.success(), "exit non-zero:\n{stdout}\n{stderr}");
     // Both judges (bash + declarative) passed.
-    assert!(stdout.contains("SCORE: 2 PASS / 0 FAIL"), "expected 2/0:\n{stdout}");
+    assert!(stdout.contains("SCORE: 4 PASS / 0 FAIL"), "expected 4/0:\n{stdout}");
 }
 
 /// Under `supervise`, teardown reaps RUNTIME-spawned seats too (the team-standup pattern: a seat spins

@@ -148,6 +148,26 @@ st2 reads only the runner-normative subset — `identity`, `host`, `type`, `work
   st2-native unified `resources/inbox` (+ `st ding` → `st2 ding`), its own milestone needing its own
   parity/neutrality proof (M2's wire-compatible bus is the head start).
 
+### Native eval bus contract
+
+A native eval does not need to author `ST_ROOT`. `st2 eval` gives its kickoff, agent tasks, bare
+`ding` sidecars, requester replies, and judges one flat ephemeral catalog root. A top-level explicit
+`ST_ROOT` remains an override for compatibility or deliberately partitioned test cases.
+
+The Codex-native reference cells are pinned at evals commit
+[`ace73881`](https://github.com/compoundingtech/evals/commit/ace73881be68681700646cf9cdca9e0a61c2fcf1):
+
+- [`license-mit-codex`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/cells/license-mit-codex/license-mit-codex.kdl)
+- [`signal-rename-codex`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/cells/signal-rename-codex/signal-rename-codex.kdl)
+- [`ghost-bug-codex`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/cells/ghost-bug-codex/ghost-bug-codex.kdl)
+- [`poisoned-pr-codex`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/cells/poisoned-pr-codex/poisoned-pr-codex.kdl)
+- [`fork-in-the-road-codex`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/cells/fork-in-the-road-codex/fork-in-the-road-codex.kdl)
+
+The usage-aware support/run ledger is
+[`HARNESS-MATRIX.md`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/HARNESS-MATRIX.md);
+the executable native/persona gate is
+[`bin/check-codex-native.sh`](https://github.com/compoundingtech/evals/blob/ace73881be68681700646cf9cdca9e0a61c2fcf1/bin/check-codex-native.sh).
+
 ## Running as a service (headless Linux)
 
 On a headless host (like hetz) install the supervisor as a systemd-user unit — the direct

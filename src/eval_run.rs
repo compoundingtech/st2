@@ -262,11 +262,12 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The bus root — the spec's top-level `ST_ROOT` with `$CATALOG` expanded, else `<catalog>/smalltalk`.
+/// The bus root — the spec's top-level `ST_ROOT` with `$CATALOG` expanded, else the native flat
+/// catalog root. Task runners use that same flat root when no task-level `ST_ROOT` is authored.
 fn bus_root(spec: &Spec, catalog: &Path) -> PathBuf {
     match spec.env.get("ST_ROOT") {
         Some(v) => PathBuf::from(expand_catalog(v, catalog)),
-        None => catalog.join("smalltalk"),
+        None => catalog.to_path_buf(),
     }
 }
 
@@ -1097,7 +1098,11 @@ mod tests {
         let s = parse_spec("env { ST_ROOT \"$CATALOG/bus\" }\nagent \"a\" { command \"run\" }").unwrap();
         assert_eq!(bus_root(&s, Path::new("/tmp/cat")), PathBuf::from("/tmp/cat/bus"));
         let s2 = parse_spec(r#"agent "a" { command "run" }"#).unwrap();
-        assert_eq!(bus_root(&s2, Path::new("/tmp/cat")), PathBuf::from("/tmp/cat/smalltalk"));
+        assert_eq!(
+            bus_root(&s2, Path::new("/tmp/cat")),
+            PathBuf::from("/tmp/cat"),
+            "a native eval with no authored ST_ROOT shares the task runtime's flat catalog bus"
+        );
     }
 
     #[test]
