@@ -65,9 +65,10 @@ The compact declaration shape is:
 ```kdl
 agent "<identity>" {
   host "<host>"
-  role "worker"
   workspace "<workspace>"
-  supervisor "<supervisor-bus-id>"
+  // Optional metadata:
+  // role "worker"
+  // supervisor "<supervisor-bus-id>"
   env { ST_AGENT "<host>.<identity>" }
   command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
   ding
@@ -142,6 +143,17 @@ st2 agents --json --enrich
 st2 context read --full
 ```
 
+For a catalog-backed agent, every native bus operation resolves the same agent directory used by
+the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
+links live under `<agent-dir>/resources/`. The flat `<root>/<identity>` layout remains only as the
+intentional catalog-less fallback used by isolated folder evals.
+
+Adopters should cut directly to this native layout rather than stage through a retired compatibility
+transport. Before launching a migrated identity, install and verify hooks, validate and materialize
+its hand-authored declaration, stop the predecessor transport, and decide how any unread legacy
+backlog will be archived or forwarded. Never run old and native DING owners concurrently for the same
+identity.
+
 Native DING watches the recipient inbox and safely stages:
 
 ```text
@@ -181,15 +193,18 @@ message, ding, agents, status, context, resource
 env, pty, shell, pretrust
 hooks, service, eval
 compile-agent (experimental)
+completions
 ```
 
-The project ships no completion or manpage generator.
+`st2 completions <shell>` emits completions from the live command tree. No generated completion or
+manpage tree is committed.
 
 ## Clean-room verification
 
-The test suite builds a temporary `PATH` containing only the current `st2` binary plus `pty`,
-`codex`, and `claude` shims. It verifies the supported help/doctor/native authoring surface without
-any retired binary:
+The test suite builds a temporary `PATH` containing only the current `st2` binary, required Git,
+and `pty`, `codex`, and `claude` shims. It installs and verifies a scratch hook receipt, instantiates
+both maintained hand-authored KDL examples in fresh Git workspaces, validates and materializes them
+twice, and verifies the help/doctor/native authoring surface without any retired binary:
 
 ```sh
 cargo test --test native_only --all-features
@@ -204,7 +219,7 @@ cargo test --all-targets --all-features
 
 ## Eval corpus
 
-The evidence ledger is pinned at
+The Codex evidence ledger is pinned at
 [`67b45d2694ac40762b09f51bf625d092ab68de74`](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/HARNESS-MATRIX.md).
 
 Current native Codex examples:
@@ -219,14 +234,21 @@ Current native Codex examples:
 The pinned [native static checker](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/bin/check-codex-native.sh)
 does not consume model usage.
 
-Claude corpus references are historical and are not native-current examples:
+The Claude native-readiness ledger is pinned at
+[`a52b68dfe4bdb65a3bb6a1ba51c674476cf197df`](https://github.com/compoundingtech/evals/blob/a52b68dfe4bdb65a3bb6a1ba51c674476cf197df/CLAUDE-NATIVE-READINESS.md).
+Its current event-first native examples and gates are immutable at
+[`56b86a04837dc176f1a53d9f90dee3f3a7e57499`](https://github.com/compoundingtech/evals/commit/56b86a04837dc176f1a53d9f90dee3f3a7e57499):
 
-- [`ding-reply`](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/cells/ding-reply/ding-reply.kdl):
-  free syntax gate `bash -n cells/ding-reply/judges/*.sh`; authoritative run
-  `st2 eval ./cells/ding-reply/ --keep`, opt-in paid.
-- [`team-standup`](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/cells/team-standup/team-standup.kdl):
-  free syntax gate `bash -n cells/team-standup/judges/*.sh`; authoritative run
-  `st2 eval ./cells/team-standup/ --keep`, opt-in paid.
+- [`ding-reply`](https://github.com/compoundingtech/evals/blob/56b86a04837dc176f1a53d9f90dee3f3a7e57499/cells/ding-reply/ding-reply.kdl):
+  one Claude seat with a native bare `ding`.
+- [`signal-rename`](https://github.com/compoundingtech/evals/blob/56b86a04837dc176f1a53d9f90dee3f3a7e57499/cells/signal-rename/signal-rename.kdl):
+  one Claude supervisor and three specialists, each with a native bare `ding`.
 
-There is currently no native-current Claude eval KDL or free authoritative folder-eval parser.
-Claude conversion, a native static gate, and an explicitly authorized current-build run remain open.
+Run `bin/check-claude-native.sh` and `bin/check-claude-reset.sh` from that tree for the free static
+acceptance. The gates reject polling language and legacy bus declarations, require event-first DING
+guidance, and prove repeatable clean fixture resets. They do not invoke a model. A current-build
+`st2 eval` model run remains pending explicit authorization, so these examples have static acceptance
+but no current native live-smoke claim.
+
+[`team-standup`](https://github.com/compoundingtech/evals/blob/a52b68dfe4bdb65a3bb6a1ba51c674476cf197df/cells/team-standup/team-standup.kdl)
+remains a legacy reference to the retired generated-declaration flow, not a current native example.

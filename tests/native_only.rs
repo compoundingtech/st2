@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,6 +10,12 @@ fn executable(path: &Path, body: &str) {
 
 fn clean_path() -> tempfile::TempDir {
     let bin = tempfile::tempdir().unwrap();
+    symlink(env!("CARGO_BIN_EXE_st2"), bin.path().join("st2")).unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("the native authoring guide requires git on PATH");
+    symlink(git, bin.path().join("git")).unwrap();
     executable(
         &bin.path().join("pty"),
         "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then printf '[]\\n'; fi\nexit 0\n",
@@ -17,6 +23,19 @@ fn clean_path() -> tempfile::TempDir {
     executable(&bin.path().join("codex"), "#!/bin/sh\nexit 0\n");
     executable(&bin.path().join("claude"), "#!/bin/sh\nexit 0\n");
     bin
+}
+
+fn clean_st2(bin: &Path, state: &Path, hooks: &Path) -> Command {
+    let mut command = Command::new(bin.join("st2"));
+    command
+        .env("PATH", bin)
+        .env("XDG_STATE_HOME", state)
+        .env("ST_HOOKS", hooks)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .env_remove("ST_AGENT");
+    command
 }
 
 fn native_catalog(root: &Path, workspace: &Path) {
@@ -31,6 +50,193 @@ fn native_catalog(root: &Path, workspace: &Path) {
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn clean_path_executes_the_maintained_native_authoring_guide() {
+    let bin = clean_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let hooks = tmp.path().join("hooks");
+    let catalog = tmp.path().join("catalog");
+    let codex_workspace = tmp.path().join("codex-workspace");
+    let claude_workspace = tmp.path().join("claude-workspace");
+    fs::create_dir_all(catalog.join("agents/clean/codex")).unwrap();
+    fs::create_dir_all(catalog.join("agents/clean/claude")).unwrap();
+    fs::create_dir_all(catalog.join("_templates")).unwrap();
+    fs::create_dir_all(&codex_workspace).unwrap();
+    fs::create_dir_all(&claude_workspace).unwrap();
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let codex = fs::read_to_string(manifest.join("examples/native/agent-codex.kdl"))
+        .unwrap()
+        .replace("<identity>", "codex")
+        .replace("<host>", "clean")
+        .replace("<workspace>", &codex_workspace.display().to_string())
+        .replace("<boot prompt>", "boot");
+    let claude = fs::read_to_string(manifest.join("examples/native/agent-claude.kdl"))
+        .unwrap()
+        .replace("<identity>", "claude")
+        .replace("<host>", "clean")
+        .replace("<workspace>", &claude_workspace.display().to_string())
+        .replace("<boot prompt>", "boot");
+    fs::write(
+        catalog.join("agents/clean/codex/agent.kdl"),
+        codex.as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("agents/clean/claude/agent.kdl"),
+        claude.as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("_templates/clean.codex.AGENTS.md"),
+        "# Clean Codex agent\n",
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("_templates/clean.claude.persona.md"),
+        "# Clean Claude persona\n",
+    )
+    .unwrap();
+    fs::copy(
+        manifest.join("templates/bus.st2.md"),
+        catalog.join("_templates/bus.st2.md"),
+    )
+    .unwrap();
+
+    for workspace in [&codex_workspace, &claude_workspace] {
+        let git = Command::new(bin.path().join("git"))
+            .args(["init", "-q"])
+            .arg(workspace)
+            .env("PATH", bin.path())
+            .status()
+            .unwrap();
+        assert!(git.success());
+    }
+
+    let install = clean_st2(bin.path(), &state, &hooks)
+        .args(["hooks", "install"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let verify = clean_st2(bin.path(), &state, &hooks)
+        .args(["hooks", "verify"])
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let validate = clean_st2(bin.path(), &state, &hooks)
+        .arg("validate")
+        .arg("--catalog")
+        .arg(&catalog)
+        .output()
+        .unwrap();
+    assert!(
+        validate.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&validate.stdout),
+        String::from_utf8_lossy(&validate.stderr)
+    );
+
+    let materialize = || {
+        clean_st2(bin.path(), &state, &hooks)
+            .arg("up")
+            .arg("--catalog")
+            .arg(&catalog)
+            .args(["--host", "clean", "--materialize-only"])
+            .output()
+            .unwrap()
+    };
+    let first = materialize();
+    assert!(
+        first.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let codex_settings = fs::read(codex_workspace.join(".codex/hooks.json")).unwrap();
+    let claude_settings = fs::read(claude_workspace.join(".claude/settings.local.json")).unwrap();
+    let second = materialize();
+    assert!(
+        second.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read(codex_workspace.join(".codex/hooks.json")).unwrap(),
+        codex_settings
+    );
+    assert_eq!(
+        fs::read(claude_workspace.join(".claude/settings.local.json")).unwrap(),
+        claude_settings
+    );
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(hooks.join("current.json")).unwrap()).unwrap();
+    let selected = hooks.join(receipt["directory"].as_str().unwrap());
+    for (settings, names) in [
+        (
+            serde_json::from_slice::<serde_json::Value>(&codex_settings).unwrap(),
+            vec![
+                "codex-session-start.sh",
+                "codex-pre-compact.sh",
+                "codex-stop.sh",
+            ],
+        ),
+        (
+            serde_json::from_slice::<serde_json::Value>(&claude_settings).unwrap(),
+            vec![
+                "claude-session-start.sh",
+                "claude-pre-compact.sh",
+                "claude-stop-failure.sh",
+            ],
+        ),
+    ] {
+        let encoded = settings.to_string();
+        for name in names {
+            assert!(
+                encoded.contains(&selected.join(name).display().to_string()),
+                "{name} did not resolve into {}:\n{encoded}",
+                selected.display()
+            );
+        }
+    }
+
+    assert_eq!(
+        fs::read_to_string(codex_workspace.join("AGENTS.md")).unwrap(),
+        "# Clean Codex agent\n"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_workspace.join(".st2/PERSONA.md")).unwrap(),
+        "# Clean Claude persona\n"
+    );
+    for workspace in [&codex_workspace, &claude_workspace] {
+        let status = Command::new(bin.path().join("git"))
+            .arg("-C")
+            .arg(workspace)
+            .args(["status", "--porcelain"])
+            .env("PATH", bin.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "{} was left dirty:\n{}",
+            workspace.display(),
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
 }
 
 #[test]
@@ -53,7 +259,14 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         .unwrap();
     assert!(help.status.success());
     let help = String::from_utf8_lossy(&help.stdout);
-    for command in ["validate", "message", "ding", "hooks", "compile-agent"] {
+    for command in [
+        "validate",
+        "message",
+        "ding",
+        "hooks",
+        "compile-agent",
+        "completions",
+    ] {
         assert!(help.contains(command), "missing {command} in help:\n{help}");
     }
     for removed in [
