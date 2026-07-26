@@ -258,20 +258,92 @@ fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
     let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
-    std::fs::create_dir_all(&cell).unwrap();
+    let fixture = cell.join("fixture");
+    std::fs::create_dir_all(fixture.join("scripts")).unwrap();
     // Chain: cd.worker → cd.sup → cd.cos (root). worker CRASHES (exit 1) → ding up to sup AND cos;
-    // `clean` exits 0 → stays silent. sup/cos idle. No done signal → times out (bounded).
+    // `clean` exits 0 → stays silent. A clean sentinel exits only after kickoff; its supervisor-driven
+    // respawn proves that at least one supervise tick observed worker + clean alive. Only then does the
+    // sup release those two seats, so neither can race the boot gate or the `ever_alive` classification
+    // under load. Their second launches report that both exits were observed and respawned.
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 team "cd" {
-  agent "worker" { supervisor "cd.sup"; env { ST_AGENT "cd.worker" }; command "sh -c 'sleep 2; exit 1'" }
-  agent "clean"  { supervisor "cd.cos"; env { ST_AGENT "cd.clean" }; command "sh -c 'sleep 2; exit 0'" }
-  agent "sup"    { supervisor "cd.cos"; env { ST_AGENT "cd.sup" }; command "sleep 100000" }
+  agent "gate"   { supervisor "cd.cos"; env { ST_AGENT "cd.gate" }; command "sh $CATALOG/scripts/gate.sh" }
+  agent "worker" { supervisor "cd.sup"; env { ST_AGENT "cd.worker" }; command "sh $CATALOG/scripts/worker.sh" }
+  agent "clean"  { supervisor "cd.cos"; env { ST_AGENT "cd.clean" }; command "sh $CATALOG/scripts/clean.sh" }
+  agent "sup"    { supervisor "cd.cos"; env { ST_AGENT "cd.sup" }; command "sh $CATALOG/scripts/sup.sh" }
   agent "cos"    { env { ST_AGENT "cd.cos" }; command "sleep 100000" }
 }
-eval { message { from "runner"; to "cd.sup"; content "go" }; max-timeout "8s"; supervise; judges { judge "ok" { exec "true" } } }
+eval {
+  copy "./fixture"
+  message { from "runner"; to "cd.sup"; content "go" }
+  max-timeout "20s"
+  supervise
+  judges { judge "ok" { exec "true" } }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/gate.sh"),
+        r#"#!/bin/sh
+while [ ! -e "$CATALOG/release-gate-after-kickoff" ]; do sleep 0.05; done
+if mkdir "$CATALOG/gate-exited-once" 2>/dev/null; then
+  exit 0
+fi
+st2 message send cd.sup --root "$ST_ROOT" --as cd.gate -m "supervise tick completed" >/dev/null 2>&1
+sleep 100000
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/worker.sh"),
+        r#"#!/bin/sh
+while [ ! -e "$CATALOG/release-after-supervise-tick" ]; do sleep 0.05; done
+if mkdir "$CATALOG/worker-exited-once" 2>/dev/null; then
+  exit 1
+fi
+st2 message send cd.sup --root "$ST_ROOT" --as cd.worker -m "worker respawned after crash" >/dev/null 2>&1
+sleep 100000
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/clean.sh"),
+        r#"#!/bin/sh
+while [ ! -e "$CATALOG/release-after-supervise-tick" ]; do sleep 0.05; done
+if mkdir "$CATALOG/clean-exited-once" 2>/dev/null; then
+  exit 0
+fi
+st2 message send cd.sup --root "$ST_ROOT" --as cd.clean -m "clean seat respawned" >/dev/null 2>&1
+sleep 100000
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/sup.sh"),
+        r#"#!/bin/sh
+wait_from() {
+  from=$1
+  for _ in $(seq 1 160); do
+    count=$(st2 message ls cd.sup --root "$ST_ROOT" --from "$from" --count 2>/dev/null || echo 0)
+    [ "$count" -gt 0 ] 2>/dev/null && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+wait_from runner || exit 2
+: > "$CATALOG/release-gate-after-kickoff"
+wait_from cd.gate || exit 3
+: > "$CATALOG/release-after-supervise-tick"
+wait_from st2 || exit 4
+wait_from cd.worker || exit 5
+wait_from cd.clean || exit 6
+st2 message send runner --root "$ST_ROOT" --as cd.sup -m "both supervised exits classified" >/dev/null 2>&1
+sleep 100000
 "#,
     )
     .unwrap();
@@ -288,6 +360,10 @@ eval { message { from "runner"; to "cd.sup"; content "go" }; max-timeout "8s"; s
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("team signalled done"),
+        "post-boot exit/respawn handshake didn't complete:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
     // (b) the crash escalates to BOTH the direct supervisor and the root cos.
     assert!(
         stdout.contains("crash-ding: cd.worker → cd.sup"),
@@ -298,20 +374,14 @@ eval { message { from "runner"; to "cd.sup"; content "go" }; max-timeout "8s"; s
         "crash didn't reach the root cos:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
     // (c) the clean-exit seat produces NO ding.
-    assert!(!stdout.contains("crash-ding: cd.clean"), "a clean exit (0) must NOT crash-ding:\n{stdout}");
-
-    // Clean up any survivors (sup/cos sleeps + per-task scopes).
-    for id in ["cd.worker", "cd.clean", "cd.sup", "cd.cos"] {
-        let _ = Command::new("pkill").args(["-9", "-f", &format!("ST_AGENT={id}")]).status();
-    }
-    let _ = Command::new("pkill").args(["-9", "-f", "sleep 100000"]).status();
-    if let Ok(o) = Command::new("systemctl").args(["--user", "list-units", "--no-legend", "st2-cd.*"]).output() {
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            if let Some(unit) = line.split_whitespace().next() {
-                let _ = Command::new("systemctl").args(["--user", "stop", unit]).status();
-            }
-        }
-    }
+    assert!(
+        !stdout.contains("crash-ding: cd.clean"),
+        "a clean exit (0) must NOT crash-ding:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("crash-ding: cd.gate"),
+        "the clean gate exit (0) must NOT crash-ding:\n{stdout}"
+    );
 }
 
 /// A seat whose command exits at boot (127 command-not-found, crash) must fail the eval FAST + loudly,
