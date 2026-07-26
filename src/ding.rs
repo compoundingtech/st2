@@ -158,6 +158,11 @@ pub trait Poker {
     /// Try to inject and submit `text`. Unsafe pane state returns [`PokeOutcome::Deferred`] without
     /// sending Return; transport/inspection failures are errors and are retried by the watch loop.
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
+    /// On sidecar startup, recover at most one notice that is already visibly staged and still
+    /// present in the seeded unread backlog. The default is inert for fake and legacy pokers.
+    fn recover_seeded(&self, _backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
+        Ok(PokeOutcome::Deferred)
+    }
     /// True while the target pty session still exists — the ding exits cleanly once it's gone.
     fn session_alive(&self) -> bool;
 }
@@ -251,6 +256,17 @@ impl PtyPoker {
 impl Poker for PtyPoker {
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
         self.poke_with(text, &mut || Ok(()))
+    }
+
+    fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
+        if self.mode != DeliveryMode::CodexGuarded || backlog.is_empty() {
+            return Ok(PokeOutcome::Deferred);
+        }
+        let screen = self.peek()?;
+        let Some(text) = exact_staged_backlog_notice(&screen, backlog) else {
+            return Ok(PokeOutcome::Deferred);
+        };
+        self.poke_with(&text, &mut || Ok(()))
     }
 
     fn session_alive(&self) -> bool {
@@ -457,6 +473,21 @@ fn classify_pane(screen: &str, expected: &str) -> PaneState {
 
 fn looks_like_dismissible_plan_modal(plain: &str) -> bool {
     collapse_whitespace(plain).contains("Create a plan? shift+tab use Plan mode esc dismiss")
+}
+
+/// Select one seeded unread notice only when that exact full DING is already in the bottom composer.
+/// Stable ids make two matches impossible in a valid backlog, but ambiguity still fails closed.
+fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<String> {
+    let mut matches = backlog.iter().filter_map(|msg| {
+        let text = poke_text(msg);
+        matches!(
+            classify_pane(screen, &text),
+            PaneState::Staged | PaneState::DismissiblePlanModal
+        )
+        .then_some(text)
+    });
+    let one = matches.next()?;
+    matches.next().is_none().then_some(one)
 }
 
 fn looks_like_choice_menu(plain: &str) -> bool {
@@ -706,9 +737,10 @@ impl Default for DingConfig {
 }
 
 /// Watch `inbox_dir` and poke `poker` on each new arrival until `stop` is set or the target session is
-/// gone. Existing inbox contents are seeded as already-seen (no startup poke storm). Unsafe pane or
-/// `busy`/`dnd` status defers in FIFO order; transport failures retain the head for retry. A message
-/// archived while deferred is pruned before delivery.
+/// gone. Existing inbox contents are seeded as already-seen (no startup poke storm). On the first
+/// live/available pass only, one seeded message may resume if its exact full DING is already staged
+/// in the bottom composer. Unsafe pane or `busy`/`dnd` status defers in FIFO order; transport failures
+/// retain the head for retry. A message archived while deferred is pruned before delivery.
 pub fn run_ding(
     inbox_dir: &Path,
     status_path: Option<&Path>,
@@ -736,6 +768,7 @@ pub fn run_ding(
         "st2 ding: ready — seeded {} existing message(s) as already-seen; watching for new arrivals.",
         backlog.len()
     );
+    let mut seeded_recovery = Some(backlog);
 
     let mut watch = SessionWatch::default();
     let mut logged_waiting = false;
@@ -758,6 +791,22 @@ pub fn run_ding(
             {
                 let _ = status::refresh(sp); // best-effort — a hiccup must not kill the sidecar
                 last_refresh = Some(Instant::now());
+            }
+            if !delivery_suppressed(status_path)
+                && let Some(mut backlog) = seeded_recovery.take()
+            {
+                retain_current_messages(inbox_dir, &mut backlog);
+                match poker.recover_seeded(&backlog) {
+                    Ok(PokeOutcome::Delivered) => {
+                        eprintln!(
+                            "st2 ding: resumed one exact staged message from the seeded inbox."
+                        );
+                    }
+                    Ok(PokeOutcome::Deferred) => {}
+                    Err(error) => {
+                        eprintln!("st2 ding: seeded staged-message recovery failed: {error}")
+                    }
+                }
             }
             // Only scan once the target is up: arrivals during the startup race stay unseen and are
             // queued on the first live pass, so nothing is lost to the launch gap.
@@ -786,6 +835,15 @@ pub fn run_ding(
     Ok(())
 }
 
+fn retain_current_messages(inbox_dir: &Path, messages: &mut Vec<Message>) {
+    let Ok(current) = message::list_inbox(inbox_dir) else {
+        messages.clear();
+        return;
+    };
+    let filenames: HashSet<&str> = current.iter().map(|msg| msg.filename.as_str()).collect();
+    messages.retain(|msg| filenames.contains(msg.filename.as_str()));
+}
+
 fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<Message>) {
     let Ok(current) = message::list_inbox(inbox_dir) else {
         return;
@@ -794,13 +852,17 @@ fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<Message>) {
     pending.retain(|msg| filenames.contains(msg.filename.as_str()));
 }
 
-fn flush_pending(status_path: Option<&Path>, pending: &mut VecDeque<Message>, poker: &dyn Poker) {
-    if status_path.is_some_and(|path| {
+fn delivery_suppressed(status_path: Option<&Path>) -> bool {
+    status_path.is_some_and(|path| {
         matches!(
             status::read_state(path),
             status::State::Busy | status::State::Dnd
         )
-    }) {
+    })
+}
+
+fn flush_pending(status_path: Option<&Path>, pending: &mut VecDeque<Message>, poker: &dyn Poker) {
+    if delivery_suppressed(status_path) {
         return;
     }
 
@@ -1049,6 +1111,48 @@ mod tests {
             classify_pane(&historical, expected),
             PaneState::Staged,
             "a historical plan prompt above the bottom composer is not a live modal"
+        );
+    }
+
+    #[test]
+    fn seeded_recovery_matches_exactly_one_visible_unread_notice() {
+        let exact = msg("1714826789012-k0ygwh.md", "cos", Some("safety"));
+        let other = msg("1714826789013-abc123.md", "alice", Some("other"));
+        let expected = poke_text(&exact);
+        let backlog = [other.clone(), exact.clone()];
+
+        assert_eq!(
+            exact_staged_backlog_notice(&plan_modal_codex_screen(&expected), &backlog),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&staged_codex_screen(&expected), &backlog),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen("half-written human request"),
+                &backlog
+            ),
+            None
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&modal_codex_screen(&expected), &backlog),
+            None,
+            "a generic choice modal remains blocked"
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen(&expected),
+                std::slice::from_ref(&other)
+            ),
+            None,
+            "visible text must still be an unread inbox message"
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&staged_codex_screen(&expected), &[exact.clone(), exact]),
+            None,
+            "an ambiguous duplicate match fails closed"
         );
     }
 
@@ -1325,6 +1429,24 @@ mod tests {
                 vec!["escape"],
                 PokeOutcome::Deferred,
             ),
+            (
+                VecDeque::from([
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                ]),
+                vec!["escape"],
+                PokeOutcome::Deferred,
+            ),
+            (
+                VecDeque::from([
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                    modal_codex_screen(expected),
+                ]),
+                vec!["escape"],
+                PokeOutcome::Deferred,
+            ),
         ] {
             let screens = RefCell::new(after_escape);
             let actions = RefCell::new(Vec::new());
@@ -1587,6 +1709,66 @@ mod tests {
         assert_eq!(
             crate::status::read_state(&sp),
             crate::status::State::Available
+        );
+    }
+
+    #[test]
+    fn startup_recovers_seeded_backlog_once_only_after_dnd_clears() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecoveryPoker {
+            recoveries: Mutex<Vec<Vec<String>>>,
+            ordinary_pokes: Mutex<Vec<String>>,
+        }
+        impl Poker for RecoveryPoker {
+            fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+                self.ordinary_pokes.lock().unwrap().push(text.to_string());
+                Ok(PokeOutcome::Delivered)
+            }
+            fn recover_seeded(&self, backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
+                self.recoveries
+                    .lock()
+                    .unwrap()
+                    .push(backlog.iter().map(|msg| msg.filename.clone()).collect());
+                Ok(PokeOutcome::Delivered)
+            }
+            fn session_alive(&self) -> bool {
+                true
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let status_path = crate::status::status_path(tmp.path());
+        crate::status::set_state(&status_path, crate::status::State::Dnd).unwrap();
+        let filename = send_to_inbox(&inbox, "alice", Some("seeded"), None, &[], "hi").unwrap();
+        let stop = AtomicBool::new(false);
+        let poker = RecoveryPoker::default();
+        let config = DingConfig {
+            poll: Duration::from_millis(5),
+            status_refresh: Duration::from_secs(60),
+            delivery_mode: DeliveryMode::CodexGuarded,
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                crate::status::set_state(&status_path, crate::status::State::Available).unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+                stop.store(true, Ordering::SeqCst);
+            });
+            run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
+        });
+
+        assert_eq!(
+            poker.recoveries.lock().unwrap().as_slice(),
+            [vec![filename]],
+            "the seeded backlog is offered for exact recovery once"
+        );
+        assert!(
+            poker.ordinary_pokes.lock().unwrap().is_empty(),
+            "startup recovery never replays the backlog as ordinary arrivals"
         );
     }
 

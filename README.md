@@ -139,7 +139,9 @@ Consumers must key on the `[DING]` prefix and stable id, not descriptive words. 
 bracketed-pastes without Return, re-inspects the bottom-most composer, and submits only the exact
 staged notice. For the exact idle `Create a plan? … esc dismiss` prompt only, st2 confirms the same
 modal twice, sends Escape without Return, and re-inspects before delivery. Every other modal, active
-turn, draft, `busy`, or `dnd` state defers.
+turn, draft, `busy`, or `dnd` state defers. After a DING-sidecar restart, st2 can resume one notice
+only when the bottom composer exactly matches one still-unread seeded inbox message; it never replays
+the seeded backlog.
 
 ## Cleanup
 
