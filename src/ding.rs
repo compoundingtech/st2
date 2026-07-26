@@ -1101,6 +1101,10 @@ struct PendingMessage {
     staged_text: Option<String>,
     in_inbox: bool,
     origin: PendingOrigin,
+    /// Consecutive flushes this message has been deferred on. A guarded pane that never presents an
+    /// idle composer defers forever, and a deferral owns no input and changes no state — so without
+    /// this the sidecar is silent and an undeliverable agent looks exactly like an idle one.
+    deferrals: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,6 +1120,7 @@ impl PendingMessage {
             staged_text: None,
             in_inbox: true,
             origin: PendingOrigin::Arrival,
+            deferrals: 0,
         }
     }
 
@@ -1125,6 +1130,7 @@ impl PendingMessage {
             staged_text: Some(text),
             in_inbox: true,
             origin: PendingOrigin::Seeded,
+            deferrals: 0,
         }
     }
 }
@@ -1173,6 +1179,7 @@ fn flush_pending(
             }
             Ok(PokeOutcome::Staged) => {
                 head.staged_text = Some(text);
+                head.deferrals = 0;
                 break;
             }
             Ok(PokeOutcome::Deferred) if was_staged => {
@@ -1181,17 +1188,46 @@ fn flush_pending(
                 // later fresh guarded attempt, but seeded startup backlog is never replayed.
                 if head.in_inbox && head.origin == PendingOrigin::Arrival {
                     head.staged_text = None;
+                    head.deferrals = head.deferrals.saturating_add(1);
+                    report_deferral(head);
                     break;
                 }
                 pending.pop_front();
             }
-            Ok(PokeOutcome::Deferred) => break,
+            Ok(PokeOutcome::Deferred) => {
+                head.deferrals = head.deferrals.saturating_add(1);
+                report_deferral(head);
+                break;
+            }
             Err(e) => {
                 eprintln!("st2 ding: {e}");
                 break;
             }
         }
     }
+}
+
+/// A pane the guard never finds safe defers on every poll, forever, in silence — so a genuinely
+/// undeliverable agent (a guarded mode against a pane that will never present the expected composer)
+/// is indistinguishable from an idle one through every surface st2 exposes. Say so, at the threshold
+/// and then at a widening interval, so a busy pane stays quiet but a stuck one does not.
+fn report_deferral(head: &PendingMessage) {
+    if !should_report_deferral(head.deferrals) {
+        return;
+    }
+    eprintln!(
+        "st2 ding: message {} still undelivered after {} deferred attempt(s) — the target pane has \
+         not been in a state this delivery mode will write to.",
+        head.message.filename, head.deferrals
+    );
+}
+
+/// Report at [`DEFERRAL_REPORT_AFTER`], then on each further multiple of it. Bounded, and never on
+/// the ordinary transient deferral of a pane that is merely mid-turn.
+const DEFERRAL_REPORT_AFTER: u32 = 30;
+
+fn should_report_deferral(deferrals: u32) -> bool {
+    deferrals >= DEFERRAL_REPORT_AFTER && deferrals % DEFERRAL_REPORT_AFTER == 0
 }
 
 /// Set by SIGINT/SIGTERM so `st2 ding` exits cleanly when st2 tears the sidecar down.
@@ -3150,5 +3186,81 @@ mod tests {
         let mut restarted_seen = HashSet::new();
         assert!(new_arrivals(&inbox, &mut restarted_seen).is_empty());
         assert!(restarted_seen.is_empty());
+    }
+
+    /// A guarded pane that never becomes safe defers on every poll and owns no input, so nothing
+    /// about the sidecar changes and an undeliverable agent reads as an idle one. Deferrals have to
+    /// accumulate on the head, and the accumulation has to reach a reporting threshold.
+    #[test]
+    fn a_head_that_never_delivers_accumulates_deferrals_and_is_reported() {
+        struct AlwaysDeferring;
+        impl Poker for AlwaysDeferring {
+            fn poke(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
+                Ok(PokeOutcome::Deferred)
+            }
+            fn session_alive(&self) -> bool {
+                true
+            }
+        }
+
+        let mut pending =
+            VecDeque::from([PendingMessage::new(msg("1700000000000-abc123.md", "alice", None))]);
+        let poker = AlwaysDeferring;
+
+        for expected in 1..=DEFERRAL_REPORT_AFTER {
+            flush_pending(None, &mut pending, &poker);
+            assert_eq!(pending.len(), 1, "an undeliverable head stays queued");
+            assert_eq!(
+                pending.front().unwrap().deferrals,
+                expected,
+                "each deferral must be counted, not silently dropped"
+            );
+        }
+
+        // Quiet for the ordinary transient deferral, loud once the pane is plainly not accepting.
+        assert!(!should_report_deferral(1));
+        assert!(!should_report_deferral(DEFERRAL_REPORT_AFTER - 1));
+        assert!(should_report_deferral(DEFERRAL_REPORT_AFTER));
+        assert!(!should_report_deferral(DEFERRAL_REPORT_AFTER + 1));
+        assert!(should_report_deferral(DEFERRAL_REPORT_AFTER * 2));
+    }
+
+    /// A delivery resets the count, so an intermittently busy pane never drifts into the report.
+    #[test]
+    fn a_delivery_clears_accumulated_deferrals() {
+        struct ScriptedOnce {
+            outcomes: Mutex<VecDeque<PokeOutcome>>,
+        }
+        impl Poker for ScriptedOnce {
+            fn poke(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
+                Ok(self.outcomes.lock().unwrap().pop_front().unwrap())
+            }
+            fn session_alive(&self) -> bool {
+                true
+            }
+        }
+
+        let mut pending = VecDeque::from([
+            PendingMessage::new(msg("1700000000000-abc123.md", "alice", None)),
+            PendingMessage::new(msg("1700000000001-def456.md", "bob", None)),
+        ]);
+        let poker = ScriptedOnce {
+            outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Deferred,
+                PokeOutcome::Delivered,
+                PokeOutcome::Deferred,
+            ])),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.front().unwrap().deferrals, 1);
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 1, "the head delivered");
+        assert_eq!(
+            pending.front().unwrap().deferrals,
+            1,
+            "the new head starts its own count"
+        );
     }
 }
