@@ -140,8 +140,11 @@ bracketed-pastes without Return, re-inspects the bottom-most composer, and submi
 staged notice. For the exact idle `Create a plan? … esc dismiss` prompt only, st2 confirms the same
 modal twice, sends Escape without Return, and re-inspects before delivery. Every other modal, active
 turn, draft, `busy`, or `dnd` state defers. After a DING-sidecar restart, st2 can resume one notice
-only when the bottom composer exactly matches one still-unread seeded inbox message; it never replays
-the seeded backlog.
+only when the visible bottom composer starts with `[DING]` and its stable id names exactly one
+still-unread seeded inbox message. Only the description before `[id:…]` may differ across a rolling
+binary window; the normalized tail must still match that message's subject, sender/defaults, and
+`check your inbox`. The whole visible composer must then survive the normal exact-text guard. st2
+never replays the seeded backlog.
 
 ## Cleanup
 

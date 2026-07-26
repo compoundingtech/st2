@@ -158,8 +158,8 @@ pub trait Poker {
     /// Try to inject and submit `text`. Unsafe pane state returns [`PokeOutcome::Deferred`] without
     /// sending Return; transport/inspection failures are errors and are retried by the watch loop.
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
-    /// On sidecar startup, recover at most one notice that is already visibly staged and still
-    /// present in the seeded unread backlog. The default is inert for fake and legacy pokers.
+    /// On sidecar startup, recover at most one notice whose visible stable DING id names exactly one
+    /// message in the seeded unread backlog. The default is inert for fake and legacy pokers.
     fn recover_seeded(&self, _backlog: &[Message]) -> anyhow::Result<PokeOutcome> {
         Ok(PokeOutcome::Deferred)
     }
@@ -475,19 +475,62 @@ fn looks_like_dismissible_plan_modal(plain: &str) -> bool {
     collapse_whitespace(plain).contains("Create a plan? shift+tab use Plan mode esc dismiss")
 }
 
-/// Select one seeded unread notice only when that exact full DING is already in the bottom composer.
-/// Stable ids make two matches impossible in a valid backlog, but ambiguity still fails closed.
+/// Select one seeded unread notice only when the bottom composer is a DING whose stable id names
+/// exactly one backlog message. Descriptive words are deliberately non-authoritative across rolling
+/// binary versions; the entire visible composer becomes the exact expected text for the subsequent
+/// guarded re-inspection. Ambiguity still fails closed.
 fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<String> {
-    let mut matches = backlog.iter().filter_map(|msg| {
-        let text = poke_text(msg);
-        matches!(
-            classify_pane(screen, &text),
-            PaneState::Staged | PaneState::DismissiblePlanModal
-        )
-        .then_some(text)
-    });
-    let one = matches.next()?;
-    matches.next().is_none().then_some(one)
+    let (_, CodexComposer::Typed(input)) = located_bottom_codex_composer(screen)? else {
+        return None;
+    };
+    if input
+        .chars()
+        .any(|ch| ch.is_control() && !ch.is_whitespace())
+    {
+        return None;
+    }
+    let visible = collapse_whitespace(&input);
+    let (id, visible_tail) = visible_staged_ding_parts(&visible)?;
+    if !matches!(
+        classify_pane(screen, &visible),
+        PaneState::Staged | PaneState::DismissiblePlanModal
+    ) {
+        return None;
+    }
+
+    let mut matches = backlog.iter().filter(|msg| poke_id(&msg.filename) == id);
+    let message = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let marker = format!("[id:{id}]");
+    let expected = poke_text(message);
+    let (_, expected_tail) = expected.split_once(&marker)?;
+    (collapse_whitespace(visible_tail) == collapse_whitespace(expected_tail)).then_some(visible)
+}
+
+fn visible_staged_ding_parts(visible: &str) -> Option<(&str, &str)> {
+    let rest = visible.strip_prefix("[DING] ")?;
+    let (description, after_marker) = rest.split_once("[id:")?;
+    let (id, suffix) = after_marker.split_once(']')?;
+    if description.trim().is_empty()
+        || id.len() != 6
+        || !id.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'h'
+                    | b'j'..=b'k'
+                    | b'm'..=b'n'
+                    | b'p'..=b't'
+                    | b'v'..=b'z'
+            )
+        })
+        || suffix.contains("[id:")
+    {
+        return None;
+    }
+    Some((id, suffix))
 }
 
 fn looks_like_choice_menu(plain: &str) -> bool {
@@ -738,9 +781,10 @@ impl Default for DingConfig {
 
 /// Watch `inbox_dir` and poke `poker` on each new arrival until `stop` is set or the target session is
 /// gone. Existing inbox contents are seeded as already-seen (no startup poke storm). On the first
-/// live/available pass only, one seeded message may resume if its exact full DING is already staged
-/// in the bottom composer. Unsafe pane or `busy`/`dnd` status defers in FIFO order; transport failures
-/// retain the head for retry. A message archived while deferred is pruned before delivery.
+/// live/available pass only, one seeded message may resume if a visible bottom-composer DING has a
+/// stable id naming exactly one unread backlog file. Unsafe pane or `busy`/`dnd` status defers in FIFO
+/// order; transport failures retain the head for retry. A message archived while deferred is pruned
+/// before delivery.
 pub fn run_ding(
     inbox_dir: &Path,
     status_path: Option<&Path>,
@@ -1129,6 +1173,20 @@ mod tests {
             exact_staged_backlog_notice(&staged_codex_screen(&expected), &backlog),
             Some(expected.clone())
         );
+        let rolling_notice = format!(
+            "[DING] new {} message: [id:k0ygwh] safety (from cos); check your inbox",
+            ["small", "talk"].concat()
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&staged_codex_screen(&rolling_notice), &backlog),
+            Some(rolling_notice.clone()),
+            "only the description before the stable id may differ across the rolling window"
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&plan_modal_codex_screen(&rolling_notice), &backlog),
+            Some(rolling_notice.clone()),
+            "the rolling form remains recoverable under the exact stable plan modal"
+        );
         assert_eq!(
             exact_staged_backlog_notice(
                 &staged_codex_screen("half-written human request"),
@@ -1142,6 +1200,16 @@ mod tests {
             "a generic choice modal remains blocked"
         );
         assert_eq!(
+            exact_staged_backlog_notice(&idle_codex_screen(), &backlog),
+            None,
+            "an idle restart never replays seeded inbox work"
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&staged_codex_screen(&expected), &[]),
+            None,
+            "an archived or otherwise absent inbox message cannot recover"
+        );
+        assert_eq!(
             exact_staged_backlog_notice(
                 &staged_codex_screen(&expected),
                 std::slice::from_ref(&other)
@@ -1150,9 +1218,52 @@ mod tests {
             "visible text must still be an unread inbox message"
         );
         assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen(
+                    "[DING] changed wording [id:zzzzzz] but no unread file has this id"
+                ),
+                &backlog
+            ),
+            None
+        );
+        for edited in [
+            format!("extra {rolling_notice}"),
+            rolling_notice.replace("safety", "human-edited subject"),
+            rolling_notice.replace("(from cos)", "(from mallory)"),
+            format!("{rolling_notice} extra tail"),
+            rolling_notice.replace("[id:k0ygwh]", "[id:iiiiii]"),
+            rolling_notice.replace("new ", "new \u{0}"),
+        ] {
+            assert_eq!(
+                exact_staged_backlog_notice(&staged_codex_screen(&edited), &backlog),
+                None,
+                "human-edited or ambiguous wire text must fail closed: {edited:?}"
+            );
+        }
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen("[DING] ambiguous [id:k0ygwh] second marker [id:abc123]"),
+                &backlog
+            ),
+            None
+        );
+        assert_eq!(
             exact_staged_backlog_notice(&staged_codex_screen(&expected), &[exact.clone(), exact]),
             None,
             "an ambiguous duplicate match fails closed"
+        );
+
+        let mut defaults = msg("1714826789014-def456.md", "", None);
+        defaults.from = None;
+        let default_rolling =
+            "[DING] rolling words [id:def456] (no subject) (from unknown); check your inbox";
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &current_linux_staged_codex_screen(default_rolling),
+                &[defaults]
+            ),
+            Some(default_rolling.to_string()),
+            "message-derived defaults are part of the authoritative tail"
         );
     }
 
@@ -1742,7 +1853,8 @@ mod tests {
         let inbox = tmp.path().join("resources").join("inbox");
         let status_path = crate::status::status_path(tmp.path());
         crate::status::set_state(&status_path, crate::status::State::Dnd).unwrap();
-        let filename = send_to_inbox(&inbox, "alice", Some("seeded"), None, &[], "hi").unwrap();
+        let selected = send_to_inbox(&inbox, "alice", Some("seeded"), None, &[], "hi").unwrap();
+        let silent = send_to_inbox(&inbox, "bob", Some("also seeded"), None, &[], "yo").unwrap();
         let stop = AtomicBool::new(false);
         let poker = RecoveryPoker::default();
         let config = DingConfig {
@@ -1763,12 +1875,34 @@ mod tests {
 
         assert_eq!(
             poker.recoveries.lock().unwrap().as_slice(),
-            [vec![filename]],
-            "the seeded backlog is offered for exact recovery once"
+            [vec![selected, silent]],
+            "the complete seeded backlog is offered for exact matching once"
         );
         assert!(
             poker.ordinary_pokes.lock().unwrap().is_empty(),
             "startup recovery never replays the backlog as ordinary arrivals"
+        );
+    }
+
+    #[test]
+    fn archived_seeded_message_is_not_a_recovery_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("resources").join("inbox");
+        let archive = tmp.path().join("resources").join("archive");
+        let filename = send_to_inbox(&inbox, "alice", Some("seeded"), None, &[], "hi").unwrap();
+        let before = message::list_inbox(&inbox).unwrap();
+        let visible = poke_text(&before[0]);
+        assert_eq!(
+            exact_staged_backlog_notice(&staged_codex_screen(&visible), &before),
+            Some(visible.clone())
+        );
+
+        message::archive_msg(&inbox, &archive, &filename).unwrap();
+        let after = message::list_inbox(&inbox).unwrap();
+        assert!(after.is_empty());
+        assert_eq!(
+            exact_staged_backlog_notice(&staged_codex_screen(&visible), &after),
+            None
         );
     }
 
