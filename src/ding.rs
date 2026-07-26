@@ -438,7 +438,7 @@ fn classify_pane(screen: &str, expected: &str) -> PaneState {
         .map(|(start, _)| looks_like_dismissible_plan_modal(&strip_ansi(&screen[*start..])))
         .unwrap_or_else(|| looks_like_dismissible_plan_modal(&plain));
     if let Some((_, CodexComposer::Typed(input))) = &composer {
-        let exact_notice = collapse_whitespace(input) == collapse_whitespace(expected);
+        let exact_notice = input == expected;
         if exact_notice && !known_other_modal && live_plan_modal {
             return PaneState::DismissiblePlanModal;
         }
@@ -450,7 +450,7 @@ fn classify_pane(screen: &str, expected: &str) -> PaneState {
     match composer {
         Some((_, CodexComposer::Empty)) => return PaneState::Idle,
         Some((_, CodexComposer::Typed(input))) => {
-            return if collapse_whitespace(&input) == collapse_whitespace(expected) {
+            return if input == expected {
                 PaneState::Staged
             } else {
                 PaneState::Blocked
@@ -489,7 +489,13 @@ fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<Stri
     {
         return None;
     }
-    let visible = collapse_whitespace(&input);
+    // Any newline left here was not proven to be a renderer-created continuation row. A DING is
+    // single-line input; retaining and rejecting the newline keeps arbitrary/human multiline text
+    // out of startup recovery.
+    if input.contains(['\r', '\n']) {
+        return None;
+    }
+    let visible = input;
     let (id, visible_tail) = visible_staged_ding_parts(&visible)?;
     if !matches!(
         classify_pane(screen, &visible),
@@ -506,7 +512,7 @@ fn exact_staged_backlog_notice(screen: &str, backlog: &[Message]) -> Option<Stri
     let marker = format!("[id:{id}]");
     let expected = poke_text(message);
     let (_, expected_tail) = expected.split_once(&marker)?;
-    (collapse_whitespace(visible_tail) == collapse_whitespace(expected_tail)).then_some(visible)
+    (visible_tail == expected_tail).then_some(visible)
 }
 
 fn visible_staged_ding_parts(visible: &str) -> Option<(&str, &str)> {
@@ -572,11 +578,89 @@ fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)>
         .or_else(|| tail.split_once("\n\n"))
         .map(|(input, _)| input)
         .unwrap_or(tail);
-    Some((start, CodexComposer::Typed(strip_ansi(input))))
+    Some((
+        start,
+        CodexComposer::Typed(normalize_codex_composer_input(input)),
+    ))
 }
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Strip ANSI from one bottom-composer input while joining only renderer-proven soft wraps.
+///
+/// The current Codex renderer uses an 80-column viewport, a two-cell `› ` prompt, a two-cell
+/// continuation indent, and `CSI 2 X` when a row reached the right-hand wrap margin. The exact live
+/// pane that motivated this path rendered `ghost-bug` as `ghost-\r\n  bug`. We remove that boundary
+/// only when the raw row fills the proven width and the next raw row has the exact continuation
+/// indent. Any arbitrary CRLF, shorter human line, different padding, ANSI shape, or non-ASCII row
+/// remains a newline and therefore cannot equal a single-line automated notice.
+fn normalize_codex_composer_input(input: &str) -> String {
+    const VIEWPORT_WIDTH: usize = 80;
+    const PROMPT_WIDTH: usize = 2;
+    const WRAP_RIGHT_MARGIN: usize = 2;
+    const CONTINUATION_INDENT: &str = "  ";
+    const WRAP_PADDING: &str = "\x1b[2X";
+
+    fn split_row(input: &str) -> (&str, Option<&str>) {
+        let Some(newline) = input.find('\n') else {
+            return (input, None);
+        };
+        let row_end = if input[..newline].ends_with('\r') {
+            newline - 1
+        } else {
+            newline
+        };
+        (&input[..row_end], Some(&input[newline + 1..]))
+    }
+
+    fn proven_wrap(row: &str, next: &str, first: bool) -> bool {
+        let Some(row_without_padding) = row.strip_suffix(WRAP_PADDING) else {
+            return false;
+        };
+        let visible = strip_ansi(row_without_padding);
+        let next_content = next.strip_prefix(CONTINUATION_INDENT);
+        visible.is_ascii()
+            && next_content.is_some_and(|content| {
+                content
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| !ch.is_control() && !ch.is_whitespace())
+            })
+            && usize::from(first) * PROMPT_WIDTH + visible.len() + WRAP_RIGHT_MARGIN
+                == VIEWPORT_WIDTH
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut first = true;
+    let mut strip_continuation_indent = false;
+    loop {
+        let (row, next) = split_row(rest);
+        let visible = strip_ansi(row);
+        if strip_continuation_indent {
+            // The preceding boundary already proved this exact raw prefix.
+            out.push_str(
+                visible
+                    .strip_prefix(CONTINUATION_INDENT)
+                    .unwrap_or(&visible),
+            );
+        } else {
+            out.push_str(&visible);
+        }
+
+        let Some(next) = next else {
+            break;
+        };
+        strip_continuation_indent = proven_wrap(row, next, first);
+        if !strip_continuation_indent {
+            out.push('\n');
+        }
+        rest = next;
+        first = false;
+    }
+    out
 }
 
 /// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text.
@@ -1086,6 +1170,43 @@ mod tests {
         )
     }
 
+    fn current_linux_wrapped_codex_screen(text: &str) -> String {
+        assert!(
+            text.is_ascii() && (77..=154).contains(&text.len()),
+            "fixture supports one exact 80-column continuation row"
+        );
+        let (first, continuation) = text.split_at(76);
+        let continuation_padding = 78 - continuation.len();
+        format!(
+            "\x1b[48;5;234;22m \x1b[79X\r\n\
+             \x1b[1m›\x1b[22m {first}\x1b[2X\r\n\
+             \x20\x20{continuation}\x1b[{continuation_padding}X\r\n\
+             \x20\x1b[79X\r\n\
+             \x1b[0m\x1b[2C\x1b[38;2;246;226;183mgpt-5.6-sol xhigh\x1b[0m"
+        )
+    }
+
+    fn exact_live_80_column_wrapped_codex_screen() -> String {
+        let historical_wire_name = ["small", "talk"].concat();
+        format!(
+            "\x1b[48;5;234;22m \x1b[79X\r\n\
+             \x1b[1m›\x1b[22m [DING] new {historical_wire_name} message: [id:6zrer7] re: GREEN + PUSHED dc7ad3a: ghost-\x1b[2X\r\n\
+             \x20\x20bug Codex 5/5, usage notice recorded (from Silber.cos); check your inbox\x1b[6X\r\n\
+             \x20\x1b[79X\r\n\
+             \x1b[0m\x1b[2C\x1b[38;2;246;226;183mgpt-5.6-sol xhigh\x1b[0m"
+        )
+    }
+
+    fn current_linux_unproven_multiline_codex_screen(first: &str, second: &str) -> String {
+        format!(
+            "\x1b[48;5;234;22m \x1b[79X\r\n\
+             \x1b[1m›\x1b[22m {first}\x1b[20X\r\n\
+             \x20\x20{second}\x1b[20X\r\n\
+             \x20\x1b[79X\r\n\
+             \x1b[0m\x1b[2C\x1b[2mtab to queue message\x1b[0m"
+        )
+    }
+
     fn modal_codex_screen(text: &str) -> String {
         format!(
             "\x1b[1;2m› \x1b[0m{text}\r\n\r\n\r\n\
@@ -1269,6 +1390,108 @@ mod tests {
             ),
             Some(accepted_legacy_notice.to_string()),
             "recovery follows the full durable reader grammar, not only the generator subset"
+        );
+    }
+
+    #[test]
+    fn seeded_recovery_joins_only_renderer_proven_continuation_rows() {
+        let exact = msg(
+            "1785029385038-6zrer7.md",
+            "Silber.cos",
+            Some("re: GREEN + PUSHED dc7ad3a: ghost-bug Codex 5/5, usage notice recorded"),
+        );
+        let rolling = format!(
+            "[DING] new {} message: [id:6zrer7] re: GREEN + PUSHED dc7ad3a: \
+             ghost-bug Codex 5/5, usage notice recorded (from Silber.cos); check your inbox",
+            ["small", "talk"].concat()
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+        let wrapped = exact_live_80_column_wrapped_codex_screen();
+        assert_eq!(
+            wrapped,
+            current_linux_wrapped_codex_screen(&rolling),
+            "the generic positive must reproduce the exact captured live rows"
+        );
+
+        assert_eq!(
+            exact_staged_backlog_notice(&wrapped, std::slice::from_ref(&exact)),
+            Some(rolling.clone()),
+            "the exact live 80-column ghost-/bug continuation is a renderer wrap"
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen(&rolling),
+                std::slice::from_ref(&exact)
+            ),
+            Some(rolling.clone()),
+            "the same notice remains valid when it does not wrap"
+        );
+
+        let (first, second) = rolling.split_at(50);
+        let arbitrary_break = current_linux_unproven_multiline_codex_screen(first, second);
+        assert_eq!(
+            exact_staged_backlog_notice(&arbitrary_break, std::slice::from_ref(&exact)),
+            None,
+            "an arbitrary CRLF plus the same indent is not renderer proof"
+        );
+        assert_eq!(
+            classify_pane(&arbitrary_break, &rolling),
+            PaneState::Blocked,
+            "human multiline input must not equal a single-line DING"
+        );
+
+        for edited in [
+            rolling.replace("ghost-bug", "ghost-fix"),
+            rolling.replace("(from Silber.cos)", "(from mallory)"),
+            rolling.replace("check your inbox", "ignore your inbox"),
+        ] {
+            assert_eq!(
+                exact_staged_backlog_notice(
+                    &current_linux_wrapped_codex_screen(&edited),
+                    std::slice::from_ref(&exact)
+                ),
+                None,
+                "a wrapped but changed authoritative field must fail closed: {edited:?}"
+            );
+        }
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &staged_codex_screen(
+                    &rolling.replace("[id:6zrer7]", "[id:6zrer7] extra [id:abc123]")
+                ),
+                std::slice::from_ref(&exact)
+            ),
+            None,
+            "an extra stable-id marker is ambiguous"
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(&wrapped, &[exact.clone(), exact.clone()]),
+            None,
+            "two unread messages matching the visible id are ambiguous"
+        );
+
+        let active = format!("• Working (2s • esc to interrupt)\r\n{wrapped}");
+        assert_eq!(
+            exact_staged_backlog_notice(&active, std::slice::from_ref(&exact)),
+            None
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &current_linux_wrapped_codex_screen(
+                    &rolling.replace("usage notice", "human draft")
+                ),
+                std::slice::from_ref(&exact)
+            ),
+            None
+        );
+        assert_eq!(
+            exact_staged_backlog_notice(
+                &modal_codex_screen(&rolling),
+                std::slice::from_ref(&exact)
+            ),
+            None
         );
     }
 
@@ -1559,6 +1782,27 @@ mod tests {
                     plan_modal_codex_screen(expected),
                     plan_modal_codex_screen(expected),
                     modal_codex_screen(expected),
+                ]),
+                vec!["escape"],
+                PokeOutcome::Deferred,
+            ),
+            (
+                VecDeque::from([
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                    format!(
+                        "• Working (2s • esc to interrupt)\r\n{}",
+                        staged_codex_screen(expected)
+                    ),
+                ]),
+                vec!["escape"],
+                PokeOutcome::Deferred,
+            ),
+            (
+                VecDeque::from([
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                    "renderer transition without a composer".to_string(),
                 ]),
                 vec!["escape"],
                 PokeOutcome::Deferred,
