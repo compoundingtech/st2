@@ -142,3 +142,58 @@ fn reply_threads_back_to_the_original_sender() {
     assert_eq!(got.in_reply_to.as_deref(), Some(original.as_str()));
     assert_eq!(got.subject.as_deref(), Some("re: M2 kick"));
 }
+
+/// Concurrent readers see either no canonical entry or the complete message. The large body widens
+/// the old direct-write window; a temporary sibling never matches the bus filename grammar.
+#[test]
+fn a_concurrent_reader_never_observes_a_half_written_message() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let body = "x".repeat(4 * 1024 * 1024);
+    let sends = 40usize;
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let reader = {
+        let root = root.clone();
+        let cursor = Arc::clone(&cursor);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut incomplete = 0usize;
+            while !done.load(Ordering::Relaxed) {
+                let inbox = root.join(format!("inbox-{}", cursor.load(Ordering::Relaxed)));
+                for message in list_dir(&inbox).unwrap() {
+                    if message.from.is_none() || message.subject.is_none() {
+                        incomplete += 1;
+                    }
+                }
+            }
+            incomplete
+        })
+    };
+
+    for i in 0..sends {
+        let inbox = root.join(format!("inbox-{i}"));
+        fs::create_dir_all(&inbox).unwrap();
+        cursor.store(i, Ordering::Relaxed);
+        send_to_inbox(
+            &inbox,
+            "alice",
+            Some(&format!("big {i}")),
+            None,
+            &[],
+            &body,
+        )
+        .unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+
+    assert_eq!(
+        reader.join().unwrap(),
+        0,
+        "reader observed a canonical message before it was complete"
+    );
+}

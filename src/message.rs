@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
@@ -183,6 +184,10 @@ fn parse_message(filename: &str, contents: &str) -> Message {
 
 /// Send: write a new message file into `inbox_dir`, returning its filename. Creates `inbox_dir` if
 /// missing; retries on the astronomically-unlikely filename collision.
+///
+/// The message is materialized atomically (temporary sibling + rename). A direct write under the
+/// canonical name exposes an empty or partial file to concurrent readers after create/truncate but
+/// before the bytes arrive; that incomplete message has no parseable sender or subject.
 pub fn send_to_inbox(
     inbox_dir: &Path,
     from: &str,
@@ -193,18 +198,48 @@ pub fn send_to_inbox(
 ) -> anyhow::Result<String> {
     fs::create_dir_all(inbox_dir)?;
     let contents = render_message(from, subject, in_reply_to, tags, body);
+    // This deliberately cannot match `is_message_filename`, so a concurrent scan ignores it.
+    let tmp = inbox_dir.join(tmp_name());
+    if let Err(error) = fs::write(&tmp, &contents) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     for _ in 0..8 {
         let filename = new_filename();
         let path = inbox_dir.join(&filename);
         if !path.exists() {
-            fs::write(&path, &contents)?;
+            if let Err(error) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(error.into());
+            }
             return Ok(filename);
         }
     }
+    let _ = fs::remove_file(&tmp);
     anyhow::bail!(
         "could not allocate a unique message filename in {}",
         inbox_dir.display()
     )
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn tmp_name() -> String {
+    format!(
+        ".message.tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Read a canonical entry that was already returned by `read_dir`. Removing a message concurrently
+/// (for example, inbox→archive) is normal: that entry vanished, it did not become an empty message.
+fn read_message_contents(path: &Path) -> anyhow::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("reading {}: {error}", path.display())),
+    }
 }
 
 /// List the canonical messages in `dir` (inbox or archive), sorted by send time. Non-message files
@@ -220,7 +255,9 @@ pub fn list_dir(dir: &Path) -> anyhow::Result<Vec<Message>> {
         if !is_message_filename(&name) {
             continue;
         }
-        let contents = fs::read_to_string(entry.path()).unwrap_or_default();
+        let Some(contents) = read_message_contents(&entry.path())? else {
+            continue;
+        };
         msgs.push(parse_message(&name, &contents));
     }
     // Primary order is send time; the `<rand6>` suffix is a deterministic tiebreak so two messages
@@ -474,6 +511,19 @@ mod tests {
         let m = parse_message("1784649988123-abc23z.md", "just a body, no frontmatter");
         assert_eq!(m.from, None);
         assert_eq!(m.body, "just a body, no frontmatter");
+    }
+
+    #[test]
+    fn a_message_removed_after_enumeration_is_skipped_not_parsed_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("1784649988123-abc23z.md");
+        fs::write(
+            &path,
+            render_message("alice", Some("work"), None, &[], "body"),
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_message_contents(&path).unwrap(), None);
     }
 
     #[test]

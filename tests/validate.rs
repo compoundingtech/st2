@@ -168,6 +168,29 @@ fn an_unrendered_service_is_not_runnable() {
 }
 
 #[test]
+fn a_generated_ding_sidecar_is_not_authored_runnable_work() {
+    let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; ding }"#)]);
+    assert!(has(&validate(c.path()), "not-runnable", Severity::Error));
+}
+
+#[test]
+fn ls_marks_a_generated_ding_only_agent_as_unrendered() {
+    let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; ding }"#)]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(c.path())
+        .arg("ls")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("[UNRENDERED: no task command]"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn a_missing_render_source_is_an_error() {
     let workspace = tempfile::tempdir().unwrap();
     let agent = format!(

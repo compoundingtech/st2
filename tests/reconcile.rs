@@ -9,6 +9,7 @@ use st2::{Session, reconcile};
 fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> Task {
     Task {
         kind,
+        derived: false,
         name: name.to_string(),
         id: id.map(String::from),
         command: command.map(String::from),
@@ -158,6 +159,42 @@ fn unrendered_job_without_commands_is_unrunnable() {
     let plan = reconcile(&specs, &[], HOST);
     assert!(plan.launch.is_empty());
     assert_eq!(plan.unrunnable.len(), 1);
+}
+
+#[test]
+fn generated_ding_only_job_is_unrunnable_and_does_not_launch() {
+    let mut ding = task(
+        TaskKind::Exec,
+        "ding",
+        Some("hetz.nr.ding"),
+        Some("st2 ding --identity hetz.nr --root $ST_ROOT"),
+    );
+    ding.derived = true;
+    let specs = vec![svc("nr", Some(HOST), vec![ding])];
+    let plan = reconcile(&specs, &[], HOST);
+    assert!(plan.launch.is_empty());
+    assert_eq!(plan.unrunnable.len(), 1);
+}
+
+#[test]
+fn generated_ding_launches_alongside_authored_work() {
+    let agent = task(
+        TaskKind::Pty,
+        "agent",
+        Some("hetz.runnable"),
+        Some("codex"),
+    );
+    let mut ding = task(
+        TaskKind::Exec,
+        "ding",
+        Some("hetz.runnable.ding"),
+        Some("st2 ding --identity hetz.runnable --root $ST_ROOT"),
+    );
+    ding.derived = true;
+    let specs = vec![svc("runnable", Some(HOST), vec![agent, ding])];
+    let plan = reconcile(&specs, &[], HOST);
+    assert_eq!(plan.launch.len(), 1);
+    assert_eq!(plan.launch[0].tasks.len(), 2);
 }
 
 #[test]

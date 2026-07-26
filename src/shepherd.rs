@@ -550,6 +550,7 @@ mod tests {
             restart: None,
             tasks: vec![Task {
                 kind: TaskKind::Pty,
+                derived: false,
                 name: "agent".into(),
                 id: None,
                 command: Some(command.into()),
@@ -1005,6 +1006,7 @@ mod tests {
         let mut wrong_agent = root("root", "exec claude");
         wrong_agent.tasks.push(Task {
             kind: TaskKind::Exec,
+            derived: false,
             name: "audit".into(),
             id: None,
             command: Some("exec codex".into()),

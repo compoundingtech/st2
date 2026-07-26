@@ -380,6 +380,9 @@ impl CrashLoop {
 /// Owned, human-readable summary of one reconcile+execute pass (no borrows of the plan/specs).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct UpReport {
+    /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
+    /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
+    pub skipped: bool,
     /// pty ids spawned this pass.
     pub launched: Vec<String>,
     /// pty ids torn down (retired agents) this pass.
@@ -410,7 +413,8 @@ impl UpReport {
     /// True when the pass actually changed something (or hit an error) — used to keep the loop's log
     /// quiet on no-op ticks.
     pub fn is_noteworthy(&self) -> bool {
-        !self.launched.is_empty()
+        self.skipped
+            || !self.launched.is_empty()
             || !self.torn_down.is_empty()
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
@@ -640,6 +644,7 @@ fn reconcile_pass(
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
+            report.skipped = true;
             report
                 .errors
                 .push(format!("list sessions (pass skipped): {e}"));
@@ -798,6 +803,7 @@ pub fn reconcile_pass_specs(
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
+            report.skipped = true;
             report
                 .errors
                 .push(format!("list sessions (pass skipped): {e}"));

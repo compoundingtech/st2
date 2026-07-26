@@ -948,14 +948,23 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
             );
         }
         if let Some(dir) = spec.path.parent() {
-            let state = st2::status::read_state(&st2::status::status_path(dir));
-            let fresh = state != st2::status::State::Unknown;
-            report_check(
-                &mut problems,
-                fresh,
-                &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
-                "rotted to `unknown` — is its ding refreshing?",
-            );
+            let path = st2::status::status_path(dir);
+            if !path.is_file() {
+                report_check(
+                    &mut problems,
+                    false,
+                    &format!("{bus_id} presence missing"),
+                    "no status file — is its ding refreshing?",
+                );
+            } else {
+                let state = st2::status::read_state(&path);
+                report_check(
+                    &mut problems,
+                    state != st2::status::State::Unknown,
+                    &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
+                    "rotted to `unknown` — is its ding refreshing?",
+                );
+            }
         }
     }
 
@@ -1565,6 +1574,9 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
             spec_file.display()
         );
         print_report(&report);
+        if report.skipped {
+            anyhow::bail!("one-shot reconcile pass was skipped");
+        }
         return Ok(());
     }
 
@@ -1665,6 +1677,9 @@ fn up(
         let report = up_once(root, &this_host, &runner)?;
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
+        if report.skipped {
+            anyhow::bail!("one-shot reconcile pass was skipped");
+        }
         return Ok(());
     }
 

@@ -54,6 +54,8 @@ pub struct SpecExec {
     pub id: String,
     pub command: String,
     pub env: BTreeMap<String, String>,
+    /// The process came from built-in shorthand rather than an authored `exec` command.
+    pub derived: bool,
 }
 
 /// The `eval { }` block — only `st2 eval` runs it.
@@ -299,6 +301,7 @@ pub fn ding_exec(agent_id: &str) -> SpecExec {
         // the redundant positional is dropped.
         command: format!("st2 ding --identity {agent_id} --root $ST_ROOT"),
         env: BTreeMap::new(),
+        derived: true,
     }
 }
 
@@ -430,7 +433,12 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
                             }
                         }
                     }
-                    execs.push(SpecExec { id: ex_id, command: ex_command, env: cascade(&env, &ex_env) });
+                    execs.push(SpecExec {
+                        id: ex_id,
+                        command: ex_command,
+                        env: cascade(&env, &ex_env),
+                        derived: false,
+                    });
                 }
                 other => anyhow::bail!(
                     "agent '{id}': unexpected node '{other}' (expected workspace|supervisor|env|command|ding|exec)"
@@ -714,10 +722,12 @@ eval {
     fn bare_ding_node_generates_the_builtin_sidecar() {
         // The dedicated `ding` node must parse to EXACTLY what the `ding_exec` helper generates.
         let sup = &parse_spec(REFERENCE).unwrap().agents[0];
+        assert!(sup.execs[0].derived);
         assert_eq!(ding_exec("mix.sup"), SpecExec {
             id: sup.execs[0].id.clone(),
             command: sup.execs[0].command.clone(),
             env: BTreeMap::new(),
+            derived: true,
         });
     }
 
@@ -755,6 +765,7 @@ team "mix" {
         let ex = &s.agents[0].execs[0];
         assert_eq!(ex.id, "mix.sup.ding");
         assert_eq!(ex.command, "ding --ring-the-bell"); // the literal command, not the st2 template
+        assert!(!ex.derived);
     }
 
     #[test]

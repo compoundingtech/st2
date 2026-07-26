@@ -133,6 +133,11 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
             continue;
         }
 
+        if !spec.is_runnable() {
+            plan.unrunnable.push(spec);
+            continue;
+        }
+
         let targets: Vec<TaskTarget> = spec
             .tasks
             .iter()
@@ -162,10 +167,7 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
             })
             .collect();
 
-        if targets.is_empty() {
-            plan.unrunnable.push(spec);
-            continue;
-        }
+        debug_assert!(!targets.is_empty());
 
         let mut to_launch = Vec::new();
         for target in targets {

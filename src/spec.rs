@@ -57,6 +57,9 @@ pub enum JobType {
 pub struct Task {
     /// `pty` (interactive, allocates a terminal) or `exec` (plain process, terminal-free).
     pub kind: TaskKind,
+    /// `true` when st2 generated this task from shorthand rather than the author declaring runnable
+    /// work. Derived sidecars run alongside an authored task, but cannot make a job runnable alone.
+    pub derived: bool,
     /// The task name (`agent`, `ding`, …).
     pub name: String,
     /// Explicit on-disk id. `None` → `<host>.<identity>.<name>` at spawn.
@@ -131,9 +134,12 @@ impl AgentSpec {
         self.host.as_deref().unwrap_or(this_host)
     }
 
-    /// True once at least one task carries an explicit `command` (i.e. the job was rendered).
+    /// True once at least one authored task carries an explicit `command` (i.e. the job was
+    /// rendered). A generated sidecar cannot make an otherwise-empty job runnable.
     pub fn is_runnable(&self) -> bool {
-        self.tasks.iter().any(|t| t.command.is_some())
+        self.tasks
+            .iter()
+            .any(|task| !task.derived && task.command.is_some())
     }
 
     /// The restart policy in effect (declared, else the runner default).
@@ -280,6 +286,7 @@ impl RawSpec {
             tags.insert("role".to_string(), "agent".to_string());
             tasks.push(Task {
                 kind: TaskKind::Pty,
+                derived: false,
                 name: "agent".to_string(),
                 // An agent IS its pty: ding defaults its poke target to this same bus id.
                 id: Some(bus_id.clone()),
@@ -293,6 +300,7 @@ impl RawSpec {
         if self.ding {
             tasks.push(Task {
                 kind: TaskKind::Exec,
+                derived: true,
                 name: "ding".to_string(),
                 id: Some(format!("{bus_id}.ding")),
                 command: Some(format!("st2 ding --identity {bus_id} --root $ST_ROOT")),
@@ -334,6 +342,7 @@ impl RawTask {
         env.extend(self.env);
         Task {
             kind,
+            derived: false,
             name,
             id: self.id,
             command: self.command,

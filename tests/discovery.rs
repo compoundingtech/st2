@@ -141,6 +141,7 @@ agent "cos" {
 
     let agent = spec.tasks.iter().find(|t| t.name == "agent").unwrap();
     assert_eq!(agent.kind, TaskKind::Pty);
+    assert!(!agent.derived);
     assert_eq!(agent.id.as_deref(), Some("Silber.cos"));
     assert_eq!(agent.command.as_deref(), Some("exec codex boot"));
     assert_eq!(
@@ -150,6 +151,7 @@ agent "cos" {
 
     let ding = spec.tasks.iter().find(|t| t.name == "ding").unwrap();
     assert_eq!(ding.kind, TaskKind::Exec);
+    assert!(ding.derived);
     assert_eq!(ding.id.as_deref(), Some("Silber.cos.ding"));
     assert_eq!(
         ding.command.as_deref(),

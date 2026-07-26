@@ -31,6 +31,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
             ptags.insert("role".to_string(), "agent".to_string());
             tasks.push(Task {
                 kind: TaskKind::Pty,
+                derived: false,
                 name: "agent".to_string(),
                 id: Some(a.id.clone()), // explicit id → the session is exactly the agent id (mix.sup)
                 command: Some(a.command.clone()),
@@ -42,6 +43,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
             for ex in &a.execs {
                 tasks.push(Task {
                     kind: TaskKind::Exec,
+                    derived: ex.derived,
                     name: ex.id.clone(),
                     id: Some(ex.id.clone()),
                     command: Some(ex.command.clone()),

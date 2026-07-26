@@ -13,6 +13,7 @@ use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
 #[derive(Default)]
 struct FakeRunner {
     sessions: Vec<Session>,
+    fail_list: bool,
     fail_spawn: Option<String>,
     spawned: RefCell<Vec<String>>,
     spawn_dirs: RefCell<Vec<(String, String)>>,
@@ -22,6 +23,9 @@ struct FakeRunner {
 
 impl Runner for FakeRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        if self.fail_list {
+            anyhow::bail!("simulated list failure");
+        }
         Ok(self.sessions.clone())
     }
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -292,4 +296,22 @@ fn up_once_surfaces_discovery_errors_and_unrunnable() {
     assert_eq!(report.unrunnable, vec!["nr"]);
     assert_eq!(report.errors.len(), 1);
     assert!(report.errors[0].contains("bad/agent.toml"));
+}
+
+#[test]
+fn up_once_marks_a_list_failure_as_a_skipped_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    let runner = FakeRunner {
+        fail_list: true,
+        ..Default::default()
+    };
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(report.skipped);
+    assert!(report.launched.is_empty());
+    assert!(runner.spawned.borrow().is_empty());
+    assert_eq!(
+        report.errors,
+        vec!["list sessions (pass skipped): simulated list failure"]
+    );
 }

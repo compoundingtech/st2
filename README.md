@@ -148,11 +148,10 @@ the roster: presence is `<agent-dir>/status`, while unread messages, archive rec
 links live under `<agent-dir>/resources/`. The flat `<root>/<identity>` layout remains only as the
 intentional catalog-less fallback used by isolated folder evals.
 
-Adopters should cut directly to this native layout rather than stage through a retired compatibility
-transport. Before launching a migrated identity, install and verify hooks, validate and materialize
-its hand-authored declaration, stop the predecessor transport, and decide how any unread legacy
-backlog will be archived or forwarded. Never run old and native DING owners concurrently for the same
-identity.
+Adopters should cut directly to the native layout. Before launching a migrated identity, install and
+verify hooks, validate and materialize its hand-authored declaration, stop any predecessor transport,
+and decide how any unread predecessor backlog will be archived or forwarded. Never run predecessor
+and native DING owners concurrently for the same identity.
 
 Native DING watches the recipient inbox and delivers a normalized notice:
 
@@ -203,7 +202,7 @@ manpage tree is committed.
 The test suite builds a temporary `PATH` containing only the current `st2` binary, required Git,
 and `pty`, `codex`, and `claude` shims. It installs and verifies a scratch hook receipt, instantiates
 both maintained hand-authored KDL examples in fresh Git workspaces, validates and materializes them
-twice, and verifies the help/doctor/native authoring surface without any retired binary:
+twice, and verifies the help/doctor/native authoring surface without a predecessor transport binary:
 
 ```sh
 cargo test --test native_only --all-features
@@ -219,19 +218,27 @@ cargo test --all-targets --all-features
 ## Eval corpus
 
 The Codex evidence ledger is pinned at
-[`67b45d2694ac40762b09f51bf625d092ab68de74`](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/HARNESS-MATRIX.md).
+[`f605f8626d2e672a59187c9c998015d2efb31040`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/HARNESS-MATRIX.md).
 
 Current native Codex examples:
 
-- [`license-mit-codex`](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/cells/license-mit-codex/license-mit-codex.kdl):
-  `bin/check-codex-native.sh cells/license-mit-codex` is the free static gate. The opt-in paid run is
-  `st2 eval ./cells/license-mit-codex/ --keep`; pinned evidence is 6/6 PASS in 1m39s.
-- [`signal-rename-codex`](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/cells/signal-rename-codex/signal-rename-codex.kdl):
-  `bin/check-codex-native.sh cells/signal-rename-codex` is the free static gate. The opt-in paid run
-  is `st2 eval ./cells/signal-rename-codex/ --keep`; pinned evidence is 6/6 PASS in 8m07s.
+- [`license-mit-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/license-mit-codex/license-mit-codex.kdl):
+  two subjects plus a short model judge; low expected cost; 6/6 PASS in 1m39s on the fixed build.
+- [`signal-rename-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/signal-rename-codex/signal-rename-codex.kdl):
+  four-seat multi-repository rename; high expected cost; 6/6 PASS in 8m07s.
+- [`ghost-bug-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/ghost-bug-codex/ghost-bug-codex.kdl):
+  two-seat debugging and mutation-valid regression; medium expected cost; 5/5 PASS in 1m38s, after
+  which usage-limit notices were found in the kept logs and paid work stopped.
+- [`poisoned-pr-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/poisoned-pr-codex/poisoned-pr-codex.kdl):
+  two-seat review-only security exercise; medium expected cost; 4/4 gating PASS plus the signal judge
+  in 1m52s during the explicitly reopened tail.
+- [`fork-in-the-road-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/fork-in-the-road-codex/fork-in-the-road-codex.kdl):
+  four-seat design panel; high expected cost; 5/5 PASS in 7m21s on one retry after a concrete grader
+  fix.
 
-The pinned [native static checker](https://github.com/compoundingtech/evals/blob/67b45d2694ac40762b09f51bf625d092ab68de74/bin/check-codex-native.sh)
-does not consume model usage.
+The pinned [native static checker](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/bin/check-codex-native.sh)
+does not consume model usage. The ledger records that the sequential five-cell run is complete and
+no additional model-backed eval is authorized.
 
 The Claude native-readiness ledger is pinned at
 [`a52b68dfe4bdb65a3bb6a1ba51c674476cf197df`](https://github.com/compoundingtech/evals/blob/a52b68dfe4bdb65a3bb6a1ba51c674476cf197df/CLAUDE-NATIVE-READINESS.md).
@@ -244,10 +251,7 @@ Its current event-first native examples and gates are immutable at
   one Claude supervisor and three specialists, each with a native bare `ding`.
 
 Run `bin/check-claude-native.sh` and `bin/check-claude-reset.sh` from that tree for the free static
-acceptance. The gates reject polling language and legacy bus declarations, require event-first DING
+acceptance. The gates reject polling language and non-native bus declarations, require event-first DING
 guidance, and prove repeatable clean fixture resets. They do not invoke a model. A current-build
 `st2 eval` model run remains pending explicit authorization, so these examples have static acceptance
 but no current native live-smoke claim.
-
-[`team-standup`](https://github.com/compoundingtech/evals/blob/a52b68dfe4bdb65a3bb6a1ba51c674476cf197df/cells/team-standup/team-standup.kdl)
-remains a legacy reference to the retired generated-declaration flow, not a current native example.

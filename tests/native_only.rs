@@ -313,14 +313,37 @@ fn clean_path_supports_help_validate_env_and_doctor() {
     assert!(env.contains(&format!("export PTY_ROOT={}/pty", canonical.display())));
 
     let doctor_catalog = tmp.path().join("doctor-catalog");
-    fs::create_dir_all(&doctor_catalog).unwrap();
+    let doctor_agent = doctor_catalog.join("agents/h/missing/agent.kdl");
+    fs::create_dir_all(doctor_agent.parent().unwrap()).unwrap();
+    fs::write(&doctor_agent, "agent \"missing\" { host \"h\" }\n").unwrap();
     let mut owner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
     fs::write(
         doctor_catalog.join(".st2.h.lock"),
         format!("{}\n", owner.id()),
     )
     .unwrap();
-    let doctor = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let missing = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("doctor")
+        .arg("--catalog")
+        .arg(&doctor_catalog)
+        .args(["--host", "h"])
+        .env("PATH", bin.path())
+        .env("PTY_ROOT", tmp.path().join("pty"))
+        .output()
+        .unwrap();
+    assert!(
+        !missing.status.success(),
+        "a missing presence file passed doctor:\n{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("h.missing presence missing"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+
+    fs::write(doctor_agent.parent().unwrap().join("status"), "offline\n").unwrap();
+    let offline = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(&doctor_catalog)
@@ -332,10 +355,16 @@ fn clean_path_supports_help_validate_env_and_doctor() {
     let _ = owner.kill();
     let _ = owner.wait();
     assert!(
-        doctor.status.success(),
+        offline.status.success(),
         "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&doctor.stdout),
-        String::from_utf8_lossy(&doctor.stderr)
+        String::from_utf8_lossy(&offline.stdout),
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&offline.stdout)
+            .contains("h.missing presence fresh (is `offline`)"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&offline.stdout)
     );
 }
 
