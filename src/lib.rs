@@ -29,6 +29,7 @@ pub(crate) mod shepherd;
 pub mod spec;
 pub mod status;
 pub mod validate;
+pub mod version;
 
 pub use discovery::{Discovered, SpecError, discover};
 pub use exec_backend::ExecBackend;
