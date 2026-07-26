@@ -339,3 +339,29 @@ fn a_hand_authored_native_catalog_validates_without_errors() {
         result.issues
     );
 }
+
+/// A declared delivery mode st2 does not know must be an error, not a silent fall back to inference:
+/// an author cannot observe from the outside which mode a ding actually chose.
+#[test]
+fn an_unknown_delivery_mode_is_an_error() {
+    let c = catalog(&[(
+        "hetz/worker/agent.kdl",
+        r#"agent "worker" { host "hetz"; command "exec claude"; ding; delivery "cluade" }"#,
+    )]);
+    let r = validate(c.path());
+    assert!(has(&r, "unknown-delivery", Severity::Error), "{:?}", r.issues);
+}
+
+#[test]
+fn a_known_delivery_mode_is_clean() {
+    for word in ["legacy", "codex-guarded"] {
+        let c = catalog(&[(
+            "hetz/worker/agent.kdl",
+            &format!(
+                r#"agent "worker" {{ host "hetz"; command "exec my-wrapper"; ding; delivery "{word}" }}"#
+            ),
+        )]);
+        let r = validate(c.path());
+        assert_eq!(r.errors(), 0, "{word}: {:?}", r.issues);
+    }
+}

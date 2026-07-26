@@ -567,6 +567,7 @@ mod tests {
             retired: false,
             keep: false,
             restart: None,
+            delivery: None,
             tasks: vec![Task {
                 kind: TaskKind::Pty,
                 name: "agent".into(),

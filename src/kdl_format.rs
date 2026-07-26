@@ -70,6 +70,7 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
             "restart" => raw.restart = Some(restart_node_to_raw(child)),
             "command" => raw.command = arg_string(child),
             "ding" => raw.ding = true,
+            "delivery" => raw.delivery = arg_string(child),
             "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {

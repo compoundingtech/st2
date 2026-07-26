@@ -61,6 +61,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 retired: false,
                 keep: false,
                 restart: None,
+                delivery: None,
                 tasks,
                 path: path.clone(),
             }

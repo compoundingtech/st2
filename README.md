@@ -72,6 +72,10 @@ agent "<identity>" {
   env { ST_AGENT "<host>.<identity>" }
   command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
   ding
+  // Optional: how this pane accepts a DING poke — `legacy` or `codex-guarded`.
+  // Omitted, it is inferred from the command's program name, which cannot see through a
+  // wrapper, a shim, or an absolute path. Inference stays fail-closed.
+  // delivery "legacy"
 
   render {
     copy "_templates/<host>.<identity>.AGENTS.md" "AGENTS.md"

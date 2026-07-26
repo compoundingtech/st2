@@ -202,6 +202,20 @@ pub fn validate(root: &Path) -> Report {
             ));
         }
 
+        // A declared delivery mode must be one st2 knows. Falling back to inference on a typo would
+        // be silent: an author who needs the declaration cannot observe from the outside whether it
+        // took effect, so an unrecognized word has to be an error here.
+        if let Some(word) = s.delivery.as_deref()
+            && crate::ding::DeliveryMode::parse(word).is_none()
+        {
+            issues.push(Issue::error(
+                "unknown-delivery",
+                rp.clone(),
+                ag.clone(),
+                format!("delivery '{word}' is not a known mode (expected legacy or codex-guarded)"),
+            ));
+        }
+
         // A rendered service agent must be runnable. Batch jobs legitimately carry no pty/exec tasks
         // (their work is in stages/run) — never flag them here.
         if s.job_type == JobType::Service && !s.is_runnable() {

@@ -1081,26 +1081,24 @@ fn ding_cmd(
 /// Keep the legacy combined text-plus-Return path only for a rendered Claude agent. Missing,
 /// ambiguous, or custom harness commands use the fail-closed Codex guard.
 fn ding_delivery_mode(root: &Path, id: &str, this_host: &str) -> ding::DeliveryMode {
-    let command = discover(root)
-        .specs
-        .into_iter()
-        .find(|spec| {
-            spec.bus_id(this_host) == id
-                || (spec.identity == id && spec.resolved_host(this_host) == this_host)
-        })
-        .and_then(|spec| {
-            spec.tasks
-                .iter()
-                .find(|task| task.kind == st2::TaskKind::Pty && task.name == "agent")
-                .or_else(|| {
-                    spec.tasks
-                        .iter()
-                        .find(|task| task.kind == st2::TaskKind::Pty)
-                })
-                .and_then(|task| task.command.as_deref())
-                .map(str::to_owned)
-        });
-    ding::DeliveryMode::for_agent_command(command.as_deref())
+    let spec = discover(root).specs.into_iter().find(|spec| {
+        spec.bus_id(this_host) == id
+            || (spec.identity == id && spec.resolved_host(this_host) == this_host)
+    });
+    let command = spec.as_ref().and_then(|spec| {
+        spec.tasks
+            .iter()
+            .find(|task| task.kind == st2::TaskKind::Pty && task.name == "agent")
+            .or_else(|| {
+                spec.tasks
+                    .iter()
+                    .find(|task| task.kind == st2::TaskKind::Pty)
+            })
+            .and_then(|task| task.command.as_deref())
+            .map(str::to_owned)
+    });
+    let declared = spec.as_ref().and_then(|spec| spec.delivery.as_deref());
+    ding::DeliveryMode::resolve(declared, command.as_deref())
 }
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.

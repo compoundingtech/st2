@@ -1193,6 +1193,7 @@ mod tests {
             retired: false,
             keep: false,
             restart: None,
+            delivery: None,
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }

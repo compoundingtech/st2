@@ -464,3 +464,31 @@ fn hidden_runner_state_and_resources_are_ignored() {
     assert_eq!(found.specs.len(), 1);
     assert_eq!(found.specs[0].identity, "a");
 }
+
+/// A wrapper-launched harness cannot be recognized from its command's program name, so the
+/// declaration has to carry the delivery mode. It is optional and absent means "infer".
+#[test]
+fn kdl_carries_a_declared_delivery_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/wrapped/agent.kdl",
+        r##"agent "wrapped" {
+  host "hetz"
+  command #"exec my-wrapper --flag 'boot'"#
+  ding
+  delivery "legacy"
+}
+"##,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/plain/agent.kdl",
+        r#"agent "plain" { host "hetz"; command "exec claude 'boot'"; ding }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(find(&found.specs, "wrapped").delivery.as_deref(), Some("legacy"));
+    assert_eq!(find(&found.specs, "plain").delivery, None);
+}

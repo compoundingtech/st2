@@ -38,6 +38,10 @@ pub struct AgentSpec {
     pub keep: bool,
     /// Crash/restart policy (§4). `None` → the runner's default policy.
     pub restart: Option<Restart>,
+    /// How this agent's pane accepts a ding poke, when the author declares it. `None` → inferred
+    /// from the command (see `ding::DeliveryMode`). Kept as the raw word so `spec` stays independent
+    /// of the ding; `validate` rejects an unknown one.
+    pub delivery: Option<String>,
     /// The runnable tasks (`pty` + `exec`), sorted by name for determinism.
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
@@ -195,6 +199,8 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: include the built-in `st2 ding` sidecar.
     #[serde(default)]
     pub ding: bool,
+    /// Declared ding delivery mode, overriding command-shape inference.
+    pub delivery: Option<String>,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
     #[serde(default)]
     pub pty: BTreeMap<String, RawTask>,
@@ -317,6 +323,7 @@ impl RawSpec {
             retired: self.retired,
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
+            delivery: self.delivery,
             tasks,
             path,
         }

@@ -154,6 +154,33 @@ impl DeliveryMode {
             Self::CodexGuarded
         }
     }
+
+    /// Parse a spec's declared `delivery` word. `None` for anything else, so a typo is a validate
+    /// error rather than a silent fall back to the guard — the whole point of the declaration is
+    /// that an author who needs it cannot tell from the outside whether it took effect.
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "legacy" => Some(Self::Legacy),
+            "codex-guarded" => Some(Self::CodexGuarded),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::CodexGuarded => "codex-guarded",
+        }
+    }
+
+    /// The mode for an agent: an explicit declaration wins, else infer from the command shape.
+    /// Inference stays fail-closed; the declaration is the escape hatch for a command whose program
+    /// name is a wrapper, a shim, or an absolute path.
+    pub fn resolve(declared: Option<&str>, command: Option<&str>) -> Self {
+        declared
+            .and_then(Self::parse)
+            .unwrap_or_else(|| Self::for_agent_command(command))
+    }
 }
 
 fn command_invokes(command: &str, expected: &str) -> bool {
@@ -2410,6 +2437,25 @@ mod tests {
             DeliveryMode::CodexGuarded,
             "wrapped or unfamiliar commands cannot opt into unconditional Return"
         );
+
+        // A wrapper cannot be inferred, so the spec must be able to say so. Inference is unchanged;
+        // the declaration is only consulted when it is present and valid.
+        assert_eq!(
+            DeliveryMode::resolve(Some("legacy"), Some("exec my-wrapper --flag")),
+            DeliveryMode::Legacy,
+            "a declared mode overrides command-shape inference"
+        );
+        assert_eq!(
+            DeliveryMode::resolve(Some("codex-guarded"), Some("exec claude 'boot'")),
+            DeliveryMode::CodexGuarded,
+            "a declared mode overrides inference in the guarding direction too"
+        );
+        assert_eq!(
+            DeliveryMode::resolve(None, Some("exec my-wrapper --flag")),
+            DeliveryMode::CodexGuarded,
+            "with nothing declared, inference stays fail-closed"
+        );
+        assert_eq!(DeliveryMode::parse("nonsense"), None);
 
         let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         let actions = RefCell::new(Vec::new());
