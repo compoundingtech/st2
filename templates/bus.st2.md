@@ -27,17 +27,13 @@ handle this?" first — only act on genuinely new ones.
 
 ## Inbound message handling ([DING] pokes)
 
-New peer messages surface as `[DING] new smalltalk message: [id:<rand6>] <subject> (from <sender>);
-check your inbox` lines. (The literal still reads "smalltalk" — the ding poke line is wire-compatible
-with the bus st2 replaces; read it as "new bus message". An st2-native rename of the literal is
-pending.) The `[id:<rand6>]` is the message filename's rand6 suffix — STABLE across re-pokes of the SAME
-message, so you can dedup a re-poke AT A GLANCE: if the id matches one you have already handled, it is a
-duplicate poke — skip it, no `st2 message ls` needed. Dedup on the `[id:<rand6>]`, NEVER the subject
-line: the subject text is display-only and can show stale pixels from a pane-render overlap, so a
-subject-based dedup could skip a real message wearing phantom pixels. For a NEW id: `st2 message ls` to
-find the filename (it contains that rand6), `st2 message read <filename>`, `st2 message reply <filename>
--m "<reply>"` if warranted (recipient + threading are derived from the message), `st2 message archive
-<filename>` to clear.
+New peer messages surface as `[DING] new st2 message: [id:<rand6>] <subject> (from <sender>); check
+your inbox` lines. Key only on the `[DING]` prefix and stable `[id:<rand6>]`; descriptive text is not
+an API. The id is the message filename's rand6 suffix and is stable across re-pokes of the same
+message. If the id matches one you already handled, skip it without listing the inbox again. Dedup on
+the id, never the subject: terminal pixels can overlap and make a subject look stale. For a new id,
+`st2 message ls` to find the filename, `st2 message read <filename>`, reply if warranted, then
+`st2 message archive <filename>` immediately.
 
 ## Threads stay on the bus
 
@@ -46,22 +42,21 @@ send` / `st2 message reply` — questions, blockers, "I think I'm done" signals,
 is unattended; your correspondent is your interlocutor. If you would pause to ask "should I do X?", send
 it via `st2 message reply` instead. Only address the REPL when a human directly typed there.
 
-## Adding agents — st2 is declarative (a supervisor/CoS action)
+## Adding agents — hand-authored KDL is canonical
 
-st2 has NO imperative spawn command (no `convoy add`, no `st launch`). The network IS the **catalog** — a
-folder of per-agent `agent.kdl` files — and `st2 up` supervises it. To ADD an agent you DECLARE it in
-the catalog, and the already-running `st2 up` reconciles it in on its next pass (it watches the folder):
+The network is the catalog: one `agents/<host>/<identity>/agent.kdl` declaration per agent. A
+supervisor or CoS authors the declaration, validates it, inspects its workspace targets, and lets the
+running `st2 up` reconcile it on the next pass:
 
 ```sh
-# author the agent's IR entry, then materialize its agent.kdl + workspace overlay:
-st2 add <identity> <ir-dir> --role <r> --host <h> --workspace <w> [--persona <p>] [--supervisor <s>]
-st2 compile <ir-dir> --catalog "$CATALOG"
-# — or compile one agent straight into the catalog (imperative sibling of `st2 compile`):
-st2 compile-agent --identity <id> --dir <workspace> --persona <file> [--role <r>] [--host <h>] --catalog "$CATALOG"
+${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
+st2 validate --catalog "$CATALOG"
+st2 up --catalog "$CATALOG" --host <host> --materialize-only
 ```
 
-The running `st2 up` then boots it — no separate launch step. **If you are a worker: you do NOT add
-agents** — surface the need to your supervisor. Declaring/adding agents is a supervisor/CoS action.
+`st2 compile-agent` is an experimental generation aid, not the canonical authoring surface. Inspect
+its full KDL and every `render {}` target before validation or materialization. Workers do not add
+agents; surface the need to your supervisor.
 
 ## CLI inventory
 
@@ -86,10 +81,10 @@ Resources:
 - `st2 resource add <url> [--title T] [--tag T,T] [--relation R]`
 - `st2 resource ls [<identity>]` · `st2 resource read [<identity>] <ref>` · `st2 resource remove [<identity>] <ref>`
 
-Adding agents (supervisor/CoS): `st2 add` / `st2 compile` / `st2 compile-agent` (see above) — declarative;
-`st2 up` reconciles it in.
+Agent declarations: hand-authored `agents/<host>/<identity>/agent.kdl`; optional experimental
+`st2 compile-agent`; `st2 validate`; `st2 up --materialize-only`; `st2 up`.
 
 Catalog selection on every catalog-aware command: `--catalog <path>` → `$CATALOG` →
-`${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`. Bus ops retain `--root` as a legacy
+`${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`. Bus ops retain `--root` as an explicit
 flat-bus/catalog override. Other shared bus flags: `--as <identity>` (default `$ST_AGENT`), `--host`.
 Every command supports `--help`.

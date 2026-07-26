@@ -58,18 +58,18 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         interval: u64,
     },
-    /// Native message bus (VRS §5): send/list/read/archive/reply over agents' `resources/inbox`.
-    /// The wire format (a `<unix-ms>-<rand6>.md` markdown file) is smalltalk-compatible.
+    /// Native message bus: send/list/read/archive/reply over agents' `resources/inbox`.
+    /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
     #[command(subcommand)]
     Message(MessageCmd),
-    /// An agent's working-state context (lossless-restart, smalltalk-compatible): read/write/append.
+    /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
     /// An agent's linked resources (high-value output a peer can find): add/ls/read/remove.
     #[command(subcommand)]
     Resource(ResourceCmd),
-    /// Install `st2 up` as a systemd-user service (headless Linux — the `convoy-up.service`
-    /// replacement). macOS stays manual (TCC). Subcommands: install / status / uninstall.
+    /// Install `st2 up` as a systemd-user service on headless Linux. macOS stays manual (TCC).
+    /// Subcommands: install / status / uninstall.
     #[command(subcommand)]
     Service(ServiceCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and safely poke its pty (`[DING] …`) on
@@ -108,55 +108,13 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// Compile an IR folder into a runnable catalog: for each IR `agent`, write `<catalog>/<host>/
-    /// <identity>/agent.kdl` (behavior-neutral wiring), materialize the persona overlay into the
-    /// agent's workspace, and create its bus dirs. (Was `st2 render`; `render` kept as an alias.)
-    #[command(name = "compile", visible_alias = "render")]
-    Render {
-        /// IR input folder — `*.kdl` agent declarations, with `personas/<persona>.md` alongside.
-        ir_dir: PathBuf,
-        /// Legacy positional catalog output folder. Prefer --catalog; defaults to $CATALOG, then
-        /// the default st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog_dir: Option<PathBuf>,
-    },
-    /// Declare a new agent: author its IR entry (`<ir-dir>/<identity>.kdl`). No render, no launch —
-    /// then `st2 compile` materializes it and `st2 up` runs it.
-    Add {
-        /// The agent identity (e.g. `fabric-claude`).
-        identity: String,
-        /// IR folder to write the entry into.
-        ir_dir: PathBuf,
-        #[arg(long, default_value = "worker")]
-        role: String,
-        #[arg(long)]
-        host: String,
-        #[arg(long, default_value = "claude")]
-        harness: String,
-        #[arg(long)]
-        model: Option<String>,
-        /// Persona basename (defaults to the role).
-        #[arg(long)]
-        persona: Option<String>,
-        #[arg(long)]
-        workspace: String,
-        #[arg(long)]
-        supervisor: Option<String>,
-    },
-    /// Un-declare an agent: delete its IR entry (`<ir-dir>/<identity>.kdl`). Re-compile + `st2 down`
-    /// to stop a running instance.
-    Remove { identity: String, ir_dir: PathBuf },
-    /// Generate ONE compact agent from flags: catalog-owned agent.kdl, templates, and bus dirs.
-    /// The workspace remains untouched until `st2 up --materialize-only` (or a real `st2 up`) applies
-    /// the declaration. Harness-specific Claude/Codex hooks are included automatically. Also available
-    /// as `st2 build-agent` and the older `st2 render-agent` alias.
-    #[command(
-        name = "compile-agent",
-        visible_aliases = ["render-agent", "build-agent"]
-    )]
-    RenderAgent {
-        /// Legacy positional catalog folder. Prefer --catalog; defaults to $CATALOG, then the
-        /// default st2 catalog.
+    /// EXPERIMENTAL: generate one compact agent declaration plus catalog-owned templates. Hand-authored
+    /// KDL is canonical. Inspect the full generated KDL and every workspace `render {}` target before
+    /// materialization. The workspace remains untouched until `st2 up --materialize-only` or `st2 up`.
+    #[command(name = "compile-agent")]
+    CompileAgent {
+        /// Optional positional catalog folder. Prefer --catalog; defaults to $CATALOG, then the
+        /// standard st2 catalog.
         #[arg(conflicts_with = "catalog_path")]
         catalog: Option<PathBuf>,
         #[arg(long)]
@@ -187,8 +145,8 @@ enum Command {
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
     /// tasks (stopping/crashing st2 never does). Idempotent.
     Down {
-        /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
-        /// default st2 catalog.
+        /// Optional positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
+        /// standard st2 catalog.
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
         /// Host to tear down. Defaults to the local hostname.
@@ -196,26 +154,21 @@ enum Command {
         host: Option<String>,
     },
     /// Print shell exports for a catalog's bus — `eval "$(st2 env --catalog <catalog>)"` sets `CATALOG`/
-    /// `ST_ROOT`/`PTY_ROOT` so `st`/`pty` target the catalog's bus.
+    /// `ST_ROOT`/`PTY_ROOT` so native bus-aware tools target the catalog.
     Env {
-        /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
-        /// st2 catalog.
+        /// Optional positional catalog path. Prefer --catalog; defaults to $CATALOG, then the
+        /// standard st2 catalog.
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
     },
     /// Pre-trust agent workspaces in the claude config (`$CLAUDE_CONFIG_DIR/.claude.json` else
     /// `~/.claude.json`) BEFORE they boot, so a kick-driven `claude` never hangs on the "Is this a
     /// project you trust?" dialog. One atomic batch write for all dirs closes the multi-spawn trust
-    /// race; merges into existing entries (never clobbers). Run it before `st2 up`, like `convoy
-    /// pretrust`.
+    /// race; merges into existing entries (never clobbers). Run it before `st2 up`.
     Pretrust {
         /// Workspace directories to mark trusted.
         #[arg(required = true)]
         dirs: Vec<PathBuf>,
-        /// Accepted for `convoy pretrust` drop-in compatibility and IGNORED — `st2 pretrust` already
-        /// marks each dir trusted for BOTH claude and codex, so it needs no harness hint.
-        #[arg(long)]
-        harness: Option<String>,
     },
     /// Run an st2-spec eval end to end: copy the fixture, boot the team + judges, deliver the
     /// kickoff, wait for the sup's confirmation, run the judges → verdict. `st2 eval ./cells/<name>/`.
@@ -242,7 +195,7 @@ enum Command {
         args: Vec<String>,
     },
     /// Drop into `$SHELL` with this catalog's bus env set (`CATALOG`/`ST_ROOT`/`PTY_ROOT`), so `pty`,
-    /// `st`, and anything else target the catalog for the whole session without `eval "$(st2 env …)"`.
+    /// bus-aware tools target the catalog for the whole session without `eval "$(st2 env …)"`.
     /// The general form of `st2 pty`. Catalog selection follows `--catalog`, `$CATALOG`, then the
     /// default st2 catalog; extra args go to the shell (e.g. `st2 shell -c "pty ls"`).
     Shell {
@@ -278,7 +231,7 @@ enum Command {
         host: Option<String>,
     },
     /// List every agent in the catalog with its presence status (roster). `--json [--enrich]` is
-    /// byte-compatible with smalltalk's `st agents`.
+    /// stable machine-readable roster.
     Agents {
         /// The catalog folder (like `st2 ls`/`up`). Falls back to `--root`/`$CATALOG`.
         #[arg(conflicts_with = "catalog_path")]
@@ -559,28 +512,7 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
-        Command::Render {
-            ir_dir,
-            catalog_dir,
-        } => {
-            let catalog_dir = catalog_arg(catalog_dir)?;
-            render_cmd(&ir_dir, &catalog_dir)
-        }
-        Command::Add {
-            identity,
-            ir_dir,
-            role,
-            host,
-            harness,
-            model,
-            persona,
-            workspace,
-            supervisor,
-        } => add_cmd(
-            &identity, &ir_dir, &role, &host, &harness, model, persona, &workspace, supervisor,
-        ),
-        Command::Remove { identity, ir_dir } => remove_cmd(&identity, &ir_dir),
-        Command::RenderAgent {
+        Command::CompileAgent {
             catalog,
             identity,
             role,
@@ -593,7 +525,7 @@ fn main() -> Result<()> {
             extra_arg,
         } => {
             let catalog = catalog_arg(catalog)?;
-            render_agent_cmd(
+            compile_agent_cmd(
                 &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
                 extra_arg,
             )
@@ -606,7 +538,7 @@ fn main() -> Result<()> {
             let root = catalog_arg(root)?;
             env_cmd(&root)
         }
-        Command::Pretrust { dirs, harness: _ } => pretrust_cmd(&dirs),
+        Command::Pretrust { dirs } => pretrust_cmd(&dirs),
         Command::Eval { folder, host, keep } => eval_cmd(&folder, host, keep),
         Command::Validate { root, strict, json } => {
             let root = catalog_arg(root)?;
@@ -621,35 +553,8 @@ fn main() -> Result<()> {
     }
 }
 
-fn render_cmd(ir_dir: &Path, catalog_dir: &Path) -> Result<()> {
-    let personas_dir = ir_dir.join("personas");
-    let mut count = 0;
-    for entry in
-        std::fs::read_dir(ir_dir).with_context(|| format!("reading IR dir {}", ir_dir.display()))?
-    {
-        let path = entry?.path();
-        // IR files are the *.kdl at the top level; personas/ lives in a subdir.
-        if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path)?;
-        let agents = st2::render::parse_ir(&text)
-            .with_context(|| format!("parsing IR {}", path.display()))?;
-        for ir in &agents {
-            let dir = st2::render::render_agent(ir, catalog_dir, &personas_dir)
-                .with_context(|| format!("rendering agent '{}'", ir.identity))?;
-            println!("rendered {} → {}", ir.bus_id(), dir.display());
-            count += 1;
-        }
-    }
-    if count == 0 {
-        println!("no IR agents (`*.kdl`) found under {}", ir_dir.display());
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
-fn render_agent_cmd(
+fn compile_agent_cmd(
     catalog: &Path,
     identity: &str,
     role: &str,
@@ -662,24 +567,17 @@ fn render_agent_cmd(
     extra_arg: Vec<String>,
 ) -> Result<()> {
     let host = host.unwrap_or_else(detect_host);
-    let persona_name = persona
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .with_context(|| format!("persona path {} has no file stem", persona.display()))?
-        .to_string();
-    let ir = st2::render::IrAgent {
+    let input = st2::compile_agent::AgentInput {
         identity: identity.to_string(),
         host: host.clone(),
         role: role.to_string(),
         harness: harness.to_string(),
         model,
-        persona: persona_name,
         workspace: dir.to_string(),
         supervisor,
-        permissions: None,
         extra_args: extra_arg,
     };
-    let agent_dir = st2::render::compile_agent(&ir, catalog, persona)
+    let agent_dir = st2::compile_agent::compile_agent(&input, catalog, persona)
         .with_context(|| format!("compiling agent '{identity}'"))?;
     println!(
         "compiled {host}.{identity} → {}  \
@@ -688,52 +586,6 @@ fn render_agent_cmd(
         catalog.display(),
         catalog.display(),
         catalog.display()
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_cmd(
-    identity: &str,
-    ir_dir: &Path,
-    role: &str,
-    host: &str,
-    harness: &str,
-    model: Option<String>,
-    persona: Option<String>,
-    workspace: &str,
-    supervisor: Option<String>,
-) -> Result<()> {
-    let path = ir_dir.join(format!("{identity}.kdl"));
-    if path.exists() {
-        anyhow::bail!(
-            "agent '{identity}' is already declared at {}",
-            path.display()
-        );
-    }
-    std::fs::create_dir_all(ir_dir)?;
-    let mut s = format!(
-        "agent \"{identity}\" {{\n  host \"{host}\"\n  role \"{role}\"\n  harness \"{harness}\"\n"
-    );
-    if let Some(m) = &model {
-        s.push_str(&format!("  model \"{m}\"\n"));
-    }
-    if let Some(p) = &persona {
-        s.push_str(&format!("  persona \"{p}\"\n"));
-    }
-    s.push_str(&format!("  workspace \"{workspace}\"\n"));
-    if let Some(sup) = &supervisor {
-        s.push_str(&format!("  supervisor \"{sup}\"\n"));
-    }
-    s.push_str("}\n");
-    // Sanity: it must parse as IR before we write it.
-    st2::render::parse_ir(&s)
-        .with_context(|| format!("declared IR for '{identity}' does not parse"))?;
-    std::fs::write(&path, &s)?;
-    println!(
-        "declared {host}.{identity} → {}  (now: st2 compile {} --catalog <catalog>)",
-        path.display(),
-        ir_dir.display()
     );
     Ok(())
 }
@@ -764,19 +616,6 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
     let report = st2::down(root, &this_host, &runner)?;
     println!("teardown on host '{this_host}':");
     print_report(&report);
-    Ok(())
-}
-
-fn remove_cmd(identity: &str, ir_dir: &Path) -> Result<()> {
-    let path = ir_dir.join(format!("{identity}.kdl"));
-    if !path.exists() {
-        anyhow::bail!("no IR entry for '{identity}' at {}", path.display());
-    }
-    std::fs::remove_file(&path)?;
-    println!(
-        "removed {}  (re-render + `st2 down` to stop a running instance)",
-        path.display()
-    );
     Ok(())
 }
 
@@ -936,11 +775,10 @@ fn catalog_root_for_env() -> Result<PathBuf> {
     absolute_catalog_path(&root)
 }
 
-/// Set `CATALOG`/`ST_ROOT`/`PTY_ROOT` on a child so `st`/`pty` target this catalog's bus — the same
-/// exports `st2 env` prints.
+/// Set the same native catalog environment that `st2 env` prints.
 fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
     cmd.env("CATALOG", root)
-        .env("ST_ROOT", root.join("smalltalk"))
+        .env("ST_ROOT", root)
         .env("PTY_ROOT", root.join("pty"));
 }
 
@@ -959,8 +797,8 @@ fn pty_cmd(args: &[String]) -> Result<()> {
     Err(anyhow::anyhow!("failed to exec `pty`: {err}"))
 }
 
-/// `st2 shell [<args>…]` — drop into `$SHELL` with the catalog's bus env set, so `pty`/`st`/anything
-/// target the catalog for the whole session without re-`eval`. The general form of `st2 pty`.
+/// `st2 shell [<args>…]` — drop into `$SHELL` with the native catalog environment set. The general
+/// form of `st2 pty`.
 fn shell_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
@@ -976,10 +814,9 @@ fn shell_cmd(args: &[String]) -> Result<()> {
 fn env_cmd(root: &Path) -> Result<()> {
     let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let c = c.display();
-    // The same roots st2 sets on every task it spawns; `eval "$(st2 env --catalog <catalog>)"` makes st/pty
-    // target this catalog's bus.
+    // The same roots st2 sets on every task it spawns.
     println!("export CATALOG={c}");
-    println!("export ST_ROOT={c}/smalltalk");
+    println!("export ST_ROOT={c}");
     println!("export PTY_ROOT={c}/pty");
     Ok(())
 }
@@ -1003,14 +840,12 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
     let mut problems = 0usize;
 
     // 1) The tools a running fleet needs.
-    for tool in ["pty", "st"] {
-        report_check(
-            &mut problems,
-            tool_on_path(tool),
-            &format!("`{tool}` on PATH"),
-            "not found",
-        );
-    }
+    report_check(
+        &mut problems,
+        tool_on_path("pty"),
+        "`pty` on PATH",
+        "not found",
+    );
 
     // 2) A supervisor holding the host-lock (i.e. `st2 up` is running).
     match st2::HostLock::new(root, &this_host).live_owner() {
@@ -1447,7 +1282,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     }
 }
 
-/// `st2 message ls --json` row (byte-compatible with smalltalk's `st message ls --json`).
+/// `st2 message ls --json` row (stable st2 wire contract).
 #[derive(serde::Serialize)]
 struct LsItemJson<'a> {
     filename: &'a str,
@@ -1664,7 +1499,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// `st2 up <single-file-spec>` — supervise the spec's top-level team as a fleet: keep-alive + respawn,
-/// nomad-decoupled, exactly like `st2 up --catalog <catalog>` (the `convoy up` replacement). `--once` does a
+/// nomad-decoupled, exactly like `st2 up --catalog <catalog>`. `--once` does a
 /// single boot pass; otherwise it supervises on a timer under a host lock until Ctrl-C.
 fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u64) -> Result<()> {
     let (spec, root) = st2::eval_run::load_spec(spec_file)?;

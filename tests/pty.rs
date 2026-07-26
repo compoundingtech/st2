@@ -20,7 +20,11 @@ fn pty_shim() -> tempfile::TempDir {
 }
 
 fn path_with(bin: &Path) -> String {
-    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
 }
 
 #[test]
@@ -40,12 +44,15 @@ fn pty_defaults_to_the_xdg_catalog_and_passes_args_through() {
     let catalog = state.path().join("st2/default/catalog");
 
     assert!(s.contains(&format!("CATALOG={}", catalog.display())), "{s}");
-    assert!(s.contains(&format!("PTY_ROOT={}/pty", catalog.display())), "{s}");
     assert!(
-        s.contains(&format!("ST_ROOT={}/smalltalk", catalog.display())),
+        s.contains(&format!("PTY_ROOT={}/pty", catalog.display())),
         "{s}"
     );
-    assert!(s.contains("ARGS=peek sess1"), "args not passed through: {s}");
+    assert!(s.contains(&format!("ST_ROOT={}", catalog.display())), "{s}");
+    assert!(
+        s.contains("ARGS=peek sess1"),
+        "args not passed through: {s}"
+    );
 }
 
 #[test]
@@ -64,7 +71,10 @@ fn pty_honors_a_preset_catalog_env_over_cwd() {
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     let canon = cat.path().canonicalize().unwrap();
-    assert!(s.contains(&format!("CATALOG={}", canon.display())), "preset CATALOG ignored: {s}");
+    assert!(
+        s.contains(&format!("CATALOG={}", canon.display())),
+        "preset CATALOG ignored: {s}"
+    );
     assert!(s.contains("ARGS=ls"), "{s}");
 }
 
@@ -106,7 +116,10 @@ fn pty_passes_hyphen_flags_through() {
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("ARGS=ls --json"), "hyphen flag not passed through: {s}");
+    assert!(
+        s.contains("ARGS=ls --json"),
+        "hyphen flag not passed through: {s}"
+    );
 }
 
 #[test]
@@ -131,5 +144,8 @@ fn shell_execs_the_shell_with_the_bus_env() {
         s.contains(&format!("PTY_ROOT={}/pty", catalog.display())),
         "{s}"
     );
-    assert!(s.contains("ARGS=-c noop"), "shell args not passed through: {s}");
+    assert!(
+        s.contains("ARGS=-c noop"),
+        "shell args not passed through: {s}"
+    );
 }

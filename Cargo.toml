@@ -14,7 +14,7 @@ name = "st2"
 path = "src/lib.rs"
 
 [dependencies]
-# Sync by design, mirroring convoy-rust: the runner is I/O-light (shell-outs to `pty` + a
+# Sync by design: the runner is I/O-light (shell-outs to `pty` plus a
 # folder watch + a sleep), so no tokio. Deps grow per milestone; M0 needs only parse + CLI.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

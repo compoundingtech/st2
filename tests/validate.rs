@@ -240,14 +240,10 @@ fn a_host_folder_mismatch_is_a_warning() {
 #[test]
 fn a_dangling_overlay_import_is_a_warning() {
     let d = tempfile::tempdir().unwrap();
-    // Workspace with render's overlay shape, but the imported persona file is missing.
+    // Workspace with the native overlay shape, but the imported persona file is missing.
     let ws = d.path().join("ws");
     std::fs::create_dir_all(ws.join(".claude/rules")).unwrap();
-    std::fs::write(
-        ws.join(".claude/rules/convoy.md"),
-        "@../../.convoy/PERSONA.md\n",
-    )
-    .unwrap();
+    std::fs::write(ws.join(".claude/rules/st2.md"), "@../../.st2/PERSONA.md\n").unwrap();
     let agent = format!(
         r#"agent "w" {{ host "hetz"; type "service"; workspace {:?}; pty "agent" {{ command "x" }} }}"#,
         ws.display()
@@ -257,7 +253,7 @@ fn a_dangling_overlay_import_is_a_warning() {
     assert!(has(&validate(d.path()), "dangling-import", Severity::Warn));
 }
 
-// ---- CLI: exit codes, --strict, --json, render round-trip ------------------------------------
+// ---- CLI: exit codes, --strict, --json, native example ---------------------------------------
 
 fn run_validate(args: &[&std::ffi::OsStr]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -318,37 +314,28 @@ fn cli_json_is_well_formed() {
 }
 
 #[test]
-fn a_rendered_catalog_validates_without_errors() {
-    // Render examples/ir (with a real workspace) → the runner's own output must clear validate.
-    let ws = tempfile::tempdir().unwrap();
-    let ir = tempfile::tempdir().unwrap();
-    let fleet = std::fs::read_to_string("examples/ir/fleet.kdl")
-        .unwrap()
-        .replace(
-            "/replace/with/a/real/repo/path",
-            ws.path().to_str().unwrap(),
-        );
-    std::fs::write(ir.path().join("fleet.kdl"), fleet).unwrap();
-    std::fs::create_dir_all(ir.path().join("personas")).unwrap();
-    std::fs::copy(
-        "examples/ir/personas/worker.md",
-        ir.path().join("personas/worker.md"),
+fn a_hand_authored_native_catalog_validates_without_errors() {
+    let workspace = tempfile::tempdir().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let declaration = include_str!("../examples/format/agent-codex.kdl")
+        .replace("<identity>", "worker")
+        .replace("<host>", "h")
+        .replace("<workspace>", workspace.path().to_str().unwrap());
+    let path = catalog.path().join("agents/h/worker/agent.kdl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, declaration).unwrap();
+    std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
+    std::fs::write(
+        catalog.path().join("_templates/h.worker.AGENTS.md"),
+        "# Worker\n",
     )
     .unwrap();
 
-    let cat = tempfile::tempdir().unwrap();
-    let render = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
-        .arg("render")
-        .arg(ir.path())
-        .arg(cat.path())
-        .output()
-        .unwrap();
-    assert!(
-        render.status.success(),
-        "render failed: {}",
-        String::from_utf8_lossy(&render.stderr)
+    let result = validate(catalog.path());
+    assert_eq!(
+        result.errors(),
+        0,
+        "native catalog has errors: {:?}",
+        result.issues
     );
-
-    let r = validate(cat.path());
-    assert_eq!(r.errors(), 0, "rendered catalog has errors: {:?}", r.issues);
 }

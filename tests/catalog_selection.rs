@@ -108,7 +108,7 @@ fn global_catalog_flag_overrides_the_environment_from_a_subcommand() {
 }
 
 #[test]
-fn build_agent_can_target_only_the_global_catalog_flag() {
+fn compile_agent_can_target_only_the_global_catalog_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
@@ -120,7 +120,7 @@ fn build_agent_can_target_only_the_global_catalog_flag() {
         .arg("--catalog")
         .arg(&catalog)
         .args([
-            "build-agent",
+            "compile-agent",
             "--identity",
             "worker",
             "--host",

@@ -1,9 +1,8 @@
 //! The ding sidecar (M2.2): a native watcher over an agent's `resources/inbox` that pokes the agent's
-//! pty on every new message arrival — st2's replacement for smalltalk's external `st ding`.
+//! pty on every new message arrival.
 //!
-//! The notice text is wire-identical to the thing it replaces, so a running agent's `[DING]`
-//! handling is unchanged:
-//! `[DING] new smalltalk message: [id:<rand6>] <subject> (from <sender>); check your inbox`.
+//! The notice carries a stable `[DING]` prefix and message id:
+//! `[DING] new st2 message: [id:<rand6>] <subject> (from <sender>); check your inbox`.
 //!
 //! Delivery is deliberately safer than the old unconditional text-then-Enter sequence. For a Codex
 //! pane, DING bracketed-pastes the notice without Enter, waits for the TUI to settle, peeks again,
@@ -34,7 +33,7 @@ use crate::message::{self, Message};
 use crate::status;
 
 /// The `<rand6>` of a `<unix-ms>-<rand6>.md` filename — the stable id an agent dedups re-pokes on.
-/// Falls back to the `.md`-stripped stem for anything off-grammar (mirrors smalltalk's `ding_id`).
+/// Falls back to the `.md`-stripped stem for anything off-grammar.
 pub fn poke_id(filename: &str) -> &str {
     if message::is_message_filename(filename) {
         // `13 digits` + `-` = 14 bytes of prefix, then the 6 rand chars.
@@ -44,9 +43,9 @@ pub fn poke_id(filename: &str) -> &str {
     }
 }
 
-/// The `[DING] …` line an agent sees in its terminal for one newly-arrived message. Byte-for-byte the
-/// format smalltalk emits and every agent's `DING-BUS.md` pattern-matches. Empty/missing `subject`
-/// and `from` degrade to `(no subject)` / `unknown`.
+/// The `[DING] …` line an agent sees for one newly arrived message. Consumers must key on the prefix
+/// and stable id rather than descriptive words. Empty/missing `subject` and `from` degrade to
+/// `(no subject)` / `unknown`.
 pub fn poke_text(msg: &Message) -> String {
     let subject = msg
         .subject
@@ -59,12 +58,13 @@ pub fn poke_text(msg: &Message) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown");
     format!(
-        "[DING] new smalltalk message: [id:{}] {subject} (from {from}); check your inbox",
+        "[DING] new st2 message: [id:{}] {subject} (from {from}); check your inbox",
         poke_id(&msg.filename)
     )
 }
 
-/// The legacy `pty send` argv for a non-Codex pane: text, then `key:return`, with a `0.5s` gap.
+/// The unguarded `pty send` argv for an explicitly non-Codex pane: text, then `key:return`, with a
+/// `0.5s` gap.
 /// Codex instead uses [`pty_stage_args`] followed by a guarded [`pty_submit_args`].
 pub fn pty_send_args(session: &str, text: &str) -> Vec<String> {
     vec![
@@ -498,7 +498,7 @@ pub fn session_alive(session: &str) -> bool {
 
 /// The `pty` session registry dir — MUST mirror pty-rust's `registry::session_dir()` resolution
 /// (`$PTY_ROOT`, else the deprecated `$PTY_SESSION_DIR`, else `~/.local/state/pty`), or the pidfile
-/// probe looks in the wrong place. Under convoy, `$PTY_ROOT` points into the network's state dir.
+/// probe looks in the wrong place.
 fn pty_session_dir() -> PathBuf {
     for var in ["PTY_ROOT", "PTY_SESSION_DIR"] {
         if let Ok(d) = std::env::var(var)
@@ -540,7 +540,7 @@ pub fn new_arrivals(inbox_dir: &Path, seen: &mut HashSet<String>) -> Vec<Message
 }
 
 /// Consecutive liveness misses tolerated before the ding gives up on a session it has seen alive
-/// (matches smalltalk-ding). Debounces a transient probe blip from killing the sidecar.
+/// Debounces a transient probe blip from killing the sidecar.
 const SESSION_GONE_DEBOUNCE_MISSES: u32 = 3;
 
 /// The startup-grace + debounce state for the session-liveness watch. Kept as a pure decision (fed one
@@ -616,9 +616,9 @@ pub fn run_ding(
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     // Arm the watcher BEFORE seeding: a file that lands in the gap between the seed scan and the watch
-    // starting still fires an event we process next pass, so nothing slips through (mirrors
-    // smalltalk-ding). Watch the inbox if it exists, else its parent (`resources/`) so we still catch
-    // the inbox dir being created. Best-effort — the poll timer is the real correctness guarantee.
+    // starting still fires an event we process next pass, so nothing slips through. Watch the inbox
+    // if it exists, else its parent (`resources/`) so we still catch the inbox dir being created.
+    // Best-effort — the poll timer is the real correctness guarantee.
     let (tx, rx) = channel::<()>();
     let watch_at = if inbox_dir.exists() {
         inbox_dir
@@ -797,14 +797,14 @@ mod tests {
     fn poke_text_shape_and_defaults() {
         assert_eq!(
             poke_text(&msg("1714826789012-x9k4mz.md", "alice", Some("deploy?"))),
-            "[DING] new smalltalk message: [id:x9k4mz] deploy? (from alice); check your inbox"
+            "[DING] new st2 message: [id:x9k4mz] deploy? (from alice); check your inbox"
         );
-        // Empty/missing subject + from degrade to the smalltalk defaults.
+        // Empty/missing subject + from degrade to stable defaults.
         let mut m = msg("1714826789012-x9k4mz.md", "", Some(""));
         m.from = None;
         assert_eq!(
             poke_text(&m),
-            "[DING] new smalltalk message: [id:x9k4mz] (no subject) (from unknown); check your inbox"
+            "[DING] new st2 message: [id:x9k4mz] (no subject) (from unknown); check your inbox"
         );
     }
 
@@ -895,8 +895,7 @@ mod tests {
 
     #[test]
     fn codex_choice_modal_blocks_return_even_when_ding_text_is_staged() {
-        let expected =
-            "[DING] new smalltalk message: [id:k0ygwh] safety (from cos); check your inbox";
+        let expected = "[DING] new st2 message: [id:k0ygwh] safety (from cos); check your inbox";
         assert_eq!(
             classify_pane(&modal_codex_screen(expected), expected),
             PaneState::Blocked
@@ -905,8 +904,7 @@ mod tests {
 
     #[test]
     fn codex_idle_staged_and_human_typing_states_are_distinct() {
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         let human = staged_codex_screen("half-written human request");
         let working = format!(
             "• Working (42s • esc to interrupt)\r\n\r\n{}",
@@ -927,8 +925,7 @@ mod tests {
 
     #[test]
     fn current_codex_renderer_variants_preserve_idle_staged_and_human_distinctions() {
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
 
         for idle in [
             current_macos_idle_codex_screen(),
@@ -974,8 +971,7 @@ mod tests {
 
     #[test]
     fn bottom_most_composer_marker_wins_over_historical_typed_content() {
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         let screen = format!(
             "{}\r\n{}",
             staged_codex_screen("old human prompt"),
@@ -989,8 +985,7 @@ mod tests {
     fn post_paste_modal_or_composer_mismatch_defers_without_return_then_submits_when_safe() {
         use std::cell::{Cell, RefCell};
 
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         for blocked_after_paste in [
             modal_codex_screen(expected),
             staged_codex_screen("human changed the composer"),
@@ -1079,8 +1074,7 @@ mod tests {
     fn pre_paste_modal_active_draft_and_peek_failure_fail_closed() {
         use std::cell::{Cell, RefCell};
 
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         let screens = [
             modal_codex_screen(expected),
             format!(
@@ -1140,8 +1134,7 @@ mod tests {
     fn ordinary_idle_codex_poke_round_trips_paste_repeek_then_return() {
         use std::cell::{Cell, RefCell};
 
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         let screens = RefCell::new(VecDeque::from([
             idle_codex_screen(),
             staged_codex_screen(expected),
@@ -1194,8 +1187,7 @@ mod tests {
             "wrapped or unfamiliar commands cannot opt into unconditional Return"
         );
 
-        let expected =
-            "[DING] new smalltalk message: [id:abc123] hi (from alice); check your inbox";
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
         let actions = RefCell::new(Vec::new());
         let before = Cell::new(0);
         let outcome = guarded_poke(

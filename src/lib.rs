@@ -1,15 +1,11 @@
 //! st2 — a harness-agnostic runner over a unified catalog+inbox folder.
 //!
-//! st2 is the RUN half of convoy, split out from RENDER. It reads a folder of *already-rendered*
-//! agent specs (each carrying explicit pty `command`s) plus each agent's inbox, and it does two
-//! dumb jobs: keep every declared agent's ptys running, and deliver messages by moving inbox files.
-//! It never needs to know what `claude` or `codex` are — everything harness-specific is baked into
-//! the spec's command/env by RENDER before st2 ever sees it.
-//!
-//! Milestones: **M0** spec model + discovery (this) · M1 reconcile plan · M2 pty execution ·
-//! M3 watch loop + flapping-cap + GC · M4 message delivery.
+//! st2 reads a catalog of hand-authored agent declarations plus each agent's inbox. It keeps every
+//! declared task running and delivers native messages. Harness-specific behavior stays explicit in
+//! each declaration's command, environment, hooks, and workspace materialization block.
 
 pub mod agents;
+pub mod compile_agent;
 pub mod context;
 pub mod ding;
 pub mod discovery;
@@ -26,7 +22,6 @@ pub mod materialize;
 pub mod message;
 pub mod pretrust;
 pub mod reconcile;
-pub mod render;
 pub mod resource;
 pub mod run;
 pub mod service;
