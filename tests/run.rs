@@ -13,6 +13,7 @@ use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
 #[derive(Default)]
 struct FakeRunner {
     sessions: Vec<Session>,
+    fail_list: bool,
     fail_spawn: Option<String>,
     spawned: RefCell<Vec<String>>,
     spawn_dirs: RefCell<Vec<(String, String)>>,
@@ -22,6 +23,9 @@ struct FakeRunner {
 
 impl Runner for FakeRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        if self.fail_list {
+            anyhow::bail!("`pty list --json` failed: simulated failure");
+        }
         Ok(self.sessions.clone())
     }
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -292,4 +296,42 @@ fn up_once_surfaces_discovery_errors_and_unrunnable() {
     assert_eq!(report.unrunnable, vec!["nr"]);
     assert_eq!(report.errors.len(), 1);
     assert!(report.errors[0].contains("bad/agent.toml"));
+}
+
+/// A pass that could not take a session snapshot reconciled *nothing* — it is not the same as a pass
+/// that ran and had a per-agent error. `--once` is a one-shot boot step whose exit status is the only
+/// signal a unit or deploy hook reads, so the report must say the pass was skipped.
+#[test]
+fn a_pass_that_cannot_list_sessions_is_reported_as_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+
+    let runner = FakeRunner { fail_list: true, ..Default::default() };
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert!(report.skipped, "a pass with no session snapshot must be marked skipped");
+    assert!(report.launched.is_empty(), "a skipped pass must launch nothing");
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(
+        report.errors.iter().any(|e| e.contains("pass skipped")),
+        "unexpected errors: {:?}",
+        report.errors
+    );
+}
+
+/// The converse: a pass that *did* run is never marked skipped, even when an agent failed to spawn.
+/// That per-agent failure is an error, not an absent reconcile, and must stay non-fatal.
+#[test]
+fn a_pass_that_ran_is_not_skipped_even_when_an_agent_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+
+    let runner = FakeRunner {
+        fail_spawn: Some("hetz.demo-claude".to_string()),
+        ..Default::default()
+    };
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert!(!report.skipped);
+    assert!(!report.errors.is_empty());
 }

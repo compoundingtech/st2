@@ -1592,6 +1592,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
             spec_file.display()
         );
         print_report(&report);
+        bail_if_pass_skipped(&report)?;
         return Ok(());
     }
 
@@ -1692,6 +1693,7 @@ fn up(
         let report = up_once(root, &this_host, &runner)?;
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
+        bail_if_pass_skipped(&report)?;
         return Ok(());
     }
 
@@ -1717,6 +1719,17 @@ fn up(
     );
     lock.release();
     result
+}
+
+/// A single `--once` pass is a one-shot boot step, so its exit status is the only signal a caller
+/// (a unit's `ExecStart`, a deploy hook, a CI gate) reads. A skipped pass launched nothing and left
+/// the fleet in an unknown state, so it must not exit 0. Per-agent errors during a pass that *did*
+/// run are deliberately not fatal — that distinction is the point.
+fn bail_if_pass_skipped(report: &UpReport) -> Result<()> {
+    if report.skipped {
+        anyhow::bail!("no reconcile happened — the pass was skipped");
+    }
+    Ok(())
 }
 
 fn print_report(report: &UpReport) {

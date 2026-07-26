@@ -404,6 +404,10 @@ pub struct UpReport {
     pub warnings: Vec<String>,
     /// discovery + execution errors (non-fatal; collected).
     pub errors: Vec<String>,
+    /// True when no reconcile happened at all — the session snapshot could not be taken, so nothing
+    /// was planned, launched, or torn down. Distinct from "the pass ran and some agent errored":
+    /// a skipped pass leaves the fleet in an unknown state, so `--once` must not report success.
+    pub skipped: bool,
 }
 
 impl UpReport {
@@ -643,6 +647,7 @@ fn reconcile_pass(
             report
                 .errors
                 .push(format!("list sessions (pass skipped): {e}"));
+            report.skipped = true;
             return report;
         }
     };
@@ -801,6 +806,7 @@ pub fn reconcile_pass_specs(
             report
                 .errors
                 .push(format!("list sessions (pass skipped): {e}"));
+            report.skipped = true;
             return report;
         }
     };
