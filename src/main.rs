@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use st2::{
     HostLock, Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message,
@@ -16,7 +16,7 @@ use st2::{
 #[derive(Parser)]
 #[command(
     name = "st2",
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ST2_GIT_SHA"), ")"),
+    version = st2::version::display_version(),
     about = "Harness-agnostic runner over a unified catalog+inbox folder"
 )]
 struct Cli {
@@ -247,6 +247,12 @@ enum Command {
         enrich: bool,
         #[command(flatten)]
         ctx: MsgCtx,
+    },
+    /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
+    /// Generated from the live command tree, so it never drifts from the actual flags.
+    Completions {
+        /// The shell to generate completions for.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -549,6 +555,13 @@ fn main() -> Result<()> {
         Command::Doctor { root, host } => {
             let root = catalog_arg(root)?;
             doctor_cmd(&root, host)
+        }
+        Command::Completions { shell } => {
+            // Generate from the live command tree so the script can never drift
+            // from the actual flags (the flake gates this at build time).
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "st2", &mut std::io::stdout());
+            Ok(())
         }
     }
 }

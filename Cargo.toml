@@ -18,6 +18,7 @@ path = "src/lib.rs"
 # folder watch + a sleep), so no tokio. Deps grow per milestone; M0 needs only parse + CLI.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 kdl = "6"
 libc = "0.2"
 notify = "8"

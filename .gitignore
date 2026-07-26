@@ -1,5 +1,8 @@
 /target
 
+# Nix build symlink.
+/result
+
 # Per-agent runtime overlay (materialized per clone; machine-specific, never product).
 .st2/
 .claude/
