@@ -1,8 +1,8 @@
 # st2
 
 st2 runs a declarative network of Codex and Claude agents from one catalog. It owns process
-reconciliation, native messages, safe terminal DING delivery, presence, durable context, workspace
-materialization, and explicit teardown.
+reconciliation, native messages, normalized terminal DING delivery, presence, durable context,
+workspace materialization, and explicit teardown.
 
 Hand-authored KDL is the canonical interface. `st2 compile-agent` is experimental and must be
 reviewed before its output is materialized.
@@ -154,22 +154,21 @@ its hand-authored declaration, stop the predecessor transport, and decide how an
 backlog will be archived or forwarded. Never run old and native DING owners concurrently for the same
 identity.
 
-Native DING watches the recipient inbox and safely stages:
+Native DING watches the recipient inbox and delivers a normalized notice:
 
 ```text
 [DING] new st2 message: [id:<rand6>] <subject> (from <sender>); check your inbox
 ```
 
-Consumers must key on the `[DING]` prefix and stable id, not descriptive words. Codex delivery
-bracketed-pastes without Return, re-inspects the bottom-most composer, and submits only the exact
-staged notice. For the exact idle `Create a plan? … esc dismiss` prompt only, st2 confirms the same
-modal twice, sends Escape without Return, and re-inspects before delivery. Every other modal, active
-turn, draft, `busy`, or `dnd` state defers. After a DING-sidecar restart, st2 can resume one notice
-only when the visible bottom composer starts with `[DING]` and its stable id names exactly one
-still-unread seeded inbox message. Only the description before `[id:…]` may differ across a rolling
-binary window; the normalized tail must still match that message's subject, sender/defaults, and
-`check your inbox`. The whole visible composer must then survive the normal exact-text guard. st2
-never replays the seeded backlog.
+Consumers must key on the `[DING]` prefix and stable id, not descriptive words. Every maintained
+harness uses the same transport: normalize untrusted fields into bounded, single-line printable
+text, send one bracketed-paste sequence, wait 500 ms, then send Return in that same `pty send`
+command. The fixed delay addresses observed paste settling, but st2 does not inspect the terminal
+and cannot guarantee modal safety; a modal that opens during the gap could receive Return. `busy`
+and `dnd` defer new arrivals in FIFO order, archive receipts suppress restored duplicates, and
+transport failures retain the head for retry. A restarted sidecar seeds but never replays the
+existing inbox; the boot ritual owns backlog draining. The generic path is covered for both
+maintained harness declarations, while live Claude delivery proof remains pending.
 
 ## Cleanup
 

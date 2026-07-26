@@ -15,7 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::ding::PokeOutcome;
 use crate::spec::{AgentSpec, TaskKind};
 
 pub(crate) const SHEPHERD_PROMPT: &str = "[ST2 LOCAL TICK] Run the scheduled local machine-root \
@@ -72,7 +71,7 @@ pub(crate) trait Poker {
         session: &str,
         text: &str,
         before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-    ) -> anyhow::Result<PokeOutcome>;
+    ) -> anyhow::Result<()>;
 }
 
 pub(crate) trait Reporter {
@@ -129,7 +128,6 @@ impl fmt::Display for Fault {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SkipReason {
     Dnd,
-    UnsafePane,
     Delivered,
     Backoff,
 }
@@ -229,10 +227,9 @@ fn select_target(specs: &[AgentSpec], this_host: &str) -> Result<Target, Fault> 
 
 /// Run one complete shepherd state transition.
 ///
-/// The ordering is the safety contract: load state, honor delivery/backoff, prepare a prompt-safe
-/// poke, durably save the attempt immediately before submit, latch successful delivery in memory,
-/// then durably save the delivered bucket. A modal/typing deferral never invokes the pre-submit
-/// callback, so it consumes neither the attempt backoff nor the delivered latch.
+/// The ordering is the safety contract: load state, honor delivery/backoff, durably save the attempt
+/// immediately before the single terminal send, latch successful delivery in memory, then durably
+/// save the delivered bucket.
 pub(crate) fn run_pass(
     specs: &[AgentSpec],
     this_host: &str,
@@ -303,16 +300,10 @@ pub(crate) fn run_pass(
         if let Some(fault) = attempt_fault {
             return Err(fault);
         }
-        let poke = poke.map_err(|error| Fault::Poke {
+        poke.map_err(|error| Fault::Poke {
             key: key.clone(),
             error: error.to_string(),
         })?;
-        if poke != PokeOutcome::Delivered {
-            return Ok(Outcome::Skipped {
-                key: key.clone(),
-                reason: SkipReason::UnsafePane,
-            });
-        }
 
         // Latch before the second durable write: a successful poke must never be duplicated by this
         // runtime merely because persisting its delivery failed.
@@ -445,7 +436,7 @@ impl Poker for PtyPoker {
         session: &str,
         text: &str,
         before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-    ) -> anyhow::Result<PokeOutcome> {
+    ) -> anyhow::Result<()> {
         crate::ding::PtyPoker::new(session).poke_with(text, before_submit)
     }
 }
@@ -516,8 +507,6 @@ mod tests {
     struct FakePoker {
         calls: Vec<String>,
         failures: usize,
-        deferrals: usize,
-        stagings: usize,
         events: Rc<RefCell<Vec<String>>>,
     }
 
@@ -527,15 +516,7 @@ mod tests {
             session: &str,
             text: &str,
             before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-        ) -> anyhow::Result<PokeOutcome> {
-            if self.deferrals > 0 {
-                self.deferrals -= 1;
-                return Ok(PokeOutcome::Deferred);
-            }
-            if self.stagings > 0 {
-                self.stagings -= 1;
-                return Ok(PokeOutcome::Staged);
-            }
+        ) -> anyhow::Result<()> {
             before_submit()?;
             self.events.borrow_mut().push("poke".into());
             self.calls.push(format!("{session}: {text}"));
@@ -543,7 +524,7 @@ mod tests {
                 self.failures -= 1;
                 anyhow::bail!("poke fault");
             }
-            Ok(PokeOutcome::Delivered)
+            Ok(())
         }
     }
 
@@ -752,126 +733,6 @@ mod tests {
             Outcome::Delivered { .. }
         ));
         assert_eq!(poker.calls.len(), 1);
-    }
-
-    #[test]
-    fn shepherd_unsafe_pane_defers_without_attempt_or_backoff_then_delivers() {
-        let specs = [root("root", "exec codex")];
-        let now = CADENCE_SECS * 3;
-        let key = ShepherdKey::new("node", "root");
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut runtime = Runtime::default();
-        let mut store = FakeStore {
-            events: Rc::clone(&events),
-            ..Default::default()
-        };
-        let mut poker = FakePoker {
-            deferrals: 1,
-            events: Rc::clone(&events),
-            ..Default::default()
-        };
-        let mut reporter = FakeReporter::default();
-
-        assert!(matches!(
-            pass(
-                &specs,
-                now,
-                &mut runtime,
-                &mut store,
-                &mut poker,
-                &mut reporter
-            ),
-            Outcome::Skipped {
-                reason: SkipReason::UnsafePane,
-                ..
-            }
-        ));
-        assert_eq!(
-            store.states.get(&key).copied().unwrap_or_default(),
-            PersistedState::default(),
-            "neutral pane deferral must not create an attempt/backoff or delivered latch"
-        );
-        assert!(runtime.delivered.is_empty());
-        assert!(events.borrow().is_empty());
-        assert!(poker.calls.is_empty());
-        assert!(reporter.0.is_empty());
-
-        assert!(matches!(
-            pass(
-                &specs,
-                now + 1,
-                &mut runtime,
-                &mut store,
-                &mut poker,
-                &mut reporter
-            ),
-            Outcome::Delivered { bucket: 3, .. }
-        ));
-        assert_eq!(
-            events.borrow().as_slice(),
-            ["save-attempt", "poke", "save-delivered"]
-        );
-        assert_eq!(poker.calls.len(), 1);
-    }
-
-    #[test]
-    fn shepherd_staged_pane_is_not_latched_or_backed_off_before_safe_submit() {
-        let specs = [root("root", "exec codex")];
-        let now = CADENCE_SECS * 3;
-        let key = ShepherdKey::new("node", "root");
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut runtime = Runtime::default();
-        let mut store = FakeStore {
-            events: Rc::clone(&events),
-            ..Default::default()
-        };
-        let mut poker = FakePoker {
-            stagings: 1,
-            events: Rc::clone(&events),
-            ..Default::default()
-        };
-        let mut reporter = FakeReporter::default();
-
-        assert!(matches!(
-            pass(
-                &specs,
-                now,
-                &mut runtime,
-                &mut store,
-                &mut poker,
-                &mut reporter
-            ),
-            Outcome::Skipped {
-                reason: SkipReason::UnsafePane,
-                ..
-            }
-        ));
-        assert_eq!(
-            store.states.get(&key).copied().unwrap_or_default(),
-            PersistedState::default(),
-            "a pasted but unsubmitted prompt is not a durable attempt or delivery"
-        );
-        assert!(runtime.delivered.is_empty());
-        assert!(events.borrow().is_empty());
-        assert!(poker.calls.is_empty());
-
-        assert!(matches!(
-            pass(
-                &specs,
-                now + 1,
-                &mut runtime,
-                &mut store,
-                &mut poker,
-                &mut reporter
-            ),
-            Outcome::Delivered { bucket: 3, .. }
-        ));
-        assert_eq!(
-            events.borrow().as_slice(),
-            ["save-attempt", "poke", "save-delivered"]
-        );
-        assert_eq!(poker.calls.len(), 1);
-        assert!(reporter.0.is_empty());
     }
 
     #[test]

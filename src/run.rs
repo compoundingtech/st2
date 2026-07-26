@@ -1744,7 +1744,7 @@ mod tests {
                 _session: &str,
                 _text: &str,
                 _before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-            ) -> anyhow::Result<crate::ding::PokeOutcome> {
+            ) -> anyhow::Result<()> {
                 panic!("a missing root must fault before poke")
             }
         }
