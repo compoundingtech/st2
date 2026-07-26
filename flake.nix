@@ -84,7 +84,7 @@
           # tests in `tests/*.rs` each assume a real environment the Nix build
           # sandbox deliberately lacks — `/bin/bash` + `jq` (the shipped Codex
           # hooks), `/usr/bin/git` on a hardcoded `PATH` (materialize's
-          # git-worktree safety check), and a live `pty` / `convoy` / systemd
+          # git-worktree safety check), and live PTY backends or a systemd
           # `--user` manager (the survival + render-neutrality gates). Chasing
           # those with per-test skips is unbounded as the suite grows, so they run
           # on native CI (real runner) while the flake proves the package here:

@@ -54,20 +54,40 @@ impl Fixture {
     }
 
     fn run(&self, script: &str) -> Output {
+        self.run_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("hooks")
+                .join(script),
+        )
+    }
+
+    fn run_path(&self, script: &Path) -> Output {
         let current_path = std::env::var("PATH").unwrap_or_default();
         Command::new("/bin/bash")
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("hooks")
-                    .join(script),
-            )
+            .arg(script)
             .env("PATH", format!("{}:{current_path}", self.bin.display()))
             .env("ST_ROOT", &self.catalog)
             .env("CATALOG", &self.catalog)
             .env("ST_AGENT", "Silber.cos")
+            .env("ST_HOOKS", self.state.join("st2/hooks"))
             .env("XDG_STATE_HOME", &self.state)
             .output()
             .unwrap()
+    }
+
+    fn install_hooks(&self) -> PathBuf {
+        let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["hooks", "install"])
+            .env("ST_HOOKS", self.state.join("st2/hooks"))
+            .env("XDG_STATE_HOME", &self.state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        st2::hooks::versioned_hooks_dir_at(&self.state.join("st2/hooks"))
     }
 }
 
@@ -79,7 +99,12 @@ fn jq_available() -> bool {
 }
 
 fn stop_reason(output: &Output) -> String {
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let object = json.as_object().unwrap();
@@ -184,6 +209,33 @@ fn stop_uses_since_cursor_and_emits_only_new_messages() {
 }
 
 #[test]
+fn installed_versioned_stop_hook_preserves_the_scope_a_envelope_and_cursor() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Codex hook");
+        return;
+    }
+    let fixture = Fixture::new();
+    let hooks = fixture.install_hooks();
+    assert!(hooks.to_string_lossy().contains("/sets/sha256-"));
+    message::send_to_inbox(
+        &fixture.inbox,
+        "Silber.worker",
+        Some("installed"),
+        None,
+        &[],
+        "one",
+    )
+    .unwrap();
+
+    let first = fixture.run_path(&hooks.join("codex-stop.sh"));
+    assert!(stop_reason(&first).contains("installed"));
+    let quiet = fixture.run_path(&hooks.join("codex-stop.sh"));
+    assert!(quiet.status.success());
+    assert!(quiet.stdout.is_empty());
+    assert!(quiet.stderr.is_empty());
+}
+
+#[test]
 fn stop_fails_open_without_required_commands() {
     let fixture = Fixture::new();
     let output = Command::new("/bin/bash")
@@ -196,6 +248,7 @@ fn stop_fails_open_without_required_commands() {
         .env("ST_ROOT", &fixture.catalog)
         .env("CATALOG", &fixture.catalog)
         .env("ST_AGENT", "Silber.cos")
+        .env("ST_HOOKS", fixture.state.join("st2/hooks"))
         .env("XDG_STATE_HOME", &fixture.state)
         .output()
         .unwrap();

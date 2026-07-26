@@ -72,6 +72,10 @@ enum Command {
     /// Subcommands: install / status / uninstall.
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// Explicit lifecycle-hook management. `up` and materialization only verify; they never install
+    /// or refresh hooks.
+    #[command(subcommand)]
+    Hooks(HooksCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and safely poke its pty (`[DING] …`) on
     /// each new message. Codex modal/typing panes and busy/dnd status defer FIFO. Long-running — st2
     /// keeps it alive as a task alongside the agent. Exits when the target pty session is gone.
@@ -302,6 +306,18 @@ enum ServiceCmd {
 }
 
 #[derive(Subcommand)]
+enum HooksCmd {
+    /// Atomically publish this binary's immutable hook set and select it with a receipt.
+    Install {
+        /// Permit an intentional rollback to an older or unorderable hook set.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    /// Read-only verification of the selected receipt and every embedded hook byte.
+    Verify,
+}
+
+#[derive(Subcommand)]
 enum ResourceCmd {
     /// Link a resource (a URL you produced or reference) into your resource list.
     Add {
@@ -503,6 +519,7 @@ fn main() -> Result<()> {
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
+        Command::Hooks(cmd) => hooks_cmd(cmd),
         Command::Ding {
             session,
             identity,
@@ -594,12 +611,36 @@ fn compile_agent_cmd(
         .with_context(|| format!("compiling agent '{identity}'"))?;
     println!(
         "compiled {host}.{identity} → {}  \
-         (next: st2 validate --catalog {}; st2 up --catalog {} --host {host} --materialize-only; then st2 up --catalog {} --host {host} --once)",
+         (next: st2 hooks install; st2 validate --catalog {}; st2 up --catalog {} --host {host} --materialize-only; then st2 up --catalog {} --host {host} --once)",
         agent_dir.display(),
         catalog.display(),
         catalog.display(),
         catalog.display()
     );
+    Ok(())
+}
+
+fn hooks_cmd(command: HooksCmd) -> Result<()> {
+    match command {
+        HooksCmd::Install { allow_downgrade } => {
+            let dir = st2::hooks::install(allow_downgrade)?;
+            let root = st2::hooks::hooks_root()?;
+            println!(
+                "installed hook set {} in {}\nreceipt {}",
+                st2::hooks::hookset_id(),
+                dir.display(),
+                root.join("current.json").display()
+            );
+        }
+        HooksCmd::Verify => {
+            let dir = st2::hooks::verify_installed()?;
+            println!(
+                "verified hook set {} in {}",
+                st2::hooks::hookset_id(),
+                dir.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1599,7 +1640,6 @@ fn up(
     let this_host = host.unwrap_or_else(detect_host);
     // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    st2::hooks::ensure_installed().context("installing st2 lifecycle hooks")?;
 
     if materialize_only {
         let found = discover(&catalog_root);
@@ -1608,6 +1648,11 @@ fn up(
         }
         for error in &found.errors {
             eprintln!("error: {}: {}", error.path.display(), error.message);
+        }
+        if st2::hooks::required_by_codex(&found.specs, &this_host) {
+            st2::hooks::verify_installed().context(
+                "verifying explicitly installed lifecycle hooks before Codex materialization",
+            )?;
         }
         let report = st2::materialize::materialize_catalog(&catalog_root, &found.specs, &this_host);
         for item in &report.materialized {

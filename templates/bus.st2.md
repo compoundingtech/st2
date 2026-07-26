@@ -50,6 +50,7 @@ running `st2 up` reconcile it on the next pass:
 
 ```sh
 ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
+st2 hooks verify
 st2 validate --catalog "$CATALOG"
 st2 up --catalog "$CATALOG" --host <host> --materialize-only
 ```
@@ -80,6 +81,10 @@ Working state (lossless-restart):
 Resources:
 - `st2 resource add <url> [--title T] [--tag T,T] [--relation R]`
 - `st2 resource ls [<identity>]` · `st2 resource read [<identity>] <ref>` · `st2 resource remove [<identity>] <ref>`
+
+Machine lifecycle hooks (explicit; `up` never installs or refreshes them):
+- `st2 hooks install [--allow-downgrade]`
+- `st2 hooks verify`
 
 Agent declarations: hand-authored `agents/<host>/<identity>/agent.kdl`; optional experimental
 `st2 compile-agent`; `st2 validate`; `st2 up --materialize-only`; `st2 up`.

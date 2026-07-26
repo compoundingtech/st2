@@ -53,7 +53,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         .unwrap();
     assert!(help.status.success());
     let help = String::from_utf8_lossy(&help.stdout);
-    for command in ["validate", "message", "ding", "compile-agent"] {
+    for command in ["validate", "message", "ding", "hooks", "compile-agent"] {
         assert!(help.contains(command), "missing {command} in help:\n{help}");
     }
     for removed in [

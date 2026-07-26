@@ -24,10 +24,16 @@ the workspace. Inspect all generated KDL and workspace targets before use.
 Use this sequence for hand-authored or generated declarations:
 
 ```sh
+st2 hooks install
+st2 hooks verify
 st2 validate <catalog>
 st2 up <catalog> --host <host> --materialize-only
 st2 up <catalog> --host <host> --once
 ```
+
+Hook installation is explicit and receipt-bearing. `up` and materialization only verify the
+selected immutable hook set; they never refresh shared scripts. Managed settings resolve
+`$ST_HOOKS/<script>` into that versioned set.
 
 The `render { ... }` block is ordered. `copy`, `file`, `json-upsert`, and `ensure-line` are
 boot-gating operations; a failure prevents that agent from starting. Materialization refuses any

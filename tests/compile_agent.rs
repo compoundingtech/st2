@@ -35,6 +35,7 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
     let persona = tmp.path().join("supervisor.md");
     let persona_body = "# Supervisor\n\nCoordinate the task.\n";
     fs::create_dir_all(&workspace).unwrap();
@@ -60,6 +61,7 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
         .arg(&workspace)
         .arg("--persona")
         .arg(&persona)
+        .env("ST_HOOKS", &hooks_root)
         .output()
         .unwrap();
     assert!(
@@ -90,6 +92,7 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     let validate = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("validate")
         .arg(&catalog)
+        .env("ST_HOOKS", &hooks_root)
         .output()
         .unwrap();
     assert!(
@@ -101,6 +104,7 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
         .arg("up")
         .arg(&catalog)
         .args(["--host", "h", "--materialize-only"])
+        .env("ST_HOOKS", &hooks_root)
         .env("XDG_STATE_HOME", tmp.path().join("state"))
         .output()
         .unwrap();
@@ -132,6 +136,8 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
+    let state = tmp.path().join("state");
+    let hooks_root = tmp.path().join("hooks");
     let persona = tmp.path().join("worker.md");
     let persona_body = "# Codex worker\n\nOwn the scoped repository.\n";
     fs::create_dir_all(&workspace).unwrap();
@@ -154,6 +160,7 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
         .arg(&workspace)
         .arg("--persona")
         .arg(&persona)
+        .env("ST_HOOKS", &hooks_root)
         .output()
         .unwrap();
     assert!(
@@ -163,11 +170,23 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     );
     assert!(!workspace.join("AGENTS.md").exists());
 
+    let install = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["hooks", "install"])
+        .env("ST_HOOKS", &hooks_root)
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
     let materialize = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("up")
         .arg(&catalog)
         .args(["--host", "h", "--materialize-only"])
-        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("ST_HOOKS", &hooks_root)
+        .env("XDG_STATE_HOME", &state)
         .output()
         .unwrap();
     assert!(
@@ -187,6 +206,13 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
             .unwrap()
             .ends_with("/codex-session-start.sh")
     );
+    assert!(
+        hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("/sets/sha256-"),
+        "rendered hook references must select one immutable hook set"
+    );
 
     let kdl = fs::read_to_string(catalog.join("agents/h/worker/agent.kdl")).unwrap();
     assert!(kdl.contains("exec codex"));
@@ -196,6 +222,8 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
 
 #[test]
 fn removed_generator_aliases_are_unknown_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hooks_root = tmp.path().join("hooks");
     let removed = [
         ["a", "dd"].concat(),
         ["com", "pile"].concat(),
@@ -207,6 +235,7 @@ fn removed_generator_aliases_are_unknown_commands() {
     for removed in removed {
         let output = Command::new(env!("CARGO_BIN_EXE_st2"))
             .arg(&removed)
+            .env("ST_HOOKS", &hooks_root)
             .output()
             .unwrap();
         assert!(!output.status.success(), "{removed} unexpectedly succeeded");

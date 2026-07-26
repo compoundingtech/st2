@@ -22,6 +22,8 @@ From a checkout:
 cargo install --path . --locked
 st2 --help
 pty --help
+st2 hooks install
+st2 hooks verify
 ```
 
 The standard catalog is:
@@ -32,6 +34,16 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog
 
 Every catalog-aware command accepts `--catalog`; otherwise st2 uses `$CATALOG`, then that standard
 location.
+
+Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
+publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
+and workspace materialization verify that receipt but never create, refresh, or rewrite hooks.
+An intentional rollback to an older set requires `st2 hooks install --allow-downgrade`.
+
+`ST_HOOKS` overrides the machine-local hook root for installation, verification, and managed tasks.
+During materialization, hook commands such as `$ST_HOOKS/codex-stop.sh` resolve to the selected
+immutable set, so rendered settings are versioned without embedding a machine-specific root in the
+declaration.
 
 ## Author a native agent
 
@@ -78,6 +90,7 @@ task. Declarations should not contain machine-specific install paths.
 Gate the declaration before starting anything:
 
 ```sh
+st2 hooks verify
 st2 validate --catalog "$CATALOG"
 st2 up --catalog "$CATALOG" --host <host> --materialize-only
 ```
@@ -166,7 +179,7 @@ st2 service uninstall
 ls, up, down, validate, doctor
 message, ding, agents, status, context, resource
 env, pty, shell, pretrust
-service, eval
+hooks, service, eval
 compile-agent (experimental)
 ```
 

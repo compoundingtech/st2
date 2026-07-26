@@ -156,7 +156,7 @@ impl PtyCli {
             .env("ST_ROOT", &self.catalog_root)
             .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
             .env("TERM", "xterm-256color");
-        if let Ok(path) = crate::hooks::hooks_dir() {
+        if let Ok(path) = crate::hooks::hooks_root() {
             cmd.env("ST_HOOKS", path);
         }
         for (k, v) in &target.env {
@@ -602,9 +602,32 @@ fn reconcile_pass(
         ..Default::default()
     };
 
+    // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
+    // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
+    // so live sessions can still be adopted; only their materialization and any new launch defer.
+    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
+        .then(crate::hooks::verify_installed)
+        .transpose()
+        .err()
+        .map(|error| error.to_string());
+    if let Some(error) = &hook_error {
+        report.errors.push(format!(
+            "verify lifecycle hooks before Codex materialization: {error}; materialization deferred"
+        ));
+    }
+    let materializable_specs = found
+        .specs
+        .iter()
+        .filter(|spec| {
+            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
     // Ordered, idempotent pre-boot materialization. A gating render failure removes only that agent
     // from this pass; advisory git-exclude failures remain warnings and never block a launch.
-    let materialized = crate::materialize::materialize_catalog(root, &found.specs, this_host);
+    let materialized =
+        crate::materialize::materialize_catalog(root, &materializable_specs, this_host);
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
     let eligible_specs: Vec<_> = found
@@ -627,7 +650,16 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches(root, &mut plan, &mut report, crate::pretrust::pretrust_codex);
+    gate_codex_launches(
+        root,
+        &mut plan,
+        &mut report,
+        || match &hook_error {
+            Some(error) => anyhow::bail!("{error}"),
+            None => Ok(()),
+        },
+        crate::pretrust::pretrust_codex,
+    );
     execute(&plan, runner, cap, &mut report);
     report
 }
@@ -638,12 +670,14 @@ fn reconcile_pass(
 /// update, and fail closed: if trust cannot be established, suppress the affected agent launches
 /// (including their sidecars) and surface the error. Already-live/adopted agents never enter this
 /// path.
-fn gate_codex_launches<'a, F>(
+fn gate_codex_launches<'a, V, F>(
     catalog_root: &Path,
     plan: &mut ReconcilePlan<'a>,
     report: &mut UpReport,
+    verify_hooks: V,
     pretrust: F,
 ) where
+    V: FnOnce() -> anyhow::Result<()>,
     F: FnOnce(&[PathBuf]) -> anyhow::Result<usize>,
 {
     let mut workspaces = Vec::new();
@@ -667,6 +701,16 @@ fn gate_codex_launches<'a, F>(
         gated_agents.push(launch.spec.identity.clone());
     }
     if workspaces.is_empty() {
+        return;
+    }
+
+    if let Err(error) = verify_hooks() {
+        plan.launch
+            .retain(|launch| !gated_agents.contains(&launch.spec.identity));
+        report.errors.push(format!(
+            "verify lifecycle hooks for new Codex agent(s) {}: {error}; launch suppressed",
+            gated_agents.join(", ")
+        ));
         return;
     }
 
@@ -1263,6 +1307,7 @@ mod tests {
             Path::new("/catalog"),
             &mut plan,
             &mut UpReport::default(),
+            || Ok(()),
             |workspaces| {
                 captured.borrow_mut().extend_from_slice(workspaces);
                 Ok(workspaces.len())
@@ -1313,16 +1358,22 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches(Path::new("/catalog"), &mut plan, &mut report, |workspaces| {
-            assert_eq!(
-                workspaces,
-                [
-                    PathBuf::from("/workspaces/left"),
-                    PathBuf::from("/workspaces/right")
-                ]
-            );
-            anyhow::bail!("read-only Codex config")
-        });
+        gate_codex_launches(
+            Path::new("/catalog"),
+            &mut plan,
+            &mut report,
+            || Ok(()),
+            |workspaces| {
+                assert_eq!(
+                    workspaces,
+                    [
+                        PathBuf::from("/workspaces/left"),
+                        PathBuf::from("/workspaces/right")
+                    ]
+                );
+                anyhow::bail!("read-only Codex config")
+            },
+        );
 
         assert_eq!(
             plan.launch
@@ -1352,14 +1403,60 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches(Path::new("/catalog"), &mut plan, &mut report, |_| {
-            panic!("an already-live Codex agent must not enter the pretrust gate")
-        });
+        gate_codex_launches(
+            Path::new("/catalog"),
+            &mut plan,
+            &mut report,
+            || panic!("an already-live Codex agent must not enter the hook gate"),
+            |_| panic!("an already-live Codex agent must not enter the pretrust gate"),
+        );
 
         assert_eq!(plan.adopt, [&spec]);
         assert_eq!(plan.launch.len(), 1);
         assert_eq!(plan.launch[0].tasks[0].name, "ding");
         assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn hook_verification_failure_suppresses_only_new_codex_agents() {
+        let mut codex = spec_fixture();
+        codex.identity = "codex".into();
+        codex.path = PathBuf::from("/catalog/node/codex/agent.kdl");
+        let mut claude = spec_fixture();
+        claude.identity = "claude".into();
+        claude.path = PathBuf::from("/catalog/node/claude/agent.kdl");
+        let mut codex_agent = target("node.codex.agent", "exec codex");
+        codex_agent.workspace = Some("/workspaces/codex".into());
+        let claude_agent = target("node.claude.agent", "exec claude");
+        let mut plan = ReconcilePlan::default();
+        plan.launch.push(Launch {
+            spec: &codex,
+            tasks: vec![codex_agent],
+        });
+        plan.launch.push(Launch {
+            spec: &claude,
+            tasks: vec![claude_agent],
+        });
+        let mut report = UpReport::default();
+
+        gate_codex_launches(
+            Path::new("/catalog"),
+            &mut plan,
+            &mut report,
+            || anyhow::bail!("stale receipt"),
+            |_| panic!("pretrust must not run after hook verification fails"),
+        );
+
+        assert_eq!(
+            plan.launch
+                .iter()
+                .map(|launch| launch.spec.identity.as_str())
+                .collect::<Vec<_>>(),
+            ["claude"]
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("stale receipt"));
+        assert!(report.errors[0].contains("launch suppressed"));
     }
 
     /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
@@ -1451,6 +1548,12 @@ mod tests {
             envs.get("TERM"),
             Some(&Some("xterm-256color".to_string())),
             "headless st2 launches must not pass TERM=dumb into an interactive harness"
+        );
+        assert!(
+            envs.get("ST_HOOKS")
+                .and_then(Option::as_deref)
+                .is_some_and(|path| !path.contains("/sets/sha256-")),
+            "managed tasks keep ST_HOOKS at the receipt-bearing root; only rendered hook commands use a versioned set"
         );
     }
 

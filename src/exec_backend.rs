@@ -82,7 +82,7 @@ impl ExecBackend {
                 "PTY_ROOT",
                 crate::run::effective_pty_root(&self.catalog_root),
             );
-        if let Ok(path) = crate::hooks::hooks_dir() {
+        if let Ok(path) = crate::hooks::hooks_root() {
             cmd.env("ST_HOOKS", path);
         }
         for (k, v) in &target.env {

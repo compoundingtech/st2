@@ -24,7 +24,7 @@ fn agent_kdl(workspace: &Path, render: &str) -> String {
   host "Silber"
   workspace "{}"
   env {{ ST_AGENT "Silber.cos" }}
-  command "codex"
+  command "true"
   ding
   render {{
 {render}
@@ -252,6 +252,7 @@ fn missing_git_executable_fails_closed_before_workspace_write() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
     let empty_path = tmp.path().join("empty-path");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&empty_path).unwrap();
@@ -268,6 +269,7 @@ fn missing_git_executable_fails_closed_before_workspace_write() {
         .arg("up")
         .arg(&catalog)
         .args(["--host", "Silber", "--materialize-only"])
+        .env("ST_HOOKS", &hooks_root)
         .env("PATH", &empty_path)
         .output()
         .unwrap();
@@ -348,6 +350,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
     fs::create_dir_all(&workspace).unwrap();
     write(&catalog.join("_templates/brief.md"), "brief\n");
     write(
@@ -360,6 +363,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
         .arg(&catalog)
         .args(["--host", "Silber", "--materialize-only"])
         // Proves this path never tries the runtime's external pty backend.
+        .env("ST_HOOKS", &hooks_root)
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();

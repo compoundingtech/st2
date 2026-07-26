@@ -199,7 +199,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
         ),
         ("ST_AGENT".to_string(), spec.bus_id(this_host)),
     ]);
-    if let Ok(path) = crate::hooks::hooks_dir() {
+    if let Ok(path) = crate::hooks::versioned_hooks_dir() {
         env.insert("ST_HOOKS".to_string(), path.display().to_string());
     }
     if let Some(task) = spec.tasks.iter().find(|task| task.name == "agent") {

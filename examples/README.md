@@ -11,6 +11,8 @@ Replace every placeholder, add its referenced files under `<catalog>/_templates/
 result before starting a process:
 
 ```sh
+st2 hooks install
+st2 hooks verify
 st2 validate --catalog <catalog>
 st2 up --catalog <catalog> --host <host> --materialize-only
 st2 up --catalog <catalog> --host <host> --once
