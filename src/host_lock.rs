@@ -1,8 +1,8 @@
 //! The single-owner guard (post-v0 item b) — one supervising st2 per **(folder, host)**.
 //!
 //! Two st2 loops reconciling the same folder for the same host would double-spawn every agent and
-//! fight over liveness. A pid-file lock prevents it, mirroring convoy's `HostLock` — but scoped by
-//! host (`<root>/.st2.<host>.lock`), because the folder is a *synced* catalog: host A's lock file
+//! fight over liveness. A pid-file lock prevents it and is scoped by host
+//! (`<root>/.st2.<host>.lock`), because the folder is a *synced* catalog: host A's lock file
 //! syncs to host B, and B must ignore it (B only reads `.st2.<B>.lock`). The lock is dot-prefixed so
 //! discovery skips it. A crashed owner leaves a stale lock (dead pid) which the next start reclaims.
 

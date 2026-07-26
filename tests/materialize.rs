@@ -174,7 +174,8 @@ fn every_content_directive_refuses_to_change_a_tracked_target_before_any_write()
         let report = materialize_catalog(&catalog, &found.specs, "Silber");
         assert_eq!(report.errors.len(), 1, "{name}: {:?}", report.errors);
         assert!(
-            report.errors[0].contains("tracked workspace target"),
+            report.errors[0].contains("generated materialization would change Git-tracked target")
+                && report.errors[0].contains("choose an untracked overlay target"),
             "{name}: {:?}",
             report.errors
         );
@@ -244,6 +245,42 @@ fn untracked_and_non_git_targets_remain_materializable() {
             "new\n"
         );
     }
+}
+
+#[test]
+fn missing_git_executable_fails_closed_before_workspace_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let empty_path = tmp.path().join("empty-path");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&empty_path).unwrap();
+    init_git(&workspace);
+    write(&workspace.join("AGENTS.md"), "old\n");
+    track(&workspace, "AGENTS.md");
+    write(&catalog.join("_templates/AGENTS.md"), "new\n");
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "Silber", "--materialize-only"])
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("git rev-parse for materialization safety"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+        "old\n"
+    );
 }
 
 #[test]

@@ -4,6 +4,9 @@
 agent "<identity>" {
   host "<host>"
   workspace "<workspace>"
+  // Optional metadata:
+  // role "worker"
+  // supervisor "<host>.<supervisor-identity>"
   env {
     ST_AGENT "<host>.<identity>"
   }

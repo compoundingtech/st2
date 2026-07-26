@@ -1,15 +1,12 @@
-//! Spawn-time env-var expansion (post-v0 item c).
+//! Spawn-time environment-variable expansion.
 //!
-//! The gist says paths use `$CONVOY_NET`-style vars "expanded by pty at spawn". Verified empirically:
-//! that only holds for pty's OWN pty.toml manifest path. st2 spawns via `pty run` with env passed
-//! through the child process env — which pty does **not** shell-expand — so an env VALUE like
-//! `ST_ROOT = "$CONVOY_NET/smalltalk"` reaches the child verbatim. The `command` is fine (st2 runs it
-//! under `sh -c`, which expands at spawn), but env values, `cwd`, and tag values do NOT pass through a
-//! shell. st2 therefore expands those itself, here, against its own ambient environment.
+//! st2 spawns via `pty run` with values passed through the child environment. Those values, `cwd`,
+//! and tags do not pass through a shell, so st2 expands them explicitly. The command itself runs
+//! under `sh -c` and expands there.
 //!
 //! Supported forms: `$VAR`, `${VAR}`, and `$$` → literal `$`. An **unset** variable is left as its
 //! literal token (`$VAR`) rather than blanked — a spawn-time path with an undefined var is a
-//! misconfiguration worth seeing, not one to silently turn into a wrong path like `/smalltalk`.
+//! misconfiguration worth seeing, not one to silently turn into a wrong absolute path.
 
 /// Expand `$VAR` / `${VAR}` / `$$` in `input`, resolving names via `lookup`. Unknown names are left
 /// as their literal token.
@@ -102,10 +99,10 @@ mod tests {
 
     #[test]
     fn expands_bare_and_braced_vars() {
-        let env = HashMap::from([("CONVOY_NET", "/net/foo")]);
-        assert_eq!(expand_vars("$CONVOY_NET/smalltalk", lookup(&env)), "/net/foo/smalltalk");
-        assert_eq!(expand_vars("${CONVOY_NET}/pty", lookup(&env)), "/net/foo/pty");
-        assert_eq!(expand_vars("pre-${CONVOY_NET}-post", lookup(&env)), "pre-/net/foo-post");
+        let env = HashMap::from([("TEAM_ROOT", "/net/foo")]);
+        assert_eq!(expand_vars("$TEAM_ROOT/bus", lookup(&env)), "/net/foo/bus");
+        assert_eq!(expand_vars("${TEAM_ROOT}/pty", lookup(&env)), "/net/foo/pty");
+        assert_eq!(expand_vars("pre-${TEAM_ROOT}-post", lookup(&env)), "pre-/net/foo-post");
     }
 
     #[test]
@@ -119,7 +116,7 @@ mod tests {
     #[test]
     fn unset_vars_are_left_as_literal_tokens() {
         let env: HashMap<&str, &str> = HashMap::new();
-        assert_eq!(expand_vars("$CONVOY_NET/x", lookup(&env)), "$CONVOY_NET/x");
+        assert_eq!(expand_vars("$TEAM_ROOT/x", lookup(&env)), "$TEAM_ROOT/x");
         assert_eq!(expand_vars("${MISSING}/x", lookup(&env)), "${MISSING}/x");
     }
 

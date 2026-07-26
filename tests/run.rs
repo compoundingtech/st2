@@ -66,7 +66,7 @@ id = "hetz.demo-claude"
 command = "exec claude 'boot'"
 [exec.ding]
 id = "hetz.demo.ding"
-command = "st ding hetz.demo"
+command = "st2 ding hetz.demo"
 "#;
 
 #[test]
@@ -118,7 +118,7 @@ id = "hetz.demo-claude"
 command = "exec claude 'boot'"
 [exec.ding]
 id = "hetz.demo.ding"
-command = "st ding hetz.demo"
+command = "st2 ding hetz.demo"
 "#;
     write(tmp.path(), "agents/hetz/demo/agent.toml", retired);
     let runner = FakeRunner {

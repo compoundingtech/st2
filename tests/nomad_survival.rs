@@ -1,9 +1,8 @@
-//! The Nomad-decoupling gate (hard requirement for st2 replacing convoy).
+//! The supervisor-decoupling gate.
 //!
 //! st2 is a *decoupled* supervisor: stopping or crashing the runner MUST leave its running tasks
 //! alive, and a fresh runner MUST ADOPT them rather than cold-booting. The ONLY thing that kills a
-//! task is an explicit teardown (a `retired` spec — st2's `convoy down`). This is the exact guarantee
-//! whose absence cost a 45-minute convoy fleet outage, so it is proven here with REAL processes —
+//! task is an explicit teardown (a `retired` spec). This guarantee is proven with real processes —
 //! spawning the real `st2` binary, killing it with SIGTERM *and* SIGKILL, and asserting the task pids
 //! survive and get re-adopted — not with a fake runner.
 //!
@@ -380,7 +379,7 @@ fn explicit_teardown_kills_but_plain_stop_does_not(kind: &str) {
     runner.0.wait().unwrap();
     assert!(process_alive(task_pid), "{kind}: a plain runner stop killed the task — it must not");
 
-    // Retiring the spec is st2's `convoy down`: the ONE action that tears the task down.
+    // Retiring the spec is the one action that tears the task down.
     fx.write_agent("survivor", kind, true);
     let out = fx.up_once();
     assert!(out.contains("torn down"), "{kind}: retiring the spec did not tear the task down; output:\n{out}");

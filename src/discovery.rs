@@ -65,7 +65,7 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') {
-            continue; // skip .git, .convoy, hidden files
+            continue; // skip hidden files and directories
         }
         let ft = match entry.file_type() {
             Ok(ft) => ft,

@@ -1,19 +1,17 @@
 //! Isolated task spawn (R21b) — the permanent fleet-fragility fix.
 //!
 //! st2 already survives its own *process* death (`setsid`, see [`crate::exec_backend`] and
-//! `tests/nomad_survival.rs`). But `setsid` changes a process's **session**, not its **cgroup** — and
-//! on a systemd host the whole convoy network runs inside ONE service cgroup (e.g.
-//! `…/app.slice/convoy-up.service`). systemd tears a unit down by **cgroup**, so a `systemctl restart`
-//! of the transport/supervisor unit SIGTERM+SIGKILLs every task still in that cgroup. That is exactly
-//! how a fabric restart cascade-killed the whole hetz fleet.
+//! `tests/nomad_survival.rs`). But `setsid` changes a process's **session**, not its **cgroup**.
+//! systemd tears a unit down by cgroup, so restarting a supervisor unit would kill every task still
+//! in that cgroup.
 //!
 //! The fix: spawn each task into its own OS supervision domain, independent of BOTH the spawner and
 //! the transport daemon — one goal, per-OS mechanism.
 //!
 //! - **Linux**: `systemd-run --user --scope --unit=<unit> --collect --quiet -- <task>`. The task runs
 //!   in its own transient scope = its own cgroup, registered with the user manager as a **sibling** of
-//!   the transport unit (verified: a scope created from inside `convoy-up.service` lands at
-//!   `app.slice/<unit>`, not nested under it). A cascade kill of the transport unit's cgroup cannot
+//!   the transport unit (a scope created inside a service lands at `app.slice/<unit>`, not nested
+//!   under the service). A cascade kill of the transport unit's cgroup cannot
 //!   reach a sibling. `--scope` (not `--service`) keeps st2 the logical supervisor — systemd provides
 //!   only the cgroup; adoption/teardown/restart stay st2's. `--collect` GCs the scope once it empties.
 //! - **macOS / non-systemd Linux**: `setsid` + reparent to init/launchd is the whole defense — there

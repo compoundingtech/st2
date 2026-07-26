@@ -1,6 +1,5 @@
-//! `st2 validate <catalog>` — check that a **rendered** catalog conforms to st2's runner contract, so
-//! any renderer (convoy today, Johannes's nix derivations next) can confirm it hit the spec *before*
-//! running. Read-only; changes nothing.
+//! `st2 validate <catalog>` — check that a catalog conforms to st2's runner contract before running.
+//! Read-only; changes nothing.
 //!
 //! Two severities, graded by the CoS principle:
 //! - **ERROR** — the agent will fail to run, or run and silently do the wrong thing (parse failure,

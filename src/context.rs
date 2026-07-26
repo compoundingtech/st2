@@ -1,4 +1,4 @@
-//! Working-state context (M2.6) — st2's native version of smalltalk's `context/` (brief-024).
+//! Durable working-state context for lossless restarts.
 //!
 //! An agent's lossless-restart memory of "what it was mid-doing", so state survives a cold restart
 //! (it ties to the boot hooks: on SessionStart an agent can rehydrate from here). Per agent, under
@@ -10,7 +10,7 @@
 //!
 //! Every read tolerates a missing folder/file — absent → empty text. Writes are atomic (tmp+rename),
 //! so a concurrent reader never sees a partial file and two appends never race (distinct filenames).
-//! Wire-compatible with smalltalk's `context/` so an agent's state survives the tooling swap.
+//! The stable file shape lets an agent recover after a process or host restart.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -65,7 +65,7 @@ eval {
       exec "test \"$ST_ROOT\" = \"$CATALOG\" && test \"$(cat $CATALOG/sup/ST_ROOT)\" = \"$CATALOG\" && test \"$(cat $CATALOG/worker/ST_ROOT)\" = \"$CATALOG\""
     }
     judge "no legacy split bus" {
-      exec "test ! -e $CATALOG/smalltalk/t.sup/inbox && test ! -e $CATALOG/smalltalk/t.worker/inbox && test ! -e $CATALOG/smalltalk/requester/inbox"
+      exec "test ! -e $CATALOG/obsolete-bus/t.sup/inbox && test ! -e $CATALOG/obsolete-bus/t.worker/inbox && test ! -e $CATALOG/obsolete-bus/requester/inbox"
     }
   }
 }
@@ -148,7 +148,7 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat() {
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
-env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 agent "sup" { env { ST_AGENT "sup" }; command "sh -c 'pty run -d --id rtpeer -- sleep 778899001122; exec sleep 778899003344'" }
 eval {
   message { from "runner"; to "sup"; content "go" }
@@ -198,7 +198,7 @@ fn team_less_run_stage_captures_and_judges() {
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
-env { ST_ROOT "$CATALOG/smalltalk" }
+env { ST_ROOT "$CATALOG/custom-bus" }
 eval {
   max-timeout "20s"
   run "make"  { command "echo hi > $CATALOG/out.txt" }
@@ -255,7 +255,7 @@ fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
-env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 team "cd" {
   agent "worker" { supervisor "cd.sup"; env { ST_AGENT "cd.worker" }; command "sh -c 'sleep 2; exit 1'" }
   agent "clean"  { supervisor "cd.cos"; env { ST_AGENT "cd.clean" }; command "sh -c 'sleep 2; exit 0'" }
@@ -314,7 +314,7 @@ fn st2_eval_fails_fast_when_a_seat_exits_at_boot() {
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
-env { ST_ROOT "$CATALOG/smalltalk"; PTY_ROOT "$CATALOG/pty" }
+env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 agent "bad" { env { ST_AGENT "bad" }; command "definitely-not-a-real-binary-xyz123" }
 eval {
   copy "./fixture"

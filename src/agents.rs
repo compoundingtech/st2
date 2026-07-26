@@ -1,7 +1,6 @@
 //! The agent roster (M2.3): the data behind `st2 agents`. Enumerates the catalog's agents with their
-//! presence status, and optionally last-activity + inbox count. The CLI's JSON is byte-compatible
-//! with smalltalk's `st agents --json [--enrich]` (`{identity, status, name}` / `+{lastActivity,
-//! inbox}`) so existing tooling — cos shepherd sweeps, jq — is a drop-in.
+//! presence status, and optionally last-activity + inbox count. The JSON field names, order, and
+//! null handling are a stable machine-readable contract.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +14,7 @@ use crate::status::{self, State};
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
 pub struct AgentRow {
-    /// The bus id — `<host>.<identity>` (the folder-name form smalltalk reports as `identity`).
+    /// The bus id — `<host>.<identity>`.
     pub identity: String,
     /// Effective presence (derived: stale → `unknown`, etc.).
     pub status: State,
@@ -50,8 +49,7 @@ pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
     rows
 }
 
-/// `st2 agents --json` row. Field ORDER + names are the wire contract — they byte-match smalltalk's
-/// `st agents --json`.
+/// `st2 agents --json` row. Field order and names are the stable wire contract.
 #[derive(Serialize)]
 struct SummaryJson<'a> {
     identity: &'a str,
@@ -59,7 +57,7 @@ struct SummaryJson<'a> {
     name: Option<&'a str>,
 }
 
-/// `st2 agents --json --enrich` row (adds `lastActivity` + `inbox`, matching smalltalk's order).
+/// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
 #[derive(Serialize)]
 struct EnrichedJson<'a> {
     identity: &'a str,
@@ -70,8 +68,7 @@ struct EnrichedJson<'a> {
     inbox: usize,
 }
 
-/// Serialize a roster to the JSON `st2 agents --json [--enrich]` emits — byte-compatible with
-/// smalltalk's `st agents --json [--enrich]` (this is the parity contract).
+/// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
 pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
     if enrich {
         let out: Vec<EnrichedJson> = rows
@@ -113,8 +110,8 @@ fn inbox_count(agent_dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Newest mtime (unix ms) across the agent's inbox files, archive files, and status file (mirrors
-/// smalltalk's `computeLastActivity`). `None` if none of those exist.
+/// Newest mtime (unix ms) across the agent's inbox files, archive files, and status file. `None` if
+/// none of those exist.
 fn newest_mtime_ms(agent_dir: &Path) -> Option<f64> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for dir in [
@@ -161,10 +158,9 @@ mod tests {
         }
     }
 
-    /// The JSON `st2 agents --json` emits must byte-match smalltalk's shape: field names, order, and
-    /// null handling. This is the `agents --json` parity contract (see INVARIANTS.md).
+    /// Field names, order, and null handling are stable (see INVARIANTS.md).
     #[test]
-    fn agents_json_is_byte_compatible_with_smalltalk() {
+    fn agents_json_has_stable_wire_shape() {
         let rows = [
             row(
                 "hetz.cos-claude",

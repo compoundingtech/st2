@@ -559,7 +559,9 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         })?;
         if is_git_tracked(&workspace, relative)? {
             anyhow::bail!(
-                "agent '{}': refusing to change tracked workspace target '{}' ({})",
+                "agent '{}': generated materialization would change Git-tracked target '{}' ({}); \
+                 keep the tracked file byte-identical, choose an untracked overlay target, or edit \
+                 the tracked file intentionally outside st2",
                 spec.identity,
                 raw_destination,
                 target.display()

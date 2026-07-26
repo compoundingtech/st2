@@ -12,7 +12,8 @@ The examples use `<host>`, `<identity>`, and `<workspace>` placeholders. st2 pro
 `ST_ROOT`, `PTY_ROOT`, and `ST_HOOKS` when it starts a task, so hook declarations contain no
 machine-specific install paths. Copy the appropriate file into
 `<catalog>/agents/<host>/<identity>/agent.kdl`, replace every placeholder, and add the referenced
-catalog-owned templates.
+catalog-owned templates. `role` and `supervisor` are optional metadata; uncomment them when the seat
+has an assigned role or reports to another bus identity.
 
 ## Lifecycle
 
@@ -33,6 +34,9 @@ boot-gating operations; a failure prevents that agent from starting. Materializa
 real change to a Git-tracked target before its first workspace write. A byte-identical tracked
 target is safe and idempotent; untracked and non-Git targets remain writable. `git-exclude` is
 advisory, so a non-Git workspace or exclusion failure does not prevent a boot.
+
+Tracked-target detection invokes `git` and fails closed if it cannot inspect a workspace that appears
+to belong to a Git worktree.
 
 Materialization is idempotent. JSON values are deep-merged, existing unrelated
 settings survive, loader lines are added once, and generated workspace files

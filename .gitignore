@@ -1,7 +1,7 @@
 /target
 
-# Per-agent runtime overlay (rendered per clone; machine-specific, never product).
-.convoy/
+# Per-agent runtime overlay (materialized per clone; machine-specific, never product).
+.st2/
 .claude/
 
 # Local scratch note.

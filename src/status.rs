@@ -1,4 +1,4 @@
-//! Presence status (M2.3) — st2's native version of smalltalk's per-agent `status` liveness file.
+//! Native per-agent presence status.
 //!
 //! A `status` file (sibling of `agent.kdl` in the agent's dir) holds exactly one word: one of the
 //! settable states. `unknown` is DERIVED, never written — a status whose mtime is older than
@@ -7,15 +7,14 @@
 //! Writes are atomic (tmp + rename) so a concurrent reader never sees a partial file. The ding
 //! periodically re-writes an agent's own status to bump the mtime *preserving the value* so a
 //! healthy-but-idle agent never rots to `unknown` (the failure that read the whole fleet `unknown`
-//! for 45 min). Wire-compatible with smalltalk: same vocabulary, same 15-min stale window, same
-//! file semantics.
+//! for 45 min). The vocabulary, stale window, and file semantics are stable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-/// A status file older than this reads as `unknown` no matter its contents (smalltalk parity).
+/// A status file older than this reads as `unknown` no matter its contents.
 pub const STATUS_STALE: Duration = Duration::from_secs(15 * 60);
 /// How often a live agent's status should be refreshed to stay inside the stale window — 5 min gives
 /// a 3× safety margin (two missed refreshes before `unknown`).
@@ -68,7 +67,7 @@ pub fn status_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("status")
 }
 
-/// Read an agent's effective presence. Order matters (smalltalk parity): missing file → `offline`;
+/// Read an agent's effective presence. Order matters: missing file → `offline`;
 /// mtime older than [`STATUS_STALE`] → `unknown` (regardless of contents); unreadable → `offline`;
 /// else the first line's word if valid, else `offline` (never trust a corrupt file).
 pub fn read_state(status_path: &Path) -> State {
@@ -96,7 +95,7 @@ pub fn set_state(status_path: &Path, state: State) -> anyhow::Result<()> {
     write_atomic(status_path, state.as_str())
 }
 
-/// Outcome of a [`refresh`] call (mirrors smalltalk's `RefreshOutcome`).
+/// Outcome of a [`refresh`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
     /// File present + a valid settable state → re-wrote the same value, mtime bumped.

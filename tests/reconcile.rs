@@ -55,7 +55,7 @@ fn fresh_service_launches_all_tasks_pty_and_exec() {
         Some(HOST),
         vec![
             task(TaskKind::Pty, "agent", Some("hetz.st2-claude"), Some("exec claude 'boot'")),
-            task(TaskKind::Exec, "ding", Some("hetz.st2.ding"), Some("st ding hetz.st2")),
+            task(TaskKind::Exec, "ding", Some("hetz.st2.ding"), Some("st2 ding hetz.st2")),
         ],
     )];
     let plan = reconcile(&specs, &[], HOST);

@@ -117,7 +117,7 @@ fn eval_exit_code(catalog: &Path, identity: &str) -> Option<i64> {
 /// (e.g. evals-claude running `st2 eval`), those session-identity vars (`CLAUDECODE`,
 /// `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, …) leak into the seats and make a nested claude behave as a
 /// child/one-shot — it exits after the boot turn instead of staying interactive (the seat-persistence
-/// failure). The fleet's claude, spawned by convoy (no parent agent), never has these; this matches it.
+/// failure). A fresh top-level harness has none of these, so the child must not inherit them.
 /// `ANTHROPIC_*` (API creds) is deliberately kept — only the per-session identity is stripped.
 fn sanitize_agent_env() {
     let should_strip = |k: &str| {
@@ -980,13 +980,13 @@ mod tests {
     fn maps_agents_to_pty_plus_exec_tasks_keyed_by_id() {
         let spec = parse_spec(
             r#"
-            env { ST_ROOT "$CATALOG/smalltalk" }
+            env { ST_ROOT "$CATALOG/custom-bus" }
             team "mix" {
               agent "sup" {
                 workspace "./sup"
                 env { ST_AGENT "mix.sup" }
                 command "exec claude 'boot'"
-                exec "mix.sup.ding" { command "st2 ding mix.sup --identity mix.sup --root $CATALOG/smalltalk" }
+                exec "mix.sup.ding" { command "st2 ding mix.sup --identity mix.sup --root $CATALOG/custom-bus" }
               }
             }
             "#,
@@ -1006,7 +1006,7 @@ mod tests {
         assert!(matches!(a.tasks[0].kind, TaskKind::Pty));
         assert_eq!(a.tasks[0].id.as_deref(), Some("mix.sup"));
         assert_eq!(a.tasks[0].command.as_deref(), Some("exec claude 'boot'"));
-        assert_eq!(a.tasks[0].env.get("ST_ROOT").unwrap(), "$CATALOG/smalltalk"); // cascaded
+        assert_eq!(a.tasks[0].env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded
         assert_eq!(a.tasks[0].env.get("ST_AGENT").unwrap(), "mix.sup");
         // Task 1 = the ding exec keyed by its id, inheriting the agent env.
         assert!(matches!(a.tasks[1].kind, TaskKind::Exec));

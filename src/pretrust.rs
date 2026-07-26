@@ -1,18 +1,18 @@
 //! Workspace pre-trust (R12) — mark agent workspaces trusted in the claude config BEFORE any agent
 //! boots, so a kick-driven headless `claude` does not hang on the interactive "Is this a project you
-//! trust?" dialog. This is st2's equivalent of `convoy pretrust`, and it is the blocker an autonomous
-//! run hits first (proven in the ghost-bug pilot: even `--permission-mode bypassPermissions` still
+//! trust?" dialog. This is the blocker an autonomous run hits first: even
+//! `--permission-mode bypassPermissions` still
 //! shows the *workspace-trust* dialog, which is separate from permission prompts).
 //!
 //! The claude config is a JSON object at `$CLAUDE_CONFIG_DIR/.claude.json` (else `$HOME/.claude.json`)
 //! whose `projects` map is keyed by absolute workspace path. A workspace is trusted when its entry has
-//! `"hasTrustDialogAccepted": true`; convoy also sets `"hasCompletedProjectOnboarding": true`, so we
-//! match it (skips onboarding friction too). We MERGE into any existing entry — never clobber the
+//! `"hasTrustDialogAccepted": true`; st2 also sets `"hasCompletedProjectOnboarding": true` to skip
+//! onboarding friction. We merge into any existing entry and never clobber the
 //! other per-project fields — and write ALL requested dirs in ONE atomic read-modify-write.
 //!
 //! Why batch + before-boot: a booted claude periodically flushes `.claude.json`, so per-agent trust
 //! writes interleaved with sibling boots lost-update each other — the multi-spawn trust race. Trusting
-//! every workspace in one write *before* the first agent boots closes it (the same fix convoy landed).
+//! every workspace in one write *before* the first agent boots closes it.
 
 use std::path::{Path, PathBuf};
 
@@ -133,7 +133,7 @@ pub fn pretrust_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .context("a `projects` entry is not a JSON object")?;
-        // Merge — set only the trust flags, preserve every other field convoy/claude wrote.
+        // Merge — set only the trust flags and preserve every other field Claude wrote.
         entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
         entry.insert("hasCompletedProjectOnboarding".into(), Value::Bool(true));
     }

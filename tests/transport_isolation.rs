@@ -1,8 +1,8 @@
 //! The transport-decoupling gate — the permanent fix for the fleet-fragility incident.
 //!
 //! st2's `nomad_survival` gate proves a task survives its supervisor's *process* death (SIGTERM/
-//! SIGKILL to st2). That is necessary but NOT sufficient: on a systemd host the whole convoy network
-//! runs inside ONE service cgroup (e.g. `…/app.slice/convoy-up.service`), and `setsid` changes a
+//! SIGKILL to st2). That is necessary but not sufficient: on a systemd host a supervisor and its
+//! children can share one service cgroup, and `setsid` changes a
 //! process's *session*, not its *cgroup*. systemd tears a unit down by **cgroup**, so a
 //! `systemctl restart` of the transport/supervisor unit SIGTERM+SIGKILLs every task still sitting in
 //! that cgroup — which is exactly how a fabric restart cascade-killed the whole hetz fleet.
@@ -101,7 +101,7 @@ impl Fixture {
         }
     }
 
-    /// Occupy a transport scope (stand-in for the convoy-up.service cgroup) with:
+    /// Occupy a transport scope (stand-in for a supervisor service cgroup) with:
     ///   1. a real `st2 up --once` that spawns the task into its OWN scope (a sibling of this one),
     ///      then exits — `--once` so there is no continuous reconcile that could, under concurrent
     ///      `pty list` contention, transiently misread the live session as dead and GC it (a
@@ -321,7 +321,7 @@ fn task_survives_transport_cgroup_cascade(kind: &str) {
     // The control (a naive `sleep`) is live in the transport cgroup right now.
     assert!(!scope_pids(&transport).is_empty(), "transport scope unexpectedly empty before the cascade");
 
-    // 3) Fire the cascade: SIGKILL the transport scope's cgroup — the lethal blow of a `convoy up`
+    // 3) Fire the cascade: SIGKILL the transport scope's cgroup — the supervisor-restart failure
     //    restart (its SIGTERM would be trapped by a supervisor; the SIGKILL escalation is what kills).
     cascade_kill_scope(&transport);
 

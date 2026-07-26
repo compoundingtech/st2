@@ -21,8 +21,8 @@ use crate::spec::{Restart, RestartMode, parse_duration};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
     /// The logical host this file's team belongs to (top-level `host "silber"`), if declared. It is the
-    /// convoy `host` name (silber/hetz), NOT necessarily the OS hostname — `st2 up/down` resolve the run
-    /// host as `--host` (explicit) › this field › the OS hostname, so a per-host spec ups its own slice
+    /// Logical host name, not necessarily the OS hostname. `st2 up/down` resolve the run host as
+    /// `--host` (explicit) › this field › the OS hostname, so a per-host spec runs its own slice
     /// even when the machine's OS hostname differs from the logical name.
     pub host: Option<String>,
     /// Top-level env — cascades into every agent + process (child scopes override).
@@ -291,7 +291,7 @@ fn cascade(parent: &BTreeMap<String, String>, child: &BTreeMap<String, String>) 
 /// The canonical ding sidecar for an agent — exactly what `exec "ding"` (no command block)
 /// generates, and the long-term `ding {}` collapse. `--root $ST_ROOT` resolves from the cascaded env
 /// at spawn (the exec backend `$CATALOG`-expands env values, so `ST_ROOT` is an absolute path there) —
-/// NOT a re-derived `$CATALOG/smalltalk`, so a spec that overrides `ST_ROOT` is honored.
+/// not a re-derived default, so a spec that overrides `ST_ROOT` is honored.
 pub fn ding_exec(agent_id: &str) -> SpecExec {
     SpecExec {
         id: format!("{agent_id}.ding"),
@@ -607,10 +607,10 @@ mod tests {
 
     // The reference example (design: license-mit), with the two KDL-validity fixes I proved against
     // kdl-6: `#`-comments → `//`, and the `message` fields separated (they mis-parse on one line).
-    // Bus root uses `$CATALOG/smalltalk` (the Q4 rename).
+    // An explicit custom bus root proves that authored ST_ROOT overrides are preserved.
     const REFERENCE: &str = r##"
 env {
-  ST_ROOT  "$CATALOG/smalltalk"
+  ST_ROOT  "$CATALOG/custom-bus"
   PTY_ROOT "$CATALOG/pty"
 }
 
@@ -663,7 +663,7 @@ eval {
     fn parses_the_reference_example() {
         let s = parse_spec(REFERENCE).unwrap();
         // Top-level env cascades.
-        assert_eq!(s.env.get("ST_ROOT").unwrap(), "$CATALOG/smalltalk");
+        assert_eq!(s.env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus");
         // Team prefixes agent ids.
         let ids: Vec<&str> = s.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, ["mix.sup", "mix.worker"]);
@@ -671,7 +671,7 @@ eval {
         let sup = &s.agents[0];
         assert_eq!(sup.workspace.as_deref(), Some("./sup"));
         assert!(sup.command.contains("exec claude --permission-mode bypassPermissions"));
-        assert_eq!(sup.env.get("ST_ROOT").unwrap(), "$CATALOG/smalltalk"); // cascaded from top
+        assert_eq!(sup.env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded from top
         assert_eq!(sup.env.get("ST_AGENT").unwrap(), "mix.sup"); // agent-level
         // The bare `ding` node auto-derives `<agent>.ding` and st2 generates the standard sidecar
         // against the cascaded $ST_ROOT; it inherits the agent env.
@@ -791,8 +791,8 @@ team "mix" {
 
     #[test]
     fn parses_a_top_level_host_and_defaults_to_none() {
-        // A per-host fleet file declares the logical host (the convoy `host` name) at the top; it used to
-        // be an "unexpected top-level node" hard-error. Absent → None (falls back to --host / OS hostname).
+        // A per-host fleet file declares the logical host at the top. Absent → None (falls back to
+        // --host / OS hostname).
         let with = parse_spec("host \"silber\"\nagent \"a\" { command \"x\" }").unwrap();
         assert_eq!(with.host.as_deref(), Some("silber"));
         let without = parse_spec("agent \"a\" { command \"x\" }").unwrap();
@@ -832,7 +832,7 @@ team "mix" {
         // run-collapse form: each `run "label" { … }` IS one step; multiple `run` nodes run in order.
         let spec = parse_spec(
             "eval {\n  max-timeout \"2m\"\n  \
-             run \"render\" { workspace \"repo\"; command \"st2 render x\"; retry { attempts 3; interval \"5s\" } }\n  \
+             run \"build\" { workspace \"repo\"; command \"make check\"; retry { attempts 3; interval \"5s\" } }\n  \
              run \"probe\" { command \"doctor\"; env { FOO \"bar\" }; unset \"ST_ROOT\" \"PTY_ROOT\"; allow-nonzero }\n  \
              judges { judge \"ok\" { exec \"true\" } }\n}\n",
         )
@@ -841,12 +841,12 @@ team "mix" {
         let ev = spec.eval.unwrap();
         assert!(ev.message.is_none(), "a team-less eval has no kickoff message");
         assert_eq!(ev.run_steps.len(), 2, "two flat run nodes → two ordered steps");
-        let render = &ev.run_steps[0];
-        assert_eq!(render.id, "render");
-        assert_eq!(render.workspace.as_deref(), Some("repo"));
-        assert_eq!(render.command, "st2 render x");
-        assert!(!render.allow_nonzero, "default is must-exit-0");
-        let r = render.retry.as_ref().unwrap();
+        let build = &ev.run_steps[0];
+        assert_eq!(build.id, "build");
+        assert_eq!(build.workspace.as_deref(), Some("repo"));
+        assert_eq!(build.command, "make check");
+        assert!(!build.allow_nonzero, "default is must-exit-0");
+        let r = build.retry.as_ref().unwrap();
         assert_eq!(r.attempts, 3);
         assert_eq!(r.delay, Duration::from_secs(5)); // interval → the inter-retry backoff
         let probe = &ev.run_steps[1];

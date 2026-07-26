@@ -86,10 +86,8 @@ struct PtyListEntry {
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
 /// e.g. an eval run's short `/tmp/stev-<runid>` that dodges the 104-byte unix-socket-path limit that a
-/// deep `<catalog>/pty` would blow — else the rendered default `<catalog>/pty`. Applied uniformly to
-/// spawn AND list/kill so st2 always manages sessions where it put them (this is why `st2 down` failed
-/// to reap pty agents in the eval pilot: spawn honored the rendered root but list/kill inherited a
-/// different ambient one). Mirrors how convoy / `pty` honor a direct `$PTY_ROOT` verbatim.
+/// deep `<catalog>/pty` would blow — else the native default `<catalog>/pty`. Applied uniformly to
+/// spawn and list/kill so st2 always manages sessions where it put them.
 pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
     effective_pty_root_from(catalog_root, std::env::var_os("PTY_ROOT"))
 }
@@ -803,8 +801,8 @@ pub fn up_once_specs(
     )
 }
 
-/// Supervise an in-memory spec team: keep-alive + respawn on a timer, nomad-decoupled — the `convoy up`
-/// replacement for a single-file st2 spec, behaving exactly like [`up_loop`] over a catalog (same
+/// Supervise an in-memory spec team: keep-alive + respawn on a timer, behaving exactly like
+/// [`up_loop`] over a catalog (same
 /// FlappingCap, LivenessDebounce, crash-loop surfacing, and "stop leaves sessions running"). Timer-only
 /// (a spec is one static file — no folder to watch; edit + restart to change it). `root` roots
 /// `$CATALOG` + crash-loop surfacing. Runs until SIGINT/SIGTERM.
@@ -1516,7 +1514,7 @@ mod tests {
         let mut t = target("hetz.demo.agent", "exec claude $ST2_TEST_EXPAND_NET_9f3/go");
         t.cwd = Some(format!("${key}/work"));
         t.tags.insert("net".into(), format!("${key}"));
-        t.env.insert("ST_ROOT".into(), format!("${key}/smalltalk"));
+        t.env.insert("ST_ROOT".into(), format!("${key}/custom-bus"));
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
 
         let args: Vec<String> = cmd
@@ -1547,7 +1545,7 @@ mod tests {
             .collect();
         assert_eq!(
             envs.get("ST_ROOT"),
-            Some(&Some("/net/xyz/smalltalk".to_string()))
+            Some(&Some("/net/xyz/custom-bus".to_string()))
         );
 
         unsafe { std::env::remove_var(key) }

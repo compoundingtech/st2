@@ -1,6 +1,5 @@
-//! Resources (M2.6) — st2's native version of smalltalk's `resources/` (brief-009): an agent links
-//! high-value output (a PR, a doc, a dashboard) as a durable, listable record so peers/supervisors can
-//! find it without digging through the inbox.
+//! Native resource links: an agent records high-value output (a PR, a doc, a dashboard) as a durable,
+//! listable record so peers and supervisors can find it without digging through the inbox.
 //!
 //! Each resource is a markdown file with YAML frontmatter (`url`, optional `title`/`tags`/`relation`)
 //! and an optional body, named `<unix-ms>-<rand6>.md` (the shared grammar → chronological by name),

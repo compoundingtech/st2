@@ -48,12 +48,12 @@ agent "fabric-claude" {
     tags role="agent" env="prod"
     env {
       ST_AGENT "silber.fabric-claude"
-      ST_ROOT  "$CATALOG/smalltalk"
+      ST_ROOT  "$CATALOG"
     }
   }
 
   exec "ding" {
-    command #"st ding silber.fabric --identity silber.fabric-claude"#
+    command #"st2 ding silber.fabric --identity silber.fabric-claude"#
     keep #true
   }
 
@@ -102,13 +102,13 @@ fn parses_full_kdl_service_job() {
     assert_eq!(agent.tags.get("role").map(String::as_str), Some("agent"));
     assert_eq!(
         agent.env.get("ST_ROOT").map(String::as_str),
-        Some("$CATALOG/smalltalk")
+        Some("$CATALOG")
     );
 
     let ding = s.tasks.iter().find(|t| t.name == "ding").unwrap();
     assert_eq!(ding.kind, TaskKind::Exec);
     assert!(ding.keep);
-    assert!(ding.command.as_deref().unwrap().starts_with("st ding"));
+    assert!(ding.command.as_deref().unwrap().starts_with("st2 ding"));
 
     assert!(s.is_runnable());
 }
@@ -201,7 +201,7 @@ id = "hetz.fetcher"
 command = "exec claude 'boot'"
 
 [exec.ding]
-command = "st ding hetz.fetcher"
+command = "st2 ding hetz.fetcher"
 "#;
     write(tmp.path(), "agents/hetz/fetcher/agent.toml", toml);
 
@@ -229,7 +229,7 @@ fn parses_json_service_job() {
     let json = r#"{
         "identity": "reporter", "host": "hetz", "type": "service",
         "pty":  { "agent": { "command": "exec claude 'boot'" } },
-        "exec": { "ding":  { "command": "st ding hetz.reporter" } }
+        "exec": { "ding":  { "command": "st2 ding hetz.reporter" } }
     }"#;
     write(tmp.path(), "agents/hetz/reporter/agent.json", json);
 

@@ -1,4 +1,4 @@
-//! Native message bus (M2) — the send/receive core that replaces smalltalk's `st`.
+//! Native message bus.
 //!
 //! st2 owns messaging directly now: a message is a markdown file with YAML frontmatter, named
 //! `<unix-ms>-<rand6>.md`, written into the recipient agent's `resources/inbox/` (VRS §5). The
@@ -6,8 +6,7 @@
 //! the send time. Send = write the file. Archive = move inbox→archive. Nobody mutates a file after
 //! creation. An archive copy is also a durable receipt: if an eventually-consistent file sync briefly
 //! restores the same filename in the inbox, inbox readers suppress the duplicate and a repeated
-//! archive removes it without overwriting the receipt. The on-disk format is kept wire-compatible
-//! with smalltalk so the two interoperate during the migration and tooling/agents port cleanly.
+//! archive removes it without overwriting the receipt. The on-disk grammar is stable.
 //!
 //! This module is location-agnostic: it operates on an inbox/agent directory a caller resolves (from
 //! the catalog for VRS-native, or `$ST_ROOT` for a compat shim).
@@ -19,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
-/// a strict subset of what the reader accepts: the frozen bus grammar is `[0-9a-z]{6}`, so a peer /
-/// smalltalk message may legally use i/l/o/u — [`is_message_filename`] must not reject those.
+/// a strict subset of what the reader accepts: the frozen bus grammar is `[0-9a-z]{6}`, so a peer
+/// may legally use i/l/o/u and [`is_message_filename`] must not reject those.
 const CROCKFORD: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// Parsed frontmatter + body of a message. Readers are permissive: missing/malformed frontmatter
@@ -80,9 +79,9 @@ fn rand6() -> String {
         .collect()
 }
 
-/// True if `name` matches the frozen bus grammar `^[0-9]{13}-[0-9a-z]{6}\.md$` (smalltalk LAYOUT-004).
+/// True if `name` matches the frozen bus grammar `^[0-9]{13}-[0-9a-z]{6}\.md$`.
 /// The reader accepts the FULL `[0-9a-z]` rand6 alphabet — st2 generates a Crockford subset, but a
-/// peer/smalltalk message may use any lowercase alnum and dropping those would lose real messages.
+/// peer message may use any lowercase alnum and dropping those would lose real messages.
 pub fn is_message_filename(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".md") else {
         return false;
@@ -272,7 +271,7 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
 }
 
 /// The inbox dir for `id` under `root`: the NATIVE catalog inbox (`<agent_dir>/resources/inbox`) if a
-/// catalog agent is discoverable, else the FLAT smalltalk-style bus inbox (`<root>/<id>/inbox`). The
+/// catalog agent is discoverable, else the flat bus inbox (`<root>/<id>/inbox`). The
 /// flat fallback lets `st2 ding`/`st2 message` operate on a catalog-LESS bus — e.g. an eval's ST_ROOT,
 /// where agents are booted from a single spec (no on-disk `agent.kdl` to discover). `root` is whatever
 /// `--root`/ST_ROOT names, so the layout follows the spec, never a hardcoded path.
@@ -553,7 +552,7 @@ mod tests {
     fn resolve_inbox_falls_back_to_the_flat_bus_when_catalog_less() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        // No catalog under root → the flat smalltalk-style bus (<root>/<id>/inbox|archive).
+        // No catalog under root → the flat bus (<root>/<id>/inbox|archive).
         assert_eq!(
             resolve_inbox(root, "mix.sup", "h"),
             root.join("mix.sup").join("inbox")

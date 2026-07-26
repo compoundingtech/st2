@@ -275,7 +275,7 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
     }
 }
 
-/// `st2 up <spec>` (no --once) SUPERVISES the team like `convoy up`: a killed agent is respawned. Boots
+/// `st2 up <spec>` (no --once) supervises the team: a killed agent is respawned. Boots
 /// a benign agent under a fast interval, kills it, and confirms the supervise loop brings it back with a
 /// NEW pid — then stops st2 (sessions persist, nomad-decoupled) and cleans up.
 #[test]
@@ -292,7 +292,7 @@ fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
     std::fs::create_dir_all(&spec_dir).unwrap();
     std::fs::write(
         spec_dir.join("cell.kdl"),
-        "env { ST_ROOT \"$CATALOG/smalltalk\"; PTY_ROOT \"$CATALOG/pty\" }\nagent \"a\" { env { ST_AGENT \"a\" }; command \"sleep 100000\" }\n",
+        "env { ST_ROOT \"$CATALOG/custom-bus\"; PTY_ROOT \"$CATALOG/pty\" }\nagent \"a\" { env { ST_AGENT \"a\" }; command \"sleep 100000\" }\n",
     )
     .unwrap();
     let pty_root = tmp.path().join("pty");

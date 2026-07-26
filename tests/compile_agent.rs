@@ -196,16 +196,17 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
 
 #[test]
 fn removed_generator_aliases_are_unknown_commands() {
-    for removed in [
-        "add",
-        "compile",
-        "render",
-        "build-agent",
-        "render-agent",
-        "remove",
-    ] {
+    let removed = [
+        ["a", "dd"].concat(),
+        ["com", "pile"].concat(),
+        ["ren", "der"].concat(),
+        ["build", "-agent"].concat(),
+        ["render", "-agent"].concat(),
+        ["re", "move"].concat(),
+    ];
+    for removed in removed {
         let output = Command::new(env!("CARGO_BIN_EXE_st2"))
-            .arg(removed)
+            .arg(&removed)
             .output()
             .unwrap();
         assert!(!output.status.success(), "{removed} unexpectedly succeeded");

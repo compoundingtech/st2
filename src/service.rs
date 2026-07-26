@@ -1,14 +1,12 @@
 //! `st2 service install|status|uninstall` — install `st2 up` as a **systemd-user** unit so the
-//! supervisor comes back on boot and on crash. This is the headless-Linux replacement for
-//! `convoy-up.service` at the swap.
+//! supervisor comes back on boot and on crash.
 //!
 //! **Linux-only, by design (the maintainer).** The Mac stays MANUAL — the maintainer runs `st2 up` themselves there
 //! (TCC: a launchd-owned process can't inherit his GUI/keychain trust), so we deliberately do NOT
 //! ship a launchd path like fabric does. On macOS (or anything non-systemd) this bails loud.
 //!
-//! **Why this is safe now (and wasn't for `convoy-up.service`).** A single restart of
-//! `convoy-up.service` once SIGKILL'd the whole fleet, because every agent shared that unit's cgroup.
-//! st2 spawns each task in its OWN transient scope (`systemd-run --user --scope`, see `isolate.rs`) —
+//! A service restart is safe because st2 spawns each task in its own transient scope
+//! (`systemd-run --user --scope`, see `isolate.rs`) —
 //! a SIBLING of this unit, not a child. So stopping/restarting `st2.service` reaps only the
 //! supervisor loop; the agents survive in their scopes and a fresh supervisor ADOPTS them
 //! (tests/nomad_survival.rs + tests/transport_isolation.rs). That is the whole reason this unit is
@@ -44,7 +42,7 @@ pub struct ServiceSpec {
     /// user-local or version-manager directories.
     path: String,
     /// Optional machine-local pty registry. This is deliberately independent of the synced catalog:
-    /// a runner swap can adopt live sessions from a legacy registry without syncing pid/socket state.
+    /// an explicit adoption can use an existing registry without syncing pid/socket state.
     pty_root: Option<PathBuf>,
     memory_max_mb: u64,
 }
@@ -105,10 +103,10 @@ pub fn install(
     let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
     let path = service_path(&exe)?;
     // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must exist
-    // now (you install the service against a rendered catalog, not a future one).
+    // now (you install the service against an existing catalog, not a future one).
     let catalog = catalog.canonicalize().with_context(|| {
         format!(
-            "catalog {} does not exist — render/create it before installing the service",
+            "catalog {} does not exist — create it before installing the service",
             catalog.display()
         )
     })?;
@@ -262,7 +260,7 @@ pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
         .join(" ");
     format!(
         "[Unit]\n\
-Description=st2 supervisor (st2 up) — replaces convoy-up.service\n\
+Description=st2 supervisor (st2 up)\n\
 After=network.target\n\
 \n\
 [Service]\n\
@@ -347,7 +345,7 @@ mod tests {
         ));
         assert!(!unit.contains("Environment=PTY_ROOT="));
         assert!(unit.contains("WantedBy=default.target"));
-        assert!(unit.contains("replaces convoy-up.service"));
+        assert!(unit.contains("Description=st2 supervisor (st2 up)"));
         Ok(())
     }
 

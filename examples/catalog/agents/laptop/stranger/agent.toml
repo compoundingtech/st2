@@ -1,6 +1,0 @@
-# Lives on a DIFFERENT host (host "laptop", from the path). `st2 up --host demo` reports it as
-# other-host and never touches it — the laptop's own st2 runs it once the folder syncs there.
-type = "service"
-
-[pty.agent]
-command = "while true; do echo \"[stranger] not on this host\"; sleep 20; done"
