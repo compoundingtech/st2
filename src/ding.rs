@@ -6,11 +6,13 @@
 //!
 //! Delivery is deliberately safer than the old unconditional text-then-Enter sequence. For a Codex
 //! pane, DING bracketed-pastes the notice without Enter, waits for the TUI to settle, peeks again,
-//! and submits only when the exact notice is still in an otherwise-idle composer. A model-choice
-//! modal, an active turn, a human draft, or an unreadable pane defers the message in memory; `busy`
-//! and `dnd` status do likewise. The inbox file remains the durable source of truth while deferred.
-//! This closes the race where Codex opened a choice modal during the old 0.5-second gap and the
-//! unconditional trailing Return selected the modal's default action.
+//! and submits only when the exact notice is still in an otherwise-idle composer. One exact idle
+//! `Create a plan? … esc dismiss` prompt has a bounded recovery: after a second identical
+//! inspection, DING sends only Escape, re-inspects, and still sends Return only for the exact staged
+//! notice. Every other modal, an active turn, a human draft, or an unreadable pane defers the message
+//! in memory; `busy` and `dnd` status do likewise. The inbox file remains the durable source of truth
+//! while deferred. This closes the race where Codex opened a choice modal during the 0.5-second gap
+//! and an unconditional trailing Return selected the modal's default action.
 //!
 //! It DOES run the brief-023 presence refresh: while the agent's pty is alive it re-writes the
 //! agent's own `status` file on a cadence (preserving the value) so a healthy-but-idle agent never
@@ -92,6 +94,17 @@ pub fn pty_submit_args(session: &str) -> Vec<String> {
         session.into(),
         "--seq".into(),
         "key:return".into(),
+    ]
+}
+
+/// Dismiss only a separately recognized Codex plan prompt. Escape and Return are intentionally
+/// separate PTY operations so dismissing a modal can never also activate its selected action.
+pub fn pty_dismiss_plan_modal_args(session: &str) -> Vec<String> {
+    vec![
+        "send".into(),
+        session.into(),
+        "--seq".into(),
+        "key:escape".into(),
     ]
 }
 
@@ -222,6 +235,12 @@ impl PtyPoker {
             text,
             &mut || self.peek(),
             &mut || self.run(pty_stage_args(&self.session, text), "send"),
+            &mut || {
+                self.run(
+                    pty_dismiss_plan_modal_args(&self.session),
+                    "send plan-modal dismissal to",
+                )
+            },
             &mut || self.run(pty_submit_args(&self.session), "send"),
             &mut || thread::sleep(Duration::from_millis(500)),
             before_submit,
@@ -246,6 +265,8 @@ enum PaneState {
     Idle,
     /// The exact expected DING notice is staged in the Codex composer, with no modal/active turn.
     Staged,
+    /// The exact notice is staged under the one Codex plan prompt that explicitly permits Escape.
+    DismissiblePlanModal,
     /// Codex is active, modal, holding human input, or otherwise ambiguous. Never send Return.
     Blocked,
     /// No recognized Codex state was found. Guarded delivery fails closed.
@@ -271,12 +292,22 @@ fn guarded_poke(
     text: &str,
     peek: &mut dyn FnMut() -> anyhow::Result<String>,
     stage: &mut dyn FnMut() -> anyhow::Result<()>,
+    dismiss_plan_modal: &mut dyn FnMut() -> anyhow::Result<()>,
     submit: &mut dyn FnMut() -> anyhow::Result<()>,
     settle: &mut dyn FnMut(),
     before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<PokeOutcome> {
     match classify_pane(&peek()?, text) {
         PaneState::Blocked => Ok(PokeOutcome::Deferred),
+        PaneState::DismissiblePlanModal => recover_plan_modal(
+            text,
+            peek,
+            stage,
+            dismiss_plan_modal,
+            submit,
+            settle,
+            before_submit,
+        ),
         PaneState::Staged => {
             before_submit()?;
             submit()?;
@@ -291,6 +322,15 @@ fn guarded_poke(
                     submit()?;
                     Ok(PokeOutcome::Delivered)
                 }
+                PaneState::DismissiblePlanModal => recover_plan_modal(
+                    text,
+                    peek,
+                    stage,
+                    dismiss_plan_modal,
+                    submit,
+                    settle,
+                    before_submit,
+                ),
                 // This includes the incident window: a Codex model-choice modal appeared after
                 // paste but before Return. Leave the exact notice staged and retry when safe.
                 PaneState::Blocked | PaneState::Idle | PaneState::Unknown => {
@@ -301,6 +341,48 @@ fn guarded_poke(
         // A transiently blank or partially rendered Codex pane can contain no recognizable
         // signature. The configured Codex/unknown path still fails closed.
         PaneState::Unknown => Ok(PokeOutcome::Deferred),
+    }
+}
+
+/// Recover one stable, exact Codex plan prompt without polling or ever sending Return to the modal.
+///
+/// The modal must survive a second inspection before Escape. After dismissal, an exact staged
+/// notice can submit immediately; an empty composer can be restaged once. Any other state defers.
+fn recover_plan_modal(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    stage: &mut dyn FnMut() -> anyhow::Result<()>,
+    dismiss_plan_modal: &mut dyn FnMut() -> anyhow::Result<()>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    settle: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    settle();
+    if classify_pane(&peek()?, text) != PaneState::DismissiblePlanModal {
+        return Ok(PokeOutcome::Deferred);
+    }
+
+    dismiss_plan_modal()?;
+    settle();
+    match classify_pane(&peek()?, text) {
+        PaneState::Staged => {
+            before_submit()?;
+            submit()?;
+            Ok(PokeOutcome::Delivered)
+        }
+        PaneState::Idle => {
+            stage()?;
+            settle();
+            if classify_pane(&peek()?, text) != PaneState::Staged {
+                return Ok(PokeOutcome::Deferred);
+            }
+            before_submit()?;
+            submit()?;
+            Ok(PokeOutcome::Delivered)
+        }
+        PaneState::DismissiblePlanModal | PaneState::Blocked | PaneState::Unknown => {
+            Ok(PokeOutcome::Deferred)
+        }
     }
 }
 
@@ -323,20 +405,35 @@ const CODEX_TYPED_COMPOSERS: [&str; 4] = [
 /// rotating placeholder, and Codex keeps the empty composer visible while a turn is running.
 fn classify_pane(screen: &str, expected: &str) -> PaneState {
     let plain = strip_ansi(screen);
-    let modal = plain.contains("Our systems are thinking a bit more")
+    let known_other_modal = plain.contains("Our systems are thinking a bit more")
         || plain.contains("Retry with a faster model")
         || looks_like_choice_menu(&plain);
     let active = plain.contains("Working (")
         || plain.contains("esc to interrupt")
         || plain.contains("Messages to be submitted after next tool call")
         || plain.contains("press esc to interrupt and send");
-    if modal || active {
+    if active {
         return PaneState::Blocked;
     }
 
-    match bottom_codex_composer(screen) {
-        Some(CodexComposer::Empty) => return PaneState::Idle,
-        Some(CodexComposer::Typed(input)) => {
+    let composer = located_bottom_codex_composer(screen);
+    let live_plan_modal = composer
+        .as_ref()
+        .map(|(start, _)| looks_like_dismissible_plan_modal(&strip_ansi(&screen[*start..])))
+        .unwrap_or_else(|| looks_like_dismissible_plan_modal(&plain));
+    if let Some((_, CodexComposer::Typed(input))) = &composer {
+        let exact_notice = collapse_whitespace(input) == collapse_whitespace(expected);
+        if exact_notice && !known_other_modal && live_plan_modal {
+            return PaneState::DismissiblePlanModal;
+        }
+    }
+    if known_other_modal || live_plan_modal {
+        return PaneState::Blocked;
+    }
+
+    match composer {
+        Some((_, CodexComposer::Empty)) => return PaneState::Idle,
+        Some((_, CodexComposer::Typed(input))) => {
             return if collapse_whitespace(&input) == collapse_whitespace(expected) {
                 PaneState::Staged
             } else {
@@ -358,6 +455,10 @@ fn classify_pane(screen: &str, expected: &str) -> PaneState {
     }
 }
 
+fn looks_like_dismissible_plan_modal(plain: &str) -> bool {
+    collapse_whitespace(plain).contains("Create a plan? shift+tab use Plan mode esc dismiss")
+}
+
 fn looks_like_choice_menu(plain: &str) -> bool {
     let mut first = false;
     let mut later = false;
@@ -368,7 +469,7 @@ fn looks_like_choice_menu(plain: &str) -> bool {
     first && later
 }
 
-fn bottom_codex_composer(screen: &str) -> Option<CodexComposer> {
+fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)> {
     let empty = CODEX_EMPTY_COMPOSERS
         .iter()
         .filter_map(|marker| {
@@ -394,7 +495,7 @@ fn bottom_codex_composer(screen: &str) -> Option<CodexComposer> {
         (None, None) => return None,
     };
     if empty {
-        return Some(CodexComposer::Empty);
+        return Some((start, CodexComposer::Empty));
     }
     let tail = &screen[start + marker_len..];
     let input = tail
@@ -404,7 +505,7 @@ fn bottom_codex_composer(screen: &str) -> Option<CodexComposer> {
         .or_else(|| tail.split_once("\n\n"))
         .map(|(input, _)| input)
         .unwrap_or(tail);
-    Some(CodexComposer::Typed(strip_ansi(input)))
+    Some((start, CodexComposer::Typed(strip_ansi(input))))
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -834,6 +935,10 @@ mod tests {
             vec!["send", "my-session", "--paste", "[DING] hi"]
         );
         assert_eq!(
+            pty_dismiss_plan_modal_args("my-session"),
+            vec!["send", "my-session", "--seq", "key:escape"]
+        );
+        assert_eq!(
             pty_submit_args("my-session"),
             vec!["send", "my-session", "--seq", "key:return"]
         );
@@ -893,12 +998,57 @@ mod tests {
         )
     }
 
+    fn plan_modal_codex_screen(text: &str) -> String {
+        format!(
+            "\x1b[1m›\x1b[1C\x1b[0m{text}\r\n\r\n\
+             \x1b[1mCreate a plan?\x1b[0m\r\n\
+             \x1b[2mshift+tab use Plan mode   esc dismiss\x1b[0m\r\n"
+        )
+    }
+
     #[test]
     fn codex_choice_modal_blocks_return_even_when_ding_text_is_staged() {
         let expected = "[DING] new st2 message: [id:k0ygwh] safety (from cos); check your inbox";
         assert_eq!(
             classify_pane(&modal_codex_screen(expected), expected),
             PaneState::Blocked
+        );
+    }
+
+    #[test]
+    fn only_exact_staged_notice_under_current_plan_modal_is_dismissible() {
+        let expected = "[DING] new st2 message: [id:k0ygwh] safety (from cos); check your inbox";
+        assert_eq!(
+            classify_pane(&plan_modal_codex_screen(expected), expected),
+            PaneState::DismissiblePlanModal
+        );
+        assert_eq!(
+            classify_pane(
+                &plan_modal_codex_screen("half-written human request"),
+                expected
+            ),
+            PaneState::Blocked
+        );
+        assert_eq!(
+            classify_pane(
+                &format!(
+                    "• Working (2s • esc to interrupt)\r\n{}",
+                    plan_modal_codex_screen(expected)
+                ),
+                expected
+            ),
+            PaneState::Blocked
+        );
+
+        let historical = format!(
+            "{}\r\n{}",
+            plan_modal_codex_screen("old system notice"),
+            staged_codex_screen(expected)
+        );
+        assert_eq!(
+            classify_pane(&historical, expected),
+            PaneState::Staged,
+            "a historical plan prompt above the bottom composer is not a live modal"
         );
     }
 
@@ -1000,6 +1150,7 @@ mod tests {
                     actions.borrow_mut().push("paste");
                     Ok(())
                 },
+                &mut || unreachable!("generic modal must not be dismissed"),
                 &mut || {
                     actions.borrow_mut().push("return");
                     Ok(())
@@ -1021,6 +1172,7 @@ mod tests {
                 expected,
                 &mut || Ok(safe_screen.pop_front().unwrap()),
                 &mut || unreachable!("the exact text is already staged"),
+                &mut || unreachable!("there is no plan modal"),
                 &mut || {
                     actions.borrow_mut().push("return");
                     Ok(())
@@ -1055,6 +1207,7 @@ mod tests {
                 actions.borrow_mut().push("paste");
                 Ok(())
             },
+            &mut || unreachable!("an unreadable screen must not dismiss a modal"),
             &mut || {
                 actions.borrow_mut().push("return");
                 Ok(())
@@ -1068,6 +1221,144 @@ mod tests {
         assert!(outcome.is_err(), "a failed re-peek must fail closed");
         assert_eq!(actions.borrow().as_slice(), ["paste"]);
         assert_eq!(before.get(), 0);
+    }
+
+    #[test]
+    fn stable_plan_modal_dismisses_with_escape_then_delivers_exact_notice() {
+        use std::cell::{Cell, RefCell};
+
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
+        let screens = RefCell::new(VecDeque::from([
+            idle_codex_screen(),
+            plan_modal_codex_screen(expected),
+            plan_modal_codex_screen(expected),
+            staged_codex_screen(expected),
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let outcome = guarded_poke(
+            expected,
+            &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("escape");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, PokeOutcome::Delivered);
+        assert_eq!(actions.borrow().as_slice(), ["paste", "escape", "return"]);
+        assert_eq!(before.get(), 1);
+    }
+
+    #[test]
+    fn changed_plan_modal_defers_without_escape_or_return() {
+        use std::cell::{Cell, RefCell};
+
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
+        let screens = RefCell::new(VecDeque::from([
+            plan_modal_codex_screen(expected),
+            staged_codex_screen(expected),
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let before = Cell::new(0);
+        let outcome = guarded_poke(
+            expected,
+            &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+            &mut || unreachable!("the exact text is already staged"),
+            &mut || {
+                actions.borrow_mut().push("escape");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || {
+                before.set(before.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, PokeOutcome::Deferred);
+        assert!(actions.borrow().is_empty());
+        assert_eq!(before.get(), 0);
+    }
+
+    #[test]
+    fn plan_modal_escape_can_restage_one_empty_composer_but_never_a_changed_draft() {
+        use std::cell::{Cell, RefCell};
+
+        let expected = "[DING] new st2 message: [id:abc123] hi (from alice); check your inbox";
+        for (after_escape, expected_actions, expected_outcome) in [
+            (
+                VecDeque::from([
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                    idle_codex_screen(),
+                    staged_codex_screen(expected),
+                ]),
+                vec!["escape", "paste", "return"],
+                PokeOutcome::Delivered,
+            ),
+            (
+                VecDeque::from([
+                    plan_modal_codex_screen(expected),
+                    plan_modal_codex_screen(expected),
+                    staged_codex_screen("human changed the composer"),
+                ]),
+                vec!["escape"],
+                PokeOutcome::Deferred,
+            ),
+        ] {
+            let screens = RefCell::new(after_escape);
+            let actions = RefCell::new(Vec::new());
+            let before = Cell::new(0);
+            let outcome = guarded_poke(
+                expected,
+                &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+                &mut || {
+                    actions.borrow_mut().push("paste");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("escape");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || {},
+                &mut || {
+                    before.set(before.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(outcome, expected_outcome);
+            assert_eq!(actions.into_inner(), expected_actions);
+            assert_eq!(
+                before.get(),
+                usize::from(expected_outcome == PokeOutcome::Delivered)
+            );
+        }
     }
 
     #[test]
@@ -1093,6 +1384,7 @@ mod tests {
                     actions.borrow_mut().push("paste");
                     Ok(())
                 },
+                &mut || unreachable!("unsafe panes must not be dismissed"),
                 &mut || {
                     actions.borrow_mut().push("return");
                     Ok(())
@@ -1116,6 +1408,10 @@ mod tests {
                 &mut || anyhow::bail!("peek unavailable"),
                 &mut || {
                     actions.borrow_mut().push("paste");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("escape");
                     Ok(())
                 },
                 &mut || {
@@ -1148,6 +1444,7 @@ mod tests {
                 actions.borrow_mut().push("paste");
                 Ok(())
             },
+            &mut || unreachable!("there is no plan modal"),
             &mut || {
                 actions.borrow_mut().push("return");
                 Ok(())
@@ -1194,6 +1491,7 @@ mod tests {
             expected,
             &mut || Ok(String::new()),
             &mut || unreachable!("ambiguous screen must not stage"),
+            &mut || unreachable!("ambiguous screen must not dismiss a modal"),
             &mut || unreachable!("ambiguous screen must not submit"),
             &mut || {},
             &mut || {

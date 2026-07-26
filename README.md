@@ -137,7 +137,9 @@ Native DING watches the recipient inbox and safely stages:
 
 Consumers must key on the `[DING]` prefix and stable id, not descriptive words. Codex delivery
 bracketed-pastes without Return, re-inspects the bottom-most composer, and submits only the exact
-staged notice. Modals, active turns, drafts, `busy`, and `dnd` defer.
+staged notice. For the exact idle `Create a plan? … esc dismiss` prompt only, st2 confirms the same
+modal twice, sends Escape without Return, and re-inspects before delivery. Every other modal, active
+turn, draft, `busy`, or `dnd` state defers.
 
 ## Cleanup
 
