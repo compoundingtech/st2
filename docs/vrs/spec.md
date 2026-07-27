@@ -39,7 +39,9 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   only declarations pinned to the local host.
 - **R04:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
-  host-local supervision, bounded recovery, and escalation.
+  host-local supervision, bounded recovery, and escalation. Filesystem reads
+  never wake reconciliation; only create, modify, rename, or remove events may
+  wake it before the bounded timer.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
@@ -57,7 +59,8 @@ atomic inbox file → DING attempt → agent reads → archive receipt
   `busy` does not. Failed delivery remains retryable. Sidecar restart emits a
   bounded recovery notice instead of replaying the inbox. Delivery may wake an
   agent while it is working, but an active or uncertain human composer must be
-  left untouched.
+  left untouched. Inbox reads do not wake the sidecar; only mutations bypass
+  its bounded poll cadence.
 
 ## State and scope
 

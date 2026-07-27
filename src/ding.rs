@@ -997,7 +997,7 @@ pub fn run_ding(
     } else {
         inbox_dir.parent().unwrap_or(inbox_dir)
     };
-    let _watcher = watch_dir(watch_at, tx);
+    let _watcher = crate::watch::watch_recursive_mutations(watch_at, tx);
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
@@ -1209,19 +1209,6 @@ pub fn serve(
         config,
         &STOP,
     )
-}
-
-/// Best-effort recursive watcher. `None` means timer-only fallback.
-fn watch_dir(dir: &Path, tx: std::sync::mpsc::Sender<()>) -> Option<notify::RecommendedWatcher> {
-    use notify::{RecursiveMode, Watcher};
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        if result.is_ok() {
-            let _ = tx.send(());
-        }
-    })
-    .ok()?;
-    watcher.watch(dir, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
 }
 
 fn drain(rx: &Receiver<()>) {
@@ -1890,5 +1877,37 @@ mod tests {
         assert_eq!(calls[0], RECOVERY_POKE);
         assert!(calls[1].contains("post-start"));
         assert!(!calls.iter().any(|call| call.contains("seeded")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_ding_does_not_spin_on_its_own_inbox_reads() {
+        let agent = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(agent.path());
+        std::fs::create_dir_all(&inbox).unwrap();
+        let status_path = status::status_path(agent.path());
+        status::set_state(&status_path, status::State::Available).unwrap();
+
+        let poker = RecordingPoker::live();
+        let stop = AtomicBool::new(false);
+        let config = DingConfig {
+            poll: Duration::from_millis(20),
+            status_refresh: Duration::from_secs(60),
+        };
+        let started = Instant::now();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(
+            poker.probes.load(Ordering::SeqCst) <= 20,
+            "idle DING must sleep at its configured cadence"
+        );
     }
 }

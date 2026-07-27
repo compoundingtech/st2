@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -1091,21 +1091,6 @@ fn install_signal_handler() {
     }
 }
 
-/// Best-effort recursive watcher over the catalog folder: sends `()` on any change so an edited /
-/// dropped / retired spec reconciles immediately. Returns `None` (timer-only fallback) if the
-/// platform or dir can't be watched. (Inbox writes also fire it — harmless, reconcile is idempotent.)
-fn watch_folder(dir: &Path, tx: Sender<()>) -> Option<notify::RecommendedWatcher> {
-    use notify::{RecursiveMode, Watcher};
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            let _ = tx.send(());
-        }
-    })
-    .ok()?;
-    watcher.watch(dir, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
-}
-
 fn drain(rx: &Receiver<()>) {
     while rx.try_recv().is_ok() {}
 }
@@ -1118,11 +1103,22 @@ pub fn up_loop(
     this_host: &str,
     runner: &dyn Runner,
     interval: Duration,
-    mut on_report: impl FnMut(&UpReport),
+    on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     install_signal_handler();
+    up_loop_until(root, this_host, runner, interval, &STOP, on_report)
+}
+
+fn up_loop_until(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    stop: &AtomicBool,
+    mut on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
     let (tx, rx) = channel::<()>();
-    let _watcher = watch_folder(root, tx);
+    let _watcher = crate::watch::watch_recursive_mutations(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
@@ -1146,14 +1142,14 @@ pub fn up_loop(
         }
         on_report(&report);
 
-        if STOP.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
             break;
         }
 
         // Sleep the interval in 250ms slices, waking early on a folder change or a stop signal.
         let slices = (interval.as_millis() / 250).max(1);
         for _ in 0..slices {
-            if STOP.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) {
                 break;
             }
             match rx.recv_timeout(Duration::from_millis(250)) {
@@ -1165,7 +1161,7 @@ pub fn up_loop(
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        if STOP.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
             break;
         }
     }
@@ -1258,6 +1254,57 @@ mod tests {
             env: BTreeMap::new(),
             keep: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EmptyRunner;
+
+    #[cfg(target_os = "linux")]
+    impl Runner for EmptyRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(Vec::new())
+        }
+
+        fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            unreachable!("an empty catalog cannot launch")
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            unreachable!("an empty catalog cannot kill")
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            unreachable!("an empty catalog cannot remove")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_supervisor_does_not_spin_on_its_own_catalog_reads() {
+        let catalog = tempfile::tempdir().unwrap();
+        let stop = AtomicBool::new(false);
+        let mut passes = 0usize;
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(350));
+                stop.store(true, Ordering::SeqCst);
+            });
+            up_loop_until(
+                catalog.path(),
+                "test-host",
+                &EmptyRunner,
+                Duration::from_secs(60),
+                &stop,
+                |_| passes += 1,
+            )
+            .unwrap();
+        });
+
+        assert!(
+            passes <= 2,
+            "idle supervisor must wait instead of reconciling its own read events: {passes} passes"
+        );
     }
 
     // ── liveness debounce (R21c): a transient `pty list` not-alive flicker under load must not

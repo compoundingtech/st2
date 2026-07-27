@@ -29,6 +29,7 @@ pub mod spec;
 pub mod status;
 pub mod validate;
 pub mod version;
+mod watch;
 
 pub use discovery::{Discovered, SpecError, discover};
 pub use exec_backend::ExecBackend;

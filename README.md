@@ -228,6 +228,11 @@ or restart, the sidecar first adopts an exact staged recovery/backlog notice whe
 one generic check-inbox recovery DING if unread work remains; it does not replay every backlog
 message.
 
+Both DING and the catalog supervisor use filesystem events only as an early-wake optimization.
+Create, modify, rename, and remove events wake them; read/open access events do not. Their own inbox
+and catalog reads therefore cannot self-trigger a Linux inotify loop, and the bounded timer remains
+the correctness fallback.
+
 ## Cleanup
 
 Explicit teardown is the only operation that ends declared tasks:
