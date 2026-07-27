@@ -228,8 +228,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Health check for a running catalog: tools and supervisor healthy, active agents alive with
-    /// fresh presence, and retired agents fully absent. Exits non-zero on problems.
+    /// Health check for a catalog: tools available, active agents alive with fresh presence, and
+    /// retired agents fully absent. Exits non-zero on problems.
     Doctor {
         /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
         /// st2 catalog.
@@ -238,6 +238,9 @@ enum Command {
         /// Host to check. Defaults to the local hostname.
         #[arg(long)]
         host: Option<String>,
+        /// Require a live long-running `st2 up` host lock. Omit for manual/--once operation.
+        #[arg(long)]
+        require_supervisor: bool,
     },
     /// List every agent in the catalog with presence and retirement state. `--json [--enrich]` is
     /// the stable machine-readable roster.
@@ -579,9 +582,13 @@ fn main() -> Result<()> {
         }
         Command::Pty { args } => pty_cmd(&args),
         Command::Shell { args } => shell_cmd(&args),
-        Command::Doctor { root, host } => {
+        Command::Doctor {
+            root,
+            host,
+            require_supervisor,
+        } => {
             let root = catalog_arg(root)?;
-            doctor_cmd(&root, host)
+            doctor_cmd(&root, host, require_supervisor)
         }
         Command::Completions { shell } => {
             // Generate from the live command tree so the script can never drift
@@ -895,7 +902,7 @@ fn pretrust_cmd(dirs: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
+fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Result<()> {
     let this_host = host.unwrap_or_else(detect_host);
     let catalog = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     println!(
@@ -912,14 +919,28 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
         "not found",
     );
 
-    // 2) A supervisor holding the host-lock (i.e. `st2 up` is running).
-    match st2::HostLock::new(root, &this_host).live_owner() {
+    // 2) Supervision mode. A one-shot/manual host intentionally has no lock. A caller that expects
+    // a resident loop can opt into enforcing one; a stale file always indicates an unclean exit.
+    let host_lock = st2::HostLock::new(root, &this_host);
+    match host_lock.live_owner() {
         Some(_) => report_check(&mut problems, true, "supervisor (st2 up) running", ""),
+        None if host_lock.has_stale_lock() => report_check(
+            &mut problems,
+            false,
+            "supervision host-lock healthy",
+            "stale host-lock from a dead supervisor",
+        ),
+        None if !require_supervisor => report_check(
+            &mut problems,
+            true,
+            "supervision mode manual/--once (no live host-lock)",
+            "",
+        ),
         None => report_check(
             &mut problems,
             false,
             "supervisor (st2 up) running",
-            "no live host-lock — run `st2 up`",
+            "required but no live host-lock — run `st2 up`",
         ),
     }
 
@@ -935,7 +956,18 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
         );
     }
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&this_host));
-    let sessions = runner.list_sessions().unwrap_or_default();
+    let sessions = match runner.list_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            report_check(
+                &mut problems,
+                false,
+                "task runtime readable",
+                &format!("{error:#}"),
+            );
+            anyhow::bail!("{problems} problem(s) found");
+        }
+    };
     let live: std::collections::HashSet<String> = sessions
         .iter()
         .filter(|s| s.alive)

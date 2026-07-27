@@ -13,8 +13,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::{Read as _, Seek as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
@@ -26,6 +28,62 @@ use crate::flapping::FlappingCap;
 use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
 use crate::spec::TaskKind;
+
+const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
+/// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
+/// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
+fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            // Never turn the timeout into another unbounded wait. Reap asynchronously so a
+            // long-running supervisor does not accumulate zombies, while a wedged runtime cannot
+            // hold up this failed probe or a short-lived doctor process.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    stdout.rewind()?;
+    stderr.rewind()?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout.read_to_end(&mut stdout_bytes)?;
+    stderr.read_to_end(&mut stderr_bytes)?;
+    Ok(Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
 
 /// Resolve a task's working directory: declared `cwd` (expanded), else the agent's `workspace`
 /// (expanded), else the spec file's directory (spec.md §2). A relative value is joined to the spec
@@ -178,10 +236,13 @@ impl PtyCli {
 
 impl Runner for PtyCli {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
-        let out = Command::new(&self.bin)
-            .args(["list", "--json"])
-            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
-            .output()?;
+        let out = output_with_timeout(
+            Command::new(&self.bin)
+                .args(["list", "--json"])
+                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
         if !out.status.success() {
             anyhow::bail!(
                 "`pty list --json` failed: {}",

@@ -152,6 +152,12 @@ st2 up --catalog "$CATALOG" --host <host> --once
 
 There is intentionally no resident macOS service path.
 
+`st2 doctor` accepts the absence of a live host lock as the normal manual/`--once` mode. For a
+resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the
+health check. A stale lock left by a dead supervisor is always a failure. The underlying
+non-interactive `pty list --json` runtime probe is bounded; a wedged client becomes an explicit
+doctor failure instead of hanging the health check.
+
 For a foreground supervisor on any host:
 
 ```sh
