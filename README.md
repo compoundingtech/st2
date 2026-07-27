@@ -7,6 +7,13 @@ workspace materialization, and explicit teardown.
 Hand-authored KDL is the canonical interface. `st2 compile-agent` is experimental and must be
 reviewed before its output is materialized.
 
+## Product intent and implementation contract
+
+Read the [vision](docs/vrs/vision.md), [requirements](docs/vrs/requirements.md), and
+[specification](docs/vrs/spec.md) before changing product behavior. Update `docs/vrs/spec.md` with
+implementation changes. Nathan must approve changes to `docs/vrs/vision.md` or
+`docs/vrs/requirements.md`.
+
 ## Install
 
 Prerequisites:
