@@ -24,7 +24,7 @@ pub struct AgentSpec {
     pub identity: String,
     /// Which machine runs this agent. `None` → resolved to the path's host / this machine.
     pub host: Option<String>,
-    /// Optional declared persona role (used by local shepherding; ignored for execution).
+    /// Optional declared persona role. Preserved as metadata and ignored for execution.
     pub role: Option<String>,
     /// `service` (long-running, respawns) — the only job type. Defaults to service.
     pub job_type: JobType,

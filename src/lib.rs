@@ -25,7 +25,6 @@ pub mod reconcile;
 pub mod resource;
 pub mod run;
 pub mod service;
-pub(crate) mod shepherd;
 pub mod spec;
 pub mod status;
 pub mod validate;

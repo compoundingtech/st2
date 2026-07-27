@@ -39,8 +39,9 @@ selected immutable hook set; they never refresh shared scripts. Managed settings
 
 Both maintained declarations load the shipped bus contract. Agents must declare `busy` before
 actively executing a unit of work and return to `available` only when yielding or ready for new
-work. `dnd` is an explicit hold, not an inferred terminal state. This declaration is the DING safety
-gate: st2 intentionally does not inspect either harness's terminal pixels.
+work. Busy agents still receive DING. `dnd` is the only delivery hold and the sidecar does not renew
+it, so an abandoned hold becomes stale after 15 minutes. st2 intentionally does not inspect either
+harness's terminal pixels.
 
 The `render { ... }` block is ordered. `copy`, `file`, `json-upsert`, and `ensure-line` are
 boot-gating operations; a failure prevents that agent from starting. Materialization refuses any

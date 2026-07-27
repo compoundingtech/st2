@@ -276,12 +276,19 @@ pub fn list_dir(dir: &Path) -> anyhow::Result<Vec<Message>> {
 /// The sibling `archive/` is a durable handled-message receipt. Eventually-consistent sync can
 /// briefly restore an inbox file after a local inbox→archive move but before the delete tombstone
 /// converges. If the same canonical filename already exists in archive, the archived copy wins and
-/// the raw inbox duplicate is not unread work.
+/// the raw inbox duplicate is not unread work. Listing also removes that duplicate so every reader
+/// helps the archive receipt converge locally.
 pub fn list_inbox(inbox_dir: &Path) -> anyhow::Result<Vec<Message>> {
     let archive_dir = sibling_archive_dir(inbox_dir);
-    let mut msgs = list_dir(inbox_dir)?;
-    msgs.retain(|msg| !archive_dir.join(&msg.filename).is_file());
-    Ok(msgs)
+    let mut unread = Vec::new();
+    for message in list_dir(inbox_dir)? {
+        if archive_dir.join(&message.filename).is_file() {
+            remove_inbox_duplicate(&inbox_dir.join(&message.filename), &message.filename)?;
+        } else {
+            unread.push(message);
+        }
+    }
+    Ok(unread)
 }
 
 /// The archive directory paired with an inbox. Both native
@@ -587,8 +594,12 @@ mod tests {
             list_inbox(&inbox).unwrap().is_empty(),
             "the archive receipt suppresses it"
         );
+        assert!(
+            !inbox.join(&filename).exists(),
+            "listing must also clean the shadowed inbox replica"
+        );
 
-        // Repeating archive is safe: preserve the first receipt and remove only the duplicate.
+        // Repeating archive is safe after listing already removed the duplicate.
         archive_msg(&inbox, &archive, &filename).unwrap();
         assert!(!inbox.join(&filename).exists());
         assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);

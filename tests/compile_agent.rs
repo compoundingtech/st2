@@ -134,8 +134,10 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     let loader = fs::read_to_string(workspace.join(".claude/rules/st2.md")).unwrap();
     assert!(loader.contains("PERSONA.md"));
     let bus = fs::read_to_string(workspace.join(".st2/bus.md")).unwrap();
-    assert!(bus.contains("## Status discipline (DING safety)"));
+    assert!(bus.contains("## Status discipline"));
     assert!(bus.contains("Set `busy` immediately before actively executing"));
+    assert!(bus.contains("does not suppress notifications merely because you are `busy`"));
+    assert!(bus.contains("abandoned hold ages to `unknown` after 15 minutes"));
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(workspace.join(".claude/settings.local.json")).unwrap())
             .unwrap();
@@ -214,8 +216,10 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     let agents = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
     assert!(agents.starts_with(persona_body));
     assert!(agents.contains("# st2 bus instructions"));
-    assert!(agents.contains("## Status discipline (DING safety)"));
+    assert!(agents.contains("## Status discipline"));
     assert!(agents.contains("Set `busy` immediately before actively executing"));
+    assert!(agents.contains("does not suppress notifications merely because you are `busy`"));
+    assert!(agents.contains("abandoned hold ages to `unknown` after 15 minutes"));
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(workspace.join(".codex/hooks.json")).unwrap()).unwrap();
     assert!(

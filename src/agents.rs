@@ -110,7 +110,7 @@ fn read_name(agent_dir: &Path) -> Option<String> {
 }
 
 /// Count logically unread messages in the agent's `resources/inbox`. A same-filename archive receipt
-/// suppresses a raw inbox duplicate restored by eventually-consistent sync.
+/// suppresses and cleans a raw inbox duplicate restored by eventually-consistent sync.
 fn inbox_count(agent_dir: &Path) -> usize {
     message::list_inbox(&message::inbox_dir(agent_dir))
         .map(|msgs| msgs.len())

@@ -73,6 +73,10 @@ fn archived_filename_wins_over_a_restored_raw_inbox_copy_in_all_list_modes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("# 0 messages in bob inbox"));
+    assert!(
+        !inbox.join(filename).exists(),
+        "listing must clean the inbox file shadowed by the archive receipt"
+    );
 
     let out = list(tmp.path(), &["--count"]);
     assert!(

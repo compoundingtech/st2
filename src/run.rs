@@ -714,7 +714,7 @@ fn gate_codex_launches<'a, V, F>(
             .iter()
             .find(|target| {
                 target.name == "agent"
-                    && crate::shepherd::command_invokes_codex(&target.command)
+                    && crate::hooks::command_invokes_codex(&target.command)
             })
         else {
             continue;
@@ -755,54 +755,13 @@ fn gate_codex_launches<'a, V, F>(
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    let mut shepherd_runtime = crate::shepherd::Runtime::default();
-    let clock = crate::shepherd::SystemClock;
-    let mut store = crate::shepherd::FilesystemStore::new(root);
-    let mut poker = crate::shepherd::PtyPoker;
-    let mut reporter = crate::shepherd::StderrReporter;
-    let report = reconcile_and_shepherd_pass(
+    Ok(reconcile_pass(
         root,
         this_host,
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
-        &mut shepherd_runtime,
-        &clock,
-        &mut store,
-        &mut poker,
-        &mut reporter,
-    );
-    Ok(report)
-}
-
-/// The one catalog pass used by both one-shot and long-running supervision. Keeping shepherding in
-/// this adapter guarantees reconcile still runs when shepherd selection or delivery faults, while
-/// making the entire shepherd transition injectable for multi-pass and fresh-runtime tests.
-#[allow(clippy::too_many_arguments)]
-fn reconcile_and_shepherd_pass(
-    root: &Path,
-    this_host: &str,
-    runner: &dyn Runner,
-    cap: &mut FlappingCap,
-    debounce: &mut LivenessDebounce,
-    shepherd_runtime: &mut crate::shepherd::Runtime,
-    clock: &dyn crate::shepherd::Clock,
-    store: &mut dyn crate::shepherd::Store,
-    poker: &mut dyn crate::shepherd::Poker,
-    reporter: &mut dyn crate::shepherd::Reporter,
-) -> UpReport {
-    let report = reconcile_pass(root, this_host, runner, cap, debounce);
-    let found = crate::discover(root);
-    crate::shepherd::run_pass(
-        &found.specs,
-        this_host,
-        shepherd_runtime,
-        clock,
-        store,
-        poker,
-        reporter,
-    );
-    report
+    ))
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -1046,11 +1005,6 @@ pub fn up_loop(
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    let mut shepherd_runtime = crate::shepherd::Runtime::default();
-    let clock = crate::shepherd::SystemClock;
-    let mut shepherd_store = crate::shepherd::FilesystemStore::new(root);
-    let mut shepherd_poker = crate::shepherd::PtyPoker;
-    let mut shepherd_reporter = crate::shepherd::StderrReporter;
 
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
@@ -1058,18 +1012,7 @@ pub fn up_loop(
     let mut reported_flapping: HashSet<String> = HashSet::new();
 
     loop {
-        let report = reconcile_and_shepherd_pass(
-            root,
-            this_host,
-            runner,
-            &mut cap,
-            &mut debounce,
-            &mut shepherd_runtime,
-            &clock,
-            &mut shepherd_store,
-            &mut shepherd_poker,
-            &mut shepherd_reporter,
-        );
+        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1717,105 +1660,6 @@ mod tests {
         let h = detect_host();
         assert!(!h.is_empty());
         assert!(!h.contains('.'), "short name only, got {h}");
-    }
-
-    #[test]
-    fn reconcile_and_shepherd_pass_keeps_reconciling_when_shepherd_faults() {
-        struct RecordingRunner {
-            spawned: RefCell<Vec<String>>,
-        }
-        impl Runner for RecordingRunner {
-            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
-                Ok(Vec::new())
-            }
-            fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
-                self.spawned.borrow_mut().push(target.pty_id.clone());
-                Ok(())
-            }
-            fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
-                Ok(())
-            }
-            fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-        struct Clock;
-        impl crate::shepherd::Clock for Clock {
-            fn now_secs(&self) -> u64 {
-                1
-            }
-        }
-        struct Store;
-        impl crate::shepherd::Store for Store {
-            fn is_dnd(&mut self, _agent_dir: &Path) -> bool {
-                false
-            }
-            fn load(
-                &mut self,
-                _key: &crate::shepherd::ShepherdKey,
-            ) -> anyhow::Result<crate::shepherd::PersistedState> {
-                Ok(crate::shepherd::PersistedState::default())
-            }
-            fn save(
-                &mut self,
-                _key: &crate::shepherd::ShepherdKey,
-                _state: crate::shepherd::PersistedState,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-        struct NoPoke;
-        impl crate::shepherd::Poker for NoPoke {
-            fn poke(
-                &mut self,
-                _session: &str,
-                _text: &str,
-                _before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-            ) -> anyhow::Result<()> {
-                panic!("a missing root must fault before poke")
-            }
-        }
-        #[derive(Default)]
-        struct Reports(Vec<String>);
-        impl crate::shepherd::Reporter for Reports {
-            fn report(&mut self, fault: &crate::shepherd::Fault) {
-                self.0.push(fault.to_string());
-            }
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agents/node/worker");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(
-            agent_dir.join("agent.toml"),
-            "identity=\"worker\"\nhost=\"node\"\nrole=\"worker\"\n[pty.agent]\ncommand=\"exec claude\"\n",
-        )
-        .unwrap();
-        let runner = RecordingRunner {
-            spawned: RefCell::new(Vec::new()),
-        };
-        let mut runtime = crate::shepherd::Runtime::default();
-        let mut store = Store;
-        let mut poker = NoPoke;
-        let mut reports = Reports::default();
-
-        let report = reconcile_and_shepherd_pass(
-            tmp.path(),
-            "node",
-            &runner,
-            &mut FlappingCap::default(),
-            &mut LivenessDebounce::new(DEBOUNCE_GRACE),
-            &mut runtime,
-            &Clock,
-            &mut store,
-            &mut poker,
-            &mut reports,
-        );
-
-        assert_eq!(report.launched, ["node.worker.agent"]);
-        assert_eq!(runner.spawned.borrow().as_slice(), ["node.worker.agent"]);
-        assert_eq!(reports.0.len(), 1);
-        assert!(reports.0[0].contains("no active local role=root"));
     }
 
 }

@@ -15,21 +15,21 @@ see below).
 4. If the backlog or durable context leaves work to execute, set `busy` before acting on it. Return
    to `available` only when yielding or ready for new work.
 
-## Status discipline (DING safety)
+## Status discipline
 
-DING deliberately does not inspect terminal pixels. Your declared status is therefore the delivery
-gate, not decorative presence:
+Status tells peers whether you are working or ready. DING deliberately does not inspect terminal
+pixels and does not suppress notifications merely because you are `busy`:
 
 - Set `busy` immediately before actively executing a unit of work, including its tool calls,
   commands, edits, and verification. Keep it `busy` until you reach a safe yield point.
 - Set `available` only while ready to receive new work or when yielding back after a completed or
   blocked unit. Do not leave yourself `available` while working.
-- Set `dnd` only as an explicit operator/agent hold. It defers DING like `busy`, but remains a
-  deliberate hold until you intentionally clear it.
+- Set `dnd` only as an explicit operator/agent hold. Fresh `dnd` is the only status that defers
+  DING. The sidecar does not refresh `dnd`, so an abandoned hold ages to `unknown` after 15 minutes.
 
 Use `st2 status "$ST_AGENT" --set busy` before work and
-`st2 status "$ST_AGENT" --set available` when yielding. The live DING sidecar refreshes the recorded
-value without changing it.
+`st2 status "$ST_AGENT" --set available` when yielding. The live DING sidecar refreshes non-DND
+presence without changing its value.
 
 ## Resume safety — do NOT double-act (important for hosted/respawned agents)
 

@@ -5,9 +5,10 @@
 //! [`STATUS_STALE`] reads as `unknown` regardless of its contents, so a crashed/gone agent stops
 //! reading as its last set value. Reads are permissive (missing → `offline`, corrupt → `offline`).
 //! Writes are atomic (tmp + rename) so a concurrent reader never sees a partial file. The ding
-//! periodically re-writes an agent's own status to bump the mtime *preserving the value* so a
-//! healthy-but-idle agent never rots to `unknown` (the failure that read the whole fleet `unknown`
-//! for 45 min). The vocabulary, stale window, and file semantics are stable.
+//! periodically re-writes an agent's own non-DND status to bump the mtime *preserving the value* so
+//! a healthy-but-idle agent never rots to `unknown` (the failure that read the whole fleet `unknown`
+//! for 45 min). `dnd` is intentionally not refreshed: an abandoned hold ages to `unknown` after the
+//! same stale window. The vocabulary, stale window, and file semantics are stable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,6 +101,8 @@ pub fn set_state(status_path: &Path, state: State) -> anyhow::Result<()> {
 pub enum RefreshOutcome {
     /// File present + a valid settable state → re-wrote the same value, mtime bumped.
     Refreshed,
+    /// File recorded `dnd` → left untouched so an abandoned hold ages out.
+    LeftDnd,
     /// File missing → wrote `available` (the sensible default for a connected agent).
     WroteDefault,
     /// File present but its contents aren't a settable state → left untouched.
@@ -110,10 +113,9 @@ pub enum RefreshOutcome {
     Error,
 }
 
-/// Bump an agent's status mtime so a live-but-idle agent never rots to `unknown`, PRESERVING the
-/// recorded value. Missing → write `available`. A valid settable value → re-write the same value.
-/// `unknown` or corrupt → leave untouched (never invent a value). Atomic. This is the brief-023
-/// refresh the ding runs on the agent it serves.
+/// Bump an agent's status mtime so a live-but-idle agent never rots to `unknown`, preserving the
+/// recorded value. Missing → write `available`. A valid non-DND value → re-write the same value.
+/// `dnd`, `unknown`, or corrupt → leave untouched (never renew a hold or invent a value). Atomic.
 pub fn refresh(status_path: &Path) -> RefreshOutcome {
     if !status_path.exists() {
         return match write_atomic(status_path, State::Available.as_str()) {
@@ -128,6 +130,9 @@ pub fn refresh(status_path: &Path) -> RefreshOutcome {
     let first = raw.lines().next().unwrap_or("").trim();
     if first == "unknown" {
         return RefreshOutcome::LeftUnknown;
+    }
+    if first == "dnd" {
+        return RefreshOutcome::LeftDnd;
     }
     match State::parse_settable(first) {
         Some(s) => match write_atomic(status_path, s.as_str()) {
@@ -231,6 +236,19 @@ mod tests {
         let sp = status_path(tmp.path());
         assert_eq!(refresh(&sp), RefreshOutcome::WroteDefault);
         assert_eq!(read_state(&sp), State::Available);
+    }
+
+    #[test]
+    fn refresh_leaves_dnd_to_age_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        set_state(&sp, State::Dnd).unwrap();
+        let before = fs::metadata(&sp).unwrap().modified().unwrap();
+        std::thread::sleep(Dur::from_millis(5));
+
+        assert_eq!(refresh(&sp), RefreshOutcome::LeftDnd);
+        assert_eq!(fs::metadata(&sp).unwrap().modified().unwrap(), before);
+        assert_eq!(read_state(&sp), State::Dnd);
     }
 
     #[test]

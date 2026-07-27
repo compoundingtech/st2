@@ -47,6 +47,11 @@ During materialization, hook commands such as `$ST_HOOKS/codex-stop.sh` resolve 
 immutable set, so rendered settings are versioned without embedding a machine-specific root in the
 declaration.
 
+The hooks have a small operational purpose: session-start restores durable context and exposes the
+current inbox; pre-compact preserves a recovery breadcrumb when no context was written; stop and
+failure hooks surface newly arrived work or a harness failure. They fail open so hook trouble does
+not prevent the harness from starting or stopping.
+
 ## Author a native agent
 
 Start from the maintained [Codex](examples/native/agent-codex.kdl) or
@@ -81,6 +86,24 @@ agent "<identity>" {
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ST_HOOKS/codex-session-start.sh","timeout":5}]}]}}
 """#
     git-exclude "AGENTS.md" ".codex/hooks.json"
+  }
+}
+```
+
+### Scheduled work is coming soon, not implemented
+
+st2 does not parse or run scheduled entries today. The intended direction starts with a declarative
+DING targeted at the containing agent; scheduled PTY or exec work may be considered later. This is a
+non-functional preview, and `st2 validate` correctly rejects it today:
+
+```kdl
+agent "<identity>" {
+  // Current implemented fields and tasks go here.
+
+  // FUTURE ONLY — not valid current agent.kdl syntax.
+  schedule "local-health" {
+    every "2h"
+    ding "Run the local health check."
   }
 }
 ```
@@ -172,11 +195,13 @@ text, send one bracketed-paste sequence, wait 500 ms, then send Return in that s
 command. The fixed delay addresses observed paste settling, but st2 does not inspect the terminal
 and cannot guarantee modal safety; a modal that opens during the gap could receive Return. Agents
 must therefore declare `busy` before actively executing work and return to `available` only when
-yielding or ready for new work. `dnd` is an explicit hold. `busy` and `dnd` defer new arrivals in
-FIFO order, archive receipts suppress restored duplicates, and transport failures retain the head
-for retry. A restarted sidecar seeds but never replays the existing inbox; the boot ritual owns
-backlog draining. The generic path is covered for both maintained harness declarations, while live
-Claude delivery proof remains pending.
+yielding or ready for new work, but `busy` never suppresses DING. Fresh `dnd` is the only delivery
+hold. The sidecar does not refresh `dnd`, so an abandoned hold becomes stale after 15 minutes and
+delivery resumes. New arrivals remain FIFO, same-filename archive receipts shadow and clean restored
+inbox duplicates, and a failed PTY send retains the notice in memory for retry. On start or restart,
+the sidecar sends one generic check-inbox recovery DING if unread work remains; it does not replay a
+notice per backlog message. The generic path is covered for both maintained harness declarations,
+while live Claude delivery proof remains pending.
 
 ## Cleanup
 

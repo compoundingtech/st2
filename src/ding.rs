@@ -7,8 +7,9 @@
 //!
 //! The sidecar deliberately does not inspect or classify terminal pixels. It retains only the
 //! transport-independent contracts: normalized single-line payloads, FIFO delivery, archive-receipt
-//! deduplication, `busy`/`dnd` gating, presence refresh, and target-session liveness. Startup seeds
-//! the existing inbox without poking it; the agent's boot ritual owns backlog draining.
+//! deduplication, fresh-`dnd` gating, presence refresh, and target-session liveness. `busy` never
+//! suppresses a notification. Startup coalesces existing unread work into one generic recovery DING
+//! instead of replaying every message.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
+const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
 
 /// The `<rand6>` of a `<unix-ms>-<rand6>.md` filename — the stable id an agent dedups re-pokes on.
 /// Falls back to the `.md`-stripped stem for anything off-grammar.
@@ -136,10 +138,7 @@ impl PtyPoker {
         Ok(())
     }
 
-    /// Central production path shared by inbox DING and scheduled shepherd prompts.
-    ///
-    /// Shepherd uses `before_submit` to durably record its attempt immediately before the one
-    /// terminal command. Inbox delivery passes a no-op.
+    /// Central production path for one normalized delayed-submit terminal notice.
     pub fn poke_with(
         &self,
         text: &str,
@@ -202,8 +201,9 @@ pub fn probe_pty_on_path() -> anyhow::Result<()> {
 }
 
 /// Logically unread messages in `inbox_dir` not in `seen`, in send order, while updating `seen` to
-/// exactly the current unread set. A same-named archive receipt suppresses a restored raw inbox copy.
-/// The first call returns the whole backlog; the sidecar discards it for push-only-on-new behavior.
+/// exactly the current unread set. A same-named archive receipt suppresses and cleans a restored raw
+/// inbox copy. The first call returns the whole backlog; the sidecar coalesces it into one recovery
+/// notice.
 pub fn new_arrivals(inbox_dir: &Path, seen: &mut HashSet<String>) -> Vec<Message> {
     let messages = message::list_inbox(inbox_dir).unwrap_or_default();
     let current: HashSet<&str> = messages
@@ -215,6 +215,21 @@ pub fn new_arrivals(inbox_dir: &Path, seen: &mut HashSet<String>) -> Vec<Message
         .into_iter()
         .filter(|message| seen.insert(message.filename.clone()))
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingNotice {
+    Recovery { startup: HashSet<String> },
+    Message(Message),
+}
+
+impl PendingNotice {
+    fn text(&self) -> String {
+        match self {
+            Self::Recovery { .. } => RECOVERY_POKE.to_string(),
+            Self::Message(message) => poke_text(message),
+        }
+    }
 }
 
 /// Consecutive liveness misses tolerated after a session has first been observed alive.
@@ -269,10 +284,11 @@ impl Default for DingConfig {
     }
 }
 
-/// Watch `inbox_dir` and poke each post-start arrival until stopped or the target session is gone.
+/// Watch `inbox_dir` and notify until stopped or the target session is gone.
 ///
-/// Existing inbox contents are seeded without a poke. New arrivals remain FIFO-queued across
-/// `busy`/`dnd` status and transport failures. Archive receipts prune queued work before delivery.
+/// Existing unread contents become one generic recovery DING. New arrivals remain FIFO-queued
+/// across fresh `dnd` status and transport failures; `busy` does not suppress delivery. Archive
+/// receipts prune queued work before delivery.
 pub fn run_ding(
     inbox_dir: &Path,
     status_path: Option<&Path>,
@@ -291,15 +307,28 @@ pub fn run_ding(
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
+    let mut pending = VecDeque::new();
+    if !backlog.is_empty() {
+        pending.push_back(PendingNotice::Recovery {
+            startup: backlog
+                .iter()
+                .map(|message| message.filename.clone())
+                .collect(),
+        });
+    }
     eprintln!(
-        "st2 ding: ready — seeded {} existing message(s) as already-seen; watching for new arrivals.",
-        backlog.len()
+        "st2 ding: ready — found {} existing unread message(s){}; watching for new arrivals.",
+        backlog.len(),
+        if backlog.is_empty() {
+            ""
+        } else {
+            " and queued one recovery notice"
+        }
     );
 
     let mut watch = SessionWatch::default();
     let mut logged_waiting = false;
     let mut last_refresh: Option<Instant> = None;
-    let mut pending = VecDeque::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -320,7 +349,11 @@ pub fn run_ding(
                 last_refresh = Some(Instant::now());
             }
 
-            pending.extend(new_arrivals(inbox_dir, &mut seen));
+            pending.extend(
+                new_arrivals(inbox_dir, &mut seen)
+                    .into_iter()
+                    .map(PendingNotice::Message),
+            );
             prune_archived_pending(inbox_dir, &mut pending);
             flush_pending(status_path, &mut pending, poker);
         } else if !watch.seen_alive && !logged_waiting {
@@ -342,7 +375,7 @@ pub fn run_ding(
     Ok(())
 }
 
-fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<Message>) {
+fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<PendingNotice>) {
     let Ok(current) = message::list_inbox(inbox_dir) else {
         return;
     };
@@ -350,25 +383,29 @@ fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<Message>) {
         .iter()
         .map(|message| message.filename.as_str())
         .collect();
-    pending.retain(|message| filenames.contains(message.filename.as_str()));
+    pending.retain(|notice| match notice {
+        PendingNotice::Recovery { startup } => startup
+            .iter()
+            .any(|filename| filenames.contains(filename.as_str())),
+        PendingNotice::Message(message) => filenames.contains(message.filename.as_str()),
+    });
 }
 
 fn delivery_suppressed(status_path: Option<&Path>) -> bool {
-    status_path.is_some_and(|path| {
-        matches!(
-            status::read_state(path),
-            status::State::Busy | status::State::Dnd
-        )
-    })
+    status_path.is_some_and(|path| status::read_state(path) == status::State::Dnd)
 }
 
-fn flush_pending(status_path: Option<&Path>, pending: &mut VecDeque<Message>, poker: &dyn Poker) {
+fn flush_pending(
+    status_path: Option<&Path>,
+    pending: &mut VecDeque<PendingNotice>,
+    poker: &dyn Poker,
+) {
     if delivery_suppressed(status_path) {
         return;
     }
 
-    while let Some(message) = pending.front() {
-        if let Err(error) = poker.poke(&poke_text(message)) {
+    while let Some(notice) = pending.front() {
+        if let Err(error) = poker.poke(&notice.text()) {
             eprintln!("st2 ding: {error}");
             break;
         }
@@ -629,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_delivery_respects_status_fifo_archive_and_transport_retry() {
+    fn pending_delivery_ignores_busy_but_respects_fresh_dnd_archive_and_retry() {
         let agent = tempfile::tempdir().unwrap();
         let inbox = inbox_dir(agent.path());
         let archive = archive_dir(agent.path());
@@ -637,41 +674,84 @@ mod tests {
         let first = send_to_inbox(&inbox, "alice", Some("first"), None, &[], "one").unwrap();
         std::thread::sleep(Duration::from_millis(2));
         let second = send_to_inbox(&inbox, "bob", Some("second"), None, &[], "two").unwrap();
-        let mut pending: VecDeque<Message> =
-            message::list_inbox(&inbox).unwrap().into_iter().collect();
+        let mut pending: VecDeque<PendingNotice> = message::list_inbox(&inbox)
+            .unwrap()
+            .into_iter()
+            .map(PendingNotice::Message)
+            .collect();
         let poker = RecordingPoker::live();
-
-        status::set_state(&status_path, status::State::Busy).unwrap();
-        flush_pending(Some(&status_path), &mut pending, &poker);
-        status::set_state(&status_path, status::State::Dnd).unwrap();
-        flush_pending(Some(&status_path), &mut pending, &poker);
-        assert!(poker.calls.lock().unwrap().is_empty());
 
         archive_msg(&inbox, &archive, &first).unwrap();
         prune_archived_pending(&inbox, &mut pending);
         assert_eq!(
             pending
                 .iter()
-                .map(|message| message.filename.as_str())
+                .filter_map(|notice| match notice {
+                    PendingNotice::Message(message) => Some(message.filename.as_str()),
+                    PendingNotice::Recovery { .. } => None,
+                })
                 .collect::<Vec<_>>(),
             [second.as_str()]
         );
 
         *poker.failures.lock().unwrap() = 1;
-        status::set_state(&status_path, status::State::Available).unwrap();
+        status::set_state(&status_path, status::State::Busy).unwrap();
         flush_pending(Some(&status_path), &mut pending, &poker);
         assert_eq!(pending.len(), 1, "a failed head remains queued");
         flush_pending(Some(&status_path), &mut pending, &poker);
         assert!(pending.is_empty());
 
+        let third = send_to_inbox(&inbox, "carol", Some("third"), None, &[], "three").unwrap();
+        pending.extend(
+            message::list_inbox(&inbox)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.filename == third)
+                .map(PendingNotice::Message),
+        );
+        status::set_state(&status_path, status::State::Dnd).unwrap();
+        flush_pending(Some(&status_path), &mut pending, &poker);
+        assert_eq!(pending.len(), 1, "fresh dnd suppresses delivery");
+
+        let stale = std::time::SystemTime::now() - status::STATUS_STALE - Duration::from_secs(1);
+        std::fs::File::open(&status_path)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        flush_pending(Some(&status_path), &mut pending, &poker);
+        assert!(
+            pending.is_empty(),
+            "stale dnd reads unknown and no longer suppresses"
+        );
+
         let calls = poker.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].contains("[id:"));
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], calls[1], "the failed FIFO head retries first");
+        assert!(calls[0].contains("second"));
+        assert!(calls[2].contains("third"));
     }
 
     #[test]
-    fn startup_backlog_is_silent_and_only_post_start_arrivals_poke() {
+    fn startup_recovery_notice_retries_in_memory() {
+        let poker = RecordingPoker::live();
+        *poker.failures.lock().unwrap() = 1;
+        let mut pending = VecDeque::from([PendingNotice::Recovery {
+            startup: HashSet::from(["1785070000000-abc123.md".to_string()]),
+        }]);
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 1);
+        flush_pending(None, &mut pending, &poker);
+        assert!(pending.is_empty());
+
+        let calls = poker.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1], "the failed FIFO head retries first");
+        assert_eq!(calls[0], RECOVERY_POKE);
+    }
+
+    #[test]
+    fn startup_backlog_gets_one_generic_recovery_then_new_arrivals_poke() {
         let agent = tempfile::tempdir().unwrap();
         let inbox = inbox_dir(agent.path());
         let status_path = status::status_path(agent.path());
@@ -692,7 +772,7 @@ mod tests {
                     std::thread::yield_now();
                 }
                 send_to_inbox(&inbox, "new", Some("post-start"), None, &[], "new").unwrap();
-                while poker.calls.lock().unwrap().is_empty() && Instant::now() < deadline {
+                while poker.calls.lock().unwrap().len() < 2 && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 stop.store(true, Ordering::SeqCst);
@@ -702,8 +782,9 @@ mod tests {
         });
 
         let calls = poker.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].contains("post-start"));
-        assert!(!calls[0].contains("seeded"));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], RECOVERY_POKE);
+        assert!(calls[1].contains("post-start"));
+        assert!(!calls.iter().any(|call| call.contains("seeded")));
     }
 }

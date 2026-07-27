@@ -77,8 +77,9 @@ enum Command {
     #[command(subcommand)]
     Hooks(HooksCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
-    /// message. Busy/dnd status defers FIFO. Long-running — st2 keeps it alive as a task alongside
-    /// the agent. Exits when the target pty session is gone.
+    /// message. Busy does not suppress delivery; only fresh dnd defers FIFO. A startup backlog is
+    /// coalesced into one recovery notice. Long-running — st2 keeps it alive as a task alongside the
+    /// agent. Exits when the target pty session is gone.
     /// `st2 ping` is an alias (the maintainer is renaming ding → ping, since dinging is the runner's
     /// job now); it is the exact same command.
     #[command(visible_alias = "ping")]

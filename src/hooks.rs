@@ -131,12 +131,25 @@ pub fn required_by_codex(specs: &[crate::spec::AgentSpec], this_host: &str) -> b
 pub fn required_by_codex_agent(spec: &crate::spec::AgentSpec, this_host: &str) -> bool {
     spec.host.as_deref().is_none_or(|host| host == this_host)
         && spec.tasks.iter().any(|task| {
-            task.name == "agent"
-                && task
-                    .command
-                    .as_deref()
-                    .is_some_and(crate::shepherd::command_invokes_codex)
+            task.name == "agent" && task.command.as_deref().is_some_and(command_invokes_codex)
         })
+}
+
+/// Recognize the exact command shape emitted for Codex agents while accepting an absolute binary
+/// path in a hand-authored declaration. Arbitrary shell pipelines and incidental arguments are not
+/// guessed through.
+pub(crate) fn command_invokes_codex(command: &str) -> bool {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("exec ")
+        .unwrap_or(command)
+        .trim_start();
+    let Some(program) = command.split_ascii_whitespace().next() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "codex")
 }
 
 fn receipt_path(root: &Path) -> PathBuf {
@@ -348,6 +361,19 @@ pub fn install_at(root: &Path, allow_downgrade: bool) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_command_classification_is_exact() {
+        assert!(command_invokes_codex(
+            "exec codex --dangerously-bypass-approvals-and-sandbox 'x'"
+        ));
+        assert!(command_invokes_codex("/opt/bin/codex --model x"));
+        assert!(!command_invokes_codex("echo codex"));
+        assert!(!command_invokes_codex("claude codex"));
+        assert!(!command_invokes_codex(
+            "exec /opt/bin/codex-wrapper --model x"
+        ));
+    }
 
     #[test]
     fn explicit_install_is_idempotent_receipted_and_executable() {
