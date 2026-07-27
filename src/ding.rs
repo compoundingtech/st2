@@ -1,19 +1,21 @@
 //! Native inbox-to-terminal DING delivery.
 //!
-//! Every harness uses one transport:
-//! `pty send <session> --with-delay 0.5 --seq <bracketed-paste notice> --seq key:return`.
-//! The fixed delay is based on observed paste-settling behavior. It reduces early-submit races but
-//! cannot guarantee modal safety: a terminal UI can still open a modal before Return arrives.
+//! Every maintained harness uses the same fail-closed transport: positively identify an empty
+//! composer, bracketed-paste the normalized notice without Return, and submit only after two exact
+//! safe-composer observations. A human draft, active turn, modal, changed composer, unreadable
+//! screen, or bounded observation timeout never receives Return.
 //!
-//! The sidecar deliberately does not inspect or classify terminal pixels. It retains only the
-//! transport-independent contracts: normalized single-line payloads, FIFO delivery, archive-receipt
-//! deduplication, fresh-`dnd` gating, presence refresh, and target-session liveness. `busy` never
-//! suppresses a notification. Startup coalesces existing unread work into one generic recovery DING
-//! instead of replaying every message.
+//! Once a paste command starts, the sidecar owns that payload and retries by inspection only. It
+//! never pastes the same notice again until the exact staged payload has disappeared or changed.
+//! This preserves FIFO/archive behavior without letting a command timeout create duplicate text.
+//! Startup can adopt an exact staged recovery or backlog notice before coalescing remaining unread
+//! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
 
 use std::collections::{HashSet, VecDeque};
+use std::io::{Read as _, Seek as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
@@ -27,6 +29,9 @@ const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
 const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
+const PTY_COMMAND_TIMEOUT: Duration = Duration::from_millis(600);
+const COMPOSER_OBSERVATION_WINDOW: Duration = Duration::from_millis(450);
+const COMPOSER_OBSERVATION_POLL: Duration = Duration::from_millis(10);
 
 /// The `<rand6>` of a `<unix-ms>-<rand6>.md` filename — the stable id an agent dedups re-pokes on.
 /// Falls back to the `.md`-stripped stem for anything off-grammar.
@@ -91,24 +96,45 @@ fn bracketed_paste(text: &str) -> String {
     format!("{BRACKETED_PASTE_START}{normalized}{BRACKETED_PASTE_END}")
 }
 
-/// Exact harness-neutral `pty send` argv: one bracketed-paste sequence, one fixed delay, then Return.
-pub fn pty_send_args(session: &str, text: &str) -> Vec<String> {
+/// Bracketed-paste one normalized notice without Return.
+pub fn pty_stage_args(session: &str, text: &str) -> Vec<String> {
     vec![
         "send".into(),
         session.into(),
-        "--with-delay".into(),
-        "0.5".into(),
         "--seq".into(),
         bracketed_paste(text),
+    ]
+}
+
+/// Submit a composer that two immediately adjacent inspections proved contains the exact notice.
+pub fn pty_submit_args(session: &str) -> Vec<String> {
+    vec![
+        "send".into(),
+        session.into(),
         "--seq".into(),
         "key:return".into(),
     ]
 }
 
-/// How DING delivers a poke and checks liveness — abstracted so the watch loop is testable without
-/// a real `pty`.
+/// One delivery attempt either submitted the notice, owns a paste that must be retried by
+/// inspection only, or performed no input because the target was not positively safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PokeOutcome {
+    Delivered,
+    Staged,
+    Deferred,
+}
+
+/// How DING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
+/// real `pty`.
 pub trait Poker {
-    fn poke(&self, text: &str) -> anyhow::Result<()>;
+    fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
+    fn retry_staged(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
+        Ok(PokeOutcome::Deferred)
+    }
+    fn adopt_staged(&self, _candidates: &[String]) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
     fn session_alive(&self) -> bool;
 }
 
@@ -126,11 +152,11 @@ impl PtyPoker {
         }
     }
 
-    fn run(&self, args: Vec<String>) -> anyhow::Result<()> {
-        let out = Command::new(&self.bin).args(args).output()?;
+    fn run(&self, args: Vec<String>, operation: &str) -> anyhow::Result<()> {
+        let out = output_with_timeout(Command::new(&self.bin).args(args), PTY_COMMAND_TIMEOUT)?;
         if !out.status.success() {
             anyhow::bail!(
-                "`pty send {}` failed: {}",
+                "`pty {operation} {}` failed: {}",
                 self.session,
                 String::from_utf8_lossy(&out.stderr).trim()
             );
@@ -138,25 +164,641 @@ impl PtyPoker {
         Ok(())
     }
 
-    /// Central production path for one normalized delayed-submit terminal notice.
+    fn peek(&self) -> anyhow::Result<String> {
+        let out = output_with_timeout(
+            Command::new(&self.bin).args(["peek", self.session.as_str()]),
+            PTY_COMMAND_TIMEOUT,
+        )?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty peek {}` failed: {}",
+                self.session,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        String::from_utf8(out.stdout).map_err(|error| {
+            anyhow::anyhow!("`pty peek {}` returned non-UTF-8: {error}", self.session)
+        })
+    }
+
+    /// Central production safety path shared by inbox DING and any caller that needs to record an
+    /// attempt immediately before the only command containing Return.
     pub fn poke_with(
         &self,
         text: &str,
         before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        before_submit()?;
-        self.run(pty_send_args(&self.session, text))
+    ) -> anyhow::Result<PokeOutcome> {
+        observed_poke(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_stage_args(&self.session, text), "send"),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
+            before_submit,
+        )
     }
 }
 
 impl Poker for PtyPoker {
-    fn poke(&self, text: &str) -> anyhow::Result<()> {
+    fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
         self.poke_with(text, &mut || Ok(()))
+    }
+
+    fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+        observed_retry_staged(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || Ok(()),
+        )
+    }
+
+    fn adopt_staged(&self, candidates: &[String]) -> anyhow::Result<Option<String>> {
+        let screen = self.peek()?;
+        Ok(exact_staged_candidate(&screen, candidates))
     }
 
     fn session_alive(&self) -> bool {
         session_alive(&self.session)
     }
+}
+
+/// Run a non-interactive child with bounded output capture. Temporary files keep an escaped
+/// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
+fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    stdout.rewind()?;
+    stderr.rewind()?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout.read_to_end(&mut stdout_bytes)?;
+    stderr.read_to_end(&mut stderr_bytes)?;
+    Ok(Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
+/// What the current bottom composer proves about one exact normalized notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerState {
+    /// A maintained harness is positively idle and contains only its known placeholder.
+    EmptySafe,
+    /// The exact notice is the complete composer and the harness is positively idle.
+    ExactSafe,
+    /// The exact notice is present, but a modal, active turn, or non-idle footer blocks Return.
+    ExactBlocked,
+    /// A maintained composer contains different text (including a human draft).
+    Changed,
+    /// No maintained, unambiguous composer state was proven.
+    Ambiguous,
+}
+
+fn exact_staged_candidate(screen: &str, candidates: &[String]) -> Option<String> {
+    candidates.iter().find_map(|candidate| {
+        matches!(
+            classify_composer(screen, candidate),
+            ComposerState::ExactSafe | ComposerState::ExactBlocked
+        )
+        .then(|| candidate.clone())
+    })
+}
+
+fn observed_poke(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    stage: &mut dyn FnMut() -> anyhow::Result<()>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    poll: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    observed_poke_with_window(
+        text,
+        peek,
+        stage,
+        submit,
+        poll,
+        before_submit,
+        COMPOSER_OBSERVATION_WINDOW,
+    )
+}
+
+/// Two-phase DING delivery with injected operations for deterministic regression tests.
+fn observed_poke_with_window(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    stage: &mut dyn FnMut() -> anyhow::Result<()>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    poll: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    observation_window: Duration,
+) -> anyhow::Result<PokeOutcome> {
+    match classify_composer(&peek()?, text) {
+        ComposerState::ExactSafe => {
+            return submit_after_final_observation(text, peek, submit, before_submit);
+        }
+        ComposerState::ExactBlocked => return Ok(PokeOutcome::Staged),
+        ComposerState::EmptySafe => {}
+        ComposerState::Changed | ComposerState::Ambiguous => {
+            return Ok(PokeOutcome::Deferred);
+        }
+    }
+
+    // Once this command starts, success is ambiguous on any error or timeout: the paste may already
+    // have reached the TUI. Preserve ownership and let retry_staged inspect instead of re-pasting.
+    if let Err(error) = stage() {
+        eprintln!("st2 ding: paste command became ambiguous; retaining staged ownership: {error}");
+        return Ok(PokeOutcome::Staged);
+    }
+
+    let deadline = Instant::now() + observation_window;
+    loop {
+        let screen = match peek() {
+            Ok(screen) => screen,
+            Err(error) => {
+                eprintln!(
+                    "st2 ding: post-paste observation failed; retaining staged ownership: {error}"
+                );
+                return Ok(PokeOutcome::Staged);
+            }
+        };
+        match classify_composer(&screen, text) {
+            ComposerState::ExactSafe => {
+                return submit_after_final_observation(text, peek, submit, before_submit);
+            }
+            ComposerState::ExactBlocked => return Ok(PokeOutcome::Staged),
+            ComposerState::Changed => return Ok(PokeOutcome::Deferred),
+            ComposerState::EmptySafe | ComposerState::Ambiguous => {}
+        }
+        if Instant::now() >= deadline {
+            return Ok(PokeOutcome::Staged);
+        }
+        poll();
+    }
+}
+
+/// The final observation is intentionally adjacent to the bare-Return operation. Any change or
+/// uncertainty after the first exact observation prevents submission.
+fn submit_after_final_observation(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    let screen = match peek() {
+        Ok(screen) => screen,
+        Err(error) => {
+            eprintln!(
+                "st2 ding: final composer observation failed; retaining staged ownership: {error}"
+            );
+            return Ok(PokeOutcome::Staged);
+        }
+    };
+    match classify_composer(&screen, text) {
+        ComposerState::ExactSafe => {}
+        ComposerState::ExactBlocked | ComposerState::Ambiguous => {
+            return Ok(PokeOutcome::Staged);
+        }
+        ComposerState::EmptySafe | ComposerState::Changed => {
+            return Ok(PokeOutcome::Deferred);
+        }
+    }
+    if let Err(error) = before_submit() {
+        eprintln!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
+        return Ok(PokeOutcome::Staged);
+    }
+    if let Err(error) = submit() {
+        eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
+        return Ok(PokeOutcome::Staged);
+    }
+    Ok(PokeOutcome::Delivered)
+}
+
+/// Inspect-only retry for a payload whose paste command already started.
+fn observed_retry_staged(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<PokeOutcome> {
+    let screen = match peek() {
+        Ok(screen) => screen,
+        Err(error) => {
+            eprintln!("st2 ding: staged retry observation failed; retaining ownership: {error}");
+            return Ok(PokeOutcome::Staged);
+        }
+    };
+    match classify_composer(&screen, text) {
+        ComposerState::ExactSafe => {
+            submit_after_final_observation(text, peek, submit, before_submit)
+        }
+        ComposerState::ExactBlocked | ComposerState::Ambiguous => Ok(PokeOutcome::Staged),
+        ComposerState::EmptySafe | ComposerState::Changed => Ok(PokeOutcome::Deferred),
+    }
+}
+
+const CODEX_EMPTY_COMPOSERS: [&str; 3] = [
+    "\x1b[1;22m›\x1b[1C\x1b[22;2m",
+    "\x1b[1m›\x1b[1C\x1b[22;2m",
+    "\x1b[1m›\x1b[22m \x1b[2m",
+];
+const CODEX_TYPED_COMPOSERS: [&str; 4] = [
+    "\x1b[1;22m›\x1b[1C\x1b[0m",
+    "\x1b[1;2m› \x1b[0m",
+    "\x1b[1m›\x1b[1C\x1b[0m",
+    "\x1b[1m›\x1b[22m ",
+];
+enum CodexComposer {
+    Empty,
+    Typed(String),
+}
+
+fn classify_composer(screen: &str, expected: &str) -> ComposerState {
+    let plain = strip_ansi(screen);
+    if plain.contains("Claude Code v") {
+        return classify_claude_composer(&plain, expected);
+    }
+    if located_bottom_codex_composer(screen).is_some()
+        || plain.contains("OpenAI Codex")
+        || plain
+            .lines()
+            .any(|line| line.trim_start().starts_with("gpt-"))
+    {
+        return classify_codex_composer(screen, &plain, expected);
+    }
+    ComposerState::Ambiguous
+}
+
+fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> ComposerState {
+    let blocked = interaction_blocked(plain);
+    let Some((start, composer)) = located_bottom_codex_composer(screen) else {
+        return ComposerState::Ambiguous;
+    };
+    let idle_footer = codex_idle_footer(&screen[start..]);
+    match composer {
+        CodexComposer::Empty if !blocked && idle_footer => ComposerState::EmptySafe,
+        CodexComposer::Empty => ComposerState::Ambiguous,
+        CodexComposer::Typed(input) => {
+            let exact = logical_soft_wrap_candidates(&input, 70)
+                .iter()
+                .any(|input| input == expected);
+            if exact && !blocked && idle_footer {
+                ComposerState::ExactSafe
+            } else if exact {
+                ComposerState::ExactBlocked
+            } else {
+                ComposerState::Changed
+            }
+        }
+    }
+}
+
+fn codex_idle_footer(screen_from_composer: &str) -> bool {
+    strip_ansi(screen_from_composer).lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("gpt-") && line.contains(" · /")
+    })
+}
+
+fn classify_claude_composer(plain: &str, expected: &str) -> ComposerState {
+    let Some((logical_inputs, footer)) = located_bottom_claude_composer(plain) else {
+        return ComposerState::Ambiguous;
+    };
+    let exact = logical_inputs.iter().any(|input| input == expected);
+    let placeholder = logical_inputs.len() == 1 && is_claude_idle_placeholder(&logical_inputs[0]);
+    let idle_footer = footer.contains("⏵⏵")
+        && footer.contains("shift+tab to cycle")
+        && footer.contains("permissions on");
+    let blocked = interaction_blocked(plain);
+    if exact {
+        if idle_footer && !blocked {
+            ComposerState::ExactSafe
+        } else {
+            ComposerState::ExactBlocked
+        }
+    } else if placeholder && idle_footer && !blocked {
+        ComposerState::EmptySafe
+    } else {
+        ComposerState::Changed
+    }
+}
+
+/// Claude 2.1.220 rotates repository-aware examples (file names and verbs vary) without styling
+/// them differently from typed input. The exact `Try "<single-line example>"` grammar plus the
+/// maintained idle footer is therefore the narrowest available positive heuristic.
+fn is_claude_idle_placeholder(input: &str) -> bool {
+    input
+        .strip_prefix("Try \"")
+        .and_then(|example| example.strip_suffix('"'))
+        .is_some_and(|example| {
+            !example.is_empty()
+                && example.chars().count() <= 72
+                && !example.chars().any(char::is_control)
+                && !example.contains(['\r', '\n'])
+        })
+}
+
+/// Extract all logical strings consistent with Claude's renderer-proven soft wraps. At a full-width
+/// row Claude may either wrap at a discarded space or split a token, so each proven boundary has
+/// exactly two candidates: join with one space or with none. The bounded DING length keeps this set
+/// small; any unfamiliar multiline shape fails closed.
+fn located_bottom_claude_composer(plain: &str) -> Option<(Vec<String>, String)> {
+    let lines: Vec<&str> = plain.lines().collect();
+    let separators: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.chars().count() >= 40 && trimmed.chars().all(|ch| ch == '─')).then_some(index)
+        })
+        .collect();
+    let (&bottom, before_bottom) = separators.split_last()?;
+    let &top = before_bottom.last()?;
+    if bottom <= top + 1 {
+        return None;
+    }
+
+    let rows = &lines[top + 1..bottom];
+    let first_row = rows.first()?.trim_end();
+    let first = first_row
+        .strip_prefix("❯\u{00a0}")
+        .or_else(|| first_row.strip_prefix("❯ "))?;
+    let input = std::iter::once(first)
+        .chain(rows[1..].iter().map(|row| row.trim_end()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let candidates = logical_soft_wrap_candidates(&input, 70);
+    let footer = lines[bottom + 1..].join("\n");
+    Some((candidates, footer))
+}
+
+/// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
+/// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
+/// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
+/// unfamiliar multiline input remains literal and cannot equal a normalized single-line DING.
+fn logical_soft_wrap_candidates(input: &str, minimum_first_content_chars: usize) -> Vec<String> {
+    let rows: Vec<&str> = input.lines().collect();
+    let Some(first) = rows.first() else {
+        return vec![String::new()];
+    };
+    if rows.len() == 1 {
+        return vec![(*first).to_string()];
+    }
+    let mut candidates = vec![(*first).to_string()];
+    let mut previous = *first;
+    for (index, row) in rows[1..].iter().enumerate() {
+        let required_previous_width = minimum_first_content_chars + usize::from(index > 0) * 2;
+        if previous.chars().count() < required_previous_width
+            || !row.starts_with("  ")
+            || row.trim().is_empty()
+        {
+            return vec![input.to_string()];
+        }
+        let continuation = row.strip_prefix("  ").expect("prefix checked").trim_end();
+        let mut next = Vec::with_capacity(candidates.len().saturating_mul(2).min(32));
+        for candidate in candidates {
+            if next.len() >= 32 {
+                return vec![input.to_string()];
+            }
+            next.push(format!("{candidate}{continuation}"));
+            next.push(format!("{candidate} {continuation}"));
+        }
+        candidates = next;
+        previous = row;
+    }
+    candidates
+}
+
+fn interaction_blocked(plain: &str) -> bool {
+    plain.contains("Working (")
+        || plain.contains("esc to interrupt")
+        || plain.contains("Esc to interrupt")
+        || plain.contains("ctrl+c to interrupt")
+        || plain.contains("Messages to be submitted after next tool call")
+        || plain.contains("press esc to interrupt and send")
+        || plain.contains("Our systems are thinking a bit more")
+        || plain.contains("Retry with a faster model")
+        || plain.contains("Create a plan?")
+        || looks_like_choice_menu(plain)
+}
+
+fn looks_like_choice_menu(plain: &str) -> bool {
+    let mut first = false;
+    let mut later = false;
+    for line in plain.lines().map(str::trim_start) {
+        first |= line.starts_with("› 1.") || line.starts_with("> 1.");
+        later |= line.starts_with("2.") || line.starts_with("3.");
+    }
+    first && later
+}
+
+fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)> {
+    let empty = CODEX_EMPTY_COMPOSERS
+        .iter()
+        .filter_map(|marker| {
+            screen
+                .rfind(marker)
+                .map(|start| (start, marker.len(), true))
+        })
+        .max_by_key(|(start, _, _)| *start);
+    let typed = CODEX_TYPED_COMPOSERS
+        .iter()
+        .filter_map(|marker| {
+            screen
+                .rfind(marker)
+                .map(|start| (start, marker.len(), false))
+        })
+        .max_by_key(|(start, _, _)| *start);
+    let (start, marker_len, empty) = match (empty, typed) {
+        (Some(empty), Some(typed)) if empty.0 >= typed.0 => empty,
+        (_, Some(typed)) => typed,
+        (Some(empty), None) => empty,
+        (None, None) => return None,
+    };
+    if empty {
+        return Some((start, CodexComposer::Empty));
+    }
+    let tail = &screen[start + marker_len..];
+    let input = tail
+        .split_once("\r\n \x1b[")
+        .or_else(|| tail.split_once("\n \x1b["))
+        .or_else(|| tail.split_once("\r\n\r\n"))
+        .or_else(|| tail.split_once("\n\n"))
+        .map(|(input, _)| input)
+        .unwrap_or(tail);
+    Some((
+        start,
+        CodexComposer::Typed(normalize_codex_composer_input(input)),
+    ))
+}
+
+/// Strip ANSI from one bottom-composer input while joining only renderer-proven Codex soft wraps.
+fn normalize_codex_composer_input(input: &str) -> String {
+    const VIEWPORT_WIDTH: usize = 80;
+    const PROMPT_WIDTH: usize = 2;
+    const WRAP_RIGHT_MARGIN: usize = 2;
+    const CONTINUATION_INDENT: &str = "  ";
+    const WRAP_PADDING: &str = "\x1b[2X";
+
+    fn split_row(input: &str) -> (&str, Option<&str>) {
+        let Some(newline) = input.find('\n') else {
+            return (input, None);
+        };
+        let row_end = if input[..newline].ends_with('\r') {
+            newline - 1
+        } else {
+            newline
+        };
+        (&input[..row_end], Some(&input[newline + 1..]))
+    }
+
+    fn proven_wrap(row: &str, next: &str, first: bool) -> bool {
+        let Some(row_without_padding) = row.strip_suffix(WRAP_PADDING) else {
+            return false;
+        };
+        let visible = strip_ansi(row_without_padding);
+        let next_content = next.strip_prefix(CONTINUATION_INDENT);
+        visible.is_ascii()
+            && next_content.is_some_and(|content| {
+                content
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| !ch.is_control() && !ch.is_whitespace())
+            })
+            && usize::from(first) * PROMPT_WIDTH + visible.len() + WRAP_RIGHT_MARGIN
+                == VIEWPORT_WIDTH
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut first = true;
+    let mut strip_continuation_indent = false;
+    loop {
+        let (row, next) = split_row(rest);
+        let visible = strip_ansi(row);
+        if strip_continuation_indent {
+            out.push_str(
+                visible
+                    .strip_prefix(CONTINUATION_INDENT)
+                    .unwrap_or(&visible),
+            );
+        } else {
+            out.push_str(&visible);
+        }
+        let Some(next) = next else {
+            break;
+        };
+        strip_continuation_indent = proven_wrap(row, next, first);
+        if !strip_continuation_indent {
+            out.push('\n');
+        }
+        rest = next;
+        first = false;
+    }
+    out
+}
+
+/// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text. Bounded
+/// cursor-forward sequences represent visible spaces in current Codex and Claude panes.
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            let ch = input[index..].chars().next().expect("valid UTF-8 boundary");
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+        index += 1;
+        if index >= bytes.len() {
+            break;
+        }
+        match bytes[index] {
+            b'[' => {
+                index += 1;
+                let params_start = index;
+                let mut final_byte = None;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        final_byte = Some(byte);
+                        break;
+                    }
+                }
+                if final_byte == Some(b'C') {
+                    let params = &bytes[params_start..index.saturating_sub(1)];
+                    let width = if params.is_empty() {
+                        Some(1)
+                    } else if params.iter().all(u8::is_ascii_digit) {
+                        std::str::from_utf8(params)
+                            .ok()
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .map(|value| value.max(1))
+                    } else {
+                        None
+                    };
+                    if let Some(width) = width.filter(|width| *width <= 512) {
+                        for _ in 0..width {
+                            out.push(' ');
+                        }
+                    }
+                }
+            }
+            b']' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    out
 }
 
 /// `<pty-session-dir>/<session>.pid` + `kill(pid, 0)`; any miss means gone. This mirrors the
@@ -193,7 +835,7 @@ fn home_dir() -> PathBuf {
 
 /// Refuse to start if the `pty` binary is unreachable.
 pub fn probe_pty_on_path() -> anyhow::Result<()> {
-    match Command::new("pty").arg("--help").output() {
+    match output_with_timeout(Command::new("pty").arg("--help"), PTY_COMMAND_TIMEOUT) {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => anyhow::bail!("`pty --help` exited {}", out.status),
         Err(error) => anyhow::bail!("`pty` not runnable on PATH: {error}"),
@@ -219,15 +861,67 @@ pub fn new_arrivals(inbox_dir: &Path, seen: &mut HashSet<String>) -> Vec<Message
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingNotice {
-    Recovery { startup: HashSet<String> },
-    Message(Message),
+    Recovery {
+        startup: HashSet<String>,
+        in_inbox: bool,
+        staged_text: Option<String>,
+    },
+    Message {
+        message: Message,
+        in_inbox: bool,
+        staged_text: Option<String>,
+    },
+    /// Exact composer text adopted on sidecar startup. The ordinary recovery notice remains behind
+    /// it so any other unread backlog is still coalesced after this owned payload resolves.
+    Adopted { staged_text: Option<String> },
 }
 
 impl PendingNotice {
     fn text(&self) -> String {
         match self {
             Self::Recovery { .. } => RECOVERY_POKE.to_string(),
-            Self::Message(message) => poke_text(message),
+            Self::Message { message, .. } => poke_text(message),
+            Self::Adopted {
+                staged_text: Some(text),
+            } => text.clone(),
+            Self::Adopted { staged_text: None } => String::new(),
+        }
+    }
+
+    fn staged_text(&self) -> Option<&str> {
+        match self {
+            Self::Recovery { staged_text, .. }
+            | Self::Message { staged_text, .. }
+            | Self::Adopted { staged_text } => staged_text.as_deref(),
+        }
+    }
+
+    fn set_staged_text(&mut self, value: Option<String>) {
+        match self {
+            Self::Recovery { staged_text, .. }
+            | Self::Message { staged_text, .. }
+            | Self::Adopted { staged_text } => *staged_text = value,
+        }
+    }
+
+    fn in_inbox(&self) -> bool {
+        match self {
+            Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => *in_inbox,
+            Self::Adopted { .. } => false,
+        }
+    }
+
+    fn adopted(text: String) -> Self {
+        Self::Adopted {
+            staged_text: Some(text),
+        }
+    }
+
+    fn message(message: Message) -> Self {
+        Self::Message {
+            message,
+            in_inbox: true,
+            staged_text: None,
         }
     }
 }
@@ -307,6 +1001,11 @@ pub fn run_ding(
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
+    let mut startup_candidates = (!backlog.is_empty()).then(|| {
+        std::iter::once(RECOVERY_POKE.to_string())
+            .chain(backlog.iter().map(poke_text))
+            .collect::<Vec<_>>()
+    });
     let mut pending = VecDeque::new();
     if !backlog.is_empty() {
         pending.push_back(PendingNotice::Recovery {
@@ -314,6 +1013,8 @@ pub fn run_ding(
                 .iter()
                 .map(|message| message.filename.clone())
                 .collect(),
+            in_inbox: true,
+            staged_text: None,
         });
     }
     eprintln!(
@@ -349,10 +1050,33 @@ pub fn run_ding(
                 last_refresh = Some(Instant::now());
             }
 
+            if !delivery_suppressed(status_path)
+                && let Some(candidates) = startup_candidates.as_ref()
+            {
+                match poker.adopt_staged(candidates) {
+                    Ok(Some(text)) => {
+                        if text == RECOVERY_POKE {
+                            if let Some(recovery) = pending
+                                .iter_mut()
+                                .find(|notice| matches!(notice, PendingNotice::Recovery { .. }))
+                            {
+                                recovery.set_staged_text(Some(text));
+                            }
+                        } else {
+                            pending.push_front(PendingNotice::adopted(text));
+                        }
+                        startup_candidates = None;
+                    }
+                    Ok(None) => startup_candidates = None,
+                    Err(error) => {
+                        eprintln!("st2 ding: startup staged-notice adoption failed: {error}")
+                    }
+                }
+            }
             pending.extend(
                 new_arrivals(inbox_dir, &mut seen)
                     .into_iter()
-                    .map(PendingNotice::Message),
+                    .map(PendingNotice::message),
             );
             prune_archived_pending(inbox_dir, &mut pending);
             flush_pending(status_path, &mut pending, poker);
@@ -383,12 +1107,26 @@ fn prune_archived_pending(inbox_dir: &Path, pending: &mut VecDeque<PendingNotice
         .iter()
         .map(|message| message.filename.as_str())
         .collect();
-    pending.retain(|notice| match notice {
-        PendingNotice::Recovery { startup } => startup
-            .iter()
-            .any(|filename| filenames.contains(filename.as_str())),
-        PendingNotice::Message(message) => filenames.contains(message.filename.as_str()),
-    });
+    for notice in pending.iter_mut() {
+        match notice {
+            PendingNotice::Recovery {
+                startup, in_inbox, ..
+            } => {
+                *in_inbox = startup
+                    .iter()
+                    .any(|filename| filenames.contains(filename.as_str()));
+            }
+            PendingNotice::Message {
+                message, in_inbox, ..
+            } => {
+                *in_inbox = filenames.contains(message.filename.as_str());
+            }
+            PendingNotice::Adopted { .. } => {}
+        }
+    }
+    // A paste that already started stays owned across an archive race. It is never pasted again;
+    // the inspect-only retry either submits the exact safe payload or proves ownership disappeared.
+    pending.retain(|notice| notice.staged_text().is_some() || notice.in_inbox());
 }
 
 fn delivery_suppressed(status_path: Option<&Path>) -> bool {
@@ -404,12 +1142,39 @@ fn flush_pending(
         return;
     }
 
-    while let Some(notice) = pending.front() {
-        if let Err(error) = poker.poke(&notice.text()) {
-            eprintln!("st2 ding: {error}");
-            break;
+    while let Some(notice) = pending.front_mut() {
+        let staged = notice.staged_text().map(str::to_string);
+        let was_staged = staged.is_some();
+        let text = staged.unwrap_or_else(|| notice.text());
+        let outcome = if was_staged {
+            poker.retry_staged(&text)
+        } else {
+            poker.poke(&text)
+        };
+        match outcome {
+            Ok(PokeOutcome::Delivered) => {
+                pending.pop_front();
+            }
+            Ok(PokeOutcome::Staged) => {
+                notice.set_staged_text(Some(text));
+                break;
+            }
+            Ok(PokeOutcome::Deferred) if was_staged => {
+                // The exact owned payload disappeared or changed. Adopted startup text has the
+                // generic recovery notice behind it, while unread ordinary work may make one later
+                // fresh guarded attempt. Archived work is done.
+                notice.set_staged_text(None);
+                if notice.in_inbox() {
+                    break;
+                }
+                pending.pop_front();
+            }
+            Ok(PokeOutcome::Deferred) => break,
+            Err(error) => {
+                eprintln!("st2 ding: {error}");
+                break;
+            }
         }
-        pending.pop_front();
     }
 }
 
@@ -504,19 +1269,52 @@ mod tests {
     }
 
     impl Poker for RecordingPoker {
-        fn poke(&self, text: &str) -> anyhow::Result<()> {
+        fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
             self.calls.lock().unwrap().push(text.to_string());
             let mut failures = self.failures.lock().unwrap();
             if *failures > 0 {
                 *failures -= 1;
                 anyhow::bail!("injected send failure");
             }
-            Ok(())
+            Ok(PokeOutcome::Delivered)
         }
 
         fn session_alive(&self) -> bool {
             self.probes.fetch_add(1, Ordering::SeqCst);
             self.alive.load(Ordering::SeqCst)
+        }
+    }
+
+    struct OwnershipPoker {
+        pokes: Mutex<Vec<String>>,
+        retries: Mutex<Vec<String>>,
+        poke_outcomes: Mutex<VecDeque<PokeOutcome>>,
+        retry_outcomes: Mutex<VecDeque<PokeOutcome>>,
+    }
+
+    impl Poker for OwnershipPoker {
+        fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+            self.pokes.lock().unwrap().push(text.to_string());
+            Ok(self
+                .poke_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected fresh poke"))
+        }
+
+        fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
+            self.retries.lock().unwrap().push(text.to_string());
+            Ok(self
+                .retry_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected staged retry"))
+        }
+
+        fn session_alive(&self) -> bool {
+            true
         }
     }
 
@@ -566,8 +1364,8 @@ mod tests {
         assert!(text.ends_with("; check your inbox"));
 
         let direct = format!("{text}\x1b[201~\nsecond line");
-        let args = pty_send_args("seat", &direct);
-        let framed = &args[5];
+        let args = pty_stage_args("seat", &direct);
+        let framed = &args[3];
         assert_eq!(framed.matches(BRACKETED_PASTE_START).count(), 1);
         assert_eq!(framed.matches(BRACKETED_PASTE_END).count(), 1);
         let inner = framed
@@ -580,36 +1378,298 @@ mod tests {
     }
 
     #[test]
-    fn pty_send_is_one_exact_delayed_sequence_without_inspection_or_escape() {
+    fn pty_stage_and_submit_are_separate_exact_sequences() {
         assert_eq!(
-            pty_send_args("my-session", "hello\nworld"),
+            pty_stage_args("my-session", "hello\nworld"),
             vec![
                 "send",
                 "my-session",
-                "--with-delay",
-                "0.5",
                 "--seq",
                 "\x1b[200~hello world\x1b[201~",
-                "--seq",
-                "key:return",
             ]
         );
+        assert_eq!(
+            pty_submit_args("my-session"),
+            vec!["send", "my-session", "--seq", "key:return"]
+        );
+        assert!(!pty_stage_args("my-session", "hello").contains(&"key:return".to_string()));
+    }
 
-        let source = include_str!("ding.rs");
-        for removed in [
-            ["pty ", "peek"].concat(),
-            ["key:", "escape"].concat(),
-            ["Delivery", "Mode"].concat(),
-            ["classify_", "pane"].concat(),
-            ["recover_", "seeded"].concat(),
-            ["Co", "dex"].concat(),
-            ["Clau", "de"].concat(),
+    fn idle_codex_screen() -> String {
+        "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
+         \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+            .to_string()
+    }
+
+    fn staged_codex_screen(text: &str) -> String {
+        let rendered = text.replace(' ', "\x1b[1C");
+        format!(
+            "\x1b[1m›\x1b[1C\x1b[0m{rendered}\r\n\r\n\
+             \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+        )
+    }
+
+    fn human_codex_screen() -> String {
+        staged_codex_screen("please keep my half-written draft")
+    }
+
+    fn claude_rule() -> String {
+        "─".repeat(80)
+    }
+
+    fn idle_claude_screen() -> String {
+        let rule = claude_rule();
+        format!(
+            "Claude Code v2.1.220\r\n{rule}\r\n❯\u{00a0}Try \"write a test for validate.rs\"\r\n\
+             {rule}\r\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        )
+    }
+
+    fn staged_claude_screen(text: &str) -> String {
+        assert!(text.is_ascii());
+        let rule = claude_rule();
+        let composer = if text.len() <= 77 {
+            format!("❯\u{00a0}{text}")
+        } else {
+            let (first, continuation) = text.split_at(77);
+            format!("❯\u{00a0}{first}\r\n  {continuation}")
+        };
+        format!(
+            "Claude Code v2.1.220\r\n{rule}\r\n{composer}\r\n{rule}\r\n\
+             ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )
+    }
+
+    #[test]
+    fn maintained_composer_classifiers_require_exact_idle_state() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        assert_eq!(
+            classify_composer(&idle_codex_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&staged_codex_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_composer(&human_codex_screen(), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!("Create a plan?\r\n{}", staged_codex_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer(&idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_composer(&staged_claude_screen("a changed human composer"), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!("Esc to interrupt\r\n{}", staged_claude_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+        assert_eq!(
+            classify_composer("unknown terminal pixels", expected),
+            ComposerState::Ambiguous
+        );
+    }
+
+    #[test]
+    fn startup_adopts_only_an_exact_recovery_or_backlog_composer() {
+        let recovery = RECOVERY_POKE.to_string();
+        let backlog =
+            "[DING] new st2 message: [id:abc123] seeded (from cos); check your inbox".to_string();
+        let candidates = vec![recovery.clone(), backlog.clone()];
+        assert_eq!(
+            exact_staged_candidate(&staged_codex_screen(&backlog), &candidates),
+            Some(backlog.clone())
+        );
+        assert_eq!(
+            exact_staged_candidate(&staged_claude_screen(&recovery), &candidates),
+            Some(recovery)
+        );
+        assert_eq!(
+            exact_staged_candidate(&human_codex_screen(), &candidates),
+            None
+        );
+    }
+
+    #[test]
+    fn paste_then_two_exact_observations_precede_return() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] ordered (from cos); check your inbox";
+        let screens = RefCell::new(VecDeque::from([
+            idle_codex_screen(),
+            staged_codex_screen(text),
+            staged_codex_screen(text),
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let outcome = observed_poke_with_window(
+            text,
+            &mut || {
+                actions.borrow_mut().push("peek");
+                Ok(screens.borrow_mut().pop_front().unwrap())
+            },
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || actions.borrow_mut().push("poll"),
+            &mut || {
+                actions.borrow_mut().push("receipt");
+                Ok(())
+            },
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Delivered);
+        assert_eq!(
+            *actions.borrow(),
+            ["peek", "paste", "peek", "peek", "receipt", "return"]
+        );
+    }
+
+    #[test]
+    fn changed_modal_ambiguous_and_bounded_timeout_never_return() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] guarded (from cos); check your inbox";
+        for screen in [
+            human_codex_screen(),
+            format!("Create a plan?\r\n{}", staged_codex_screen(text)),
+            "unrecognized renderer".to_string(),
         ] {
-            assert!(
-                !source.contains(&removed),
-                "renderer-specific path returned: {removed}"
-            );
+            let actions = RefCell::new(Vec::new());
+            let outcome = observed_poke_with_window(
+                text,
+                &mut || {
+                    actions.borrow_mut().push("peek");
+                    Ok(screen.clone())
+                },
+                &mut || {
+                    actions.borrow_mut().push("paste");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || {},
+                &mut || Ok(()),
+                Duration::ZERO,
+            )
+            .unwrap();
+            assert_ne!(outcome, PokeOutcome::Delivered);
+            assert!(!actions.borrow().contains(&"return"));
+            assert!(!actions.borrow().contains(&"paste"));
         }
+
+        let screens = RefCell::new(VecDeque::from([idle_claude_screen(), idle_claude_screen()]));
+        let actions = RefCell::new(Vec::new());
+        let outcome = observed_poke_with_window(
+            text,
+            &mut || {
+                actions.borrow_mut().push("peek");
+                Ok(screens.borrow_mut().pop_front().unwrap())
+            },
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || Ok(()),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Staged);
+        assert_eq!(*actions.borrow(), ["peek", "paste", "peek"]);
+    }
+
+    #[test]
+    fn final_observation_change_and_staged_retry_are_fail_closed() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] final race (from cos); check your inbox";
+        let screens = RefCell::new(VecDeque::from([
+            idle_codex_screen(),
+            staged_codex_screen(text),
+            human_codex_screen(),
+        ]));
+        let actions = RefCell::new(Vec::new());
+        let outcome = observed_poke_with_window(
+            text,
+            &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+            &mut || {
+                actions.borrow_mut().push("paste");
+                Ok(())
+            },
+            &mut || {
+                actions.borrow_mut().push("return");
+                Ok(())
+            },
+            &mut || {},
+            &mut || Ok(()),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Deferred);
+        assert_eq!(*actions.borrow(), ["paste"]);
+
+        let retry_screens = RefCell::new(VecDeque::from([
+            staged_claude_screen(text),
+            staged_claude_screen(text),
+        ]));
+        let retry_actions = RefCell::new(Vec::new());
+        assert_eq!(
+            observed_retry_staged(
+                text,
+                &mut || Ok(retry_screens.borrow_mut().pop_front().unwrap()),
+                &mut || {
+                    retry_actions.borrow_mut().push("return");
+                    Ok(())
+                },
+                &mut || Ok(()),
+            )
+            .unwrap(),
+            PokeOutcome::Delivered
+        );
+        assert_eq!(*retry_actions.borrow(), ["return"]);
+    }
+
+    #[test]
+    fn pty_commands_have_a_real_outer_timeout() {
+        let started = Instant::now();
+        let error = output_with_timeout(
+            Command::new("sh").args(["-c", "sleep 2"]),
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -666,6 +1726,48 @@ mod tests {
     }
 
     #[test]
+    fn staged_ownership_survives_archive_and_never_repastes() {
+        let agent = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(agent.path());
+        let archive = archive_dir(agent.path());
+        let filename = send_to_inbox(&inbox, "cos", Some("owned"), None, &[], "body").unwrap();
+        let message = message::list_inbox(&inbox).unwrap().pop().unwrap();
+        let expected = poke_text(&message);
+        let mut pending = VecDeque::from([PendingNotice::message(message)]);
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+            retry_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Delivered,
+            ])),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].staged_text(), Some(expected.as_str()));
+
+        archive_msg(&inbox, &archive, &filename).unwrap();
+        prune_archived_pending(&inbox, &mut pending);
+        assert_eq!(
+            pending.len(),
+            1,
+            "an already-started paste remains inspection-owned across archive"
+        );
+
+        flush_pending(None, &mut pending, &poker);
+        assert_eq!(pending.len(), 1);
+        flush_pending(None, &mut pending, &poker);
+        assert!(pending.is_empty());
+        assert_eq!(poker.pokes.lock().unwrap().as_slice(), [expected.as_str()]);
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            [expected.as_str(), expected.as_str()]
+        );
+    }
+
+    #[test]
     fn pending_delivery_ignores_busy_but_respects_fresh_dnd_archive_and_retry() {
         let agent = tempfile::tempdir().unwrap();
         let inbox = inbox_dir(agent.path());
@@ -677,7 +1779,7 @@ mod tests {
         let mut pending: VecDeque<PendingNotice> = message::list_inbox(&inbox)
             .unwrap()
             .into_iter()
-            .map(PendingNotice::Message)
+            .map(PendingNotice::message)
             .collect();
         let poker = RecordingPoker::live();
 
@@ -687,8 +1789,8 @@ mod tests {
             pending
                 .iter()
                 .filter_map(|notice| match notice {
-                    PendingNotice::Message(message) => Some(message.filename.as_str()),
-                    PendingNotice::Recovery { .. } => None,
+                    PendingNotice::Message { message, .. } => Some(message.filename.as_str()),
+                    PendingNotice::Recovery { .. } | PendingNotice::Adopted { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             [second.as_str()]
@@ -707,7 +1809,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .filter(|message| message.filename == third)
-                .map(PendingNotice::Message),
+                .map(PendingNotice::message),
         );
         status::set_state(&status_path, status::State::Dnd).unwrap();
         flush_pending(Some(&status_path), &mut pending, &poker);
@@ -737,6 +1839,8 @@ mod tests {
         *poker.failures.lock().unwrap() = 1;
         let mut pending = VecDeque::from([PendingNotice::Recovery {
             startup: HashSet::from(["1785070000000-abc123.md".to_string()]),
+            in_inbox: true,
+            staged_text: None,
         }]);
 
         flush_pending(None, &mut pending, &poker);

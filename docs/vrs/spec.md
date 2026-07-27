@@ -83,10 +83,13 @@ requires Nathan's explicit approval.
   boundary, and execution receipts are not yet specified. A successful
   executable eval and Nathan's approval should resolve this before adding
   scheduler requirements.
-- **DQ2 Safe DING delivery:** The current screen/composer heuristic is not yet a
-  reliable proof that pasting is safe and has occasionally interrupted human
-  typing. Prefixing the displayed notice with two blank lines can improve
-  readability but does not satisfy R04. Resolve this with a stronger evented
+- **DQ2 Safe DING delivery:** Bounded observation now replaces the fixed
+  paste-to-Return delay: maintained Codex and Claude composers must be
+  positively empty before paste and show the exact staged notice twice before
+  a separate Return. Human, modal, active, changed, timed-out, and unknown
+  states fail closed, with staged-payload ownership preventing duplicate paste.
+  This measured screen heuristic is still not an evented proof and renderer
+  changes may defer delivery. Resolve the remaining gap with a stronger evented
   signal or other measured classifier; a small on-device model is an optional
   experiment, not a required architecture.
 - **DQ3 Catalog agent state:** Define the catalog paths, schemas, freshness

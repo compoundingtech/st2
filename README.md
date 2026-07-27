@@ -210,17 +210,23 @@ Native DING watches the recipient inbox and delivers a normalized notice:
 
 Consumers must key on the `[DING]` prefix and stable id, not descriptive words. Every maintained
 harness uses the same transport: normalize untrusted fields into bounded, single-line printable
-text, send one bracketed-paste sequence, wait 500 ms, then send Return in that same `pty send`
-command. The fixed delay addresses observed paste settling, but st2 does not inspect the terminal
-and cannot guarantee modal safety; a modal that opens during the gap could receive Return. Agents
-must therefore declare `busy` before actively executing work and return to `available` only when
+text, positively identify an empty current Codex or Claude composer, and send one bracketed-paste
+sequence without Return. The sidecar then observes for a short bounded window and sends a separate
+bare Return only after two immediately adjacent inspections show the exact notice in a positively
+idle composer. A human draft, active turn, modal, changed composer, unreadable screen, command
+timeout, or unknown renderer defers submission. Once a paste command starts, the sidecar retains
+ownership and retries by inspection only, so a timeout cannot duplicate the paste. This measured
+screen heuristic is fail-closed for the maintained renderer versions but is not an evented TUI
+contract; renderer changes can defer delivery and remain an explicit design gap.
+
+Agents must declare `busy` before actively executing work and return to `available` only when
 yielding or ready for new work, but `busy` never suppresses DING. Fresh `dnd` is the only delivery
 hold. The sidecar does not refresh `dnd`, so an abandoned hold becomes stale after 15 minutes and
 delivery resumes. New arrivals remain FIFO, same-filename archive receipts shadow and clean restored
-inbox duplicates, and a failed PTY send retains the notice in memory for retry. On start or restart,
-the sidecar sends one generic check-inbox recovery DING if unread work remains; it does not replay a
-notice per backlog message. The generic path is covered for both maintained harness declarations,
-while live Claude delivery proof remains pending.
+inbox duplicates, and failed or uncertain PTY operations retain the notice for safe retry. On start
+or restart, the sidecar first adopts an exact staged recovery/backlog notice when present, then sends
+one generic check-inbox recovery DING if unread work remains; it does not replay every backlog
+message.
 
 ## Cleanup
 
