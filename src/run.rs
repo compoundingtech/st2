@@ -11,7 +11,7 @@
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Seek as _};
 use std::os::unix::process::CommandExt as _;
@@ -30,6 +30,7 @@ use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
 use crate::spec::TaskKind;
 
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
@@ -182,6 +183,39 @@ impl PtyCli {
         resolve_task_cwd(target, spec_dir, &self.catalog_root)
     }
 
+    /// The st2-owned part of a PTY task's environment. This same final map is both inherited by the
+    /// initial `pty run` process and persisted through repeatable `--env KEY=VALUE` arguments, so a
+    /// manual `pty restart` recreates the task without snapshotting unrelated ambient OS variables.
+    fn managed_task_env(&self, target: &TaskTarget) -> BTreeMap<OsString, OsString> {
+        let mut env = BTreeMap::from([
+            (
+                OsString::from("CATALOG"),
+                self.catalog_root.as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("ST_ROOT"),
+                self.catalog_root.as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("PTY_ROOT"),
+                effective_pty_root(&self.catalog_root).into_os_string(),
+            ),
+            (OsString::from("TERM"), OsString::from("xterm-256color")),
+        ]);
+        if let Ok(path) = crate::hooks::hooks_root() {
+            env.insert(OsString::from("ST_HOOKS"), path.into_os_string());
+        }
+        for (key, value) in &target.env {
+            let value = if key == "PTY_ROOT" {
+                effective_pty_root(&self.catalog_root).into_os_string()
+            } else {
+                OsString::from(self.expand(value))
+            };
+            env.insert(OsString::from(key), value);
+        }
+        env
+    }
+
     /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
     /// env can be unit-tested without spawning anything.
     ///
@@ -208,25 +242,16 @@ impl PtyCli {
         for (k, v) in &target.tags {
             cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
         }
-        // Per-task env, $-expanded (nothing shell-expands these downstream). $CATALOG is also set so
-        // the command's own `sh -c` expansion can reference it. PTY_ROOT resolves to the EFFECTIVE root
-        // (an exported ambient one wins over the rendered `$CATALOG/pty`), so the session lands where
-        // st2's own list/kill will look for it. A PTY task always gets a real terminal type even when
-        // st2 itself was started headlessly with `TERM=dumb`; harness TUIs otherwise stop at a prompt.
-        // An explicit task `env { TERM "..." }` below still wins.
-        cmd.env("CATALOG", &self.catalog_root)
-            .env("ST_ROOT", &self.catalog_root)
-            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
-            .env("TERM", "xterm-256color");
-        if let Ok(path) = crate::hooks::hooks_root() {
-            cmd.env("ST_HOOKS", path);
-        }
-        for (k, v) in &target.env {
-            if k == "PTY_ROOT" {
-                cmd.env("PTY_ROOT", effective_pty_root(&self.catalog_root));
-            } else {
-                cmd.env(k, self.expand(v));
-            }
+        // Apply the resolved managed overlay to the initial launcher exactly as before, and also
+        // persist it in PTY metadata for manual restart. PTY applies repeated `--env` entries
+        // last-wins, then forcibly injects the new session's own PTY_SESSION identity.
+        let managed_env = self.managed_task_env(target);
+        cmd.envs(&managed_env);
+        for (key, value) in &managed_env {
+            let mut assignment = key.clone();
+            assignment.push("=");
+            assignment.push(value);
+            cmd.arg("--env").arg(assignment);
         }
         // Run the command verbatim under a shell — st2 never parses or splits it.
         cmd.arg("--").arg("sh").arg("-c").arg(&target.command);
@@ -325,6 +350,42 @@ impl Runner for PtyCli {
             );
         }
         Ok(())
+    }
+
+    fn reap_for_restart(&self, pty_id: &str) -> anyhow::Result<()> {
+        // An exited PTY can remain in its daemon's 500ms shutdown window. Removing its files during
+        // that window and immediately reusing the id is unsafe: the old generation's final cleanup
+        // can unlink the new generation's socket/pid and leave `pty run` waiting for its full startup
+        // timeout. Wait for the recorded daemon to finish its bounded shutdown before removing the
+        // corpse. PTY may self-reap the files while we wait; "not found" is therefore success here.
+        let pty_root = effective_pty_root(&self.catalog_root);
+        let daemon_pid = std::fs::read_to_string(pty_root.join(format!("{pty_id}.pid")))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok());
+        if let Some(pid) = daemon_pid {
+            let deadline = Instant::now() + PTY_DAEMON_SHUTDOWN_WAIT;
+            while crate::host_lock::process_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if crate::host_lock::process_alive(pid) {
+                anyhow::bail!(
+                    "pty daemon {pid} for '{pty_id}' did not finish its bounded shutdown"
+                );
+            }
+        }
+
+        let out = Command::new(&self.bin)
+            .arg("rm")
+            .arg(pty_id)
+            .env("PTY_ROOT", &pty_root)
+            .output()?;
+        if out.status.success() || String::from_utf8_lossy(&out.stderr).contains("not found") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "`pty rm {pty_id}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
     }
 
     fn remove(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -1506,7 +1567,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        // Order: run -d --force --id <id> --name <bus-id> --cwd <cwd> -- sh -c <command>
+        // Stable launch/config arguments precede the persisted environment and command separator.
         assert_eq!(&args[0..2], &["run", "-d"]);
         assert!(args.contains(&"--force".to_string()));
         let id_pos = args.iter().position(|a| a == "--id").unwrap();
@@ -1515,6 +1576,83 @@ mod tests {
         assert_eq!(args[name_pos + 1], "hetz.demo");
         let sep = args.iter().position(|a| a == "--").unwrap();
         assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
+    }
+
+    #[test]
+    fn build_run_command_persists_the_complete_managed_environment_before_the_command() {
+        let cli = PtyCli::new(PathBuf::from("/my/catalog"));
+        let mut t = target("hetz.demo.agent", "exec codex 'boot'");
+        t.env.insert("CUSTOM".into(), "task-value".into());
+        t.env.insert("ST_AGENT".into(), "hetz.demo".into());
+        t.env.insert("ST_ROOT".into(), "$CATALOG/custom-bus".into());
+        t.env.insert("TERM".into(), "screen-256color".into());
+        t.env
+            .insert("PTY_ROOT".into(), "/declared/root/must-not-win".into());
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        let mut persisted = BTreeMap::new();
+        let mut index = 0;
+        while index < separator {
+            if args[index] == "--env" {
+                let (key, value) = args[index + 1].split_once('=').unwrap();
+                assert!(
+                    persisted
+                        .insert(key.to_string(), value.to_string())
+                        .is_none(),
+                    "the final managed overlay needs only one persisted value per key"
+                );
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+        let inherited = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            persisted, inherited,
+            "initial process env and restart-persisted env must be the same resolved overlay"
+        );
+        assert_eq!(
+            persisted.get("CATALOG").map(String::as_str),
+            Some("/my/catalog")
+        );
+        assert_eq!(
+            persisted.get("ST_ROOT").map(String::as_str),
+            Some("/my/catalog/custom-bus")
+        );
+        assert_eq!(
+            persisted.get("PTY_ROOT").map(String::as_str),
+            Some(
+                effective_pty_root(&cli.catalog_root)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            persisted.get("TERM").map(String::as_str),
+            Some("screen-256color")
+        );
+        assert_eq!(
+            persisted.get("ST_AGENT").map(String::as_str),
+            Some("hetz.demo")
+        );
+        assert_eq!(
+            persisted.get("CUSTOM").map(String::as_str),
+            Some("task-value")
+        );
+        assert!(persisted.contains_key("ST_HOOKS"));
     }
 
     #[test]

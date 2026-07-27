@@ -688,10 +688,13 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             let supervise_runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
             let mut sup_cap = crate::flapping::FlappingCap::default();
             let mut sup_debounce = crate::run::LivenessDebounce::new(Duration::from_secs(2));
-            // Crash-ding state: only a seat that was EVER alive counts as a crash when it later dies (a
-            // not-yet-booted seat is not a crash); `dinged` dedups so one crash = one ding until the seat
-            // is alive again.
-            let mut ever_alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Crash-ding state: the boot gate immediately above proved every declared seat alive, so
+            // carry that proof into supervision. PTY may self-reap a fast exit before the first
+            // post-kickoff list snapshot; starting empty would then misclassify the proven-live seat
+            // as never booted and suppress its crash ding. `dinged` dedups so one crash = one ding
+            // until the seat is alive again.
+            let mut ever_alive: std::collections::HashSet<String> =
+                specs.iter().map(|seat| seat.identity.clone()).collect();
             let mut dinged: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut tick = || {
                 if eval.supervise {

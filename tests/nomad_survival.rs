@@ -55,7 +55,10 @@ impl Fixture {
     /// An `st2` invocation with this fixture's isolated state env.
     fn st2(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_st2"));
-        c.env("XDG_STATE_HOME", &self.xdg).env("PTY_ROOT", &self.pty_root);
+        c.env("XDG_STATE_HOME", &self.xdg)
+            .env("PTY_ROOT", &self.pty_root)
+            .env("ST_HOOKS", self.xdg.join("st2/hooks"))
+            .env("ST2_TEST_AMBIENT_ONLY", "initial-launch-only");
         c
     }
 
@@ -87,6 +90,42 @@ impl Fixture {
         let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, kdl).unwrap();
+    }
+
+    /// Write a PTY task that records every st2-managed environment value and its cwd on each boot.
+    /// The append-only snapshot lets a test compare the initial launch with a manual `pty restart`.
+    fn write_restart_env_agent(&self, identity: &str) -> PathBuf {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}.task"));
+        let workspace = self.catalog.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let snapshot = self.catalog.join("restart-env.txt");
+        let kdl = format!(
+            r##"agent "{identity}" {{
+  identity "{identity}"
+  host "{HOST}"
+  type "service"
+  workspace "$CATALOG/workspace"
+  supervisor "{HOST}.supervisor"
+  env {{
+    ST_AGENT "{HOST}.{identity}"
+    ST_ROOT "$CATALOG/custom-bus"
+    TERM "screen-256color"
+    PTY_ROOT "$CATALOG/declared-root-must-not-win"
+    CUSTOM "task-value"
+  }}
+  pty "task" {{
+    tags purpose="restart-env"
+    command #"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$CATALOG" "$ST_ROOT" "$PTY_ROOT" "$TERM" "$ST_HOOKS" "$ST_AGENT" "$ST_SUPERVISOR" "$CUSTOM" "$PWD" "$ST2_TEST_AMBIENT_ONLY" >> "$CATALOG/restart-env.txt"; exec sleep 120"#
+  }}
+}}
+"##
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+        snapshot
     }
 
     /// The pidfile whose liveness == "the task is running": the exec child's pid, or the pty daemon's
@@ -288,6 +327,122 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
             "down did not stop {session_id}"
         );
     }
+}
+
+#[test]
+fn manual_pty_restart_preserves_every_st2_managed_environment_and_config_value() {
+    if !pty_gate("manual_pty_restart_preserves_every_st2_managed_environment_and_config_value") {
+        return;
+    }
+    let fx = Fixture::new();
+    let identity = "envrestart";
+    let session_id = format!("{HOST}.{identity}.task");
+    let snapshot = fx.write_restart_env_agent(identity);
+
+    let launched = fx.up_once();
+    assert!(
+        launched.contains(&format!("launched (1): {session_id}")),
+        "st2 did not launch the restart fixture:\n{launched}"
+    );
+    assert!(
+        poll_until(SPAWN_TIMEOUT, || {
+            std::fs::read_to_string(&snapshot).is_ok_and(|contents| contents.lines().count() == 1)
+        }),
+        "initial PTY task never wrote its managed environment snapshot"
+    );
+    let initial_pid = read_pid(&fx.task_pidfile("pty", identity)).unwrap();
+
+    let restarted = Command::new("pty")
+        .env_remove("ST2_TEST_AMBIENT_ONLY")
+        .env("PTY_ROOT", &fx.pty_root)
+        .args(["restart", "-y", &session_id])
+        .output()
+        .unwrap();
+    assert!(
+        restarted.status.success(),
+        "`pty restart -y` failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restarted.stdout),
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert!(
+        poll_until(SPAWN_TIMEOUT, || {
+            std::fs::read_to_string(&snapshot).is_ok_and(|contents| contents.lines().count() >= 2)
+        }),
+        "manually restarted PTY task never wrote its second environment snapshot"
+    );
+    let restarted_pid = read_pid(&fx.task_pidfile("pty", identity)).unwrap();
+    assert_ne!(
+        restarted_pid, initial_pid,
+        "manual restart did not replace the session process"
+    );
+    assert!(process_alive(restarted_pid));
+
+    let snapshots = std::fs::read_to_string(&snapshot).unwrap();
+    let lines = snapshots.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "unexpected task boot count:\n{snapshots}");
+    let catalog = fx.catalog.canonicalize().unwrap();
+    let expected_managed = [
+        catalog.to_string_lossy().into_owned(),
+        catalog.join("custom-bus").to_string_lossy().into_owned(),
+        fx.pty_root.to_string_lossy().into_owned(),
+        "screen-256color".to_string(),
+        fx.xdg.join("st2/hooks").to_string_lossy().into_owned(),
+        format!("{HOST}.{identity}"),
+        format!("{HOST}.supervisor"),
+        "task-value".to_string(),
+        catalog.join("workspace").to_string_lossy().into_owned(),
+    ];
+    let initial_expected = expected_managed
+        .iter()
+        .cloned()
+        .chain(["initial-launch-only".to_string()])
+        .collect::<Vec<_>>()
+        .join("|");
+    let restarted_expected = expected_managed
+        .iter()
+        .cloned()
+        .chain([String::new()])
+        .collect::<Vec<_>>()
+        .join("|");
+    assert_eq!(
+        lines[0], initial_expected,
+        "initial launch must inherit ambient input in addition to the managed overlay"
+    );
+    assert_eq!(
+        lines[1], restarted_expected,
+        "manual PTY restart must restore the managed overlay without snapshotting ambient input"
+    );
+
+    let listed = Command::new("pty")
+        .env("PTY_ROOT", &fx.pty_root)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let sessions: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let session = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["name"] == session_id)
+        .unwrap();
+    let expected_display_name = format!("{HOST}.{identity}");
+    let expected_cwd = catalog.join("workspace").to_string_lossy().into_owned();
+    assert_eq!(
+        session["displayName"].as_str(),
+        Some(expected_display_name.as_str()),
+        "manual restart lost the st2 agent display name"
+    );
+    assert_eq!(
+        session["cwd"].as_str(),
+        Some(expected_cwd.as_str()),
+        "manual restart lost the resolved task cwd"
+    );
+    assert_eq!(
+        session["tags"]["purpose"].as_str(),
+        Some("restart-env"),
+        "manual restart lost the task tag"
+    );
 }
 
 // ── the guarantee: killing the runner leaves the task alive; a fresh runner adopts it ─────────────

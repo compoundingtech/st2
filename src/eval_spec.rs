@@ -83,7 +83,8 @@ pub struct Eval {
     /// set, a dead team seat is respawned FROM THE SPEC (full env re-applied → it rejoins the bus cold),
     /// so a fault-injector can restart/crash a seat mid-run and the recovery is exercised. Absent →
     /// boot-once (the default; the seats are booted once and not respawned) — unchanged for every other
-    /// cell. Recovery is respawn-from-spec, NOT `pty restart` (which drops the child env / bus identity).
+    /// cell. Recovery remains respawn-from-spec rather than `pty restart`, so eval supervision stays
+    /// owned by st2 even though PTY metadata can now restore the managed environment manually.
     pub supervise: bool,
 }
 

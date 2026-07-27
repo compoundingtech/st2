@@ -109,7 +109,8 @@ agent "<identity>" {
 ```
 
 st2 provides `CATALOG`, flat native `ST_ROOT`, local `PTY_ROOT`, `ST_AGENT`, and `ST_HOOKS` to the
-task. Declarations should not contain machine-specific install paths.
+task. The complete st2-managed overlay is also persisted in PTY metadata, so a manual `pty restart`
+retains those values. Declarations should not contain machine-specific install paths.
 
 ## Validate and materialize
 
