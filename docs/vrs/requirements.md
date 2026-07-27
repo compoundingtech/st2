@@ -11,17 +11,21 @@ accepted.
 
 ## Assumptions
 
-- **A01 Declared fleet:** Each agent has one authored declaration and one
-  pinned host.
-- **A02 Local ownership:** Each machine's root reconciles work declared for
-  that machine.
+- **A01 Declared fleet:** Each runnable agent has one current authored
+  declaration and one pinned host.
+- **A02 Trusted private fleet:** The catalog, runtime state, and participating
+  hosts belong to one trusted operator; st2 is not an adversarial multi-tenant
+  boundary.
+- **A03 Durable host state:** Each host preserves its catalog and runtime state
+  across process restarts. Whole-disk loss and backup are outside st2.
+- **A04 Eventual transport:** Hosts may disconnect; Fabric eventually resumes
+  transport when connectivity returns. st2 does not guarantee network
+  availability.
 
 ## Acceptable Tradeoffs
 
 - **T01 Explicit limits:** A documented unsupported case is preferable to a
   hidden distributed guarantee.
-- **T02 Stable scope first:** Non-agent identities may wait until the agent and
-  st2 specs are stable.
 
 ## Requirements
 
@@ -34,21 +38,28 @@ accepted.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
 
+### Must provide intelligent host supervision
+
+- **R04 Root supervision:** Every machine has exactly one root agent. The
+  deterministic st2 reconciler keeps declared local processes converged; the
+  root observes host-local runtime health, diagnoses failures, performs bounded
+  recovery, and escalates what it cannot resolve.
+
 ### Must preserve delivery and launch behavior
 
-- **R04 DING/archive semantics:** Inbox delivery, archive precedence, retries,
+- **R05 DING/archive semantics:** Inbox delivery, archive precedence, retries,
   suppression, and restart recovery are deterministic and tested. DING may
   interrupt agent work, but it must not alter or submit a human's active draft;
   an unknown interaction state defers delivery.
-- **R05 Restartable launch definitions:** A restarted PTY or exec receives the
+- **R06 Restartable launch definitions:** A restarted PTY or exec receives the
   complete effective launch definition, including environment and supported
   launch fields.
-- **R06 Verified hooks:** Required hook content is installed explicitly and
+- **R07 Verified hooks:** Required hook content is installed explicitly and
   verified before a rendered agent depends on it.
 
 ### Must preserve agent state and scope
 
-- **R07 State externalization:** An agent's current work and durable decisions
+- **R08 State externalization:** An agent's current work and durable decisions
   can survive process replacement without depending on its transcript.
-- **R08 Agent-only identity:** st2 models agents, not arbitrary non-agent
-  identities, until Nathan explicitly changes that scope.
+- **R09 Agent-only identity:** st2 models agents. Non-agent identities are
+  unsupported.
