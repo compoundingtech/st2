@@ -30,7 +30,7 @@ pub struct AgentSpec {
     pub job_type: JobType,
     /// The repo/worktree; **defaults each task's cwd** (spec.md §2).
     pub workspace: Option<String>,
-    /// Identity of this agent's supervisor — crash-dings/escalations route here.
+    /// Bare identity or `<host>.<identity>` of this agent's supervisor — crash-dings route here.
     pub supervisor: Option<String>,
     /// `true` decommissions the agent (an edit, never a file delete) → torn down by reconcile.
     pub retired: bool,

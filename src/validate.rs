@@ -7,10 +7,9 @@
 //!   relative path, or a missing **catalog-rooted** path — the renderer's own output). Exits non-zero.
 //! - **WARN** — advisory; the run still works (identity/host path↔content mismatch — the spec says a
 //!   mismatch is a warning; a dangling supervisor — crash-dings just route nowhere; a missing
-//!   **external** path such as the workspace repo — the validate host may not be the run host; an
-//!   overlay `@import` that does not resolve — a *render* concern, not st2 law, since a valid spec
-//!   may carry no persona). `--strict` promotes every WARN to a failure so a renderer's CI can demand
-//!   spotless.
+//!   **external** path for an agent assigned to the selected validation host; an overlay `@import`
+//!   that does not resolve — a *render* concern, not st2 law, since a valid spec may carry no
+//!   persona). `--strict` promotes every WARN to a failure so a renderer's CI can demand spotless.
 //!
 //! st2 stays render-agnostic: render-only fields (`harness`, `model`, `role`, `persona`,
 //! `permissions`, …) are never required — their absence is never an issue.
@@ -103,6 +102,18 @@ impl Report {
 
 /// Validate a catalog. Returns every issue found, in a stable order (files sorted by discovery).
 pub fn validate(root: &Path) -> Report {
+    validate_scoped(root, None)
+}
+
+/// Validate a whole catalog while checking host-local filesystem facts only for `this_host`.
+///
+/// Structural checks remain fleet-wide. This scope only prevents a synced multi-host catalog from
+/// warning that another machine's external workspace or task cwd is absent locally.
+pub fn validate_for_host(root: &Path, this_host: &str) -> Report {
+    validate_scoped(root, Some(this_host))
+}
+
+fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
     // Canonicalize so `$CATALOG`-rooted paths expand to absolute paths (a relative root would make
     // every `$CATALOG/...` look relative). Falls back to the given root if it does not exist yet.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -155,14 +166,29 @@ pub fn validate(root: &Path) -> Report {
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     // Placeholder host for bus-id collision: catalogs carry explicit host, and an empty host still
     // makes two unset-host same-identity specs collide (which is the real bug).
-    let this_host = "";
+    let collision_host = "";
+    let addresses: HashSet<String> = d
+        .specs
+        .iter()
+        .flat_map(|s| {
+            let mut values = vec![s.identity.clone()];
+            if s.host.is_some() {
+                values.push(s.bus_id(collision_host));
+            }
+            values
+        })
+        .collect();
 
     for s in &d.specs {
         let rp = rel(root, &s.path);
         let ag = Some(s.identity.clone());
+        let runs_on_selected_host = match this_host {
+            Some(host) => s.resolved_host(host) == host,
+            None => true,
+        };
 
         // Duplicate bus id — the runner cannot run two agents under one <host>.<identity>.
-        let bid = s.bus_id(this_host);
+        let bid = s.bus_id(collision_host);
         if let Some(prev) = seen.insert(bid.clone(), s.path.clone()) {
             issues.push(Issue::error(
                 "dup-id",
@@ -216,14 +242,16 @@ pub fn validate(root: &Path) -> Report {
 
         // Path fields must be absolute or $CATALOG-rooted, and must exist.
         for (field, raw) in path_fields(s) {
-            if let Some(issue) = check_path(root, &rp, &ag, &field, &raw) {
+            if let Some(issue) = check_path(root, &rp, &ag, &field, &raw, runs_on_selected_host) {
                 issues.push(issue);
             }
         }
 
-        // A supervisor that names no agent in this catalog — advisory (may live elsewhere).
+        // Runtime routing accepts either a bare identity or a fully-qualified <host>.<identity>.
+        // Validation must index the same address set or it rejects declarations the bus can route.
         if let Some(sup) = &s.supervisor
             && !identities.contains(sup.as_str())
+            && !addresses.contains(sup)
         {
             issues.push(Issue::warn(
                 "dangling-supervisor",
@@ -234,7 +262,9 @@ pub fn validate(root: &Path) -> Report {
         }
 
         // Overlay lint: render's persona overlay `@import`s must resolve (WARN — render concern).
-        issues.extend(overlay_lint(&rp, &ag, s));
+        if runs_on_selected_host {
+            issues.extend(overlay_lint(&rp, &ag, s));
+        }
 
         // Declarative render is a pre-boot gate: malformed directives, unsafe destinations, or a
         // missing catalog-owned copy source would prevent this agent from booting.
@@ -273,8 +303,16 @@ fn path_fields(s: &AgentSpec) -> Vec<(String, String)> {
 
 /// Check one path field: `$CATALOG` expands to the catalog root; a path bearing any *other* `$VAR` is
 /// skipped (an unset var is a literal token — do not guess). What remains must be absolute (R11:
-/// final-spec paths are absolute or $CATALOG-rooted, never relative) and must exist.
-fn check_path(root: &Path, rp: &str, ag: &Option<String>, field: &str, raw: &str) -> Option<Issue> {
+/// final-spec paths are absolute or $CATALOG-rooted, never relative). Catalog-owned paths must
+/// always exist; external paths are checked only for an agent assigned to the selected host.
+fn check_path(
+    root: &Path,
+    rp: &str,
+    ag: &Option<String>,
+    field: &str,
+    raw: &str,
+    check_external_presence: bool,
+) -> Option<Issue> {
     let root_s = root.to_string_lossy();
     let expanded = raw
         .replace("${CATALOG}", &root_s)
@@ -295,24 +333,25 @@ fn check_path(root: &Path, rp: &str, ag: &Option<String>, field: &str, raw: &str
     }
     if !p.exists() {
         // A **catalog-rooted** path is the renderer's own output — its absence is a real render bug
-        // (ERROR). An **external** absolute path (e.g. the workspace repo) may simply not be present
-        // on the host running `validate` — a nix build gate legitimately validates a catalog whose
-        // workspace is cloned on a different run host — so that is advisory (WARN), not a failure.
-        return Some(if p.starts_with(root) {
-            Issue::error(
+        // (ERROR). An **external** absolute path is checked only for the selected run host; its
+        // absence there is advisory (WARN), not a structural catalog failure.
+        return if p.starts_with(root) {
+            Some(Issue::error(
                 "bad-path",
                 rp.to_string(),
                 ag.clone(),
                 format!("{field} '{raw}' does not exist"),
-            )
-        } else {
-            Issue::warn(
+            ))
+        } else if check_external_presence {
+            Some(Issue::warn(
                 "bad-path",
                 rp.to_string(),
                 ag.clone(),
                 format!("{field} '{raw}' does not exist (absent on this host? — not the run host)"),
-            )
-        });
+            ))
+        } else {
+            None
+        };
     }
     None
 }

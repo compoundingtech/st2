@@ -217,6 +217,10 @@ enum Command {
         /// st2 catalog.
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
+        /// Host whose external workspace/task paths should be checked. Structural checks always
+        /// cover the whole catalog. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
         /// Fail (non-zero exit) on warnings too, not just errors.
         #[arg(long)]
         strict: bool,
@@ -564,9 +568,14 @@ fn main() -> Result<()> {
         }
         Command::Pretrust { dirs } => pretrust_cmd(&dirs),
         Command::Eval { folder, host, keep } => eval_cmd(&folder, host, keep),
-        Command::Validate { root, strict, json } => {
+        Command::Validate {
+            root,
+            host,
+            strict,
+            json,
+        } => {
             let root = catalog_arg(root)?;
-            validate_cmd(&root, strict, json)
+            validate_cmd(&root, host, strict, json)
         }
         Command::Pty { args } => pty_cmd(&args),
         Command::Shell { args } => shell_cmd(&args),
@@ -721,9 +730,10 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool) -> Result<()> {
     }
 }
 
-fn validate_cmd(root: &Path, strict: bool, json: bool) -> Result<()> {
+fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let report = st2::validate::validate(&catalog_root);
+    let host = host.unwrap_or_else(detect_host);
+    let report = st2::validate::validate_for_host(&catalog_root, &host);
     let (errors, warnings) = (report.errors(), report.warnings());
 
     if json {

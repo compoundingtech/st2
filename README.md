@@ -117,9 +117,14 @@ Gate the declaration before starting anything:
 
 ```sh
 st2 hooks verify
-st2 validate --catalog "$CATALOG"
+st2 validate --catalog "$CATALOG" --strict
 st2 up --catalog "$CATALOG" --host <host> --materialize-only
 ```
+
+Validation always checks the whole synced catalog structurally. External workspace and task-path
+presence is checked only for the selected run host, which defaults to the local short hostname; use
+`--host <host>` to validate another machine's local paths. Supervisors may be declared as either a
+bare identity or the fully-qualified `<host>.<identity>` bus id.
 
 Materialization simulates all content operations before writing. It refuses any real change to a
 Git-tracked target, including `AGENTS.md`; byte-identical tracked content is accepted. Inspect the

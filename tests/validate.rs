@@ -2,7 +2,7 @@
 //! it hit the spec. Each test builds a minimal catalog exercising one failure mode and asserts the
 //! exact issue code + severity; a clean catalog (and our shipped `examples/`) must validate spotless.
 
-use st2::validate::{Report, Severity, validate};
+use st2::validate::{Report, Severity, validate, validate_for_host};
 
 /// Write a set of `(relative-path, body)` files into a fresh temp catalog.
 fn catalog(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -117,6 +117,22 @@ fn a_missing_external_path_is_only_a_warning() {
         r.errors(),
         0,
         "a missing external workspace must not be an error: {:?}",
+        r.issues
+    );
+}
+
+#[test]
+fn a_remote_hosts_missing_external_path_is_not_a_local_warning() {
+    let c = catalog(&[(
+        "hetz/w/agent.kdl",
+        r#"agent "w" { host "hetz"; type "service"; workspace "/no/such/dir/xyz123"; pty "agent" { command "x" } }"#,
+    )]);
+    let r = validate_for_host(c.path(), "Silber");
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+    assert_eq!(
+        r.warnings(),
+        0,
+        "remote-host filesystem facts must not dirty local strict validation: {:?}",
         r.issues
     );
 }
@@ -239,6 +255,28 @@ fn a_dangling_supervisor_is_a_warning() {
 }
 
 #[test]
+fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
+    let c = catalog(&[
+        (
+            "Silber/cos/agent.kdl",
+            r#"agent "cos" { host "Silber"; command "x" }"#,
+        ),
+        (
+            "hetz/w/agent.kdl",
+            r#"agent "w" { host "hetz"; supervisor "Silber.cos"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+    assert_eq!(
+        r.warnings(),
+        0,
+        "runtime-routable qualified supervisors must validate: {:?}",
+        r.issues
+    );
+}
+
+#[test]
 fn an_identity_folder_mismatch_is_a_warning() {
     let c = catalog(&[(
         "hetz/folder-name/agent.kdl",
@@ -297,6 +335,26 @@ fn cli_exits_zero_on_a_clean_catalog() {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn cli_host_scope_keeps_remote_paths_out_of_strict_validation() {
+    let c = catalog(&[(
+        "hetz/w/agent.kdl",
+        r#"agent "w" { host "hetz"; workspace "/no/such/dir/xyz123"; command "x" }"#,
+    )]);
+    let out = run_validate(&[
+        c.path().as_os_str(),
+        std::ffi::OsStr::new("--host"),
+        std::ffi::OsStr::new("Silber"),
+        std::ffi::OsStr::new("--strict"),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
