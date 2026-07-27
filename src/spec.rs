@@ -3,9 +3,10 @@
 //! A job reads like a Nomad job: the *agent* is the job, its **tasks** are `pty{}` (interactive —
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
-//! `identity`, `host`, `type`, `workspace`, `retired`, `keep`, `supervisor`, `restart{}`, and the
-//! tasks. Everything render-only (`harness`, `model`, `role`, `persona`, `permissions`, `transport`,
-//! `strategy`, `meta{}`) is baked into the tasks/commands by the render layer and ignored here.
+//! `identity`, `host`, `role` (metadata only), `type`, `workspace`, `retired`, `keep`, `supervisor`,
+//! `restart{}`, and the tasks. Everything render-only (`harness`, `model`, `persona`, `permissions`,
+//! `transport`, `strategy`, `meta{}`) is baked into the tasks/commands by the render layer and
+//! ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -177,8 +178,9 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 
 // ---- Raw deserialization target (shared by TOML + JSON) --------------------------------------
 
-/// The permissive on-disk shape. Unknown keys (`harness`, `model`, `role`, `persona`, `permissions`,
-/// `transport`, `strategy`, `meta`, …) are intentionally dropped — that is how st2 stays render-agnostic.
+/// The permissive on-disk shape. Unknown keys (`harness`, `model`, `persona`, `permissions`,
+/// `transport`, `strategy`, `meta`, …) are intentionally dropped — that is how st2 stays
+/// render-agnostic.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RawSpec {
     pub identity: Option<String>,

@@ -100,7 +100,7 @@ non-functional preview, and `st2 validate` correctly rejects it today:
 agent "<identity>" {
   // Current implemented fields and tasks go here.
 
-  // FUTURE ONLY — not valid current agent.kdl syntax.
+  // FUTURE ONLY — reserved and rejected by the current contract.
   schedule "local-health" {
     every "2h"
     ding "Run the local health check."

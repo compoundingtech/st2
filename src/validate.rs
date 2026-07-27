@@ -11,7 +11,7 @@
 //!   that does not resolve — a *render* concern, not st2 law, since a valid spec may carry no
 //!   persona). `--strict` promotes every WARN to a failure so a renderer's CI can demand spotless.
 //!
-//! st2 stays render-agnostic: render-only fields (`harness`, `model`, `role`, `persona`,
+//! st2 stays render-agnostic: render-only fields (`harness`, `model`, `persona`,
 //! `permissions`, …) are never required — their absence is never an issue.
 
 use std::collections::{HashMap, HashSet};
@@ -158,7 +158,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
                 }
             }
         }
-        issues.extend(dropped_task_check(root, f));
+        issues.extend(kdl_shape_check(root, f));
     }
 
     // 3. Resolved pass: cross-spec + field checks over each agent.
@@ -356,9 +356,9 @@ fn check_path(
     None
 }
 
-/// A KDL `pty`/`exec` block with no name argument is silently dropped by the parser — the task never
-/// runs. Catch it directly on the KDL tree (TOML/JSON tasks are keyed maps and cannot be nameless).
-fn dropped_task_check(root: &Path, path: &Path) -> Vec<Issue> {
+/// Catch runner-significant KDL shapes that the permissive lowerer cannot accept silently. TOML/JSON
+/// tasks are keyed maps and cannot be nameless; `schedule` is a reserved future KDL surface.
+fn kdl_shape_check(root: &Path, path: &Path) -> Vec<Issue> {
     if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
         return Vec::new();
     }
@@ -384,6 +384,15 @@ fn dropped_task_check(root: &Path, path: &Path) -> Vec<Issue> {
                     rel(root, path),
                     agent.clone(),
                     format!("{kind} task has no name — it is silently dropped and never runs"),
+                ));
+            }
+            if kind == "schedule" {
+                out.push(Issue::error(
+                    "unsupported-schedule",
+                    rel(root, path),
+                    agent.clone(),
+                    "scheduled work is reserved for a future contract and is not implemented"
+                        .to_string(),
                 ));
             }
         }

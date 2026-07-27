@@ -236,6 +236,26 @@ fn a_nameless_task_is_an_error() {
     ));
 }
 
+#[test]
+fn the_future_schedule_preview_is_explicitly_rejected() {
+    let c = catalog(&[(
+        "hetz/w/agent.kdl",
+        r#"agent "w" {
+  host "hetz"
+  command "x"
+  schedule "local-health" {
+    every "2h"
+    ding "Run the local health check."
+  }
+}"#,
+    )]);
+    assert!(has(
+        &validate(c.path()),
+        "unsupported-schedule",
+        Severity::Error
+    ));
+}
+
 // ---- warnings --------------------------------------------------------------------------------
 
 #[test]
