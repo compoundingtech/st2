@@ -170,11 +170,13 @@ Consumers must key on the `[DING]` prefix and stable id, not descriptive words. 
 harness uses the same transport: normalize untrusted fields into bounded, single-line printable
 text, send one bracketed-paste sequence, wait 500 ms, then send Return in that same `pty send`
 command. The fixed delay addresses observed paste settling, but st2 does not inspect the terminal
-and cannot guarantee modal safety; a modal that opens during the gap could receive Return. `busy`
-and `dnd` defer new arrivals in FIFO order, archive receipts suppress restored duplicates, and
-transport failures retain the head for retry. A restarted sidecar seeds but never replays the
-existing inbox; the boot ritual owns backlog draining. The generic path is covered for both
-maintained harness declarations, while live Claude delivery proof remains pending.
+and cannot guarantee modal safety; a modal that opens during the gap could receive Return. Agents
+must therefore declare `busy` before actively executing work and return to `available` only when
+yielding or ready for new work. `dnd` is an explicit hold. `busy` and `dnd` defer new arrivals in
+FIFO order, archive receipts suppress restored duplicates, and transport failures retain the head
+for retry. A restarted sidecar seeds but never replays the existing inbox; the boot ritual owns
+backlog draining. The generic path is covered for both maintained harness declarations, while live
+Claude delivery proof remains pending.
 
 ## Cleanup
 

@@ -12,6 +12,24 @@ see below).
    <filename>`, `st2 message reply <filename> -m "<your reply>"` if a response is warranted, and
    `st2 message archive <filename>` to clear. Don't leave inbox items unaddressed.
 3. `st2 agents --json --enrich` to see who's around and whether any peers are waiting on you.
+4. If the backlog or durable context leaves work to execute, set `busy` before acting on it. Return
+   to `available` only when yielding or ready for new work.
+
+## Status discipline (DING safety)
+
+DING deliberately does not inspect terminal pixels. Your declared status is therefore the delivery
+gate, not decorative presence:
+
+- Set `busy` immediately before actively executing a unit of work, including its tool calls,
+  commands, edits, and verification. Keep it `busy` until you reach a safe yield point.
+- Set `available` only while ready to receive new work or when yielding back after a completed or
+  blocked unit. Do not leave yourself `available` while working.
+- Set `dnd` only as an explicit operator/agent hold. It defers DING like `busy`, but remains a
+  deliberate hold until you intentionally clear it.
+
+Use `st2 status "$ST_AGENT" --set busy` before work and
+`st2 status "$ST_AGENT" --set available` when yielding. The live DING sidecar refreshes the recorded
+value without changing it.
 
 ## Resume safety — do NOT double-act (important for hosted/respawned agents)
 
@@ -33,7 +51,7 @@ an API. The id is the message filename's rand6 suffix and is stable across re-po
 message. If the id matches one you already handled, skip it without listing the inbox again. Dedup on
 the id, never the subject: terminal pixels can overlap and make a subject look stale. For a new id,
 `st2 message ls` to find the filename, `st2 message read <filename>`, reply if warranted, then
-`st2 message archive <filename>` immediately.
+`st2 message archive <filename>` immediately. Set `busy` before executing the message's work.
 
 ## Threads stay on the bus
 

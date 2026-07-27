@@ -137,6 +137,66 @@ fn exec_auto_logs_stdout_and_stderr_to_catalog_logs() {
     backend.remove(id).ok();
 }
 
+#[test]
+fn exec_restart_reap_keeps_bounded_diagnostics_and_final_remove_cleans_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let catalog = tmp.path().join("catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    let backend = ExecBackend::new(state.clone(), catalog.clone());
+    let id = "hetz.demo.crasher";
+    let current = catalog.join("logs").join(format!("{id}.log"));
+    let previous = catalog.join("logs").join(format!("{id}.log.1"));
+
+    for (generation, expected_previous) in [
+        ("GENERATION_ONE", None),
+        ("GENERATION_TWO", Some("GENERATION_ONE")),
+        ("GENERATION_THREE", Some("GENERATION_TWO")),
+    ] {
+        backend
+            .spawn(
+                &exec_target(id, &format!("printf '%s\\n' {generation}; exit 1")),
+                tmp.path(),
+            )
+            .unwrap();
+        assert!(
+            wait_until(|| fs::read_to_string(&current)
+                .unwrap_or_default()
+                .contains(generation)),
+            "current generation never reached {}",
+            current.display()
+        );
+        if let Some(expected) = expected_previous {
+            assert_eq!(
+                fs::read_to_string(&previous).unwrap(),
+                format!("{expected}\n")
+            );
+        } else {
+            assert!(!previous.exists());
+        }
+        assert!(
+            wait_until(|| backend
+                .list()
+                .unwrap()
+                .iter()
+                .any(|session| session.pty_id == id && !session.alive)),
+            "{generation} never exited"
+        );
+        backend.reap_for_restart(id).unwrap();
+        assert!(!state.join(format!("{id}.pid")).exists());
+        assert!(!current.exists());
+        assert_eq!(
+            fs::read_to_string(&previous).unwrap(),
+            format!("{generation}\n")
+        );
+    }
+
+    backend.remove(id).unwrap();
+    assert!(!state.join(format!("{id}.pid")).exists());
+    assert!(!current.exists());
+    assert!(!previous.exists());
+}
+
 /// macOS has no `/proc`; `ps` prints `??` when a process has no controlling terminal.
 #[cfg(target_os = "macos")]
 fn tty_nr(pid: i32) -> Option<i64> {

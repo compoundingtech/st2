@@ -76,6 +76,7 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     assert!(kdl.starts_with("// Experimental output from `st2 compile-agent`."));
     assert!(kdl.contains("supervisor \"lead\""));
     assert!(kdl.contains("'--verbose'"));
+    assert!(kdl.contains("set status busy"));
     assert!(!kdl.contains("ST_SUPERVISOR"));
     assert!(!workspace.join(".st2/PERSONA.md").exists());
 
@@ -132,6 +133,9 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     );
     let loader = fs::read_to_string(workspace.join(".claude/rules/st2.md")).unwrap();
     assert!(loader.contains("PERSONA.md"));
+    let bus = fs::read_to_string(workspace.join(".st2/bus.md")).unwrap();
+    assert!(bus.contains("## Status discipline (DING safety)"));
+    assert!(bus.contains("Set `busy` immediately before actively executing"));
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(workspace.join(".claude/settings.local.json")).unwrap())
             .unwrap();
@@ -210,6 +214,8 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     let agents = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
     assert!(agents.starts_with(persona_body));
     assert!(agents.contains("# st2 bus instructions"));
+    assert!(agents.contains("## Status discipline (DING safety)"));
+    assert!(agents.contains("Set `busy` immediately before actively executing"));
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(workspace.join(".codex/hooks.json")).unwrap()).unwrap();
     assert!(
@@ -228,6 +234,7 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
 
     let kdl = fs::read_to_string(catalog.join("agents/h/worker/agent.kdl")).unwrap();
     assert!(kdl.contains("exec codex"));
+    assert!(kdl.contains("set status busy"));
     assert!(kdl.contains("--dangerously-bypass-hook-trust"));
     assert!(kdl.contains("json-upsert \".codex/hooks.json\""));
 }

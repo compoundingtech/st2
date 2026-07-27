@@ -50,7 +50,11 @@ pub trait Runner {
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
     /// SIGTERM a running session.
     fn kill(&self, pty_id: &str) -> anyhow::Result<()>;
-    /// Remove an exited session's files (garbage-collect).
+    /// Reap an exited session before restarting it. Backends may preserve bounded diagnostics here.
+    fn reap_for_restart(&self, pty_id: &str) -> anyhow::Result<()> {
+        self.remove(pty_id)
+    }
+    /// Finally remove an exited session's files (retirement/final garbage collection).
     fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
 }
 
@@ -330,6 +334,17 @@ impl Runner for SystemRunner {
         }
     }
 
+    fn reap_for_restart(&self, pty_id: &str) -> anyhow::Result<()> {
+        match self.index.borrow().get(pty_id) {
+            Some(TaskKind::Exec) => self.exec.reap_for_restart(pty_id),
+            Some(TaskKind::Pty) => self.pty.reap_for_restart(pty_id),
+            None => {
+                let _ = self.pty.reap_for_restart(pty_id);
+                self.exec.reap_for_restart(pty_id)
+            }
+        }
+    }
+
     fn remove(&self, pty_id: &str) -> anyhow::Result<()> {
         match self.index.borrow().get(pty_id) {
             Some(TaskKind::Exec) => self.exec.remove(pty_id),
@@ -475,11 +490,17 @@ pub fn execute(
                 crate::flapping::RestartDecision::Delaying
                 | crate::flapping::RestartDecision::RateLimited => continue,
             }
-            // Reap the corpse first (a dead session blocks respawn), then respawn.
+            // Reap the corpse first (a dead session blocks respawn), preserving any backend-owned
+            // bounded diagnostics, then respawn.
             if gc_set.contains(target.pty_id.as_str()) {
-                match runner.remove(&target.pty_id) {
+                match runner.reap_for_restart(&target.pty_id) {
                     Ok(()) => report.gc.push(target.pty_id.clone()),
-                    Err(e) => report.errors.push(format!("rm {}: {e}", target.pty_id)),
+                    Err(e) => {
+                        report
+                            .errors
+                            .push(format!("reap {} for restart: {e}", target.pty_id));
+                        continue;
+                    }
                 }
             }
             match runner.spawn(target, spec_dir) {

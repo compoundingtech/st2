@@ -223,8 +223,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Health check for a running catalog: tools on PATH, a supervisor holding the lock, each agent's
-    /// task alive, and presence fresh (not rotted to `unknown`) or parked. Exits non-zero on problems.
+    /// Health check for a running catalog: tools and supervisor healthy, active agents alive with
+    /// fresh presence, and retired agents fully absent. Exits non-zero on problems.
     Doctor {
         /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
         /// st2 catalog.
@@ -912,7 +912,8 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
         ),
     }
 
-    // 3) Per this-host agent: every task alive, and presence not rotted to `unknown`.
+    // 3) Per this-host declaration: active tasks must be alive with fresh presence; retired tasks
+    // must all be absent and need no presence file.
     let found = discover(&catalog);
     for e in &found.errors {
         report_check(
@@ -923,18 +924,44 @@ fn doctor_cmd(root: &Path, host: Option<String>) -> Result<()> {
         );
     }
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&this_host));
-    let live: std::collections::HashSet<String> = runner
-        .list_sessions()
-        .unwrap_or_default()
-        .into_iter()
+    let sessions = runner.list_sessions().unwrap_or_default();
+    let live: std::collections::HashSet<String> = sessions
+        .iter()
         .filter(|s| s.alive)
-        .map(|s| s.pty_id)
+        .map(|s| s.pty_id.clone())
+        .collect();
+    let present: std::collections::HashMap<String, bool> = sessions
+        .into_iter()
+        .map(|session| (session.pty_id, session.alive))
         .collect();
     for spec in &found.specs {
         if spec.resolved_host(&this_host) != this_host {
             continue;
         }
         let bus_id = spec.bus_id(&this_host);
+        if spec.retired {
+            let still_present = spec
+                .tasks
+                .iter()
+                .map(|task| {
+                    task.id
+                        .clone()
+                        .unwrap_or_else(|| format!("{bus_id}.{}", task.name))
+                })
+                .filter_map(|id| {
+                    present.get(&id).map(|alive| {
+                        format!("{id} ({})", if *alive { "alive" } else { "dead" })
+                    })
+                })
+                .collect::<Vec<_>>();
+            report_check(
+                &mut problems,
+                still_present.is_empty(),
+                &format!("{bus_id} retirement complete (all declared tasks absent)"),
+                &format!("still present: {}", still_present.join(", ")),
+            );
+            continue;
+        }
         for task in &spec.tasks {
             let id = task
                 .id

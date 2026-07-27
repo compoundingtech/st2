@@ -19,7 +19,7 @@ fi
     [[ "$context" == *$'\n' ]] || printf '\n'
     printf '</context>\n\n'
   fi
-  printf '%s\n' "Run the st2 boot ritual now: set your status to available, then drain your inbox by reading, acting on, replying when useful, and archiving each handled message."
+  printf '%s\n' "Run the st2 boot ritual now: set your status to available, then drain your inbox by reading, acting on, replying when useful, and archiving each handled message. Before resuming or starting work, set your status to busy; set available only when yielding or ready for new work."
 } >&2
 
 exit 2

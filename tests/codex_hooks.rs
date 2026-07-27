@@ -148,6 +148,8 @@ fn session_start_emits_current_codex_context_envelope() {
     assert!(additional.contains("working on the materializer"));
     assert!(additional.contains("## st2 inbox (1 unread)"));
     assert!(additional.contains("Run the st2 boot ritual"));
+    assert!(additional.contains("set your status to busy"));
+    assert!(additional.contains("set available only when yielding"));
 }
 
 #[test]

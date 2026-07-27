@@ -27,9 +27,9 @@ impl AgentInput {
 
     fn command(&self) -> anyhow::Result<String> {
         let boot = if self.role == "chief-of-staff" {
-            "You just cold-started. Read AGENTS.md and run your st2 boot ritual now: set status available and drain your inbox. Resume any unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
+            "You just cold-started. Read AGENTS.md and run your st2 boot ritual now: set status available and drain your inbox. Before resuming or starting work, set status busy; set available only when yielding or ready for new work. Resume unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
         } else {
-            "You just cold-started. Run your st2 boot ritual now: set status available and drain your inbox. Resume any unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
+            "You just cold-started. Run your st2 boot ritual now: set status available and drain your inbox. Before resuming or starting work, set status busy; set available only when yielding or ready for new work. Resume unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
         };
         let model = self
             .model

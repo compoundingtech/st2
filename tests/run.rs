@@ -15,9 +15,11 @@ struct FakeRunner {
     sessions: Vec<Session>,
     fail_list: bool,
     fail_spawn: Option<String>,
+    fail_reap: Option<String>,
     spawned: RefCell<Vec<String>>,
     spawn_dirs: RefCell<Vec<(String, String)>>,
     killed: RefCell<Vec<String>>,
+    reaped: RefCell<Vec<String>>,
     removed: RefCell<Vec<String>>,
 }
 
@@ -40,6 +42,13 @@ impl Runner for FakeRunner {
     }
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         self.killed.borrow_mut().push(pty_id.to_string());
+        Ok(())
+    }
+    fn reap_for_restart(&self, pty_id: &str) -> anyhow::Result<()> {
+        self.reaped.borrow_mut().push(pty_id.to_string());
+        if self.fail_reap.as_deref() == Some(pty_id) {
+            anyhow::bail!("reap broke");
+        }
         Ok(())
     }
     fn remove(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -167,10 +176,60 @@ fn up_once_reaps_dead_nonkeep_then_respawns() {
         ..Default::default()
     };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let mut reaped = runner.reaped.borrow().clone();
+    reaped.sort();
+    assert_eq!(reaped, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert!(
+        runner.removed.borrow().is_empty(),
+        "a crash restart is not final retirement cleanup"
+    );
+    assert_eq!(report.launched.len(), 2);
+}
+
+#[test]
+fn up_once_does_not_restart_a_task_when_diagnostic_reap_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo-claude"), dead("hetz.demo.ding")],
+        fail_reap: Some("hetz.demo-claude".into()),
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.launched, vec!["hetz.demo.ding"]);
+    assert_eq!(runner.spawned.borrow().as_slice(), ["hetz.demo.ding"]);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error == "reap hetz.demo-claude for restart: reap broke")
+    );
+}
+
+#[test]
+fn up_once_finally_removes_dead_retired_tasks_without_restarting_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let retired = AGENT.replacen(
+        "type = \"service\"",
+        "type = \"service\"\nretired = true",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.toml", &retired);
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo-claude"), dead("hetz.demo.ding")],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
     let mut removed = runner.removed.borrow().clone();
     removed.sort();
     assert_eq!(removed, vec!["hetz.demo-claude", "hetz.demo.ding"]);
-    assert_eq!(report.launched.len(), 2);
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(report.launched.is_empty());
+    assert_eq!(report.gc.len(), 2);
 }
 
 #[test]
@@ -196,6 +255,11 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
     assert_eq!(last.flapping, vec!["hetz.demo-claude"]);
     assert!(last.gc.is_empty(), "parked flapper keeps its corpse");
     assert_eq!(runner.spawned.borrow().len(), 3); // limit
+    assert_eq!(runner.reaped.borrow().len(), 3);
+    assert!(
+        runner.removed.borrow().is_empty(),
+        "crash-loop handling must never take the final-retirement cleanup path"
+    );
 
     // The rich crash-loop record carries what surfacing needs — the parked task, its agent, and the
     // supervisor to notify — recorded once (not per pass).

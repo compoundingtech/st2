@@ -24,7 +24,7 @@ use crate::run::resolve_task_cwd;
 
 /// Supervises `exec` tasks as terminal-free processes.
 pub struct ExecBackend {
-    /// Where `<id>.pid` / `<id>.log` live (machine-local; not synced).
+    /// Where `<id>.pid` lives (machine-local; not synced).
     state_dir: PathBuf,
     /// The catalog root — the value of `$CATALOG` during expansion.
     catalog_root: PathBuf,
@@ -47,6 +47,11 @@ impl ExecBackend {
     /// stays inspectable after the fact. (Distinct from the machine-local pid state in `state_dir`.)
     fn log_path(&self, id: &str) -> PathBuf {
         self.catalog_root.join("logs").join(format!("{id}.log"))
+    }
+
+    /// The one bounded prior generation retained across a crash restart.
+    fn previous_log_path(&self, id: &str) -> PathBuf {
+        self.catalog_root.join("logs").join(format!("{id}.log.1"))
     }
 
     /// Spawn `target` as a terminal-free, detached process and record its pid.
@@ -174,10 +179,29 @@ impl ExecBackend {
         Ok(())
     }
 
-    /// Remove an exec task's runner-state (pid + log) — the GC path.
+    /// Reap a crashed exec before restarting it: remove only the stale pid and rotate the current
+    /// diagnostic log to one bounded prior generation. The next spawn creates a fresh current log,
+    /// leaving `<id>.log` + `<id>.log.1` inspectable without unbounded crash-loop accumulation.
+    pub fn reap_for_restart(&self, id: &str) -> anyhow::Result<()> {
+        let current = self.log_path(id);
+        if current.exists() {
+            let previous = self.previous_log_path(id);
+            let _ = fs::remove_file(&previous);
+            fs::rename(&current, &previous)?;
+        }
+        // Remove the pid only after diagnostics are safely rotated. If rotation fails, retaining the
+        // dead pid lets the next reconciliation retry instead of treating the task as a fresh launch
+        // and appending a new execution to the unrotated log.
+        let _ = fs::remove_file(self.pid_path(id));
+        Ok(())
+    }
+
+    /// Finally remove an exec task's runner-state and both bounded log generations. This is the
+    /// retirement/final-GC path, not ordinary crash relaunch.
     pub fn remove(&self, id: &str) -> anyhow::Result<()> {
         let _ = fs::remove_file(self.pid_path(id));
         let _ = fs::remove_file(self.log_path(id));
+        let _ = fs::remove_file(self.previous_log_path(id));
         Ok(())
     }
 
