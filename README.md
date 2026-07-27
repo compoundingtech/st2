@@ -260,43 +260,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-## Eval corpus
+## Eval contract
 
-The Codex evidence ledger is pinned at
-[`f605f8626d2e672a59187c9c998015d2efb31040`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/HARNESS-MATRIX.md).
+The sole canonical agent contract is
+[`AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md) in the evals
+repository. Eval corpus definitions, execution/readiness evidence, authorization, and results belong
+to that repository; st2 does not duplicate or pin its ledgers here.
 
-Current native Codex examples:
-
-- [`license-mit-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/license-mit-codex/license-mit-codex.kdl):
-  two subjects plus a short model judge; low expected cost; 6/6 PASS in 1m39s on the fixed build.
-- [`signal-rename-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/signal-rename-codex/signal-rename-codex.kdl):
-  four-seat multi-repository rename; high expected cost; 6/6 PASS in 8m07s.
-- [`ghost-bug-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/ghost-bug-codex/ghost-bug-codex.kdl):
-  two-seat debugging and mutation-valid regression; medium expected cost; 5/5 PASS in 1m38s, after
-  which usage-limit notices were found in the kept logs and paid work stopped.
-- [`poisoned-pr-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/poisoned-pr-codex/poisoned-pr-codex.kdl):
-  two-seat review-only security exercise; medium expected cost; 4/4 gating PASS plus the signal judge
-  in 1m52s during the explicitly reopened tail.
-- [`fork-in-the-road-codex`](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/cells/fork-in-the-road-codex/fork-in-the-road-codex.kdl):
-  four-seat design panel; high expected cost; 5/5 PASS in 7m21s on one retry after a concrete grader
-  fix.
-
-The pinned [native static checker](https://github.com/compoundingtech/evals/blob/f605f8626d2e672a59187c9c998015d2efb31040/bin/check-codex-native.sh)
-does not consume model usage. The ledger records that the sequential five-cell run is complete and
-no additional model-backed eval is authorized.
-
-The Claude native-readiness ledger is pinned at
-[`a52b68dfe4bdb65a3bb6a1ba51c674476cf197df`](https://github.com/compoundingtech/evals/blob/a52b68dfe4bdb65a3bb6a1ba51c674476cf197df/CLAUDE-NATIVE-READINESS.md).
-Its current event-first native examples and gates are immutable at
-[`56b86a04837dc176f1a53d9f90dee3f3a7e57499`](https://github.com/compoundingtech/evals/commit/56b86a04837dc176f1a53d9f90dee3f3a7e57499):
-
-- [`ding-reply`](https://github.com/compoundingtech/evals/blob/56b86a04837dc176f1a53d9f90dee3f3a7e57499/cells/ding-reply/ding-reply.kdl):
-  one Claude seat with a native bare `ding`.
-- [`signal-rename`](https://github.com/compoundingtech/evals/blob/56b86a04837dc176f1a53d9f90dee3f3a7e57499/cells/signal-rename/signal-rename.kdl):
-  one Claude supervisor and three specialists, each with a native bare `ding`.
-
-Run `bin/check-claude-native.sh` and `bin/check-claude-reset.sh` from that tree for the free static
-acceptance. The gates reject polling language and non-native bus declarations, require event-first DING
-guidance, and prove repeatable clean fixture resets. They do not invoke a model. A current-build
-`st2 eval` model run remains pending explicit authorization, so these examples have static acceptance
-but no current native live-smoke claim.
+`st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
+interface, and generated output must be reviewed before materialization.
