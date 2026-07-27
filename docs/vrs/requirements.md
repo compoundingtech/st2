@@ -57,9 +57,13 @@ accepted.
 - **R07 Verified hooks:** Required hook content is installed explicitly and
   verified before a rendered agent depends on it.
 
-### Must preserve agent state and scope
+### Must externalize agent state and scope
 
-- **R08 State externalization:** An agent's current work and durable decisions
+- **R08 Catalog observability:** Catalog-backed state exposes each agent's
+  presence, declared activity status, current plan, and current plan step
+  without PTY or transcript inspection. Presence and activity status are
+  distinct, and stale state is identifiable.
+- **R09 State continuity:** An agent's current work and durable decisions
   can survive process replacement without depending on its transcript.
-- **R09 Agent-only identity:** st2 models agents. Non-agent identities are
+- **R10 Agent-only identity:** st2 models agents. Non-agent identities are
   unsupported.

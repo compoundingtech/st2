@@ -61,10 +61,15 @@ atomic inbox file → DING attempt → agent reads → archive receipt
 
 ## State and scope
 
-- **R08:** Durable work state is external to the model transcript and is
+- **R08:** Presence and activity status are separate signals. The catalog must
+  also expose the agent's current plan and step with explicit freshness so a
+  human or supervising agent can understand progress without PTY inspection.
+  Current presence/status files provide only part of this contract; the
+  canonical plan-progress shape is not yet specified.
+- **R09:** Durable work state is external to the model transcript and is
   restored into replacement sessions through declared workspace files and
   verified hooks.
-- **R09:** Fleet identities are agents. General-purpose identity kinds are
+- **R10:** Fleet identities are agents. General-purpose identity kinds are
   unsupported.
 
 The owner updates this spec whenever implementation changes.
@@ -84,3 +89,8 @@ requires Nathan's explicit approval.
   readability but does not satisfy R04. Resolve this with a stronger evented
   signal or other measured classifier; a small on-device model is an optional
   experiment, not a required architecture.
+- **DQ3 Catalog agent state:** Define the catalog paths, schemas, freshness
+  rules, and atomic update semantics for presence, activity status, current
+  plan, and current plan step. Prove that stale state is distinguishable and
+  that a supervisor can follow plan progress without inspecting a PTY before
+  adding the shape to `AGENT-SPEC.md`.

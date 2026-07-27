@@ -9,7 +9,9 @@
    drift apart.
 3. **That runtime must be reliable in operation.** Launch configuration, hooks,
    messages, and durable state can drift or disappear across restarts and
-   machines, while failures still need intelligent diagnosis and recovery.
+   machines. Without externalized state, humans and supervisors must inspect
+   terminals to learn whether an agent is present or making progress, while
+   failures still need intelligent diagnosis and recovery.
 
 ## The Vision
 
@@ -18,6 +20,7 @@
   agent work.
 - One intelligent root agent on each machine to supervise local runtime health,
   recovery, and escalation.
+- Catalog-visible agent presence, activity status, and current plan progress.
 - Durable message passing and encapsulated agent state.
 - A concrete implementation of the executable agent spec maintained by
   `compoundingtech/evals`.
@@ -35,9 +38,13 @@
    restarted without losing its effective launch definition or durable state.
 3. Every machine has exactly one root agent that observes local health,
    resolves bounded runtime failures, and escalates what it cannot resolve.
-4. Host placement, hooks, message delivery, archive handling, and recovery have
+4. A human, CoS, root, or supervisor can inspect catalog-backed state to
+   determine an agent's presence, activity status, current plan, and current
+   plan step without opening its PTY or relying on its transcript; stale state
+   is explicit.
+5. Host placement, hooks, message delivery, archive handling, and recovery have
    explicit contracts and executable evidence.
-5. Agent work can be scheduled or triggered as durable, inspectable workflows
+6. Agent work can be scheduled or triggered as durable, inspectable workflows
    across the declared fleet.
-6. Agent messages arrive reliably without corrupting, combining with, or
+7. Agent messages arrive reliably without corrupting, combining with, or
    submitting a human's active input.
