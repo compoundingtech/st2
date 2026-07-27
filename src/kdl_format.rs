@@ -3,8 +3,9 @@
 //! serde-native) and fills a [`RawSpec`], which then flows through the shared identity/host
 //! resolution. A file may hold more than one `agent` node.
 //!
-//! Only runner-normative fields are read; render-only fields (`harness`, `model`, `role`, `persona`,
-//! `permissions`, `transport`, `strategy`) and the inert `meta{}` block are ignored.
+//! Only runner-normative fields plus metadata `role` are read; render-only fields (`harness`,
+//! `model`, `persona`, `permissions`, `transport`, `strategy`) and the inert `meta{}` block are
+//! ignored.
 
 use kdl::{KdlDocument, KdlNode};
 
@@ -81,7 +82,7 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
                     raw.exec.insert(name, task_node_to_raw(child));
                 }
             }
-            // meta, harness, model, role, persona, permissions, transport, strategy, … — ignored.
+            // meta, harness, model, persona, permissions, transport, strategy, … — ignored.
             _ => {}
         }
     }
