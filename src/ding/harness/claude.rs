@@ -112,7 +112,7 @@ fn located_bottom_claude_composer(plain: &str) -> Option<(usize, Vec<String>, St
 ///
 /// Matching the finished shape too would be catastrophic rather than merely conservative — every
 /// idle pane shows it immediately after a turn, so DING would never deliver again.
-pub(super) fn claude_turn_in_flight(plain: &str) -> bool {
+fn claude_turn_in_flight(plain: &str) -> bool {
     plain.lines().any(|line| {
         let Some((head, _)) = line.trim().split_once('…') else {
             return false;

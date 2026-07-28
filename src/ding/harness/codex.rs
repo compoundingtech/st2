@@ -180,8 +180,27 @@ fn normalize_codex_composer_input(input: &str) -> String {
 /// States in which Return must not be sent. Several of these strings are Claude-specific chrome
 /// that the pre-split shared predicate also applied to Codex panes; they are duplicated rather
 /// than narrowed here so that splitting the harnesses apart changes no behaviour.
+/// The progress-line shape inherited from the pre-split shared predicate. It is another harness's
+/// rendering, kept here only so the split changed no behaviour, and duplicated rather than called
+/// across module lines so that narrowing it is a local edit to this file.
+fn inherited_progress_line(plain: &str) -> bool {
+    plain.lines().any(|line| {
+        let Some((head, _)) = line.trim().split_once('…') else {
+            return false;
+        };
+        let mut tokens = head.split_whitespace();
+        let (Some(glyph), Some(word), None) = (tokens.next(), tokens.next(), tokens.next()) else {
+            return false;
+        };
+        glyph.chars().count() == 1
+            && !glyph.chars().any(char::is_alphanumeric)
+            && !word.is_empty()
+            && word.chars().all(char::is_alphabetic)
+    })
+}
+
 fn interaction_blocked(plain: &str) -> bool {
-    crate::ding::harness::claude::claude_turn_in_flight(plain)
+    inherited_progress_line(plain)
         || plain.contains("Working (")
         || plain.contains("esc to interrupt")
         || plain.contains("Esc to interrupt")
