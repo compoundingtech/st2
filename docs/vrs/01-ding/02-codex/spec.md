@@ -64,7 +64,10 @@ known limit below rather than described as done.
 
 - Recognition depends on exact styled sequences, so a renderer change that
   alters the emitted styling defers delivery until the marker set is updated. An
-  unrecognized composer is `Ambiguous`, never assumed idle.
+  unrecognized composer is never assumed idle. It is not by itself `Ambiguous`
+  either: failing to locate means this harness proves nothing about the screen,
+  and the screen is still offered to every other maintained harness. `Ambiguous`
+  is the result when no harness locates a composer.
 - A transcript that contains a captured screen from another harness is resolved
   by positional dispatch rather than by this harness's own matching; see
   `DING-R04`.
