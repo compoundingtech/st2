@@ -45,7 +45,10 @@ pub fn discover(root: &Path) -> Discovered {
                 out.specs.extend(specs);
                 out.warnings.extend(warnings);
             }
-            Err(e) => out.errors.push(SpecError { path, message: e.to_string() }),
+            Err(e) => out.errors.push(SpecError {
+                path,
+                message: e.to_string(),
+            }),
         }
     }
     out
@@ -72,7 +75,11 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
             Err(_) => continue,
         };
         if ft.is_dir() {
-            if path == root.join("pty") {
+            if path == root.join("pty")
+                || name == "resources"
+                || name == "archive"
+                || name == "inbox"
+            {
                 continue;
             }
             collect_spec_files(root, &path, acc);
@@ -92,8 +99,12 @@ pub(crate) fn parse_raw_file(path: &Path) -> anyhow::Result<Vec<RawSpec>> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let text = fs::read_to_string(path)?;
     Ok(match ext {
-        "toml" => vec![toml::from_str(&text).map_err(|e| anyhow::anyhow!("TOML parse error: {e}"))?],
-        "json" => vec![serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("JSON parse error: {e}"))?],
+        "toml" => {
+            vec![toml::from_str(&text).map_err(|e| anyhow::anyhow!("TOML parse error: {e}"))?]
+        }
+        "json" => vec![
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("JSON parse error: {e}"))?,
+        ],
         "kdl" => crate::kdl_format::parse_kdl(&text)?,
         _ => Vec::new(),
     })
@@ -141,7 +152,10 @@ fn resolve_spec(
         (Some(c), _) => c,
         (None, Some(p)) => p,
         (None, None) => {
-            anyhow::bail!("{}: spec has no identity in content or path", path.display())
+            anyhow::bail!(
+                "{}: spec has no identity in content or path",
+                path.display()
+            )
         }
     };
 
@@ -189,11 +203,19 @@ pub fn path_defaults(root: &Path, file: &Path) -> (Option<String>, Option<String
     if stem == "agent" {
         // Generic filename: identity = last dir, host = second-to-last dir.
         let identity = dirs.last().cloned();
-        let host = if dirs.len() >= 2 { Some(dirs[dirs.len() - 2].clone()) } else { None };
+        let host = if dirs.len() >= 2 {
+            Some(dirs[dirs.len() - 2].clone())
+        } else {
+            None
+        };
         (identity, host)
     } else {
         // File named for the agent: identity = stem, host = its parent dir (if any).
-        let identity = if stem.is_empty() { None } else { Some(stem.to_string()) };
+        let identity = if stem.is_empty() {
+            None
+        } else {
+            Some(stem.to_string())
+        };
         let host = dirs.last().cloned();
         (identity, host)
     }
@@ -225,7 +247,10 @@ mod path_tests {
 
     #[test]
     fn flat_file_named_for_agent() {
-        assert_eq!(pd("/cat", "/cat/fabric-claude.toml"), (Some("fabric-claude".into()), None));
+        assert_eq!(
+            pd("/cat", "/cat/fabric-claude.toml"),
+            (Some("fabric-claude".into()), None)
+        );
     }
 
     #[test]

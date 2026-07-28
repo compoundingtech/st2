@@ -12,6 +12,7 @@
 //! State is machine-local (pids don't sync across hosts) and keyed by host, so a restarted st2 on the
 //! same host adopts the exec processes it left running.
 
+use anyhow::Context;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::process::CommandExt;
@@ -127,7 +128,8 @@ impl ExecBackend {
         let mut out = Vec::new();
         let dir = match fs::read_dir(&self.state_dir) {
             Ok(d) => d,
-            Err(_) => return Ok(out), // no state dir yet
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(error.into()),
         };
         for entry in dir.flatten() {
             let path = entry.path();
@@ -137,12 +139,12 @@ impl ExecBackend {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Some(pid) = fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok())
-            else {
-                continue;
-            };
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("reading exec pid record {}", path.display()))?;
+            let pid = raw
+                .trim()
+                .parse::<i32>()
+                .with_context(|| format!("parsing exec pid record {}", path.display()))?;
             // Reap if it's our exited child (ECHILD after an st2 restart is fine — it's now init's).
             unsafe {
                 let mut status = 0;
