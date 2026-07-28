@@ -30,7 +30,9 @@ const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
 const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
 const PTY_COMMAND_TIMEOUT: Duration = Duration::from_millis(600);
+#[allow(dead_code)]
 const COMPOSER_OBSERVATION_WINDOW: Duration = Duration::from_millis(450);
+#[allow(dead_code)]
 const COMPOSER_OBSERVATION_POLL: Duration = Duration::from_millis(10);
 /// A human or active turn can keep a staged notice unsafe for minutes. Retrying `pty peek` every
 /// inbox poll creates a short-lived child for each attempt, so keep the correctness fallback but
@@ -120,6 +122,20 @@ pub fn pty_submit_args(session: &str) -> Vec<String> {
     ]
 }
 
+/// Recovery delivery: one bounded PTY transaction containing paste and Return.
+pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
+    vec![
+        "send".into(),
+        session.into(),
+        "--seq".into(),
+        bracketed_paste(text),
+        "--seq".into(),
+        "key:return".into(),
+        "--with-delay".into(),
+        "500".into(),
+    ]
+}
+
 /// One delivery attempt either submitted the notice, owns a paste that must be retried by
 /// inspection only, or performed no input because the target was not positively safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,14 +208,13 @@ impl PtyPoker {
         text: &str,
         before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<PokeOutcome> {
-        observed_poke(
-            text,
-            &mut || self.peek(),
-            &mut || self.run(pty_stage_args(&self.session, text), "send"),
-            &mut || self.run(pty_submit_args(&self.session), "send"),
-            &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
-            before_submit,
-        )
+        // Recovery contract: PTY-alive delivery is transport-first. Keep one owned payload,
+        // stage it once, wait a bounded interval, then submit exactly once; pane heuristics remain
+        // diagnostic only and must not silently suppress messaging.
+        self.run(pty_delivery_args(&self.session, text), "send")
+            .map_err(|error| anyhow::anyhow!("staging DING payload: {error}"))?;
+        before_submit()?;
+        Ok(PokeOutcome::Delivered)
     }
 }
 
@@ -209,12 +224,10 @@ impl Poker for PtyPoker {
     }
 
     fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
-        observed_retry_staged(
-            text,
-            &mut || self.peek(),
-            &mut || self.run(pty_submit_args(&self.session), "send"),
-            &mut || Ok(()),
-        )
+        let _ = text;
+        self.run(pty_submit_args(&self.session), "send")
+            .map_err(|error| anyhow::anyhow!("submitting staged DING payload: {error}"))?;
+        Ok(PokeOutcome::Delivered)
     }
 
     fn adopt_staged(&self, candidates: &[String]) -> anyhow::Result<Option<String>> {
@@ -302,6 +315,7 @@ fn exact_staged_candidate(screen: &str, candidates: &[String]) -> Option<String>
     })
 }
 
+#[allow(dead_code)]
 fn observed_poke(
     text: &str,
     peek: &mut dyn FnMut() -> anyhow::Result<String>,
@@ -413,6 +427,7 @@ fn submit_after_final_observation(
 }
 
 /// Inspect-only retry for a payload whose paste command already started.
+#[allow(dead_code)]
 fn observed_retry_staged(
     text: &str,
     peek: &mut dyn FnMut() -> anyhow::Result<String>,
