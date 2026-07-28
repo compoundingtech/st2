@@ -504,9 +504,9 @@ fn classify_claude_composer(plain: &str, expected: &str) -> ComposerState {
     };
     let exact = logical_inputs.iter().any(|input| input == expected);
     let placeholder = logical_inputs.len() == 1 && is_claude_idle_placeholder(&logical_inputs[0]);
-    let idle_footer = footer.contains("⏵⏵")
-        && footer.contains("shift+tab to cycle")
-        && footer.contains("permissions on");
+    // The keybinding hint is runtime-composed and may be absent or remapped. The mode marker and
+    // permission state are the stable safety signals; active/modal/changed states remain fail-closed.
+    let idle_footer = footer.contains("⏵⏵") && footer.contains("permissions on");
     let blocked = interaction_blocked(plain);
     if exact {
         if idle_footer && !blocked {
@@ -1426,6 +1426,10 @@ mod tests {
         )
     }
 
+    fn idle_claude_screen_without_hint() -> String {
+        idle_claude_screen().replace(" (shift+tab to cycle)", "")
+    }
+
     fn staged_claude_screen(text: &str) -> String {
         assert!(text.is_ascii());
         let rule = claude_rule();
@@ -1467,6 +1471,10 @@ mod tests {
 
         assert_eq!(
             classify_composer(&idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&idle_claude_screen_without_hint(), expected),
             ComposerState::EmptySafe
         );
         assert_eq!(
