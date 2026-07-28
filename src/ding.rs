@@ -1411,6 +1411,23 @@ mod tests {
         assert!(!pty_stage_args("my-session", "hello").contains(&"key:return".to_string()));
     }
 
+    #[test]
+    fn pty_delivery_uses_face607_delay_order_and_seconds() {
+        assert_eq!(
+            pty_delivery_args("s", "hello"),
+            vec![
+                "send",
+                "s",
+                "--with-delay",
+                "0.5",
+                "--seq",
+                "\x1b[200~hello\x1b[201~",
+                "--seq",
+                "key:return"
+            ]
+        );
+    }
+
     fn idle_codex_screen() -> String {
         "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
          \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
