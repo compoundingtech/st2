@@ -19,10 +19,26 @@ layout, reconciliation and materialization, supervision, sessions and their
 backends, message delivery into a terminal, health reporting, and the eval
 runtime.
 
-Terms belonging to the underlying domain — process, session, signal, PATH from
-POSIX; job, task, allocation from the scheduler tradition; composer, viewport,
-scrollback from the terminal — are borrowed with their established meanings. A
-borrowed word is preferred over a coined one.
+Terms belonging to the underlying domain are borrowed with their established
+meanings, and a borrowed word is preferred over a coined one. Three domains
+supply most of the vocabulary: POSIX (process, process group, session, signal,
+pid, PATH), the terminal (pty, composer, bracketed paste, Return, and the
+session lifecycle words the terminal tool reports), and the scheduler tradition.
+
+The scheduler borrowing is explicit and load-bearing: a declaration reads like a
+Nomad job, where **the agent is the job** and its **tasks** are what run. That
+one sentence is the origin of two things this document has to flag — *task* as a
+homograph, and **job** and **agent** as synonyms for one concept, both in use.
+It is also where the job-type vocabulary comes from, of which only the
+long-running kind survives.
+
+**One caveat on the seam.** That st2 defers to the agent-spec is stated in both
+directions in its own documents, and a shape may have to be proven here before
+becoming canonical there — so st2 can originate a term and push it upward.
+Which words the agent-spec actually defines cannot be settled from this
+repository, because that document is not vendored here. The direction of
+deference is established; the exact inherited list is not, and drawing that line
+precisely requires reading the upstream document.
 
 Consumers that render or wrap st2 add their own vocabulary. Terms that appear
 only in a consumer's tooling, such as an eval **cell** directory layout, are not
@@ -49,7 +65,10 @@ an example path.
 ### Identity and placement
 
 - **Agent** — the modeled actor. st2 models agents and nothing else; non-agent
-  identities are unsupported.
+  identities are unsupported. **Job** is a synonym, inherited from the scheduler
+  analogy the declaration is built on: the agent *is* the job, and its tasks are
+  what run. Both words are in use. Prefer **agent**, and read *job* as pointing
+  at the analogy rather than at a second concept.
 - **Identity** — an agent's bare name, unique within the fleet.
 - **Bus id** — an agent's address, `<host>.<identity>`. The identity qualified by
   the host that runs it.
@@ -218,10 +237,21 @@ names for one path that can nonetheless diverge is worse than two names for two
 paths, because equality holds until it doesn't and nothing in the vocabulary
 signals which is being relied on.
 
-**Always qualify.** Never write bare *root*. The one place this cannot be fixed
-by convention is where a ratified requirement already uses the bare word; that
-wording is the owner's to change, and until it is, *host-local roots* should be
-read as the host-local catalog scope rather than as root agents.
+**Always qualify.** Never write bare *root*.
+
+One place cannot be fixed by convention. A ratified requirement assigns
+reconciliation to "host-local roots", and no reading of it is clean. Read as root
+agents it contradicts the neighbouring requirement, which explicitly gives
+reconciliation to the deterministic reconciler and observation to the root agent.
+Read as a directory it says a directory owns reconciliation, which is not a thing
+a directory does. The only coherent reading is a third, informal sense — the
+host-local st2 instance — which appears nowhere else and is defined nowhere. The
+specification does not settle it either: its gloss of that requirement drops the
+word, and its gloss of the neighbour again separates the loop from the root
+agent.
+
+Read it as the host-local st2 instance. That is the reading which does not
+contradict its neighbour, and it is the owner's to confirm or correct.
 
 ### `supervisor`
 
@@ -257,6 +287,15 @@ receipt**; the others belong to the terminal tool and to test scaffolding.
 
 An agent's job type, authored in KDL, and the systemd unit that runs the control
 plane. Unrelated concepts, both user-facing. Write **job type** for the former.
+
+### `generation`
+
+One instance of a reused session id, and one rotated log file of which exactly
+two are retained. Both answer "what survives a restart", both are
+bounded-retention concepts, and both live in lifecycle code a few files apart —
+one warning that an old generation's cleanup can unlink a new generation's
+socket, the other counting retained log generations. Qualify as **session
+generation** or **log generation**; bare *generation* is not safe here.
 
 ### `session`
 
@@ -341,7 +380,23 @@ convention needs no type.
 - **Hook bundle** — the specification's word for what the implementation calls a
   hook set. Prefer **hook set**, which is also what appears on disk.
 
-The last three are divergences between the specification's vocabulary and the
+Two more are undefined rather than merely unimplemented, and both are
+load-bearing where they appear:
+
+- **Lifecycle owner** — named once, as the subject of a rule about when exit
+  evidence may be removed. Nothing says who it is. By elimination it is presumably
+  the control plane, but the reconciler is never called this, so the sentence
+  introduces an actor the vocabulary does not otherwise have. Note that
+  *lifecycle* does qualify two nouns that are pinned — lifecycle hooks and a
+  lifecycle id — which makes the third use read as established when it is not.
+- **`face607`** — a bare codename appearing in three places, standing for
+  external behaviour: a bounded delivery delay, and a clean-exit reaping rule.
+  It is defined nowhere in this repository, yet it is the stated justification
+  for both a DING timing constant and a retention decision. A codename that
+  cannot be resolved is worse than an unexplained constant, because it looks
+  like a reference.
+
+The first three are divergences between the specification's vocabulary and the
 implementation's, not merely missing types. They are recorded here so a reader
 does not go looking for something that was never built, or conclude that two
 words name two things.
