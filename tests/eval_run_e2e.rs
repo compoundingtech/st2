@@ -119,7 +119,7 @@ sleep 60
     let out = Command::new(bin)
         .args(["eval"])
         .arg(&cell)
-        .env("PATH", path)
+        .env("PATH", &path)
         .env_remove("CATALOG")
         .env_remove("ST_ROOT")
         .env_remove("PTY_ROOT")
@@ -136,6 +136,28 @@ sleep 60
     assert!(out.status.success(), "exit non-zero:\n{stdout}\n{stderr}");
     // Both judges (bash + declarative) passed.
     assert!(stdout.contains("SCORE: 4 PASS / 0 FAIL"), "expected 4/0:\n{stdout}");
+
+    let json_out = Command::new(bin)
+        .args(["eval", "--json"])
+        .arg(&cell)
+        .env("PATH", &path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .env("XDG_STATE_HOME", tmp.path().join("xdg-json"))
+        .output()
+        .unwrap();
+    assert!(json_out.status.success(), "json eval should preserve exit 0: {}", String::from_utf8_lossy(&json_out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&json_out.stdout).expect("--json emits EvalReport");
+    assert_eq!(json["done"], true);
+    assert!(json["judges"].as_array().is_some());
+
+    let invalid = Command::new(bin)
+        .args(["eval", "--json"])
+        .arg(tmp.path().join("missing.kdl"))
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success(), "invalid eval input must retain nonzero exit");
 }
 
 /// Under `supervise`, teardown reaps RUNTIME-spawned seats too (the team-standup pattern: a seat spins
