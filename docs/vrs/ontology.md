@@ -103,7 +103,13 @@ an example path.
 - **DING** — the delivery of an unread message into a running agent's terminal,
   performed by a sidecar that watches the inbox. Named for the poke rather than
   the message, because the message has already arrived; the DING is what makes
-  the agent notice. **Ping** is an accepted alias for the same thing.
+  the agent notice.
+- **Ping** — the same thing as DING. The command accepts both names, and the
+  stated direction is to settle on *ping*, since performing the poke is the
+  runner's job rather than a separate act. The rest of the vocabulary has not
+  moved: the authored keyword, the derived task name that code matches as a
+  literal, and the wire prefix all still say *ding*. Until those move, write
+  **DING** for the mechanism and treat *ping* as the name it is becoming.
 - **Poke** — one attempt to put a notice into a composer. The act; the DING is
   the arrangement that performs it.
 
@@ -202,7 +208,15 @@ At least six senses, four of which appear in the VRS documents themselves:
 These collide rather than coexist: `vision.md` uses bare *root* for the root
 agent in a list of actors, while `requirements.md` uses bare *roots* for
 host-local scopes in one requirement and for watcher scopes in another. A reader
-cannot resolve which is meant from the sentence alone.
+cannot resolve which is meant from the sentence alone. Four of the senses are
+directories, and three of those are printed together by the command that exports
+the bus environment — so seeing them side by side is routine.
+
+A second hazard sits inside the directory senses: the bus root is normally
+*equal to* the catalog root, since no nested bus directory is synthesized. Two
+names for one path that can nonetheless diverge is worse than two names for two
+paths, because equality holds until it doesn't and nothing in the vocabulary
+signals which is being relied on.
 
 **Always qualify.** Never write bare *root*. The one place this cannot be fixed
 by convention is where a ratified requirement already uses the bare word; that
@@ -219,12 +233,17 @@ routinely called "the supervisor". Write **control plane** for the process and
 
 ### `status`
 
-The most reused word in the system, with six senses: the presence value; the
-presence file on disk; the command that gets or sets presence; the roster field;
-the roster filter; and the systemd unit state reported by an unrelated
-subcommand. Most coexist harmlessly, but the presence senses and the systemd
-sense are both operator-visible and share a verb. Write **presence** for the
-concept and reserve *status* for the file and the commands that name it.
+The most reused word in the system. It names the presence value, the presence
+file on disk, the command that gets or sets presence, the roster field, the
+roster filter, a session's lifecycle state as the terminal tool reports it
+(running, exited, vanished), and the systemd unit state of the control plane.
+
+Two pairs genuinely collide. Presence and the session lifecycle are both "the
+status of an agent" in plain English while answering different questions — is it
+declaring itself available, versus is its process still there. And the command
+that reads presence differs from the one that reads the unit state by a single
+word. Write **presence** for the declared signal and **session state** for the
+lifecycle, and reserve bare *status* for the file and the commands that name it.
 
 ### `receipt`
 
@@ -248,17 +267,33 @@ a task's liveness is discussed.
 
 ### `live`
 
-Established usage is process liveness — a live session, a live host lock, a live
-owner. The DING subsystem introduces a second sense in **live composer**, where
-it means the composer that will receive keystrokes as opposed to one drawn in
-scrollback. The two do not overlap in subject matter, but the word is doing
-different work, so the composer sense should always carry its noun.
+The mildest entry here, kept because the second sense is new. Established usage
+is liveness — a live host lock, and *alive* for sessions and processes, which the
+implementation already keeps apart. The DING subsystem introduces **live
+composer**, meaning the composer that will receive keystrokes as opposed to one
+drawn in scrollback. The senses collide only in prose, so the fix is editorial:
+the composer sense always carries its noun.
 
 ### `keep`
 
-A garbage-collection pin on a declaration or task, and an unrelated flag that
-preserves an eval's temporary catalog. Different concepts, one word, both
-authored by the operator.
+Three senses, and the third is the dangerous one. It is a garbage-collection pin
+the operator authors on a declaration or task; an unrelated flag that preserves
+an eval's temporary catalog; and a tag the runtime *forces on* for tasks named
+`agent` or `ding`, so their exit evidence survives.
+
+The first and third share a name and a mechanism but not their provenance: an
+operator who authors the pin as false on a ding still gets the forced tag. The
+authored word therefore does not describe the resulting behaviour, and a reader
+who knows only the KDL keyword will predict the wrong outcome.
+
+### `agent`
+
+The declared entity, and a *task* literally named `agent` — the one the compact
+declaration form derives, which the runtime special-cases by comparing the name
+as a literal string. So a declaration named `mix` has a task named `agent`, and
+that task's id is `<host>.mix` rather than anything containing the word. Write
+**declaration** or **the agent** for the entity and **the agent task** for the
+task whenever both are in scope.
 
 ### `identity`
 
@@ -310,3 +345,20 @@ The last three are divergences between the specification's vocabulary and the
 implementation's, not merely missing types. They are recorded here so a reader
 does not go looking for something that was never built, or conclude that two
 words name two things.
+
+## Words that do not bind
+
+A declaration may carry keywords the parser accepts and the runtime ignores:
+among them **harness**, **model**, **persona**, **permissions**, **transport**,
+**strategy**, and a free-form metadata block. Dropping unknown keys is
+deliberate — it is how st2 stays independent of whatever rendered the
+declaration — but the consequence is a vocabulary hazard rather than a
+convenience: these read as authored configuration and change nothing, and the
+grammar gives an author no way to tell a binding keyword from an inert one.
+
+**Harness** and **persona** are the sharp cases, because the same words *do*
+bind elsewhere as flags on the generator that writes declarations. One word,
+authored in two places, effective in one.
+
+Treat these as metadata, never as configuration, and never cite one as evidence
+that a declaration is configured a particular way.
