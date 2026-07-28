@@ -71,8 +71,9 @@ atomic inbox file → DING attempt → agent reads → archive receipt
   `busy` does not. Failed delivery remains retryable. Sidecar restart emits a
   bounded recovery notice instead of replaying the inbox. Delivery may wake an
   agent while it is working, but an active or uncertain human composer must be
-  left untouched. Inbox reads do not wake the sidecar; only mutations bypass
-  its bounded poll cadence.
+  left untouched. Unsafe delivery retries use a bounded backoff so an active
+  composer cannot create a short-lived PTY probe on every inbox poll. Inbox
+  reads do not wake the sidecar; only mutations bypass its bounded poll cadence.
 
 ## State and scope
 

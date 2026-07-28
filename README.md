@@ -247,7 +247,9 @@ Agents must declare `busy` before actively executing work and return to `availab
 yielding or ready for new work, but `busy` never suppresses DING. Fresh `dnd` is the only delivery
 hold. The sidecar does not refresh `dnd`, so an abandoned hold becomes stale after 15 minutes and
 delivery resumes. New arrivals remain FIFO, same-filename archive receipts shadow and clean restored
-inbox duplicates, and failed or uncertain PTY operations retain the notice for safe retry. On start
+inbox duplicates, and failed or uncertain PTY operations retain the notice for safe retry. Unsafe
+delivery retries use a bounded backoff, so an active composer cannot make the sidecar spawn a fresh
+PTY probe on every inbox poll. On start
 or restart, the sidecar first adopts an exact staged recovery/backlog notice when present, then sends
 one generic check-inbox recovery DING if unread work remains; it does not replay every backlog
 message.

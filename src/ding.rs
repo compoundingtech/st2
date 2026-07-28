@@ -32,6 +32,10 @@ const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox
 const PTY_COMMAND_TIMEOUT: Duration = Duration::from_millis(600);
 const COMPOSER_OBSERVATION_WINDOW: Duration = Duration::from_millis(450);
 const COMPOSER_OBSERVATION_POLL: Duration = Duration::from_millis(10);
+/// A human or active turn can keep a staged notice unsafe for minutes. Retrying `pty peek` every
+/// inbox poll creates a short-lived child for each attempt, so keep the correctness fallback but
+/// bound that descendant churn independently of the filesystem poll cadence.
+const DELIVERY_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
 /// The `<rand6>` of a `<unix-ms>-<rand6>.md` filename — the stable id an agent dedups re-pokes on.
 /// Falls back to the `.md`-stripped stem for anything off-grammar.
@@ -1030,6 +1034,7 @@ pub fn run_ding(
     let mut watch = SessionWatch::default();
     let mut logged_waiting = false;
     let mut last_refresh: Option<Instant> = None;
+    let mut next_delivery_attempt: Option<Instant> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1050,36 +1055,41 @@ pub fn run_ding(
                 last_refresh = Some(Instant::now());
             }
 
-            if !delivery_suppressed(status_path)
-                && let Some(candidates) = startup_candidates.as_ref()
-            {
-                match poker.adopt_staged(candidates) {
-                    Ok(Some(text)) => {
-                        if text == RECOVERY_POKE {
-                            if let Some(recovery) = pending
-                                .iter_mut()
-                                .find(|notice| matches!(notice, PendingNotice::Recovery { .. }))
-                            {
-                                recovery.set_staged_text(Some(text));
-                            }
-                        } else {
-                            pending.push_front(PendingNotice::adopted(text));
-                        }
-                        startup_candidates = None;
-                    }
-                    Ok(None) => startup_candidates = None,
-                    Err(error) => {
-                        eprintln!("st2 ding: startup staged-notice adoption failed: {error}")
-                    }
-                }
-            }
             pending.extend(
                 new_arrivals(inbox_dir, &mut seen)
                     .into_iter()
                     .map(PendingNotice::message),
             );
             prune_archived_pending(inbox_dir, &mut pending);
-            flush_pending(status_path, &mut pending, poker);
+
+            let delivery_due =
+                next_delivery_attempt.is_none_or(|deadline| Instant::now() >= deadline);
+            if delivery_due && !delivery_suppressed(status_path) {
+                if let Some(candidates) = startup_candidates.as_ref() {
+                    match poker.adopt_staged(candidates) {
+                        Ok(Some(text)) => {
+                            if text == RECOVERY_POKE {
+                                if let Some(recovery) = pending
+                                    .iter_mut()
+                                    .find(|notice| matches!(notice, PendingNotice::Recovery { .. }))
+                                {
+                                    recovery.set_staged_text(Some(text));
+                                }
+                            } else {
+                                pending.push_front(PendingNotice::adopted(text));
+                            }
+                            startup_candidates = None;
+                        }
+                        Ok(None) => startup_candidates = None,
+                        Err(error) => {
+                            eprintln!("st2 ding: startup staged-notice adoption failed: {error}")
+                        }
+                    }
+                }
+                flush_pending(status_path, &mut pending, poker);
+                next_delivery_attempt = (startup_candidates.is_some() || !pending.is_empty())
+                    .then(|| Instant::now() + DELIVERY_RETRY_BACKOFF);
+            }
         } else if !watch.seen_alive && !logged_waiting {
             eprintln!(
                 "st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone."
@@ -1241,6 +1251,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingPoker {
         alive: AtomicBool,
+        defer: AtomicBool,
         probes: AtomicUsize,
         failures: Mutex<usize>,
         calls: Mutex<Vec<String>>,
@@ -1258,6 +1269,9 @@ mod tests {
     impl Poker for RecordingPoker {
         fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
             self.calls.lock().unwrap().push(text.to_string());
+            if self.defer.load(Ordering::SeqCst) {
+                return Ok(PokeOutcome::Deferred);
+            }
             let mut failures = self.failures.lock().unwrap();
             if *failures > 0 {
                 *failures -= 1;
@@ -1877,6 +1891,37 @@ mod tests {
         assert_eq!(calls[0], RECOVERY_POKE);
         assert!(calls[1].contains("post-start"));
         assert!(!calls.iter().any(|call| call.contains("seeded")));
+    }
+
+    #[test]
+    fn deferred_delivery_backoff_bounds_short_lived_pty_attempts() {
+        let agent = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(agent.path());
+        let status_path = status::status_path(agent.path());
+        status::set_state(&status_path, status::State::Available).unwrap();
+        send_to_inbox(&inbox, "alice", Some("active"), None, &[], "active").unwrap();
+
+        let poker = RecordingPoker::live();
+        poker.defer.store(true, Ordering::SeqCst);
+        let stop = AtomicBool::new(false);
+        let config = DingConfig {
+            poll: Duration::from_millis(20),
+            status_refresh: Duration::from_secs(60),
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                stop.store(true, Ordering::SeqCst);
+            });
+            run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
+        });
+
+        assert_eq!(
+            poker.calls.lock().unwrap().len(),
+            1,
+            "an unsafe composer must not respawn pty peek/send children every inbox poll"
+        );
     }
 
     #[cfg(target_os = "linux")]
