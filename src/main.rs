@@ -450,6 +450,9 @@ enum MessageCmd {
         /// Print only the message count.
         #[arg(long)]
         count: bool,
+        /// Include full message bodies in JSON output (opt-in; default shape is unchanged).
+        #[arg(long)]
+        include_body: bool,
         /// Show only messages from this sender.
         #[arg(long = "from")]
         from: Option<String>,
@@ -1273,6 +1276,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             identity,
             archive,
             count,
+            include_body,
             from,
             since,
             json,
@@ -1299,7 +1303,10 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 return Ok(());
             }
             if json {
-                let items: Vec<LsItemJson> = msgs.iter().map(LsItemJson::from).collect();
+                let items: Vec<LsItemJson> = msgs
+                    .iter()
+                    .map(|m| LsItemJson::from_message(m, include_body))
+                    .collect();
                 println!("{}", serde_json::to_string(&items)?);
                 return Ok(());
             }
@@ -1410,6 +1417,8 @@ struct LsItemJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<&'a str>,
 }
 
 impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
@@ -1422,7 +1431,18 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            body: None,
         }
+    }
+}
+
+impl<'a> LsItemJson<'a> {
+    fn from_message(m: &'a st2::message::Message, include_body: bool) -> Self {
+        let mut item = Self::from(m);
+        if include_body {
+            item.body = Some(&m.body);
+        }
+        item
     }
 }
 
