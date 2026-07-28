@@ -69,6 +69,15 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   binary, starts the control plane again, and proves adoption with the same
   agent PID/creation identity and no duplicate process.
 
+- **Session registry:** A catalog owns the `pty` registry holding its tasks.
+  `<catalog>/pty` is the default; a catalog may declare another so that one host
+  can share a single registry across catalogs. Resolution is an exported
+  `PTY_ROOT`, then the catalog's declaration, then the default, applied
+  uniformly to spawn, list, kill, and the bus environment st2 hands to native
+  tools, so every reader that can resolve the catalog agrees about where its
+  sessions are. A declaration whose field set does not match fails `st2
+  validate` rather than resolving silently back to the default.
+
 ## Message lifecycle
 
 ```text
