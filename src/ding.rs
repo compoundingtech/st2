@@ -468,27 +468,39 @@ enum CodexComposer {
     Typed(String),
 }
 
+/// Locate every maintained composer and classify the LOWEST one on screen.
+///
+/// A pane has exactly one live composer and it sits at the bottom of the viewport, so anything
+/// composer-shaped above it is scrollback — typically a pasted or logged screen from the other
+/// harness. Preferring one harness unconditionally lets that transcript decide: a Codex pane whose
+/// scrollback holds a captured Claude screen would be classified from the capture. That is a
+/// wrong *positive* rather than a wrong negative, because the paste and the Return go to the pane's
+/// real composer whichever text was read — so it can type into, or submit, a human's live draft.
+/// Comparing positions needs no per-pair special case: scrollback is above the live composer by
+/// construction.
+///
+/// Detection deliberately does not consult the `Claude Code v…` startup banner. `pty peek` returns
+/// the viewport only, and the banner is absent from real panes (see the harness note on
+/// `located_bottom_claude_composer`), so it cannot gate anything. The ruled `❯` composer is durable.
 fn classify_composer(screen: &str, expected: &str) -> ComposerState {
     let plain = strip_ansi(screen);
-    // `pty peek` returns only the viewport, so the startup `Claude Code v…` banner has scrolled
-    // away on any pane that has been used. The ruled `❯` composer is the durable Claude marker.
-    if let Some(composer) = located_bottom_claude_composer(&plain) {
-        return classify_claude_composer(&plain, composer, expected);
+    let claude = located_bottom_claude_composer(&plain);
+    // The Codex locator reports a byte offset into the raw ANSI screen while the Claude locator
+    // works in `plain` line indices. Every Codex marker starts at an `\x1b[` boundary, so stripping
+    // the prefix is faithful and its newline count is that composer's `plain` row.
+    let codex_row = located_bottom_codex_composer(screen)
+        .map(|(start, _)| strip_ansi(&screen[..start]).matches('\n').count());
+    match (claude, codex_row) {
+        (Some((claude_row, _, _)), Some(codex_row)) if claude_row < codex_row => {
+            classify_codex_composer(screen, &plain, expected)
+        }
+        (Some((_, logical_inputs, footer)), _) => {
+            classify_claude_composer(&plain, (logical_inputs, footer), expected)
+        }
+        (None, Some(_)) => classify_codex_composer(screen, &plain, expected),
+        // No maintained composer is locatable, so nothing is proven either way.
+        (None, None) => ComposerState::Ambiguous,
     }
-    // A Claude pane whose composer cannot be located stays unproven rather than falling through to
-    // the Codex heuristics below.
-    if plain.contains("Claude Code v") {
-        return ComposerState::Ambiguous;
-    }
-    if located_bottom_codex_composer(screen).is_some()
-        || plain.contains("OpenAI Codex")
-        || plain
-            .lines()
-            .any(|line| line.trim_start().starts_with("gpt-"))
-    {
-        return classify_codex_composer(screen, &plain, expected);
-    }
-    ComposerState::Ambiguous
 }
 
 fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> ComposerState {
@@ -568,7 +580,7 @@ fn is_claude_idle_placeholder(input: &str) -> bool {
 /// row Claude may either wrap at a discarded space or split a token, so each proven boundary has
 /// exactly two candidates: join with one space or with none. The bounded DING length keeps this set
 /// small; any unfamiliar multiline shape fails closed.
-fn located_bottom_claude_composer(plain: &str) -> Option<(Vec<String>, String)> {
+fn located_bottom_claude_composer(plain: &str) -> Option<(usize, Vec<String>, String)> {
     let lines: Vec<&str> = plain.lines().collect();
     let separators: Vec<usize> = lines
         .iter()
@@ -598,7 +610,9 @@ fn located_bottom_claude_composer(plain: &str) -> Option<(Vec<String>, String)> 
         .join("\n");
     let candidates = logical_soft_wrap_candidates(&input, 70);
     let footer = lines[bottom + 1..].join("\n");
-    Some((candidates, footer))
+    // `top + 1` is the composer's first row, which is what the router compares against the Codex
+    // composer's row to find the lower — and therefore live — of the two.
+    Some((top + 1, candidates, footer))
 }
 
 /// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
@@ -1521,6 +1535,55 @@ mod tests {
 
     fn mature_staged_claude_screen(text: &str) -> String {
         mature_claude_screen(&format!("❯\u{00a0}{text}"))
+    }
+
+    /// A Codex pane whose scrollback holds a captured Claude screen — two ruled lines around a `❯`
+    /// row plus a Claude idle footer — above the live, ANSI-detected Codex composer. Capturing and
+    /// pasting pane text is routine, so this shape is not exotic.
+    fn codex_screen_below_claude_transcript(transcript_row: &str, codex: &str) -> String {
+        let rule = claude_rule();
+        format!(
+            "  scrollback: a pasted Claude pane\r\n{rule}\r\n❯\u{00a0}{transcript_row}\r\n{rule}\r\n\
+             \u{0020} ⏵⏵ bypass permissions on (shift+tab to cycle)\r\n\r\n{codex}"
+        )
+    }
+
+    /// Scrollback that merely looks like a composer must never outrank the live one. The paste and
+    /// the Return always go to the pane's real bottom composer, so misreading transcript text as
+    /// "idle" or "already staged" is a wrong positive: it can type into, or submit, a human draft.
+    #[test]
+    fn transcript_composers_never_outrank_the_live_bottom_composer() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        // The live Codex composer holds a human draft in both cases, so both must stay `Changed`.
+        // An empty transcript row would otherwise read as positively-empty and allow the paste.
+        assert_eq!(
+            classify_composer(
+                &codex_screen_below_claude_transcript("", &human_codex_screen()),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        // A transcript row holding the exact notice is the worse case: it would otherwise satisfy
+        // the two adjacent exact observations and send a bare Return to the draft.
+        assert_eq!(
+            classify_composer(
+                &codex_screen_below_claude_transcript(expected, &human_codex_screen()),
+                expected
+            ),
+            ComposerState::Changed
+        );
+
+        // The rule is positional, not a Codex preference: a genuine Claude pane whose scrollback
+        // shows a captured Codex composer still classifies from its own live Claude composer.
+        assert_eq!(
+            classify_composer(
+                &format!("{}\r\n{}", staged_codex_screen("a stale pasted codex draft"), mature_idle_claude_screen()),
+                expected
+            ),
+            ComposerState::EmptySafe
+        );
     }
 
     #[test]
