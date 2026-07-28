@@ -119,6 +119,13 @@ and no-op desired-equals-actual behavior.
 
 ## Open design questions
 
+### Targeted materialization (R13)
+
+`st2 up --materialize-only --agent <id>` filters discovery before rendering,
+so a declared agent/task change cannot be blocked by unrelated slow or
+unreadable workspaces. This selector is materialization-only; live
+reconciliation remains separately gated and host-local.
+
 - **DQ1 Scheduled work:** The vision includes per-machine schedulers that form a
   distributed workflow engine, but the KDL shape, event inbox, deduplication
   boundary, and execution receipts are not yet specified. A successful
