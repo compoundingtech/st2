@@ -19,7 +19,7 @@ fn retired_catalog(root: &Path) -> Child {
         "agent \"gone\" { host \"h\"; retired #true; command \"true\" }\n",
     )
     .unwrap();
-    let owner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let owner = Command::new("sleep").arg("30").spawn().unwrap();
     fs::write(root.join(".st2.h.lock"), format!("{}\n", owner.id())).unwrap();
     owner
 }
