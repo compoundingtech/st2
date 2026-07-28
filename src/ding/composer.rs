@@ -1,0 +1,159 @@
+//! What a peeked screen proves about one exact notice, and the routing that decides which
+//! composer on the screen is the live one.
+
+use super::harness::{self, Screen};
+
+/// What the current bottom composer proves about one exact normalized notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ComposerState {
+    /// A maintained harness is positively idle and contains only its known placeholder.
+    EmptySafe,
+    /// The exact notice is the complete composer and the harness is positively idle.
+    ExactSafe,
+    /// The exact notice is present, but a modal, active turn, or non-idle footer blocks Return.
+    ExactBlocked,
+    /// A maintained composer contains different text (including a human draft).
+    Changed,
+    /// No maintained, unambiguous composer state was proven.
+    Ambiguous,
+}
+
+
+/// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
+/// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
+/// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
+/// unfamiliar multiline input remains literal and cannot equal a normalized single-line DING.
+pub(super) fn logical_soft_wrap_candidates(input: &str, minimum_first_content_chars: usize) -> Vec<String> {
+    let rows: Vec<&str> = input.lines().collect();
+    let Some(first) = rows.first() else {
+        return vec![String::new()];
+    };
+    if rows.len() == 1 {
+        return vec![(*first).to_string()];
+    }
+    let mut candidates = vec![(*first).to_string()];
+    let mut previous = *first;
+    for (index, row) in rows[1..].iter().enumerate() {
+        let required_previous_width = minimum_first_content_chars + usize::from(index > 0) * 2;
+        if previous.chars().count() < required_previous_width
+            || !row.starts_with("  ")
+            || row.trim().is_empty()
+        {
+            return vec![input.to_string()];
+        }
+        let continuation = row.strip_prefix("  ").expect("prefix checked").trim_end();
+        let mut next = Vec::with_capacity(candidates.len().saturating_mul(2).min(32));
+        for candidate in candidates {
+            if next.len() >= 32 {
+                return vec![input.to_string()];
+            }
+            next.push(format!("{candidate}{continuation}"));
+            next.push(format!("{candidate} {continuation}"));
+        }
+        candidates = next;
+        previous = row;
+    }
+    candidates
+}
+
+
+pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
+    let mut first = false;
+    let mut later = false;
+    for line in plain.lines().map(str::trim_start) {
+        first |= line.starts_with("› 1.") || line.starts_with("> 1.");
+        later |= line.starts_with("2.") || line.starts_with("3.");
+    }
+    first && later
+}
+
+
+/// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text. Bounded
+/// cursor-forward sequences represent visible spaces in current Codex and Claude panes.
+pub(super) fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            let ch = input[index..].chars().next().expect("valid UTF-8 boundary");
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+        index += 1;
+        if index >= bytes.len() {
+            break;
+        }
+        match bytes[index] {
+            b'[' => {
+                index += 1;
+                let params_start = index;
+                let mut final_byte = None;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        final_byte = Some(byte);
+                        break;
+                    }
+                }
+                if final_byte == Some(b'C') {
+                    let params = &bytes[params_start..index.saturating_sub(1)];
+                    let width = if params.is_empty() {
+                        Some(1)
+                    } else if params.iter().all(u8::is_ascii_digit) {
+                        std::str::from_utf8(params)
+                            .ok()
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .map(|value| value.max(1))
+                    } else {
+                        None
+                    };
+                    if let Some(width) = width.filter(|width| *width <= 512) {
+                        for _ in 0..width {
+                            out.push(' ');
+                        }
+                    }
+                }
+            }
+            b']' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    out
+}
+
+
+/// Locate every maintained composer and classify the LOWEST one on screen.
+///
+/// A pane has exactly one live composer and it sits at the bottom of the viewport, so anything
+/// composer-shaped above it is scrollback — typically a pasted or logged screen from the other
+/// harness. Preferring one harness unconditionally lets that transcript decide, which is a wrong
+/// *positive*: the paste and the Return go to the pane's real composer whichever text was read, so
+/// it can type into, or submit, a human's live draft. Scrollback is above the live composer by
+/// construction, so picking the lowest needs no per-pair special case.
+pub(super) fn classify_composer(screen: &str, expected: &str) -> ComposerState {
+    let plain = strip_ansi(screen);
+    let screen = Screen { raw: screen, plain: &plain };
+    harness::all()
+        .into_iter()
+        .filter_map(|harness| harness.locate(&screen).map(|located| (located.row, harness)))
+        .max_by_key(|(row, _)| *row)
+        .map(|(_, harness)| harness.classify(&screen, expected))
+        // No maintained composer is locatable, so nothing is proven either way.
+        .unwrap_or(ComposerState::Ambiguous)
+}
