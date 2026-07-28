@@ -652,8 +652,37 @@ fn logical_soft_wrap_candidates(input: &str, minimum_first_content_chars: usize)
     candidates
 }
 
+/// Claude 2.1.220 renders an in-flight turn as a status line and ships no interrupt hint with it.
+/// Sampled across real panes, an active turn looks like `✻ Frolicking… (3m 35s · ↓ 6.9k tokens)`,
+/// `✽ Schlepping…`, or `· Metamorphosing…`, while a finished turn looks like `✻ Brewed for 5s` or
+/// `✻ Cogitated for 11s · 1 shell still running`.
+///
+/// Two things follow. The leading glyph animates (`·` `✶` `✻` `✽` all observed), so it cannot be
+/// matched literally. And the elapsed timer is absent from some active frames, so requiring it
+/// would fail open on exactly the frames that matter. What separates the two states is the
+/// ellipsis directly after a single gerund: a finished turn says `for <n>s` instead.
+///
+/// Matching the finished shape too would be catastrophic rather than merely conservative — every
+/// idle pane shows it immediately after a turn, so DING would never deliver again.
+fn claude_turn_in_flight(plain: &str) -> bool {
+    plain.lines().any(|line| {
+        let Some((head, _)) = line.trim().split_once('…') else {
+            return false;
+        };
+        let mut tokens = head.split_whitespace();
+        let (Some(glyph), Some(word), None) = (tokens.next(), tokens.next(), tokens.next()) else {
+            return false;
+        };
+        glyph.chars().count() == 1
+            && !glyph.chars().any(char::is_alphanumeric)
+            && !word.is_empty()
+            && word.chars().all(char::is_alphabetic)
+    })
+}
+
 fn interaction_blocked(plain: &str) -> bool {
-    plain.contains("Working (")
+    claude_turn_in_flight(plain)
+        || plain.contains("Working (")
         || plain.contains("esc to interrupt")
         || plain.contains("Esc to interrupt")
         || plain.contains("ctrl+c to interrupt")
@@ -1537,6 +1566,32 @@ mod tests {
         mature_claude_screen(&format!("❯\u{00a0}{text}"))
     }
 
+    /// The same used pane with an in-flight turn: a spinner status line above the composer. Every
+    /// frame below was observed on a real 2.1.220 pane; the glyph animates and the elapsed timer is
+    /// not always rendered, so both variations appear here.
+    fn mid_turn_claude_screen(status: &str, composer: &str) -> String {
+        let rule = claude_rule();
+        let footer = "  ⏵⏵ bypass permissions on · PR #42 · 2 shells · ← 1 agent";
+        format!("  an earlier turn\r\n{status}\r\n{rule}\r\n{composer}\r\n{rule}\r\n{footer}")
+    }
+
+    /// Status lines for an ACTIVE turn — Return must never be sent.
+    const ACTIVE_TURN_STATUS: [&str; 4] = [
+        "✻ Frolicking… (3m 35s · ↓ 6.9k tokens)",
+        "✽ Schlepping…",
+        "· Metamorphosing…",
+        "✶ Schlepping… (9s · ↓ 296 tokens · thinking with high effort)",
+    ];
+
+    /// Status lines for a FINISHED turn — these sit above every genuinely idle composer, so
+    /// treating them as blocked would stop delivery entirely.
+    const FINISHED_TURN_STATUS: [&str; 4] = [
+        "✻ Brewed for 5s",
+        "✻ Crunched for 7s",
+        "✻ Cogitated for 11s · 1 shell still running",
+        "✻ Baked for 3s · 1 shell still running",
+    ];
+
     /// A Codex pane whose scrollback holds a captured Claude screen — two ruled lines around a `❯`
     /// row plus a Claude idle footer — above the live, ANSI-detected Codex composer. Capturing and
     /// pasting pane text is routine, so this shape is not exotic.
@@ -1546,6 +1601,50 @@ mod tests {
             "  scrollback: a pasted Claude pane\r\n{rule}\r\n❯\u{00a0}{transcript_row}\r\n{rule}\r\n\
              \u{0020} ⏵⏵ bypass permissions on (shift+tab to cycle)\r\n\r\n{codex}"
         )
+    }
+
+    /// An in-flight Claude turn ships no interrupt hint, so the composer being empty is not proof
+    /// that Return is safe — the pane is working. The finished-turn line looks almost identical and
+    /// sits above every genuinely idle composer, so both directions are pinned here.
+    #[test]
+    fn an_in_flight_turn_blocks_return_but_a_finished_one_does_not() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for status in ACTIVE_TURN_STATUS {
+            // Empty composer mid-turn: positively empty, but not safe.
+            assert_ne!(
+                classify_composer(&mid_turn_claude_screen(status, "❯\u{00a0}"), expected),
+                ComposerState::EmptySafe,
+                "active turn must not be EmptySafe: {status}"
+            );
+            // The notice already staged mid-turn: exact, but Return is still withheld.
+            assert_eq!(
+                classify_composer(
+                    &mid_turn_claude_screen(status, &format!("❯\u{00a0}{expected}")),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "active turn must be ExactBlocked: {status}"
+            );
+        }
+
+        // A finished turn is the normal idle screen. Blocking on it would stop delivery forever.
+        for status in FINISHED_TURN_STATUS {
+            assert_eq!(
+                classify_composer(&mid_turn_claude_screen(status, "❯\u{00a0}"), expected),
+                ComposerState::EmptySafe,
+                "finished turn must stay deliverable: {status}"
+            );
+            assert_eq!(
+                classify_composer(
+                    &mid_turn_claude_screen(status, &format!("❯\u{00a0}{expected}")),
+                    expected
+                ),
+                ComposerState::ExactSafe,
+                "finished turn must stay submittable: {status}"
+            );
+        }
     }
 
     /// Scrollback that merely looks like a composer must never outrank the live one. The paste and
