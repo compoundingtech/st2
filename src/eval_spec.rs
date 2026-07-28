@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use kdl::{KdlDocument, KdlNode};
+use kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::spec::{Restart, RestartMode, parse_duration};
 
@@ -150,10 +150,13 @@ pub enum Check {
     /// `file "p" lacks "text"` — path does NOT contain the substring.
     FileLacks { path: String, text: String },
     /// `json "p" field "x" is "y"` — the JSON field equals the value.
-    JsonField { path: String, field: String, value: String },
+    JsonField { path: String, field: String, value: JsonScalar },
     /// `committed "p"` — the path is tracked + committed (checked by the eval flow via git).
     Committed { path: String },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonScalar { String(String), Bool(bool), Integer(i64) }
 
 // ── KDL helpers (match the idiom in render.rs / kdl_format.rs) ───────────────────────────────────
 
@@ -581,7 +584,7 @@ fn parse_judge(node: &KdlNode) -> anyhow::Result<Judge> {
                 // json "p" field "x" is "y"
                 let path = arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs a path"))?;
                 let field = arg_n(c, 2).ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs `field <x>`"))?;
-                let value = arg_n(c, 4).ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs `is <y>`"))?;
+                let value = c.get(4).and_then(|v| match v { KdlValue::String(s) => Some(JsonScalar::String(s.clone())), KdlValue::Bool(b) => Some(JsonScalar::Bool(*b)), KdlValue::Integer(i) => (*i).try_into().ok().map(JsonScalar::Integer), _ => None }).ok_or_else(|| anyhow::anyhow!("judge '{name}': json value must be string, boolean, or integer"))?;
                 checks.push(Check::JsonField { path, field, value });
             }
             "committed" => {
@@ -711,7 +714,7 @@ eval {
         }
         match &ev.judges[2].kind {
             JudgeKind::Declarative(checks) => assert!(matches!(&checks[0],
-                Check::JsonField { path, field, value } if path == "worker/package.json" && field == "license" && value == "MIT")),
+                Check::JsonField { path, field, value } if path == "worker/package.json" && field == "license" && *value == JsonScalar::String("MIT".into()))),
             other => panic!("expected json declarative, got {other:?}"),
         }
         // Per-judge timeout + ask flavor.

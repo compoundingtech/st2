@@ -818,11 +818,9 @@ fn run_declarative(checks: &[Check], catalog: &Path) -> (bool, String) {
                 (!body.contains(text.as_str()), format!("{path} lacks {text:?}"))
             }
             Check::JsonField { path, field, value } => {
-                let got = std::fs::read_to_string(catalog.join(path))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                    .and_then(|v| v.get(field).and_then(|f| f.as_str().map(String::from)));
-                (got.as_deref() == Some(value.as_str()), format!("{path} field {field} is {value:?} (got {got:?})"))
+                let expected = match value { crate::eval_spec::JsonScalar::String(s) => serde_json::Value::String(s.clone()), crate::eval_spec::JsonScalar::Bool(b) => serde_json::Value::Bool(*b), crate::eval_spec::JsonScalar::Integer(i) => serde_json::Value::Number((*i).into()) };
+                let got = std::fs::read_to_string(catalog.join(path)).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v.get(field).cloned());
+                (got.as_ref() == Some(&expected), format!("{path} field {field} is {value:?} (got {got:?})"))
             }
             Check::Committed { path } => {
                 let ok = is_committed_clean(catalog, path);
@@ -1128,11 +1126,11 @@ mod tests {
         let ok = [
             Check::FileHas { path: "worker/LICENSE".into(), text: "Permission is hereby granted".into() },
             Check::FileLacks { path: "worker/LICENSE".into(), text: "proprietary".into() },
-            Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: "MIT".into() },
+            Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: crate::eval_spec::JsonScalar::String("MIT".into()) },
         ];
         assert!(run_declarative(&ok, cat.path()).0);
         // A wrong json value fails.
-        let bad = [Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: "GPL".into() }];
+        let bad = [Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: crate::eval_spec::JsonScalar::String("GPL".into()) }];
         assert!(!run_declarative(&bad, cat.path()).0);
         // FileHas on a missing file fails.
         let missing = [Check::FileHas { path: "worker/NOPE".into(), text: "x".into() }];
