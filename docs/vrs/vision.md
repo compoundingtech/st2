@@ -36,6 +36,9 @@
    path, with unsupported behavior stated plainly.
 2. A canonical agent declaration can be validated, materialized, launched, and
    restarted without losing its effective launch definition or durable state.
+   The st2 control plane itself can be stopped, killed, reinstalled, and
+   restarted without stopping or replacing any running agent; the replacement
+   runtime adopts the existing agent processes without duplication.
 3. Every machine has exactly one root agent that observes local health,
    resolves bounded runtime failures, and escalates what it cannot resolve.
 4. A human, CoS, root, or supervisor can inspect catalog-backed state to

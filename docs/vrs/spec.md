@@ -11,8 +11,9 @@ replacement for the README, CLI help, KDL examples, or tests.
 ## Scope
 
 st2 validates a declared agent fleet, materializes agent workspaces, launches
-host-local work, supervises restartable tasks, and delivers messages. The
-agent grammar and harness-facing contract remain canonical in
+host-local work, adopts and supervises independently surviving tasks, and
+delivers messages. The agent grammar and harness-facing contract remain
+canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
 ## Host-local scheduling and supervision
@@ -46,6 +47,17 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   launcher so manual and supervised restarts are equivalent.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them.
+- **R11:** `st2 up` is a replaceable control plane, not the lifetime owner of
+  its agents. Normal exit, forced termination, binary replacement, and restart
+  leave every running agent PID and creation identity unchanged. The new
+  control plane adopts those processes and starts only missing work; it does
+  not duplicate them. Agent stop or retirement requires a separate explicit
+  lifecycle action.
+
+  Executable acceptance starts an agent, terminates `st2 up` normally and with
+  a forced kill, verifies the agent remains alive and usable, replaces the st2
+  binary, starts the control plane again, and proves adoption with the same
+  agent PID/creation identity and no duplicate process.
 
 ## Message lifecycle
 

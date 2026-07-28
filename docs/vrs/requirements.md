@@ -56,6 +56,12 @@ accepted.
   launch fields.
 - **R07 Verified hooks:** Required hook content is installed explicitly and
   verified before a rendered agent depends on it.
+- **R11 Control-plane replacement safety:** Stopping or killing `st2 up` must
+  not stop, restart, or replace any agent it launched. st2 can be reinstalled
+  and restarted while running agents continue unchanged; the replacement
+  control plane adopts those existing processes by stable identity and starts
+  only genuinely missing work. Stopping an agent is a separate, explicit
+  lifecycle action.
 
 ### Must externalize agent state and scope
 

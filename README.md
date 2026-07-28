@@ -172,6 +172,30 @@ For a foreground supervisor on any host:
 st2 up --catalog "$CATALOG" --host <host>
 ```
 
+### Staged control-plane replacement gate
+
+`st2 up` is a replaceable control plane, not the lifetime owner of an agent. Stopping it normally
+or killing it must leave every agent running. `st2 down` and declaration retirement are separate,
+explicit lifecycle actions and must never be used merely to replace the control plane.
+
+Every staged recovery or binary cutover must retain a pre-stop receipt of each agent's stable task
+identity, PID, and process-creation identity. Install the verified replacement binary atomically
+while those tasks continue running, restart the control plane, and do not accept the host until its
+first reconcile proves all of the following:
+
+- every pre-existing agent is still usable with the same PID and creation identity;
+- the replacement reports those agents as adopted and does not launch or duplicate them;
+- only genuinely missing declared work is launched;
+- explicit teardown remains the only path that stops an agent.
+
+The executable gate drives the real st2 binary and both PTY and exec backends through normal stop,
+forced kill, atomic binary replacement, adoption, a live-task heartbeat, and a duplicate-boot
+receipt:
+
+```sh
+cargo test --test nomad_survival --all-features
+```
+
 ## Messages, DING, status, and context
 
 Inside a managed task, `CATALOG`, `ST_ROOT`, and `ST_AGENT` are already set:

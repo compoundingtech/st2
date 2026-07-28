@@ -3,8 +3,9 @@
 //! st2 is a *decoupled* supervisor: stopping or crashing the runner MUST leave its running tasks
 //! alive, and a fresh runner MUST ADOPT them rather than cold-booting. The ONLY thing that kills a
 //! task is an explicit teardown (a `retired` spec). This guarantee is proven with real processes —
-//! spawning the real `st2` binary, killing it with SIGTERM *and* SIGKILL, and asserting the task pids
-//! survive and get re-adopted — not with a fake runner.
+//! installing the real `st2` binary, stopping it with SIGTERM *and* SIGKILL, atomically replacing
+//! that binary, and asserting the task pids and creation identities survive and get re-adopted
+//! without duplicate boots — not with a fake runner.
 //!
 //! Two spawn paths, both covered:
 //!   - `exec` — st2 supervises the process directly and detaches it with `setsid`, so it survives
@@ -16,6 +17,7 @@
 //! Tasks are `sleep 120` — long enough for the test, short enough to self-reap if cleanup is ever
 //! skipped; the fixture's `Drop` also force-kills anything it spawned, even on a panic.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,16 +47,27 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (catalog, xdg, pty_root) = (root.join("catalog"), root.join("xdg"), root.join("ptyroot"));
+        let (catalog, xdg, pty_root) =
+            (root.join("catalog"), root.join("xdg"), root.join("ptyroot"));
         for d in [&catalog, &xdg, &pty_root] {
             std::fs::create_dir_all(d).unwrap();
         }
-        Fixture { catalog, xdg, pty_root, pty_sessions: Default::default(), _tmp: tmp }
+        Fixture {
+            catalog,
+            xdg,
+            pty_root,
+            pty_sessions: Default::default(),
+            _tmp: tmp,
+        }
     }
 
     /// An `st2` invocation with this fixture's isolated state env.
     fn st2(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_st2"));
+        self.st2_from(Path::new(env!("CARGO_BIN_EXE_st2")))
+    }
+
+    fn st2_from(&self, binary: &Path) -> Command {
+        let mut c = Command::new(binary);
         c.env("XDG_STATE_HOME", &self.xdg)
             .env("PTY_ROOT", &self.pty_root)
             .env("ST_HOOKS", self.xdg.join("st2/hooks"))
@@ -65,7 +78,9 @@ impl Fixture {
     /// Write a one-task service agent (`kind` = "exec" | "pty"), optionally retired.
     fn write_agent(&self, identity: &str, kind: &str, retired: bool) {
         if kind == "pty" {
-            self.pty_sessions.borrow_mut().push(format!("{HOST}.{identity}.task"));
+            self.pty_sessions
+                .borrow_mut()
+                .push(format!("{HOST}.{identity}.task"));
         }
         let retired_line = if retired { "retired #true" } else { "" };
         let kdl = format!(
@@ -75,6 +90,34 @@ impl Fixture {
         let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, kdl).unwrap();
+    }
+
+    /// Write an agent with an external boot receipt and heartbeat. The receipt proves a replacement
+    /// control plane did not duplicate the task; a growing heartbeat proves the original task remains
+    /// usable while no control plane is running and after adoption.
+    fn write_replacement_agent(&self, identity: &str, kind: &str) -> (PathBuf, PathBuf) {
+        if kind == "pty" {
+            self.pty_sessions
+                .borrow_mut()
+                .push(format!("{HOST}.{identity}.task"));
+        }
+        let boots = self.xdg.join(format!("{identity}.boots"));
+        let heartbeat = self.xdg.join(format!("{identity}.heartbeat"));
+        let kdl = format!(
+            r##"agent "{identity}" {{
+  identity "{identity}"
+  host "{HOST}"
+  type "service"
+  {kind} "task" {{
+    command #"printf 'boot\n' >> "$XDG_STATE_HOME/{identity}.boots"; while :; do printf . >> "$XDG_STATE_HOME/{identity}.heartbeat"; sleep 0.05; done"#
+  }}
+}}
+"##
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+        (boots, heartbeat)
     }
 
     /// Write a compact agent whose primary pty id is exactly its bus identity — the shape emitted
@@ -132,16 +175,48 @@ impl Fixture {
     /// pid (which owns the session). Both survive st2's death when the property holds.
     fn task_pidfile(&self, kind: &str, identity: &str) -> PathBuf {
         match kind {
-            "exec" => self.xdg.join("st2").join(HOST).join("exec").join(format!("{HOST}.{identity}.task.pid")),
+            "exec" => self
+                .xdg
+                .join("st2")
+                .join(HOST)
+                .join("exec")
+                .join(format!("{HOST}.{identity}.task.pid")),
             "pty" => self.pty_root.join(format!("{HOST}.{identity}.task.pid")),
             other => panic!("unknown task kind {other}"),
         }
     }
 
+    /// Install the built binary at a deployment-like path owned by this fixture.
+    fn install_control_plane(&self) -> PathBuf {
+        let bin_dir = self.xdg.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let installed = bin_dir.join("st2");
+        std::fs::copy(env!("CARGO_BIN_EXE_st2"), &installed).unwrap();
+        installed
+    }
+
+    /// Atomically replace the installed binary and prove the selected file identity changed.
+    fn replace_control_plane(&self, installed: &Path) {
+        let before = binary_file_identity(installed);
+        let staged = installed.with_extension("next");
+        std::fs::copy(env!("CARGO_BIN_EXE_st2"), &staged).unwrap();
+        std::fs::File::open(&staged).unwrap().sync_all().unwrap();
+        std::fs::rename(&staged, installed).unwrap();
+        let after = binary_file_identity(installed);
+        assert_ne!(
+            after, before,
+            "the control-plane binary path did not select a replacement file"
+        );
+    }
+
     /// Spawn the real `st2 up` supervisor loop (long interval — the immediate first pass does the
     /// spawning; the loop just gives us a live runner to kill).
     fn spawn_loop(&self) -> Child {
-        self.st2()
+        self.spawn_loop_from(Path::new(env!("CARGO_BIN_EXE_st2")))
+    }
+
+    fn spawn_loop_from(&self, binary: &Path) -> Child {
+        self.st2_from(binary)
             .arg("up")
             .arg(&self.catalog)
             .args(["--host", HOST, "--interval", "60"])
@@ -153,7 +228,23 @@ impl Fixture {
 
     /// One `st2 up --once` pass; returns its stdout (where launched/adopted/torn-down is reported).
     fn up_once(&self) -> String {
-        let out = self.st2().arg("up").arg(&self.catalog).args(["--host", HOST, "--once"]).output().unwrap();
+        self.up_once_from(Path::new(env!("CARGO_BIN_EXE_st2")))
+    }
+
+    fn up_once_from(&self, binary: &Path) -> String {
+        let out = self
+            .st2_from(binary)
+            .arg("up")
+            .arg(&self.catalog)
+            .args(["--host", HOST, "--once"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "replacement `st2 up --once` failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }
@@ -211,8 +302,57 @@ fn read_alive(pidfile: &Path) -> bool {
     read_pid(pidfile).is_some_and(process_alive)
 }
 
+fn binary_file_identity(path: &Path) -> (u64, u64) {
+    let metadata = std::fs::metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn process_creation_identity(pid: i32) -> String {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after_name = &stat[stat.rfind(')').unwrap() + 1..];
+    let fields = after_name.split_whitespace().collect::<Vec<_>>();
+    // `/proc/<pid>/stat` field 22 is the process start time. The first field after `)` is field 3.
+    format!("linux-start-ticks:{}", fields[19])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_creation_identity(pid: i32) -> String {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ps could not inspect task pid {pid}"
+    );
+    let started = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        !started.is_empty(),
+        "ps returned no creation identity for task pid {pid}"
+    );
+    format!("ps-lstart:{started}")
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn line_count(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|contents| contents.lines().count())
+        .unwrap_or(0)
+}
+
 fn signal_pid(pid: i32, sig: &str) {
-    let ok = Command::new("kill").arg(format!("-{sig}")).arg(pid.to_string()).status().unwrap().success();
+    let ok = Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status()
+        .unwrap()
+        .success();
     assert!(ok, "failed to send SIG{sig} to pid {pid}");
 }
 
@@ -228,7 +368,11 @@ fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 fn pty_available() -> bool {
-    Command::new("pty").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("pty")
+        .arg("--help")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// These tests drive the real `st2` binary, whose SystemRunner lists `pty` sessions every reconcile
@@ -445,80 +589,123 @@ fn manual_pty_restart_preserves_every_st2_managed_environment_and_config_value()
     );
 }
 
-// ── the guarantee: killing the runner leaves the task alive; a fresh runner adopts it ─────────────
+// ── R11: replace the control plane while the unchanged task stays usable and is adopted ──────────
 
-fn runner_death_survives_and_readopts(kind: &str, signal: &str) {
+fn control_plane_replacement_preserves_agent(kind: &str, signal: &str) {
     // The whole scenario runs the real `st2` binary, whose SystemRunner lists `pty` sessions every
     // reconcile pass — so pty must be present even for an `exec` task, or every pass is skipped and
     // nothing spawns. Gate accordingly (fail-loud without pty; see `pty_gate`).
-    if !pty_gate(&format!("runner_death_survives_and_readopts({kind}/{signal})")) {
+    if !pty_gate(&format!(
+        "control_plane_replacement_preserves_agent({kind}/{signal})"
+    )) {
         return;
     }
     let fx = Fixture::new();
-    fx.write_agent("survivor", kind, false);
+    let (boots, heartbeat) = fx.write_replacement_agent("survivor", kind);
+    let installed = fx.install_control_plane();
 
-    // 1) A real runner spawns the task.
-    let mut runner = Runner(fx.spawn_loop());
+    // 1) The installed control plane spawns one usable task.
+    let mut runner = Runner(fx.spawn_loop_from(&installed));
     let pidfile = fx.task_pidfile(kind, "survivor");
     assert!(
-        poll_until(SPAWN_TIMEOUT, || read_alive(&pidfile)),
-        "{kind}/{signal}: runner never brought up a live task (pidfile {})",
+        poll_until(SPAWN_TIMEOUT, || {
+            read_alive(&pidfile) && line_count(&boots) == 1 && file_len(&heartbeat) > 0
+        }),
+        "{kind}/{signal}: runner never brought up one usable task (pidfile {})",
         pidfile.display()
     );
     let task_pid = read_pid(&pidfile).unwrap();
+    let task_creation = process_creation_identity(task_pid);
 
-    // 2) Kill the runner with the given signal and reap it, so it is provably gone.
+    // 2) Stop or force-kill the control plane and prove the original task keeps doing work.
     let runner_pid = runner.0.id() as i32;
     signal_pid(runner_pid, signal);
     runner.0.wait().unwrap();
-    assert!(!process_alive(runner_pid), "{kind}/{signal}: runner did not actually die");
-
-    // 3) THE PROPERTY: the task outlived its supervisor.
+    assert!(
+        !process_alive(runner_pid),
+        "{kind}/{signal}: runner did not actually die"
+    );
     assert!(
         process_alive(task_pid),
-        "{kind}/{signal}: task pid {task_pid} died with the runner — st2 is NOT nomad-decoupled"
+        "{kind}/{signal}: task pid {task_pid} died with the control plane"
+    );
+    let heartbeat_without_control_plane = file_len(&heartbeat);
+    assert!(
+        poll_until(Duration::from_secs(2), || {
+            file_len(&heartbeat) > heartbeat_without_control_plane
+        }),
+        "{kind}/{signal}: surviving task stopped being usable with no control plane"
     );
 
-    // 4) A fresh runner ADOPTS (report says adopted, never launched) and does not disturb the pid.
-    let out = fx.up_once();
+    // 3) Reinstall st2 atomically while the task is live, and declare one genuinely missing task.
+    fx.replace_control_plane(&installed);
+    fx.write_agent("newcomer", kind, false);
+
+    // 4) The replacement adopts the survivor unchanged and starts only the genuinely missing work.
+    let heartbeat_before_adoption = file_len(&heartbeat);
+    let out = fx.up_once_from(&installed);
+    let newcomer_id = format!("{HOST}.newcomer.task");
     assert!(
         out.contains("adopted (1): survivor"),
-        "{kind}/{signal}: fresh runner did not adopt the surviving task; output:\n{out}"
+        "{kind}/{signal}: replacement did not adopt the surviving task; output:\n{out}"
     );
     assert!(
-        !out.contains("launched"),
-        "{kind}/{signal}: fresh runner COLD-BOOTED (launched) instead of adopting; output:\n{out}"
+        out.contains(&format!("launched (1): {newcomer_id}")),
+        "{kind}/{signal}: replacement did not start exactly the missing task; output:\n{out}"
+    );
+    assert_eq!(
+        read_pid(&pidfile),
+        Some(task_pid),
+        "{kind}/{signal}: adoption replaced the survivor pid"
+    );
+    assert_eq!(
+        process_creation_identity(task_pid),
+        task_creation,
+        "{kind}/{signal}: adoption replaced the survivor creation identity"
+    );
+    assert_eq!(
+        line_count(&boots),
+        1,
+        "{kind}/{signal}: replacement control plane duplicated the survivor"
     );
     assert!(
-        process_alive(task_pid),
-        "{kind}/{signal}: adoption changed/killed the task pid {task_pid} (cold boot, not adopt)"
+        poll_until(Duration::from_secs(2), || {
+            file_len(&heartbeat) > heartbeat_before_adoption
+        }),
+        "{kind}/{signal}: adopted task is no longer usable"
+    );
+    assert!(
+        read_alive(&fx.task_pidfile(kind, "newcomer")),
+        "{kind}/{signal}: the genuinely missing task was reported launched but is not alive"
     );
 }
 
 #[test]
-fn sigterm_runner_leaves_exec_task_alive_and_readopts() {
-    runner_death_survives_and_readopts("exec", "TERM");
+fn normal_stop_and_binary_replacement_adopt_exec_unchanged_without_duplicate() {
+    control_plane_replacement_preserves_agent("exec", "TERM");
 }
 
 #[test]
-fn sigkill_runner_leaves_exec_task_alive_and_readopts() {
-    runner_death_survives_and_readopts("exec", "KILL");
+fn forced_kill_and_binary_replacement_adopt_exec_unchanged_without_duplicate() {
+    control_plane_replacement_preserves_agent("exec", "KILL");
 }
 
 #[test]
-fn sigterm_runner_leaves_pty_task_alive_and_readopts() {
-    runner_death_survives_and_readopts("pty", "TERM");
+fn normal_stop_and_binary_replacement_adopt_pty_unchanged_without_duplicate() {
+    control_plane_replacement_preserves_agent("pty", "TERM");
 }
 
 #[test]
-fn sigkill_runner_leaves_pty_task_alive_and_readopts() {
-    runner_death_survives_and_readopts("pty", "KILL");
+fn forced_kill_and_binary_replacement_adopt_pty_unchanged_without_duplicate() {
+    control_plane_replacement_preserves_agent("pty", "KILL");
 }
 
 // ── the inverse: only an explicit teardown kills; a plain stop never does ──────────────────────────
 
 fn explicit_teardown_kills_but_plain_stop_does_not(kind: &str) {
-    if !pty_gate(&format!("explicit_teardown_kills_but_plain_stop_does_not({kind})")) {
+    if !pty_gate(&format!(
+        "explicit_teardown_kills_but_plain_stop_does_not({kind})"
+    )) {
         return;
     }
     let fx = Fixture::new();
@@ -526,18 +713,27 @@ fn explicit_teardown_kills_but_plain_stop_does_not(kind: &str) {
 
     let mut runner = Runner(fx.spawn_loop());
     let pidfile = fx.task_pidfile(kind, "survivor");
-    assert!(poll_until(SPAWN_TIMEOUT, || read_alive(&pidfile)), "{kind}: runner never brought up a task");
+    assert!(
+        poll_until(SPAWN_TIMEOUT, || read_alive(&pidfile)),
+        "{kind}: runner never brought up a task"
+    );
     let task_pid = read_pid(&pidfile).unwrap();
 
     // A plain stop (SIGTERM the supervisor) must NOT kill the task.
     signal_pid(runner.0.id() as i32, "TERM");
     runner.0.wait().unwrap();
-    assert!(process_alive(task_pid), "{kind}: a plain runner stop killed the task — it must not");
+    assert!(
+        process_alive(task_pid),
+        "{kind}: a plain runner stop killed the task — it must not"
+    );
 
     // Retiring the spec is the one action that tears the task down.
     fx.write_agent("survivor", kind, true);
     let out = fx.up_once();
-    assert!(out.contains("torn down"), "{kind}: retiring the spec did not tear the task down; output:\n{out}");
+    assert!(
+        out.contains("torn down"),
+        "{kind}: retiring the spec did not tear the task down; output:\n{out}"
+    );
     assert!(
         poll_until(DEATH_TIMEOUT, || !process_alive(task_pid)),
         "{kind}: explicit teardown did not actually kill task pid {task_pid}"
