@@ -161,6 +161,29 @@ These terms are refined per harness; see the DING subsystem's nodes.
 - **Resource** — a durable, listable record of high-value output an agent
   produced, so a peer can find it.
 
+### Dispositions
+
+Words for how a mechanism behaves when it does not know. They are defined here
+once because several subsystems depend on them and each would otherwise state
+its own version.
+
+- **Fail-closed** — when a mechanism cannot prove the condition it needs, it
+  resolves toward refusal rather than toward action. Absence of evidence that
+  something is unsafe is not evidence that it is safe. The consequence worth
+  stating plainly: widening what counts as *proven* requires evidence, while
+  widening what counts as *unproven* is always safe. This is a property of a
+  mechanism, not a wish about one — a mechanism is fail-closed only if its
+  unknown path is the refusing path.
+- **Fail-open** — the opposite, and always a defect where it is not a stated
+  choice: an unproven condition resolving toward action. Naming it matters
+  because it is usually reached by removing a check that was accidentally
+  load-bearing, not by writing a permissive one.
+
+This document defines the terms; it does not impose them. Which surfaces are
+obliged to be fail-closed is stated in those subsystems' own requirements, so
+the obligation stays where it can be argued with and the definition does not
+drift across restatements.
+
 ### Health and evidence
 
 - **Doctor** — the on-demand health check for one catalog as seen from one host.
