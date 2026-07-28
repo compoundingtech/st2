@@ -23,11 +23,15 @@ The retirement guarantee stated here is the one already pinned in
   though they live in the same synced catalog.
   - Validation: implementation evidence — the per-declaration loop skips any
     declaration whose resolved host differs from the checked host.
-- **DOCTOR-A02 The runtime is authoritative for liveness:** Whether a declared
-  task exists and is running is decided by the task runtime's own session list,
-  not by st2's records of what it once launched.
-  - Validation: implementation evidence, plus `tests/doctor.rs` — the retirement
-    outcomes are driven entirely by a substituted session listing.
+- **DOCTOR-A02 Liveness has two sources, one per backend:** A terminal-backed
+  task's liveness comes from the task runtime's own session list. A
+  terminal-free task's liveness comes from st2's own recorded process IDs plus a
+  liveness probe on each recorded ID — here st2 is consulting what it once
+  launched, not what is running. A record that is missing, unreadable, or
+  unparseable is skipped rather than reported, so a live terminal-free process
+  whose record is gone is invisible and reads as dead.
+  - Validation: implementation evidence. No test reaches the terminal-free
+    path — `tests/doctor.rs` substitutes only the terminal-backed listing.
 - **DOCTOR-A03 Presence is a file beside the declaration:** An agent's presence
   is read from a file in the declaration's own directory, written by that
   agent's own refresher.
@@ -45,10 +49,12 @@ The retirement guarantee stated here is the one already pinned in
 ## Acceptable Tradeoffs
 
 - **DOCTOR-T01 One hard stop:** Doctor reports every problem it can still
-  evaluate rather than stopping at the first, with a single exception: an
-  unreadable task runtime ends the run, because every remaining check depends on
-  it. A partial report naming the real blocker is preferable to a full report
-  built on a failed probe.
+  evaluate rather than stopping at the first, with a single exception: a failed
+  read of the terminal-backed runtime ends the run, because every remaining
+  check depends on it. A partial report naming the real blocker is preferable to
+  a full report built on a failed probe. The terminal-free side has no
+  equivalent stop — it reports no failure at all, so unreadable records arrive
+  at the per-declaration checks as an ordinary empty result.
 - **DOCTOR-T02 Flat severity:** Every problem counts the same and any one of
   them fails the run. Callers express the only tier that exists by choosing
   whether to require a supervisor.
@@ -69,11 +75,15 @@ The retirement guarantee stated here is the one already pinned in
 - **DOCTOR-R03 Declared tasks must be alive:** Every task declared by a
   non-retired declaration pinned to the checked host must have a live session in
   the runtime. A missing session and an exited session are the same problem.
-- **DOCTOR-R04 Presence must be readable and unrotted:** Every non-retired
+- **DOCTOR-R04 Presence must exist and stay unrotted:** Every non-retired
   declaration pinned to the checked host must have a presence file, and that
   file must not have decayed to the derived unknown state. Every state an agent
   can actually declare is healthy, including `offline` — doctor checks that
-  presence is being maintained, not what it says.
+  presence is being maintained, not what it says. It does not check that the
+  file is readable or well-formed: reading presence falls back to `offline` for
+  a file that cannot be read or parsed, so a fresh but broken file is
+  indistinguishable from a declared `offline`. Staleness is evaluated before
+  the contents are read, so a broken file that is also old still fails.
 - **DOCTOR-R05 Retirement is complete only when nothing remains:** A retired
   declaration is healthy only once none of its declared task IDs appears in the
   runtime at all. A live session and a dead session record are both incomplete
@@ -94,9 +104,11 @@ The retirement guarantee stated here is the one already pinned in
 - **DOCTOR-R09 Diagnosis without repair:** Doctor must not launch, stop, reap,
   reclaim, or materialize anything. It reports; recovery is a separate,
   explicit action.
-- **DOCTOR-R10 Bounded:** Doctor must terminate even when the task runtime is
-  wedged. An unresponsive runtime is a reported problem, not a hung health
-  check.
+- **DOCTOR-R10 The session probe is bounded:** Reading the terminal-backed
+  runtime's session list must terminate on a deadline, so a wedged runtime
+  becomes a reported problem rather than a hung health check. Enumerating
+  terminal-free task records carries no such deadline; it is local filesystem
+  work and is bounded only by the filesystem responding.
 - **DOCTOR-R11 Must not touch its caller's stdin:** Doctor and every process it
   runs must leave the caller's standard input unread. A health check that blocks
   on an inherited pipe is indistinguishable from an unhealthy fleet.

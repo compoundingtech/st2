@@ -13,8 +13,8 @@ for the CLI help or the tests.
 
 Doctor resolves a catalog and a host, runs a fixed sequence of checks, prints
 one line per check, and exits non-zero if any check failed. It reads catalog
-files, one lock file, the task runtime's session list, and per-agent presence
-files. It writes nothing.
+files, one lock file, the task runtime's session list, st2's own machine-local
+process-ID records, and per-agent presence files. It writes nothing.
 
 Doctor is not a supervisor and not a repair tool. It never reconciles, launches,
 tears down, or materializes.
@@ -38,12 +38,18 @@ which host produced it.
 | 1 | required tooling | PATH entries | a required tool does not resolve to a file |
 | 2 | supervision | `<catalog>/.st2.<host>.lock` | the recorded owner is dead, or no lock exists and one was demanded |
 | 3 | catalog structure | every declaration-shaped file in the catalog | a file fails to parse or resolve an identity |
-| 4 | task runtime readable | the runtime's session list | the listing fails or exceeds its bound — ends the run |
+| 4 | task runtime readable | the terminal-backed runtime's session list | that probe fails or exceeds its bound — ends the run |
 | 5 | per declaration | declarations pinned to the checked host | see below |
 
 Checks 1 through 3 accumulate problems and continue. Check 4 is the single hard
 stop (DOCTOR-T01): without a session list, nothing in check 5 can be evaluated,
 so doctor fails immediately with the problems already found.
+
+Only the terminal-backed half of check 4 can trigger that stop. Terminal-free
+enumeration reports no failure of any kind — an unreadable state directory
+yields an empty result rather than an error — so it passes check 4 in every
+case and its problems, if any, surface later as wrong per-declaration verdicts
+(DOCTOR-DQ6).
 
 ### 1. Required tooling
 
@@ -79,8 +85,11 @@ contents — are not problems here; they belong to validation.
 
 ### 4. Task runtime
 
-One bounded, non-interactive probe collects the runtime's view of every session.
-Three properties make it safe to run from anywhere:
+The session view is assembled from two backends with different failure and
+timing characteristics, and the difference matters to every verdict in check 5.
+
+**Terminal-backed tasks.** One bounded, non-interactive probe asks the runtime
+for its sessions. Three properties make it safe to run from anywhere:
 
 - standard input is `/dev/null`, so the probe cannot consume or block on the
   caller's stdin (DOCTOR-R11);
@@ -93,8 +102,21 @@ Failure — including the bound being exceeded — is reported as a problem agai
 `task runtime readable`, carrying the underlying error (for a bound, the elapsed
 limit), and the run ends there.
 
-The session list is the union of the terminal-backed and terminal-free backends.
-From it doctor derives two views used by check 5:
+**Terminal-free tasks.** These are enumerated instead of probed. st2 records a
+process ID per task when it launches one, so the enumeration reads its own
+record directory, parses each recorded ID, and asks the kernel whether that
+process is alive. Two consequences follow, and neither is a bug doctor can see:
+
+- It is not bounded (DOCTOR-R10). There is no deadline, only however long the
+  filesystem takes to answer.
+- It cannot fail. An unreadable record directory returns an empty result, and an
+  individual record that is missing, unreadable, or unparseable is skipped
+  silently. So a terminal-free task whose record is gone is reported dead, and
+  a whole unreadable record directory looks exactly like a host with no
+  terminal-free tasks.
+
+The session list is the union of the two backends. From it doctor derives two
+views used by check 5:
 
 - **alive:** the IDs whose session is running.
 - **present:** every ID the runtime knows about, mapped to whether it is alive.
@@ -107,7 +129,15 @@ no task check, no presence check, no output line.
 
 A task's runtime ID is its explicitly declared ID, or otherwise the declaration's
 bus ID joined with the task name. A declaration authored in the compact form —
-the agent is itself one terminal task — carries the bus ID as that task's ID.
+the agent is itself one terminal task — stores the bus ID as that task's ID.
+
+That stored ID is computed when the declaration is loaded, from the host the
+declaration itself supplies through its contents or its path, before any checked
+host is known. A declaration that names no host and sits at a path that supplies
+none therefore stores a bare identity as its task ID, while the label doctor
+reports for it defaults the host to the checked host. The two disagree: doctor
+looks the task up under the stored bare identity and reports it under the
+host-qualified name.
 
 **Retired declarations** get exactly one check: no declared task ID appears in
 **present**. Because it consults the full present map rather than the alive set,
@@ -174,6 +204,10 @@ DOCTOR-R01, DOCTOR-R03, DOCTOR-R07, DOCTOR-R08, DOCTOR-R09, DOCTOR-R12, and
 DOCTOR-R13 hold by construction in the doctor path and are exercised indirectly
 by the tests above, but no test isolates them.
 
+Every test above substitutes the terminal-backed runtime and leaves the
+terminal-free record directory empty. Nothing in this table is evidence for
+terminal-free behaviour (DOCTOR-A02, DOCTOR-DQ6).
+
 ## Open design questions
 
 - **DOCTOR-DQ1 Read-only is asserted, not proven:** DOCTOR-R08 and DOCTOR-R09
@@ -201,3 +235,13 @@ by the tests above, but no test isolates them.
   which agent is unhealthy, rather than that something is, must parse the human
   lines. Whether doctor should emit a machine-readable report — and if so
   whether it shares a shape with the other inspection surfaces — is unsettled.
+- **DOCTOR-DQ6 The terminal-free backend fails open:** Every guarantee in check
+  4 — the bound, the hard stop, the reported error — covers the terminal-backed
+  probe only. The terminal-free side has no deadline and no error path, so its
+  failures do not become problems; they become wrong answers. An unreadable
+  record directory reports every live terminal-free task dead, and reports a
+  retired declaration's terminal-free tasks fully absent, which is the one
+  verdict retirement health exists to prevent. Whether that asymmetry is
+  deliberate — the records are machine-local and cheap to read, so failure was
+  perhaps judged impossible — or an unnoticed gap is unsettled. Nothing in the
+  code says, and no test covers the terminal-free path at all.
