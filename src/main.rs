@@ -566,6 +566,11 @@ fn main() -> Result<()> {
             )
         }
         Command::Down { root, host } => {
+            if root.is_none() && catalog_path.is_none() {
+                anyhow::bail!(
+                    "refusing implicit teardown target; pass --catalog <path> or an explicit catalog path"
+                );
+            }
             let root = catalog_arg(root)?;
             down_cmd(&root, host)
         }
