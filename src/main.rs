@@ -148,10 +148,11 @@ enum Command {
         extra_arg: Vec<String>,
     },
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
-    /// tasks (stopping/crashing st2 never does). Idempotent.
+    /// tasks (stopping/crashing st2 never does). Idempotent. Its target must be named — unlike every
+    /// other verb, it does not fall back to $CATALOG or the standard catalog.
     Down {
-        /// Optional positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
-        /// standard st2 catalog.
+        /// Positional catalog/spec path to tear down. Required unless --catalog is passed; teardown
+        /// never infers its target from $CATALOG or the standard st2 catalog.
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
         /// Host to tear down. Defaults to the local hostname.
@@ -562,7 +563,7 @@ fn main() -> Result<()> {
             )
         }
         Command::Down { root, host } => {
-            let root = catalog_arg(root)?;
+            let root = down_target(root, catalog_path.as_deref())?;
             down_cmd(&root, host)
         }
         Command::Env { root } => {
@@ -826,6 +827,32 @@ fn initialize_catalog_env(explicit: Option<&Path>) -> Result<()> {
         unsafe { std::env::set_var("CATALOG", path) };
     }
     Ok(())
+}
+
+/// Teardown resolves its target from argv alone — `--catalog <path>` or the positional path — and
+/// never from `$CATALOG` or the standard default.
+///
+/// Inheriting a catalog is right for the read-only verbs, and for `up`, which is additive and refuses
+/// to start while another supervisor holds the host lock. `st2 down` is the only thing that ends
+/// tasks, which is what makes "explicit teardown" a lifecycle guarantee (R11) rather than a habit —
+/// and neither inherited source is a choice the operator made *here*: st2 exports `CATALOG` into
+/// every task it launches, and the standard default is derived from `$HOME`, so it can never be
+/// absent. Inferring one would make a forgotten argument indistinguishable from "tear down this
+/// host's fleet", with no dry-run, no confirmation, and nothing to undo it.
+fn down_target(positional: Option<PathBuf>, flag: Option<&Path>) -> Result<PathBuf> {
+    // clap makes these mutually exclusive.
+    if let Some(path) = positional.as_deref().or(flag) {
+        return absolute_catalog_path(path);
+    }
+    let inferred = catalog_root_for_env()
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|_| "<none>".to_string());
+    anyhow::bail!(
+        "refusing to tear down an inferred catalog.\n\
+         `st2 down` is the only thing that ends tasks, so its target is named, never inherited.\n\
+         It would have used {inferred} (from $CATALOG, else the standard default catalog).\n\
+         Name it if that is what you mean:  st2 down --catalog {inferred}"
+    )
 }
 
 /// Resolve an optional legacy positional path, otherwise use the shared catalog selection.

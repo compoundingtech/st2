@@ -40,7 +40,8 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog
 ```
 
 Every catalog-aware command accepts `--catalog`; otherwise st2 uses `$CATALOG`, then that standard
-location.
+location. `st2 down` is the exception: teardown is the only thing that ends tasks, so it takes its
+target from `--catalog` or a path argument and refuses to infer one.
 
 ### A catalog may declare its session registry
 
@@ -283,11 +284,17 @@ the correctness fallback.
 
 ## Cleanup
 
-Explicit teardown is the only operation that ends declared tasks:
+Explicit teardown is the only operation that ends declared tasks, and it never infers which catalog
+to end:
 
 ```sh
 st2 down --catalog "$CATALOG" --host <host>
 ```
+
+Without `--catalog` or a path argument, `st2 down` refuses and prints the catalog it would have used.
+`$CATALOG` is set inside every managed task, and the standard default is derived from `$HOME`, so an
+inferred target would always exist — a forgotten argument would read as "tear down this host's
+fleet".
 
 On Linux, remove the supervisor service after teardown when it is no longer wanted:
 

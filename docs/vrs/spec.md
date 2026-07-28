@@ -59,6 +59,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   binary, starts the control plane again, and proves adoption with the same
   agent PID/creation identity and no duplicate process.
 
+  Teardown, the one action that ends tasks, resolves its catalog from the
+  command line alone. Every other verb may inherit `$CATALOG` or fall back to
+  the standard catalog; both are ambient — st2 exports `CATALOG` into every task
+  it launches, and the standard default is derived from `$HOME` — so an inferred
+  teardown target always exists and a missing argument would end a live fleet.
+
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
   can share a single registry across catalogs. Resolution is an exported
