@@ -1,0 +1,98 @@
+name: Publish exact st2 f272019
+
+on:
+  push:
+    branches: [release-f272019-assets]
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_SHA: f2720190096d7dcf9bb3256222cbdf5efbe36e4f
+  SHORT_SHA: f272019
+  TAG: v0.1.0+f272019
+  ARCHIVE: st2-0.1.0-f272019-x86_64-unknown-linux-gnu.tar.gz
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Build exact source with Nix
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          nix build .#packages.x86_64-linux.st2 --print-build-logs
+          ./result/bin/st2 --version | tee st2.version.txt
+          grep -F "$SHORT_SHA" st2.version.txt
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          install -m 0755 result/bin/st2 st2
+          tar -czf "$ARCHIVE" st2
+          sha256sum "$ARCHIVE" > SHA256SUMS
+          test "$(tar -tzf "$ARCHIVE")" = "st2"
+      - name: Publish exact annotated tag and prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
+          else
+            git tag -a "$TAG" "$SOURCE_SHA" -m "st2 0.1.0+f272019"
+            git push origin "refs/tags/$TAG"
+          fi
+          cat > release-notes.md <<'EOF'
+          Exact source: `f2720190096d7dcf9bb3256222cbdf5efbe36e4f`.
+
+          This recovery release contains the Linux x86_64 st2 control-plane binary. It does not
+          include or authorize a host build. Verify `SHA256SUMS` before staging.
+
+          Replacement safety: stop only the st2 control plane, never `st2 down`; preserve the live
+          binary as rollback; stage the verified replacement on the same filesystem and select it
+          atomically; restart the control plane; then require adoption with unchanged agent PID and
+          creation identity and no duplicate before accepting the host.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --target "$SOURCE_SHA" \
+              --prerelease \
+              --title "st2 0.1.0+f272019" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --target "$SOURCE_SHA" \
+              --prerelease \
+              --title "st2 0.1.0+f272019" \
+              --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" "$ARCHIVE" SHA256SUMS --clobber
+      - name: Verify fresh release downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir verified-download
+          gh release download "$TAG" --dir verified-download \
+            --pattern "$ARCHIVE" \
+            --pattern SHA256SUMS
+          (
+            cd verified-download
+            sha256sum --check SHA256SUMS
+            test "$(tar -tzf "$ARCHIVE")" = "st2"
+            tar -xzf "$ARCHIVE"
+            test "$(sha256sum "$ARCHIVE" | cut -d ' ' -f 1)" = \
+              "$(cut -d ' ' -f 1 SHA256SUMS)"
+            ./st2 --version | tee verified.version.txt
+            grep -F "$SHORT_SHA" verified.version.txt
+          )
