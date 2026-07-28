@@ -25,6 +25,42 @@ pub(crate) fn watch_recursive_mutations(
     Some(watcher)
 }
 
+/// Watch only declaration inputs for the supervisor. Runtime state (PTY registry, bus, logs,
+/// locks, inboxes, and generated materializations) must never wake reconciliation.
+pub(crate) fn watch_catalog_declarations(
+    root: &Path,
+    tx: Sender<()>,
+) -> Option<notify::RecommendedWatcher> {
+    let root = root.to_path_buf();
+    let callback_root = root.clone();
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        if result.is_ok_and(|event| {
+            is_mutation(&event)
+                && event
+                    .paths
+                    .iter()
+                    .any(|path| is_declaration_path(&callback_root, path))
+        }) {
+            let _ = tx.send(());
+        }
+    })
+    .ok()?;
+    watcher.watch(&root, RecursiveMode::Recursive).ok()?;
+    Some(watcher)
+}
+
+fn is_declaration_path(root: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let mut components = rel.components();
+    if matches!(
+        components.next().and_then(|c| c.as_os_str().to_str()),
+        Some("_templates")
+    ) {
+        return true;
+    }
+    path.file_name().and_then(|n| n.to_str()) == Some("agent.kdl")
+}
+
 fn is_mutation(event: &Event) -> bool {
     matches!(
         event.kind,
@@ -58,6 +94,31 @@ mod tests {
         ] {
             assert!(!is_mutation(&Event::new(kind)), "{kind:?} must stay quiet");
         }
+    }
+
+    #[test]
+    fn declaration_filter_ignores_runtime_state() {
+        let root = Path::new("/catalog");
+        assert!(is_declaration_path(
+            root,
+            Path::new("/catalog/team/agent.kdl")
+        ));
+        assert!(is_declaration_path(
+            root,
+            Path::new("/catalog/_templates/base.kdl")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            Path::new("/catalog/pty/session.json")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            Path::new("/catalog/bus/inbox/msg")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            Path::new("/catalog/team/rendered.kdl")
+        ));
     }
 
     #[cfg(target_os = "linux")]

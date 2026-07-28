@@ -831,14 +831,9 @@ fn gate_codex_launches<'a, V, F>(
     let mut workspaces = Vec::new();
     let mut gated_agents = Vec::new();
     for launch in &plan.launch {
-        let Some(agent) = launch
-            .tasks
-            .iter()
-            .find(|target| {
-                target.name == "agent"
-                    && crate::hooks::command_invokes_codex(&target.command)
-            })
-        else {
+        let Some(agent) = launch.tasks.iter().find(|target| {
+            target.name == "agent" && crate::hooks::command_invokes_codex(&target.command)
+        }) else {
             continue;
         };
         let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
@@ -1118,7 +1113,7 @@ fn up_loop_until(
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     let (tx, rx) = channel::<()>();
-    let _watcher = crate::watch::watch_recursive_mutations(root, tx);
+    let _watcher = crate::watch::watch_catalog_declarations(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
@@ -1907,5 +1902,4 @@ mod tests {
         assert!(!h.is_empty());
         assert!(!h.contains('.'), "short name only, got {h}");
     }
-
 }
