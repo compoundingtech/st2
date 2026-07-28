@@ -42,6 +42,28 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog
 Every catalog-aware command accepts `--catalog`; otherwise st2 uses `$CATALOG`, then that standard
 location.
 
+### A catalog may declare its session registry
+
+A catalog's tasks live in `<catalog>/pty` unless the catalog says otherwise. To put several catalogs
+in one host-wide `pty` registry — so any viewer enumerates every session without knowing which
+catalog produced it — declare it in `<catalog>/catalog.kdl`:
+
+```kdl
+catalog {
+  pty-root "/run/agents/pty"
+}
+```
+
+`pty-root` accepts `$VAR`/`$CATALOG`; a relative value anchors at the catalog root. The resolution
+order is an exported `PTY_ROOT` (a deliberate override, used by `st2 eval` for a short socket path),
+then this declaration, then `<catalog>/pty`. A catalog that declares nothing is unaffected.
+
+Prefer the declaration over exporting `PTY_ROOT` into readers: a reader that misses the export
+resolves a different registry and reports live agents as dead. When adopting it on a host whose
+systemd unit was installed with an ambient `PTY_ROOT`, reinstall the unit without one
+(`st2 service install`) — the export still wins, and leaving it pins the supervisor to the old
+registry while everything else follows the catalog.
+
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
 verifies that receipt for Codex launches; any local workspace render that actually references
