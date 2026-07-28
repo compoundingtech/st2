@@ -53,6 +53,9 @@ enum Command {
         /// Materialize every local agent's render block and exit without reconciling or spawning.
         #[arg(long, conflicts_with = "once")]
         materialize_only: bool,
+        /// Limit materialization/reconciliation to one declared agent identity.
+        #[arg(long)]
+        agent: Option<String>,
         /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
         /// immediately regardless).
         #[arg(long, default_value_t = 30)]
@@ -519,9 +522,10 @@ fn main() -> Result<()> {
             once,
             materialize_only,
             interval,
+            agent,
         } => {
             let root = catalog_arg(root)?;
-            up(&root, host, once, materialize_only, interval)
+            up(&root, host, once, materialize_only, interval, agent)
         }
         Command::Message(cmd) => message_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
@@ -992,9 +996,9 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                         .unwrap_or_else(|| format!("{bus_id}.{}", task.name))
                 })
                 .filter_map(|id| {
-                    present.get(&id).map(|alive| {
-                        format!("{id} ({})", if *alive { "alive" } else { "dead" })
-                    })
+                    present
+                        .get(&id)
+                        .map(|alive| format!("{id} ({})", if *alive { "alive" } else { "dead" }))
                 })
                 .collect::<Vec<_>>();
             report_check(
@@ -1683,6 +1687,7 @@ fn up(
     once: bool,
     materialize_only: bool,
     interval: u64,
+    agent: Option<String>,
 ) -> Result<()> {
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
@@ -1699,7 +1704,12 @@ fn up(
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     if materialize_only {
-        let found = discover(&catalog_root);
+        let mut found = discover(&catalog_root);
+        if let Some(identity) = agent.as_deref() {
+            found
+                .specs
+                .retain(|spec| spec.identity == identity || spec.bus_id(&this_host) == identity);
+        }
         for warning in &found.warnings {
             eprintln!("warning: {warning}");
         }
