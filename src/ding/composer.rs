@@ -153,3 +153,177 @@ pub(super) fn classify_composer(screen: &str, expected: &str) -> ComposerState {
         // No maintained composer is locatable, so nothing is proven either way.
         .unwrap_or(ComposerState::Ambiguous)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ding::fixtures::*;
+
+    #[test]
+    fn maintained_composer_classifiers_require_exact_idle_state() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        assert_eq!(
+            classify_composer(&idle_codex_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&staged_codex_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_composer(&human_codex_screen(), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!("Create a plan?\r\n{}", staged_codex_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer(&idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&idle_claude_screen_without_hint(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_composer(&staged_claude_screen("a changed human composer"), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!("Esc to interrupt\r\n{}", staged_claude_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+        // A used pane must classify exactly like a fresh one: neither the scrolled-away banner, the
+        // empty composer, nor the missing cycle hint is evidence that Return is unsafe.
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen_with_hint(), expected),
+            ComposerState::EmptySafe
+        );
+        // Only the bypass footer carries `permissions on`, so an otherwise identical accept-edits
+        // pane is never positively idle. It stays unsubmitted rather than being proven safe.
+        assert_eq!(
+            classify_composer(&mature_idle_accept_edits_claude_screen(), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(&mature_staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        // The same pane shape must still fail closed on a human draft and on an active turn.
+        assert_eq!(
+            classify_composer(
+                &mature_staged_claude_screen("a changed human composer"),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "Esc to interrupt\r\n{}",
+                    mature_staged_claude_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer("unknown terminal pixels", expected),
+            ComposerState::Ambiguous
+        );
+    }
+
+    /// Scrollback that merely looks like a composer must never outrank the live one. The paste and
+    /// the Return always go to the pane's real bottom composer, so misreading transcript text as
+    /// "idle" or "already staged" is a wrong positive: it can type into, or submit, a human draft.
+    #[test]
+    fn transcript_composers_never_outrank_the_live_bottom_composer() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        // The live Codex composer holds a human draft in both cases, so both must stay `Changed`.
+        // An empty transcript row would otherwise read as positively-empty and allow the paste.
+        assert_eq!(
+            classify_composer(
+                &codex_screen_below_claude_transcript("", &human_codex_screen()),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        // A transcript row holding the exact notice is the worse case: it would otherwise satisfy
+        // the two adjacent exact observations and send a bare Return to the draft.
+        assert_eq!(
+            classify_composer(
+                &codex_screen_below_claude_transcript(expected, &human_codex_screen()),
+                expected
+            ),
+            ComposerState::Changed
+        );
+
+        // The rule is positional, not a Codex preference: a genuine Claude pane whose scrollback
+        // shows a captured Codex composer still classifies from its own live Claude composer.
+        assert_eq!(
+            classify_composer(
+                &format!("{}\r\n{}", staged_codex_screen("a stale pasted codex draft"), mature_idle_claude_screen()),
+                expected
+            ),
+            ComposerState::EmptySafe
+        );
+    }
+
+    /// The two locators do not natively work in the same units. Codex is matched with `rfind` over
+    /// the raw screen, so it reports a **byte offset** inflated by every escape sequence above it;
+    /// Claude is matched over stripped lines, so it reports a **row**. Comparing those directly
+    /// picks Codex almost always, since an offset dwarfs a row — including when the live composer
+    /// is Claude's and the Codex match is stale scrollback. Both must be normalized to a row.
+    ///
+    /// On the screen below, measured: the Codex composer sits at byte offset 560 but row 10, while
+    /// the live Claude composer is row 20. Comparing row against offset picks Codex, so this would
+    /// classify from a pasted draft instead of the real composer.
+    #[test]
+    fn composer_positions_are_compared_as_rows_not_raw_byte_offsets() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        assert_eq!(
+            classify_composer(&live_claude_below_escape_heavy_codex_transcript(), expected),
+            ComposerState::EmptySafe
+        );
+    }
+
+    /// Normalizing the Codex offset means counting newlines in the *stripped* prefix, which is only
+    /// faithful if stripping preserves them. It does for well-formed input. It does not for an
+    /// unterminated sequence: the CSI scanner runs until a byte in `0x40..=0x7e` and `\n` is `0x0a`,
+    /// so it eats newlines, and an unterminated OSC consumes to the end of input. Both are recorded
+    /// here so a future change to `strip_ansi` cannot silently shift every row.
+    #[test]
+    fn stripping_preserves_newlines_for_well_formed_sequences_only() {
+        let nl = |text: &str| strip_ansi(text).matches('\n').count();
+
+        assert_eq!(
+            nl("\x1b[1;32mone\x1b[0m\r\n\x1b[2Ctwo\x1b[0m\r\n\x1b[1mthree\x1b[0m\r\n"),
+            3
+        );
+        // Unterminated CSI: the newline is consumed while hunting for a final byte.
+        assert_eq!(nl("before\r\n\x1b[999999\r\nafter\r\n"), 2);
+        // Unterminated OSC: everything to the end of input is consumed.
+        assert_eq!(nl("before\r\n\x1b]0;no terminator\r\nafter\r\n"), 1);
+    }
+}

@@ -144,3 +144,53 @@ fn interaction_blocked(plain: &str) -> bool {
         || plain.contains("Create a plan?")
         || looks_like_choice_menu(plain)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ding::composer::{ComposerState, classify_composer};
+    use crate::ding::fixtures::*;
+
+    /// An in-flight Claude turn ships no interrupt hint, so the composer being empty is not proof
+    /// that Return is safe — the pane is working. The finished-turn line looks almost identical and
+    /// sits above every genuinely idle composer, so both directions are pinned here.
+    #[test]
+    fn an_in_flight_turn_blocks_return_but_a_finished_one_does_not() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for status in ACTIVE_TURN_STATUS {
+            // Empty composer mid-turn: positively empty, but not safe.
+            assert_ne!(
+                classify_composer(&mid_turn_claude_screen(status, "❯\u{00a0}"), expected),
+                ComposerState::EmptySafe,
+                "active turn must not be EmptySafe: {status}"
+            );
+            // The notice already staged mid-turn: exact, but Return is still withheld.
+            assert_eq!(
+                classify_composer(
+                    &mid_turn_claude_screen(status, &format!("❯\u{00a0}{expected}")),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "active turn must be ExactBlocked: {status}"
+            );
+        }
+
+        // A finished turn is the normal idle screen. Blocking on it would stop delivery forever.
+        for status in FINISHED_TURN_STATUS {
+            assert_eq!(
+                classify_composer(&mid_turn_claude_screen(status, "❯\u{00a0}"), expected),
+                ComposerState::EmptySafe,
+                "finished turn must stay deliverable: {status}"
+            );
+            assert_eq!(
+                classify_composer(
+                    &mid_turn_claude_screen(status, &format!("❯\u{00a0}{expected}")),
+                    expected
+                ),
+                ComposerState::ExactSafe,
+                "finished turn must stay submittable: {status}"
+            );
+        }
+    }
+}

@@ -212,3 +212,45 @@ fn interaction_blocked(plain: &str) -> bool {
         || plain.contains("Create a plan?")
         || looks_like_choice_menu(plain)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ding::composer::{ComposerState, classify_composer};
+    use crate::ding::fixtures::*;
+
+    /// The Codex adapter inherited the other harness's progress-line shape from the shared
+    /// predicate that preceded the harness split, and still carries it. That inheritance is
+    /// documented as outstanding in the Codex spec, so it is pinned here rather than left to a
+    /// duplicated function body no test reaches — a transcription slip in that copy would silently
+    /// unblock a pane, which is the direction this subsystem must never fail in.
+    #[test]
+    fn the_codex_adapter_still_blocks_on_the_inherited_progress_line() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for status in ACTIVE_TURN_STATUS {
+            assert_eq!(
+                classify_composer(&format!("{status}\r\n{}", idle_codex_screen()), expected),
+                ComposerState::Ambiguous,
+                "an empty Codex composer under a progress line is not proven idle: {status}"
+            );
+            assert_eq!(
+                classify_composer(
+                    &format!("{status}\r\n{}", staged_codex_screen(expected)),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "a staged Codex notice under a progress line withholds Return: {status}"
+            );
+        }
+
+        // The finished shape must leave a Codex pane deliverable, exactly as it does for Claude.
+        for status in FINISHED_TURN_STATUS {
+            assert_eq!(
+                classify_composer(&format!("{status}\r\n{}", idle_codex_screen()), expected),
+                ComposerState::EmptySafe,
+                "a finished turn must not block a Codex pane: {status}"
+            );
+        }
+    }
+}
