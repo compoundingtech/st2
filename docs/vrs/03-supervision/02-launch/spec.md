@@ -126,9 +126,35 @@ below.
   fixed constant. Nothing establishes why that duration, whether it should
   relate to the pass interval, or what happens when a task genuinely dies twice
   inside one window. No test exercises the deferral path.
-- **LAUNCH-DQ3 The abandoned set grows without bound and is keyed by task
-  identity.** Nothing removes an entry within a supervisor's lifetime. A
-  declaration edited to change a task's identity leaves the old entry stranded,
-  and a task re-declared under a previously abandoned identity is abandoned on
-  sight. Whether that is acceptable given how rarely identities change is
-  unsettled.
+- **LAUNCH-DQ3 Abandonment is announced once but lasts indefinitely.** The
+  operator-facing notice is emitted a single time per supervisor lifetime, while
+  the state it describes persists until the supervisor is replaced. An operator
+  who arrives later — or who missed the line — finds a task that is simply not
+  running, with nothing restating *why*. The signal that separates "crashed and
+  will be retried" from "abandoned, and no retry will happen until you restart
+  supervision" decays while the condition it describes does not.
+
+  Two facts bound how bad this is, and both are worth stating so a reader does
+  not over-correct:
+
+  - **It is not silent.** An abandoned task has no live session, so the health
+    check reports it as a problem on every run. What the health check cannot say
+    is that the cause is abandonment rather than an ordinary death — it reports
+    the symptom, not the reason.
+  - **The documented remedy is correct, including for identity reuse.** The
+    notice tells the operator to fix the cause and then restart supervision.
+    Because the abandoned set is keyed by task identity and nothing removes an
+    entry within a supervisor's lifetime, editing the declaration alone leaves
+    the task abandoned on sight — the restart is not incidental advice, it is
+    the required second step, and the notice does say it.
+
+  What is unsettled is whether the reason should remain discoverable after the
+  one-time notice: whether abandonment should be visible in catalog-backed state
+  the way presence is, so that a health check or a roster could report *why* a
+  task is down rather than only that it is.
+
+  A related and smaller point: the bookkeeping collections are never pruned, so
+  they retain one entry per task identity a supervisor has ever launched. The
+  entries are inert — they are consulted only for currently-declared tasks — and
+  bounded by how many identities one supervisor sees, so this is noted rather
+  than raised.
