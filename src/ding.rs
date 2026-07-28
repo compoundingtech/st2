@@ -470,8 +470,15 @@ enum CodexComposer {
 
 fn classify_composer(screen: &str, expected: &str) -> ComposerState {
     let plain = strip_ansi(screen);
+    // `pty peek` returns only the viewport, so the startup `Claude Code v…` banner has scrolled
+    // away on any pane that has been used. The ruled `❯` composer is the durable Claude marker.
+    if let Some(composer) = located_bottom_claude_composer(&plain) {
+        return classify_claude_composer(&plain, composer, expected);
+    }
+    // A Claude pane whose composer cannot be located stays unproven rather than falling through to
+    // the Codex heuristics below.
     if plain.contains("Claude Code v") {
-        return classify_claude_composer(&plain, expected);
+        return ComposerState::Ambiguous;
     }
     if located_bottom_codex_composer(screen).is_some()
         || plain.contains("OpenAI Codex")
@@ -515,12 +522,16 @@ fn codex_idle_footer(screen_from_composer: &str) -> bool {
     })
 }
 
-fn classify_claude_composer(plain: &str, expected: &str) -> ComposerState {
-    let Some((logical_inputs, footer)) = located_bottom_claude_composer(plain) else {
-        return ComposerState::Ambiguous;
-    };
+fn classify_claude_composer(
+    plain: &str,
+    (logical_inputs, footer): (Vec<String>, String),
+    expected: &str,
+) -> ComposerState {
     let exact = logical_inputs.iter().any(|input| input == expected);
-    let placeholder = logical_inputs.len() == 1 && is_claude_idle_placeholder(&logical_inputs[0]);
+    // An empty composer is a stronger positive-empty proof than the placeholder below, because no
+    // human draft can be empty. Claude only shows the rotating placeholder on an unused pane.
+    let placeholder = logical_inputs.len() == 1
+        && (logical_inputs[0].is_empty() || is_claude_idle_placeholder(&logical_inputs[0]));
     // The keybinding hint is runtime-composed and may be absent or remapped. The mode marker and
     // permission state are the stable safety signals; active/modal/changed states remain fail-closed.
     let idle_footer = footer.contains("⏵⏵") && footer.contains("permissions on");
@@ -574,10 +585,13 @@ fn located_bottom_claude_composer(plain: &str) -> Option<(Vec<String>, String)> 
     }
 
     let rows = &lines[top + 1..bottom];
-    let first_row = rows.first()?.trim_end();
+    // Strip the prompt before trimming: the separator Claude emits is U+00A0, which is itself
+    // trailing whitespace, so trimming first erases the prompt of an empty composer.
+    let first_row = rows.first()?;
     let first = first_row
         .strip_prefix("❯\u{00a0}")
-        .or_else(|| first_row.strip_prefix("❯ "))?;
+        .or_else(|| first_row.strip_prefix("❯ "))?
+        .trim_end();
     let input = std::iter::once(first)
         .chain(rows[1..].iter().map(|row| row.trim_end()))
         .collect::<Vec<_>>()
@@ -1479,6 +1493,36 @@ mod tests {
         )
     }
 
+    /// A pane that has been used: the startup banner has scrolled out of the peeked viewport, the
+    /// composer is empty rather than showing a rotating placeholder, and the footer omits the
+    /// conditional `(shift+tab to cycle)` hint while keeping the permission-mode indicator.
+    fn mature_claude_screen(composer: &str) -> String {
+        let rule = claude_rule();
+        let footer = "  ⏵⏵ bypass permissions on · PR #42 · 2 shells · ← 1 agent";
+        format!("  an earlier turn\r\n{rule}\r\n{composer}\r\n{rule}\r\n{footer}")
+    }
+
+    fn mature_idle_claude_screen() -> String {
+        mature_claude_screen("❯\u{00a0}")
+    }
+
+    fn mature_idle_claude_screen_with_hint() -> String {
+        mature_idle_claude_screen().replace(
+            "⏵⏵ bypass permissions on",
+            "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        )
+    }
+
+    /// The same used pane in accept-edits mode. `permissions on` is specific to the bypass footer,
+    /// so no accept-edits or auto pane is positively idle to this classifier.
+    fn mature_idle_accept_edits_claude_screen() -> String {
+        mature_idle_claude_screen().replace("⏵⏵ bypass permissions on", "⏵⏵ accept edits on")
+    }
+
+    fn mature_staged_claude_screen(text: &str) -> String {
+        mature_claude_screen(&format!("❯\u{00a0}{text}"))
+    }
+
     #[test]
     fn maintained_composer_classifiers_require_exact_idle_state() {
         let expected =
@@ -1526,6 +1570,45 @@ mod tests {
             ),
             ComposerState::ExactBlocked
         );
+        // A used pane must classify exactly like a fresh one: neither the scrolled-away banner, the
+        // empty composer, nor the missing cycle hint is evidence that Return is unsafe.
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen_with_hint(), expected),
+            ComposerState::EmptySafe
+        );
+        // Only the bypass footer carries `permissions on`, so an otherwise identical accept-edits
+        // pane is never positively idle. It stays unsubmitted rather than being proven safe.
+        assert_eq!(
+            classify_composer(&mature_idle_accept_edits_claude_screen(), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(&mature_staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        // The same pane shape must still fail closed on a human draft and on an active turn.
+        assert_eq!(
+            classify_composer(
+                &mature_staged_claude_screen("a changed human composer"),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "Esc to interrupt\r\n{}",
+                    mature_staged_claude_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
         assert_eq!(
             classify_composer("unknown terminal pixels", expected),
             ComposerState::Ambiguous
