@@ -28,7 +28,6 @@ const CODEX_EMPTY_COMPOSERS: [&str; 3] = [
     "\x1b[1m›\x1b[22m \x1b[2m",
 ];
 
-
 const CODEX_TYPED_COMPOSERS: [&str; 4] = [
     "\x1b[1;22m›\x1b[1C\x1b[0m",
     "\x1b[1;2m› \x1b[0m",
@@ -36,12 +35,10 @@ const CODEX_TYPED_COMPOSERS: [&str; 4] = [
     "\x1b[1m›\x1b[22m ",
 ];
 
-
 enum CodexComposer {
     Empty,
     Typed(String),
 }
-
 
 fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> ComposerState {
     let blocked = interaction_blocked(plain);
@@ -67,14 +64,12 @@ fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> Compose
     }
 }
 
-
 fn codex_idle_footer(screen_from_composer: &str) -> bool {
     strip_ansi(screen_from_composer).lines().any(|line| {
         let line = line.trim();
         line.starts_with("gpt-") && line.contains(" · /")
     })
 }
-
 
 fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)> {
     let empty = CODEX_EMPTY_COMPOSERS
@@ -115,7 +110,6 @@ fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)>
         CodexComposer::Typed(normalize_codex_composer_input(input)),
     ))
 }
-
 
 /// Strip ANSI from one bottom-composer input while joining only renderer-proven Codex soft wraps.
 fn normalize_codex_composer_input(input: &str) -> String {
@@ -182,7 +176,6 @@ fn normalize_codex_composer_input(input: &str) -> String {
     }
     out
 }
-
 
 /// States in which Return must not be sent. Several of these strings are Claude-specific chrome
 /// that the pre-split shared predicate also applied to Codex panes; they are duplicated rather

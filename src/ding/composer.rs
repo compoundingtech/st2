@@ -18,7 +18,6 @@ pub(super) enum ComposerState {
     Ambiguous,
 }
 
-
 /// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
 /// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
 /// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
@@ -56,7 +55,6 @@ pub(super) fn logical_soft_wrap_candidates(input: &str, minimum_first_content_ch
     candidates
 }
 
-
 pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
     let mut first = false;
     let mut later = false;
@@ -66,7 +64,6 @@ pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
     }
     first && later
 }
-
 
 /// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text. Bounded
 /// cursor-forward sequences represent visible spaces in current Codex and Claude panes.
@@ -136,7 +133,6 @@ pub(super) fn strip_ansi(input: &str) -> String {
     }
     out
 }
-
 
 /// Locate every maintained composer and classify the LOWEST one on screen.
 ///

@@ -296,7 +296,6 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
     })
 }
 
-
 fn exact_staged_candidate(screen: &str, candidates: &[String]) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         matches!(
@@ -441,20 +440,6 @@ fn observed_retry_staged(
         ComposerState::EmptySafe | ComposerState::Changed => Ok(PokeOutcome::Deferred),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// `<pty-session-dir>/<session>.pid` + `kill(pid, 0)`; any miss means gone. This mirrors the
 /// session registry's own liveness probe without forking `pty`.

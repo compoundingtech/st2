@@ -46,7 +46,6 @@ fn classify_claude_composer(
     }
 }
 
-
 /// Claude 2.1.220 rotates repository-aware examples (file names and verbs vary) without styling
 /// them differently from typed input. The exact `Try "<single-line example>"` grammar plus the
 /// maintained idle footer is therefore the narrowest available positive heuristic.
@@ -61,7 +60,6 @@ fn is_claude_idle_placeholder(input: &str) -> bool {
                 && !example.contains(['\r', '\n'])
         })
 }
-
 
 /// Extract all logical strings consistent with Claude's renderer-proven soft wraps. At a full-width
 /// row Claude may either wrap at a discarded space or split a token, so each proven boundary has
@@ -102,7 +100,6 @@ fn located_bottom_claude_composer(plain: &str) -> Option<(usize, Vec<String>, St
     Some((top + 1, candidates, footer))
 }
 
-
 /// Claude 2.1.220 renders an in-flight turn as a status line and ships no interrupt hint with it.
 /// Sampled across real panes, an active turn looks like `✻ Frolicking… (3m 35s · ↓ 6.9k tokens)`,
 /// `✽ Schlepping…`, or `· Metamorphosing…`, while a finished turn looks like `✻ Brewed for 5s` or
@@ -130,7 +127,6 @@ pub(super) fn claude_turn_in_flight(plain: &str) -> bool {
             && word.chars().all(char::is_alphabetic)
     })
 }
-
 
 /// States in which Return must not be sent. Several of these strings are Claude-specific chrome
 /// that the pre-split shared predicate also applied to Codex panes; they are duplicated rather
