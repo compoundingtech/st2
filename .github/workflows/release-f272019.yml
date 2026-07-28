@@ -22,19 +22,27 @@ jobs:
         with:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
-      - uses: DeterminateSystems/determinate-nix-action@v3
-      - name: Build exact source with Nix
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build exact standalone source with Cargo
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain)"
-          nix build .#packages.x86_64-linux.st2 --print-build-logs
-          ./result/bin/st2 --version | tee st2.version.txt
+          cargo build --release --locked
+          ./target/release/st2 --version | tee st2.version.txt
           grep -F "$SHORT_SHA" st2.version.txt
+          file target/release/st2 | tee st2.file.txt
+          grep -F "ELF 64-bit LSB" st2.file.txt
+          readelf --program-headers target/release/st2 | tee st2.program-headers.txt
+          ! grep -F "/nix/store/" st2.program-headers.txt
+          grep -E "Requesting program interpreter: /(lib64|lib/x86_64-linux-gnu)/" \
+            st2.program-headers.txt
+          ldd target/release/st2 | tee st2.ldd.txt
+          ! grep -F "not found" st2.ldd.txt
       - name: Package and checksum
         run: |
           set -euo pipefail
-          install -m 0755 result/bin/st2 st2
+          install -m 0755 target/release/st2 st2
           tar -czf "$ARCHIVE" st2
           sha256sum "$ARCHIVE" > SHA256SUMS
           test "$(tar -tzf "$ARCHIVE")" = "st2"
@@ -54,8 +62,8 @@ jobs:
           cat > release-notes.md <<'EOF'
           Exact source: `f2720190096d7dcf9bb3256222cbdf5efbe36e4f`.
 
-          This recovery release contains the Linux x86_64 st2 control-plane binary. It does not
-          include or authorize a host build. Verify `SHA256SUMS` before staging.
+          This recovery release contains the GitHub-hosted Ubuntu Linux x86_64 st2 control-plane
+          binary. It does not include or authorize a host build. Verify `SHA256SUMS` before staging.
 
           Replacement safety: stop only the st2 control plane, never `st2 down`; preserve the live
           binary as rollback; stage the verified replacement on the same filesystem and select it
@@ -65,6 +73,7 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" \
               --target "$SOURCE_SHA" \
+              --draft=false \
               --prerelease \
               --title "st2 0.1.0+f272019" \
               --notes-file release-notes.md
