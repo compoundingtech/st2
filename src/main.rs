@@ -191,6 +191,9 @@ enum Command {
         /// Seats are still torn down (no leaks). Also honored via `ST2_EVAL_KEEP`.
         #[arg(long)]
         keep: bool,
+        /// Emit the existing eval report as JSON without changing exit semantics.
+        #[arg(long)]
+        json: bool,
     },
     /// Run `pty` against this catalog's bus with the env auto-set, so pty subcommands and the
     /// interactive UI work without `eval "$(st2 env --catalog <catalog>)"` first. Catalog selection follows
@@ -582,7 +585,7 @@ fn main() -> Result<()> {
             env_cmd(&root)
         }
         Command::Pretrust { dirs } => pretrust_cmd(&dirs),
-        Command::Eval { folder, host, keep } => eval_cmd(&folder, host, keep),
+        Command::Eval { folder, host, keep, json } => eval_cmd(&folder, host, keep, json),
         Command::Validate {
             root,
             host,
@@ -702,7 +705,7 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn eval_cmd(folder: &Path, host: Option<String>, keep: bool) -> Result<()> {
+fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Result<()> {
     let spec_file = st2::eval_run::resolve_spec_path(folder).with_context(|| {
         format!(
             "{} is not an st2 spec (a *.kdl file, or a folder with one)",
@@ -711,6 +714,12 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool) -> Result<()> {
     })?;
     let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
     let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if report.passed() { return Ok(()); }
+        anyhow::bail!("VERDICT: FAIL")
+    }
 
     if !report.done {
         println!(

@@ -213,7 +213,7 @@ pub fn prepare_spawn_env() {
 /// The outcome of an eval run: whether the team reached "done", plus every judge's result. The
 /// verdict is all-must-pass over the judges (done is informational — the judges are the truth, so a
 /// timeout still grades the final state and simply fails the judges it should).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EvalReport {
     /// The team reached the done signal (a sup→requester confirmation post-dating a worker report).
     pub done: bool,
@@ -234,7 +234,7 @@ impl EvalReport {
 }
 
 /// One judge's outcome.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct JudgeResult {
     pub name: String,
     pub passed: bool,
