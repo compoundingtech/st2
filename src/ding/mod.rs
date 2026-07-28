@@ -21,7 +21,11 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod composer;
+mod harness;
+
 use crate::message::{self, Message};
+use composer::{ComposerState, classify_composer};
 use crate::status;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
@@ -292,21 +296,6 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
     })
 }
 
-/// What the current bottom composer proves about one exact normalized notice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposerState {
-    /// A maintained harness is positively idle and contains only its known placeholder.
-    EmptySafe,
-    /// The exact notice is the complete composer and the harness is positively idle.
-    ExactSafe,
-    /// The exact notice is present, but a modal, active turn, or non-idle footer blocks Return.
-    ExactBlocked,
-    /// A maintained composer contains different text (including a human draft).
-    Changed,
-    /// No maintained, unambiguous composer state was proven.
-    Ambiguous,
-}
-
 fn exact_staged_candidate(screen: &str, candidates: &[String]) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         matches!(
@@ -450,376 +439,6 @@ fn observed_retry_staged(
         ComposerState::ExactBlocked | ComposerState::Ambiguous => Ok(PokeOutcome::Staged),
         ComposerState::EmptySafe | ComposerState::Changed => Ok(PokeOutcome::Deferred),
     }
-}
-
-const CODEX_EMPTY_COMPOSERS: [&str; 3] = [
-    "\x1b[1;22m›\x1b[1C\x1b[22;2m",
-    "\x1b[1m›\x1b[1C\x1b[22;2m",
-    "\x1b[1m›\x1b[22m \x1b[2m",
-];
-const CODEX_TYPED_COMPOSERS: [&str; 4] = [
-    "\x1b[1;22m›\x1b[1C\x1b[0m",
-    "\x1b[1;2m› \x1b[0m",
-    "\x1b[1m›\x1b[1C\x1b[0m",
-    "\x1b[1m›\x1b[22m ",
-];
-enum CodexComposer {
-    Empty,
-    Typed(String),
-}
-
-fn classify_composer(screen: &str, expected: &str) -> ComposerState {
-    let plain = strip_ansi(screen);
-    if plain.contains("Claude Code v") {
-        return classify_claude_composer(&plain, expected);
-    }
-    if located_bottom_codex_composer(screen).is_some()
-        || plain.contains("OpenAI Codex")
-        || plain
-            .lines()
-            .any(|line| line.trim_start().starts_with("gpt-"))
-    {
-        return classify_codex_composer(screen, &plain, expected);
-    }
-    ComposerState::Ambiguous
-}
-
-fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> ComposerState {
-    let blocked = interaction_blocked(plain);
-    let Some((start, composer)) = located_bottom_codex_composer(screen) else {
-        return ComposerState::Ambiguous;
-    };
-    let idle_footer = codex_idle_footer(&screen[start..]);
-    match composer {
-        CodexComposer::Empty if !blocked && idle_footer => ComposerState::EmptySafe,
-        CodexComposer::Empty => ComposerState::Ambiguous,
-        CodexComposer::Typed(input) => {
-            let exact = logical_soft_wrap_candidates(&input, 70)
-                .iter()
-                .any(|input| input == expected);
-            if exact && !blocked && idle_footer {
-                ComposerState::ExactSafe
-            } else if exact {
-                ComposerState::ExactBlocked
-            } else {
-                ComposerState::Changed
-            }
-        }
-    }
-}
-
-fn codex_idle_footer(screen_from_composer: &str) -> bool {
-    strip_ansi(screen_from_composer).lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("gpt-") && line.contains(" · /")
-    })
-}
-
-fn classify_claude_composer(plain: &str, expected: &str) -> ComposerState {
-    let Some((logical_inputs, footer)) = located_bottom_claude_composer(plain) else {
-        return ComposerState::Ambiguous;
-    };
-    let exact = logical_inputs.iter().any(|input| input == expected);
-    let placeholder = logical_inputs.len() == 1 && is_claude_idle_placeholder(&logical_inputs[0]);
-    // The keybinding hint is runtime-composed and may be absent or remapped. The mode marker and
-    // permission state are the stable safety signals; active/modal/changed states remain fail-closed.
-    let idle_footer = footer.contains("⏵⏵") && footer.contains("permissions on");
-    let blocked = interaction_blocked(plain);
-    if exact {
-        if idle_footer && !blocked {
-            ComposerState::ExactSafe
-        } else {
-            ComposerState::ExactBlocked
-        }
-    } else if placeholder && idle_footer && !blocked {
-        ComposerState::EmptySafe
-    } else {
-        ComposerState::Changed
-    }
-}
-
-/// Claude 2.1.220 rotates repository-aware examples (file names and verbs vary) without styling
-/// them differently from typed input. The exact `Try "<single-line example>"` grammar plus the
-/// maintained idle footer is therefore the narrowest available positive heuristic.
-fn is_claude_idle_placeholder(input: &str) -> bool {
-    input
-        .strip_prefix("Try \"")
-        .and_then(|example| example.strip_suffix('"'))
-        .is_some_and(|example| {
-            !example.is_empty()
-                && example.chars().count() <= 72
-                && !example.chars().any(char::is_control)
-                && !example.contains(['\r', '\n'])
-        })
-}
-
-/// Extract all logical strings consistent with Claude's renderer-proven soft wraps. At a full-width
-/// row Claude may either wrap at a discarded space or split a token, so each proven boundary has
-/// exactly two candidates: join with one space or with none. The bounded DING length keeps this set
-/// small; any unfamiliar multiline shape fails closed.
-fn located_bottom_claude_composer(plain: &str) -> Option<(Vec<String>, String)> {
-    let lines: Vec<&str> = plain.lines().collect();
-    let separators: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let trimmed = line.trim();
-            (trimmed.chars().count() >= 40 && trimmed.chars().all(|ch| ch == '─')).then_some(index)
-        })
-        .collect();
-    let (&bottom, before_bottom) = separators.split_last()?;
-    let &top = before_bottom.last()?;
-    if bottom <= top + 1 {
-        return None;
-    }
-
-    let rows = &lines[top + 1..bottom];
-    let first_row = rows.first()?.trim_end();
-    let first = first_row
-        .strip_prefix("❯\u{00a0}")
-        .or_else(|| first_row.strip_prefix("❯ "))?;
-    let input = std::iter::once(first)
-        .chain(rows[1..].iter().map(|row| row.trim_end()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let candidates = logical_soft_wrap_candidates(&input, 70);
-    let footer = lines[bottom + 1..].join("\n");
-    Some((candidates, footer))
-}
-
-/// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
-/// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
-/// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
-/// unfamiliar multiline input remains literal and cannot equal a normalized single-line DING.
-fn logical_soft_wrap_candidates(input: &str, minimum_first_content_chars: usize) -> Vec<String> {
-    let rows: Vec<&str> = input.lines().collect();
-    let Some(first) = rows.first() else {
-        return vec![String::new()];
-    };
-    if rows.len() == 1 {
-        return vec![(*first).to_string()];
-    }
-    let mut candidates = vec![(*first).to_string()];
-    let mut previous = *first;
-    for (index, row) in rows[1..].iter().enumerate() {
-        let required_previous_width = minimum_first_content_chars + usize::from(index > 0) * 2;
-        if previous.chars().count() < required_previous_width
-            || !row.starts_with("  ")
-            || row.trim().is_empty()
-        {
-            return vec![input.to_string()];
-        }
-        let continuation = row.strip_prefix("  ").expect("prefix checked").trim_end();
-        let mut next = Vec::with_capacity(candidates.len().saturating_mul(2).min(32));
-        for candidate in candidates {
-            if next.len() >= 32 {
-                return vec![input.to_string()];
-            }
-            next.push(format!("{candidate}{continuation}"));
-            next.push(format!("{candidate} {continuation}"));
-        }
-        candidates = next;
-        previous = row;
-    }
-    candidates
-}
-
-fn interaction_blocked(plain: &str) -> bool {
-    plain.contains("Working (")
-        || plain.contains("esc to interrupt")
-        || plain.contains("Esc to interrupt")
-        || plain.contains("ctrl+c to interrupt")
-        || plain.contains("Messages to be submitted after next tool call")
-        || plain.contains("press esc to interrupt and send")
-        || plain.contains("Our systems are thinking a bit more")
-        || plain.contains("Retry with a faster model")
-        || plain.contains("Create a plan?")
-        || looks_like_choice_menu(plain)
-}
-
-fn looks_like_choice_menu(plain: &str) -> bool {
-    let mut first = false;
-    let mut later = false;
-    for line in plain.lines().map(str::trim_start) {
-        first |= line.starts_with("› 1.") || line.starts_with("> 1.");
-        later |= line.starts_with("2.") || line.starts_with("3.");
-    }
-    first && later
-}
-
-fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)> {
-    let empty = CODEX_EMPTY_COMPOSERS
-        .iter()
-        .filter_map(|marker| {
-            screen
-                .rfind(marker)
-                .map(|start| (start, marker.len(), true))
-        })
-        .max_by_key(|(start, _, _)| *start);
-    let typed = CODEX_TYPED_COMPOSERS
-        .iter()
-        .filter_map(|marker| {
-            screen
-                .rfind(marker)
-                .map(|start| (start, marker.len(), false))
-        })
-        .max_by_key(|(start, _, _)| *start);
-    let (start, marker_len, empty) = match (empty, typed) {
-        (Some(empty), Some(typed)) if empty.0 >= typed.0 => empty,
-        (_, Some(typed)) => typed,
-        (Some(empty), None) => empty,
-        (None, None) => return None,
-    };
-    if empty {
-        return Some((start, CodexComposer::Empty));
-    }
-    let tail = &screen[start + marker_len..];
-    let input = tail
-        .split_once("\r\n \x1b[")
-        .or_else(|| tail.split_once("\n \x1b["))
-        .or_else(|| tail.split_once("\r\n\r\n"))
-        .or_else(|| tail.split_once("\n\n"))
-        .map(|(input, _)| input)
-        .unwrap_or(tail);
-    Some((
-        start,
-        CodexComposer::Typed(normalize_codex_composer_input(input)),
-    ))
-}
-
-/// Strip ANSI from one bottom-composer input while joining only renderer-proven Codex soft wraps.
-fn normalize_codex_composer_input(input: &str) -> String {
-    const VIEWPORT_WIDTH: usize = 80;
-    const PROMPT_WIDTH: usize = 2;
-    const WRAP_RIGHT_MARGIN: usize = 2;
-    const CONTINUATION_INDENT: &str = "  ";
-    const WRAP_PADDING: &str = "\x1b[2X";
-
-    fn split_row(input: &str) -> (&str, Option<&str>) {
-        let Some(newline) = input.find('\n') else {
-            return (input, None);
-        };
-        let row_end = if input[..newline].ends_with('\r') {
-            newline - 1
-        } else {
-            newline
-        };
-        (&input[..row_end], Some(&input[newline + 1..]))
-    }
-
-    fn proven_wrap(row: &str, next: &str, first: bool) -> bool {
-        let Some(row_without_padding) = row.strip_suffix(WRAP_PADDING) else {
-            return false;
-        };
-        let visible = strip_ansi(row_without_padding);
-        let next_content = next.strip_prefix(CONTINUATION_INDENT);
-        visible.is_ascii()
-            && next_content.is_some_and(|content| {
-                content
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| !ch.is_control() && !ch.is_whitespace())
-            })
-            && usize::from(first) * PROMPT_WIDTH + visible.len() + WRAP_RIGHT_MARGIN
-                == VIEWPORT_WIDTH
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    let mut first = true;
-    let mut strip_continuation_indent = false;
-    loop {
-        let (row, next) = split_row(rest);
-        let visible = strip_ansi(row);
-        if strip_continuation_indent {
-            out.push_str(
-                visible
-                    .strip_prefix(CONTINUATION_INDENT)
-                    .unwrap_or(&visible),
-            );
-        } else {
-            out.push_str(&visible);
-        }
-        let Some(next) = next else {
-            break;
-        };
-        strip_continuation_indent = proven_wrap(row, next, first);
-        if !strip_continuation_indent {
-            out.push('\n');
-        }
-        rest = next;
-        first = false;
-    }
-    out
-}
-
-/// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text. Bounded
-/// cursor-forward sequences represent visible spaces in current Codex and Claude panes.
-fn strip_ansi(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != 0x1b {
-            let ch = input[index..].chars().next().expect("valid UTF-8 boundary");
-            out.push(ch);
-            index += ch.len_utf8();
-            continue;
-        }
-        index += 1;
-        if index >= bytes.len() {
-            break;
-        }
-        match bytes[index] {
-            b'[' => {
-                index += 1;
-                let params_start = index;
-                let mut final_byte = None;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    index += 1;
-                    if (0x40..=0x7e).contains(&byte) {
-                        final_byte = Some(byte);
-                        break;
-                    }
-                }
-                if final_byte == Some(b'C') {
-                    let params = &bytes[params_start..index.saturating_sub(1)];
-                    let width = if params.is_empty() {
-                        Some(1)
-                    } else if params.iter().all(u8::is_ascii_digit) {
-                        std::str::from_utf8(params)
-                            .ok()
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .map(|value| value.max(1))
-                    } else {
-                        None
-                    };
-                    if let Some(width) = width.filter(|width| *width <= 512) {
-                        for _ in 0..width {
-                            out.push(' ');
-                        }
-                    }
-                }
-            }
-            b']' => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == 0x07 {
-                        index += 1;
-                        break;
-                    }
-                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-                        index += 2;
-                        break;
-                    }
-                    index += 1;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    out
 }
 
 /// `<pty-session-dir>/<session>.pid` + `kill(pid, 0)`; any miss means gone. This mirrors the
@@ -1479,6 +1098,203 @@ mod tests {
         )
     }
 
+    /// A pane that has been used: the startup banner has scrolled out of the peeked viewport, the
+    /// composer is empty rather than showing a rotating placeholder, and the footer omits the
+    /// conditional `(shift+tab to cycle)` hint while keeping the permission-mode indicator.
+    fn mature_claude_screen(composer: &str) -> String {
+        let rule = claude_rule();
+        let footer = "  ⏵⏵ bypass permissions on · PR #42 · 2 shells · ← 1 agent";
+        format!("  an earlier turn\r\n{rule}\r\n{composer}\r\n{rule}\r\n{footer}")
+    }
+
+    fn mature_idle_claude_screen() -> String {
+        mature_claude_screen("❯\u{00a0}")
+    }
+
+    fn mature_idle_claude_screen_with_hint() -> String {
+        mature_idle_claude_screen().replace(
+            "⏵⏵ bypass permissions on",
+            "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        )
+    }
+
+    /// The same used pane in accept-edits mode. `permissions on` is specific to the bypass footer,
+    /// so no accept-edits or auto pane is positively idle to this classifier.
+    fn mature_idle_accept_edits_claude_screen() -> String {
+        mature_idle_claude_screen().replace("⏵⏵ bypass permissions on", "⏵⏵ accept edits on")
+    }
+
+    fn mature_staged_claude_screen(text: &str) -> String {
+        mature_claude_screen(&format!("❯\u{00a0}{text}"))
+    }
+
+    /// The same used pane with an in-flight turn: a spinner status line above the composer. Every
+    /// frame below was observed on a real 2.1.220 pane; the glyph animates and the elapsed timer is
+    /// not always rendered, so both variations appear here.
+    fn mid_turn_claude_screen(status: &str, composer: &str) -> String {
+        let rule = claude_rule();
+        let footer = "  ⏵⏵ bypass permissions on · PR #42 · 2 shells · ← 1 agent";
+        format!("  an earlier turn\r\n{status}\r\n{rule}\r\n{composer}\r\n{rule}\r\n{footer}")
+    }
+
+    /// Status lines for an ACTIVE turn — Return must never be sent.
+    const ACTIVE_TURN_STATUS: [&str; 4] = [
+        "✻ Frolicking… (3m 35s · ↓ 6.9k tokens)",
+        "✽ Schlepping…",
+        "· Metamorphosing…",
+        "✶ Schlepping… (9s · ↓ 296 tokens · thinking with high effort)",
+    ];
+
+    /// Status lines for a FINISHED turn — these sit above every genuinely idle composer, so
+    /// treating them as blocked would stop delivery entirely.
+    const FINISHED_TURN_STATUS: [&str; 4] = [
+        "✻ Brewed for 5s",
+        "✻ Crunched for 7s",
+        "✻ Cogitated for 11s · 1 shell still running",
+        "✻ Baked for 3s · 1 shell still running",
+    ];
+
+    /// A live Claude composer with a stale Codex composer above it in scrollback, preceded by
+    /// escape-heavy output. The escapes inflate the Codex byte offset far past the Claude
+    /// composer's row, which is what makes the two locators' units observably disagree.
+    fn live_claude_below_escape_heavy_codex_transcript() -> String {
+        let padding = "\x1b[1;32m\x1b[38;5;204mpadding with lots of escapes\x1b[0m\x1b[0m\r\n".repeat(10);
+        let codex = staged_codex_screen("a stale pasted codex draft");
+        let filler = "\x1b[1;32mmore padding\x1b[0m\r\n".repeat(6);
+        format!("{padding}{codex}\r\n{filler}{}", mature_idle_claude_screen())
+    }
+
+    /// A Codex pane whose scrollback holds a captured Claude screen — two ruled lines around a `❯`
+    /// row plus a Claude idle footer — above the live, ANSI-detected Codex composer. Capturing and
+    /// pasting pane text is routine, so this shape is not exotic.
+    fn codex_screen_below_claude_transcript(transcript_row: &str, codex: &str) -> String {
+        let rule = claude_rule();
+        format!(
+            "  scrollback: a pasted Claude pane\r\n{rule}\r\n❯\u{00a0}{transcript_row}\r\n{rule}\r\n\
+             \u{0020} ⏵⏵ bypass permissions on (shift+tab to cycle)\r\n\r\n{codex}"
+        )
+    }
+
+    /// An in-flight Claude turn ships no interrupt hint, so the composer being empty is not proof
+    /// that Return is safe — the pane is working. The finished-turn line looks almost identical and
+    /// sits above every genuinely idle composer, so both directions are pinned here.
+    #[test]
+    fn an_in_flight_turn_blocks_return_but_a_finished_one_does_not() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for status in ACTIVE_TURN_STATUS {
+            // Empty composer mid-turn: positively empty, but not safe.
+            assert_ne!(
+                classify_composer(&mid_turn_claude_screen(status, "❯\u{00a0}"), expected),
+                ComposerState::EmptySafe,
+                "active turn must not be EmptySafe: {status}"
+            );
+            // The notice already staged mid-turn: exact, but Return is still withheld.
+            assert_eq!(
+                classify_composer(
+                    &mid_turn_claude_screen(status, &format!("❯\u{00a0}{expected}")),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "active turn must be ExactBlocked: {status}"
+            );
+        }
+
+        // A finished turn is the normal idle screen. Blocking on it would stop delivery forever.
+        for status in FINISHED_TURN_STATUS {
+            assert_eq!(
+                classify_composer(&mid_turn_claude_screen(status, "❯\u{00a0}"), expected),
+                ComposerState::EmptySafe,
+                "finished turn must stay deliverable: {status}"
+            );
+            assert_eq!(
+                classify_composer(
+                    &mid_turn_claude_screen(status, &format!("❯\u{00a0}{expected}")),
+                    expected
+                ),
+                ComposerState::ExactSafe,
+                "finished turn must stay submittable: {status}"
+            );
+        }
+    }
+
+    /// The two locators do not natively work in the same units. Codex is matched with `rfind` over
+    /// the raw screen, so it reports a **byte offset** inflated by every escape sequence above it;
+    /// Claude is matched over stripped lines, so it reports a **row**. Comparing those directly
+    /// picks Codex almost always, since an offset dwarfs a row — including when the live composer
+    /// is Claude's and the Codex match is stale scrollback. Both must be normalized to a row.
+    ///
+    /// On the screen below, measured: the Codex composer sits at byte offset 560 but row 10, while
+    /// the live Claude composer is row 20. Comparing row against offset picks Codex, so this would
+    /// classify from a pasted draft instead of the real composer.
+    #[test]
+    fn composer_positions_are_compared_as_rows_not_raw_byte_offsets() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        assert_eq!(
+            classify_composer(&live_claude_below_escape_heavy_codex_transcript(), expected),
+            ComposerState::EmptySafe
+        );
+    }
+
+    /// Normalizing the Codex offset means counting newlines in the *stripped* prefix, which is only
+    /// faithful if stripping preserves them. It does for well-formed input. It does not for an
+    /// unterminated sequence: the CSI scanner runs until a byte in `0x40..=0x7e` and `\n` is `0x0a`,
+    /// so it eats newlines, and an unterminated OSC consumes to the end of input. Both are recorded
+    /// here so a future change to `strip_ansi` cannot silently shift every row.
+    #[test]
+    fn stripping_preserves_newlines_for_well_formed_sequences_only() {
+        let nl = |text: &str| composer::strip_ansi(text).matches('\n').count();
+
+        assert_eq!(
+            nl("\x1b[1;32mone\x1b[0m\r\n\x1b[2Ctwo\x1b[0m\r\n\x1b[1mthree\x1b[0m\r\n"),
+            3
+        );
+        // Unterminated CSI: the newline is consumed while hunting for a final byte.
+        assert_eq!(nl("before\r\n\x1b[999999\r\nafter\r\n"), 2);
+        // Unterminated OSC: everything to the end of input is consumed.
+        assert_eq!(nl("before\r\n\x1b]0;no terminator\r\nafter\r\n"), 1);
+    }
+
+    /// Scrollback that merely looks like a composer must never outrank the live one. The paste and
+    /// the Return always go to the pane's real bottom composer, so misreading transcript text as
+    /// "idle" or "already staged" is a wrong positive: it can type into, or submit, a human draft.
+    #[test]
+    fn transcript_composers_never_outrank_the_live_bottom_composer() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        // The live Codex composer holds a human draft in both cases, so both must stay `Changed`.
+        // An empty transcript row would otherwise read as positively-empty and allow the paste.
+        assert_eq!(
+            classify_composer(
+                &codex_screen_below_claude_transcript("", &human_codex_screen()),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        // A transcript row holding the exact notice is the worse case: it would otherwise satisfy
+        // the two adjacent exact observations and send a bare Return to the draft.
+        assert_eq!(
+            classify_composer(
+                &codex_screen_below_claude_transcript(expected, &human_codex_screen()),
+                expected
+            ),
+            ComposerState::Changed
+        );
+
+        // The rule is positional, not a Codex preference: a genuine Claude pane whose scrollback
+        // shows a captured Codex composer still classifies from its own live Claude composer.
+        assert_eq!(
+            classify_composer(
+                &format!("{}\r\n{}", staged_codex_screen("a stale pasted codex draft"), mature_idle_claude_screen()),
+                expected
+            ),
+            ComposerState::EmptySafe
+        );
+    }
+
     #[test]
     fn maintained_composer_classifiers_require_exact_idle_state() {
         let expected =
@@ -1526,6 +1342,45 @@ mod tests {
             ),
             ComposerState::ExactBlocked
         );
+        // A used pane must classify exactly like a fresh one: neither the scrolled-away banner, the
+        // empty composer, nor the missing cycle hint is evidence that Return is unsafe.
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen_with_hint(), expected),
+            ComposerState::EmptySafe
+        );
+        // Only the bypass footer carries `permissions on`, so an otherwise identical accept-edits
+        // pane is never positively idle. It stays unsubmitted rather than being proven safe.
+        assert_eq!(
+            classify_composer(&mature_idle_accept_edits_claude_screen(), expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(&mature_staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+        // The same pane shape must still fail closed on a human draft and on an active turn.
+        assert_eq!(
+            classify_composer(
+                &mature_staged_claude_screen("a changed human composer"),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "Esc to interrupt\r\n{}",
+                    mature_staged_claude_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
         assert_eq!(
             classify_composer("unknown terminal pixels", expected),
             ComposerState::Ambiguous
