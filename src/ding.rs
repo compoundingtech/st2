@@ -29,7 +29,9 @@ const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
 const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
-const PTY_COMMAND_TIMEOUT: Duration = Duration::from_millis(600);
+// Must exceed face607's bounded 0.5s delivery delay plus PTY/Node startup overhead; otherwise a
+// successful pane write is misreported as a timeout and retried, duplicating the owned payload.
+const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 #[allow(dead_code)]
 const COMPOSER_OBSERVATION_WINDOW: Duration = Duration::from_millis(450);
 #[allow(dead_code)]
