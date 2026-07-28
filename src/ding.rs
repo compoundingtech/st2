@@ -127,12 +127,12 @@ pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
     vec![
         "send".into(),
         session.into(),
+        "--with-delay".into(),
+        "0.5".into(),
         "--seq".into(),
         bracketed_paste(text),
         "--seq".into(),
         "key:return".into(),
-        "--with-delay".into(),
-        "500".into(),
     ]
 }
 
