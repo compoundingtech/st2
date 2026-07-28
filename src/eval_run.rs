@@ -1122,7 +1122,7 @@ mod tests {
         let cat = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cat.path().join("worker")).unwrap();
         std::fs::write(cat.path().join("worker/LICENSE"), "Permission is hereby granted, free of charge\n").unwrap();
-        std::fs::write(cat.path().join("worker/package.json"), r#"{"name":"w","license":"MIT"}"#).unwrap();
+        std::fs::write(cat.path().join("worker/package.json"), r#"{"name":"w","license":"MIT","ok":true,"count":3}"#).unwrap();
         let ok = [
             Check::FileHas { path: "worker/LICENSE".into(), text: "Permission is hereby granted".into() },
             Check::FileLacks { path: "worker/LICENSE".into(), text: "proprietary".into() },
@@ -1132,6 +1132,17 @@ mod tests {
         // A wrong json value fails.
         let bad = [Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: crate::eval_spec::JsonScalar::String("GPL".into()) }];
         assert!(!run_declarative(&bad, cat.path()).0);
+        let typed = [
+            Check::JsonField { path: "worker/package.json".into(), field: "ok".into(), value: crate::eval_spec::JsonScalar::Bool(true) },
+            Check::JsonField { path: "worker/package.json".into(), field: "count".into(), value: crate::eval_spec::JsonScalar::Integer(3) },
+        ];
+        assert!(run_declarative(&typed, cat.path()).0);
+        let mismatches = [
+            Check::JsonField { path: "worker/package.json".into(), field: "count".into(), value: crate::eval_spec::JsonScalar::String("3".into()) },
+            Check::JsonField { path: "worker/package.json".into(), field: "ok".into(), value: crate::eval_spec::JsonScalar::String("true".into()) },
+        ];
+        assert!(!run_declarative(&mismatches[..1], cat.path()).0);
+        assert!(!run_declarative(&mismatches[1..], cat.path()).0);
         // FileHas on a missing file fails.
         let missing = [Check::FileHas { path: "worker/NOPE".into(), text: "x".into() }];
         assert!(!run_declarative(&missing, cat.path()).0);
