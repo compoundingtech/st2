@@ -1154,6 +1154,16 @@ mod tests {
         "✻ Baked for 3s · 1 shell still running",
     ];
 
+    /// A live Claude composer with a stale Codex composer above it in scrollback, preceded by
+    /// escape-heavy output. The escapes inflate the Codex byte offset far past the Claude
+    /// composer's row, which is what makes the two locators' units observably disagree.
+    fn live_claude_below_escape_heavy_codex_transcript() -> String {
+        let padding = "\x1b[1;32m\x1b[38;5;204mpadding with lots of escapes\x1b[0m\x1b[0m\r\n".repeat(10);
+        let codex = staged_codex_screen("a stale pasted codex draft");
+        let filler = "\x1b[1;32mmore padding\x1b[0m\r\n".repeat(6);
+        format!("{padding}{codex}\r\n{filler}{}", mature_idle_claude_screen())
+    }
+
     /// A Codex pane whose scrollback holds a captured Claude screen — two ruled lines around a `❯`
     /// row plus a Claude idle footer — above the live, ANSI-detected Codex composer. Capturing and
     /// pasting pane text is routine, so this shape is not exotic.
@@ -1207,6 +1217,44 @@ mod tests {
                 "finished turn must stay submittable: {status}"
             );
         }
+    }
+
+    /// The two locators do not natively work in the same units. Codex is matched with `rfind` over
+    /// the raw screen, so it reports a **byte offset** inflated by every escape sequence above it;
+    /// Claude is matched over stripped lines, so it reports a **row**. Comparing those directly
+    /// picks Codex almost always, since an offset dwarfs a row — including when the live composer
+    /// is Claude's and the Codex match is stale scrollback. Both must be normalized to a row.
+    ///
+    /// On the screen below, measured: the Codex composer sits at byte offset 560 but row 10, while
+    /// the live Claude composer is row 20. Comparing row against offset picks Codex, so this would
+    /// classify from a pasted draft instead of the real composer.
+    #[test]
+    fn composer_positions_are_compared_as_rows_not_raw_byte_offsets() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        assert_eq!(
+            classify_composer(&live_claude_below_escape_heavy_codex_transcript(), expected),
+            ComposerState::EmptySafe
+        );
+    }
+
+    /// Normalizing the Codex offset means counting newlines in the *stripped* prefix, which is only
+    /// faithful if stripping preserves them. It does for well-formed input. It does not for an
+    /// unterminated sequence: the CSI scanner runs until a byte in `0x40..=0x7e` and `\n` is `0x0a`,
+    /// so it eats newlines, and an unterminated OSC consumes to the end of input. Both are recorded
+    /// here so a future change to `strip_ansi` cannot silently shift every row.
+    #[test]
+    fn stripping_preserves_newlines_for_well_formed_sequences_only() {
+        let nl = |text: &str| composer::strip_ansi(text).matches('\n').count();
+
+        assert_eq!(
+            nl("\x1b[1;32mone\x1b[0m\r\n\x1b[2Ctwo\x1b[0m\r\n\x1b[1mthree\x1b[0m\r\n"),
+            3
+        );
+        // Unterminated CSI: the newline is consumed while hunting for a final byte.
+        assert_eq!(nl("before\r\n\x1b[999999\r\nafter\r\n"), 2);
+        // Unterminated OSC: everything to the end of input is consumed.
+        assert_eq!(nl("before\r\n\x1b]0;no terminator\r\nafter\r\n"), 1);
     }
 
     /// Scrollback that merely looks like a composer must never outrank the live one. The paste and
