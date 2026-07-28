@@ -59,7 +59,11 @@ impl State {
 
     /// Parse any valid state word, including `unknown` — used when reading a file's contents.
     fn parse_any(s: &str) -> Option<State> {
-        Self::parse_settable(s).or(if s == "unknown" { Some(State::Unknown) } else { None })
+        Self::parse_settable(s).or(if s == "unknown" {
+            Some(State::Unknown)
+        } else {
+            None
+        })
     }
 }
 
@@ -78,7 +82,7 @@ pub fn read_state(status_path: &Path) -> State {
     };
     if let Ok(mtime) = meta.modified()
         && let Ok(age) = SystemTime::now().duration_since(mtime)
-        && age > STATUS_STALE
+        && age >= STATUS_STALE
     {
         return State::Unknown; // stale → not trustworthy
     }
@@ -163,7 +167,11 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// A per-write-unique temp filename (pid + a process-local counter — no collisions within a process,
 /// and the pid separates processes).
 fn tmp_name() -> String {
-    format!(".status.tmp-{}-{}", std::process::id(), TMP_COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        ".status.tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]
@@ -181,11 +189,20 @@ mod tests {
     fn set_then_read_roundtrips_each_settable_state() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        for st in [State::Offline, State::Available, State::Busy, State::Away, State::Dnd] {
+        for st in [
+            State::Offline,
+            State::Available,
+            State::Busy,
+            State::Away,
+            State::Dnd,
+        ] {
             set_state(&sp, st).unwrap();
             assert_eq!(read_state(&sp), st);
             // file content is exactly `<state>\n` (wire format).
-            assert_eq!(fs::read_to_string(&sp).unwrap(), format!("{}\n", st.as_str()));
+            assert_eq!(
+                fs::read_to_string(&sp).unwrap(),
+                format!("{}\n", st.as_str())
+            );
         }
     }
 
