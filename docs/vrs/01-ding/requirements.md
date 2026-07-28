@@ -10,8 +10,8 @@ preconditions for pressing Return rather than as a delivery guarantee.
 This decomposes [`R05`](../requirements.md) — the ratified floor for inbox
 delivery, archive precedence, retries, suppression, and restart recovery — into
 the subsystem's own obligations, and inherits the watcher obligations in `R14`
-and `R15`. Where this file and the root disagree, the root wins and this file is
-wrong.
+and `R15`. Where this file and the root documents disagree, the root documents
+win and this file is wrong.
 
 The realization per maintained harness is specified in
 [`01-claude/spec.md`](./01-claude/spec.md) and
