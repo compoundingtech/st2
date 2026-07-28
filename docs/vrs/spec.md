@@ -70,9 +70,10 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   can share a single registry across catalogs. Resolution is an exported
   `PTY_ROOT`, then the catalog's declaration, then the default, applied
   uniformly to spawn, list, kill, and the bus environment st2 hands to native
-  tools, so every reader that can resolve the catalog agrees about where its
-  sessions are. A declaration whose field set does not match fails `st2
-  validate` rather than resolving silently back to the default.
+  tools. Tasks and sidecars receive that root in their spawn environment; a
+  process that resolves its registry from the environment alone therefore agrees
+  when st2 launched it, and only then. A declaration whose field set does not
+  match fails `st2 validate` rather than resolving silently back to the default.
 
 ## Message lifecycle
 
