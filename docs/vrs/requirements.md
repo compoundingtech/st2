@@ -73,3 +73,15 @@ accepted.
   can survive process replacement without depending on its transcript.
 - **R10 Agent-only identity:** st2 models agents. Non-agent identities are
   unsupported.
+
+- **R13 Shortest-path reconciliation:** An event is evidence, not permission
+  to run the world. st2 classifies source, path, kind, and affected identity,
+  then takes the shortest correct path from observed state to desired state.
+- **R14 Explicit filesystem-event contracts:** Every watcher is deny-by-default
+  with exact roots, paths, mutation kinds, semantic meaning, debounce policy,
+  and consumer. Reads, opens, unknown paths, and runtime output never trigger
+  generic reconciliation.
+- **R15 Bounded event coalescing:** Accepted event streams use tested
+  head/tail coalescing: immediate head response, one quiet tail, and a hard
+  maximum preventing starvation or unbounded scans, PTY queries, launches,
+  delivery attempts, or writes.

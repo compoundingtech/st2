@@ -92,6 +92,31 @@ The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.
 
+## Event contracts (R13–R15)
+
+An event is evidence, not permission to run the world. The reconciler retains
+path and kind, maps them to the affected identity or template dependency set,
+and computes the smallest desired-versus-actual delta. One declaration affects
+only that agent; a template affects only its dependents. A no-op performs zero
+PTY queries, launches, teardowns, materialization, or writes.
+
+Watchers are deny-by-default. The classifier/action contract is:
+
+| Event | Minimal action |
+| --- | --- |
+| `agents/**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
+| referenced `_templates/**` mutation | converge dependent agents only |
+| inbox create/archive/remove | DING consumer only; supervisor no-op |
+| plan/resource/status mutation | specialized consumer only; supervisor no-op |
+| PTY/exec/log/PID/socket/lock/temp/backup/read/open/unknown | no-op |
+
+Startup, timer, watcher overflow/loss, and ambiguity are bounded full-audit
+fallbacks. Accepted streams use head/tail coalescing: immediate head response,
+one quiet tail after a burst, and a hard maximum. Executable proof covers
+positive declaration/template wakes, negative runtime/bus events, bounded
+discovery/materialization/PTY queries and writes, continuous-event starvation,
+and no-op desired-equals-actual behavior.
+
 ## Open design questions
 
 - **DQ1 Scheduled work:** The vision includes per-machine schedulers that form a
