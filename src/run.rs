@@ -242,6 +242,12 @@ impl PtyCli {
         for (k, v) in &target.tags {
             cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
         }
+        // Managed agent and DING sessions retain PTY exit evidence until the lifecycle owner records
+        // the receipt and explicitly removes the generation. This prevents face607 clean-exit reaping
+        // from erasing diagnostics needed for adoption/loss investigation.
+        if target.name == "agent" || target.name == "ding" {
+            cmd.arg("--tag").arg("keep=true");
+        }
         // Apply the resolved managed overlay to the initial launcher exactly as before, and also
         // persist it in PTY metadata for manual restart. PTY applies repeated `--env` entries
         // last-wins, then forcibly injects the new session's own PTY_SESSION identity.
