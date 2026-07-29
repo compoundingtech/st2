@@ -42,7 +42,7 @@ pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
 pub use host_lock::HostLock;
-pub use reconcile::{Launch, ReconcilePlan, Session, TaskTarget, Teardown, reconcile};
+pub use reconcile::{Launch, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
     up_loop, up_loop_specs, up_once, up_once_specs,

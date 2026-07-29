@@ -13,6 +13,7 @@ fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> 
         name: name.to_string(),
         id: id.map(String::from),
         command: command.map(String::from),
+        argv: None,
         cwd: None,
         tags: BTreeMap::new(),
         env: BTreeMap::new(),

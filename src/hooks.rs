@@ -135,8 +135,25 @@ pub fn required_by_codex(specs: &[agent_spec::spec::AgentSpec], this_host: &str)
 pub fn required_by_codex_agent(spec: &agent_spec::spec::AgentSpec, this_host: &str) -> bool {
     spec.host.as_deref().is_none_or(|host| host == this_host)
         && spec.tasks.iter().any(|task| {
-            task.name == "agent" && task.command.as_deref().is_some_and(command_invokes_codex)
+            task.name == "agent"
+                && (task.command.as_deref().is_some_and(command_invokes_codex)
+                    || task.argv.as_deref().is_some_and(argv_invokes_codex))
         })
+}
+
+pub(crate) fn launch_invokes_codex(launch: &crate::reconcile::TaskLaunch) -> bool {
+    match launch {
+        crate::reconcile::TaskLaunch::Shell(command) => command_invokes_codex(command),
+        crate::reconcile::TaskLaunch::Argv(argv) => argv_invokes_codex(argv),
+    }
+}
+
+fn argv_invokes_codex(argv: &[String]) -> bool {
+    argv.first().is_some_and(|program| {
+        Path::new(program)
+            .file_name()
+            .is_some_and(|name| name == "codex")
+    })
 }
 
 /// Recognize the exact command shape emitted for Codex agents while accepting an absolute binary
@@ -395,6 +412,17 @@ mod tests {
         assert!(!command_invokes_codex(
             "exec /opt/bin/codex-wrapper --model x"
         ));
+        assert!(argv_invokes_codex(&[
+            "codex".into(),
+            "--model".into(),
+            "x".into()
+        ]));
+        assert!(argv_invokes_codex(&[
+            "/opt/bin/codex".into(),
+            "resume".into()
+        ]));
+        assert!(!argv_invokes_codex(&[]));
+        assert!(!argv_invokes_codex(&["codex-wrapper".into()]));
     }
 
     #[test]
@@ -448,11 +476,7 @@ mod tests {
         let mut successor = expected_receipt();
         successor.manifest.hookset = "sha256-successor".into();
         successor.manifest.directory = "sets/sha256-successor".into();
-        fs::write(
-            receipt_path(tmp.path()),
-            receipt_bytes(&successor).unwrap(),
-        )
-        .unwrap();
+        fs::write(receipt_path(tmp.path()), receipt_bytes(&successor).unwrap()).unwrap();
 
         assert_eq!(verify_required_set_at(tmp.path()).unwrap(), required);
         assert!(verify_installed_at(tmp.path()).is_err());
@@ -468,26 +492,32 @@ mod tests {
         let mut receipt = read_receipt(stale.path()).unwrap();
         receipt.manifest.hookset = "sha256-stale".into();
         fs::write(receipt_path(stale.path()), receipt_bytes(&receipt).unwrap()).unwrap();
-        assert!(verify_installed_at(stale.path())
-            .unwrap_err()
-            .to_string()
-            .contains("requires"));
+        assert!(
+            verify_installed_at(stale.path())
+                .unwrap_err()
+                .to_string()
+                .contains("requires")
+        );
 
         let partial = tempfile::tempdir().unwrap();
         let partial_dir = install_at(partial.path(), false).unwrap();
         fs::remove_file(partial_dir.join("codex-stop.sh")).unwrap();
-        assert!(verify_installed_at(partial.path())
-            .unwrap_err()
-            .to_string()
-            .contains("codex-stop.sh"));
+        assert!(
+            verify_installed_at(partial.path())
+                .unwrap_err()
+                .to_string()
+                .contains("codex-stop.sh")
+        );
 
         let mismatch = tempfile::tempdir().unwrap();
         let mismatch_dir = install_at(mismatch.path(), false).unwrap();
         fs::write(mismatch_dir.join("codex-stop.sh"), b"wrong\n").unwrap();
-        assert!(verify_installed_at(mismatch.path())
-            .unwrap_err()
-            .to_string()
-            .contains("content mismatch"));
+        assert!(
+            verify_installed_at(mismatch.path())
+                .unwrap_err()
+                .to_string()
+                .contains("content mismatch")
+        );
     }
 
     #[test]

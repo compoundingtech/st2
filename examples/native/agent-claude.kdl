@@ -13,7 +13,7 @@ agent "<identity>" {
 
   // The rendered bus contract requires agent-declared status: busy while executing work, available
   // only when yielding/ready, and dnd only for an explicit hold.
-  command #"exec claude --permission-mode bypassPermissions '<boot prompt>'"#
+  argv "claude" "--permission-mode" "bypassPermissions" "<boot prompt>"
   ding
 
   render {

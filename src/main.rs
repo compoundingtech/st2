@@ -589,7 +589,12 @@ fn main() -> Result<()> {
             env_cmd(&root)
         }
         Command::Pretrust { dirs } => pretrust_cmd(&dirs),
-        Command::Eval { folder, host, keep, json } => eval_cmd(&folder, host, keep, json),
+        Command::Eval {
+            folder,
+            host,
+            keep,
+            json,
+        } => eval_cmd(&folder, host, keep, json),
         Command::Validate {
             root,
             host,
@@ -728,12 +733,18 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
         )
     })?;
     let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
-    if json { unsafe { std::env::set_var("ST2_EVAL_JSON", "1"); } }
+    if json {
+        unsafe {
+            std::env::set_var("ST2_EVAL_JSON", "1");
+        }
+    }
     let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        if report.passed() { return Ok(()); }
+        if report.passed() {
+            return Ok(());
+        }
         anyhow::bail!("VERDICT: FAIL")
     }
 
@@ -1914,7 +1925,7 @@ fn ls(root: &Path) -> Result<()> {
         let runnable = if spec.is_runnable() {
             ""
         } else {
-            "  [UNRENDERED: no task command]"
+            "  [UNRENDERED: no task launch]"
         };
         let retired = if spec.retired { "  [retired]" } else { "" };
         println!(
@@ -1929,8 +1940,12 @@ fn ls(root: &Path) -> Result<()> {
                 st2::TaskKind::Pty => "pty",
                 st2::TaskKind::Exec => "exec",
             };
-            let cmd = task.command.as_deref().unwrap_or("<none>");
-            println!("      - {tk} {name}: {cmd}", name = task.name);
+            let launch = match (&task.command, &task.argv) {
+                (Some(command), _) => format!("command {command}"),
+                (_, Some(argv)) => format!("argv {argv:?}"),
+                _ => "<none>".to_string(),
+            };
+            println!("      - {tk} {name}: {launch}", name = task.name);
         }
     }
 
