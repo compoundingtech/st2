@@ -78,10 +78,13 @@ fn two_task_spec(identity: &str, first: &str, second: &str) -> AgentSpec {
 #[test]
 fn selected_one_shot_missing_spawns_only_selected_task() {
     let runner = FakeRunner {
-        sessions: vec![live("host.agent.side")],
+        sessions: vec![live("host.agent.side"), live("host.sibling.work")],
         ..Default::default()
     };
-    let specs = vec![two_task_spec("agent", "host.agent.work", "host.agent.side")];
+    let specs = vec![
+        two_task_spec("agent", "host.agent.work", "host.agent.side"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
     let report = up_once_selected_specs(
         Path::new("/tmp"),
         &specs,
@@ -101,10 +104,17 @@ fn selected_one_shot_missing_spawns_only_selected_task() {
 #[test]
 fn selected_one_shot_live_adopts_without_actions() {
     let runner = FakeRunner {
-        sessions: vec![live("host.agent.work"), live("host.agent.side")],
+        sessions: vec![
+            live("host.agent.work"),
+            live("host.agent.side"),
+            live("host.sibling.work"),
+        ],
         ..Default::default()
     };
-    let specs = vec![two_task_spec("agent", "host.agent.work", "host.agent.side")];
+    let specs = vec![
+        two_task_spec("agent", "host.agent.work", "host.agent.side"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
     let report = up_once_selected_specs(
         Path::new("/tmp"),
         &specs,
@@ -124,10 +134,17 @@ fn selected_one_shot_live_adopts_without_actions() {
 #[test]
 fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
     let runner = FakeRunner {
-        sessions: vec![dead("host.agent.work"), live("host.agent.side")],
+        sessions: vec![
+            dead("host.agent.work"),
+            live("host.agent.side"),
+            live("host.sibling.work"),
+        ],
         ..Default::default()
     };
-    let specs = vec![two_task_spec("agent", "host.agent.work", "host.agent.side")];
+    let specs = vec![
+        two_task_spec("agent", "host.agent.work", "host.agent.side"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
     let report = up_once_selected_specs(
         Path::new("/tmp"),
         &specs,
@@ -148,10 +165,13 @@ fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
 #[test]
 fn selected_one_shot_second_live_pass_is_a_noop() {
     let runner = FakeRunner {
-        sessions: vec![live("host.agent.work")],
+        sessions: vec![live("host.agent.work"), live("host.sibling.work")],
         ..Default::default()
     };
-    let specs = vec![task_spec("agent", None, "host.agent.work")];
+    let specs = vec![
+        task_spec("agent", None, "host.agent.work"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
     let report = up_once_selected_specs(
         Path::new("/tmp"),
         &specs,
