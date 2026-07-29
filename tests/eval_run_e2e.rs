@@ -6,7 +6,8 @@
 //!
 //! Needs `pty` on PATH — HARD failure if absent unless ST2_ALLOW_PTY_SKIP is set.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,15 @@ impl Drop for RemoveDirOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[allow(dead_code)]
+fn preserved_eval_catalog(output: &std::process::Output) -> std::path::PathBuf {
+    let text = format!("{}\n{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
+    text.lines()
+        .find_map(|line| line.strip_prefix("catalog preserved (--keep): "))
+        .map(std::path::PathBuf::from)
+        .expect("--keep eval must report preserved catalog")
 }
 
 #[test]
@@ -187,8 +197,21 @@ sleep 60
 /// Under `supervise`, teardown reaps RUNTIME-spawned seats too (the team-standup pattern: a seat spins
 /// up an undeclared peer mid-run), not just the declared team. The seat spawns an undeclared `rtpeer`
 /// into the eval's hermetic PTY_ROOT; after the eval, no orphan carrying the peer's marker survives.
-#[test]
-fn supervise_teardown_reaps_a_runtime_spawned_seat() {
+const RUNTIME_PEER_SPEC: &str = r#"
+env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
+agent "sup" {
+  env { ST_AGENT "sup" }
+  command "sh -c 'pty run -d --id rtpeer -- sleep 100000; for _ in $(seq 1 100); do test -s $PTY_ROOT/rtpeer.pid && break; sleep 0.05; done; cat $PTY_ROOT/rtpeer.pid > $CATALOG/runtime-peer.pid; exec sleep 100000'"
+}
+eval {
+  message { from "runner"; to "sup"; content "go" }
+  max-timeout "6s"
+  supervise
+  judges { judge "trivial" { exec "exit 0" } }
+}
+"#;
+
+fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, expect_success: bool) {
     if !pty_available() {
         assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
         eprintln!("SKIP supervise_teardown_reaps_a_runtime_spawned_seat: `pty` not on PATH");
@@ -203,23 +226,11 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat() {
     // daemon pid inside the preserved eval catalog. No done signal → the eval times out → supervised
     // teardown must reap both the declared seat and the runtime peer. The proof below uses only this
     // invocation's root + exact pid; concurrent evals cannot be observed or killed.
-    std::fs::write(
-        cell.join("cell.kdl"),
-        r#"
-env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
-agent "sup" {
-  env { ST_AGENT "sup" }
-  command "sh -c 'pty run -d --id rtpeer -- sleep 100000; for _ in $(seq 1 100); do test -s $PTY_ROOT/rtpeer.pid && break; sleep 0.05; done; cat $PTY_ROOT/rtpeer.pid > $CATALOG/runtime-peer.pid; exec sleep 100000'"
-}
-eval {
-  message { from "runner"; to "sup"; content "go" }
-  max-timeout "6s"
-  supervise
-  judges { judge "trivial" { exec "exit 0" } }
-}
-"#,
-    )
-    .unwrap();
+    let spec_text = RUNTIME_PEER_SPEC;
+    assert_eq!(spec_text.len(), 459);
+    let sentinel = "judge \"trivial\" { exec \"exit 0\" }";
+    assert_eq!(spec_text.matches(sentinel).count(), 1);
+    std::fs::write(cell.join("cell.kdl"), spec_text.replace(sentinel, &format!("judge \"trivial\" {{ exec \"{judge_command}\" }}"))).unwrap();
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
     let child = Command::new(bin)
         .args(["eval", "--keep"])
@@ -245,6 +256,13 @@ eval {
         )),
         "eval did not preserve its expected per-process catalog:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
+    assert_eq!(out.status.success(), expect_success);
+    if expect_success {
+        assert!(stdout.contains("VERDICT: PASS"), "expected human PASS verdict:\n{stdout}\n{stderr}");
+    } else {
+        assert!(stderr.contains("VERDICT: FAIL"), "expected human FAIL verdict on stderr:\n{stdout}\n{stderr}");
+        assert!(!out.status.success(), "human FAIL must be nonzero");
+    }
 
     let peer_pid: i32 = std::fs::read_to_string(catalog.join("runtime-peer.pid"))
         .unwrap()
@@ -252,15 +270,7 @@ eval {
         .parse()
         .unwrap();
     let peer_alive = unsafe { libc::kill(peer_pid, 0) == 0 };
-    if peer_alive {
-        // Failure cleanup stays inside this invocation's PTY root; never scan or kill by a global
-        // command marker. Preserve the pre-cleanup observation for the assertion below.
-        let _ = Command::new("pty")
-            .args(["--root"])
-            .arg(catalog.join("pty"))
-            .args(["kill", "rtpeer"])
-            .status();
-    }
+    assert!(!peer_alive, "runtime peer still alive before post-teardown assertions (pid {peer_pid})");
     let sessions = Command::new("pty")
         .args(["--root"])
         .arg(catalog.join("pty"))
@@ -274,14 +284,138 @@ eval {
     );
     let session_json: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
     assert!(
-        !peer_alive
-            && !catalog.join("pty/rtpeer.pid").exists()
-            && session_json
-                .as_array()
-                .is_some_and(|sessions| sessions.iter().all(|session| session["name"] != "rtpeer")),
+        !catalog.join("pty/rtpeer.pid").exists()
+            && !catalog.join("pty/rtpeer.sock").exists()
+            && session_json.as_array().is_some_and(|sessions| sessions.is_empty()),
         "runtime-spawned seat leaked after supervise teardown (pid {peer_pid}, registry {session_json}):\n\
          --stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
+}
+
+#[test]
+fn supervise_teardown_reaps_a_runtime_spawned_seat() { supervise_teardown_reaps_a_runtime_spawned_seat_case("exit 0", true); }
+
+#[test]
+fn supervise_teardown_runtime_peer_human_failure() { supervise_teardown_reaps_a_runtime_spawned_seat_case("exit 1", false); }
+
+struct SignalCaseFailureGuard {
+    child: Option<std::process::Child>,
+    pty_root: PathBuf,
+    peer_id: String,
+    peer_pid: Option<i32>,
+    armed: bool,
+    receipt: Arc<Mutex<SignalCleanupReceipt>>,
+}
+
+fn pty_session_pid(root: &Path, id: &str) -> (i32, serde_json::Value) {
+    let out = Command::new("pty").args(["--root"]).arg(root).args(["stats", "--json", id]).output().unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("stats parse failed: {e}; raw={}", String::from_utf8_lossy(&out.stdout)));
+    fn find(v: &serde_json::Value) -> Option<i32> { match v { serde_json::Value::Object(m) => m.get("process").and_then(|p| p.get("pid")).and_then(|p| p.as_i64()).map(|p| p as i32).or_else(|| m.values().find_map(find)), serde_json::Value::Array(a) => a.iter().find_map(find), _ => None } }
+    let pid = find(&raw).unwrap_or_else(|| panic!("stats missing process.pid: {raw}")); (pid, raw)
+}
+
+#[derive(Clone, Debug, Default)]
+struct SignalCleanupReceipt { success: bool, diagnostics: String, child_pid: Option<u32>, child_dead: bool, peer_pid: Option<i32>, peer_dead: bool, registry_empty: bool, pid_absent: bool, socket_absent: bool }
+
+impl SignalCaseFailureGuard {
+    fn disarm(&mut self) { self.armed = false; }
+    fn child_mut(&mut self) -> Option<&mut std::process::Child> { self.child.as_mut() }
+    fn take_child(&mut self) -> Option<std::process::Child> { self.child.take() }
+}
+
+impl Drop for SignalCaseFailureGuard {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let child_pid = self.child.as_ref().map(|c| c.id()); let peer_pid = self.peer_pid;
+        let mut ok = false; let mut diagnostics = String::new();
+        for _ in 0..5 {
+            let _ = Command::new("pty").args(["--root"]).arg(&self.pty_root).args(["kill", &self.peer_id]).status();
+            if let Some(pid) = peer_pid && unsafe { libc::kill(pid, 0) == 0 } { unsafe { libc::kill(pid, libc::SIGKILL); } }
+            let _ = Command::new("pty").args(["--root"]).arg(&self.pty_root).args(["rm", &self.peer_id]).status();
+            match Command::new("pty").args(["--root"]).arg(&self.pty_root).args(["list", "--json"]).output() {
+                Ok(out) => if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if json.as_array().is_some_and(|v| v.is_empty()) { ok = true; break; }
+                    diagnostics = json.to_string();
+                } else { diagnostics = String::from_utf8_lossy(&out.stderr).into_owned(); },
+                Err(e) => diagnostics = e.to_string(),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let child_dead = child_pid.is_some_and(|p| unsafe { libc::kill(p as i32, 0) != 0 });
+        let peer_dead = peer_pid.is_none_or(|p| unsafe { libc::kill(p, 0) != 0 });
+        let pid_absent = !self.pty_root.join(format!("{}.pid", self.peer_id)).exists();
+        let socket_absent = !self.pty_root.join(format!("{}.sock", self.peer_id)).exists();
+        if !ok && diagnostics.is_empty() { diagnostics = "registry did not converge empty".into(); }
+        if let Ok(mut receipt) = self.receipt.lock() { receipt.child_pid=child_pid; receipt.child_dead=child_dead; receipt.peer_pid=peer_pid; receipt.peer_dead=peer_dead; receipt.registry_empty=ok; receipt.pid_absent=pid_absent; receipt.socket_absent=socket_absent; receipt.success=child_dead&&peer_dead&&ok&&pid_absent&&socket_absent; receipt.diagnostics=diagnostics; }
+    }
+}
+
+fn runtime_peer_signal_case(sig: libc::c_int) {
+    if !pty_available() {
+        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "pty not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        eprintln!("SKIP runtime_peer_signal_case: pty not on PATH");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2"); let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap(); let cell = tmp.path().join("cell"); std::fs::create_dir_all(&cell).unwrap();
+    std::fs::write(cell.join("cell.kdl"), RUNTIME_PEER_SPEC).unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let child = Command::new(bin).args(["eval", "--keep"]).arg(&cell).env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg")).env_remove("CATALOG").env_remove("ST_ROOT").env_remove("PTY_ROOT")
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id())); let _guard = RemoveDirOnDrop(catalog.clone());
+    let receipt = Arc::new(Mutex::new(SignalCleanupReceipt::default()));
+    let mut failure = SignalCaseFailureGuard { child: Some(child), pty_root: catalog.join("pty"), peer_id: "rtpeer".into(), peer_pid: None, armed: true, receipt };
+    let marker = catalog.join("runtime-peer.pid"); let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(100)); }
+    if !marker.exists() { let status = failure.child_mut().and_then(|c| c.try_wait().ok()).flatten(); panic!("marker timeout status={status:?} catalog={}", catalog.display()); }
+    assert!(catalog.is_dir());
+    let (session_pid, _stats) = pty_session_pid(&catalog.join("pty"), "rtpeer");
+    let child_id = failure.child_mut().unwrap().id();
+    assert_eq!(unsafe { libc::kill(child_id as i32, sig) }, 0);
+    let out = failure.take_child().unwrap().wait_with_output().unwrap(); assert!(!out.status.success(), "status={:?} stdout={} stderr={}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(combined.contains("eval interrupted by SIGINT/SIGTERM"), "missing interruption contract: {combined}");
+    let peer: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap(); failure.peer_pid = Some(peer); assert!(unsafe { libc::kill(peer, 0) != 0 });
+    assert!(unsafe { libc::kill(session_pid, 0) != 0 });
+    let listed = Command::new("pty").args(["--root"]).arg(catalog.join("pty")).args(["list", "--json"]).output().unwrap();
+    let registry: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap(); assert!(registry.as_array().is_some_and(|v| v.is_empty()));
+    assert!(!catalog.join("pty/rtpeer.pid").exists()); assert!(!catalog.join("pty/rtpeer.sock").exists());
+    failure.disarm();
+}
+
+#[test] fn supervise_runtime_peer_sigterm_reaps() { runtime_peer_signal_case(libc::SIGTERM); }
+#[test] fn supervise_runtime_peer_sigint_reaps() { runtime_peer_signal_case(libc::SIGINT); }
+
+#[test]
+fn signal_case_failure_guard_reaps_on_unwind() {
+    if !pty_available() {
+        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "pty not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        eprintln!("SKIP signal_case_failure_guard_reaps_on_unwind: pty not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap(); let catalog = tmp.path().join("catalog"); let receipt = Arc::new(Mutex::new(SignalCleanupReceipt::default()));
+    let receipt_out = receipt.clone();
+    let session_pid_out: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+    let session_pid_capture = session_pid_out.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::fs::create_dir_all(catalog.join("pty")).unwrap();
+        let _catalog = RemoveDirOnDrop(catalog.clone());
+        let root = catalog.join("pty");
+        let peer = Command::new("pty").args(["--root"]).arg(&root).args(["run", "-d", "--id", "rtpeer", "--", "sleep", "1000"]).status().unwrap(); assert!(peer.success());
+        let pid_path = root.join("rtpeer.pid"); let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_path.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(50)); }
+        let peer_pid: i32 = std::fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+        let (session_pid, _) = pty_session_pid(&root, "rtpeer"); *session_pid_capture.lock().unwrap() = Some(session_pid);
+        let child = Command::new("sh").args(["-c", "sleep 1000"]).spawn().unwrap();
+        let guard = SignalCaseFailureGuard { child: Some(child), pty_root: root, peer_id: "rtpeer".into(), peer_pid: Some(peer_pid), armed: true, receipt: receipt.clone() };
+        let _guard = guard; panic!("representative post-signal assertion");
+    }));
+    assert!(result.is_err()); let receipt = receipt_out.lock().unwrap(); assert!(receipt.success, "cleanup diagnostics: {}", receipt.diagnostics); assert!(receipt.diagnostics.is_empty()); assert!(receipt.child_pid.is_some() && receipt.child_dead && receipt.peer_pid.is_some() && receipt.peer_dead && receipt.registry_empty && receipt.pid_absent && receipt.socket_absent); let session_pid = session_pid_out.lock().unwrap().unwrap(); assert!(unsafe { libc::kill(session_pid, 0) != 0 }); assert!(!catalog.exists());
 }
 
 /// A TEAM-LESS eval (no agents, no kickoff) runs its `run` steps to completion, captures each step's

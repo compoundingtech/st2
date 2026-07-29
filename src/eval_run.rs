@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -21,6 +22,30 @@ macro_rules! eval_log {
     ($($arg:tt)*) => {
         if std::env::var_os("ST2_EVAL_JSON").is_some() { eprintln!($($arg)*); } else { std::println!($($arg)*); }
     };
+}
+
+static EVAL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_eval_signal(_signal: libc::c_int) {
+    EVAL_INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+fn install_eval_signal_handlers() -> (libc::sighandler_t, libc::sighandler_t) {
+    EVAL_INTERRUPTED.store(false, Ordering::SeqCst);
+    // libc exposes sighandler_t as a numeric ABI token on some targets.
+    #[allow(clippy::fn_to_numeric_cast, function_casts_as_integer)]
+    unsafe {
+        (libc::signal(libc::SIGINT, on_eval_signal as libc::sighandler_t), libc::signal(libc::SIGTERM, on_eval_signal as libc::sighandler_t))
+    }
+}
+
+fn restore_eval_signal_handlers(previous: (libc::sighandler_t, libc::sighandler_t)) {
+    unsafe { libc::signal(libc::SIGINT, previous.0); libc::signal(libc::SIGTERM, previous.1); }
+}
+
+struct EvalSignalGuard((libc::sighandler_t, libc::sighandler_t));
+impl Drop for EvalSignalGuard {
+    fn drop(&mut self) { restore_eval_signal_handlers(self.0); }
 }
 
 /// Map a parsed spec's agents into in-memory [`AgentSpec`]s rooted at `root` (which becomes `$CATALOG`
@@ -311,6 +336,9 @@ fn wait_done(
     let req_inbox = bus.join(requester).join("inbox");
     let deadline = Instant::now() + timeout;
     loop {
+        if EVAL_INTERRUPTED.load(Ordering::SeqCst) {
+            return false;
+        }
         // Earliest worker→sup report (a message from a worker seat). Scan the sup's inbox AND archive:
         // DING-BUS mandates "archive a message the moment you act on it", so a well-behaved sup MOVES the
         // report inbox→archive the instant it acts. Scanning inbox-only makes the done-signal a race
@@ -411,6 +439,7 @@ fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
 /// kickoff, wait for the sup's confirmation (post-dating a worker report) or `max-timeout`, tear down.
 /// (P4 runs the judges after done and returns the verdict.) The temp catalog is removed on the way out.
 pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<EvalReport> {
+    let _signal_guard = EvalSignalGuard(install_eval_signal_handlers());
     let (spec, spec_dir) = load_spec(spec_file)?;
     let eval = spec.eval.clone().ok_or_else(|| {
         anyhow::anyhow!("{} has no `eval {{}}` block — use `st2 up` to just boot the team", spec_file.display())
@@ -423,6 +452,7 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
     let catalog = std::env::temp_dir().join(format!("st2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&catalog);
     std::fs::create_dir_all(&catalog)?;
+    let _guard = EvalCleanupGuard { runner: SystemRunner::new(catalog.clone(), catalog.join("exec")), catalog: catalog.clone(), host: host.clone(), keep };
     // SAFETY: st2 eval is single-threaded up to the boot; set before any seat spawns.
     unsafe { std::env::set_var("PTY_ROOT", catalog.join("pty")) };
     // Root exec-task state under the catalog too, so ANY st2 sub-invocation spawned INSIDE the eval — a
@@ -443,7 +473,12 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
         unsafe { std::env::set_var("PATH", format!("{}:{path}", dir.display())) };
     }
 
-    let result = run_eval_inner(&spec, &eval, &spec_dir, &catalog, &host);
+    let result = if EVAL_INTERRUPTED.load(Ordering::SeqCst) {
+        Err(anyhow::anyhow!("eval interrupted by SIGINT/SIGTERM"))
+    } else {
+        run_eval_inner(&spec, &eval, &spec_dir, &catalog, &host)
+    };
+    reap_all_eval_sessions(&catalog, &host)?;
     // Seats are already torn down inside run_eval_inner (no leaks). `--keep` preserves the catalog
     // files (worker repo base..HEAD, judge outputs, bus) for post-run inspection — e.g. a gate
     // reproduction reading the folder before it's "real"; otherwise the hermetic catalog is removed.
@@ -453,6 +488,40 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
         let _ = std::fs::remove_dir_all(&catalog);
     }
     result
+}
+
+fn reap_all_eval_sessions_with_runner<R: Runner>(runner: &R, host: &str) -> Result<()> {
+    let _host = host;
+    let mut last_error = None;
+    for _ in 0..5 {
+        let sessions = runner.list_sessions().with_context(|| format!("listing eval sessions for host {host}"))?;
+        if sessions.is_empty() { return Ok(()); }
+        for session in sessions {
+            if session.alive && let Err(error) = runner.kill(&session.pty_id) { last_error = Some(format!("kill {}: {error:#}", session.pty_id)); }
+            if let Err(error) = runner.remove(&session.pty_id) { last_error = Some(format!("remove {}: {error:#}", session.pty_id)); }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    anyhow::bail!("eval session reap did not reach empty state on host {host}; last error: {}", last_error.unwrap_or_else(|| "none".into()))
+}
+
+fn reap_all_eval_sessions(catalog: &Path, host: &str) -> Result<()> {
+    let runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
+    reap_all_eval_sessions_with_runner(&runner, host)
+}
+
+/// Idempotent safety net for eval catalog lifetime. Normal teardown remains responsible for
+/// sessions; this guard ensures an unwind cannot strand the hermetic catalog on disk.
+struct EvalCleanupGuard<R: Runner> { runner: R, catalog: PathBuf, host: String, keep: bool }
+impl<R: Runner> Drop for EvalCleanupGuard<R> {
+    fn drop(&mut self) {
+        let reap = reap_all_eval_sessions_with_runner(&self.runner, &self.host);
+        if let Err(error) = reap {
+            eprintln!("st2 eval cleanup: {error:#}; preserving catalog {}", self.catalog.display());
+            return;
+        }
+        if !self.keep { let _ = std::fs::remove_dir_all(&self.catalog); }
+    }
 }
 
 /// Run the eval's `run { }` stage: its command steps, sequentially (declaration order), BEFORE judging.
@@ -762,6 +831,10 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             wait_done(&bus, &sup, &msg.from, &workers, eval.max_timeout, &mut tick)
         };
 
+        if EVAL_INTERRUPTED.load(Ordering::SeqCst) {
+            anyhow::bail!("eval interrupted by SIGINT/SIGTERM");
+        }
+
         if done {
             eval_log!("== team signalled done — judging ==");
         } else {
@@ -967,6 +1040,76 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconcile::{Session, TaskTarget};
+    use std::cell::RefCell;
+
+    struct RaceRunner { lists: RefCell<Vec<Vec<Session>>>, ops: RefCell<Vec<String>> }
+    impl Runner for RaceRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { Ok(self.lists.borrow_mut().remove(0)) }
+        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
+        fn kill(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("kill:{id}")); anyhow::bail!("already gone") }
+        fn remove(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("remove:{id}")); anyhow::bail!("already gone") }
+    }
+
+    #[test]
+    fn reap_race_errors_converge_only_after_empty_list() {
+        let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None }], vec![]]), ops: RefCell::new(Vec::new()) };
+        assert!(reap_all_eval_sessions_with_runner(&runner, "test").is_ok());
+        assert_eq!(runner.ops.borrow().len(), 2);
+    }
+
+    struct PersistentRunner { lists: RefCell<usize>, ops: RefCell<usize> }
+    impl Runner for PersistentRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { *self.lists.borrow_mut() += 1; Ok(vec![Session { pty_id: "stuck".into(), alive: true, exit_code: None }]) }
+        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
+        fn kill(&self, _: &str) -> anyhow::Result<()> { *self.ops.borrow_mut() += 1; Ok(()) }
+        fn remove(&self, _: &str) -> anyhow::Result<()> { *self.ops.borrow_mut() += 1; Ok(()) }
+    }
+
+    #[test]
+    fn reap_persistent_residual_fails_after_bounded_attempts() {
+        let runner = PersistentRunner { lists: RefCell::new(0), ops: RefCell::new(0) };
+        let error = reap_all_eval_sessions_with_runner(&runner, "host-x").unwrap_err().to_string();
+        assert!(error.contains("host-x") && error.contains("empty state"));
+        assert_eq!(*runner.lists.borrow(), 5);
+        assert_eq!(*runner.ops.borrow(), 10);
+    }
+
+    #[test]
+    fn cleanup_guard_reaps_on_unwind_without_double_panic() {
+        use std::rc::Rc;
+        let lists = Rc::new(RefCell::new(vec![vec![Session { pty_id: "panic".into(), alive: true, exit_code: None }], vec![]]));
+        let ops = Rc::new(RefCell::new(Vec::new()));
+        struct Shared { lists: Rc<RefCell<Vec<Vec<Session>>>>, ops: Rc<RefCell<Vec<String>>> }
+        impl Runner for Shared {
+            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { Ok(self.lists.borrow_mut().remove(0)) }
+            fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
+            fn kill(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("kill:{id}")); Ok(()) }
+            fn remove(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("remove:{id}")); Ok(()) }
+        }
+        let runner = Shared { lists: lists.clone(), ops: ops.clone() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = EvalCleanupGuard { runner, catalog: std::env::temp_dir().join("st2-test-panic"), host: "test".into(), keep: true };
+            panic!("panic after guard acquisition");
+        }));
+        assert!(result.is_err());
+        assert_eq!(*lists.borrow(), Vec::<Vec<Session>>::new());
+        assert_eq!(&*ops.borrow(), &["kill:panic", "remove:panic"]);
+    }
+
+    #[test]
+    fn cleanup_guard_catalog_lifetime_matrix() {
+        for keep in [false, true] {
+            let dir = tempfile::tempdir().unwrap(); let catalog = dir.path().join("catalog"); std::fs::create_dir_all(&catalog).unwrap();
+            let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None }], vec![]]), ops: RefCell::new(Vec::new()) };
+            { let _guard = EvalCleanupGuard { runner, catalog: catalog.clone(), host: "test".into(), keep }; }
+            assert_eq!(catalog.exists(), keep);
+        }
+        let dir = tempfile::tempdir().unwrap(); let catalog = dir.path().join("catalog"); std::fs::create_dir_all(&catalog).unwrap();
+        let runner = PersistentRunner { lists: RefCell::new(0), ops: RefCell::new(0) };
+        { let _guard = EvalCleanupGuard { runner, catalog: catalog.clone(), host: "test".into(), keep: false }; }
+        assert!(catalog.exists());
+    }
 
     #[test]
     fn signal_judges_do_not_gate_the_verdict() {
