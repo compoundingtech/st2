@@ -17,6 +17,12 @@ use crate::reconcile::reconcile;
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
 use crate::spec::{AgentSpec, JobType, Task, TaskKind};
 
+macro_rules! eval_log {
+    ($($arg:tt)*) => {
+        if std::env::var_os("ST2_EVAL_JSON").is_some() { eprintln!($($arg)*); } else { std::println!($($arg)*); }
+    };
+}
+
 /// Map a parsed spec's agents into in-memory [`AgentSpec`]s rooted at `root` (which becomes `$CATALOG`
 /// and the base for each agent's `workspace`/cwd). Each agent's own `command` is a `pty` task keyed by
 /// the agent id; each `exec` block is an `exec` task keyed by its id. Env is already cascaded.
@@ -442,7 +448,7 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
     // files (worker repo base..HEAD, judge outputs, bus) for post-run inspection — e.g. a gate
     // reproduction reading the folder before it's "real"; otherwise the hermetic catalog is removed.
     if keep {
-        println!("catalog preserved (--keep): {}", catalog.display());
+        eval_log!("catalog preserved (--keep): {}", catalog.display());
     } else {
         let _ = std::fs::remove_dir_all(&catalog);
     }
@@ -536,7 +542,7 @@ fn run_steps(
         combined.extend_from_slice(&err);
         let _ = std::fs::write(logs_dir.join(format!("{}.log", step.id)), &combined);
         runtime.insert(format!("RUN_{}_EXIT", env_key(&step.id)), exit.to_string());
-        println!("== run step {} → exit {}{} ==", step.id, exit, if step.allow_nonzero { " (allow-nonzero)" } else { "" });
+        eval_log!("== run step {} → exit {}{} ==", step.id, exit, if step.allow_nonzero { " (allow-nonzero)" } else { "" });
 
         if !step.allow_nonzero {
             // Default: a run step must succeed. A non-zero final exit hard-fails the verdict as a
@@ -618,7 +624,7 @@ fn crash_ding(seat_id: &str, specs: &[AgentSpec], bus: &Path) {
     for ancestor in &chain {
         let inbox = bus.join(ancestor).join("inbox");
         let _ = crate::message::send_to_inbox(&inbox, "st2", Some(&subject), None, &[], &body);
-        println!("== crash-ding: {seat_id} → {ancestor} ==");
+        eval_log!("== crash-ding: {seat_id} → {ancestor} ==");
     }
 }
 
@@ -644,7 +650,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
     let (done, specs) = if agents.is_empty() {
         // TEAM-LESS: nothing to boot, kick off, or wait on — the run steps did the work → straight to judging.
         if !eval.run_steps.is_empty() {
-            println!("== team-less eval: {} run step(s) ran → judging ==", eval.run_steps.len());
+            eval_log!("== team-less eval: {} run step(s) ran → judging ==", eval.run_steps.len());
         }
         (true, Vec::new())
     } else {
@@ -659,7 +665,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             let _ = crate::pretrust::pretrust(&dirs);
         }
 
-        println!("== boot team ({} agents) ==", specs.len());
+        eval_log!("== boot team ({} agents) ==", specs.len());
         boot_team(&specs, host, catalog)?;
         boot_gate(&agents, &specs, host, catalog)?;
 
@@ -671,11 +677,11 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
         let to_inbox = bus.join(&msg.to).join("inbox");
         crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
             .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
-        println!("== kickoff → {} (from {}) ==", msg.to, msg.from);
+        eval_log!("== kickoff → {} (from {}) ==", msg.to, msg.from);
 
         let sup = msg.to.clone();
         let workers: Vec<String> = spec.agents.iter().map(|a| a.id.clone()).filter(|id| *id != sup).collect();
-        println!(
+        eval_log!(
             "== waiting for {sup}→{} confirmation post-dating a worker report (≤{:?}) ==",
             msg.from, eval.max_timeout
         );
@@ -749,7 +755,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                         ),
                     };
                     if !report.launched.is_empty() {
-                        println!("== supervise: respawned {:?} from spec ==", report.launched);
+                        eval_log!("== supervise: respawned {:?} from spec ==", report.launched);
                     }
                 }
             };
@@ -757,9 +763,9 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
         };
 
         if done {
-            println!("== team signalled done — judging ==");
+            eval_log!("== team signalled done — judging ==");
         } else {
-            println!("== max-timeout: no confirmation within {:?} — judging the final state ==", eval.max_timeout);
+            eval_log!("== max-timeout: no confirmation within {:?} — judging the final state ==", eval.max_timeout);
         }
         (done, specs)
     };

@@ -713,6 +713,7 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
         )
     })?;
     let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
+    if json { unsafe { std::env::set_var("ST2_EVAL_JSON", "1"); } }
     let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
 
     if json {
