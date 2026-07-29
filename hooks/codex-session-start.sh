@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # st2 Codex SessionStart hook: restore fresh working state, expose the unread inbox, and remind the
 # model to complete its boot ritual. Fail-open: a missing dependency never prevents Codex startup.
 

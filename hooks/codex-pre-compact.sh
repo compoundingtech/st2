@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # st2 Codex PreCompact hook. Never block compaction. If the agent has not captured any durable
 # working state, write a reconstruction stub; never overwrite non-whitespace state.
 

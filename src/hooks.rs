@@ -52,6 +52,8 @@ struct InstallReceipt {
     st2_version: String,
     st2_git_sha: String,
     source_commit_unix: u64,
+    #[serde(default)]
+    source_dirty: bool,
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -80,11 +82,13 @@ fn expected_manifest() -> HookManifest {
 }
 
 fn expected_receipt() -> InstallReceipt {
+    let identity = crate::version::build_identity();
     InstallReceipt {
         manifest: expected_manifest(),
-        st2_version: env!("CARGO_PKG_VERSION").to_string(),
-        st2_git_sha: env!("ST2_GIT_SHA_FULL").to_string(),
-        source_commit_unix: env!("ST2_GIT_COMMIT_UNIX").parse().unwrap_or(0),
+        st2_version: identity.version,
+        st2_git_sha: identity.rev,
+        source_commit_unix: identity.commit_unix,
+        source_dirty: identity.dirty,
     }
 }
 
@@ -239,7 +243,7 @@ fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
 fn check_replacement(
     current: &InstallReceipt,
     candidate: &InstallReceipt,
-    allow_downgrade: bool,
+    replace: bool,
 ) -> Result<()> {
     if current.manifest.hookset == candidate.manifest.hookset {
         return Ok(());
@@ -252,7 +256,7 @@ fn check_replacement(
                     .cmp(&candidate.source_commit_unix)
             })
         });
-    if allow_downgrade || source_order == Some(Ordering::Less) {
+    if replace || source_order == Some(Ordering::Less) {
         return Ok(());
     }
     let reason = match source_order {
@@ -263,7 +267,7 @@ fn check_replacement(
     };
     anyhow::bail!(
         "refusing to replace hook set '{}' with '{}' because {reason}; \
-         rerun with --allow-downgrade only for an intentional rollback",
+         rerun with --replace to intentionally select this binary's exact hook set",
         current.manifest.hookset,
         candidate.manifest.hookset
     )
@@ -330,25 +334,24 @@ fn write_receipt(root: &Path, receipt: &InstallReceipt) -> Result<()> {
 }
 
 /// Explicitly publish this binary's immutable hook set and atomically select it.
-pub fn install(allow_downgrade: bool) -> Result<PathBuf> {
-    install_at(&hooks_root()?, allow_downgrade)
+pub fn install(replace: bool) -> Result<PathBuf> {
+    install_at(&hooks_root()?, replace)
 }
 
 /// Explicit installer beneath a provided root. Ordinary `up` and materialization paths never call it.
-pub fn install_at(root: &Path, allow_downgrade: bool) -> Result<PathBuf> {
+pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
     fs::create_dir_all(root).with_context(|| format!("creating hook root {}", root.display()))?;
     let candidate = expected_receipt();
     match read_receipt(root) {
         Ok(current) => {
-            check_replacement(&current, &candidate, allow_downgrade)?;
+            check_replacement(&current, &candidate, replace)?;
             if current.manifest.hookset == candidate.manifest.hookset {
                 return verify_set(root, &current.manifest);
             }
         }
-        Err(error) if receipt_path(root).exists() && !allow_downgrade => {
-            return Err(error).context(
-                "refusing to replace an unreadable hook receipt without --allow-downgrade",
-            );
+        Err(error) if receipt_path(root).exists() && !replace => {
+            return Err(error)
+                .context("refusing to replace an unreadable hook receipt without --replace");
         }
         Err(_) => {}
     }
@@ -397,6 +400,14 @@ mod tests {
     }
 
     #[test]
+    fn receipts_without_dirty_provenance_remain_readable() {
+        let mut legacy = serde_json::to_value(expected_receipt()).unwrap();
+        legacy.as_object_mut().unwrap().remove("sourceDirty");
+        let parsed: InstallReceipt = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.source_dirty);
+    }
+
+    #[test]
     fn verification_rejects_missing_stale_partial_and_mismatched_state() {
         let missing = tempfile::tempdir().unwrap();
         assert!(verify_installed_at(missing.path()).is_err());
@@ -429,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_binary_needs_explicit_downgrade_authority() {
+    fn an_older_binary_needs_explicit_replacement_authority() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path()).unwrap();
         let mut newer = expected_receipt();
@@ -439,7 +450,7 @@ mod tests {
         fs::write(receipt_path(tmp.path()), receipt_bytes(&newer).unwrap()).unwrap();
 
         let error = install_at(tmp.path(), false).unwrap_err().to_string();
-        assert!(error.contains("--allow-downgrade"), "{error}");
+        assert!(error.contains("--replace"), "{error}");
         assert!(install_at(tmp.path(), true).is_ok());
         assert_eq!(
             read_receipt(tmp.path()).unwrap().manifest.hookset,

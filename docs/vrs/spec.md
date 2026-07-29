@@ -46,7 +46,13 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
-  and verified before materialization references them.
+  and verified before materialization references them. Their receipts use the
+  same resolved build identity as the binary's version surfaces for both
+  hermetic package builds and source builds. Installation automatically accepts
+  an ordered upgrade; `--replace` is the explicit exact-state authority for a
+  downgrade, an unorderable build, or an unreadable receipt. Shipped hooks
+  resolve Bash through `PATH`; the Nix package executes their integration gate
+  with Bash and `jq` declared.
 - **R11:** `st2 up` is a replaceable control plane, not the lifetime owner of
   its agents. Normal exit, forced termination, binary replacement, and restart
   leave every running agent PID and creation identity unchanged. The new

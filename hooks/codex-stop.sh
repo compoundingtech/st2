@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # st2 Codex Stop hook: expose messages that arrived since the previous idle checkpoint. Ding remains
 # the live push path; this is the lifecycle backstop. Fail-open on every dependency/CLI error.
 
