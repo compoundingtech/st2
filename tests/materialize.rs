@@ -22,6 +22,14 @@ fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
     assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), before);
 }
 
+#[test]
+fn task_selector_cli_modes_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--task", "host.a.x"], vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--once", "--task", "host.a.x"], vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--materialize-only", "--task", "host.a.x", "--agent", "a"], vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--agent", "a"]] {
+        let out=Command::new(env!("CARGO_BIN_EXE_st2")).args(args).output().unwrap(); assert!(!out.status.success());
+    }
+}
+
 fn spec(catalog: &Path, identity: &str) -> AgentSpec {
     discover(catalog)
         .specs
