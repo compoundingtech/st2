@@ -962,6 +962,30 @@ pub fn up_once_selected_specs(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    up_once_selected_specs_with_gates(
+        catalog_root,
+        specs,
+        selector,
+        this_host,
+        runner,
+        || crate::hooks::verify_installed().map(|_| ()),
+        crate::pretrust::pretrust_codex,
+    )
+}
+
+fn up_once_selected_specs_with_gates<V, F>(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+    verify_hooks: V,
+    pretrust: F,
+) -> anyhow::Result<UpReport>
+where
+    V: FnOnce() -> anyhow::Result<()>,
+    F: FnOnce(&[PathBuf]) -> anyhow::Result<usize>,
+{
     crate::reconcile::resolve_task(specs, selector, this_host)?;
     let sessions = runner
         .list_sessions()
@@ -972,8 +996,8 @@ pub fn up_once_selected_specs(
         catalog_root,
         &mut plan,
         &mut report,
-        || Ok(()),
-        crate::pretrust::pretrust_codex,
+        verify_hooks,
+        pretrust,
     );
     execute(&plan, runner, &mut FlappingCap::default(), &mut report);
     Ok(report)
@@ -1263,7 +1287,7 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::TaskKind;
+    use crate::spec::{AgentSpec, JobType, Task, TaskKind};
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
@@ -1282,10 +1306,8 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     struct EmptyRunner;
 
-    #[cfg(target_os = "linux")]
     impl Runner for EmptyRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
             Ok(Vec::new())
@@ -1302,6 +1324,25 @@ mod tests {
         fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
             unreachable!("an empty catalog cannot remove")
         }
+    }
+
+    #[test]
+    fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
+        let spec = AgentSpec {
+            identity: "codex".into(), host: None, role: None, job_type: JobType::Service,
+            workspace: None, supervisor: None, retired: false, keep: false, restart: None,
+            tasks: vec![Task { kind: TaskKind::Pty, derived: false, name: "agent".into(),
+                id: Some("test.codex.agent".into()), command: Some("codex --version".into()),
+                cwd: None, tags: BTreeMap::new(), env: BTreeMap::new(), keep: false }],
+            path: "/tmp/spec.kdl".into(),
+        };
+        let report = up_once_selected_specs_with_gates(
+            Path::new("/tmp"), &[spec], "test.codex.agent", "test", &EmptyRunner,
+            || anyhow::bail!("stale receipt"),
+            |_| anyhow::bail!("must not pretrust"),
+        ).unwrap();
+        assert!(report.launched.is_empty());
+        assert!(report.errors.iter().any(|e| e.contains("launch suppressed")));
     }
 
     #[cfg(target_os = "linux")]
@@ -1337,8 +1378,6 @@ mod tests {
     //    destructively GC/relaunch a HEALTHY agent; a stable death must still be reaped ──────────────
 
     use crate::reconcile::Launch;
-    use crate::spec::{AgentSpec, JobType};
-
     fn sess(id: &str, alive: bool) -> Session {
         Session {
             pty_id: id.to_string(),
