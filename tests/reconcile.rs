@@ -53,6 +53,14 @@ fn selected_reconcile_launches_missing_and_adopts_live_without_siblings() {
 }
 
 #[test]
+fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
+    let keep = svc("a", None, vec![{ let mut t=task(TaskKind::Exec,"x",None,Some("a")); t.keep=true; t }]);
+    let specs=[keep]; let p = reconcile_selected(&specs, &[Session { pty_id:"host.a.x".into(), alive:false, exit_code:Some(7) }], "host", "host.a.x").unwrap(); assert!(p.launch.is_empty() && p.gc.is_empty() && p.adopt.len()==1);
+    let mut retired = svc("b", None, vec![{ let mut t=task(TaskKind::Exec,"x",None,Some("b")); t.keep=true; t }]); retired.retired=true;
+    let specs=[retired]; let p = reconcile_selected(&specs, &[Session { pty_id:"host.b.x".into(), alive:false, exit_code:Some(7) }], "host", "host.b.x").unwrap(); assert!(p.teardown.is_empty() && p.gc.is_empty());
+}
+
+#[test]
 fn selector_rejects_duplicate_explicit_and_runtime_collision() {
     let dup = vec![svc("a", None, vec![task(TaskKind::Exec, "x", Some("dup"), Some("a"))]), svc("b", None, vec![task(TaskKind::Exec, "y", Some("dup"), Some("b"))])];
     assert!(resolve_task(&dup, "dup", "host").is_err());
