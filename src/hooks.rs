@@ -360,7 +360,12 @@ pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
         Ok(current) => {
             check_replacement(&current, &candidate, replace)?;
             if current.manifest.hookset == candidate.manifest.hookset {
-                return verify_set_contents(root, &current.manifest);
+                let dir = verify_set_contents(root, &current.manifest)?;
+                if current != candidate {
+                    write_receipt(root, &candidate)?;
+                    verify_installed_at(root)?;
+                }
+                return Ok(dir);
             }
         }
         Err(error) if receipt_path(root).exists() && !replace => {
@@ -419,6 +424,21 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("sourceDirty");
         let parsed: InstallReceipt = serde_json::from_value(legacy).unwrap();
         assert!(!parsed.source_dirty);
+    }
+
+    #[test]
+    fn same_hookset_reinstall_refreshes_build_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected = install_at(tmp.path(), false).unwrap();
+        let mut stale = expected_receipt();
+        stale.st2_version = "0.0.0-stale".into();
+        stale.st2_git_sha = "stale".into();
+        stale.source_commit_unix = 0;
+        stale.source_dirty = !stale.source_dirty;
+        fs::write(receipt_path(tmp.path()), receipt_bytes(&stale).unwrap()).unwrap();
+
+        assert_eq!(install_at(tmp.path(), false).unwrap(), selected);
+        assert_eq!(read_receipt(tmp.path()).unwrap(), expected_receipt());
     }
 
     #[test]
