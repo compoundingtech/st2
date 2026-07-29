@@ -152,6 +152,22 @@ sleep 60
     assert_eq!(json["done"], true);
     assert!(json["judges"].as_array().is_some());
 
+    let fail_cell = cell.join("fail.kdl");
+    let fail_spec = std::fs::read_to_string(cell.join("cell.kdl")).unwrap()
+        .replace("test -f $CATALOG/worker/DONE", "test -f $CATALOG/worker/NOPE");
+    std::fs::write(&fail_cell, fail_spec).unwrap();
+    let fail_out = Command::new(bin)
+        .args(["eval", "--json"])
+        .arg(&fail_cell)
+        .env("PATH", &path)
+        .env_remove("CATALOG").env_remove("ST_ROOT").env_remove("PTY_ROOT")
+        .env("XDG_STATE_HOME", tmp.path().join("xdg-fail"))
+        .output().unwrap();
+    assert!(!fail_out.status.success());
+    let fail_json: serde_json::Value = serde_json::from_slice(&fail_out.stdout).expect("failed eval report");
+    assert_eq!(fail_json["judges"][0]["passed"], false);
+    assert!(!String::from_utf8_lossy(&fail_out.stdout).contains("=="));
+
     let invalid = Command::new(bin)
         .args(["eval", "--json"])
         .arg(tmp.path().join("missing.kdl"))
