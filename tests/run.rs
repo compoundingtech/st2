@@ -21,6 +21,7 @@ struct FakeRunner {
     killed: RefCell<Vec<String>>,
     reaped: RefCell<Vec<String>>,
     removed: RefCell<Vec<String>>,
+    ops: RefCell<Vec<String>>,
 }
 
 impl Runner for FakeRunner {
@@ -34,6 +35,9 @@ impl Runner for FakeRunner {
         if self.fail_spawn.as_deref() == Some(target.pty_id.as_str()) {
             anyhow::bail!("simulated spawn failure");
         }
+        self.ops
+            .borrow_mut()
+            .push(format!("spawn:{}", target.pty_id));
         self.spawned.borrow_mut().push(target.pty_id.clone());
         self.spawn_dirs
             .borrow_mut()
@@ -45,6 +49,7 @@ impl Runner for FakeRunner {
         Ok(())
     }
     fn reap_for_restart(&self, pty_id: &str) -> anyhow::Result<()> {
+        self.ops.borrow_mut().push(format!("reap:{pty_id}"));
         self.reaped.borrow_mut().push(pty_id.to_string());
         if self.fail_reap.as_deref() == Some(pty_id) {
             anyhow::bail!("reap broke");
@@ -93,6 +98,8 @@ fn up_once_launches_all_tasks_of_a_fresh_agent() {
     let mut launched = report.launched.clone();
     launched.sort();
     assert_eq!(launched, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert!(report.restarted.is_empty());
+    assert!(report.gc.is_empty());
     assert!(report.errors.is_empty());
     let dirs = runner.spawn_dirs.borrow();
     assert!(dirs.iter().all(|(_, d)| d.ends_with("agents/hetz/demo")));
@@ -168,7 +175,7 @@ fn up_once_collects_spawn_errors_without_aborting() {
 }
 
 #[test]
-fn up_once_reaps_dead_nonkeep_then_respawns() {
+fn up_once_reports_dead_active_reap_spawn_as_restart_not_gc_or_launch() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
     let runner = FakeRunner {
@@ -183,7 +190,24 @@ fn up_once_reaps_dead_nonkeep_then_respawns() {
         runner.removed.borrow().is_empty(),
         "a crash restart is not final retirement cleanup"
     );
-    assert_eq!(report.launched.len(), 2);
+    assert!(report.launched.is_empty());
+    let mut restarted = report.restarted.clone();
+    restarted.sort();
+    assert_eq!(restarted, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert!(
+        report.gc.is_empty(),
+        "a successful restart must not be reported as final GC"
+    );
+    assert_eq!(
+        runner.ops.borrow().as_slice(),
+        [
+            "reap:hetz.demo-claude",
+            "spawn:hetz.demo-claude",
+            "reap:hetz.demo.ding",
+            "spawn:hetz.demo.ding",
+        ],
+        "report taxonomy must not change reap-before-spawn execution ordering"
+    );
 }
 
 #[test]
@@ -198,13 +222,43 @@ fn up_once_does_not_restart_a_task_when_diagnostic_reap_fails() {
 
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
 
-    assert_eq!(report.launched, vec!["hetz.demo.ding"]);
+    assert!(report.launched.is_empty());
+    assert_eq!(report.restarted, vec!["hetz.demo.ding"]);
+    assert!(report.gc.is_empty());
     assert_eq!(runner.spawned.borrow().as_slice(), ["hetz.demo.ding"]);
     assert!(
         report
             .errors
             .iter()
             .any(|error| error == "reap hetz.demo-claude for restart: reap broke")
+    );
+}
+
+#[test]
+fn up_once_does_not_report_a_failed_replacement_as_restarted() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo-claude"), live("hetz.demo.ding")],
+        fail_spawn: Some("hetz.demo-claude".into()),
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(
+        runner.reaped.borrow().as_slice(),
+        ["hetz.demo-claude"],
+        "the stale record is still reaped before the replacement attempt"
+    );
+    assert!(report.launched.is_empty());
+    assert!(report.restarted.is_empty());
+    assert!(report.gc.is_empty());
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error == "spawn hetz.demo-claude: simulated spawn failure")
     );
 }
 
@@ -229,6 +283,7 @@ fn up_once_finally_removes_dead_retired_tasks_without_restarting_them() {
     assert_eq!(removed, vec!["hetz.demo-claude", "hetz.demo.ding"]);
     assert!(runner.reaped.borrow().is_empty());
     assert!(report.launched.is_empty());
+    assert!(report.restarted.is_empty());
     assert_eq!(report.gc.len(), 2);
 }
 

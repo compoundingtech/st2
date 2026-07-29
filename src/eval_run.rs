@@ -824,7 +824,10 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                         ),
                     };
                     if !report.launched.is_empty() {
-                        eval_log!("== supervise: respawned {:?} from spec ==", report.launched);
+                        eval_log!("== supervise: launched {:?} from spec ==", report.launched);
+                    }
+                    if !report.restarted.is_empty() {
+                        eval_log!("== supervise: restarted {:?} from spec ==", report.restarted);
                     }
                 }
             };

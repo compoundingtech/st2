@@ -527,11 +527,14 @@ pub struct UpReport {
     /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
     /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
     pub skipped: bool,
-    /// pty ids spawned this pass.
+    /// Task ids first spawned this pass (no prior runtime record was reaped).
     pub launched: Vec<String>,
+    /// Task ids successfully restarted this pass: a dead active record was reaped, then its
+    /// replacement was spawned. Kept distinct from both first launch and final garbage collection.
+    pub restarted: Vec<String>,
     /// pty ids torn down (retired agents) this pass.
     pub torn_down: Vec<String>,
-    /// pty ids garbage-collected (dead, non-`keep`) this pass.
+    /// Task ids finally garbage-collected this pass, with no replacement spawned.
     pub gc: Vec<String>,
     /// pty ids whose GC/relaunch was DEFERRED this pass by the liveness debounce — a task that read
     /// not-alive but was alive within the grace window, i.e. a transient `pty list` flicker under load,
@@ -559,6 +562,7 @@ impl UpReport {
     pub fn is_noteworthy(&self) -> bool {
         self.skipped
             || !self.launched.is_empty()
+            || !self.restarted.is_empty()
             || !self.torn_down.is_empty()
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
@@ -621,9 +625,10 @@ pub fn execute(
             }
             // Reap the corpse first (a dead session blocks respawn), preserving any backend-owned
             // bounded diagnostics, then respawn.
-            if gc_set.contains(target.pty_id.as_str()) {
+            let restarting = gc_set.contains(target.pty_id.as_str());
+            if restarting {
                 match runner.reap_for_restart(&target.pty_id) {
-                    Ok(()) => report.gc.push(target.pty_id.clone()),
+                    Ok(()) => {}
                     Err(e) => {
                         report
                             .errors
@@ -635,7 +640,11 @@ pub fn execute(
             match runner.spawn(target, spec_dir) {
                 Ok(()) => {
                     cap.record(&target.pty_id, now);
-                    report.launched.push(target.pty_id.clone());
+                    if restarting {
+                        report.restarted.push(target.pty_id.clone());
+                    } else {
+                        report.launched.push(target.pty_id.clone());
+                    }
                 }
                 Err(e) => report.errors.push(format!("spawn {}: {e}", target.pty_id)),
             }
