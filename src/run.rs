@@ -975,7 +975,7 @@ pub fn up_once_selected_specs(
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
 /// materialize only that owner and execute the selected plan.
-pub fn up_once_selected_catalog(
+pub fn up_once_selected(
     catalog_root: &Path,
     selector: &str,
     this_host: &str,
@@ -983,12 +983,16 @@ pub fn up_once_selected_catalog(
 ) -> anyhow::Result<UpReport> {
     let found = crate::discovery::discover(catalog_root);
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+    let all_specs = found.specs.clone();
     let mut report = UpReport::default();
     report.warnings.extend(found.warnings);
     report.errors.extend(found.errors.into_iter().map(|e| e.message));
     let owner = owner.clone();
-    if crate::hooks::required_by_codex(std::slice::from_ref(&owner), this_host) {
-        crate::hooks::verify_installed().map_err(|e| anyhow::anyhow!("verify hooks: {e}"))?;
+    if crate::hooks::required_by_codex_agent(&owner, this_host) {
+        if let Err(error) = crate::hooks::verify_installed() {
+            report.errors.push(format!("verify lifecycle hooks: {error}"));
+            return Ok(report);
+        }
     }
     let materialized =
         crate::materialize::materialize_catalog(catalog_root, std::slice::from_ref(&owner), this_host);
@@ -997,7 +1001,17 @@ pub fn up_once_selected_catalog(
     if !report.errors.is_empty() {
         return Ok(report);
     }
-    up_once_selected_specs(catalog_root, std::slice::from_ref(&owner), selector, this_host, runner)
+    let mut execution = up_once_selected_specs_with_gates(
+        catalog_root, &all_specs, selector, this_host, runner,
+        || Ok(()), crate::pretrust::pretrust_codex,
+    )?;
+    report.warnings.append(&mut execution.warnings);
+    report.errors.append(&mut execution.errors);
+    report.launched.append(&mut execution.launched);
+    report.torn_down.append(&mut execution.torn_down);
+    report.gc.append(&mut execution.gc);
+    report.adopted.append(&mut execution.adopted);
+    Ok(report)
 }
 
 fn up_once_selected_specs_with_gates<V, F>(
