@@ -1,20 +1,88 @@
 //! M1 correctness net: plan execution against a fake Runner (no real processes spawned).
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use st2::message;
 use st2::reconcile::{Session, TaskTarget};
 use st2::run::Runner;
-use st2::message;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected_specs};
+use st2::spec::{AgentSpec, JobType, Task, TaskKind};
 
 #[test]
 fn selected_one_shot_unknown_refuses_before_runner_list() {
     let runner = FakeRunner::default();
-    let error = up_once_selected_specs(Path::new("/tmp"), &[], "host", "host.missing.task", &runner).unwrap_err();
+    let error =
+        up_once_selected_specs(Path::new("/tmp"), &[], "host.missing.task", "host", &runner)
+            .unwrap_err();
     assert!(error.to_string().contains("did not resolve"));
-    assert_eq!(runner.list_calls.get(), 0); assert!(runner.spawned.borrow().is_empty()); assert!(runner.killed.borrow().is_empty()); assert!(runner.reaped.borrow().is_empty()); assert!(runner.removed.borrow().is_empty());
+    assert_eq!(runner.list_calls.get(), 0);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+}
+
+fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
+    AgentSpec {
+        identity: identity.into(),
+        host: host.map(str::to_owned),
+        role: None,
+        job_type: JobType::Service,
+        workspace: None,
+        supervisor: None,
+        retired: false,
+        keep: false,
+        restart: None,
+        tasks: vec![Task {
+            kind: TaskKind::Exec,
+            derived: false,
+            name: "work".into(),
+            id: Some(id.into()),
+            command: Some("true".into()),
+            cwd: None,
+            tags: BTreeMap::new(),
+            env: BTreeMap::new(),
+            keep: false,
+        }],
+        path: "/tmp/spec.kdl".into(),
+    }
+}
+
+fn assert_refusal(runner: &FakeRunner) {
+    assert_eq!(runner.list_calls.get(), 0);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+}
+
+#[test]
+fn selected_one_shot_ambiguous_refuses_before_runner_list() {
+    let runner = FakeRunner::default();
+    let specs = vec![task_spec("one", None, "dup"), task_spec("two", None, "dup")];
+    let error =
+        up_once_selected_specs(Path::new("/tmp"), &specs, "dup", "host", &runner).unwrap_err();
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+    assert_refusal(&runner);
+}
+
+#[test]
+fn selected_one_shot_wrong_host_refuses_before_runner_list() {
+    let runner = FakeRunner::default();
+    let specs = vec![task_spec("remote", Some("other"), "other.remote.work")];
+    let error = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "other.remote.work",
+        "host",
+        &runner,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("did not resolve"));
+    assert_refusal(&runner);
 }
 use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
 
@@ -74,10 +142,18 @@ fn write(root: &Path, rel: &str, contents: &str) {
 }
 
 fn live(id: &str) -> Session {
-    Session { pty_id: id.to_string(), alive: true, exit_code: None }
+    Session {
+        pty_id: id.to_string(),
+        alive: true,
+        exit_code: None,
+    }
 }
 fn dead(id: &str) -> Session {
-    Session { pty_id: id.to_string(), alive: false, exit_code: None }
+    Session {
+        pty_id: id.to_string(),
+        alive: false,
+        exit_code: None,
+    }
 }
 
 /// A v2 service job: a pty agent + an exec ding.
@@ -125,7 +201,10 @@ fn up_once_adopts_when_all_tasks_already_live() {
 fn up_once_launches_only_the_missing_task() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
-    let runner = FakeRunner { sessions: vec![live("hetz.demo-claude")], ..Default::default() };
+    let runner = FakeRunner {
+        sessions: vec![live("hetz.demo-claude")],
+        ..Default::default()
+    };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched, vec!["hetz.demo.ding"]);
 }
@@ -158,8 +237,16 @@ command = "st2 ding hetz.demo"
 #[test]
 fn up_once_skips_other_host_specs() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/here/agent.toml", "identity=\"here\"\n[pty.agent]\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/silber/there/agent.toml", "identity=\"there\"\n[pty.agent]\ncommand=\"y\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/here/agent.toml",
+        "identity=\"here\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/silber/there/agent.toml",
+        "identity=\"there\"\n[pty.agent]\ncommand=\"y\"\n",
+    );
     let runner = FakeRunner::default();
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched.len(), 1);
@@ -170,7 +257,10 @@ fn up_once_skips_other_host_specs() {
 fn up_once_collects_spawn_errors_without_aborting() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
-    let runner = FakeRunner { fail_spawn: Some("hetz.demo-claude".into()), ..Default::default() };
+    let runner = FakeRunner {
+        fail_spawn: Some("hetz.demo-claude".into()),
+        ..Default::default()
+    };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched, vec!["hetz.demo.ding"]);
     assert_eq!(report.errors.len(), 1);
@@ -252,7 +342,10 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
         "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[restart]\nattempts=3\ninterval=\"60s\"\nmode=\"fail\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
     );
     let found = discover(tmp.path());
-    let runner = FakeRunner { sessions: vec![dead("hetz.demo-claude")], ..Default::default() };
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo-claude")],
+        ..Default::default()
+    };
     let mut cap = FlappingCap::default();
 
     let mut last = UpReport::default();
@@ -308,12 +401,19 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
 
     let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos-claude"));
     let msgs = message::list_dir(&inbox).unwrap();
-    assert_eq!(msgs.len(), 1, "supervisor gets exactly one crash-loop message");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "supervisor gets exactly one crash-loop message"
+    );
     let m = &msgs[0];
     assert_eq!(m.from.as_deref(), Some("st2.hetz")); // the runner is the sender
     assert_eq!(m.subject.as_deref(), Some("crash-loop: hetz.demo parked"));
     assert!(m.tags.contains(&"crash-loop".to_string()));
-    assert!(m.body.contains("hetz.demo-claude"), "body names the parked task");
+    assert!(
+        m.body.contains("hetz.demo-claude"),
+        "body names the parked task"
+    );
 }
 
 /// `st2 down` kills every LIVE task of THIS host's catalog agents (the explicit teardown), skips
@@ -321,13 +421,29 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
 #[test]
 fn down_tears_down_this_hosts_live_tasks_only() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", "identity=\"demo\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/hetz/dead/agent.toml", "identity=\"dead\"\n[pty.agent]\nid=\"hetz.dead\"\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/silber/other/agent.toml", "identity=\"other\"\nhost=\"silber\"\n[pty.agent]\nid=\"silber.other\"\ncommand=\"x\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.toml",
+        "identity=\"demo\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/dead/agent.toml",
+        "identity=\"dead\"\n[pty.agent]\nid=\"hetz.dead\"\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/silber/other/agent.toml",
+        "identity=\"other\"\nhost=\"silber\"\n[pty.agent]\nid=\"silber.other\"\ncommand=\"x\"\n",
+    );
 
     // demo is live, dead is dead, other belongs to another host + is live.
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo-claude"), dead("hetz.dead"), live("silber.other")],
+        sessions: vec![
+            live("hetz.demo-claude"),
+            dead("hetz.dead"),
+            live("silber.other"),
+        ],
         ..Default::default()
     };
     let report = down(tmp.path(), "hetz", &runner).unwrap();
@@ -361,9 +477,21 @@ fn surface_crash_loop_without_supervisor_sends_nothing() {
 #[test]
 fn up_once_surfaces_discovery_errors_and_unrunnable() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/good/agent.toml", "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/hetz/bad/agent.toml", "identity=\"b\"\nnot valid =");
-    write(tmp.path(), "agents/hetz/nr/agent.toml", "identity=\"nr\"\ntype=\"service\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/good/agent.toml",
+        "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/bad/agent.toml",
+        "identity=\"b\"\nnot valid =",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/nr/agent.toml",
+        "identity=\"nr\"\ntype=\"service\"\n",
+    );
     let runner = FakeRunner::default();
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched, vec!["hetz.good.agent"]);
