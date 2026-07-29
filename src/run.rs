@@ -999,13 +999,18 @@ pub fn up_once_selected(
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
     let mut report = UpReport::default();
     report.warnings.extend(found.warnings);
-    report.errors.extend(found.errors.into_iter().map(|e| e.message));
+    report.errors.extend(
+        found
+            .errors
+            .into_iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.message)),
+    );
     let owner = owner.clone();
-    if crate::hooks::required_by_codex_agent(&owner, this_host) {
-        if let Err(error) = crate::hooks::verify_installed() {
-            report.errors.push(format!("verify lifecycle hooks: {error}"));
-            return Ok(report);
-        }
+    if crate::hooks::required_by_codex_agent(&owner, this_host)
+        && let Err(error) = crate::hooks::verify_installed()
+    {
+        report.errors.push(format!("verify lifecycle hooks: {error}"));
+        return Ok(report);
     }
     let materialized =
         crate::materialize::materialize_catalog(catalog_root, std::slice::from_ref(&owner), this_host);
@@ -1015,7 +1020,7 @@ pub fn up_once_selected(
     if owner_materialization_failed {
         return Ok(report);
     }
-    let mut execution = up_once_selected_specs_with_gates(
+    let execution = up_once_selected_specs_with_gates(
         catalog_root,
         &found.specs,
         selector,
