@@ -36,16 +36,16 @@ pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
     let mut rows: Vec<AgentRow> = found
         .specs
         .iter()
-        .filter_map(|s| {
-            let agent_dir = s.path.parent()?;
-            Some(AgentRow {
+        .map(|s| {
+            let agent_dir = &s.agent_dir;
+            AgentRow {
                 identity: s.bus_id(this_host),
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: read_name(agent_dir),
                 retired: s.retired,
                 last_activity_ms: newest_mtime_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
-            })
+            }
         })
         .collect();
     rows.sort_by(|a, b| a.identity.cmp(&b.identity));

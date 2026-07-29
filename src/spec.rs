@@ -41,8 +41,10 @@ pub struct AgentSpec {
     pub restart: Option<Restart>,
     /// The runnable tasks (`pty` + `exec`), sorted by name for determinism.
     pub tasks: Vec<Task>,
-    /// Where this spec was loaded from — the anchor for its resources and for edits.
+    /// Immutable declaration source used for render parsing and source-relative inputs.
     pub path: PathBuf,
+    /// Stable mutable state root used for resources, status, and the default task cwd.
+    pub agent_dir: PathBuf,
 }
 
 /// The kind of job. Only `service` (long-running) remains — `type = batch` is retired; the native
@@ -317,6 +319,10 @@ impl RawSpec {
         // `service` is the only job type; a stray `type` string is caught by validate (unknown-type).
         let job_type = JobType::Service;
 
+        let agent_dir = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
         AgentSpec {
             identity,
             host,
@@ -329,6 +335,7 @@ impl RawSpec {
             restart: self.restart.map(RawRestart::lower),
             tasks,
             path,
+            agent_dir,
         }
     }
 }

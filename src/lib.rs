@@ -5,6 +5,7 @@
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
 pub mod agents;
+pub mod catalog_store;
 pub mod compile_agent;
 pub mod context;
 pub mod ding;

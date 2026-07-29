@@ -33,6 +33,7 @@ fn spec(identity: &str, host: Option<&str>, job_type: JobType, retired: bool, ta
         restart: None,
         tasks,
         path: PathBuf::from(format!("/cat/agents/{}/{identity}/agent.kdl", host.unwrap_or("this"))),
+        agent_dir: PathBuf::from(format!("/cat/agents/{}/{identity}", host.unwrap_or("this"))),
     }
 }
 

@@ -343,7 +343,7 @@ pub fn resolve_agent_dir(catalog_root: &Path, recipient: &str, this_host: &str) 
         .specs
         .into_iter()
         .find(|s| s.bus_id(this_host) == recipient || s.identity == recipient)
-        .and_then(|s| s.path.parent().map(Path::to_path_buf))
+        .map(|s| s.agent_dir)
 }
 
 /// The default subject for a reply to a message whose subject was `original`: the original prefixed
@@ -379,9 +379,7 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
     let found = crate::discover(catalog_root);
     let mut all: HashMap<String, Message> = HashMap::new();
     for spec in &found.specs {
-        let Some(dir) = spec.path.parent() else {
-            continue;
-        };
+        let dir = &spec.agent_dir;
         for d in [inbox_dir(dir), archive_dir(dir)] {
             for m in list_dir(&d).unwrap_or_default() {
                 all.entry(m.filename.clone()).or_insert(m);
