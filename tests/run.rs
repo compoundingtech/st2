@@ -1,6 +1,6 @@
 //! M1 correctness net: plan execution against a fake Runner (no real processes spawned).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::Path;
 
@@ -12,6 +12,7 @@ use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
 
 #[derive(Default)]
 struct FakeRunner {
+    list_calls: Cell<usize>,
     sessions: Vec<Session>,
     fail_list: bool,
     fail_spawn: Option<String>,
@@ -25,6 +26,7 @@ struct FakeRunner {
 
 impl Runner for FakeRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        self.list_calls.set(self.list_calls.get() + 1);
         if self.fail_list {
             anyhow::bail!("simulated list failure");
         }
