@@ -5,6 +5,22 @@ use std::path::PathBuf;
 
 use st2::spec::{AgentSpec, JobType, Task, TaskKind};
 use st2::{Session, reconcile};
+use st2::reconcile::resolve_task;
+
+#[test]
+fn exact_task_selector_matrix() {
+    let specs = vec![
+        svc("a", None, vec![task(TaskKind::Pty, "agent", None, Some("run")), task(TaskKind::Exec, "ding", Some("host.a.ding"), Some("ding"))]),
+        svc("b", None, vec![task(TaskKind::Pty, "agent", Some("host.a.agent"), Some("other"))]),
+        svc("remote", Some("other"), vec![task(TaskKind::Pty, "agent", None, Some("remote"))]),
+    ];
+    let (_, selected, runtime) = resolve_task(&specs, "host.a.ding", "host").unwrap();
+    assert_eq!(selected.name, "ding"); assert_eq!(runtime, "host.a.ding");
+    assert!(resolve_task(&specs, "host.a.agent", "host").is_err()); // explicit-id collision is ambiguous
+    assert!(resolve_task(&specs, "a", "host").is_err());
+    assert!(resolve_task(&specs, "other.remote.agent", "host").is_err());
+    assert!(resolve_task(&specs, "host.a.missing", "host").is_err());
+}
 
 fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> Task {
     Task {
