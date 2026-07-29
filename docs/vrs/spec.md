@@ -44,7 +44,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   never wake reconciliation; only create, modify, rename, or remove events may
   wake it before the bounded timer.
 - **R06:** st2 passes the complete effective task definition to the underlying
-  launcher so manual and supervised restarts are equivalent.
+  launcher so manual and supervised restarts are equivalent. Harness readiness
+  that depends on a dynamically selected account belongs to that declared
+  command. In particular, reconciliation never mutates an ambient Codex config
+  before launch: the command may select an account-specific `CODEX_HOME` only
+  after st2 starts it. `st2 pretrust` remains an explicit operator utility for
+  commands that intentionally use the ambient Claude and Codex configs.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both

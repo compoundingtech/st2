@@ -804,52 +804,38 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches(
-        root,
-        &mut plan,
-        &mut report,
-        || match &hook_error {
-            Some(error) => anyhow::bail!("{error}"),
-            None => Ok(()),
-        },
-        crate::pretrust::pretrust_codex,
-    );
+    gate_codex_launches_on_hooks(&mut plan, &mut report, || match &hook_error {
+        Some(error) => anyhow::bail!("{error}"),
+        None => Ok(()),
+    });
     execute(&plan, runner, cap, &mut report);
     report
 }
 
-/// A missing Codex agent must be trusted before its pty exists. Codex's bypass flags do not bypass
-/// the workspace-trust prompt; without this gate a remotely synced declaration appears launched but
-/// is really parked waiting for a human keystroke. Batch every workspace into one atomic config
-/// update, and fail closed: if trust cannot be established, suppress the affected agent launches
-/// (including their sidecars) and surface the error. Already-live/adopted agents never enter this
-/// path.
-fn gate_codex_launches<'a, V, F>(
-    catalog_root: &Path,
+/// A missing Codex agent must not launch against stale lifecycle hooks. Suppress the affected agent
+/// launches (including their sidecars) and surface the error when hook verification fails.
+///
+/// Workspace trust belongs to the declared provider command and its selected account-specific
+/// runtime. Reconciliation deliberately does not mutate an ambient Codex config: an account selector
+/// may choose `CODEX_HOME` only after this process launches the command, so such a write would target
+/// the wrong state and could not satisfy the launched seat's trust gate.
+fn gate_codex_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
     report: &mut UpReport,
     verify_hooks: V,
-    pretrust: F,
 ) where
     V: FnOnce() -> anyhow::Result<()>,
-    F: FnOnce(&[PathBuf]) -> anyhow::Result<usize>,
 {
-    let mut workspaces = Vec::new();
     let mut gated_agents = Vec::new();
     for launch in &plan.launch {
-        let Some(agent) = launch.tasks.iter().find(|target| {
+        let Some(_) = launch.tasks.iter().find(|target| {
             target.name == "agent" && crate::hooks::command_invokes_codex(&target.command)
         }) else {
             continue;
         };
-        let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
-        let workspace = resolve_task_cwd(agent, spec_dir, catalog_root);
-        if !workspaces.contains(&workspace) {
-            workspaces.push(workspace);
-        }
         gated_agents.push(launch.spec.identity.clone());
     }
-    if workspaces.is_empty() {
+    if gated_agents.is_empty() {
         return;
     }
 
@@ -858,16 +844,6 @@ fn gate_codex_launches<'a, V, F>(
             .retain(|launch| !gated_agents.contains(&launch.spec.identity));
         report.errors.push(format!(
             "verify lifecycle hooks for new Codex agent(s) {}: {error}; launch suppressed",
-            gated_agents.join(", ")
-        ));
-        return;
-    }
-
-    if let Err(error) = pretrust(&workspaces) {
-        plan.launch
-            .retain(|launch| !gated_agents.contains(&launch.spec.identity));
-        report.errors.push(format!(
-            "pretrust Codex workspace(s) for {}: {error}; launch suppressed",
             gated_agents.join(", ")
         ));
     }
@@ -1421,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_pretrust_batches_every_new_workspace_once() {
+    fn codex_hook_gate_accepts_new_agents_without_mutating_the_launch_plan() {
         let mut left = spec_fixture();
         left.identity = "left".into();
         left.path = PathBuf::from("/catalog/node/left/agent.kdl");
@@ -1441,96 +1417,29 @@ mod tests {
             spec: &right,
             tasks: vec![right_agent],
         });
-        let captured = RefCell::new(Vec::new());
-
-        gate_codex_launches(
-            Path::new("/catalog"),
-            &mut plan,
-            &mut UpReport::default(),
-            || Ok(()),
-            |workspaces| {
-                captured.borrow_mut().extend_from_slice(workspaces);
-                Ok(workspaces.len())
-            },
-        );
-
-        assert_eq!(
-            captured.into_inner(),
-            [PathBuf::from("/workspaces/shared")],
-            "all affected workspaces are passed in one deduplicated batch"
-        );
-        assert_eq!(plan.launch.len(), 2);
-    }
-
-    #[test]
-    fn codex_pretrust_failure_suppresses_every_affected_agent_and_sidecar() {
-        let mut left = spec_fixture();
-        left.identity = "left".into();
-        left.path = PathBuf::from("/catalog/node/left/agent.kdl");
-        let mut right = spec_fixture();
-        right.identity = "right".into();
-        right.path = PathBuf::from("/catalog/node/right/agent.kdl");
-        let mut other = spec_fixture();
-        other.identity = "other".into();
-        other.path = PathBuf::from("/catalog/node/other/agent.kdl");
-
-        let mut left_agent = target("node.left.agent", "exec codex");
-        left_agent.workspace = Some("/workspaces/left".into());
-        let mut left_ding = target("node.left.ding", "st2 ding");
-        left_ding.name = "ding".into();
-        let mut right_agent = target("node.right.agent", "/opt/bin/codex --model gpt-5");
-        right_agent.workspace = Some("/workspaces/right".into());
-        let mut right_ding = target("node.right.ding", "st2 ding");
-        right_ding.name = "ding".into();
-        let non_codex = target("node.other.agent", "exec claude");
-        let mut plan = ReconcilePlan::default();
-        plan.launch.push(Launch {
-            spec: &left,
-            tasks: vec![left_agent, left_ding],
-        });
-        plan.launch.push(Launch {
-            spec: &right,
-            tasks: vec![right_agent, right_ding],
-        });
-        plan.launch.push(Launch {
-            spec: &other,
-            tasks: vec![non_codex],
-        });
+        let expected = plan
+            .launch
+            .iter()
+            .map(|launch| launch.spec.identity.clone())
+            .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches(
-            Path::new("/catalog"),
-            &mut plan,
-            &mut report,
-            || Ok(()),
-            |workspaces| {
-                assert_eq!(
-                    workspaces,
-                    [
-                        PathBuf::from("/workspaces/left"),
-                        PathBuf::from("/workspaces/right")
-                    ]
-                );
-                anyhow::bail!("read-only Codex config")
-            },
-        );
+        gate_codex_launches_on_hooks(&mut plan, &mut report, || Ok(()));
 
         assert_eq!(
             plan.launch
                 .iter()
-                .map(|launch| launch.spec.identity.as_str())
+                .map(|launch| launch.spec.identity.clone())
                 .collect::<Vec<_>>(),
-            ["other"],
-            "both Codex agents and all their sidecars fail closed"
+            expected,
+            "successful hook verification must leave the launch plan unchanged"
         );
-        assert_eq!(plan.launch[0].tasks[0].pty_id, "node.other.agent");
-        assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("left, right"));
-        assert!(report.errors[0].contains("launch suppressed"));
+        assert_eq!(plan.launch.len(), 2);
+        assert!(report.errors.is_empty());
     }
 
     #[test]
-    fn codex_pretrust_does_not_touch_adopted_agents_or_sidecar_only_repairs() {
+    fn codex_hook_gate_does_not_touch_adopted_agents_or_sidecar_only_repairs() {
         let mut spec = spec_fixture();
         spec.identity = "root".into();
         let mut ding = target("node.root.ding", "st2 ding");
@@ -1543,12 +1452,10 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches(
-            Path::new("/catalog"),
+        gate_codex_launches_on_hooks(
             &mut plan,
             &mut report,
             || panic!("an already-live Codex agent must not enter the hook gate"),
-            |_| panic!("an already-live Codex agent must not enter the pretrust gate"),
         );
 
         assert_eq!(plan.adopt, [&spec]);
@@ -1579,13 +1486,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches(
-            Path::new("/catalog"),
-            &mut plan,
-            &mut report,
-            || anyhow::bail!("stale receipt"),
-            |_| panic!("pretrust must not run after hook verification fails"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, &mut report, || {
+            anyhow::bail!("stale receipt")
+        });
 
         assert_eq!(
             plan.launch
