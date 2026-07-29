@@ -252,6 +252,28 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             ));
         }
 
+        // Codex decides workspace trust from the selected account's command-line configuration.
+        // Keep this structural and fleet-wide: a remote agent's declaration can drift just as
+        // readily as a local one's, and no host filesystem fact is needed to compare decoded bytes.
+        if !s.retired
+            && let Some(workspace) = s.workspace.as_deref()
+        {
+            for task in &s.tasks {
+                if task.name == "agent"
+                    && let Some(command) = task.command.as_deref()
+                    && crate::hooks::command_invokes_codex(command)
+                    && let Some(reason) = codex_project_trust_error(command, workspace)
+                {
+                    issues.push(Issue::error(
+                        "codex-project-trust",
+                        rp.clone(),
+                        ag.clone(),
+                        format!("Codex task 'agent' project trust is invalid: {reason}"),
+                    ));
+                }
+            }
+        }
+
         // Path fields must be absolute or $CATALOG-rooted, and must exist.
         for (field, raw) in path_fields(s) {
             if let Some(issue) = check_path(root, &rp, &ag, &field, &raw, runs_on_selected_host) {
@@ -366,6 +388,255 @@ fn check_path(
         };
     }
     None
+}
+
+/// Require one self-contained Codex `projects` override for the declared workspace.
+///
+/// The command is still an opaque `sh -c` line to the runner. Validation only tokenizes the first
+/// simple command well enough to inspect Codex's actual `-c`/`--config` arguments: it never executes
+/// or expands anything, and stops at shell control operators. Quotes are removed because Codex sees
+/// their decoded contents. TOML then decodes the project key for a byte-for-byte comparison with the
+/// already-decoded workspace declaration.
+pub(crate) fn codex_project_trust_error(command: &str, workspace: &str) -> Option<String> {
+    let words = match first_simple_command_words(command) {
+        Ok(words) => words,
+        Err(reason) => return Some(reason.to_string()),
+    };
+    let overrides = match codex_config_overrides(&words) {
+        Ok(overrides) => overrides,
+        Err(reason) => return Some(reason.to_string()),
+    };
+
+    let mut projects = Vec::new();
+    for config in &overrides {
+        match projects_override(config, workspace) {
+            ProjectsOverride::Unrelated => {}
+            relevant => projects.push(relevant),
+        }
+    }
+
+    match projects.as_slice() {
+        [] => Some(format!(
+            "missing a -c/--config projects override for workspace '{workspace}'"
+        )),
+        [ProjectsOverride::Valid] => None,
+        [ProjectsOverride::Invalid(reason)] => Some(reason.clone()),
+        [_] => unreachable!("unrelated overrides are not collected"),
+        many => Some(format!(
+            "found {} projects config assignments; expected exactly one",
+            many.len()
+        )),
+    }
+}
+
+/// Decode shell words from the positively classified Codex command, stopping before a second shell
+/// command. This deliberately implements only quoting/escaping boundaries, not expansion or general
+/// shell evaluation.
+fn first_simple_command_words(command: &str) -> Result<Vec<String>, &'static str> {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("exec ")
+        .unwrap_or(command)
+        .trim_start();
+    let Some(program_end) = command.find(char::is_whitespace) else {
+        return Ok(Vec::new());
+    };
+    shell_words(&command[program_end..])
+}
+
+fn shell_words(input: &str) -> Result<Vec<String>, &'static str> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Unquoted,
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = Quote::Unquoted;
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::Unquoted;
+                } else {
+                    word.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::Unquoted,
+                '\\' => {
+                    let Some(escaped) = chars.next() else {
+                        return Err("command ends with an incomplete escape");
+                    };
+                    if escaped != '\n' {
+                        word.push(escaped);
+                    }
+                }
+                _ => word.push(ch),
+            },
+            Quote::Unquoted => match ch {
+                '\'' => {
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    let Some(escaped) = chars.next() else {
+                        return Err("command ends with an incomplete escape");
+                    };
+                    if escaped != '\n' {
+                        word.push(escaped);
+                        started = true;
+                    }
+                }
+                '\n' | '\r' => {
+                    if started {
+                        words.push(word);
+                    }
+                    return Ok(words);
+                }
+                c if c.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                // The classifier only recognizes a direct Codex invocation. Do not inspect a later
+                // pipeline/command or mistake its prose for Codex arguments.
+                ';' | '|' | '&' | '<' | '>' | '(' | ')' => {
+                    if started {
+                        words.push(word);
+                    }
+                    return Ok(words);
+                }
+                '#' if !started => return Ok(words),
+                _ => {
+                    word.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+
+    match quote {
+        Quote::Unquoted => {
+            if started {
+                words.push(word);
+            }
+            Ok(words)
+        }
+        Quote::Single | Quote::Double => Err("command has an unclosed shell quote"),
+    }
+}
+
+/// Collect the four config spellings accepted by Codex/Clap:
+/// `-c value`, `-cvalue`, `--config value`, and `--config=value`.
+fn codex_config_overrides(words: &[String]) -> Result<Vec<String>, &'static str> {
+    let mut overrides = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let word = &words[i];
+        if word == "--" {
+            break;
+        }
+        if word == "-c" || word == "--config" {
+            let Some(value) = words.get(i + 1) else {
+                return Err("-c/--config is missing its key=value argument");
+            };
+            overrides.push(value.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = word.strip_prefix("--config=") {
+            if value.is_empty() {
+                return Err("--config= is missing its key=value argument");
+            }
+            overrides.push(value.to_string());
+        } else if let Some(value) = word.strip_prefix("-c")
+            && !word.starts_with("--")
+            && !value.is_empty()
+        {
+            overrides.push(value.to_string());
+        }
+        i += 1;
+    }
+    Ok(overrides)
+}
+
+enum ProjectsOverride {
+    Unrelated,
+    Valid,
+    Invalid(String),
+}
+
+fn projects_override(config: &str, workspace: &str) -> ProjectsOverride {
+    let parsed = config.parse::<toml::Table>();
+    let targets_projects = parsed
+        .as_ref()
+        .is_ok_and(|table| table.contains_key("projects"))
+        || toml_lhs_targets_projects(config);
+    if !targets_projects {
+        return ProjectsOverride::Unrelated;
+    }
+
+    let table = match parsed {
+        Ok(table) => table,
+        Err(error) => {
+            return ProjectsOverride::Invalid(format!(
+                "projects config is not valid TOML: {error}"
+            ));
+        }
+    };
+    if table.len() != 1 {
+        return ProjectsOverride::Invalid(
+            "projects config must contain exactly one top-level assignment".to_string(),
+        );
+    }
+    let Some(projects) = table.get("projects").and_then(toml::Value::as_table) else {
+        return ProjectsOverride::Invalid("projects config must be a table".to_string());
+    };
+    if projects.len() != 1 {
+        return ProjectsOverride::Invalid(format!(
+            "projects table has {} keys; expected exactly one",
+            projects.len()
+        ));
+    }
+    let (project, value) = projects.iter().next().expect("length checked");
+    if project.as_bytes() != workspace.as_bytes() {
+        return ProjectsOverride::Invalid(format!(
+            "project key '{project}' does not byte-match workspace '{workspace}'"
+        ));
+    }
+    let Some(project) = value.as_table() else {
+        return ProjectsOverride::Invalid(
+            "the workspace project value must be a table".to_string(),
+        );
+    };
+    if project.get("trust_level").and_then(toml::Value::as_str) != Some("trusted") {
+        return ProjectsOverride::Invalid(
+            "the workspace project must set trust_level exactly to \"trusted\"".to_string(),
+        );
+    }
+    ProjectsOverride::Valid
+}
+
+/// Recognize a malformed assignment whose TOML key is nevertheless `projects`, so it cannot be
+/// ignored beside an otherwise-valid override. Appending a dummy value lets TOML decode quoted and
+/// dotted keys without interpreting the original value.
+fn toml_lhs_targets_projects(config: &str) -> bool {
+    let lhs = config.split_once('=').map_or(config, |(lhs, _)| lhs).trim();
+    let probe = format!("{lhs}=0");
+    probe
+        .parse::<toml::Table>()
+        .is_ok_and(|table| table.contains_key("projects"))
 }
 
 /// Catch runner-significant KDL shapes that the permissive lowerer cannot accept silently. TOML/JSON

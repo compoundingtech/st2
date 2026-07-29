@@ -98,7 +98,8 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 ```
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`.
+`copy` under `$CATALOG/_templates`. The Codex declaration repeats the exact decoded `<workspace>`
+bytes in its command-local `projects` trust table; keep both values byte-identical.
 
 The compact declaration shape is:
 
@@ -110,7 +111,7 @@ agent "<identity>" {
   // role "worker"
   // supervisor "<supervisor-bus-id>"
   env { ST_AGENT "<host>.<identity>" }
-  command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
+  command #"exec codex -c 'projects={"<workspace>"={trust_level="trusted"}}' --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
   ding
 
   render {

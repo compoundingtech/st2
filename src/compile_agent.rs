@@ -46,16 +46,41 @@ impl AgentInput {
                 "exec claude --permission-mode bypassPermissions{model}{extra} {}",
                 shell_single_quote(boot)
             )),
-            "codex" => Ok(format!(
-                "exec codex --dangerously-bypass-approvals-and-sandbox \
-                 --dangerously-bypass-hook-trust{model}{extra} {}",
-                shell_single_quote(boot)
-            )),
+            "codex" => {
+                let project_trust = shell_single_quote(&codex_project_trust(&self.workspace));
+                let command = format!(
+                    "exec codex -c {project_trust} \
+                     --dangerously-bypass-approvals-and-sandbox \
+                     --dangerously-bypass-hook-trust{model}{extra} {}",
+                    shell_single_quote(boot)
+                );
+                if let Some(reason) =
+                    crate::validate::codex_project_trust_error(&command, &self.workspace)
+                {
+                    anyhow::bail!(
+                        "compile-agent: generated Codex command has invalid project trust: {reason}"
+                    );
+                }
+                Ok(command)
+            }
             other => anyhow::bail!(
                 "compile-agent: harness '{other}' is not supported (expected claude or codex)"
             ),
         }
     }
+}
+
+/// One command-local Codex config override. TOML's table serializer owns key escaping so the
+/// decoded key is byte-identical to the declared workspace even when it contains quotes or slashes.
+fn codex_project_trust(workspace: &str) -> String {
+    let mut project = toml::Table::new();
+    project.insert(
+        "trust_level".to_string(),
+        toml::Value::String("trusted".to_string()),
+    );
+    let mut projects = toml::Table::new();
+    projects.insert(workspace.to_string(), toml::Value::Table(project));
+    format!("projects={}", toml::Value::Table(projects))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -67,7 +92,13 @@ fn kdl_str(value: &str) -> String {
 }
 
 fn kdl_raw(value: &str) -> String {
-    format!("#\"{value}\"#")
+    for count in 1.. {
+        let hashes = "#".repeat(count);
+        if !value.contains(&format!("\"{hashes}")) {
+            return format!("{hashes}\"{value}\"{hashes}");
+        }
+    }
+    unreachable!("a finite string always has an unused raw-string delimiter")
 }
 
 fn kdl_multiline_raw(value: &str) -> String {
