@@ -80,6 +80,24 @@ pub struct ReconcilePlan<'a> {
     pub gc: Vec<String>,
 }
 
+/// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
+pub fn resolve_task<'a>(specs: &'a [AgentSpec], selector: &str, this_host: &str) -> anyhow::Result<(&'a AgentSpec, &'a crate::spec::Task, String)> {
+    let mut matches = Vec::new();
+    for spec in specs {
+        if spec.resolved_host(this_host) != this_host { continue; }
+        for task in &spec.tasks {
+            let runtime = task.id.clone().unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+            let qualified = format!("{}.{}", spec.bus_id(this_host), task.name);
+            if selector == runtime || selector == qualified { matches.push((spec, task, runtime)); }
+        }
+    }
+    match matches.as_slice() {
+        [(spec, task, runtime)] => Ok((*spec, *task, runtime.clone())),
+        [] => anyhow::bail!("task selector {selector:?} did not resolve to one local task"),
+        _ => anyhow::bail!("task selector {selector:?} is ambiguous"),
+    }
+}
+
 /// The state of a declared task's session in the ACTUAL world.
 enum SessionState {
     Alive,
