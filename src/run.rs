@@ -973,6 +973,33 @@ pub fn up_once_selected_specs(
     )
 }
 
+/// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
+/// materialize only that owner and execute the selected plan.
+pub fn up_once_selected_catalog(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    let found = crate::discovery::discover(catalog_root);
+    let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+    let mut report = UpReport::default();
+    report.warnings.extend(found.warnings);
+    report.errors.extend(found.errors.into_iter().map(|e| e.message));
+    let owner = owner.clone();
+    if crate::hooks::required_by_codex(std::slice::from_ref(&owner), this_host) {
+        crate::hooks::verify_installed().map_err(|e| anyhow::anyhow!("verify hooks: {e}"))?;
+    }
+    let materialized =
+        crate::materialize::materialize_catalog(catalog_root, std::slice::from_ref(&owner), this_host);
+    report.warnings.extend(materialized.warnings);
+    report.errors.extend(materialized.errors);
+    if !report.errors.is_empty() {
+        return Ok(report);
+    }
+    up_once_selected_specs(catalog_root, std::slice::from_ref(&owner), selector, this_host, runner)
+}
+
 fn up_once_selected_specs_with_gates<V, F>(
     catalog_root: &Path,
     specs: &[crate::spec::AgentSpec],
