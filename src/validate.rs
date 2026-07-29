@@ -144,6 +144,16 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             e.to_string(),
         ));
     }
+    for (host, path) in crate::catalog::host_config_paths(root) {
+        if let Err(error) = crate::catalog::load_host(root, &host) {
+            issues.push(Issue::error(
+                "host-config",
+                rel(root, &path),
+                None,
+                error.to_string(),
+            ));
+        }
+    }
 
     // 3. Raw pass (once per file): a typo'd `type` is normalized to `service` by the parser, so it can
     //    only be seen before lowering. A KDL `pty`/`exec` block with no name is silently dropped — the

@@ -84,12 +84,30 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
             }
             collect_spec_files(root, &path, acc);
         } else if ft.is_file()
+            && !is_host_config(root, &path)
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && SPEC_EXTS.contains(&ext)
         {
             acc.push(path);
         }
     }
+}
+
+/// `agents/<host>/config.kdl` is a host-local catalog declaration, never an agent declaration.
+/// Reserve only that exact shape so an agent legitimately named `config` elsewhere is unaffected.
+fn is_host_config(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    matches!(
+        components.as_slice(),
+        [
+            Component::Normal(agents),
+            Component::Normal(_host),
+            Component::Normal(file)
+        ] if *agents == "agents" && *file == "config.kdl"
+    )
 }
 
 /// What a declaration literally *says*, before lowering normalizes it away.

@@ -4,6 +4,7 @@
 //! `XDG_STATE_HOME` pointed at temp dirs, so nothing here can resolve a real catalog or registry.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -139,4 +140,160 @@ fn a_mistyped_declaration_fails_validate() {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["issues"][0]["code"], "catalog-config");
     assert_eq!(report["issues"][0]["severity"], "error");
+}
+
+#[test]
+fn matching_host_config_outranks_and_isolates_a_malformed_shared_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let host_config = catalog.join("agents/h/config.kdl");
+    fs::create_dir_all(host_config.parent().unwrap()).unwrap();
+    fs::write(
+        &host_config,
+        "host { pty-root \"$CATALOG/host-registry\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("catalog.kdl"),
+        "catalog { pty_root \"malformed-unused-fallback\" }\n",
+    )
+    .unwrap();
+
+    let out = st2(
+        &["env", "--catalog", catalog.to_str().unwrap(), "--host", "h"],
+        tmp.path(),
+    );
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!(
+        "export PTY_ROOT={}/host-registry",
+        catalog.canonicalize().unwrap().display()
+    )));
+
+    // Without a matching host layer, the malformed shared layer is needed and fails closed.
+    let out = st2(
+        &[
+            "env",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--host",
+            "other",
+        ],
+        tmp.path(),
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown catalog field 'pty_root'"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn validate_diagnoses_root_and_every_host_config_without_counting_phantom_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    write_agent(&catalog, "h", "seat");
+    fs::write(
+        catalog.join("catalog.kdl"),
+        "catalog { pty_root \"bad-root\" }\n",
+    )
+    .unwrap();
+    for (host, contents) in [
+        ("h", "host { pty_root \"bad-host\" }\n"),
+        ("other", "catalog { pty-root \"wrong-node\" }\n"),
+    ] {
+        let path = catalog.join("agents").join(host).join("config.kdl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    let out = st2(
+        &[
+            "validate",
+            "--json",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--host",
+            "h",
+        ],
+        tmp.path(),
+    );
+    assert!(!out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["agents"], 1);
+    let issues = report["issues"].as_array().unwrap();
+    for expected in [
+        "catalog.kdl",
+        "agents/h/config.kdl",
+        "agents/other/config.kdl",
+    ] {
+        assert!(
+            issues.iter().any(|issue| issue["path"] == expected),
+            "missing {expected}: {issues:?}"
+        );
+    }
+}
+
+#[test]
+fn up_uses_the_matching_host_root_for_runtime_session_operations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let config = catalog.join("agents/h/config.kdl");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(config, "host { pty-root \"$CATALOG/runtime-registry\" }\n").unwrap();
+
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = tmp.path().join("observed-pty-root");
+    let pty = bin.join("pty");
+    fs::write(
+        &pty,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$PTY_ROOT\" > '{}'\nprintf '[]\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&pty, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "up",
+            "--once",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--host",
+            "h",
+        ])
+        .env("PATH", path)
+        .env("HOME", tmp.path())
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env_remove("PTY_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        catalog
+            .canonicalize()
+            .unwrap()
+            .join("runtime-registry")
+            .display()
+            .to_string()
+    );
 }

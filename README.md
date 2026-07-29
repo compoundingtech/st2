@@ -43,23 +43,49 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog
 Every catalog-aware command accepts `--catalog`; otherwise st2 uses `$CATALOG`, then that standard
 location.
 
-### A catalog may declare its session registry
+Initialize the selected catalog for this machine without overwriting any existing declaration:
 
-A catalog's tasks live in `<catalog>/pty` unless the catalog says otherwise. To put several catalogs
-in one host-wide `pty` registry — so any viewer enumerates every session without knowing which
-catalog produced it — declare it in `<catalog>/catalog.kdl`:
+```sh
+st2 init --catalog "$CATALOG" --host <host>
+```
+
+This creates only `agents/<host>/config.kdl`, with the portable declaration
+`host { pty-root "$CATALOG/pty" }`. Repeating the command validates and reports the existing file
+without changing any byte.
+
+### A host or catalog may declare its session registry
+
+A catalog's tasks live in `<catalog>/pty` unless a stronger layer says otherwise. A machine-specific
+registry belongs only in that machine's synced `agents/<host>/config.kdl`:
 
 ```kdl
-catalog {
-  pty-root "/run/agents/pty"
+host {
+  pty-root "/mnt/fast-volume/st2/pty"
 }
 ```
 
-`pty-root` accepts `$VAR`/`$CATALOG`; a relative value anchors at the catalog root. The resolution
-order is an exported `PTY_ROOT` (a deliberate override, used by `st2 eval` for a short socket path),
-then this declaration, then `<catalog>/pty`. A catalog that declares nothing is unaffected.
+The parent folder is the sole host key; the `host` node takes no host argument. All host config
+files may sync, but a command consumes only the exact host selected by `--host` or, when omitted,
+the local short hostname. `st2 env`, `st2 pty`, and `st2 shell` accept the same `--host`.
 
-Prefer the declaration over exporting `PTY_ROOT` into readers: a reader that misses the export
+The root `<catalog>/catalog.kdl` is a synced, shared fallback and must stay portable. For example,
+several catalogs under one shared parent can name a sibling registry without embedding one
+machine's filesystem layout:
+
+```kdl
+catalog {
+  pty-root "$CATALOG/../shared-pty"
+}
+```
+
+`pty-root` accepts `$VAR`/`$CATALOG`; a relative value anchors at the catalog root. Resolution is
+deterministic: a non-empty exported `PTY_ROOT` (an explicit ephemeral override), then the matching
+host config, then the shared root config, then `<catalog>/pty`. Stronger layers isolate unused lower
+ones: a valid host config is not blocked by a malformed shared fallback. A malformed layer fails
+closed when it is actually needed. `st2 validate` still diagnoses the root declaration and every
+synced host config, including configs for other hosts.
+
+Prefer catalog declarations over exporting `PTY_ROOT` into readers: a reader that misses the export
 resolves a different registry and reports live agents as dead. When adopting it on a host whose
 systemd unit was installed with an ambient `PTY_ROOT`, reinstall the unit without one
 (`st2 service install`) — the export still wins, and leaving it pins the supervisor to the old

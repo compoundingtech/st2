@@ -75,13 +75,17 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   agent PID/creation identity and no duplicate process.
 
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
-  `<catalog>/pty` is the default; a catalog may declare another so that one host
-  can share a single registry across catalogs. Resolution is an exported
-  `PTY_ROOT`, then the catalog's declaration, then the default, applied
-  uniformly to spawn, list, kill, and the bus environment st2 hands to native
-  tools, so every reader that can resolve the catalog agrees about where its
-  sessions are. A declaration whose field set does not match fails `st2
-  validate` rather than resolving silently back to the default.
+  `<catalog>/pty` is the default. A matching
+  `agents/<host>/config.kdl` may declare a host-local root; the parent folder is
+  its sole host key. The synced root `catalog.kdl` remains a portable shared
+  fallback, and machine-specific absolute roots belong only in matching host
+  config. Resolution is an exported `PTY_ROOT`, then the matching host
+  declaration, then the root declaration, then the default, applied uniformly
+  to spawn, list, kill, and the bus environment st2 hands to native tools.
+  Stronger layers short-circuit unused lower layers; a malformed layer fails
+  closed when it is needed. `st2 validate` diagnoses the root and every host
+  declaration. `st2 init` creates only a missing host declaration with
+  catalog-anchored portable content and never overwrites an existing file.
 
 ## Message lifecycle
 
