@@ -7,7 +7,15 @@ use std::path::Path;
 use st2::reconcile::{Session, TaskTarget};
 use st2::run::Runner;
 use st2::message;
-use st2::run::{CrashLoop, surface_crash_loop};
+use st2::run::{CrashLoop, surface_crash_loop, up_once_selected_specs};
+
+#[test]
+fn selected_one_shot_unknown_refuses_before_runner_list() {
+    let runner = FakeRunner::default();
+    let error = up_once_selected_specs(Path::new("/tmp"), &[], "host", "host.missing.task", &runner).unwrap_err();
+    assert!(error.to_string().contains("did not resolve"));
+    assert_eq!(runner.list_calls.get(), 0); assert!(runner.spawned.borrow().is_empty()); assert!(runner.killed.borrow().is_empty()); assert!(runner.reaped.borrow().is_empty()); assert!(runner.removed.borrow().is_empty());
+}
 use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
 
 #[derive(Default)]
