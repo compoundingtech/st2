@@ -117,14 +117,21 @@ positive declaration/template wakes, negative runtime/bus events, bounded
 discovery/materialization/PTY queries and writes, continuous-event starvation,
 and no-op desired-equals-actual behavior.
 
+## Targeted reconciliation (R19)
+
+`st2 up --materialize-only --task <host.agent.task>` resolves one exact local
+task before writing and renders only its owning agent. `st2 up --once --task
+<host.agent.task>` performs the same owner-only materialization, then inspects
+PTY/exec state and executes a plan containing only that task. Unknown,
+ambiguous, and wrong-host selectors refuse before writes or runner inspection;
+unrelated discovery diagnostics remain visible without preventing the selected
+owner/task path.
+
+`st2 up --materialize-only --agent <id>` remains the agent-wide rendering
+selector. Targeted task reconciliation is intentionally bounded to `--once`;
+the resident supervisor continues to reconcile the complete local catalog.
+
 ## Open design questions
-
-### Targeted materialization (R13)
-
-`st2 up --materialize-only --agent <id>` filters discovery before rendering,
-so a declared agent/task change cannot be blocked by unrelated slow or
-unreadable workspaces. This selector is materialization-only; live
-reconciliation remains separately gated and host-local.
 
 - **DQ1 Scheduled work:** The vision includes per-machine schedulers that form a
   distributed workflow engine, but the KDL shape, event inbox, deduplication

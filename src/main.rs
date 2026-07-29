@@ -53,9 +53,11 @@ enum Command {
         /// Materialize every local agent's render block and exit without reconciling or spawning.
         #[arg(long, conflicts_with = "once")]
         materialize_only: bool,
-        /// Limit materialization/reconciliation to one declared agent identity.
+        /// Limit materialization to one declared agent identity.
         #[arg(long)]
         agent: Option<String>,
+        /// Select one exact local task. Use with --materialize-only to render only its owner, or
+        /// with --once to render its owner and reconcile only that task.
         #[arg(long, conflicts_with = "agent")]
         task: Option<String>,
         /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
@@ -534,11 +536,8 @@ fn main() -> Result<()> {
             task,
         } => {
             let root = catalog_arg(root)?;
-            if task.is_some() && once {
-                anyhow::bail!("--task --once is deferred until selected reconcile support");
-            }
-            if task.is_some() && !materialize_only {
-                anyhow::bail!("--task requires --materialize-only in this stage");
+            if task.is_some() && !materialize_only && !once {
+                anyhow::bail!("--task requires --once or --materialize-only");
             }
             if agent.is_some() && !materialize_only {
                 anyhow::bail!("--agent requires --materialize-only");
@@ -1751,6 +1750,9 @@ fn up(
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
     if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
+        if task.is_some() {
+            anyhow::bail!("--task is for folder catalogs, not single-file specs");
+        }
         if materialize_only {
             anyhow::bail!(
                 "--materialize-only is for folder catalogs with agent render{{}} blocks, not single-file specs"
@@ -1811,7 +1813,7 @@ fn up(
         return Ok(());
     }
 
-    let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
+    let runner = SystemRunner::new(catalog_root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
     // the lock (it would double-spawn) — but it does NOT take the lock itself (that would clobber the
@@ -1823,11 +1825,20 @@ fn up(
     }
 
     if once {
-        let report = up_once(root, &this_host, &runner)?;
+        let targeted = task.is_some();
+        let report = match task.as_deref() {
+            Some(selector) => {
+                st2::run::up_once_selected(&catalog_root, selector, &this_host, &runner)?
+            }
+            None => up_once(root, &this_host, &runner)?,
+        };
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
         if report.skipped {
             anyhow::bail!("one-shot reconcile pass was skipped");
+        }
+        if targeted && !report.errors.is_empty() {
+            anyhow::bail!("targeted one-shot reconcile pass reported errors");
         }
         return Ok(());
     }

@@ -8,8 +8,197 @@ use std::path::Path;
 use st2::message;
 use st2::reconcile::{Session, TaskTarget};
 use st2::run::Runner;
-use st2::run::{CrashLoop, surface_crash_loop, up_once_selected_specs};
+use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
 use st2::spec::{AgentSpec, JobType, Task, TaskKind};
+
+fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
+    format!(
+        r#"agent "{identity}" {{
+  host "host"
+  type "service"
+  workspace "{}"
+  pty "work" {{
+    id "host.{identity}.work"
+    command "true"
+  }}
+  render {{
+    {render}
+  }}
+}}
+"#,
+        workspace.display()
+    )
+}
+
+fn write_selected_catalog(
+    catalog: &Path,
+    owner_workspace: &Path,
+    sibling_workspace: &Path,
+    owner_render: &str,
+) {
+    fs::create_dir_all(owner_workspace).unwrap();
+    fs::create_dir_all(sibling_workspace).unwrap();
+    write(
+        catalog,
+        "agents/host/owner/agent.kdl",
+        &selected_catalog_agent("owner", owner_workspace, owner_render),
+    );
+    write(
+        catalog,
+        "agents/host/sibling/agent.kdl",
+        &selected_catalog_agent(
+            "sibling",
+            sibling_workspace,
+            r#"file "SIBLING.txt" "sibling""#,
+        ),
+    );
+}
+
+#[test]
+fn selected_catalog_two_agent_kdl_recording_runner_matrix() {
+    enum Actual {
+        Missing,
+        Live,
+        Dead,
+    }
+
+    for actual in [Actual::Missing, Actual::Live, Actual::Dead] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let owner_workspace = tmp.path().join("owner-workspace");
+        let sibling_workspace = tmp.path().join("sibling-workspace");
+        write_selected_catalog(
+            &catalog,
+            &owner_workspace,
+            &sibling_workspace,
+            r#"file "OWNER.txt" "owner""#,
+        );
+
+        let mut sessions = vec![live("host.sibling.work")];
+        match actual {
+            Actual::Missing => {}
+            Actual::Live => sessions.push(live("host.owner.work")),
+            Actual::Dead => sessions.push(dead("host.owner.work")),
+        }
+        let runner = FakeRunner {
+            sessions,
+            ..Default::default()
+        };
+
+        let report = up_once_selected(&catalog, "host.owner.work", "host", &runner).unwrap();
+
+        assert_eq!(runner.list_calls.get(), 1);
+        assert_eq!(
+            fs::read_to_string(owner_workspace.join("OWNER.txt")).unwrap(),
+            "owner"
+        );
+        assert!(
+            !sibling_workspace.join("SIBLING.txt").exists(),
+            "the unrelated owner must not be materialized"
+        );
+        assert!(runner.killed.borrow().is_empty());
+        assert!(runner.removed.borrow().is_empty());
+        match actual {
+            Actual::Missing => {
+                assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
+                assert!(runner.reaped.borrow().is_empty());
+                assert_eq!(report.launched, ["host.owner.work"]);
+            }
+            Actual::Live => {
+                assert!(runner.spawned.borrow().is_empty());
+                assert!(runner.reaped.borrow().is_empty());
+                assert_eq!(report.adopted, ["owner"]);
+            }
+            Actual::Dead => {
+                assert_eq!(runner.reaped.borrow().as_slice(), ["host.owner.work"]);
+                assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
+                assert_eq!(report.gc, ["host.owner.work"]);
+                assert_eq!(report.launched, ["host.owner.work"]);
+            }
+        }
+        assert!(
+            runner
+                .spawned
+                .borrow()
+                .iter()
+                .chain(runner.reaped.borrow().iter())
+                .all(|id| id == "host.owner.work")
+        );
+    }
+}
+
+#[test]
+fn selected_catalog_surfaces_unrelated_malformed_diagnostics_without_blocking_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let owner_workspace = tmp.path().join("owner-workspace");
+    let sibling_workspace = tmp.path().join("sibling-workspace");
+    write_selected_catalog(
+        &catalog,
+        &owner_workspace,
+        &sibling_workspace,
+        r#"file "OWNER.txt" "owner""#,
+    );
+    write(
+        &catalog,
+        "agents/host/sibling/broken.kdl",
+        r#"agent "broken" {"#,
+    );
+    let runner = FakeRunner {
+        sessions: vec![live("host.sibling.work")],
+        ..Default::default()
+    };
+
+    let report = up_once_selected(&catalog, "host.owner.work", "host", &runner).unwrap();
+
+    assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
+    assert_eq!(
+        fs::read_to_string(owner_workspace.join("OWNER.txt")).unwrap(),
+        "owner"
+    );
+    assert!(!sibling_workspace.join("SIBLING.txt").exists());
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("broken.kdl") && error.contains("KDL")),
+        "{:?}",
+        report.errors
+    );
+}
+
+#[test]
+fn selected_catalog_owner_render_failure_refuses_runner_actions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let owner_workspace = tmp.path().join("owner-workspace");
+    let sibling_workspace = tmp.path().join("sibling-workspace");
+    write_selected_catalog(
+        &catalog,
+        &owner_workspace,
+        &sibling_workspace,
+        r#"copy "_templates/missing" "OWNER.txt""#,
+    );
+    let runner = FakeRunner {
+        sessions: vec![live("host.sibling.work")],
+        ..Default::default()
+    };
+
+    let report = up_once_selected(&catalog, "host.owner.work", "host", &runner).unwrap();
+
+    assert_eq!(runner.list_calls.get(), 0);
+    assert_refusal(&runner);
+    assert!(!owner_workspace.join("OWNER.txt").exists());
+    assert!(!sibling_workspace.join("SIBLING.txt").exists());
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("_templates/missing")),
+        "{:?}",
+        report.errors
+    );
+}
 
 #[test]
 fn selected_one_shot_unknown_refuses_before_runner_list() {
