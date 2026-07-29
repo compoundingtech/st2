@@ -954,6 +954,18 @@ pub fn up_once_specs(
     )
 }
 
+/// One bounded task-scoped pass over already-discovered specs. Selector resolution precedes any runner call.
+pub fn up_once_selected_specs(
+    specs: &[crate::spec::AgentSpec], selector: &str, this_host: &str, runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    crate::reconcile::resolve_task(specs, selector, this_host)?;
+    let sessions = runner.list_sessions().map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
+    let plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
+    let mut report = UpReport::default();
+    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    Ok(report)
+}
+
 /// Supervise an in-memory spec team: keep-alive + respawn on a timer, behaving exactly like
 /// [`up_loop`] over a catalog (same
 /// FlappingCap, LivenessDebounce, crash-loop surfacing, and "stop leaves sessions running"). Timer-only
