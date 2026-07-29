@@ -128,7 +128,7 @@ pub fn install(
     }
     match &spec.pty_root {
         Some(root) => println!("pty-root\t{}", root.display()),
-        None => println!("pty-root\t{}/pty (catalog default)", catalog.display()),
+        None => println!("pty-root\tresolved from host/catalog config at runtime"),
     }
     println!("memory-max-mb\t{memory_max_mb}");
     Ok(())

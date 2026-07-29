@@ -304,6 +304,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         .arg("--catalog")
         .arg(&catalog)
         .env("PATH", bin.path())
+        .env_remove("PTY_ROOT")
         .output()
         .unwrap();
     assert!(env.status.success());

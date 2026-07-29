@@ -469,3 +469,21 @@ fn hidden_runner_state_and_resources_are_ignored() {
     assert_eq!(found.specs.len(), 1);
     assert_eq!(found.specs[0].identity, "a");
 }
+
+#[test]
+fn host_config_is_reserved_and_never_becomes_a_phantom_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/local/real/agent.kdl",
+        "agent \"real\" { host \"local\"; command \"true\" }\n",
+    );
+    // Discovery does not own this file — not even when malformed. st2's catalog validator parses
+    // every host config separately, while reconciliation for another host remains isolated from it.
+    write(tmp.path(), "agents/local/config.kdl", "not valid kdl");
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs.len(), 1);
+    assert_eq!(found.specs[0].identity, "real");
+}

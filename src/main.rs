@@ -2,6 +2,7 @@
 //! folder and prints what it discovered (specs, warnings, errors). Reconcile/run land in later
 //! milestones; this is the smoke test that discovery works end to end against a real folder.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,6 +31,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize this host's catalog config without overwriting any existing declaration.
+    Init {
+        /// Optional positional catalog path. Prefer --catalog; defaults to $CATALOG, then the
+        /// standard st2 catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+        /// Host whose machine-local config should be initialized. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Discover and print every agent spec under a catalog+inbox folder.
     Ls {
         /// Legacy positional catalog/spec path. Prefer --catalog; defaults to $CATALOG, then the
@@ -168,6 +179,9 @@ enum Command {
         /// standard st2 catalog.
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
+        /// Host whose matching config should select the session registry.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Explicitly pre-trust workspaces in the ambient Claude and Codex configs. This is an operator
     /// utility for harnesses that use those ambient configs; `st2 up` never calls it automatically.
@@ -200,6 +214,9 @@ enum Command {
     /// exported for the child exactly as `st2 env` would. No arguments launches the interactive pty
     /// UI.
     Pty {
+        /// Host whose matching config should select the session registry.
+        #[arg(long)]
+        host: Option<String>,
         /// Arguments passed through to `pty` verbatim (e.g. `ls`, `peek <session>`). None → the UI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -209,6 +226,9 @@ enum Command {
     /// The general form of `st2 pty`. Catalog selection follows `--catalog`, `$CATALOG`, then the
     /// default st2 catalog; extra args go to the shell (e.g. `st2 shell -c "pty ls"`).
     Shell {
+        /// Host whose matching config should select the session registry.
+        #[arg(long)]
+        host: Option<String>,
         /// Arguments passed through to `$SHELL` verbatim. None → an interactive shell.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -304,8 +324,9 @@ enum ServiceCmd {
         /// Bake `--host <h>` into the unit. Omit to let `st2 up` auto-detect the hostname at runtime.
         #[arg(long)]
         host: Option<String>,
-        /// Machine-local pty registry to export as PTY_ROOT in the unit. Omit to use
-        /// `<catalog>/pty`. Useful when adopting live sessions from a legacy runner.
+        /// Machine-local pty registry to export as PTY_ROOT in the unit. Omit to resolve the
+        /// matching host config, shared catalog fallback, then `<catalog>/pty` at runtime. Useful
+        /// when adopting live sessions from a legacy runner.
         #[arg(long)]
         pty_root: Option<PathBuf>,
         /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
@@ -522,6 +543,10 @@ fn main() -> Result<()> {
     initialize_catalog_env(catalog_path.as_deref())?;
 
     match command {
+        Command::Init { root, host } => {
+            let root = catalog_arg(root)?;
+            init_cmd(&root, host)
+        }
         Command::Ls { root } => {
             let root = catalog_arg(root)?;
             ls(&root)
@@ -584,9 +609,9 @@ fn main() -> Result<()> {
             let root = catalog_arg(root)?;
             down_cmd(&root, host)
         }
-        Command::Env { root } => {
+        Command::Env { root, host } => {
             let root = catalog_arg(root)?;
-            env_cmd(&root)
+            env_cmd(&root, host)
         }
         Command::Pretrust { dirs } => pretrust_cmd(&dirs),
         Command::Eval { folder, host, keep, json } => eval_cmd(&folder, host, keep, json),
@@ -599,8 +624,8 @@ fn main() -> Result<()> {
             let root = catalog_arg(root)?;
             validate_cmd(&root, host, strict, json)
         }
-        Command::Pty { args } => pty_cmd(&args),
-        Command::Shell { args } => shell_cmd(&args),
+        Command::Pty { host, args } => pty_cmd(host, &args),
+        Command::Shell { host, args } => shell_cmd(host, &args),
         Command::Doctor {
             root,
             host,
@@ -701,6 +726,7 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
             .or_else(|| spec.host.clone())
             .unwrap_or_else(detect_host);
         let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &spec_root);
+        configure_runtime_pty_root(&spec_root, &this_host)?;
         let runner = SystemRunner::new(spec_root, exec_state_dir(&this_host));
         let report = st2::down_specs(&specs, &this_host, &runner)?;
         println!(
@@ -713,6 +739,7 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
 
     let this_host = host.unwrap_or_else(detect_host);
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    configure_runtime_pty_root(&catalog_root, &this_host)?;
     let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
     let report = st2::down(root, &this_host, &runner)?;
     println!("teardown on host '{this_host}':");
@@ -777,6 +804,7 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
 fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let host = host.unwrap_or_else(detect_host);
+    st2::catalog::validate_host(&host)?;
     let report = st2::validate::validate_for_host(&catalog_root, &host);
     let (errors, warnings) = (report.errors(), report.warnings());
 
@@ -819,6 +847,56 @@ fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> 
     if errors > 0 || (strict && warnings > 0) {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+const INITIAL_HOST_CONFIG: &str = "host {\n  pty-root \"$CATALOG/pty\"\n}\n";
+
+fn init_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    st2::catalog::validate_host(&host)?;
+    std::fs::create_dir_all(root)?;
+    let path = st2::catalog::host_config_path(root, &host)?;
+    std::fs::create_dir_all(path.parent().expect("host config always has a parent"))?;
+
+    let created = if path.exists() {
+        false
+    } else {
+        let mut temporary = tempfile::NamedTempFile::new_in(
+            path.parent().expect("host config always has a parent"),
+        )
+        .with_context(|| format!("creating temporary host config beside {}", path.display()))?;
+        temporary.write_all(INITIAL_HOST_CONFIG.as_bytes())?;
+        temporary.flush()?;
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => true,
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(error.error).with_context(|| {
+                    format!(
+                        "publishing host config without overwriting {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    };
+
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading host config {}", path.display()))?;
+    st2::catalog::parse_host(&text)
+        .with_context(|| format!("validating existing host config {}", path.display()))?;
+    let resolution = resolve_pty_root_for_host(root, &host)?;
+    let action = if created { "created" } else { "unchanged" };
+    println!(
+        "catalog initialized for host '{host}': {} ({action})",
+        path.display()
+    );
+    println!(
+        "pty root: {} ({})",
+        resolution.path.display(),
+        resolution.source.label()
+    );
     Ok(())
 }
 
@@ -884,24 +962,43 @@ fn catalog_root_for_env() -> Result<PathBuf> {
     absolute_catalog_path(&root)
 }
 
-/// Set the same native catalog environment that `st2 env` prints. The catalog's own declared session
-/// registry is used, not the caller's ambient one: these hand `pty` the roots of the *catalog*.
-fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
+fn resolve_pty_root_for_host(root: &Path, host: &str) -> Result<st2::catalog::PtyRootResolution> {
+    let ambient = std::env::var_os("PTY_ROOT");
+    st2::catalog::resolve_pty_root(root, host, ambient.as_deref()).with_context(|| {
+        format!(
+            "resolving pty root for host '{host}' in catalog {}",
+            root.display()
+        )
+    })
+}
+
+/// Pin the selected registry for every backend operation in this one command process.
+fn configure_runtime_pty_root(root: &Path, host: &str) -> Result<PathBuf> {
+    let resolution = resolve_pty_root_for_host(root, host)?;
+    // SAFETY: catalog commands call this before their runner starts any watcher threads or children.
+    unsafe { std::env::set_var("PTY_ROOT", &resolution.path) };
+    Ok(resolution.path)
+}
+
+/// Set the same native catalog environment that `st2 env` prints.
+fn with_bus_env(cmd: &mut std::process::Command, root: &Path, pty_root: &Path) {
     cmd.env("CATALOG", root)
         .env("ST_ROOT", root)
-        .env("PTY_ROOT", st2::catalog::pty_root(root));
+        .env("PTY_ROOT", pty_root);
 }
 
 /// `st2 pty [<pty-args>…]` — a thin pass-through to `pty` with the catalog's bus env pre-set, so
 /// the maintainer never has to `eval "$(st2 env …)"` first. **Replaces** this process with `pty` (via exec)
 /// so the interactive UI keeps the tty, signals, and exit code.
-fn pty_cmd(args: &[String]) -> Result<()> {
+fn pty_cmd(host: Option<String>, args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    let host = host.unwrap_or_else(detect_host);
+    let pty_root = resolve_pty_root_for_host(&root, &host)?.path;
     let mut cmd = std::process::Command::new("pty");
     cmd.args(args);
-    with_bus_env(&mut cmd, &root);
+    with_bus_env(&mut cmd, &root, &pty_root);
     // exec() only returns on failure (e.g. `pty` not on PATH).
     let err = cmd.exec();
     Err(anyhow::anyhow!("failed to exec `pty`: {err}"))
@@ -909,28 +1006,29 @@ fn pty_cmd(args: &[String]) -> Result<()> {
 
 /// `st2 shell [<args>…]` — drop into `$SHELL` with the native catalog environment set. The general
 /// form of `st2 pty`.
-fn shell_cmd(args: &[String]) -> Result<()> {
+fn shell_cmd(host: Option<String>, args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    let host = host.unwrap_or_else(detect_host);
+    let pty_root = resolve_pty_root_for_host(&root, &host)?.path;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let mut cmd = std::process::Command::new(&shell);
     cmd.args(args);
-    with_bus_env(&mut cmd, &root);
+    with_bus_env(&mut cmd, &root, &pty_root);
     let err = cmd.exec();
     Err(anyhow::anyhow!("failed to exec `{shell}`: {err}"))
 }
 
-fn env_cmd(root: &Path) -> Result<()> {
+fn env_cmd(root: &Path, host: Option<String>) -> Result<()> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let host = host.unwrap_or_else(detect_host);
+    let pty_root = resolve_pty_root_for_host(&canonical, &host)?.path;
     let c = canonical.display();
     // The same roots st2 sets on every task it spawns.
     println!("export CATALOG={c}");
     println!("export ST_ROOT={c}");
-    println!(
-        "export PTY_ROOT={}",
-        st2::catalog::pty_root(&canonical).display()
-    );
+    println!("export PTY_ROOT={}", pty_root.display());
     Ok(())
 }
 
@@ -946,6 +1044,7 @@ fn pretrust_cmd(dirs: &[PathBuf]) -> Result<()> {
 fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Result<()> {
     let this_host = host.unwrap_or_else(detect_host);
     let catalog = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    configure_runtime_pty_root(&catalog, &this_host)?;
     println!(
         "st2 doctor — catalog {}, host '{this_host}'",
         catalog.display()
@@ -1175,6 +1274,7 @@ fn ding_cmd(
         host,
     };
     let (catalog_root, this_host) = resolve_ctx(&ctx)?;
+    configure_runtime_pty_root(&catalog_root, &this_host)?;
     let id = acting_id(&ctx)?;
     // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
     // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
@@ -1688,6 +1788,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     // `st2 …` resolve to this binary (PATH prepend) — same prep `st2 eval` does.
     st2::eval_run::prepare_spawn_env();
     let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
+    configure_runtime_pty_root(&root, &this_host)?;
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
@@ -1756,6 +1857,7 @@ fn up(
     let this_host = host.unwrap_or_else(detect_host);
     // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    configure_runtime_pty_root(&catalog_root, &this_host)?;
 
     if materialize_only {
         let mut found = discover(&catalog_root);

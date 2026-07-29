@@ -149,9 +149,10 @@ struct PtyListEntry {
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
 /// e.g. an eval run's short `/tmp/stev-<runid>` that dodges the 104-byte unix-socket-path limit that a
-/// deep `<catalog>/pty` would blow — else what the catalog itself declares
-/// ([`crate::catalog::pty_root`]), else the native default `<catalog>/pty`. Applied uniformly to
-/// spawn and list/kill so st2 always manages sessions where it put them.
+/// deep `<catalog>/pty` would blow — else the legacy root-catalog fallback
+/// ([`crate::catalog::pty_root`]). Host-aware CLI flows resolve and pin their host config into the
+/// ambient value before constructing a runner. Applied uniformly to spawn and list/kill so st2
+/// always manages sessions where it put them.
 pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
     effective_pty_root_from(catalog_root, std::env::var_os("PTY_ROOT"))
 }

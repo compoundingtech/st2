@@ -38,6 +38,7 @@ fn pty_defaults_to_the_xdg_catalog_and_passes_args_through() {
         .env("PATH", path_with(bin.path()))
         .env("XDG_STATE_HOME", state.path())
         .env_remove("CATALOG")
+        .env_remove("PTY_ROOT")
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -67,6 +68,7 @@ fn pty_honors_a_preset_catalog_env_over_cwd() {
         .env("PATH", path_with(bin.path()))
         .env("XDG_STATE_HOME", state.path())
         .env("CATALOG", cat.path())
+        .env_remove("PTY_ROOT")
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -89,6 +91,7 @@ fn pty_global_catalog_flag_overrides_the_environment() {
         .args(["pty", "attach", "Silber.cos"])
         .env("PATH", path_with(bin.path()))
         .env("CATALOG", ambient.path())
+        .env_remove("PTY_ROOT")
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -113,6 +116,7 @@ fn pty_passes_hyphen_flags_through() {
         .env("PATH", path_with(bin.path()))
         .env("XDG_STATE_HOME", state.path())
         .env_remove("CATALOG")
+        .env_remove("PTY_ROOT")
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -135,6 +139,7 @@ fn shell_execs_the_shell_with_the_bus_env() {
         .env("SHELL", &shell)
         .env("XDG_STATE_HOME", state.path())
         .env_remove("CATALOG")
+        .env_remove("PTY_ROOT")
         .output()
         .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -148,4 +153,56 @@ fn shell_execs_the_shell_with_the_bus_env() {
         s.contains("ARGS=-c noop"),
         "shell args not passed through: {s}"
     );
+}
+
+#[test]
+fn pty_and_shell_select_the_matching_host_config() {
+    let bin = pty_shim();
+    let catalog = tempfile::tempdir().unwrap();
+    let config = catalog.path().join("agents/local/config.kdl");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "host { pty-root \"$CATALOG/local-registry\" }\n").unwrap();
+    let expected = catalog.path().join("local-registry");
+
+    let pty = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(catalog.path())
+        .args(["pty", "--host", "local", "ls"])
+        .env("PATH", path_with(bin.path()))
+        .env_remove("PTY_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        pty.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&pty.stdout),
+        String::from_utf8_lossy(&pty.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&pty.stdout);
+    assert!(
+        stdout.contains(&format!("PTY_ROOT={}", expected.display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ARGS=ls"), "{stdout}");
+
+    let shell = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(catalog.path())
+        .args(["shell", "--host", "local", "-c", "noop"])
+        .env("SHELL", bin.path().join("pty"))
+        .env_remove("PTY_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        shell.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&shell.stdout),
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&shell.stdout);
+    assert!(
+        stdout.contains(&format!("PTY_ROOT={}", expected.display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ARGS=-c noop"), "{stdout}");
 }
