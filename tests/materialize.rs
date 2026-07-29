@@ -10,6 +10,18 @@ fn write(path: &Path, contents: impl AsRef<[u8]>) {
     fs::write(path, contents).unwrap();
 }
 
+#[test]
+fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let before = fs::read_dir(tmp.path()).unwrap().count();
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["up", "--catalog"]).arg(tmp.path())
+        .args(["--host", "host", "--materialize-only", "--task", "host.missing.task"])
+        .output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), before);
+}
+
 fn spec(catalog: &Path, identity: &str) -> AgentSpec {
     discover(catalog)
         .specs
