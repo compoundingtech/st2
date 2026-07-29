@@ -1363,7 +1363,9 @@ mod tests {
         ).unwrap();
         assert_eq!(runner.list_calls.get(), 1);
         assert!(report.launched.is_empty());
-        assert!(report.errors.iter().any(|e| e.contains("stale receipt") && e.contains("launch suppressed")));
+        assert!(report.errors.iter().any(|error| {
+            error.contains("stale receipt") && error.contains("launch suppressed")
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -1381,7 +1383,9 @@ mod tests {
             up_loop_until(
                 catalog.path(),
                 "test-host",
-                &EmptyRunner,
+                &GateRunner {
+                    list_calls: Cell::new(0),
+                },
                 Duration::from_secs(60),
                 &stop,
                 |_| passes += 1,
