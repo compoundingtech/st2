@@ -56,6 +56,8 @@ enum Command {
         /// Limit materialization/reconciliation to one declared agent identity.
         #[arg(long)]
         agent: Option<String>,
+        #[arg(long, conflicts_with = "agent")]
+        task: Option<String>,
         /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
         /// immediately regardless).
         #[arg(long, default_value_t = 30)]
@@ -529,9 +531,12 @@ fn main() -> Result<()> {
             materialize_only,
             interval,
             agent,
+            task,
         } => {
             let root = catalog_arg(root)?;
-            up(&root, host, once, materialize_only, interval, agent)
+            if task.is_some() && !once && !materialize_only { anyhow::bail!("--task requires --once or --materialize-only"); }
+            if agent.is_some() && !materialize_only { anyhow::bail!("--agent requires --materialize-only"); }
+            up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
@@ -1723,6 +1728,7 @@ fn up(
     materialize_only: bool,
     interval: u64,
     agent: Option<String>,
+    task: Option<String>,
 ) -> Result<()> {
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
@@ -1740,6 +1746,11 @@ fn up(
 
     if materialize_only {
         let mut found = discover(&catalog_root);
+        if let Some(selector) = task.as_deref() {
+            let (owner, _, _) = st2::reconcile::resolve_task(&found.specs, selector, &this_host)?;
+            let owner_identity = owner.identity.clone(); let owner_path = owner.path.clone();
+            found.specs.retain(|spec| spec.identity == owner_identity && spec.path == owner_path);
+        }
         if let Some(identity) = agent.as_deref() {
             found
                 .specs
