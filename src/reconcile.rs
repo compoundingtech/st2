@@ -81,14 +81,25 @@ pub struct ReconcilePlan<'a> {
 }
 
 /// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
-pub fn resolve_task<'a>(specs: &'a [AgentSpec], selector: &str, this_host: &str) -> anyhow::Result<(&'a AgentSpec, &'a crate::spec::Task, String)> {
+pub fn resolve_task<'a>(
+    specs: &'a [AgentSpec],
+    selector: &str,
+    this_host: &str,
+) -> anyhow::Result<(&'a AgentSpec, &'a crate::spec::Task, String)> {
     let mut matches = Vec::new();
     for spec in specs {
-        if spec.resolved_host(this_host) != this_host { continue; }
+        if spec.resolved_host(this_host) != this_host {
+            continue;
+        }
         for task in &spec.tasks {
-            let runtime = task.id.clone().unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+            let runtime = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
             let qualified = format!("{}.{}", spec.bus_id(this_host), task.name);
-            if selector == runtime || selector == qualified { matches.push((spec, task, runtime)); }
+            if selector == runtime || selector == qualified {
+                matches.push((spec, task, runtime));
+            }
         }
     }
     match matches.as_slice() {
@@ -99,16 +110,65 @@ pub fn resolve_task<'a>(specs: &'a [AgentSpec], selector: &str, this_host: &str)
 }
 
 /// Pure task-scoped plan: resolve first, then retain only the selected runtime target.
-pub fn reconcile_selected<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &str, selector: &str) -> anyhow::Result<ReconcilePlan<'a>> {
+pub fn reconcile_selected<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+    selector: &str,
+) -> anyhow::Result<ReconcilePlan<'a>> {
     let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
     let mut plan = ReconcilePlan::default();
     let actual = sessions.iter().find(|s| s.pty_id == runtime);
-    if owner.retired { if let Some(s) = actual { if s.alive { plan.teardown.push(Teardown { spec: owner, pty_ids: vec![runtime] }); } else if !(task.keep || owner.keep) { plan.gc.push(runtime); } } return Ok(plan); }
-    let Some(command) = task.command.clone() else { plan.unrunnable.push(owner); return Ok(plan); };
-    let bus_id = owner.bus_id(this_host); let mut env = task.env.clone();
-    if let Some(supervisor) = &owner.supervisor { env.insert("ST_SUPERVISOR".into(), supervisor.clone()); } else { env.remove("ST_SUPERVISOR"); }
-    let target = TaskTarget { kind: task.kind, pty_id: runtime.clone(), bus_id, name: task.name.clone(), command, cwd: task.cwd.clone(), workspace: owner.workspace.clone(), tags: task.tags.clone(), env, keep: task.keep || owner.keep };
-    match actual { Some(s) if s.alive || target.keep => plan.adopt.push(owner), Some(_) => { plan.gc.push(runtime); plan.launch.push(Launch { spec: owner, tasks: vec![target] }); }, _ => plan.launch.push(Launch { spec: owner, tasks: vec![target] }) }
+    if owner.retired {
+        if let Some(s) = actual {
+            if s.alive {
+                plan.teardown.push(Teardown {
+                    spec: owner,
+                    pty_ids: vec![runtime],
+                });
+            } else if !(task.keep || owner.keep) {
+                plan.gc.push(runtime);
+            }
+        }
+        return Ok(plan);
+    }
+    let Some(command) = task.command.clone() else {
+        plan.unrunnable.push(owner);
+        return Ok(plan);
+    };
+    let bus_id = owner.bus_id(this_host);
+    let mut env = task.env.clone();
+    if let Some(supervisor) = &owner.supervisor {
+        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
+    } else {
+        env.remove("ST_SUPERVISOR");
+    }
+    let target = TaskTarget {
+        kind: task.kind,
+        pty_id: runtime.clone(),
+        bus_id,
+        name: task.name.clone(),
+        command,
+        cwd: task.cwd.clone(),
+        workspace: owner.workspace.clone(),
+        tags: task.tags.clone(),
+        env,
+        keep: task.keep || owner.keep,
+    };
+    match actual {
+        Some(s) if s.alive || target.keep => plan.adopt.push(owner),
+        Some(_) => {
+            plan.gc.push(runtime);
+            plan.launch.push(Launch {
+                spec: owner,
+                tasks: vec![target],
+            });
+        }
+        _ => plan.launch.push(Launch {
+            spec: owner,
+            tasks: vec![target],
+        }),
+    }
     Ok(plan)
 }
 
@@ -136,9 +196,15 @@ fn resolve_task_id(bus_id: &str, name: &str, explicit: Option<&str>) -> String {
 }
 
 /// Compute the reconcile plan for `specs` given observed `sessions`, filtering to `this_host`.
-pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &str) -> ReconcilePlan<'a> {
-    let by_id: HashMap<&str, bool> =
-        sessions.iter().map(|s| (s.pty_id.as_str(), s.alive)).collect();
+pub fn reconcile<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+) -> ReconcilePlan<'a> {
+    let by_id: HashMap<&str, bool> = sessions
+        .iter()
+        .map(|s| (s.pty_id.as_str(), s.alive))
+        .collect();
 
     let mut plan = ReconcilePlan::default();
     for spec in specs {
@@ -160,7 +226,10 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
                 }
             }
             if !teardown_ids.is_empty() {
-                plan.teardown.push(Teardown { spec, pty_ids: teardown_ids });
+                plan.teardown.push(Teardown {
+                    spec,
+                    pty_ids: teardown_ids,
+                });
             }
             continue;
         }
@@ -217,7 +286,10 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
         if to_launch.is_empty() {
             plan.adopt.push(spec);
         } else {
-            plan.launch.push(Launch { spec, tasks: to_launch });
+            plan.launch.push(Launch {
+                spec,
+                tasks: to_launch,
+            });
         }
     }
     plan
