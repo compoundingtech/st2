@@ -213,7 +213,10 @@ command = "st2 ding hetz.fetcher"
     let s = &found.specs[0];
     assert_eq!(s.identity, "fetcher");
     assert_eq!(s.job_type, JobType::Service);
-    assert_eq!(s.restart.clone().unwrap().mode, agent_spec::RestartMode::Delay);
+    assert_eq!(
+        s.restart.clone().unwrap().mode,
+        agent_spec::RestartMode::Delay
+    );
     assert_eq!(s.tasks.len(), 2);
     assert_eq!(
         s.tasks.iter().find(|t| t.name == "agent").unwrap().kind,

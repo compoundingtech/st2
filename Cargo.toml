@@ -3,6 +3,7 @@
 # build, and a virtual root has no `[package]` to read.
 [workspace]
 members = ["crates/agent-spec"]
+default-members = [".", "crates/agent-spec"]
 
 [package]
 name = "st2"

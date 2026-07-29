@@ -80,8 +80,9 @@
               --fish completions-fish
           '';
 
-          # Run only the hermetic **unit** tests (`--lib --bins`). The integration
-          # tests in `tests/*.rs` each assume a real environment the Nix build
+          # Run the hermetic unit tests (`--lib --bins`) plus agent-spec's
+          # discovery integration test. The root integration tests in `tests/*.rs`
+          # each assume a real environment the Nix build
           # sandbox deliberately lacks — `/bin/bash` + `jq` (the shipped Codex
           # hooks), `/usr/bin/git` on a hardcoded `PATH` (materialize's
           # git-worktree safety check), and live PTY backends or a systemd
@@ -98,6 +99,8 @@
             "--workspace"
             "--lib"
             "--bins"
+            "--test"
+            "discovery"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
