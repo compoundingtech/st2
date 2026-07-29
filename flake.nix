@@ -97,6 +97,8 @@
             "--bins"
             "--test"
             "codex_hooks"
+            "--test"
+            "hooks"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
@@ -174,12 +176,16 @@
         # retaining the same source timestamp: replacement must be explicit,
         # and must not be mislabeled as a downgrade.
         checks.hooks-replacement = pkgs.runCommand "st2-hooks-replacement-${version}" {
-          nativeBuildInputs = [ pkgs.jq ];
+          nativeBuildInputs = [
+            pkgs.git
+            pkgs.jq
+          ];
         } ''
           export HOME=$(mktemp -d)
           export ST_HOOKS=$HOME/hooks
 
           ${st2}/bin/st2 hooks install
+          original_dir=$(jq -r '.directory' "$ST_HOOKS/current.json")
           jq -e \
             --arg rev ${pkgs.lib.escapeShellArg sourceRev} \
             --argjson commit ${toString sourceCommitUnix} \
@@ -195,10 +201,28 @@
 
           ${st2HookSuccessor}/bin/st2 hooks install --replace
           ${st2HookSuccessor}/bin/st2 hooks verify
+          ${st2}/bin/st2 hooks verify-own
           jq -e \
             --argjson commit ${toString sourceCommitUnix} \
             '.st2GitSha == "hook-successor" and .sourceCommitUnix == $commit and .sourceDirty == false' \
             "$ST_HOOKS/current.json" >/dev/null
+
+          # The old binary keeps using its own previously installed immutable
+          # set even though the successor is now selected globally.
+          mkdir -p "$HOME/catalog/agents/h/worker" "$HOME/workspace"
+          git init -q "$HOME/workspace"
+          cat > "$HOME/catalog/agents/h/worker/agent.kdl" <<EOF
+          agent "worker" {
+            host "h"
+            workspace "$HOME/workspace"
+            command "exec codex"
+            render { file "hook-path" "\$ST_HOOKS/codex-stop.sh" }
+          }
+          EOF
+          ${st2}/bin/st2 up "$HOME/catalog" --host h --materialize-only
+          grep -Fx \
+            "$ST_HOOKS/$original_dir/codex-stop.sh" \
+            "$HOME/workspace/hook-path" >/dev/null
 
           touch $out
         '';

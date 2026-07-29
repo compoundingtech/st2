@@ -180,15 +180,7 @@ fn receipt_bytes(receipt: &InstallReceipt) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn verify_set(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
-    let expected = expected_manifest();
-    if manifest != &expected {
-        anyhow::bail!(
-            "active hook receipt selects '{}', but this st2 requires '{}'",
-            manifest.hookset,
-            expected.hookset
-        );
-    }
+fn verify_set_contents(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
     let dir = root.join(&manifest.directory);
     let manifest_path = dir.join(SET_MANIFEST_FILE);
     let installed_manifest = fs::read(&manifest_path)
@@ -214,6 +206,18 @@ fn verify_set(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn verify_selected_set(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
+    let required = expected_manifest();
+    if manifest != &required {
+        anyhow::bail!(
+            "active hook receipt selects '{}', but this st2 requires '{}'",
+            manifest.hookset,
+            required.hookset
+        );
+    }
+    verify_set_contents(root, manifest)
+}
+
 /// Verify that the atomic receipt selects this binary's complete, byte-exact hook set.
 /// This function is read-only.
 pub fn verify_installed() -> Result<PathBuf> {
@@ -223,7 +227,17 @@ pub fn verify_installed() -> Result<PathBuf> {
 /// Read-only verification beneath an explicit hook root.
 pub fn verify_installed_at(root: &Path) -> Result<PathBuf> {
     let receipt = read_receipt(root)?;
-    verify_set(root, &receipt.manifest)
+    verify_selected_set(root, &receipt.manifest)
+}
+
+/// Verify this binary's immutable set without requiring it to remain globally selected.
+pub fn verify_required_set() -> Result<PathBuf> {
+    verify_required_set_at(&hooks_root()?)
+}
+
+/// Read-only verification of this binary's immutable set beneath an explicit root.
+pub fn verify_required_set_at(root: &Path) -> Result<PathBuf> {
+    verify_set_contents(root, &expected_manifest())
 }
 
 fn numeric_version(version: &str) -> Option<Vec<u64>> {
@@ -283,7 +297,7 @@ fn write_set(root: &Path, receipt: &InstallReceipt) -> Result<PathBuf> {
     fs::create_dir_all(&sets).with_context(|| format!("creating {}", sets.display()))?;
     let final_dir = root.join(&receipt.manifest.directory);
     if final_dir.exists() {
-        return verify_set(root, &receipt.manifest).with_context(|| {
+        return verify_set_contents(root, &receipt.manifest).with_context(|| {
             format!(
                 "refusing to replace corrupt immutable hook set {}",
                 final_dir.display()
@@ -317,7 +331,7 @@ fn write_set(root: &Path, receipt: &InstallReceipt) -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&tmp);
     }
     result?;
-    verify_set(root, &receipt.manifest)
+    verify_set_contents(root, &receipt.manifest)
 }
 
 fn write_receipt(root: &Path, receipt: &InstallReceipt) -> Result<()> {
@@ -346,7 +360,7 @@ pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
         Ok(current) => {
             check_replacement(&current, &candidate, replace)?;
             if current.manifest.hookset == candidate.manifest.hookset {
-                return verify_set(root, &current.manifest);
+                return verify_set_contents(root, &current.manifest);
             }
         }
         Err(error) if receipt_path(root).exists() && !replace => {
@@ -405,6 +419,23 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("sourceDirty");
         let parsed: InstallReceipt = serde_json::from_value(legacy).unwrap();
         assert!(!parsed.source_dirty);
+    }
+
+    #[test]
+    fn required_set_verification_survives_selection_by_another_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let required = install_at(tmp.path(), false).unwrap();
+        let mut successor = expected_receipt();
+        successor.manifest.hookset = "sha256-successor".into();
+        successor.manifest.directory = "sets/sha256-successor".into();
+        fs::write(
+            receipt_path(tmp.path()),
+            receipt_bytes(&successor).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(verify_required_set_at(tmp.path()).unwrap(), required);
+        assert!(verify_installed_at(tmp.path()).is_err());
     }
 
     #[test]

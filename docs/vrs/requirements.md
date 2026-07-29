@@ -58,9 +58,10 @@ accepted.
   verified before a rendered agent depends on it. The selected receipt carries
   the binary's real source identity regardless of build system. Ordered
   upgrades are automatic; selecting an older, unorderable, or unreadable exact
-  hook set requires explicit replacement authority. Hook interpreters and
-  runtime dependencies are portable and explicit on every supported package
-  environment.
+  hook set requires explicit replacement authority. A selection change does not
+  invalidate another running binary's previously installed immutable set. Hook
+  interpreters and runtime dependencies are portable and explicit on every
+  supported package environment.
 - **R11 Control-plane replacement safety:** Stopping or killing `st2 up` must
   not stop, restart, or replace any agent it launched. st2 can be reinstalled
   and restarted while running agents continue unchanged; the replacement

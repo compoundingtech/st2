@@ -52,7 +52,11 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   an ordered upgrade; `--replace` is the explicit exact-state authority for a
   downgrade, an unorderable build, or an unreadable receipt. Shipped hooks
   resolve Bash through `PATH`; the Nix package executes their integration gate
-  with Bash and `jq` declared.
+  with Bash and `jq` declared. Runtime materialization verifies the invoking
+  binary's own content-addressed set, independent of which installed binary the
+  receipt currently selects, so old and new supervisors can overlap during
+  cutover. `hooks verify-own` exposes that read-only capability to package
+  activation tooling.
 - **R11:** `st2 up` is a replaceable control plane, not the lifetime owner of
   its agents. Normal exit, forced termination, binary replacement, and restart
   leave every running agent PID and creation identity unchanged. The new
