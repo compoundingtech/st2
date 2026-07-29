@@ -129,9 +129,9 @@ fn selected_reconcile_launches_missing_and_adopts_live_without_siblings() {
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.launch[0].tasks.len(), 1);
     assert_eq!(plan.launch[0].tasks[0].pty_id, "host.a.x");
-    let plan2 = reconcile_selected(&specs, &[live("host.a.x")], "host", "host.a.x").unwrap();
-    assert!(plan2.launch.is_empty());
-    assert_eq!(plan2.adopt.len(), 1);
+    let plan2 = reconcile_selected(&specs, &[live("host.a.x"), live("host.a.y"), live("host.b.z")], "host", "host.a.x").unwrap();
+    assert!(plan2.launch.is_empty() && plan2.gc.is_empty() && plan2.teardown.is_empty());
+    assert_eq!(plan2.adopt.iter().map(|s| s.identity.as_str()).collect::<Vec<_>>(), vec!["a"]);
 }
 
 #[test]
