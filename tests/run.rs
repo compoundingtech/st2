@@ -59,6 +59,115 @@ fn assert_refusal(runner: &FakeRunner) {
     assert!(runner.removed.borrow().is_empty());
 }
 
+fn two_task_spec(identity: &str, first: &str, second: &str) -> AgentSpec {
+    let mut spec = task_spec(identity, None, first);
+    spec.tasks.push(Task {
+        kind: TaskKind::Exec,
+        derived: false,
+        name: "side".into(),
+        id: Some(second.into()),
+        command: Some("true".into()),
+        cwd: None,
+        tags: BTreeMap::new(),
+        env: BTreeMap::new(),
+        keep: false,
+    });
+    spec
+}
+
+#[test]
+fn selected_one_shot_missing_spawns_only_selected_task() {
+    let runner = FakeRunner {
+        sessions: vec![live("host.agent.side")],
+        ..Default::default()
+    };
+    let specs = vec![two_task_spec("agent", "host.agent.work", "host.agent.side")];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.launched, ["host.agent.work"]);
+}
+
+#[test]
+fn selected_one_shot_live_adopts_without_actions() {
+    let runner = FakeRunner {
+        sessions: vec![live("host.agent.work"), live("host.agent.side")],
+        ..Default::default()
+    };
+    let specs = vec![two_task_spec("agent", "host.agent.work", "host.agent.side")];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.adopted, ["agent"]);
+}
+
+#[test]
+fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
+    let runner = FakeRunner {
+        sessions: vec![dead("host.agent.work"), live("host.agent.side")],
+        ..Default::default()
+    };
+    let specs = vec![two_task_spec("agent", "host.agent.work", "host.agent.side")];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(runner.reaped.borrow().as_slice(), ["host.agent.work"]);
+    assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.gc, ["host.agent.work"]);
+    assert_eq!(report.launched, ["host.agent.work"]);
+}
+
+#[test]
+fn selected_one_shot_second_live_pass_is_a_noop() {
+    let runner = FakeRunner {
+        sessions: vec![live("host.agent.work")],
+        ..Default::default()
+    };
+    let specs = vec![task_spec("agent", None, "host.agent.work")];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.adopted, ["agent"]);
+}
+
 #[test]
 fn selected_one_shot_ambiguous_refuses_before_runner_list() {
     let runner = FakeRunner::default();
