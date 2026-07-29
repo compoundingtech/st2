@@ -1,3 +1,9 @@
+# The root stays a real package (not a virtual manifest): `flake.nix` reads
+# `package.version` out of this file as the single source of truth for the
+# build, and a virtual root has no `[package]` to read.
+[workspace]
+members = ["crates/agent-spec"]
+
 [package]
 name = "st2"
 version = "0.1.0"
@@ -16,6 +22,7 @@ path = "src/lib.rs"
 [dependencies]
 # Sync by design: the runner is I/O-light (shell-outs to `pty` plus a
 # folder watch + a sleep), so no tokio. Deps grow per milestone; M0 needs only parse + CLI.
+agent-spec = { path = "crates/agent-spec" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

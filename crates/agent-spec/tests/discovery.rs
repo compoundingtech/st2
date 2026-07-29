@@ -1,15 +1,15 @@
 //! M1 correctness net: discovery + lowering of VRS `agent.kdl` jobs (spec.md §1–2, §4).
 //!
 //! Builds throwaway catalog folders, writes real job files (KDL/TOML/JSON, services), and
-//! asserts st2 lowers them per the spec: `pty`/`exec` task split, `restart{}`, `type`, `workspace`,
+//! asserts they lower per the spec: `pty`/`exec` task split, `restart{}`, `type`, `workspace`,
 //! `supervisor`; render-only fields ignored; content/path precedence; malformed → error, not halt.
 
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use st2::spec::TaskKind;
-use st2::{AgentSpec, JobType, discover};
+use agent_spec::spec::TaskKind;
+use agent_spec::{AgentSpec, JobType, discover};
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -91,7 +91,7 @@ fn parses_full_kdl_service_job() {
     assert_eq!(r.attempts, 5);
     assert_eq!(r.interval, Duration::from_secs(90));
     assert_eq!(r.delay, Duration::from_secs(5));
-    assert_eq!(r.mode, st2::RestartMode::Fail);
+    assert_eq!(r.mode, agent_spec::RestartMode::Fail);
 
     // tasks: pty "agent" + exec "ding" (sorted by name)
     assert_eq!(s.tasks.len(), 2);
@@ -213,7 +213,7 @@ command = "st2 ding hetz.fetcher"
     let s = &found.specs[0];
     assert_eq!(s.identity, "fetcher");
     assert_eq!(s.job_type, JobType::Service);
-    assert_eq!(s.restart.clone().unwrap().mode, st2::RestartMode::Delay);
+    assert_eq!(s.restart.clone().unwrap().mode, agent_spec::RestartMode::Delay);
     assert_eq!(s.tasks.len(), 2);
     assert_eq!(
         s.tasks.iter().find(|t| t.name == "agent").unwrap().kind,

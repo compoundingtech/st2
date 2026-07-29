@@ -1,0 +1,16 @@
+[package]
+name = "agent-spec"
+version = "0.1.0"
+edition = "2024"
+description = "Parse a catalog of rendered agent specs (KDL/TOML/JSON) into the runner-normative agent job model."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+kdl = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

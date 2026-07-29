@@ -27,7 +27,7 @@ use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
-use crate::spec::TaskKind;
+use agent_spec::spec::TaskKind;
 
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
@@ -896,7 +896,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 /// once (the carried cap rate-limits a same-episode second respawn; the carried debounce absorbs a
 /// transient `pty list` misread of a healthy seat).
 pub fn reconcile_pass_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
@@ -921,7 +921,7 @@ pub fn reconcile_pass_specs(
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
 /// vanished crash on the next tick.
 pub(crate) fn reconcile_pass_specs_with_sessions(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     sessions: &[Session],
     this_host: &str,
     runner: &dyn Runner,
@@ -940,7 +940,7 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
 /// One reconcile pass over an in-memory spec team (`st2 up <spec> --once`). Throwaway cap+debounce
 /// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
 pub fn up_once_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
 ) -> UpReport {
@@ -960,7 +960,7 @@ pub fn up_once_specs(
 /// (a spec is one static file — no folder to watch; edit + restart to change it). `root` roots
 /// `$CATALOG` + crash-loop surfacing. Runs until SIGINT/SIGTERM.
 pub fn up_loop_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     root: &Path,
     this_host: &str,
     runner: &dyn Runner,
@@ -1027,7 +1027,7 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
 /// Sessions persist across an `st2 up` supervisor exit (nomad-decoupled), so this is how you actually
 /// stop them. `specs` are the already-resolved [`AgentSpec`]s (from `spec_to_agent_specs`).
 pub fn down_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
@@ -1040,7 +1040,7 @@ pub fn down_specs(
 /// derived identically to how reconcile spawns them (explicit `task.id`, else `<bus_id>.<task>`), so
 /// the catalog `down` and the spec `down_specs` tear down exactly what `up`/`up_*_specs` launched.
 fn teardown_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
     report: &mut UpReport,
@@ -1238,7 +1238,7 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::TaskKind;
+    use agent_spec::spec::TaskKind;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
@@ -1312,7 +1312,7 @@ mod tests {
     //    destructively GC/relaunch a HEALTHY agent; a stable death must still be reaped ──────────────
 
     use crate::reconcile::Launch;
-    use crate::spec::{AgentSpec, JobType};
+    use agent_spec::spec::{AgentSpec, JobType};
 
     fn sess(id: &str, alive: bool) -> Session {
         Session {

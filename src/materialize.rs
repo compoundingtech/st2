@@ -11,7 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlNode};
 
-use crate::spec::AgentSpec;
+use agent_spec::spec::AgentSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderOp {

@@ -10,6 +10,8 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(doc)]
+use crate::spec::JobType;
 use crate::spec::{AgentSpec, RawSpec};
 
 /// The result of walking a catalog folder. Sorted + deterministic.
@@ -92,10 +94,39 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
     }
 }
 
+/// What a declaration literally *says*, before lowering normalizes it away.
+///
+/// Lowering is lossy by design: a typo'd `type = "srvice"` becomes [`JobType::Service`], and an
+/// identity omitted from the content is filled in from the path. Both are invisible in the resolved
+/// [`AgentSpec`], so a linter that wants to fault them has to see the declared form. This is that
+/// view — deliberately narrow, so the permissive on-disk shape itself stays private and is free to
+/// gain fields without breaking readers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declared {
+    /// `identity` as written in the file. `None` when the file relies on [`path_defaults`].
+    pub identity: Option<String>,
+    /// `type` as written, before it is normalized to [`JobType::Service`]. `None` when unset.
+    pub job_type: Option<String>,
+}
+
+/// Read the declared (pre-lowering) values of every agent in a file — one per `agent` node for KDL,
+/// 0-or-1 for TOML/JSON, empty for a non-spec extension.
+///
+/// Order matches [`discover`]'s specs for the same file, so a caller can pair them up positionally.
+pub fn parse_declared(path: &Path) -> anyhow::Result<Vec<Declared>> {
+    Ok(parse_raw_file(path)?
+        .into_iter()
+        .map(|raw| Declared {
+            identity: raw.identity,
+            job_type: raw.job_type,
+        })
+        .collect())
+}
+
 /// Parse a spec file into its raw (pre-resolution) shape — one per `agent` node for KDL, 0-or-1 for
-/// TOML/JSON. Non-spec extensions yield an empty vec. Shared by discovery and `validate` (which needs
-/// the *raw* `type` string before it is normalized away, to catch a typo'd `type = "srvice"`).
-pub(crate) fn parse_raw_file(path: &Path) -> anyhow::Result<Vec<RawSpec>> {
+/// TOML/JSON. Non-spec extensions yield an empty vec. Shared by discovery and [`parse_declared`]
+/// (which exposes the *raw* `type` and `identity` before normalization, without leaking [`RawSpec`]).
+fn parse_raw_file(path: &Path) -> anyhow::Result<Vec<RawSpec>> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let text = fs::read_to_string(path)?;
     Ok(match ext {

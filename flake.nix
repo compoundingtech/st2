@@ -90,7 +90,12 @@
           # on native CI (real runner) while the flake proves the package here:
           # it builds, its ~150 pure unit tests pass, and `--help`/completions
           # smoke-test the wired binary below.
+          # `--workspace` because the root is a real package: without it cargo
+          # selects only `st2` and the `agent-spec` crate's unit tests silently
+          # stop being gated here (they are part of the same ~150 that ran
+          # before the crate was split out).
           cargoTestFlags = [
+            "--workspace"
             "--lib"
             "--bins"
           ];
