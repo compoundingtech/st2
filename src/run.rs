@@ -27,7 +27,7 @@ use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
-use crate::spec::TaskKind;
+use agent_spec::spec::TaskKind;
 
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
@@ -773,13 +773,13 @@ fn reconcile_pass(
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
     let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
-        .then(crate::hooks::verify_installed)
+        .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
         .map(|error| error.to_string());
     if let Some(error) = &hook_error {
         report.errors.push(format!(
-            "verify lifecycle hooks before Codex materialization: {error}; materialization deferred"
+            "verify this binary's lifecycle hooks before Codex materialization: {error}; materialization deferred"
         ));
     }
     let materializable_specs = found
@@ -910,7 +910,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 /// once (the carried cap rate-limits a same-episode second respawn; the carried debounce absorbs a
 /// transient `pty list` misread of a healthy seat).
 pub fn reconcile_pass_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
@@ -935,7 +935,7 @@ pub fn reconcile_pass_specs(
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
 /// vanished crash on the next tick.
 pub(crate) fn reconcile_pass_specs_with_sessions(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     sessions: &[Session],
     this_host: &str,
     runner: &dyn Runner,
@@ -954,7 +954,7 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
 /// One reconcile pass over an in-memory spec team (`st2 up <spec> --once`). Throwaway cap+debounce
 /// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
 pub fn up_once_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
 ) -> UpReport {
@@ -1009,11 +1009,16 @@ pub fn up_once_selected(
     if crate::hooks::required_by_codex_agent(&owner, this_host)
         && let Err(error) = crate::hooks::verify_installed()
     {
-        report.errors.push(format!("verify lifecycle hooks: {error}"));
+        report
+            .errors
+            .push(format!("verify lifecycle hooks: {error}"));
         return Ok(report);
     }
-    let materialized =
-        crate::materialize::materialize_catalog(catalog_root, std::slice::from_ref(&owner), this_host);
+    let materialized = crate::materialize::materialize_catalog(
+        catalog_root,
+        std::slice::from_ref(&owner),
+        this_host,
+    );
     report.warnings.extend(materialized.warnings);
     let owner_materialization_failed = !materialized.failed_agents.is_empty();
     report.errors.extend(materialized.errors);
@@ -1026,7 +1031,8 @@ pub fn up_once_selected(
         selector,
         this_host,
         runner,
-        || Ok(()), crate::pretrust::pretrust_codex,
+        || Ok(()),
+        crate::pretrust::pretrust_codex,
     )?;
     report.absorb(execution);
     Ok(report)
@@ -1051,13 +1057,7 @@ where
         .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
     let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
-    gate_codex_launches(
-        catalog_root,
-        &mut plan,
-        &mut report,
-        verify_hooks,
-        pretrust,
-    );
+    gate_codex_launches(catalog_root, &mut plan, &mut report, verify_hooks, pretrust);
     execute(&plan, runner, &mut FlappingCap::default(), &mut report);
     Ok(report)
 }
@@ -1068,7 +1068,7 @@ where
 /// (a spec is one static file — no folder to watch; edit + restart to change it). `root` roots
 /// `$CATALOG` + crash-loop surfacing. Runs until SIGINT/SIGTERM.
 pub fn up_loop_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     root: &Path,
     this_host: &str,
     runner: &dyn Runner,
@@ -1135,7 +1135,7 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
 /// Sessions persist across an `st2 up` supervisor exit (nomad-decoupled), so this is how you actually
 /// stop them. `specs` are the already-resolved [`AgentSpec`]s (from `spec_to_agent_specs`).
 pub fn down_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
@@ -1148,7 +1148,7 @@ pub fn down_specs(
 /// derived identically to how reconcile spawns them (explicit `task.id`, else `<bus_id>.<task>`), so
 /// the catalog `down` and the spec `down_specs` tear down exactly what `up`/`up_*_specs` launched.
 fn teardown_specs(
-    specs: &[crate::spec::AgentSpec],
+    specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
     report: &mut UpReport,
@@ -1346,7 +1346,7 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{AgentSpec, JobType, Task, TaskKind};
+    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
     use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
@@ -1414,12 +1414,19 @@ mod tests {
             }],
             path: "/tmp/spec.kdl".into(),
         };
-        let runner = GateRunner { list_calls: Cell::new(0) };
+        let runner = GateRunner {
+            list_calls: Cell::new(0),
+        };
         let report = up_once_selected_specs_with_gates(
-            Path::new("/tmp"), &[spec], "test.codex.agent", "test", &runner,
+            Path::new("/tmp"),
+            &[spec],
+            "test.codex.agent",
+            "test",
+            &runner,
             || anyhow::bail!("stale receipt"),
             |_| panic!("pretrust must not run"),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(runner.list_calls.get(), 1);
         assert!(report.launched.is_empty());
         assert!(report.errors.iter().any(|error| {

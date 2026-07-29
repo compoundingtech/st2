@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use crate::spec::{Restart, RestartMode};
+use agent_spec::spec::{Restart, RestartMode};
 
 /// What to do with a would-be (re)launch this pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

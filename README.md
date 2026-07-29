@@ -21,7 +21,8 @@ Prerequisites:
 - Rust and Cargo;
 - `pty` on `PATH`;
 - at least one supported harness on `PATH`: `codex` or `claude`;
-- Git when a declaration materializes workspace files.
+- Git when a declaration materializes workspace files;
+- Bash and `jq` on `PATH` when lifecycle hooks are enabled.
 
 From a checkout:
 
@@ -44,15 +45,18 @@ location.
 
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
-verifies that receipt for Codex launches; any local workspace render that actually references
-`$ST_HOOKS` verifies it before writing. Hook-free materialization does not require an installed
-set. These checks never create, refresh, or rewrite hooks. An intentional rollback to an older set
-requires `st2 hooks install --allow-downgrade`.
+verifies its own immutable set for Codex launches; any local workspace render that actually
+references `$ST_HOOKS` verifies that set before writing. Selecting a successor does not invalidate
+an older running binary's installed set during cutover. Hook-free materialization does not require
+an installed set. These checks never create, refresh, or rewrite hooks. To select this binary's
+exact hook set when the installed and candidate builds are older or cannot be ordered, use `st2
+hooks install --replace`. `st2 hooks verify-own` is the read-only cutover probe for an installed
+binary that may no longer be selected.
 
 `ST_HOOKS` overrides the machine-local hook root for installation, verification, and managed tasks.
-During materialization, hook commands such as `$ST_HOOKS/codex-stop.sh` resolve to the selected
-immutable set, so rendered settings are versioned without embedding a machine-specific root in the
-declaration.
+During materialization, hook commands such as `$ST_HOOKS/codex-stop.sh` resolve to the invoking
+binary's immutable set, so rendered settings are versioned without embedding a machine-specific
+root in the declaration.
 
 The hooks have a small operational purpose: session-start restores durable context and exposes the
 current inbox; pre-compact preserves a recovery breadcrumb when no context was written; stop and

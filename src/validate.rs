@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::discovery::{discover, parse_raw_file, path_defaults};
-use crate::spec::{AgentSpec, JobType};
+use agent_spec::discovery::{discover, parse_declared, path_defaults};
+use agent_spec::spec::{AgentSpec, JobType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -140,7 +140,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
     files.sort();
     files.dedup();
     for f in files {
-        if let Ok(raws) = parse_raw_file(f) {
+        if let Ok(raws) = parse_declared(f) {
             for raw in raws {
                 if let Some(t) = &raw.job_type
                     && t != "service"

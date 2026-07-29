@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use crate::spec::{AgentSpec, TaskKind};
+use agent_spec::spec::{AgentSpec, TaskKind};
 
 /// ACTUAL state: one running/known task as st2 observes it (unioned across backends).
 #[derive(Debug, Clone, PartialEq, Eq)]
