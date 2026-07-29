@@ -323,12 +323,17 @@ enum ServiceCmd {
 enum HooksCmd {
     /// Atomically publish this binary's immutable hook set and select it with a receipt.
     Install {
-        /// Permit an intentional rollback to an older or unorderable hook set.
+        /// Select this binary's exact hook set even when it is older or cannot be ordered.
         #[arg(long)]
+        replace: bool,
+        /// Deprecated compatibility alias for `--replace`.
+        #[arg(long, hide = true)]
         allow_downgrade: bool,
     },
     /// Read-only verification of the selected receipt and every embedded hook byte.
     Verify,
+    /// Verify this binary's immutable hook set without requiring it to be selected.
+    VerifyOwn,
 }
 
 #[derive(Subcommand)]
@@ -654,8 +659,11 @@ fn compile_agent_cmd(
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
     match command {
-        HooksCmd::Install { allow_downgrade } => {
-            let dir = st2::hooks::install(allow_downgrade)?;
+        HooksCmd::Install {
+            replace,
+            allow_downgrade,
+        } => {
+            let dir = st2::hooks::install(replace || allow_downgrade)?;
             let root = st2::hooks::hooks_root()?;
             println!(
                 "installed hook set {} in {}\nreceipt {}",
@@ -668,6 +676,14 @@ fn hooks_cmd(command: HooksCmd) -> Result<()> {
             let dir = st2::hooks::verify_installed()?;
             println!(
                 "verified hook set {} in {}",
+                st2::hooks::hookset_id(),
+                dir.display()
+            );
+        }
+        HooksCmd::VerifyOwn => {
+            let dir = st2::hooks::verify_required_set()?;
+            println!(
+                "verified this binary's hook set {} in {}",
                 st2::hooks::hookset_id(),
                 dir.display()
             );
@@ -1752,7 +1768,7 @@ fn up(
             eprintln!("error: {}: {}", error.path.display(), error.message);
         }
         if st2::hooks::required_by_codex(&found.specs, &this_host) {
-            st2::hooks::verify_installed().context(
+            st2::hooks::verify_required_set().context(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
         }

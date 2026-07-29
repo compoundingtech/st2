@@ -759,13 +759,13 @@ fn reconcile_pass(
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
     let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
-        .then(crate::hooks::verify_installed)
+        .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
         .map(|error| error.to_string());
     if let Some(error) = &hook_error {
         report.errors.push(format!(
-            "verify lifecycle hooks before Codex materialization: {error}; materialization deferred"
+            "verify this binary's lifecycle hooks before Codex materialization: {error}; materialization deferred"
         ));
     }
     let materializable_specs = found

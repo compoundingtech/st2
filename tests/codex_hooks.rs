@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+fn bash() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("bash"))
+        .find(|path| path.is_file())
+        .expect("bash is available on PATH")
+}
+
 use st2::{context, message};
 
 struct Fixture {
@@ -63,7 +70,7 @@ impl Fixture {
 
     fn run_path(&self, script: &Path) -> Output {
         let current_path = std::env::var("PATH").unwrap_or_default();
-        Command::new("/bin/bash")
+        Command::new(bash())
             .arg(script)
             .env("PATH", format!("{}:{current_path}", self.bin.display()))
             .env("ST_ROOT", &self.catalog)
@@ -240,7 +247,7 @@ fn installed_versioned_stop_hook_preserves_the_scope_a_envelope_and_cursor() {
 #[test]
 fn stop_fails_open_without_required_commands() {
     let fixture = Fixture::new();
-    let output = Command::new("/bin/bash")
+    let output = Command::new(bash())
         .arg(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("hooks")

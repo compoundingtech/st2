@@ -4,9 +4,6 @@
 //! NixStamp can never be overridden by this (see src/version.rs). A hermetic Nix
 //! build has no `.git`, so this yields nothing there and the NixStamp is used.
 //!
-//! A full revision and commit timestamp are also exposed privately to the
-//! receipt-bearing lifecycle-hook installer. They do not affect the shared
-//! human/machine version contract.
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
@@ -29,14 +26,6 @@ fn main() {
         let stamp =
             format!(r#"{{"type":"local","rev":"{rev}","commitTs":{commit_ts},"dirty":{dirty}}}"#);
         println!("cargo:rustc-env=ST2_BUILD_STAMP_LOCAL={stamp}");
-        println!(
-            "cargo:rustc-env=ST2_GIT_SHA_FULL={}",
-            git(&["rev-parse", "HEAD"]).unwrap_or(rev)
-        );
-        println!("cargo:rustc-env=ST2_GIT_COMMIT_UNIX={commit_ts}");
-    } else {
-        println!("cargo:rustc-env=ST2_GIT_SHA_FULL=unknown");
-        println!("cargo:rustc-env=ST2_GIT_COMMIT_UNIX=0");
     }
     // Rebuild the stamp when HEAD moves or the working tree changes (dirty flag).
     println!("cargo:rerun-if-changed=.git/HEAD");
