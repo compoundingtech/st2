@@ -32,7 +32,15 @@ fn selector_derived_id_success() {
 #[test]
 fn selector_explicit_id_and_qualified_alias_return_explicit_runtime() {
     let s = vec![svc("agent", None, vec![task(TaskKind::Exec, "work", Some("custom"), Some("cmd"))])];
-    for selector in ["custom", "host.agent.work"] { assert_eq!(resolve_task(&s, selector, "host").unwrap().2, "custom"); }
+    for selector in ["custom", "host.agent.work"] { let (o,t,id)=resolve_task(&s, selector, "host").unwrap(); assert_eq!((o.identity.as_str(),t.name.as_str(),t.command.as_deref(),id.as_str()), ("agent","work",Some("cmd"),"custom")); }
+}
+
+#[test]
+fn selector_agent_command_runtime_id_and_inputs_immutable() {
+    let s = vec![svc("agent", None, vec![task(TaskKind::Pty, "agent", Some("host.agent"), Some("run"))])];
+    let before = s.clone(); let (o,t,id)=resolve_task(&s, "host.agent", "host").unwrap();
+    assert_eq!((o.identity.as_str(),t.name.as_str(),t.command.as_deref(),id.as_str()), ("agent","agent",Some("run"),"host.agent")); assert_eq!(s,before);
+    assert!(resolve_task(&s, "host.missing", "host").is_err()); assert_eq!(s,before);
 }
 
 #[test]
