@@ -69,6 +69,11 @@ eval {
   judges {
     judge "deliverable exists" { exec "test -f $CATALOG/worker/DONE" }
     judge "deliverable content" { file "worker/DONE" has "resolved" }
+    judge "typed values" {
+      json "worker/values.json" field "text" is "hello"
+      json "worker/values.json" field "ok" is #true
+      json "worker/values.json" field "count" is 7
+    }
     judge "one native bus root" {
       exec "test \"$ST_ROOT\" = \"$CATALOG\" && test \"$(cat $CATALOG/sup/ST_ROOT)\" = \"$CATALOG\" && test \"$(cat $CATALOG/worker/ST_ROOT)\" = \"$CATALOG\""
     }
@@ -89,6 +94,7 @@ sleep 0.4
 mkdir -p "$CATALOG/worker"
 printf '%s\n' "$ST_ROOT" > "$CATALOG/worker/ST_ROOT"
 echo "resolved by t.worker" > "$CATALOG/worker/DONE"
+printf '%s\n' '{"text":"hello","ok":true,"count":7}' > "$CATALOG/worker/values.json"
 st2 message send t.sup --root "$ST_ROOT" --as t.worker -m "worker done" >/dev/null 2>&1
 sleep 60
 "#,
@@ -135,7 +141,7 @@ sleep 60
     assert!(stdout.contains("VERDICT: PASS"), "expected PASS:\n--stdout--\n{stdout}\n--stderr--\n{stderr}");
     assert!(out.status.success(), "exit non-zero:\n{stdout}\n{stderr}");
     // Both judges (bash + declarative) passed.
-    assert!(stdout.contains("SCORE: 4 PASS / 0 FAIL"), "expected 4/0:\n{stdout}");
+    assert!(stdout.contains("SCORE: 5 PASS / 0 FAIL"), "expected 5/0:\n{stdout}");
 
     let json_out = Command::new(bin)
         .args(["eval", "--json"])
@@ -154,7 +160,8 @@ sleep 60
 
     let fail_cell = cell.join("fail.kdl");
     let fail_spec = std::fs::read_to_string(cell.join("cell.kdl")).unwrap()
-        .replace("test -f $CATALOG/worker/DONE", "test -f $CATALOG/worker/NOPE");
+        .replace("test -f $CATALOG/worker/DONE", "test -f $CATALOG/worker/NOPE")
+        .replace("field \"count\" is 7", "field \"count\" is 8");
     std::fs::write(&fail_cell, fail_spec).unwrap();
     let fail_out = Command::new(bin)
         .args(["eval", "--json"])
@@ -166,6 +173,7 @@ sleep 60
     assert!(!fail_out.status.success());
     let fail_json: serde_json::Value = serde_json::from_slice(&fail_out.stdout).expect("failed eval report");
     assert_eq!(fail_json["judges"][0]["passed"], false);
+    assert!(fail_json["judges"].as_array().unwrap().iter().any(|j| j["detail"].as_str().unwrap_or("").contains("count")));
     assert!(!String::from_utf8_lossy(&fail_out.stdout).contains("=="));
 
     let invalid = Command::new(bin)
