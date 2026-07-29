@@ -884,11 +884,12 @@ fn catalog_root_for_env() -> Result<PathBuf> {
     absolute_catalog_path(&root)
 }
 
-/// Set the same native catalog environment that `st2 env` prints.
+/// Set the same native catalog environment that `st2 env` prints. The catalog's own declared session
+/// registry is used, not the caller's ambient one: these hand `pty` the roots of the *catalog*.
 fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
     cmd.env("CATALOG", root)
         .env("ST_ROOT", root)
-        .env("PTY_ROOT", root.join("pty"));
+        .env("PTY_ROOT", st2::catalog::pty_root(root));
 }
 
 /// `st2 pty [<pty-args>…]` — a thin pass-through to `pty` with the catalog's bus env pre-set, so
@@ -921,12 +922,15 @@ fn shell_cmd(args: &[String]) -> Result<()> {
 }
 
 fn env_cmd(root: &Path) -> Result<()> {
-    let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let c = c.display();
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let c = canonical.display();
     // The same roots st2 sets on every task it spawns.
     println!("export CATALOG={c}");
     println!("export ST_ROOT={c}");
-    println!("export PTY_ROOT={c}/pty");
+    println!(
+        "export PTY_ROOT={}",
+        st2::catalog::pty_root(&canonical).display()
+    );
     Ok(())
 }
 

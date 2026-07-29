@@ -149,7 +149,8 @@ struct PtyListEntry {
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
 /// e.g. an eval run's short `/tmp/stev-<runid>` that dodges the 104-byte unix-socket-path limit that a
-/// deep `<catalog>/pty` would blow — else the native default `<catalog>/pty`. Applied uniformly to
+/// deep `<catalog>/pty` would blow — else what the catalog itself declares
+/// ([`crate::catalog::pty_root`]), else the native default `<catalog>/pty`. Applied uniformly to
 /// spawn and list/kill so st2 always manages sessions where it put them.
 pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
     effective_pty_root_from(catalog_root, std::env::var_os("PTY_ROOT"))
@@ -160,7 +161,7 @@ pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
 fn effective_pty_root_from(catalog_root: &Path, ambient: Option<std::ffi::OsString>) -> PathBuf {
     match ambient {
         Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => catalog_root.join("pty"),
+        _ => crate::catalog::pty_root(catalog_root),
     }
 }
 
@@ -1358,6 +1359,30 @@ mod tests {
         let short = std::ffi::OsString::from("/tmp/stev-abc123");
         assert_eq!(
             effective_pty_root_from(cat, Some(short)),
+            std::path::PathBuf::from("/tmp/stev-abc123")
+        );
+    }
+
+    #[test]
+    fn a_catalog_declared_root_outranks_the_default_but_never_an_ambient_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = tmp.path();
+        std::fs::write(
+            cat.join(crate::catalog::CONFIG_FILE),
+            "catalog { pty-root \"/run/agents/pty\" }\n",
+        )
+        .unwrap();
+
+        // The declaration replaces the `<catalog>/pty` default for every st2 pty op — so a reader
+        // that resolves the catalog finds the sessions without being handed an env var.
+        assert_eq!(
+            effective_pty_root_from(cat, None),
+            std::path::PathBuf::from("/run/agents/pty")
+        );
+        // An explicit ambient root still wins: an eval run's short decoupled partition must be able
+        // to override a catalog it copied from.
+        assert_eq!(
+            effective_pty_root_from(cat, Some("/tmp/stev-abc123".into())),
             std::path::PathBuf::from("/tmp/stev-abc123")
         );
     }
