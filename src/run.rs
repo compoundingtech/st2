@@ -553,6 +553,20 @@ pub struct UpReport {
 }
 
 impl UpReport {
+    fn absorb(&mut self, mut other: UpReport) {
+        self.skipped |= other.skipped;
+        self.launched.append(&mut other.launched);
+        self.torn_down.append(&mut other.torn_down);
+        self.gc.append(&mut other.gc);
+        self.deferred.append(&mut other.deferred);
+        self.flapping.append(&mut other.flapping);
+        self.crash_loops.append(&mut other.crash_loops);
+        self.adopted.append(&mut other.adopted);
+        self.other_host.append(&mut other.other_host);
+        self.unrunnable.append(&mut other.unrunnable);
+        self.warnings.append(&mut other.warnings);
+        self.errors.append(&mut other.errors);
+    }
     /// True when the pass actually changed something (or hit an error) — used to keep the loop's log
     /// quiet on no-op ticks.
     pub fn is_noteworthy(&self) -> bool {
@@ -983,7 +997,6 @@ pub fn up_once_selected(
 ) -> anyhow::Result<UpReport> {
     let found = crate::discovery::discover(catalog_root);
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
-    let all_specs = found.specs.clone();
     let mut report = UpReport::default();
     report.warnings.extend(found.warnings);
     report.errors.extend(found.errors.into_iter().map(|e| e.message));
@@ -997,20 +1010,20 @@ pub fn up_once_selected(
     let materialized =
         crate::materialize::materialize_catalog(catalog_root, std::slice::from_ref(&owner), this_host);
     report.warnings.extend(materialized.warnings);
+    let owner_materialization_failed = !materialized.failed_agents.is_empty();
     report.errors.extend(materialized.errors);
-    if !report.errors.is_empty() {
+    if owner_materialization_failed {
         return Ok(report);
     }
     let mut execution = up_once_selected_specs_with_gates(
-        catalog_root, &all_specs, selector, this_host, runner,
+        catalog_root,
+        &found.specs,
+        selector,
+        this_host,
+        runner,
         || Ok(()), crate::pretrust::pretrust_codex,
     )?;
-    report.warnings.append(&mut execution.warnings);
-    report.errors.append(&mut execution.errors);
-    report.launched.append(&mut execution.launched);
-    report.torn_down.append(&mut execution.torn_down);
-    report.gc.append(&mut execution.gc);
-    report.adopted.append(&mut execution.adopted);
+    report.absorb(execution);
     Ok(report)
 }
 
