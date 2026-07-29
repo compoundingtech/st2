@@ -22,6 +22,27 @@ fn exact_task_selector_matrix() {
     assert!(resolve_task(&specs, "host.a.missing", "host").is_err());
 }
 
+#[test]
+fn selector_derived_id_success() {
+    let s = vec![svc("plain", None, vec![task(TaskKind::Exec, "work", None, Some("cmd"))])];
+    let (owner, t, id) = resolve_task(&s, "host.plain.work", "host").unwrap();
+    assert_eq!((owner.identity.as_str(), t.name.as_str(), t.command.as_deref(), id.as_str()), ("plain", "work", Some("cmd"), "host.plain.work"));
+}
+
+#[test]
+fn selector_explicit_id_and_qualified_alias_return_explicit_runtime() {
+    let s = vec![svc("agent", None, vec![task(TaskKind::Exec, "work", Some("custom"), Some("cmd"))])];
+    for selector in ["custom", "host.agent.work"] { assert_eq!(resolve_task(&s, selector, "host").unwrap().2, "custom"); }
+}
+
+#[test]
+fn selector_rejects_duplicate_explicit_and_runtime_collision() {
+    let dup = vec![svc("a", None, vec![task(TaskKind::Exec, "x", Some("dup"), Some("a"))]), svc("b", None, vec![task(TaskKind::Exec, "y", Some("dup"), Some("b"))])];
+    assert!(resolve_task(&dup, "dup", "host").is_err());
+    let collision = vec![svc("a", None, vec![task(TaskKind::Exec, "x", None, Some("a"))]), svc("b", None, vec![task(TaskKind::Exec, "y", Some("host.a.x"), Some("b"))])];
+    assert!(resolve_task(&collision, "host.a.x", "host").is_err());
+}
+
 fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> Task {
     Task {
         kind,
