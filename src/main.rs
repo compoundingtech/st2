@@ -169,10 +169,9 @@ enum Command {
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
     },
-    /// Pre-trust agent workspaces in the claude config (`$CLAUDE_CONFIG_DIR/.claude.json` else
-    /// `~/.claude.json`) BEFORE they boot, so a kick-driven `claude` never hangs on the "Is this a
-    /// project you trust?" dialog. One atomic batch write for all dirs closes the multi-spawn trust
-    /// race; merges into existing entries (never clobbers). Run it before `st2 up`.
+    /// Explicitly pre-trust workspaces in the ambient Claude and Codex configs. This is an operator
+    /// utility for harnesses that use those ambient configs; `st2 up` never calls it automatically.
+    /// Account-selecting commands should instead declare trust in the selected harness invocation.
     Pretrust {
         /// Workspace directories to mark trusted.
         #[arg(required = true)]
@@ -934,7 +933,7 @@ fn env_cmd(root: &Path) -> Result<()> {
 fn pretrust_cmd(dirs: &[PathBuf]) -> Result<()> {
     let n = st2::pretrust::pretrust(dirs)?;
     println!(
-        "pre-trusted {n} workspace{} in the claude config",
+        "pre-trusted {n} workspace{} in the ambient Claude and Codex configs",
         if n == 1 { "" } else { "s" }
     );
     Ok(())
