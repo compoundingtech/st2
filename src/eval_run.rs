@@ -1149,6 +1149,11 @@ mod tests {
         ];
         assert!(!run_declarative(&mismatches[..1], cat.path()).0);
         assert!(!run_declarative(&mismatches[1..], cat.path()).0);
+        std::fs::write(cat.path().join("worker/malformed.json"), "{").unwrap();
+        let malformed = [Check::JsonField { path: "worker/malformed.json".into(), field: "n".into(), value: crate::eval_spec::JsonScalar::Integer(1) }];
+        let missing_json = [Check::JsonField { path: "worker/missing.json".into(), field: "n".into(), value: crate::eval_spec::JsonScalar::Integer(1) }];
+        assert!(!run_declarative(&malformed, cat.path()).0);
+        assert!(!run_declarative(&missing_json, cat.path()).0);
         // FileHas on a missing file fails.
         let missing = [Check::FileHas { path: "worker/NOPE".into(), text: "x".into() }];
         assert!(!run_declarative(&missing, cat.path()).0);
