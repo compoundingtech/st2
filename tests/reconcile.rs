@@ -68,6 +68,11 @@ fn selected_reconcile_action_ids_are_exact_and_refusals_immutable() {
     assert!(reconcile_selected(&specs,&sessions,"host","host.a.missing").is_err()); assert_eq!((specs,sessions),before);
 }
 
+#[test] fn selected_dead_non_keep_gc_and_relaunch_only_selected() { let specs=vec![svc("a",None,vec![task(TaskKind::Exec,"x",None,Some("a")),task(TaskKind::Exec,"y",None,Some("b"))]),svc("b",None,vec![task(TaskKind::Exec,"z",None,Some("c"))])]; let p=reconcile_selected(&specs,&[Session{pty_id:"host.a.x".into(),alive:false,exit_code:Some(1)},Session{pty_id:"host.a.y".into(),alive:false,exit_code:Some(1)},Session{pty_id:"host.b.z".into(),alive:false,exit_code:Some(1)}],"host","host.a.x").unwrap(); assert_eq!(p.gc,vec!["host.a.x"]); assert_eq!(p.launch[0].tasks[0].pty_id,"host.a.x"); }
+#[test] fn selected_retired_live_tears_down_only_selected() { let mut s=svc("a",None,vec![task(TaskKind::Exec,"x",None,Some("a"))]); s.retired=true; let specs=[s]; let p=reconcile_selected(&specs,&[live("host.a.x"),live("host.a.other")],"host","host.a.x").unwrap(); assert_eq!(p.teardown[0].pty_ids,vec!["host.a.x"]); assert!(p.launch.is_empty()&&p.gc.is_empty()); }
+#[test] fn selected_refusals_ambiguous_and_unknown_preserve_inputs() { let specs=vec![svc("a",None,vec![task(TaskKind::Exec,"x",Some("dup"),Some("a"))]),svc("b",None,vec![task(TaskKind::Exec,"y",Some("dup"),Some("b"))])]; let sessions=vec![live("dup")]; let before=(specs.clone(),sessions.clone()); assert!(reconcile_selected(&specs,&sessions,"host","dup").is_err()); assert!(reconcile_selected(&specs,&sessions,"host","none").is_err()); assert_eq!((specs,sessions),before); }
+#[test] fn selected_unrunnable_is_runner_action_free() { let specs=vec![svc("a",None,vec![task(TaskKind::Exec,"x",None,None)])]; let before=specs.clone(); let p=reconcile_selected(&specs,&[],"host","host.a.x").unwrap(); assert!(p.launch.is_empty()&&p.gc.is_empty()&&p.teardown.is_empty()); assert_eq!(specs,before); }
+
 #[test]
 fn selector_rejects_duplicate_explicit_and_runtime_collision() {
     let dup = vec![svc("a", None, vec![task(TaskKind::Exec, "x", Some("dup"), Some("a"))]), svc("b", None, vec![task(TaskKind::Exec, "y", Some("dup"), Some("b"))])];
