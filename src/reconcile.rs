@@ -100,14 +100,15 @@ pub fn resolve_task<'a>(specs: &'a [AgentSpec], selector: &str, this_host: &str)
 
 /// Pure task-scoped plan: resolve first, then retain only the selected runtime target.
 pub fn reconcile_selected<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &str, selector: &str) -> anyhow::Result<ReconcilePlan<'a>> {
-    let (owner, _, runtime) = resolve_task(specs, selector, this_host)?;
-    let scoped_sessions: Vec<_> = sessions.iter().filter(|s| s.pty_id == runtime).cloned().collect();
-    let mut plan = reconcile(specs, &scoped_sessions, this_host);
-    plan.launch.retain_mut(|launch| { launch.tasks.retain(|t| t.pty_id == runtime); !launch.tasks.is_empty() });
-    plan.teardown.retain(|t| t.pty_ids.iter().any(|id| id == &runtime));
-    plan.gc.retain(|id| id == &runtime);
-    plan.adopt.retain(|spec| spec.tasks.iter().any(|t| t.id.as_deref() == Some(&runtime) || format!("{}.{}", spec.bus_id(this_host), t.name) == runtime));
-    if scoped_sessions.iter().any(|s| s.alive) && plan.launch.is_empty() && !plan.adopt.iter().any(|s| std::ptr::eq(*s, owner)) { plan.adopt.push(owner); }
+    let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
+    let mut plan = ReconcilePlan::default();
+    let actual = sessions.iter().find(|s| s.pty_id == runtime);
+    if owner.retired { if let Some(s) = actual { if s.alive { plan.teardown.push(Teardown { spec: owner, pty_ids: vec![runtime] }); } else if !owner.keep { plan.gc.push(runtime); } } return Ok(plan); }
+    let Some(command) = task.command.clone() else { plan.unrunnable.push(owner); return Ok(plan); };
+    let bus_id = owner.bus_id(this_host); let mut env = task.env.clone();
+    if let Some(supervisor) = &owner.supervisor { env.insert("ST_SUPERVISOR".into(), supervisor.clone()); } else { env.remove("ST_SUPERVISOR"); }
+    let target = TaskTarget { kind: task.kind, pty_id: runtime.clone(), bus_id, name: task.name.clone(), command, cwd: task.cwd.clone(), workspace: owner.workspace.clone(), tags: task.tags.clone(), env, keep: task.keep || owner.keep };
+    match actual { Some(s) if s.alive || (s.exit_code.is_none() && target.keep) => plan.adopt.push(owner), Some(_) if !target.keep => { plan.gc.push(runtime); plan.launch.push(Launch { spec: owner, tasks: vec![target] }); }, _ => plan.launch.push(Launch { spec: owner, tasks: vec![target] }) }
     Ok(plan)
 }
 
