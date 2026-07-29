@@ -459,9 +459,9 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         return Ok(Vec::new());
     }
     if plan.references_variable("ST_HOOKS") {
-        crate::hooks::verify_installed().with_context(|| {
+        crate::hooks::verify_required_set().with_context(|| {
             format!(
-                "agent '{}' render plan references $ST_HOOKS, but the lifecycle hook receipt is not verified",
+                "agent '{}' render plan references $ST_HOOKS, but this binary's lifecycle hook set is not verified",
                 spec.identity
             )
         })?;

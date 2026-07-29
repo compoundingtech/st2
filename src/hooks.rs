@@ -52,6 +52,8 @@ struct InstallReceipt {
     st2_version: String,
     st2_git_sha: String,
     source_commit_unix: u64,
+    #[serde(default)]
+    source_dirty: bool,
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -80,11 +82,13 @@ fn expected_manifest() -> HookManifest {
 }
 
 fn expected_receipt() -> InstallReceipt {
+    let identity = crate::version::build_identity();
     InstallReceipt {
         manifest: expected_manifest(),
-        st2_version: env!("CARGO_PKG_VERSION").to_string(),
-        st2_git_sha: env!("ST2_GIT_SHA_FULL").to_string(),
-        source_commit_unix: env!("ST2_GIT_COMMIT_UNIX").parse().unwrap_or(0),
+        st2_version: identity.version,
+        st2_git_sha: identity.rev,
+        source_commit_unix: identity.commit_unix,
+        source_dirty: identity.dirty,
     }
 }
 
@@ -176,15 +180,7 @@ fn receipt_bytes(receipt: &InstallReceipt) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn verify_set(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
-    let expected = expected_manifest();
-    if manifest != &expected {
-        anyhow::bail!(
-            "active hook receipt selects '{}', but this st2 requires '{}'",
-            manifest.hookset,
-            expected.hookset
-        );
-    }
+fn verify_set_contents(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
     let dir = root.join(&manifest.directory);
     let manifest_path = dir.join(SET_MANIFEST_FILE);
     let installed_manifest = fs::read(&manifest_path)
@@ -210,6 +206,18 @@ fn verify_set(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn verify_selected_set(root: &Path, manifest: &HookManifest) -> Result<PathBuf> {
+    let required = expected_manifest();
+    if manifest != &required {
+        anyhow::bail!(
+            "active hook receipt selects '{}', but this st2 requires '{}'",
+            manifest.hookset,
+            required.hookset
+        );
+    }
+    verify_set_contents(root, manifest)
+}
+
 /// Verify that the atomic receipt selects this binary's complete, byte-exact hook set.
 /// This function is read-only.
 pub fn verify_installed() -> Result<PathBuf> {
@@ -219,7 +227,17 @@ pub fn verify_installed() -> Result<PathBuf> {
 /// Read-only verification beneath an explicit hook root.
 pub fn verify_installed_at(root: &Path) -> Result<PathBuf> {
     let receipt = read_receipt(root)?;
-    verify_set(root, &receipt.manifest)
+    verify_selected_set(root, &receipt.manifest)
+}
+
+/// Verify this binary's immutable set without requiring it to remain globally selected.
+pub fn verify_required_set() -> Result<PathBuf> {
+    verify_required_set_at(&hooks_root()?)
+}
+
+/// Read-only verification of this binary's immutable set beneath an explicit root.
+pub fn verify_required_set_at(root: &Path) -> Result<PathBuf> {
+    verify_set_contents(root, &expected_manifest())
 }
 
 fn numeric_version(version: &str) -> Option<Vec<u64>> {
@@ -239,7 +257,7 @@ fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
 fn check_replacement(
     current: &InstallReceipt,
     candidate: &InstallReceipt,
-    allow_downgrade: bool,
+    replace: bool,
 ) -> Result<()> {
     if current.manifest.hookset == candidate.manifest.hookset {
         return Ok(());
@@ -252,7 +270,7 @@ fn check_replacement(
                     .cmp(&candidate.source_commit_unix)
             })
         });
-    if allow_downgrade || source_order == Some(Ordering::Less) {
+    if replace || source_order == Some(Ordering::Less) {
         return Ok(());
     }
     let reason = match source_order {
@@ -263,7 +281,7 @@ fn check_replacement(
     };
     anyhow::bail!(
         "refusing to replace hook set '{}' with '{}' because {reason}; \
-         rerun with --allow-downgrade only for an intentional rollback",
+         rerun with --replace to intentionally select this binary's exact hook set",
         current.manifest.hookset,
         candidate.manifest.hookset
     )
@@ -279,7 +297,7 @@ fn write_set(root: &Path, receipt: &InstallReceipt) -> Result<PathBuf> {
     fs::create_dir_all(&sets).with_context(|| format!("creating {}", sets.display()))?;
     let final_dir = root.join(&receipt.manifest.directory);
     if final_dir.exists() {
-        return verify_set(root, &receipt.manifest).with_context(|| {
+        return verify_set_contents(root, &receipt.manifest).with_context(|| {
             format!(
                 "refusing to replace corrupt immutable hook set {}",
                 final_dir.display()
@@ -313,7 +331,7 @@ fn write_set(root: &Path, receipt: &InstallReceipt) -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&tmp);
     }
     result?;
-    verify_set(root, &receipt.manifest)
+    verify_set_contents(root, &receipt.manifest)
 }
 
 fn write_receipt(root: &Path, receipt: &InstallReceipt) -> Result<()> {
@@ -330,25 +348,29 @@ fn write_receipt(root: &Path, receipt: &InstallReceipt) -> Result<()> {
 }
 
 /// Explicitly publish this binary's immutable hook set and atomically select it.
-pub fn install(allow_downgrade: bool) -> Result<PathBuf> {
-    install_at(&hooks_root()?, allow_downgrade)
+pub fn install(replace: bool) -> Result<PathBuf> {
+    install_at(&hooks_root()?, replace)
 }
 
 /// Explicit installer beneath a provided root. Ordinary `up` and materialization paths never call it.
-pub fn install_at(root: &Path, allow_downgrade: bool) -> Result<PathBuf> {
+pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
     fs::create_dir_all(root).with_context(|| format!("creating hook root {}", root.display()))?;
     let candidate = expected_receipt();
     match read_receipt(root) {
         Ok(current) => {
-            check_replacement(&current, &candidate, allow_downgrade)?;
+            check_replacement(&current, &candidate, replace)?;
             if current.manifest.hookset == candidate.manifest.hookset {
-                return verify_set(root, &current.manifest);
+                let dir = verify_set_contents(root, &current.manifest)?;
+                if current != candidate {
+                    write_receipt(root, &candidate)?;
+                    verify_installed_at(root)?;
+                }
+                return Ok(dir);
             }
         }
-        Err(error) if receipt_path(root).exists() && !allow_downgrade => {
-            return Err(error).context(
-                "refusing to replace an unreadable hook receipt without --allow-downgrade",
-            );
+        Err(error) if receipt_path(root).exists() && !replace => {
+            return Err(error)
+                .context("refusing to replace an unreadable hook receipt without --replace");
         }
         Err(_) => {}
     }
@@ -397,6 +419,46 @@ mod tests {
     }
 
     #[test]
+    fn receipts_without_dirty_provenance_remain_readable() {
+        let mut legacy = serde_json::to_value(expected_receipt()).unwrap();
+        legacy.as_object_mut().unwrap().remove("sourceDirty");
+        let parsed: InstallReceipt = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.source_dirty);
+    }
+
+    #[test]
+    fn same_hookset_reinstall_refreshes_build_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let selected = install_at(tmp.path(), false).unwrap();
+        let mut stale = expected_receipt();
+        stale.st2_version = "0.0.0-stale".into();
+        stale.st2_git_sha = "stale".into();
+        stale.source_commit_unix = 0;
+        stale.source_dirty = !stale.source_dirty;
+        fs::write(receipt_path(tmp.path()), receipt_bytes(&stale).unwrap()).unwrap();
+
+        assert_eq!(install_at(tmp.path(), false).unwrap(), selected);
+        assert_eq!(read_receipt(tmp.path()).unwrap(), expected_receipt());
+    }
+
+    #[test]
+    fn required_set_verification_survives_selection_by_another_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let required = install_at(tmp.path(), false).unwrap();
+        let mut successor = expected_receipt();
+        successor.manifest.hookset = "sha256-successor".into();
+        successor.manifest.directory = "sets/sha256-successor".into();
+        fs::write(
+            receipt_path(tmp.path()),
+            receipt_bytes(&successor).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(verify_required_set_at(tmp.path()).unwrap(), required);
+        assert!(verify_installed_at(tmp.path()).is_err());
+    }
+
+    #[test]
     fn verification_rejects_missing_stale_partial_and_mismatched_state() {
         let missing = tempfile::tempdir().unwrap();
         assert!(verify_installed_at(missing.path()).is_err());
@@ -429,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_binary_needs_explicit_downgrade_authority() {
+    fn an_older_binary_needs_explicit_replacement_authority() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path()).unwrap();
         let mut newer = expected_receipt();
@@ -439,7 +501,7 @@ mod tests {
         fs::write(receipt_path(tmp.path()), receipt_bytes(&newer).unwrap()).unwrap();
 
         let error = install_at(tmp.path(), false).unwrap_err().to_string();
-        assert!(error.contains("--allow-downgrade"), "{error}");
+        assert!(error.contains("--replace"), "{error}");
         assert!(install_at(tmp.path(), true).is_ok());
         assert_eq!(
             read_receipt(tmp.path()).unwrap().manifest.hookset,

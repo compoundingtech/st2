@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # st2 Claude StopFailure hook: surface infrastructure wedges through presence and, when declared,
 # the agent's supervisor inbox. Fail-open; lifecycle reporting must never wedge the harness.
 

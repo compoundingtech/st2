@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # st2 Claude SessionStart hook. Claude treats exit 2 + stderr as a model-visible reminder; the hook
 # restores fresh durable context before that reminder. Missing state remains a valid cold start.
 
