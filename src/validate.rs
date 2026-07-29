@@ -473,8 +473,13 @@ fn shell_words(input: &str) -> Result<Vec<String>, &'static str> {
                     let Some(escaped) = chars.next() else {
                         return Err("command ends with an incomplete escape");
                     };
-                    if escaped != '\n' {
-                        word.push(escaped);
+                    match escaped {
+                        '\n' => {}
+                        '$' | '`' | '"' | '\\' => word.push(escaped),
+                        _ => {
+                            word.push('\\');
+                            word.push(escaped);
+                        }
                     }
                 }
                 _ => word.push(ch),
@@ -728,4 +733,43 @@ fn overlay_lint(rp: &str, ag: &Option<String>, s: &AgentSpec) -> Vec<Issue> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn double_quote_decoding_matches_a_real_posix_shell() {
+        let source = r#""special:\$:\`:\":\\:" "non-special:\q:\a" -c "projects={\"/tmp/a\\\\b\"={trust_level=\"trusted\"}}""#;
+        let decoded = shell_words(source).unwrap();
+
+        let script = format!("set -- {source}; printf '%s\\0' \"$@\"");
+        let output = Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh is available");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Vec<String> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|word| !word.is_empty())
+            .map(|word| String::from_utf8(word.to_vec()).unwrap())
+            .collect();
+        assert_eq!(decoded, actual);
+        assert_eq!(decoded[0], "special:$:`:\":\\:");
+        assert_eq!(decoded[1], r"non-special:\q:\a");
+
+        let command = format!("exec codex {source}");
+        assert_eq!(
+            codex_project_trust_error(&command, "/tmp/a\\b"),
+            None,
+            "the shell-decoded TOML key must match the declared workspace"
+        );
+    }
 }

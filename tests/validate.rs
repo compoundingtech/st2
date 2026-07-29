@@ -232,11 +232,7 @@ fn codex_project_trust_is_structural_and_remains_fleet_wide_under_host_scope() {
     );
     let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
     let report = validate_for_host(c.path(), "Silber");
-    assert!(has(
-        &report,
-        "codex-project-trust",
-        Severity::Error
-    ));
+    assert!(has(&report, "codex-project-trust", Severity::Error));
     assert_eq!(
         report.warnings(),
         0,

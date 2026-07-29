@@ -13,7 +13,7 @@ The examples use `<host>`, `<identity>`, and `<workspace>` placeholders. st2 pro
 machine-specific install paths. Copy the appropriate file into
 `<catalog>/agents/<host>/<identity>/agent.kdl`, replace every placeholder, and add the referenced
 catalog-owned templates. `role` is optional metadata; `supervisor` is optional runtime routing.
-Uncomment them when the seat has an assigned role or reports to another bus identity. In the Codex
+Uncomment them when the agent has an assigned role or reports to another bus identity. In the Codex
 declaration, replacing `<workspace>` in both places keeps its command-local project trust key
 byte-identical to the declared workspace.
 
