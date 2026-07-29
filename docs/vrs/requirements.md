@@ -85,3 +85,9 @@ accepted.
   head/tail coalescing: immediate head response, one quiet tail, and a hard
   maximum preventing starvation or unbounded scans, PTY queries, launches,
   delivery attempts, or writes.
+
+- **R16 Supervisor declaration:** Every non-root agent declares exactly one
+  supervisor; root is the only agent without a supervisor.
+- **R17 Durable error propagation:** Lifecycle, harness/eval, provider-turn,
+  task/exec/PTY, hook, and delivery errors are durably reported to the
+  responsible supervisor with agent/task identity and actionable context.
