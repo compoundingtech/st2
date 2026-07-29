@@ -1288,6 +1288,7 @@ pub fn detect_host() -> String {
 mod tests {
     use super::*;
     use crate::spec::{AgentSpec, JobType, Task, TaskKind};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
@@ -1306,43 +1307,63 @@ mod tests {
         }
     }
 
-    struct EmptyRunner;
+    struct GateRunner {
+        list_calls: Cell<usize>,
+    }
 
-    impl Runner for EmptyRunner {
+    impl Runner for GateRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            self.list_calls.set(self.list_calls.get() + 1);
             Ok(Vec::new())
         }
 
         fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot launch")
+            panic!("gate runner must not spawn")
         }
 
         fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot kill")
+            panic!("gate runner must not kill")
         }
 
         fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot remove")
+            panic!("gate runner must not remove")
         }
     }
 
     #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
-            identity: "codex".into(), host: None, role: None, job_type: JobType::Service,
-            workspace: None, supervisor: None, retired: false, keep: false, restart: None,
-            tasks: vec![Task { kind: TaskKind::Pty, derived: false, name: "agent".into(),
-                id: Some("test.codex.agent".into()), command: Some("codex --version".into()),
-                cwd: None, tags: BTreeMap::new(), env: BTreeMap::new(), keep: false }],
+            identity: "codex".into(),
+            host: None,
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            retired: false,
+            keep: false,
+            restart: None,
+            tasks: vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: Some("test.codex.agent".into()),
+                command: Some("codex --version".into()),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+            }],
             path: "/tmp/spec.kdl".into(),
         };
+        let runner = GateRunner { list_calls: Cell::new(0) };
         let report = up_once_selected_specs_with_gates(
-            Path::new("/tmp"), &[spec], "test.codex.agent", "test", &EmptyRunner,
+            Path::new("/tmp"), &[spec], "test.codex.agent", "test", &runner,
             || anyhow::bail!("stale receipt"),
-            |_| anyhow::bail!("must not pretrust"),
+            |_| panic!("pretrust must not run"),
         ).unwrap();
+        assert_eq!(runner.list_calls.get(), 1);
         assert!(report.launched.is_empty());
-        assert!(report.errors.iter().any(|e| e.contains("launch suppressed")));
+        assert!(report.errors.iter().any(|e| e.contains("stale receipt") && e.contains("launch suppressed")));
     }
 
     #[cfg(target_os = "linux")]
