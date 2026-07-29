@@ -76,6 +76,15 @@ fn task_selector_materializes_only_owning_agent() {
 }
 
 #[test]
+fn task_selector_ambiguous_refuses_without_mutation() {
+    let tmp = tempfile::tempdir().unwrap(); let catalog=tmp.path().join("catalog"); let a=tmp.path().join("a"); let b=tmp.path().join("b"); fs::create_dir_all(&a).unwrap(); fs::create_dir_all(&b).unwrap();
+    let kdl = |id:&str, ws:&Path, marker:&str| format!("agent \"{id}\" {{\n host \"Silber\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{\n  id \"dup\"\n  command \"true\"\n }}\n render {{ file \"MARKER.txt\" \"{marker}\" }}\n}}\n", ws.display());
+    write(&catalog.join("agents/Silber/a/agent.kdl"), kdl("a",&a,"a")); write(&catalog.join("agents/Silber/b/agent.kdl"), kdl("b",&b,"b"));
+    let found=st2::discover(&catalog); assert!(found.errors.is_empty(), "{:?}", found.errors); assert_eq!(found.specs.len(),2); assert!(found.specs.iter().all(|s| s.tasks.len()==1 && s.tasks[0].id.as_deref()==Some("dup")));
+    let out=Command::new(env!("CARGO_BIN_EXE_st2")).args(["up","--catalog"]).arg(&catalog).args(["--host","Silber","--materialize-only","--task","dup"]).output().unwrap(); assert!(!out.status.success()); assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous")); assert!(!a.join("MARKER.txt").exists()&&!b.join("MARKER.txt").exists());
+}
+
+#[test]
 fn task_selector_cli_modes_fail_closed() {
     let tmp = tempfile::tempdir().unwrap();
     for args in [
