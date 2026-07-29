@@ -534,9 +534,15 @@ fn main() -> Result<()> {
             task,
         } => {
             let root = catalog_arg(root)?;
-            if task.is_some() && once { anyhow::bail!("--task --once is deferred until selected reconcile support"); }
-            if task.is_some() && !materialize_only { anyhow::bail!("--task requires --materialize-only in this stage"); }
-            if agent.is_some() && !materialize_only { anyhow::bail!("--agent requires --materialize-only"); }
+            if task.is_some() && once {
+                anyhow::bail!("--task --once is deferred until selected reconcile support");
+            }
+            if task.is_some() && !materialize_only {
+                anyhow::bail!("--task requires --materialize-only in this stage");
+            }
+            if agent.is_some() && !materialize_only {
+                anyhow::bail!("--agent requires --materialize-only");
+            }
             up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
@@ -591,7 +597,12 @@ fn main() -> Result<()> {
             env_cmd(&root)
         }
         Command::Pretrust { dirs } => pretrust_cmd(&dirs),
-        Command::Eval { folder, host, keep, json } => eval_cmd(&folder, host, keep, json),
+        Command::Eval {
+            folder,
+            host,
+            keep,
+            json,
+        } => eval_cmd(&folder, host, keep, json),
         Command::Validate {
             root,
             host,
@@ -719,12 +730,18 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
         )
     })?;
     let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
-    if json { unsafe { std::env::set_var("ST2_EVAL_JSON", "1"); } }
+    if json {
+        unsafe {
+            std::env::set_var("ST2_EVAL_JSON", "1");
+        }
+    }
     let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        if report.passed() { return Ok(()); }
+        if report.passed() {
+            return Ok(());
+        }
         anyhow::bail!("VERDICT: FAIL")
     }
 
@@ -1749,8 +1766,11 @@ fn up(
         let mut found = discover(&catalog_root);
         if let Some(selector) = task.as_deref() {
             let (owner, _, _) = st2::reconcile::resolve_task(&found.specs, selector, &this_host)?;
-            let owner_identity = owner.identity.clone(); let owner_path = owner.path.clone();
-            found.specs.retain(|spec| spec.identity == owner_identity && spec.path == owner_path);
+            let owner_identity = owner.identity.clone();
+            let owner_path = owner.path.clone();
+            found
+                .specs
+                .retain(|spec| spec.identity == owner_identity && spec.path == owner_path);
         }
         if let Some(identity) = agent.as_deref() {
             found

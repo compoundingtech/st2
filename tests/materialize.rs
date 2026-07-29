@@ -194,6 +194,27 @@ fn task_selector_cli_modes_fail_closed() {
     }
 }
 
+#[test]
+fn task_selector_single_file_modes_refuse_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = tmp.path().join("spec.kdl");
+    fs::write(&spec, "agent \"a\" { host \"Silber\" command \"true\" }\n").unwrap();
+    let before = fs::read_to_string(&spec).unwrap();
+    for extra in [
+        ["--materialize-only", "--task", "Silber.a.agent"],
+        ["--once", "--task", "Silber.a.agent"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["up", spec.to_str().unwrap()])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+    }
+    assert_eq!(fs::read_to_string(&spec).unwrap(), before);
+}
+
 fn spec(catalog: &Path, identity: &str) -> AgentSpec {
     discover(catalog)
         .specs
