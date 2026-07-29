@@ -110,7 +110,8 @@ pub struct Declared {
 /// Read the declared (pre-lowering) values of every agent in a file — one per `agent` node for KDL,
 /// 0-or-1 for TOML/JSON, empty for a non-spec extension.
 ///
-/// Order matches [`discover`]'s specs for the same file, so a caller can pair them up positionally.
+/// One entry per parsed node, *including* nodes [`discover`] skips as non-specs, so this is not
+/// positionally paired with that file's [`Discovered::specs`].
 pub fn parse_declared(path: &Path) -> anyhow::Result<Vec<Declared>> {
     Ok(parse_raw_file(path)?
         .into_iter()
