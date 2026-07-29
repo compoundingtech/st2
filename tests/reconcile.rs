@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use st2::spec::{AgentSpec, JobType, Task, TaskKind};
 use st2::{Session, reconcile};
 use st2::reconcile::resolve_task;
+use st2::reconcile::reconcile_selected;
 
 #[test]
 fn exact_task_selector_matrix() {
@@ -41,6 +42,14 @@ fn selector_agent_command_runtime_id_and_inputs_immutable() {
     let before = s.clone(); let (o,t,id)=resolve_task(&s, "host.agent", "host").unwrap();
     assert_eq!((o.identity.as_str(),t.name.as_str(),t.command.as_deref(),id.as_str()), ("agent","agent",Some("run"),"host.agent")); assert_eq!(s,before);
     assert!(resolve_task(&s, "host.missing", "host").is_err()); assert_eq!(s,before);
+}
+
+#[test]
+fn selected_reconcile_launches_missing_and_adopts_live_without_siblings() {
+    let specs = vec![svc("a", None, vec![task(TaskKind::Exec, "x", None, Some("a")), task(TaskKind::Exec, "y", None, Some("b"))]), svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))])];
+    let plan = reconcile_selected(&specs, &[], "host", "host.a.x").unwrap();
+    assert_eq!(plan.launch.len(), 1); assert_eq!(plan.launch[0].tasks.len(), 1); assert_eq!(plan.launch[0].tasks[0].pty_id, "host.a.x");
+    let plan2 = reconcile_selected(&specs, &[live("host.a.x")], "host", "host.a.x").unwrap(); assert!(plan2.launch.is_empty()); assert_eq!(plan2.adopt.len(), 1);
 }
 
 #[test]
