@@ -65,6 +65,9 @@ enum Command {
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
     #[command(subcommand)]
     Message(MessageCmd),
+    /// EXPERIMENTAL: content-addressed Agent Spec catalog operations. Every result is JSON.
+    #[command(subcommand)]
+    Catalog(CatalogCmd),
     /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
@@ -332,6 +335,56 @@ enum HooksCmd {
 }
 
 #[derive(Subcommand)]
+enum CatalogCmd {
+    /// Parse and persist exact Agent Spec bytes without changing any ref or root.
+    Prepare {
+        spec: PathBuf,
+    },
+    /// Stage one immutable ref commit and resource-binding commit without changing the root.
+    Stage {
+        spec: PathBuf,
+        #[arg(long)]
+        manager: String,
+        #[arg(long)]
+        state_relative: PathBuf,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        expected_ref: Option<String>,
+        #[arg(long)]
+        binding_parent: Option<String>,
+    },
+    /// Print the selected immutable catalog root, or JSON null when absent.
+    Head,
+    /// Resolve and verify the complete selected catalog graph.
+    Inspect,
+    /// Import one exact spec, advance its ref and resource binding, then admit it atomically.
+    Publish {
+        spec: PathBuf,
+        #[arg(long)]
+        manager: String,
+        /// Stable mutable state directory relative to the catalog root.
+        #[arg(long)]
+        state_relative: PathBuf,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        expected_ref: Option<String>,
+        #[arg(long)]
+        expected_root: Option<String>,
+        #[arg(long)]
+        binding_parent: Option<String>,
+    },
+    /// Atomically admit multiple already-published ref/binding pairs from a JSON request.
+    ///
+    /// Request shape: {expectedRoot?, manager, operationId,
+    /// selections:[{refCommit, resourceBindingCommit}]}. Use `-` for stdin.
+    Admit {
+        request: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ResourceCmd {
     /// Link a resource (a URL you produced or reference) into your resource list.
     Add {
@@ -534,6 +587,10 @@ fn main() -> Result<()> {
             up(&root, host, once, materialize_only, interval, agent)
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Catalog(cmd) => {
+            let root = catalog_arg(None)?;
+            catalog_cmd(&root, cmd)
+        }
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
@@ -673,6 +730,206 @@ fn hooks_cmd(command: HooksCmd) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogAdmitRequest {
+    expected_root: Option<String>,
+    manager: String,
+    operation_id: String,
+    selections: Vec<st2::catalog_store::AdmissionSelection>,
+}
+
+struct StagedCatalogSeat {
+    host: String,
+    identity: String,
+    object: String,
+    object_path: PathBuf,
+    ref_commit: String,
+    resource_binding_commit: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn catalog_stage(
+    store: &st2::catalog_store::CatalogStore,
+    spec: &Path,
+    manager: &str,
+    state_relative: &Path,
+    operation_id: &str,
+    expected_ref: Option<&str>,
+    binding_parent: Option<&str>,
+) -> Result<StagedCatalogSeat> {
+    let bytes = std::fs::read(spec)
+        .with_context(|| format!("reading Agent Spec {}", spec.display()))?;
+    let prepared = store.prepare(&bytes)?;
+    let object_path = store.import(&prepared)?;
+    let spec_ref = store.compare_and_set_ref(
+        &prepared.host,
+        &prepared.identity,
+        expected_ref,
+        manager,
+        Some(&prepared.object),
+        &format!("{operation_id}:ref"),
+    )?;
+    let binding = store.commit_resource_binding(
+        binding_parent,
+        &prepared.host,
+        &prepared.identity,
+        manager,
+        state_relative,
+        &format!("{operation_id}:binding"),
+    )?;
+    Ok(StagedCatalogSeat {
+        host: prepared.host,
+        identity: prepared.identity,
+        object: prepared.object,
+        object_path,
+        ref_commit: spec_ref.commit,
+        resource_binding_commit: binding.commit,
+    })
+}
+
+fn catalog_cmd(root: &Path, command: CatalogCmd) -> Result<()> {
+    use st2::catalog_store::{AdmissionSelection, CatalogStore};
+
+    let store = CatalogStore::new(root);
+    let value = match command {
+        CatalogCmd::Prepare { spec } => {
+            let bytes = std::fs::read(&spec)
+                .with_context(|| format!("reading Agent Spec {}", spec.display()))?;
+            let prepared = store.prepare(&bytes)?;
+            let object_path = store.import(&prepared)?;
+            serde_json::json!({
+                "experimental": true,
+                "object": prepared.object,
+                "objectPath": object_path,
+                "host": prepared.host,
+                "identity": prepared.identity,
+                "bytes": bytes.len(),
+            })
+        }
+        CatalogCmd::Stage {
+            spec,
+            manager,
+            state_relative,
+            operation_id,
+            expected_ref,
+            binding_parent,
+        } => {
+            let staged = catalog_stage(
+                &store,
+                &spec,
+                &manager,
+                &state_relative,
+                &operation_id,
+                expected_ref.as_deref(),
+                binding_parent.as_deref(),
+            )?;
+            serde_json::json!({
+                "experimental": true,
+                "host": staged.host,
+                "identity": staged.identity,
+                "object": staged.object,
+                "objectPath": staged.object_path,
+                "refCommit": staged.ref_commit,
+                "resourceBindingCommit": staged.resource_binding_commit,
+                "rootChanged": false,
+            })
+        }
+        CatalogCmd::Head => match store.read_root()? {
+            Some(root) => serde_json::json!({
+                "experimental": true,
+                "commit": root.commit,
+                "value": root.value,
+            }),
+            None => serde_json::Value::Null,
+        },
+        CatalogCmd::Inspect => {
+            let snapshot = store.inspect_snapshot()?;
+            let (root, seats) = match snapshot {
+                Some(snapshot) => (Some(snapshot.0), snapshot.1),
+                None => (None, Vec::new()),
+            };
+            serde_json::json!({
+                "experimental": true,
+                "rootCommit": root.as_ref().map(|root| &root.commit),
+                "manager": root.as_ref().map(|root| &root.value.manager),
+                "seats": seats.into_iter().map(|seat| serde_json::json!({
+                    "busId": seat.spec.bus_id(""),
+                    "admission": seat.admission,
+                    "refCommit": seat.ref_commit,
+                    "resourceBindingCommit": seat.resource_binding_commit,
+                    "specObject": seat.spec_object,
+                    "sourcePath": seat.spec.path,
+                    "agentDir": seat.spec.agent_dir,
+                })).collect::<Vec<_>>(),
+            })
+        }
+        CatalogCmd::Publish {
+            spec,
+            manager,
+            state_relative,
+            operation_id,
+            expected_ref,
+            expected_root,
+            binding_parent,
+        } => {
+            let staged = catalog_stage(
+                &store,
+                &spec,
+                &manager,
+                &state_relative,
+                &operation_id,
+                expected_ref.as_deref(),
+                binding_parent.as_deref(),
+            )?;
+            let root_commit = store.admit(
+                expected_root.as_deref(),
+                &manager,
+                AdmissionSelection {
+                    ref_commit: staged.ref_commit.clone(),
+                    resource_binding_commit: staged.resource_binding_commit.clone(),
+                },
+                &format!("{operation_id}:root"),
+            )?;
+            serde_json::json!({
+                "experimental": true,
+                "host": staged.host,
+                "identity": staged.identity,
+                "object": staged.object,
+                "objectPath": staged.object_path,
+                "refCommit": staged.ref_commit,
+                "resourceBindingCommit": staged.resource_binding_commit,
+                "rootCommit": root_commit.commit,
+            })
+        }
+        CatalogCmd::Admit { request } => {
+            let bytes = if request == Path::new("-") {
+                use std::io::Read as _;
+                let mut bytes = Vec::new();
+                std::io::stdin().read_to_end(&mut bytes)?;
+                bytes
+            } else {
+                std::fs::read(&request)
+                    .with_context(|| format!("reading admission request {}", request.display()))?
+            };
+            let request: CatalogAdmitRequest = serde_json::from_slice(&bytes)?;
+            let root_commit = store.admit_many(
+                request.expected_root.as_deref(),
+                &request.manager,
+                &request.selections,
+                &request.operation_id,
+            )?;
+            serde_json::json!({
+                "experimental": true,
+                "rootCommit": root_commit.commit,
+                "seats": root_commit.value.admissions.len(),
+            })
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
@@ -1039,24 +1296,22 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 "session dead/missing",
             );
         }
-        if let Some(dir) = spec.path.parent() {
-            let path = st2::status::status_path(dir);
-            if !path.is_file() {
-                report_check(
-                    &mut problems,
-                    false,
-                    &format!("{bus_id} presence missing"),
-                    "no status file — is its ding refreshing?",
-                );
-            } else {
-                let state = st2::status::read_state(&path);
-                report_check(
-                    &mut problems,
-                    state != st2::status::State::Unknown,
-                    &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
-                    "rotted to `unknown` — is its ding refreshing?",
-                );
-            }
+        let path = st2::status::status_path(&spec.agent_dir);
+        if !path.is_file() {
+            report_check(
+                &mut problems,
+                false,
+                &format!("{bus_id} presence missing"),
+                "no status file — is its ding refreshing?",
+            );
+        } else {
+            let state = st2::status::read_state(&path);
+            report_check(
+                &mut problems,
+                state != st2::status::State::Unknown,
+                &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
+                "rotted to `unknown` — is its ding refreshing?",
+            );
         }
     }
 

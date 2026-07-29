@@ -595,7 +595,7 @@ pub fn execute(
     }
 
     for launch in &plan.launch {
-        let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
+        let spec_dir = &launch.spec.agent_dir;
         let policy = launch.spec.restart_policy();
         for target in &launch.tasks {
             let now = Instant::now();
@@ -842,7 +842,7 @@ fn gate_codex_launches<'a, V, F>(
         }) else {
             continue;
         };
-        let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
+        let spec_dir = &launch.spec.agent_dir;
         let workspace = resolve_task_cwd(agent, spec_dir, catalog_root);
         if !workspaces.contains(&workspace) {
             workspaces.push(workspace);
@@ -1335,6 +1335,7 @@ mod tests {
             restart: None,
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
+            agent_dir: std::path::PathBuf::from("/"),
         }
     }
 
