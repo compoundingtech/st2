@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
-use crate::spec::{Restart, RestartMode, parse_duration};
+use agent_spec::spec::{Restart, RestartMode, parse_duration};
 
 /// A parsed st2 spec: a base team (`st2 up` boots this) plus an optional `eval` (`st2 eval` runs it).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -125,14 +125,14 @@ pub fn versioned_hooks_dir_at(root: &Path) -> PathBuf {
 }
 
 /// Whether this host has a Codex agent whose rendered settings and next launch need this hook set.
-pub fn required_by_codex(specs: &[crate::spec::AgentSpec], this_host: &str) -> bool {
+pub fn required_by_codex(specs: &[agent_spec::spec::AgentSpec], this_host: &str) -> bool {
     specs
         .iter()
         .any(|spec| required_by_codex_agent(spec, this_host))
 }
 
 /// Whether one local declaration owns a Codex agent task.
-pub fn required_by_codex_agent(spec: &crate::spec::AgentSpec, this_host: &str) -> bool {
+pub fn required_by_codex_agent(spec: &agent_spec::spec::AgentSpec, this_host: &str) -> bool {
     spec.host.as_deref().is_none_or(|host| host == this_host)
         && spec.tasks.iter().any(|task| {
             task.name == "agent" && task.command.as_deref().is_some_and(command_invokes_codex)

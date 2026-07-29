@@ -87,14 +87,20 @@
               --fish completions-fish
           '';
 
-          # Run the hermetic unit tests plus the real lifecycle-hook integration
-          # test. The remaining integration tests assume facilities the Nix build
-          # sandbox deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`,
-          # live PTY backends, or a systemd `--user` manager. They remain native
-          # gates, while the flake proves that its own packaged hooks execute.
+          # Run the hermetic unit tests plus agent-spec's discovery test and the
+          # real lifecycle-hook integration tests. The remaining root integration
+          # tests assume facilities the Nix build sandbox deliberately lacks:
+          # `/usr/bin/git` on a hardcoded `PATH`, live PTY backends, or a systemd
+          # `--user` manager. They remain native gates, while the flake proves
+          # that its parser and packaged hooks execute.
+          # `--workspace` because the root is a real package: without it cargo
+          # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
+            "--workspace"
             "--lib"
             "--bins"
+            "--test"
+            "discovery"
             "--test"
             "codex_hooks"
             "--test"

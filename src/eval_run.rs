@@ -16,7 +16,7 @@ use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
 use crate::reconcile::reconcile;
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
-use crate::spec::{AgentSpec, JobType, Task, TaskKind};
+use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
 
 macro_rules! eval_log {
     ($($arg:tt)*) => {

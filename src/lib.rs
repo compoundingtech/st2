@@ -8,7 +8,6 @@ pub mod agents;
 pub mod compile_agent;
 pub mod context;
 pub mod ding;
-pub mod discovery;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod exec_backend;
@@ -17,7 +16,6 @@ pub mod flapping;
 pub mod hooks;
 pub mod host_lock;
 pub mod isolate;
-mod kdl_format;
 pub mod materialize;
 pub mod message;
 pub mod pretrust;
@@ -25,13 +23,20 @@ pub mod reconcile;
 pub mod resource;
 pub mod run;
 pub mod service;
-pub mod spec;
 pub mod status;
 pub mod validate;
 pub mod version;
 mod watch;
 
-pub use discovery::{Discovered, SpecError, discover};
+// The declaration model and the catalog walk live in the `agent-spec` crate, so st2 and any other
+// reader of the same catalog share one implementation. Re-exported under their original paths:
+// `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
+pub use agent_spec::{discovery, spec};
+
+pub use agent_spec::discovery::{Discovered, SpecError, discover};
+pub use agent_spec::spec::{
+    AgentSpec, JobType, Restart, RestartMode, Task, TaskKind, parse_duration,
+};
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
@@ -41,4 +46,3 @@ pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
     up_loop, up_loop_specs, up_once, up_once_specs,
 };
-pub use spec::{AgentSpec, JobType, Restart, RestartMode, Task, TaskKind, parse_duration};
