@@ -61,6 +61,14 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
 }
 
 #[test]
+fn selected_reconcile_action_ids_are_exact_and_refusals_immutable() {
+    let specs = vec![svc("a", None, vec![task(TaskKind::Exec,"x",None,Some("a")), task(TaskKind::Exec,"y",None,Some("b"))]), svc("b",None,vec![task(TaskKind::Exec,"z",None,Some("c"))])];
+    let sessions = vec![live("host.a.y"), live("host.b.z")]; let before=(specs.clone(),sessions.clone());
+    let p = reconcile_selected(&specs,&sessions,"host","host.a.x").unwrap(); assert_eq!(p.launch.iter().flat_map(|l|l.tasks.iter().map(|t|t.pty_id.as_str())).collect::<Vec<_>>(), vec!["host.a.x"]); assert!(p.gc.is_empty()&&p.teardown.is_empty());
+    assert!(reconcile_selected(&specs,&sessions,"host","host.a.missing").is_err()); assert_eq!((specs,sessions),before);
+}
+
+#[test]
 fn selector_rejects_duplicate_explicit_and_runtime_collision() {
     let dup = vec![svc("a", None, vec![task(TaskKind::Exec, "x", Some("dup"), Some("a"))]), svc("b", None, vec![task(TaskKind::Exec, "y", Some("dup"), Some("b"))])];
     assert!(resolve_task(&dup, "dup", "host").is_err());
