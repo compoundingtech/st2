@@ -91,3 +91,9 @@ accepted.
 - **R17 Durable error propagation:** Lifecycle, harness/eval, provider-turn,
   task/exec/PTY, hook, and delivery errors are durably reported to the
   responsible supervisor with agent/task identity and actionable context.
+- **R18 Targeted reconciliation:** An exact agent/task selector resolves its
+  identity and pinned host before mutation; unknown, ambiguous, and wrong-host
+  targets refuse before writes, listing, or actions. Materialization, hook
+  gates, PTY inspection, and plan execution are limited to the selected
+  owner/task; unrelated diagnostics remain visible while unrelated workspaces,
+  tasks, and live PTY PID/generation stay unchanged.
