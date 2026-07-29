@@ -534,7 +534,8 @@ fn main() -> Result<()> {
             task,
         } => {
             let root = catalog_arg(root)?;
-            if task.is_some() && !once && !materialize_only { anyhow::bail!("--task requires --once or --materialize-only"); }
+            if task.is_some() && once { anyhow::bail!("--task --once is deferred until selected reconcile support"); }
+            if task.is_some() && !materialize_only { anyhow::bail!("--task requires --materialize-only in this stage"); }
             if agent.is_some() && !materialize_only { anyhow::bail!("--agent requires --materialize-only"); }
             up(&root, host, once, materialize_only, interval, agent, task)
         }
