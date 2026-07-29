@@ -23,10 +23,22 @@ fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
 }
 
 #[test]
+fn task_selector_materializes_only_owning_agent() {
+    let tmp = tempfile::tempdir().unwrap(); let catalog = tmp.path().join("catalog");
+    let owner = tmp.path().join("owner"); let sibling = tmp.path().join("sibling");
+    fs::create_dir_all(&owner).unwrap(); fs::create_dir_all(&sibling).unwrap();
+    write(&catalog.join("agents/Silber/cos/agent.kdl"), agent_kdl(&owner, r#"    copy "_templates/owner" "OWNER.txt""#));
+    write(&catalog.join("agents/Silber/pty/agent.kdl"), agent_kdl(&sibling, r#"    copy "_templates/sibling" "SIBLING.txt""#).replace("agent \"cos\"", "agent \"pty\"").replace("Silber.cos", "Silber.pty"));
+    write(&catalog.join("_templates/owner"), "owner"); write(&catalog.join("_templates/sibling"), "sibling");
+    let out = Command::new(env!("CARGO_BIN_EXE_st2")).args(["up", "--catalog"]).arg(&catalog).args(["--host", "Silber", "--materialize-only", "--task", "Silber.cos.agent"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr)); assert!(owner.join("OWNER.txt").exists()); assert!(!sibling.join("SIBLING.txt").exists());
+}
+
+#[test]
 fn task_selector_cli_modes_fail_closed() {
     let tmp = tempfile::tempdir().unwrap();
     for args in [vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--task", "host.a.x"], vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--once", "--task", "host.a.x"], vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--materialize-only", "--task", "host.a.x", "--agent", "a"], vec!["up", "--catalog", tmp.path().to_str().unwrap(), "--agent", "a"]] {
-        let out=Command::new(env!("CARGO_BIN_EXE_st2")).args(args).output().unwrap(); assert!(!out.status.success());
+        let out=Command::new(env!("CARGO_BIN_EXE_st2")).args(args).output().unwrap(); assert!(!out.status.success()); assert!(!String::from_utf8_lossy(&out.stderr).trim().is_empty());
     }
 }
 
