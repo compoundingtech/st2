@@ -805,6 +805,14 @@ team "mix" {
     }
 
     #[test]
+    fn json_judge_rejects_non_scalar_expected_values() {
+        for value in ["null", "[1]", "{\"x\":1}", "1.5"] {
+            let text = format!("eval {{ judges {{ judge \"j\" {{ json \"x.json\" field \"n\" is {value} }} }} }}");
+            assert!(parse_spec(&text).is_err(), "accepted invalid JSON scalar {value}");
+        }
+    }
+
+    #[test]
     fn parses_a_top_level_host_and_defaults_to_none() {
         // A per-host fleet file declares the logical host at the top. Absent → None (falls back to
         // --host / OS hostname).
