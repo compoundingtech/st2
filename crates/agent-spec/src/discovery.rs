@@ -57,9 +57,9 @@ pub fn discover(root: &Path) -> Discovered {
 /// Whether `path` is in catalog declaration space rather than a known control/runtime namespace.
 ///
 /// A leading dot has no generic meaning: organizational directories such as `.managed` and
-/// `.retired` remain visible. Only the catalog root's `.git`, `.st2`, and `pty` children plus an
-/// actual declaration parent's `resources`, `archive`, and `inbox` children have explicit
-/// non-catalog meaning.
+/// `.retired` remain visible. `.git` and `.st2` control directories at any depth, the catalog root's
+/// `pty` child, and an actual declaration parent's `resources`, `archive`, and `inbox` children have
+/// explicit non-catalog meaning.
 pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
         return false;
@@ -72,10 +72,11 @@ pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
         })
         .collect();
 
-    if matches!(
-        components.first().and_then(|name| name.to_str()),
-        Some(".git" | ".st2" | "pty")
-    ) {
+    if components
+        .iter()
+        .any(|name| matches!(name.to_str(), Some(".git" | ".st2")))
+        || components.first().and_then(|name| name.to_str()) == Some("pty")
+    {
         return false;
     }
 

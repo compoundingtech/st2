@@ -40,8 +40,9 @@ accepted.
   folder path, while either omitted field retains path-derived defaults and
   mismatch diagnostics. The declaration's parent remains its state/resource
   anchor. Dot-prefixed and other organizational folders have no implicit
-  lifecycle meaning; discovery excludes only explicit catalog control/runtime
-  roots and state namespaces directly owned by a declaration.
+  lifecycle meaning; discovery excludes `.git` and `.st2` control directories
+  at any depth, the catalog-root `pty` runtime directory, and state namespaces
+  directly owned by a declaration.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
 

@@ -137,6 +137,14 @@ mod tests {
         ));
         assert!(!is_declaration_path(
             root,
+            &root.join("organizations/project/.git/nested/agent.kdl")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            &root.join("organizations/project/.st2/nested/agent.kdl")
+        ));
+        assert!(!is_declaration_path(
+            root,
             &root.join("pty/project/agent.kdl")
         ));
         for reserved in ["resources", "archive", "inbox"] {

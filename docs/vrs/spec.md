@@ -71,9 +71,9 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   declaration's path, whose parent remains the state/resource anchor. When
   either field is omitted, the path supplies defaults and mismatches remain
   diagnostic. Dot-prefixed folders, including `.managed` and `.retired`, are
-  ordinary declaration space; only the catalog root's `.git`, `.st2`, and
-  `pty` children and a declaration parent's `resources`, `archive`, and `inbox`
-  children are excluded.
+  ordinary declaration space; only `.git` and `.st2` directories at any depth,
+  the catalog root's `pty` child, and a declaration parent's `resources`,
+  `archive`, and `inbox` children are excluded.
 - **R04:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads

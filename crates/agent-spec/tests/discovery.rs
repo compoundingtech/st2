@@ -888,6 +888,8 @@ fn only_contextually_reserved_namespaces_are_ignored() {
     for path in [
         ".git/project/agent.kdl",
         ".st2/project/agent.kdl",
+        "organizations/project/.git/nested/agent.kdl",
+        "organizations/project/.st2/nested/agent.kdl",
         "pty/project/agent.kdl",
         "agents/hetz/live/resources/project/agent.kdl",
         "agents/hetz/live/archive/project/agent.kdl",
