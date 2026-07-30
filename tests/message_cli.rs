@@ -13,14 +13,30 @@ fn write_message(inbox: &Path, ts_ms: u64, suffix: &str, from: &str) {
     .unwrap();
 }
 
-fn list(root: &Path, extra: &[&str]) -> std::process::Output {
+fn write_agent(root: &Path, identity: &str) {
+    let directory = root.join("h").join(identity);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("agent.kdl"),
+        format!(
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn list_identity(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_st2"))
-        .args(["message", "ls", "bob", "--root"])
+        .args(["message", "ls", identity, "--root"])
         .arg(root)
         .args(["--host", "h"])
         .args(extra)
         .output()
         .unwrap()
+}
+
+fn list(root: &Path, extra: &[&str]) -> std::process::Output {
+    list_identity(root, "bob", extra)
 }
 
 #[test]
@@ -102,4 +118,151 @@ fn archived_filename_wins_over_a_restored_raw_inbox_copy_in_all_list_modes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
+fn an_unknown_catalog_identity_fails_before_every_output_mode_reads_a_box() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "alice");
+
+    // A populated flat box must not turn an unknown catalog identity into a valid result.
+    write_message(
+        &tmp.path().join("missing/inbox"),
+        1_700_000_000_000,
+        "aaaaaa",
+        "alice",
+    );
+    write_message(
+        &tmp.path().join("missing/archive"),
+        1_700_000_000_001,
+        "bbbbbb",
+        "alice",
+    );
+
+    for extra in [
+        vec![],
+        vec!["--json"],
+        vec!["--count"],
+        vec!["--archive"],
+        vec!["--archive", "--json"],
+        vec!["--archive", "--count"],
+    ] {
+        let out = list_identity(tmp.path(), "missing", &extra);
+        assert!(!out.status.success(), "mode {extra:?} must fail");
+        assert!(
+            out.stdout.is_empty(),
+            "mode {extra:?} must fail before rendering output"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("no agent 'missing' found in catalog"));
+        assert!(stderr.contains(&tmp.path().display().to_string()));
+    }
+}
+
+#[test]
+fn known_empty_native_and_catalog_less_flat_boxes_remain_valid() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path(), "alice");
+    for extra in [
+        vec![],
+        vec!["--json"],
+        vec!["--count"],
+        vec!["--archive", "--count"],
+    ] {
+        let out = list_identity(catalog.path(), "alice", &extra);
+        assert!(
+            out.status.success(),
+            "known native mode {extra:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let flat = tempfile::tempdir().unwrap();
+    write_message(
+        &flat.path().join("bob/inbox"),
+        1_700_000_000_000,
+        "aaaaaa",
+        "alice",
+    );
+    let out = list(flat.path(), &["--count"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
+fn orphan_mode_explicitly_reads_raw_flat_inbox_and_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "alice");
+    write_message(
+        &tmp.path().join("missing/inbox"),
+        1_700_000_000_000,
+        "aaaaaa",
+        "alice",
+    );
+    write_message(
+        &tmp.path().join("missing/archive"),
+        1_700_000_000_001,
+        "bbbbbb",
+        "alice",
+    );
+
+    let inbox = list_identity(tmp.path(), "missing", &["--orphan", "--json"]);
+    assert!(
+        inbox.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&inbox.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let archive = list_identity(tmp.path(), "missing", &["--orphan", "--archive", "--count"]);
+    assert!(
+        archive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&archive.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&archive.stdout).trim(), "1");
+}
+
+#[test]
+fn malformed_catalog_declarations_disable_implicit_flat_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let declaration = tmp.path().join("h/broken/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::write(&declaration, "agent \"broken\" { this is not valid").unwrap();
+    write_message(
+        &tmp.path().join("missing/inbox"),
+        1_700_000_000_000,
+        "aaaaaa",
+        "alice",
+    );
+
+    for extra in [
+        vec![],
+        vec!["--json"],
+        vec!["--count"],
+        vec!["--archive"],
+        vec!["--archive", "--json"],
+        vec!["--archive", "--count"],
+    ] {
+        let out = list_identity(tmp.path(), "missing", &extra);
+        assert!(!out.status.success(), "mode {extra:?} must fail");
+        assert!(
+            out.stdout.is_empty(),
+            "mode {extra:?} must fail before rendering output"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("no agent 'missing' found in catalog")
+        );
+    }
 }

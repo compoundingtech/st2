@@ -278,7 +278,9 @@ unchanged and appends `[retired]` to a retired row.
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
 links live under `<agent-dir>/resources/`. The flat `<root>/<identity>` layout remains only as the
-intentional catalog-less fallback used by isolated folder evals.
+intentional catalog-less fallback used by isolated folder evals. In a catalog-backed root,
+`st2 message ls` rejects an absent identity; recovery inspection of a deliberately orphaned flat
+box must be explicit with `st2 message ls <identity> --orphan` (and optionally `--archive`).
 
 Adopters should cut directly to the native layout. Before launching a migrated identity, install and
 verify hooks, validate and materialize its hand-authored declaration, stop any predecessor transport,
