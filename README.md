@@ -190,7 +190,9 @@ There is intentionally no resident macOS service path.
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the
 health check. A stale lock left by a dead supervisor is always a failure. The underlying
 non-interactive `pty list --json` runtime probe is bounded; a wedged client becomes an explicit
-doctor failure instead of hanging the health check.
+doctor failure instead of hanging the health check. The shared-registry census has a 10-second
+deadline so a busy multi-session fleet can complete without turning the bound into an unbounded
+health probe.
 
 For a foreground supervisor on any host:
 
