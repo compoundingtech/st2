@@ -2,10 +2,10 @@
 //! plus the supervisor loop that reconciles on a folder-watch + timer.
 //!
 //! Everything st2 does to the world goes through the [`Runner`] trait: list sessions, spawn a pty
-//! from its explicit command, kill a session, remove a dead one. The production [`PtyCli`] shells out
+//! from its explicit launch, kill a session, remove a dead one. The production [`PtyCli`] shells out
 //! to the `pty` CLI; tests swap in a fake, so plan execution is verified without spawning a single
-//! real process. st2 stays harness-agnostic here too — it runs the spec's `command` verbatim under
-//! `sh -c` and never inspects it.
+//! real process. st2 stays harness-agnostic here too — it either runs shell source verbatim under
+//! `sh -c` or passes a structured argv directly.
 //!
 //! The loop is decoupled Nomad-style: stopping st2 never tears down its agents — they are detached
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
+use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use agent_spec::spec::TaskKind;
 
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -104,7 +104,7 @@ pub(crate) fn resolve_task_cwd(
 pub trait Runner {
     /// ACTUAL state: every task session the runner can see (unioned across backends).
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>>;
-    /// Spawn `target` in the background from its explicit command. `spec_dir` is the spec file's
+    /// Spawn `target` in the background from its explicit launch. `spec_dir` is the spec file's
     /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
     /// SIGTERM a running session.
@@ -149,7 +149,8 @@ struct PtyListEntry {
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
 /// e.g. an eval run's short `/tmp/stev-<runid>` that dodges the 104-byte unix-socket-path limit that a
-/// deep `<catalog>/pty` would blow — else the native default `<catalog>/pty`. Applied uniformly to
+/// deep `<catalog>/pty` would blow — else what the catalog itself declares
+/// ([`crate::catalog::pty_root`]), else the native default `<catalog>/pty`. Applied uniformly to
 /// spawn and list/kill so st2 always manages sessions where it put them.
 pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
     effective_pty_root_from(catalog_root, std::env::var_os("PTY_ROOT"))
@@ -160,7 +161,7 @@ pub fn effective_pty_root(catalog_root: &Path) -> PathBuf {
 fn effective_pty_root_from(catalog_root: &Path, ambient: Option<std::ffi::OsString>) -> PathBuf {
     match ambient {
         Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => catalog_root.join("pty"),
+        _ => crate::catalog::pty_root(catalog_root),
     }
 }
 
@@ -220,8 +221,8 @@ impl PtyCli {
     /// env can be unit-tested without spawning anything.
     ///
     /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, and `cwd` — because `pty` passes the child env through verbatim. The `command` is left
-    /// unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
+    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -259,8 +260,18 @@ impl PtyCli {
             assignment.push(value);
             cmd.arg("--env").arg(assignment);
         }
-        // Run the command verbatim under a shell — st2 never parses or splits it.
-        cmd.arg("--").arg("sh").arg("-c").arg(&target.command);
+        cmd.arg("--");
+        match &target.launch {
+            // Run shell source verbatim — st2 never parses or splits it.
+            TaskLaunch::Shell(command) => {
+                cmd.arg("sh").arg("-c").arg(command);
+            }
+            // Direct mode preserves argument boundaries and introduces no shell process.
+            TaskLaunch::Argv(argv) => {
+                debug_assert!(!argv.is_empty());
+                cmd.args(argv.iter().map(|arg| self.expand(arg)));
+            }
+        }
         cmd
     }
 }
@@ -772,7 +783,7 @@ fn reconcile_pass(
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
-    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
+    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host, root)
         .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
@@ -786,7 +797,7 @@ fn reconcile_pass(
         .specs
         .iter()
         .filter(|spec| {
-            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host)
+            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host, root)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -818,52 +829,40 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches(
-        root,
-        &mut plan,
-        &mut report,
-        || match &hook_error {
-            Some(error) => anyhow::bail!("{error}"),
-            None => Ok(()),
-        },
-        crate::pretrust::pretrust_codex,
-    );
+    gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
+        Some(error) => anyhow::bail!("{error}"),
+        None => Ok(()),
+    });
     execute(&plan, runner, cap, &mut report);
     report
 }
 
-/// A missing Codex agent must be trusted before its pty exists. Codex's bypass flags do not bypass
-/// the workspace-trust prompt; without this gate a remotely synced declaration appears launched but
-/// is really parked waiting for a human keystroke. Batch every workspace into one atomic config
-/// update, and fail closed: if trust cannot be established, suppress the affected agent launches
-/// (including their sidecars) and surface the error. Already-live/adopted agents never enter this
-/// path.
-fn gate_codex_launches<'a, V, F>(
-    catalog_root: &Path,
+/// A missing Codex agent must not launch against stale lifecycle hooks. Suppress the affected agent
+/// launches (including their sidecars) and surface the error when hook verification fails.
+///
+/// Workspace trust belongs to the declared provider command and its selected account-specific
+/// runtime. Reconciliation deliberately does not mutate an ambient Codex config: an account selector
+/// may choose `CODEX_HOME` only after this process launches the command, so such a write would target
+/// the wrong state and could not satisfy the launched seat's trust gate.
+fn gate_codex_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
+    catalog_root: &Path,
     report: &mut UpReport,
     verify_hooks: V,
-    pretrust: F,
 ) where
     V: FnOnce() -> anyhow::Result<()>,
-    F: FnOnce(&[PathBuf]) -> anyhow::Result<usize>,
 {
-    let mut workspaces = Vec::new();
     let mut gated_agents = Vec::new();
     for launch in &plan.launch {
-        let Some(agent) = launch.tasks.iter().find(|target| {
-            target.name == "agent" && crate::hooks::command_invokes_codex(&target.command)
+        let Some(_) = launch.tasks.iter().find(|target| {
+            target.name == "agent"
+                && crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
         }) else {
             continue;
         };
-        let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
-        let workspace = resolve_task_cwd(agent, spec_dir, catalog_root);
-        if !workspaces.contains(&workspace) {
-            workspaces.push(workspace);
-        }
         gated_agents.push(launch.spec.identity.clone());
     }
-    if workspaces.is_empty() {
+    if gated_agents.is_empty() {
         return;
     }
 
@@ -872,16 +871,6 @@ fn gate_codex_launches<'a, V, F>(
             .retain(|launch| !gated_agents.contains(&launch.spec.identity));
         report.errors.push(format!(
             "verify lifecycle hooks for new Codex agent(s) {}: {error}; launch suppressed",
-            gated_agents.join(", ")
-        ));
-        return;
-    }
-
-    if let Err(error) = pretrust(&workspaces) {
-        plan.launch
-            .retain(|launch| !gated_agents.contains(&launch.spec.identity));
-        report.errors.push(format!(
-            "pretrust Codex workspace(s) for {}: {error}; launch suppressed",
             gated_agents.join(", ")
         ));
     }
@@ -976,15 +965,9 @@ pub fn up_once_selected_specs(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    up_once_selected_specs_with_gates(
-        catalog_root,
-        specs,
-        selector,
-        this_host,
-        runner,
-        || crate::hooks::verify_installed().map(|_| ()),
-        crate::pretrust::pretrust_codex,
-    )
+    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
+        crate::hooks::verify_installed().map(|_| ())
+    })
 }
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
@@ -1006,7 +989,7 @@ pub fn up_once_selected(
             .map(|e| format!("{}: {}", e.path.display(), e.message)),
     );
     let owner = owner.clone();
-    if crate::hooks::required_by_codex_agent(&owner, this_host)
+    if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
         && let Err(error) = crate::hooks::verify_installed()
     {
         report
@@ -1032,24 +1015,21 @@ pub fn up_once_selected(
         this_host,
         runner,
         || Ok(()),
-        crate::pretrust::pretrust_codex,
     )?;
     report.absorb(execution);
     Ok(report)
 }
 
-fn up_once_selected_specs_with_gates<V, F>(
+fn up_once_selected_specs_with_gates<V>(
     catalog_root: &Path,
     specs: &[crate::spec::AgentSpec],
     selector: &str,
     this_host: &str,
     runner: &dyn Runner,
     verify_hooks: V,
-    pretrust: F,
 ) -> anyhow::Result<UpReport>
 where
     V: FnOnce() -> anyhow::Result<()>,
-    F: FnOnce(&[PathBuf]) -> anyhow::Result<usize>,
 {
     crate::reconcile::resolve_task(specs, selector, this_host)?;
     let sessions = runner
@@ -1057,7 +1037,7 @@ where
         .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
     let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
-    gate_codex_launches(catalog_root, &mut plan, &mut report, verify_hooks, pretrust);
+    gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
     execute(&plan, runner, &mut FlappingCap::default(), &mut report);
     Ok(report)
 }
@@ -1357,7 +1337,7 @@ mod tests {
             pty_id: id.to_string(),
             bus_id: "hetz.demo".to_string(),
             name: "agent".to_string(),
-            command: cmd.to_string(),
+            launch: TaskLaunch::Shell(cmd.to_string()),
             cwd: None,
             workspace: None,
             tags: BTreeMap::new(),
@@ -1406,7 +1386,8 @@ mod tests {
                 derived: false,
                 name: "agent".into(),
                 id: Some("test.codex.agent".into()),
-                command: Some("codex --version".into()),
+                command: None,
+                argv: Some(vec!["$CATALOG/bin/codex".into(), "--version".into()]),
                 cwd: None,
                 tags: BTreeMap::new(),
                 env: BTreeMap::new(),
@@ -1424,7 +1405,6 @@ mod tests {
             "test",
             &runner,
             || anyhow::bail!("stale receipt"),
-            |_| panic!("pretrust must not run"),
         )
         .unwrap();
         assert_eq!(runner.list_calls.get(), 1);
@@ -1542,6 +1522,30 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_declared_root_outranks_the_default_but_never_an_ambient_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = tmp.path();
+        std::fs::write(
+            cat.join(crate::catalog::CONFIG_FILE),
+            "catalog { pty-root \"/run/agents/pty\" }\n",
+        )
+        .unwrap();
+
+        // The declaration replaces the `<catalog>/pty` default for every st2 pty op — so a reader
+        // that resolves the catalog finds the sessions without being handed an env var.
+        assert_eq!(
+            effective_pty_root_from(cat, None),
+            std::path::PathBuf::from("/run/agents/pty")
+        );
+        // An explicit ambient root still wins: an eval run's short decoupled partition must be able
+        // to override a catalog it copied from.
+        assert_eq!(
+            effective_pty_root_from(cat, Some("/tmp/stev-abc123".into())),
+            std::path::PathBuf::from("/tmp/stev-abc123")
+        );
+    }
+
+    #[test]
     fn debounce_never_defers_a_never_seen_task() {
         let t0 = Instant::now();
         let db = LivenessDebounce::new(Duration::from_secs(10));
@@ -1576,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_pretrust_batches_every_new_workspace_once() {
+    fn codex_hook_gate_accepts_new_agents_without_mutating_the_launch_plan() {
         let mut left = spec_fixture();
         left.identity = "left".into();
         left.path = PathBuf::from("/catalog/node/left/agent.kdl");
@@ -1596,96 +1600,34 @@ mod tests {
             spec: &right,
             tasks: vec![right_agent],
         });
-        let captured = RefCell::new(Vec::new());
-
-        gate_codex_launches(
-            Path::new("/catalog"),
-            &mut plan,
-            &mut UpReport::default(),
-            || Ok(()),
-            |workspaces| {
-                captured.borrow_mut().extend_from_slice(workspaces);
-                Ok(workspaces.len())
-            },
-        );
-
-        assert_eq!(
-            captured.into_inner(),
-            [PathBuf::from("/workspaces/shared")],
-            "all affected workspaces are passed in one deduplicated batch"
-        );
-        assert_eq!(plan.launch.len(), 2);
-    }
-
-    #[test]
-    fn codex_pretrust_failure_suppresses_every_affected_agent_and_sidecar() {
-        let mut left = spec_fixture();
-        left.identity = "left".into();
-        left.path = PathBuf::from("/catalog/node/left/agent.kdl");
-        let mut right = spec_fixture();
-        right.identity = "right".into();
-        right.path = PathBuf::from("/catalog/node/right/agent.kdl");
-        let mut other = spec_fixture();
-        other.identity = "other".into();
-        other.path = PathBuf::from("/catalog/node/other/agent.kdl");
-
-        let mut left_agent = target("node.left.agent", "exec codex");
-        left_agent.workspace = Some("/workspaces/left".into());
-        let mut left_ding = target("node.left.ding", "st2 ding");
-        left_ding.name = "ding".into();
-        let mut right_agent = target("node.right.agent", "/opt/bin/codex --model gpt-5");
-        right_agent.workspace = Some("/workspaces/right".into());
-        let mut right_ding = target("node.right.ding", "st2 ding");
-        right_ding.name = "ding".into();
-        let non_codex = target("node.other.agent", "exec claude");
-        let mut plan = ReconcilePlan::default();
-        plan.launch.push(Launch {
-            spec: &left,
-            tasks: vec![left_agent, left_ding],
-        });
-        plan.launch.push(Launch {
-            spec: &right,
-            tasks: vec![right_agent, right_ding],
-        });
-        plan.launch.push(Launch {
-            spec: &other,
-            tasks: vec![non_codex],
-        });
+        let expected = plan
+            .launch
+            .iter()
+            .map(|launch| launch.spec.identity.clone())
+            .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches(
-            Path::new("/catalog"),
+        gate_codex_launches_on_hooks(
             &mut plan,
+            Path::new("/catalog"),
             &mut report,
             || Ok(()),
-            |workspaces| {
-                assert_eq!(
-                    workspaces,
-                    [
-                        PathBuf::from("/workspaces/left"),
-                        PathBuf::from("/workspaces/right")
-                    ]
-                );
-                anyhow::bail!("read-only Codex config")
-            },
         );
 
         assert_eq!(
             plan.launch
                 .iter()
-                .map(|launch| launch.spec.identity.as_str())
+                .map(|launch| launch.spec.identity.clone())
                 .collect::<Vec<_>>(),
-            ["other"],
-            "both Codex agents and all their sidecars fail closed"
+            expected,
+            "successful hook verification must leave the launch plan unchanged"
         );
-        assert_eq!(plan.launch[0].tasks[0].pty_id, "node.other.agent");
-        assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("left, right"));
-        assert!(report.errors[0].contains("launch suppressed"));
+        assert_eq!(plan.launch.len(), 2);
+        assert!(report.errors.is_empty());
     }
 
     #[test]
-    fn codex_pretrust_does_not_touch_adopted_agents_or_sidecar_only_repairs() {
+    fn codex_hook_gate_does_not_touch_adopted_agents_or_sidecar_only_repairs() {
         let mut spec = spec_fixture();
         spec.identity = "root".into();
         let mut ding = target("node.root.ding", "st2 ding");
@@ -1698,12 +1640,11 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches(
-            Path::new("/catalog"),
+        gate_codex_launches_on_hooks(
             &mut plan,
+            Path::new("/catalog"),
             &mut report,
             || panic!("an already-live Codex agent must not enter the hook gate"),
-            |_| panic!("an already-live Codex agent must not enter the pretrust gate"),
         );
 
         assert_eq!(plan.adopt, [&spec]);
@@ -1734,12 +1675,11 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches(
-            Path::new("/catalog"),
+        gate_codex_launches_on_hooks(
             &mut plan,
+            Path::new("/catalog"),
             &mut report,
             || anyhow::bail!("stale receipt"),
-            |_| panic!("pretrust must not run after hook verification fails"),
         );
 
         assert_eq!(
@@ -1778,7 +1718,49 @@ mod tests {
         let name_pos = args.iter().position(|a| a == "--name").unwrap();
         assert_eq!(args[name_pos + 1], "hetz.demo");
         let sep = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
+        assert_eq!(
+            &args[sep + 1..],
+            &[
+                "sh",
+                "-c",
+                "exec claude --permission-mode bypassPermissions 'boot'"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_run_command_passes_direct_argv_without_a_shell() {
+        let cli = PtyCli::new(PathBuf::from("/my/catalog"));
+        let mut t = target("hetz.demo.agent", "unused");
+        t.launch = TaskLaunch::Argv(vec![
+            "axe".into(),
+            "agent".into(),
+            "exec".into(),
+            "--".into(),
+            "claude".into(),
+            "--resume".into(),
+            "$CATALOG/session id".into(),
+        ]);
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let sep = args.iter().position(|arg| arg == "--").unwrap();
+
+        assert_eq!(
+            &args[sep + 1..],
+            [
+                "axe",
+                "agent",
+                "exec",
+                "--",
+                "claude",
+                "--resume",
+                "/my/catalog/session id"
+            ]
+        );
+        assert!(!args[sep + 1..].iter().any(|arg| arg == "sh"));
     }
 
     #[test]

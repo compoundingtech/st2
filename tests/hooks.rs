@@ -357,7 +357,7 @@ fn hook_free_claude_materialization_does_not_require_a_receipt() {
 }
 
 #[test]
-fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
+fn up_once_suppresses_an_expanded_direct_codex_agent_without_mutating_hooks() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
@@ -372,7 +372,7 @@ fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
         &declaration,
         format!(
             "agent \"worker\" {{\n  host \"h\"\n  workspace \"{}\"\n  \
-             env {{ ST_AGENT \"h.worker\" }}\n  command \"exec codex\"\n  \
+             env {{ ST_AGENT \"h.worker\" }}\n  argv \"$CODEX_BIN\"\n  \
              render {{ file \"hook-proof\" \"must-not-write\" }}\n}}\n",
             workspace.display()
         ),
@@ -391,6 +391,7 @@ fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
         .arg(&catalog)
         .args(["--host", "h", "--once"])
         .env("PATH", &bin)
+        .env("CODEX_BIN", "/opt/bin/codex")
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -414,6 +415,77 @@ fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
     assert!(
         !hooks_root.exists(),
         "ordinary up must never create or rewrite the hook root"
+    );
+}
+
+#[test]
+fn up_once_never_mutates_the_ambient_codex_config_before_account_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let hooks_root = tmp.path().join("hooks");
+    let ambient_codex_home = tmp.path().join("ambient-codex-home");
+    let selected_codex_home = tmp.path().join("selected-codex-home");
+    let bin = tmp.path().join("bin");
+    let pty_log = tmp.path().join("pty.log");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        format!(
+            "agent \"worker\" {{\n  host \"h\"\n  workspace \"{}\"\n  \
+             env {{ ST_AGENT \"h.worker\" CODEX_HOME \"{}\" }}\n  \
+             command \"exec codex -c \
+             'projects={{\\\"{}\\\"={{trust_level=\\\"trusted\\\"}}}}'\"\n}}\n",
+            workspace.display(),
+            selected_codex_home.display(),
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &bin.join("pty"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
+            pty_log.display()
+        ),
+    );
+    assert!(
+        command(&hooks_root)
+            .args(["hooks", "install"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let output = command(&hooks_root)
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "h", "--once"])
+        .env("PATH", &bin)
+        .env("CODEX_HOME", &ambient_codex_home)
+        .output()
+        .unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "{report}");
+    assert!(report.contains("launched (1): h.worker"), "{report}");
+    assert!(
+        fs::read_to_string(&pty_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("run ")),
+        "the declared account-selecting Codex command must launch"
+    );
+    assert!(
+        !ambient_codex_home.exists(),
+        "st2 up must not create or mutate an ambient Codex config before the command selects its account"
     );
 }
 

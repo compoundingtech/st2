@@ -43,6 +43,28 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog
 Every catalog-aware command accepts `--catalog`; otherwise st2 uses `$CATALOG`, then that standard
 location.
 
+### A catalog may declare its session registry
+
+A catalog's tasks live in `<catalog>/pty` unless the catalog says otherwise. To put several catalogs
+in one host-wide `pty` registry — so any viewer enumerates every session without knowing which
+catalog produced it — declare it in `<catalog>/catalog.kdl`:
+
+```kdl
+catalog {
+  pty-root "/run/agents/pty"
+}
+```
+
+`pty-root` accepts `$VAR`/`$CATALOG`; a relative value anchors at the catalog root. The resolution
+order is an exported `PTY_ROOT` (a deliberate override, used by `st2 eval` for a short socket path),
+then this declaration, then `<catalog>/pty`. A catalog that declares nothing is unaffected.
+
+Prefer the declaration over exporting `PTY_ROOT` into readers: a reader that misses the export
+resolves a different registry and reports live agents as dead. When adopting it on a host whose
+systemd unit was installed with an ambient `PTY_ROOT`, reinstall the unit without one
+(`st2 service install`) — the export still wins, and leaving it pins the supervisor to the old
+registry while everything else follows the catalog.
+
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
 verifies its own immutable set for Codex launches; any local workspace render that actually
@@ -88,7 +110,7 @@ agent "<identity>" {
   // role "worker"
   // supervisor "<supervisor-bus-id>"
   env { ST_AGENT "<host>.<identity>" }
-  command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
+  argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {
@@ -100,6 +122,12 @@ agent "<identity>" {
   }
 }
 ```
+
+`argv` launches its first value directly with the remaining values as arguments. It resolves a bare
+program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
+does not introduce a shell. Use `command #"..."#` instead when the task intentionally needs shell
+syntax such as pipelines, redirects, or variable expansion; `command` continues to run under
+`sh -c`. A runnable task must declare exactly one of `argv` or `command`.
 
 ### Scheduled work is coming soon, not implemented
 

@@ -173,10 +173,9 @@ enum Command {
         #[arg(conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
     },
-    /// Pre-trust agent workspaces in the claude config (`$CLAUDE_CONFIG_DIR/.claude.json` else
-    /// `~/.claude.json`) BEFORE they boot, so a kick-driven `claude` never hangs on the "Is this a
-    /// project you trust?" dialog. One atomic batch write for all dirs closes the multi-spawn trust
-    /// race; merges into existing entries (never clobbers). Run it before `st2 up`.
+    /// Explicitly pre-trust workspaces in the ambient Claude and Codex configs. This is an operator
+    /// utility for harnesses that use those ambient configs; `st2 up` never calls it automatically.
+    /// Account-selecting commands should instead declare trust in the selected harness invocation.
     Pretrust {
         /// Workspace directories to mark trusted.
         #[arg(required = true)]
@@ -907,11 +906,12 @@ fn catalog_root_for_env() -> Result<PathBuf> {
     absolute_catalog_path(&root)
 }
 
-/// Set the same native catalog environment that `st2 env` prints.
+/// Set the same native catalog environment that `st2 env` prints. The catalog's own declared session
+/// registry is used, not the caller's ambient one: these hand `pty` the roots of the *catalog*.
 fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
     cmd.env("CATALOG", root)
         .env("ST_ROOT", root)
-        .env("PTY_ROOT", root.join("pty"));
+        .env("PTY_ROOT", st2::catalog::pty_root(root));
 }
 
 /// `st2 pty [<pty-args>…]` — a thin pass-through to `pty` with the catalog's bus env pre-set, so
@@ -944,19 +944,22 @@ fn shell_cmd(args: &[String]) -> Result<()> {
 }
 
 fn env_cmd(root: &Path) -> Result<()> {
-    let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let c = c.display();
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let c = canonical.display();
     // The same roots st2 sets on every task it spawns.
     println!("export CATALOG={c}");
     println!("export ST_ROOT={c}");
-    println!("export PTY_ROOT={c}/pty");
+    println!(
+        "export PTY_ROOT={}",
+        st2::catalog::pty_root(&canonical).display()
+    );
     Ok(())
 }
 
 fn pretrust_cmd(dirs: &[PathBuf]) -> Result<()> {
     let n = st2::pretrust::pretrust(dirs)?;
     println!(
-        "pre-trusted {n} workspace{} in the claude config",
+        "pre-trusted {n} workspace{} in the ambient Claude and Codex configs",
         if n == 1 { "" } else { "s" }
     );
     Ok(())
@@ -1801,7 +1804,7 @@ fn up(
         for error in &found.errors {
             eprintln!("error: {}: {}", error.path.display(), error.message);
         }
-        if st2::hooks::required_by_codex(&found.specs, &this_host) {
+        if st2::hooks::required_by_codex(&found.specs, &this_host, &catalog_root) {
             st2::hooks::verify_required_set().context(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
@@ -1954,7 +1957,7 @@ fn ls(root: &Path) -> Result<()> {
         let runnable = if spec.is_runnable() {
             ""
         } else {
-            "  [UNRENDERED: no task command]"
+            "  [UNRENDERED: no task launch]"
         };
         let retired = if spec.retired { "  [retired]" } else { "" };
         println!(
@@ -1969,8 +1972,12 @@ fn ls(root: &Path) -> Result<()> {
                 st2::TaskKind::Pty => "pty",
                 st2::TaskKind::Exec => "exec",
             };
-            let cmd = task.command.as_deref().unwrap_or("<none>");
-            println!("      - {tk} {name}: {cmd}", name = task.name);
+            let launch = match (&task.command, &task.argv) {
+                (Some(command), _) => format!("command {command}"),
+                (_, Some(argv)) => format!("argv {argv:?}"),
+                _ => "<none>".to_string(),
+            };
+            println!("      - {tk} {name}: {launch}", name = task.name);
         }
     }
 

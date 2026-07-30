@@ -44,7 +44,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   never wake reconciliation; only create, modify, rename, or remove events may
   wake it before the bounded timer.
 - **R06:** st2 passes the complete effective task definition to the underlying
-  launcher so manual and supervised restarts are equivalent.
+  launcher so manual and supervised restarts are equivalent. Harness readiness
+  that depends on a dynamically selected account belongs to that declared
+  command. In particular, reconciliation never mutates an ambient Codex config
+  before launch: the command may select an account-specific `CODEX_HOME` only
+  after st2 starts it. `st2 pretrust` remains an explicit operator utility for
+  commands that intentionally use the ambient Claude and Codex configs.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both
@@ -68,6 +73,15 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   a forced kill, verifies the agent remains alive and usable, replaces the st2
   binary, starts the control plane again, and proves adoption with the same
   agent PID/creation identity and no duplicate process.
+
+- **Session registry:** A catalog owns the `pty` registry holding its tasks.
+  `<catalog>/pty` is the default; a catalog may declare another so that one host
+  can share a single registry across catalogs. Resolution is an exported
+  `PTY_ROOT`, then the catalog's declaration, then the default, applied
+  uniformly to spawn, list, kill, and the bus environment st2 hands to native
+  tools, so every reader that can resolve the catalog agrees about where its
+  sessions are. A declaration whose field set does not match fails `st2
+  validate` rather than resolving silently back to the default.
 
 ## Message lifecycle
 

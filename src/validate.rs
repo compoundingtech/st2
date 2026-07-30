@@ -133,7 +133,19 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
         issues.push(Issue::error(code, rel(root, &e.path), None, message));
     }
 
-    // 2. Raw pass (once per file): a typo'd `type` is normalized to `service` by the parser, so it can
+    // 2. The catalog's own declaration. Its field set is closed (like `type`), so a typo is checkable
+    //    here without touching render-agnosticism — and it must be, because a mistyped `pty-root`
+    //    silently resolves back to `<catalog>/pty` and reads as an agent whose task is dead.
+    if let Err(e) = crate::catalog::load(root) {
+        issues.push(Issue::error(
+            "catalog-config",
+            crate::catalog::CONFIG_FILE.to_string(),
+            None,
+            e.to_string(),
+        ));
+    }
+
+    // 3. Raw pass (once per file): a typo'd `type` is normalized to `service` by the parser, so it can
     //    only be seen before lowering. A KDL `pty`/`exec` block with no name is silently dropped — the
     //    task just vanishes, the classic "silently does the wrong thing".
     let mut files: Vec<&PathBuf> = d.specs.iter().map(|s| &s.path).collect();
@@ -161,7 +173,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
         issues.extend(kdl_shape_check(root, f));
     }
 
-    // 3. Resolved pass: cross-spec + field checks over each agent.
+    // 4. Resolved pass: cross-spec + field checks over each agent.
     let identities: HashSet<&str> = d.specs.iter().map(|s| s.identity.as_str()).collect();
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     // Placeholder host for bus-id collision: catalogs carry explicit host, and an empty host still
@@ -235,7 +247,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
                 "not-runnable",
                 rp.clone(),
                 ag.clone(),
-                "service agent has no task with a command (unrendered, or the renderer emitted none)"
+                "service agent has no task with `command` or `argv` (unrendered, or the renderer emitted none)"
                     .to_string(),
             ));
         }

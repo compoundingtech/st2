@@ -41,9 +41,9 @@ pub fn pretrust(dirs: &[PathBuf]) -> Result<usize> {
     Ok(n)
 }
 
-/// Pre-trust workspaces for Codex only. Reconciliation uses this immediately before launching a
-/// missing Codex agent task, so a synced declaration cannot park on the interactive workspace-trust
-/// prompt. Keeping this Codex-specific avoids touching Claude configuration during a Codex rollout.
+/// Pre-trust workspaces for Codex only in the caller's ambient config. This remains available to
+/// explicit tooling, but reconciliation does not call it: a provider command may select an
+/// account-specific `CODEX_HOME` only after st2 launches it.
 pub fn pretrust_codex(dirs: &[PathBuf]) -> Result<usize> {
     pretrust_codex_at(&codex_config_path()?, dirs)
 }

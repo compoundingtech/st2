@@ -66,6 +66,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 name: "agent".to_string(),
                 id: Some(a.id.clone()), // explicit id → the session is exactly the agent id (mix.sup)
                 command: Some(a.command.clone()),
+                argv: None,
                 cwd: None, // → the agent's workspace (resolved relative to `root`)
                 tags: ptags,
                 env: a.env.clone(),
@@ -78,6 +79,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                     name: ex.id.clone(),
                     id: Some(ex.id.clone()),
                     command: Some(ex.command.clone()),
+                    argv: None,
                     cwd: None,
                     tags: BTreeMap::new(),
                     env: ex.env.clone(),

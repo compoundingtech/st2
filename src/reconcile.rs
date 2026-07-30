@@ -26,7 +26,7 @@ pub struct Session {
 }
 
 /// A concrete task st2 should spawn — everything a backend needs, resolved from the spec. Produced
-/// only for tasks that carry an explicit `command`.
+/// only for tasks that carry an explicit `command` or `argv`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTarget {
     /// `pty` (terminal) or `exec` (terminal-free) — selects the backend.
@@ -37,8 +37,8 @@ pub struct TaskTarget {
     pub bus_id: String,
     /// The task name (`agent`, `ding`, …).
     pub name: String,
-    /// The exact command line to exec, run verbatim under `sh -c`.
-    pub command: String,
+    /// How to launch the task: shell source or a direct program argument vector.
+    pub launch: TaskLaunch,
     /// Declared working dir; `None` → default to `workspace`, else the spec dir (resolved at spawn).
     pub cwd: Option<String>,
     /// The agent's workspace — the cwd default when `cwd` is unset.
@@ -47,6 +47,15 @@ pub struct TaskTarget {
     pub env: BTreeMap<String, String>,
     /// GC pin (task-level `keep`, or the agent-level `keep`).
     pub keep: bool,
+}
+
+/// A resolved task launch accepted by the execution backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskLaunch {
+    /// Shell source, preserved verbatim and passed to `sh -c`.
+    Shell(String),
+    /// A non-empty vector whose first element is the program.
+    Argv(Vec<String>),
 }
 
 /// An agent to launch, with the specific tasks that are missing (not already live).
@@ -74,7 +83,7 @@ pub struct ReconcilePlan<'a> {
     pub adopt: Vec<&'a AgentSpec>,
     /// host != this machine → skipped; another machine's st2 owns it.
     pub other_host: Vec<&'a AgentSpec>,
-    /// This host, active service, but no task carries a command (unrendered) → nothing to run.
+    /// This host, active service, but no task carries a launch (unrendered) → nothing to run.
     pub unrunnable: Vec<&'a AgentSpec>,
     /// Dead, non-`keep` sessions of declared tasks → reap (`rm`).
     pub gc: Vec<String>,
@@ -132,9 +141,16 @@ pub fn reconcile_selected<'a>(
         }
         return Ok(plan);
     }
-    let Some(command) = task.command.clone() else {
-        plan.unrunnable.push(owner);
-        return Ok(plan);
+    let launch = match (&task.command, &task.argv) {
+        (Some(command), None) => TaskLaunch::Shell(command.clone()),
+        (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
+        (None, None) => {
+            plan.unrunnable.push(owner);
+            return Ok(plan);
+        }
+        (Some(_), Some(_)) => {
+            unreachable!("discovery rejects tasks carrying both command and argv")
+        }
     };
     let bus_id = owner.bus_id(this_host);
     let mut env = task.env.clone();
@@ -148,7 +164,7 @@ pub fn reconcile_selected<'a>(
         pty_id: runtime.clone(),
         bus_id,
         name: task.name.clone(),
-        command,
+        launch,
         cwd: task.cwd.clone(),
         workspace: owner.workspace.clone(),
         tags: task.tags.clone(),
@@ -243,7 +259,14 @@ pub fn reconcile<'a>(
             .tasks
             .iter()
             .filter_map(|t| {
-                let command = t.command.clone()?;
+                let launch = match (&t.command, &t.argv) {
+                    (Some(command), None) => TaskLaunch::Shell(command.clone()),
+                    (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
+                    (None, None) => return None,
+                    (Some(_), Some(_)) => {
+                        unreachable!("discovery rejects tasks carrying both command and argv")
+                    }
+                };
                 // `supervisor` is the single source of truth. Hooks and harnesses consume the
                 // derived environment variable, but catalog authors/renderers never need to
                 // duplicate the relationship in env{} (and cannot accidentally make it disagree).
@@ -258,7 +281,7 @@ pub fn reconcile<'a>(
                     pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
                     bus_id: bus_id.clone(),
                     name: t.name.clone(),
-                    command,
+                    launch,
                     cwd: t.cwd.clone(),
                     workspace: spec.workspace.clone(),
                     tags: t.tags.clone(),
