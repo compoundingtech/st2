@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use st2::materialize::{materialize_catalog, parse_plan};
+use st2::materialize::{materialize_catalog, materialize_catalog_against, parse_plan};
 use st2::{AgentSpec, discover};
 
 fn write(path: &Path, contents: impl AsRef<[u8]>) {
@@ -73,6 +73,127 @@ fn task_selector_materializes_only_owning_agent() {
     );
     assert!(!sibling.join("SIBLING.txt").exists());
     assert!(String::from_utf8_lossy(&out.stdout).contains("materialized 1 operation"));
+}
+
+#[test]
+fn shared_workspace_conflicting_copy_targets_fail_before_any_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &catalog.join("agents/Silber/worker/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/worker.md" ".st2/PERSONA.md""#,
+        ),
+    );
+    write(
+        &catalog.join("agents/Silber/orchestrator/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/orchestrator.md" ".st2/PERSONA.md""#,
+        )
+        .replace("agent \"cos\"", "agent \"orchestrator\"")
+        .replace("Silber.cos", "Silber.orchestrator"),
+    );
+    write(&catalog.join("_templates/worker.md"), "worker\n");
+    write(
+        &catalog.join("_templates/orchestrator.md"),
+        "orchestrator\n",
+    );
+
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("conflicting render ownership"),
+        "{:?}",
+        report.errors
+    );
+    assert_eq!(report.failed_agents.len(), 2);
+    assert!(
+        !workspace.join(".st2/PERSONA.md").exists(),
+        "a conflicting fleet must be rejected before either owner writes"
+    );
+}
+
+#[test]
+fn selected_owner_cannot_bypass_a_shared_workspace_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &catalog.join("agents/Silber/worker/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/worker.md" ".st2/PERSONA.md""#,
+        ),
+    );
+    write(
+        &catalog.join("agents/Silber/orchestrator/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/orchestrator.md" ".st2/PERSONA.md""#,
+        )
+        .replace("agent \"cos\"", "agent \"orchestrator\"")
+        .replace("Silber.cos", "Silber.orchestrator"),
+    );
+    write(&catalog.join("_templates/worker.md"), "worker\n");
+    write(
+        &catalog.join("_templates/orchestrator.md"),
+        "orchestrator\n",
+    );
+    let found = discover(&catalog);
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "cos")
+        .unwrap();
+
+    let report = materialize_catalog_against(
+        &catalog,
+        std::slice::from_ref(worker),
+        &found.specs,
+        "Silber",
+    );
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.failed_agents.contains("Silber.cos"));
+    assert!(!workspace.join(".st2/PERSONA.md").exists());
+}
+
+#[test]
+fn shared_workspace_byte_identical_claims_are_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let render = r#"    copy "_templates/shared.md" ".st2/bus.md""#;
+    write(
+        &catalog.join("agents/Silber/a/agent.kdl"),
+        agent_kdl(&workspace, render),
+    );
+    write(
+        &catalog.join("agents/Silber/b/agent.kdl"),
+        agent_kdl(&workspace, render)
+            .replace("agent \"cos\"", "agent \"b\"")
+            .replace("Silber.cos", "Silber.b"),
+    );
+    write(&catalog.join("_templates/shared.md"), "shared\n");
+    let found = discover(&catalog);
+
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.failed_agents.is_empty());
+    assert_eq!(
+        fs::read_to_string(workspace.join(".st2/bus.md")).unwrap(),
+        "shared\n"
+    );
 }
 
 #[test]

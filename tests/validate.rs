@@ -77,6 +77,36 @@ fn an_invalid_resource_binding_is_a_parse_error() {
     assert!(has(&validate(c.path()), "parse-error", Severity::Error));
 }
 
+#[test]
+fn shared_workspace_render_conflict_is_an_error() {
+    let c = tempfile::tempdir().unwrap();
+    let workspace = c.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(c.path().join("_templates")).unwrap();
+    std::fs::write(c.path().join("_templates/a"), "a\n").unwrap();
+    std::fs::write(c.path().join("_templates/b"), "b\n").unwrap();
+    for (identity, template) in [("a", "a"), ("b", "b")] {
+        let path = c.path().join(format!("h/{identity}/agent.kdl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "agent \"{identity}\" {{ host \"h\"; workspace \"{}\"; command \"true\"; render {{ copy \"_templates/{template}\" \".st2/PERSONA.md\" }} }}",
+                workspace.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    let r = validate_for_host(c.path(), "h");
+
+    assert!(
+        has(&r, "render-owner-conflict", Severity::Error),
+        "{:?}",
+        r.issues
+    );
+}
+
 // ---- errors ----------------------------------------------------------------------------------
 
 #[test]

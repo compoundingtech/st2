@@ -298,6 +298,21 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
         }
     }
 
+    if let Some(host) = this_host {
+        for conflict in crate::materialize::render_ownership_conflicts(root, &d.specs, host) {
+            issues.push(Issue::error(
+                "render-owner-conflict",
+                ".".to_string(),
+                None,
+                format!(
+                    "conflicting render ownership for '{}': active agents {} declare incompatible content for one shared workspace target",
+                    conflict.destination.display(),
+                    conflict.owners.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+    }
+
     Report {
         issues,
         agents: d.specs.len(),
