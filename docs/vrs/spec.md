@@ -81,7 +81,10 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   uniformly to spawn, list, kill, and the bus environment st2 hands to native
   tools, so every reader that can resolve the catalog agrees about where its
   sessions are. A declaration whose field set does not match fails `st2
-  validate` rather than resolving silently back to the default.
+  validate` rather than resolving silently back to the default. The complete
+  registry census has one 10-second deadline: a busy shared fleet remains
+  admissible, while a wedged runtime fails the pass closed instead of hanging
+  reconciliation.
 
 ## Message lifecycle
 
