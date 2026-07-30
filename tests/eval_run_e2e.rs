@@ -236,7 +236,7 @@ eval {
       exec "test -f $CATALOG/sup/roots-ok && test -f $CATALOG/worker/roots-ok"
     }
     judge "render materialized before launch" {
-      exec "test \"$(cat $CATALOG/sup/materialized.txt)\" = rendered"
+      exec "test -f $CATALOG/sup/render-seen-at-process-start"
     }
     judge "custom main id survived supervision" {
       exec "test -f $CATALOG/worker/restarted-once"
@@ -306,6 +306,8 @@ exec sleep 60
     std::fs::write(
         fixture.join("scripts/sup.sh"),
         r#"#!/bin/sh
+test "$(cat "$CATALOG/sup/materialized.txt")" = rendered || exit 41
+: > "$CATALOG/sup/render-seen-at-process-start"
 echo "canonical supervisor main"
 test "$CATALOG" = "$ST_ROOT" &&
   test "$PTY_ROOT" = "$CATALOG/pty" &&
@@ -723,6 +725,20 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
                 (
                     "two",
                     r#"agent "two" { identity "two"; host "evalhost"; pty "agent" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
+                ),
+            ],
+        ),
+        (
+            "duplicate runtime task id",
+            "evalhost.one",
+            vec![
+                (
+                    "one",
+                    r#"agent "one" { identity "one"; host "evalhost"; pty "agent" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
+                ),
+                (
+                    "two",
+                    r#"agent "two" { identity "two"; host "evalhost"; pty "agent" { id "two-main"; command "sleep 60" }; exec "poison" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
                 ),
             ],
         ),

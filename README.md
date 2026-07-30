@@ -409,13 +409,14 @@ eval {
 `canonical-agents` then discovers and materializes declarations at
 `agents/<host>/<identity>/agent.kdl`. It is mutually exclusive with compact `team` / `agent` seats:
 the discovered vector is the sole authority for launch, kickoff routing, supervision, logs, and
-teardown. Strict catalog validation, main-PTY admission, and warning-free materialization all finish
-before a seat starts; backend launch errors are fatal. The native inbox/archive paths are frozen from
-that admitted vector, so later catalog mutation cannot redirect eval traffic. A multi-seat team
-completes only after the existing worker-report ordering; a singleton completes on its first
-interviewer-to-requester confirmation that post-dates the exact kickoff receipt. Canonical completion
-gates the verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and
-compact evals retain their flat bus and completion semantics.
+teardown. Strict catalog validation, main-PTY admission, fleet-unique nonempty task runtime IDs, and
+warning-free materialization all finish before a seat starts; backend launch errors are fatal. The
+native inbox/archive paths are frozen from that admitted vector, so later catalog mutation cannot
+redirect eval traffic. A multi-seat team completes only after the existing worker-report ordering.
+For a singleton, the requester inbox is snapshotted before kickoff; only a newly appearing
+interviewer reply at-or-after the exact kickoff receipt completes it. Canonical completion gates the
+verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
+evals retain their flat bus and completion semantics.
 
 `st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
 interface, and generated output must be reviewed before materialization.

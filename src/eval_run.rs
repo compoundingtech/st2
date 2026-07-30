@@ -128,6 +128,12 @@ fn admitted_route<'a>(
         .unwrap_or_else(|| panic!("strict canonical admission did not freeze route for `{id}`"))
 }
 
+fn task_runtime_id(spec: &AgentSpec, task: &Task, host: &str) -> String {
+    task.id
+        .clone()
+        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(host), task.name))
+}
+
 fn main_pty_id(spec: &AgentSpec, host: &str) -> Result<String> {
     let bus_id = spec.bus_id(host);
     let main = spec
@@ -151,10 +157,7 @@ fn main_pty_id(spec: &AgentSpec, host: &str) -> Result<String> {
             "Agent Spec `{bus_id}` main PTY named `agent` must be an independently launchable service"
         );
     }
-    let id = main
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("{bus_id}.agent"));
+    let id = task_runtime_id(spec, main, host);
     if id.trim().is_empty() {
         anyhow::bail!("Agent Spec `{bus_id}` main PTY id must be nonempty");
     }
@@ -211,7 +214,7 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
 
     let mut paths = BTreeMap::<PathBuf, usize>::new();
     let mut bus_ids = HashSet::new();
-    let mut main_ids = HashSet::new();
+    let mut runtime_ids = BTreeMap::<String, (String, bool)>::new();
     let mut seat_ids = Vec::new();
     let mut routes = BTreeMap::new();
     for spec in &found.specs {
@@ -254,8 +257,27 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             }
         }
         let main_id = main_pty_id(spec, host)?;
-        if !main_ids.insert(main_id.clone()) {
-            anyhow::bail!("canonical-agents found duplicate main PTY id `{main_id}`");
+        for task in &spec.tasks {
+            let runtime_id = task_runtime_id(spec, task, host);
+            if runtime_id.trim().is_empty() {
+                anyhow::bail!(
+                    "canonical-agents Agent Spec `{bus_id}` task `{}` runtime task id must be nonempty",
+                    task.name
+                );
+            }
+            let is_main = task.kind == TaskKind::Pty && task.name == "agent";
+            if let Some((previous, previous_is_main)) =
+                runtime_ids.insert(runtime_id.clone(), (bus_id.clone(), is_main))
+            {
+                let kind = if is_main && previous_is_main {
+                    "duplicate main PTY runtime task id"
+                } else {
+                    "duplicate runtime task id"
+                };
+                anyhow::bail!(
+                    "canonical-agents found {kind} `{runtime_id}` in `{previous}` and `{bus_id}`"
+                );
+            }
         }
         seat_ids.push(main_id);
         let agent_dir = spec
@@ -519,8 +541,9 @@ fn from_is(from: Option<&str>, id: &str) -> bool {
 
 /// Wait for the DONE signal, message-driven (not grade-poll). Multi-seat teams require a
 /// `sup → requester` confirmation whose timestamp follows a `worker → sup` report. A canonical
-/// singleton instead requires its confirmation to post-date the exact kickoff receipt. Compact
-/// singleton semantics remain unchanged. Bounded by `timeout`. Returns whether done fired.
+/// singleton instead requires a causally new requester-inbox entry at-or-after the exact kickoff
+/// receipt. Compact singleton semantics remain unchanged. Bounded by `timeout`. Returns whether done
+/// fired.
 fn wait_done(
     bus: &Path,
     canonical_routes: Option<&BTreeMap<String, CanonicalRoute>>,
@@ -528,6 +551,7 @@ fn wait_done(
     requester: &str,
     workers: &[String],
     kickoff_ts: Option<u64>,
+    requester_before_kickoff: Option<&HashSet<String>>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(),
 ) -> bool {
@@ -559,11 +583,16 @@ fn wait_done(
         let sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
         if workers.is_empty()
             && let Some(kickoff_ts) = kickoff_ts
+            && let Some(before) = requester_before_kickoff
         {
             let confirmed = crate::message::list_dir(&req_inbox)
                 .unwrap_or_default()
                 .iter()
-                .any(|m| from_is(m.from.as_deref(), sup) && m.ts_ms > kickoff_ts);
+                .any(|m| {
+                    !before.contains(&m.filename)
+                        && from_is(m.from.as_deref(), sup)
+                        && m.ts_ms >= kickoff_ts
+                });
             if confirmed {
                 return true;
             }
@@ -1074,6 +1103,13 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             Some(routes) => admitted_route(routes, &sup).inbox.clone(),
             None => bus.join(&sup).join("inbox"),
         };
+        let requester_before_kickoff = eval.canonical_agents.then(|| {
+            crate::message::list_dir(&bus.join(&msg.from).join("inbox"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|message| message.filename)
+                .collect::<HashSet<_>>()
+        });
         let kickoff_receipt =
             crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
             .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
@@ -1185,6 +1221,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                 &msg.from,
                 &workers,
                 kickoff_ts,
+                requester_before_kickoff.as_ref(),
                 eval.max_timeout,
                 &mut tick,
             )
@@ -1564,6 +1601,28 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 ],
             ),
             (
+                "duplicate runtime task id",
+                vec![
+                    (
+                        "agents/evalhost/one/agent.kdl",
+                        r#"agent "one" {
+  identity "one"
+  host "evalhost"
+  pty "agent" { id "shared"; command "sleep 60" }
+}"#,
+                    ),
+                    (
+                        "agents/evalhost/two/agent.kdl",
+                        r#"agent "two" {
+  identity "two"
+  host "evalhost"
+  pty "agent" { id "two-main"; command "sleep 60" }
+  exec "poison" { id "shared"; command "true" }
+}"#,
+                    ),
+                ],
+            ),
+            (
                 "main PTY",
                 vec![(
                     "agents/evalhost/worker/agent.kdl",
@@ -1777,6 +1836,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             req,
             &workers,
             None,
+            None,
             Duration::from_millis(100),
             noop,
         ));
@@ -1791,6 +1851,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             req,
             &workers,
             None,
+            None,
             Duration::from_millis(100),
             noop,
         ));
@@ -1802,6 +1863,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             sup,
             req,
             &workers,
+            None,
             None,
             Duration::from_millis(2000),
             noop,
@@ -1830,6 +1892,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 req,
                 &workers,
                 None,
+                None,
                 Duration::from_millis(2000),
                 noop,
             ),
@@ -1852,6 +1915,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             "req",
             &["w".to_string()],
             None,
+            None,
             Duration::from_millis(400),
             &mut tick,
         );
@@ -1860,7 +1924,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     }
 
     #[test]
-    fn canonical_singleton_done_requires_a_confirmation_after_the_exact_kickoff() {
+    fn canonical_singleton_done_is_new_after_kickoff_and_allows_the_same_millisecond() {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = root.path().join("agents/h/interviewer");
         let routes = BTreeMap::from([(
@@ -1871,7 +1935,15 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             },
         )]);
         let requester = root.path().join("requester/inbox");
-        seed_msg(&requester, 1_700_000_001_000, "aaaaaa", "h.interviewer");
+        let kickoff_ts = 1_700_000_002_000;
+        // An already-present message may even claim a FUTURE timestamp. Causality comes from the
+        // pre-kickoff filename snapshot, not wall-clock trust.
+        seed_msg(&requester, kickoff_ts + 1_000, "aaaaaa", "h.interviewer");
+        let before = crate::message::list_dir(&requester)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.filename)
+            .collect::<HashSet<_>>();
         let noop = &mut (|| {}) as &mut dyn FnMut();
         assert!(
             !wait_done(
@@ -1880,13 +1952,15 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 "h.interviewer",
                 "requester",
                 &[],
-                Some(1_700_000_002_000),
+                Some(kickoff_ts),
+                Some(&before),
                 Duration::from_millis(100),
                 noop,
             ),
-            "a pre-kickoff acknowledgement must not complete a singleton"
+            "a future-dated pre-kickoff acknowledgement must not complete a singleton"
         );
-        seed_msg(&requester, 1_700_000_003_000, "bbbbbb", "h.interviewer");
+        // Filename novelty establishes after-kickoff causality; `>=` keeps a valid same-ms reply.
+        seed_msg(&requester, kickoff_ts, "bbbbbb", "h.interviewer");
         assert!(
             wait_done(
                 root.path(),
@@ -1894,11 +1968,12 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 "h.interviewer",
                 "requester",
                 &[],
-                Some(1_700_000_002_000),
+                Some(kickoff_ts),
+                Some(&before),
                 Duration::from_secs(1),
                 noop,
             ),
-            "a post-kickoff singleton confirmation should complete promptly"
+            "a newly appearing same-ms singleton confirmation should complete promptly"
         );
     }
 

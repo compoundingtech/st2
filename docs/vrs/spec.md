@@ -29,9 +29,10 @@ and teardown.
 Admission applies `validate_for_host` strictly, then fails before spawn when
 discovery is empty, malformed, warning-bearing, duplicate, retired, nonlocal,
 noncanonical, root-overriding, unrunnable, or does not expose exactly one
-independently launchable service main PTY per declaration. Main runtime IDs
-must be nonempty and fleet-unique. Materialization warnings and backend launch
-errors are fatal. The kickoff target must resolve to exactly one member of the
+independently launchable service main PTY per declaration. Every resolved task
+runtime ID must be nonempty and fleet-unique, including collisions between a
+main PTY and another declaration's sidecar. Materialization warnings and
+backend launch errors are fatal. The kickoff target must resolve to exactly one member of the
 discovered fleet. The eval owns one native `CATALOG` / `ST_ROOT` and its
 `<catalog>/pty` registry; declarations cannot override those roots. Workspace
 renders are materialized before any seat starts.
@@ -40,9 +41,12 @@ Native inbox/archive paths are derived once from the admitted Agent Spec paths
 and carried as frozen data; routing never re-discovers the mutable catalog.
 The requester alone is an explicit eval-owned flat mailbox. Multi-seat
 completion retains the worker-report-before-supervisor-confirmation ordering.
-A singleton canonical team completes when its interviewer-to-requester
-confirmation post-dates the exact kickoff receipt. Canonical completion is a
-gating judge, so a timeout cannot pass on unrelated final-state checks alone.
+For a singleton, the eval snapshots the requester inbox before kickoff and
+completes only for a newly appearing interviewer reply whose timestamp is
+at-or-after the exact kickoff receipt. The filename snapshot rejects
+future-dated pre-seeded messages while `>=` accepts a causally new same-ms
+reply. Canonical completion is a gating judge, so a timeout cannot pass on
+unrelated final-state checks alone.
 
 Without `canonical-agents`, fixture declarations are not discovered or launched
 and compact evals retain their catalog-less flat bus. This explicit opt-in keeps
