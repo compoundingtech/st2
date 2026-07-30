@@ -124,10 +124,10 @@ agent "<identity>" {
 }
 ```
 
-`resource` binds an agent-local semantic name to an exact absolute URI. `_tag` selects a concrete
-resource contract understood by downstream readers; st2 preserves arbitrary non-empty tags without
-owning their schemas or resolving their URIs. Binding order is irrelevant and names must be unique
-within the agent:
+`resource` binds an agent-local semantic name to an exact RFC 3986 absolute URI. `_tag` selects a
+concrete resource contract understood by downstream readers; st2 preserves arbitrary non-empty tags
+and URI bytes without normalization. It neither owns their schemas nor resolves their targets.
+Binding order is irrelevant and names must be unique within the agent:
 
 ```kdl
 resource "work" _tag="github-issue" uri="github-issue://example/project/123"
@@ -271,9 +271,9 @@ st2 context read --full
 ```
 
 The roster includes retired declarations instead of silently conflating them with runtime
-presence. Both JSON shapes contain an additive `retired` boolean; `--enrich` additionally supplies
-`lastActivity` and `inbox`. Human output leaves active rows unchanged and appends `[retired]` to a
-retired row.
+presence. Both JSON shapes contain `retired` and the declaration's ordered `resources` descriptors;
+`--enrich` additionally supplies `lastActivity` and `inbox`. Human output leaves active rows
+unchanged and appends `[retired]` to a retired row.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and

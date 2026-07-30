@@ -14,8 +14,7 @@
 //!
 //! st2 consumes this crate, which is what keeps it a reference implementation rather than a copy:
 //! a second reader (a TUI, a linter) sees exactly the fields the runner sees, including the ones
-//! the runner's roster JSON does not carry (`supervisor`, `role`, `workspace`, `host`, Resource
-//! bindings).
+//! the runner's roster JSON does not carry (`supervisor`, `role`, `workspace`, `host`).
 //!
 //! Render-only fields (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`,
 //! `meta{}`) are read by the render layer and deliberately dropped here — that is what keeps a

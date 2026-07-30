@@ -434,11 +434,14 @@ fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
         Some(HOST),
         vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
     );
-    spec.resources.push(Resource {
-        name: "work".into(),
-        tag: "github-issue".into(),
-        uri: "github-issue://example/project/41".into(),
-    });
+    spec.resources.push(
+        Resource::new(
+            "work".into(),
+            "github-issue".into(),
+            "github-issue://example/project/41".into(),
+        )
+        .unwrap(),
+    );
 
     let specs = [spec];
     let plan = reconcile(&specs, &[live("hetz.a")], HOST);

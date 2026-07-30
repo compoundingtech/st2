@@ -309,16 +309,18 @@ uri = "worktree://github.com/example/project/main"
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let expected = vec![
-        Resource {
-            name: "source".into(),
-            tag: "worktree".into(),
-            uri: "worktree://github.com/example/project/main".into(),
-        },
-        Resource {
-            name: "work".into(),
-            tag: "github-issue".into(),
-            uri: "github-issue://example/project/41".into(),
-        },
+        Resource::new(
+            "source".into(),
+            "worktree".into(),
+            "worktree://github.com/example/project/main".into(),
+        )
+        .unwrap(),
+        Resource::new(
+            "work".into(),
+            "github-issue".into(),
+            "github-issue://example/project/41".into(),
+        )
+        .unwrap(),
     ];
     for identity in ["json", "kdl", "toml"] {
         assert_eq!(find(&found.specs, identity).resources, expected);
@@ -425,6 +427,61 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
             .message
             .contains("duplicate resource binding 'work'")
     );
+}
+
+#[test]
+fn public_resource_json_deserialization_enforces_the_catalog_invariants() {
+    for descriptor in [
+        r#"{"name":"","_tag":"issue","uri":"issue://one"}"#,
+        r#"{"name":"work","_tag":"","uri":"issue://one"}"#,
+        r#"{"name":"work","_tag":"issue","uri":"./relative"}"#,
+        r#"{"name":"work","_tag":"issue","uri":"issue://one","required":true}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<Resource>(descriptor).is_err(),
+            "{descriptor}"
+        );
+    }
+}
+
+#[test]
+fn forbidden_raw_uri_characters_are_rejected_across_declaration_formats() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        r##"agent "kdl" {
+  command "true"
+  resource "work" _tag="opaque" uri=#"thing://bad\slash"#
+}"##,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{
+  "identity": "json",
+  "command": "true",
+  "resource": {"work": {"_tag": "opaque", "uri": "thing://bad<left"}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+command = "true"
+
+[resource.work]
+_tag = "opaque"
+uri = 'thing://bad"quote'
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
+    assert!(found.errors.iter().all(|error| error
+        .message
+        .contains("must be an exact absolute URI")));
 }
 
 #[test]

@@ -53,12 +53,59 @@ pub struct AgentSpec {
 ///
 /// `name` is the role the resource plays for this agent, `tag` selects the downstream resource
 /// contract, and `uri` is the exact absolute identity. The envelope deliberately carries no policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Resource {
-    pub name: String,
+    name: String,
     #[serde(rename = "_tag")]
-    pub tag: String,
-    pub uri: String,
+    tag: String,
+    uri: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceDescriptor {
+    name: String,
+    #[serde(rename = "_tag")]
+    tag: String,
+    uri: String,
+}
+
+impl Resource {
+    /// Construct a descriptor after enforcing the same invariants as catalog parsing.
+    pub fn new(name: String, tag: String, uri: String) -> Result<Self, String> {
+        if name.is_empty() {
+            return Err("resource binding name cannot be empty".into());
+        }
+        if tag.is_empty() {
+            return Err(format!("resource binding '{name}' has an empty `_tag`"));
+        }
+        validate_absolute_uri(&uri).map_err(|reason| {
+            format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
+        })?;
+        Ok(Self { name, tag, uri })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
+impl<'de> Deserialize<'de> for Resource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let descriptor = ResourceDescriptor::deserialize(deserializer)?;
+        Self::new(descriptor.name, descriptor.tag, descriptor.uri).map_err(de::Error::custom)
+    }
 }
 
 /// The kind of job. Only `service` (long-running) remains — `type = batch` is retired; the native
@@ -304,22 +351,7 @@ impl RawResources {
         self.0
             .into_iter()
             .map(|(name, resource)| {
-                if name.is_empty() {
-                    anyhow::bail!("resource binding name cannot be empty");
-                }
-                if resource.tag.is_empty() {
-                    anyhow::bail!("resource binding '{name}' has an empty `_tag`");
-                }
-                validate_absolute_uri(&resource.uri).map_err(|reason| {
-                    anyhow::anyhow!(
-                        "resource binding '{name}' `uri` must be an exact absolute URI: {reason}"
-                    )
-                })?;
-                Ok(Resource {
-                    name,
-                    tag: resource.tag,
-                    uri: resource.uri,
-                })
+                Resource::new(name, resource.tag, resource.uri).map_err(anyhow::Error::msg)
             })
             .collect()
     }
@@ -374,17 +406,127 @@ fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
     {
         return Err("invalid scheme");
     }
-    if !uri.is_ascii()
-        || uri
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-    {
-        return Err("contains characters outside URI syntax");
+    if !uri.is_ascii() {
+        return Err("contains non-ASCII characters");
     }
-    let bytes = uri.as_bytes();
-    let mut offset = colon + 1;
+
+    let remainder = &uri[colon + 1..];
+    let (without_fragment, fragment) = match remainder.split_once('#') {
+        Some((head, fragment)) if !fragment.contains('#') => (head, Some(fragment)),
+        Some(_) => return Err("contains more than one fragment delimiter"),
+        None => (remainder, None),
+    };
+    let (hierarchy, query) = match without_fragment.split_once('?') {
+        Some((hierarchy, query)) => (hierarchy, Some(query)),
+        None => (without_fragment, None),
+    };
+
+    if let Some(authority_and_path) = hierarchy.strip_prefix("//") {
+        let (authority, path) = match authority_and_path.find('/') {
+            Some(slash) => (&authority_and_path[..slash], &authority_and_path[slash..]),
+            None => (authority_and_path, ""),
+        };
+        validate_uri_authority(authority)?;
+        validate_uri_component(path, b":@/")?;
+    } else {
+        validate_uri_component(hierarchy, b":@/")?;
+    }
+    if let Some(query) = query {
+        validate_uri_component(query, b":@/?")?;
+    }
+    if let Some(fragment) = fragment {
+        validate_uri_component(fragment, b":@/?")?;
+    }
+    Ok(())
+}
+
+fn validate_uri_authority(authority: &str) -> Result<(), &'static str> {
+    let mut at_parts = authority.split('@');
+    let first = at_parts.next().unwrap_or_default();
+    let second = at_parts.next();
+    if at_parts.next().is_some() {
+        return Err("authority contains more than one userinfo delimiter");
+    }
+    let host_port = match second {
+        Some(host_port) => {
+            validate_uri_component(first, b":")?;
+            host_port
+        }
+        None => first,
+    };
+
+    if let Some(literal) = host_port.strip_prefix('[') {
+        let Some(close) = literal.find(']') else {
+            return Err("authority contains an unclosed IP literal");
+        };
+        let address = &literal[..close];
+        let after = &literal[close + 1..];
+        if address.is_empty() || after.contains('[') || after.contains(']') {
+            return Err("authority contains an invalid IP literal");
+        }
+        if address.starts_with('v') || address.starts_with('V') {
+            validate_ipv_future(address)?;
+        } else if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("authority contains an invalid IPv6 literal");
+        }
+        validate_uri_port(after)?;
+        return Ok(());
+    }
+    if host_port.contains('[') || host_port.contains(']') {
+        return Err("authority contains misplaced IP-literal brackets");
+    }
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            if host.contains(':') {
+                return Err("IPv6 authority literals must be bracketed");
+            }
+            (host, Some(port))
+        }
+        None => (host_port, None),
+    };
+    validate_uri_component(host, b"")?;
+    if let Some(port) = port
+        && !port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("authority port contains a non-digit");
+    }
+    Ok(())
+}
+
+fn validate_uri_port(after_literal: &str) -> Result<(), &'static str> {
+    if after_literal.is_empty() {
+        return Ok(());
+    }
+    let Some(port) = after_literal.strip_prefix(':') else {
+        return Err("IP literal is followed by invalid authority syntax");
+    };
+    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("authority port contains a non-digit");
+    }
+    Ok(())
+}
+
+fn validate_ipv_future(address: &str) -> Result<(), &'static str> {
+    let Some((version, body)) = address[1..].split_once('.') else {
+        return Err("authority contains an invalid IPvFuture literal");
+    };
+    if version.is_empty()
+        || !version.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || body.is_empty()
+        || body.contains('%')
+    {
+        return Err("authority contains an invalid IPvFuture literal");
+    }
+    validate_uri_component(body, b":")
+}
+
+fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str> {
+    let bytes = value.as_bytes();
+    let mut offset = 0;
     while offset < bytes.len() {
-        if bytes[offset] == b'%' {
+        let byte = bytes[offset];
+        if byte == b'%' {
             if offset + 2 >= bytes.len()
                 || !bytes[offset + 1].is_ascii_hexdigit()
                 || !bytes[offset + 2].is_ascii_hexdigit()
@@ -392,8 +534,30 @@ fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
                 return Err("contains an invalid percent escape");
             }
             offset += 3;
-        } else {
+        } else if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            )
+            || extra.contains(&byte)
+        {
             offset += 1;
+        } else {
+            return Err("contains a raw character forbidden by RFC 3986");
         }
     }
     Ok(())
@@ -560,5 +724,47 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30)); // bare = seconds
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn absolute_uri_syntax_accepts_rfc3986_characters_without_normalizing() {
+        for uri in [
+            "urn:isbn:978-0-395-36341-6",
+            "mailto:agent@example.com",
+            "https://example.com/a%20b?x=1&y=two#fragment",
+            "https://[2001:db8::1]:443/a",
+            "https://[v1.fe80]:443/a",
+            "file:///tmp/worktree",
+            "vendor+thing://authority/path;v=1",
+            "data:text/plain,hello",
+        ] {
+            assert_eq!(validate_absolute_uri(uri), Ok(()), "{uri}");
+        }
+    }
+
+    #[test]
+    fn absolute_uri_syntax_rejects_forbidden_raw_characters_and_bad_escapes() {
+        for uri in [
+            "thing://bad\"quote",
+            "thing://bad\\slash",
+            "thing://bad<left",
+            "thing://bad>right",
+            "thing://bad^caret",
+            "thing://bad`tick",
+            "thing://bad{brace",
+            "thing://bad|pipe",
+            "thing://bad}brace",
+            "thing://bad space",
+            "thing://bad%2",
+            "thing://bad%zz",
+            "thing://host:not-a-port/path",
+            "thing://[2001:db8::1/path",
+            "thing://[v1.bad%20body]/path",
+            "thing://host/path#one#two",
+            "1thing://bad-scheme",
+            "./relative",
+        ] {
+            assert!(validate_absolute_uri(uri).is_err(), "{uri}");
+        }
     }
 }
