@@ -99,7 +99,8 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
 `copy` under `$CATALOG/_templates`. The Codex declaration repeats the exact decoded `<workspace>`
-bytes in its command-local `projects` trust table; keep both values byte-identical.
+bytes in its command-local `projects` trust table; keep both values byte-identical. This is a
+harness launch convention inside the opaque command, not agent-spec grammar enforced by st2.
 
 The compact declaration shape is:
 

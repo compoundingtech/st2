@@ -15,7 +15,8 @@ machine-specific install paths. Copy the appropriate file into
 catalog-owned templates. `role` is optional metadata; `supervisor` is optional runtime routing.
 Uncomment them when the agent has an assigned role or reports to another bus identity. In the Codex
 declaration, replacing `<workspace>` in both places keeps its command-local project trust key
-byte-identical to the declared workspace.
+byte-identical to the declared workspace. st2 treats that command as opaque; the trust flag is a
+Codex launch convention, not part of generic catalog validation.
 
 ## Lifecycle
 

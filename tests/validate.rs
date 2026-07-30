@@ -2,8 +2,6 @@
 //! it hit the spec. Each test builds a minimal catalog exercising one failure mode and asserts the
 //! exact issue code + severity; a clean catalog (and our shipped `examples/`) must validate spotless.
 
-use std::path::Path;
-
 use st2::validate::{Report, Severity, validate, validate_for_host};
 
 /// Write a set of `(relative-path, body)` files into a fresh temp catalog.
@@ -19,25 +17,6 @@ fn catalog(files: &[(&str, &str)]) -> tempfile::TempDir {
 
 fn has(r: &Report, code: &str, sev: Severity) -> bool {
     r.issues.iter().any(|i| i.code == code && i.severity == sev)
-}
-
-fn service(workspace: Option<&str>, command: &str, retired: bool, env: &str) -> String {
-    let workspace = workspace
-        .map(|path| format!("workspace {path:?};"))
-        .unwrap_or_default();
-    let retired = if retired { "retired true;" } else { "" };
-    format!(
-        r#"agent "w" {{
-  host "hetz"
-  {workspace}
-  {retired}
-  pty "agent" {{ command {command:?}; env {{ {env} }} }}
-}}"#
-    )
-}
-
-fn projects_config(workspace: &str, trust: &str, extra: &str) -> String {
-    format!("projects={{{workspace:?}={{trust_level={trust:?}{extra}}}}}")
 }
 
 // ---- clean cases -----------------------------------------------------------------------------
@@ -178,185 +157,6 @@ fn a_catalog_rooted_path_that_exists_is_clean() {
         ("repo/.keep", ""),
     ]);
     assert!(!has(&validate(c.path()), "bad-path", Severity::Error));
-}
-
-#[test]
-fn codex_project_trust_accepts_every_supported_config_argument_form() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let config = projects_config(workspace, "trusted", ", note=\"allowed\"");
-    let commands = [
-        format!("exec codex -c '{config}'"),
-        format!("exec codex -c'{config}'"),
-        format!("exec codex --config '{config}'"),
-        format!("exec codex --config='{config}'"),
-    ];
-
-    for command in commands {
-        let declaration = service(Some(workspace), &command, false, "");
-        let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-        let report = validate(c.path());
-        assert!(
-            !has(&report, "codex-project-trust", Severity::Error),
-            "command {command:?} should be valid: {:?}",
-            report.issues
-        );
-    }
-}
-
-#[test]
-fn active_codex_requires_project_trust_even_with_an_explicit_codex_home() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let declaration = service(
-        Some(workspace),
-        "exec codex --model gpt-5",
-        false,
-        r#"CODEX_HOME "/selected/account""#,
-    );
-    let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-    assert!(has(
-        &validate(c.path()),
-        "codex-project-trust",
-        Severity::Error
-    ));
-}
-
-#[test]
-fn codex_project_trust_is_structural_and_remains_fleet_wide_under_host_scope() {
-    let declaration = service(
-        Some("/workspace/declared/on/another/host"),
-        "exec codex",
-        false,
-        "",
-    );
-    let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-    let report = validate_for_host(c.path(), "Silber");
-    assert!(has(&report, "codex-project-trust", Severity::Error));
-    assert_eq!(
-        report.warnings(),
-        0,
-        "remote filesystem presence must remain host-scoped: {:?}",
-        report.issues
-    );
-}
-
-#[test]
-fn codex_project_key_is_compared_without_normalizing_either_path() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let lookalike = format!(
-        "{workspace}/../{}",
-        Path::new(workspace).file_name().unwrap().to_string_lossy()
-    );
-    let config = projects_config(&lookalike, "trusted", "");
-    let declaration = service(
-        Some(workspace),
-        &format!("exec codex -c '{config}'"),
-        false,
-        "",
-    );
-    let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-    assert!(has(
-        &validate(c.path()),
-        "codex-project-trust",
-        Severity::Error
-    ));
-}
-
-#[test]
-fn codex_projects_table_must_have_exactly_one_workspace_key() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let cases = [
-        "projects={}".to_string(),
-        format!(
-            "projects={{{workspace:?}={{trust_level=\"trusted\"}}, \"/other\"={{trust_level=\"trusted\"}}}}"
-        ),
-    ];
-    for config in cases {
-        let declaration = service(
-            Some(workspace),
-            &format!("exec codex -c '{config}'"),
-            false,
-            "",
-        );
-        let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-        assert!(has(
-            &validate(c.path()),
-            "codex-project-trust",
-            Severity::Error
-        ));
-    }
-}
-
-#[test]
-fn codex_project_trust_fails_closed_on_value_toml_and_duplicate_errors() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let untrusted = projects_config(workspace, "untrusted", "");
-    let malformed = "projects={";
-    let valid = projects_config(workspace, "trusted", "");
-    let cases = [
-        format!("exec codex -c '{untrusted}'"),
-        format!("exec codex -c '{malformed}'"),
-        format!("exec codex -c '{valid}' --config '{valid}'"),
-        "exec codex -c 'projects={".to_string(),
-    ];
-    for command in cases {
-        let declaration = service(Some(workspace), &command, false, "");
-        let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-        assert!(
-            has(&validate(c.path()), "codex-project-trust", Severity::Error),
-            "command {command:?} should fail closed"
-        );
-    }
-}
-
-#[test]
-fn codex_only_reads_projects_from_real_config_arguments() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let config = projects_config(workspace, "trusted", "");
-    let cases = [
-        format!("exec codex '{config}'"),
-        format!("exec codex -- --config '{config}'"),
-        format!("exec codex -c 'model=\"projects={{}}\"' ; echo '{config}'"),
-        format!("exec codex\nprintf '%s' --config '{config}'"),
-    ];
-    for command in cases {
-        let declaration = service(Some(workspace), &command, false, "");
-        let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-        assert!(
-            has(&validate(c.path()), "codex-project-trust", Severity::Error),
-            "incidental projects text in {command:?} must not count"
-        );
-    }
-}
-
-#[test]
-fn codex_project_trust_ignores_retired_non_codex_and_workspace_less_agents() {
-    let workspace = tempfile::tempdir().unwrap();
-    let workspace = workspace.path().to_str().unwrap();
-    let declarations = [
-        service(Some(workspace), "exec codex", true, ""),
-        service(Some(workspace), "exec claude", false, ""),
-        service(None, "exec codex", false, ""),
-        format!(
-            r#"agent "w" {{
-  host "hetz"
-  workspace {workspace:?}
-  pty "helper" {{ command "exec codex" }}
-}}"#
-        ),
-    ];
-    for declaration in declarations {
-        let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-        assert!(
-            !has(&validate(c.path()), "codex-project-trust", Severity::Error),
-            "control should be unaffected"
-        );
-    }
 }
 
 #[test]
@@ -611,24 +411,6 @@ fn cli_json_is_well_formed() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(v["errors"], 1);
     assert_eq!(v["issues"][0]["code"], "unknown-type");
-    assert_eq!(v["issues"][0]["severity"], "error");
-}
-
-#[test]
-fn cli_json_exposes_the_stable_codex_project_trust_code() {
-    let workspace = tempfile::tempdir().unwrap();
-    let declaration = service(
-        Some(workspace.path().to_str().unwrap()),
-        "exec codex",
-        false,
-        "",
-    );
-    let c = catalog(&[("hetz/w/agent.kdl", &declaration)]);
-    let out = run_validate(&[c.path().as_os_str(), std::ffi::OsStr::new("--json")]);
-    assert!(!out.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    assert_eq!(v["errors"], 1);
-    assert_eq!(v["issues"][0]["code"], "codex-project-trust");
     assert_eq!(v["issues"][0]["severity"], "error");
 }
 

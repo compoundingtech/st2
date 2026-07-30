@@ -54,13 +54,6 @@ impl AgentInput {
                      --dangerously-bypass-hook-trust{model}{extra} {}",
                     shell_single_quote(boot)
                 );
-                if let Some(reason) =
-                    crate::validate::codex_project_trust_error(&command, &self.workspace)
-                {
-                    anyhow::bail!(
-                        "compile-agent: generated Codex command has invalid project trust: {reason}"
-                    );
-                }
                 Ok(command)
             }
             other => anyhow::bail!(
@@ -70,8 +63,9 @@ impl AgentInput {
     }
 }
 
-/// One command-local Codex config override. TOML's table serializer owns key escaping so the
-/// decoded key is byte-identical to the declared workspace even when it contains quotes or slashes.
+/// One generator-owned, command-local Codex config override. TOML's table serializer owns key
+/// escaping so the decoded key is byte-identical to the declared workspace even when it contains
+/// quotes or slashes. Generic catalog validation continues to treat the resulting command as opaque.
 fn codex_project_trust(workspace: &str) -> String {
     let mut project = toml::Table::new();
     project.insert(
