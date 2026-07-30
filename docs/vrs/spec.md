@@ -16,7 +16,7 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
-## Resource bindings
+## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:
 
