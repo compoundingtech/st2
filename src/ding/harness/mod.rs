@@ -20,8 +20,8 @@ use super::composer::ComposerState;
 /// stays behind [`Harness`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReceiptState {
-    /// The unique exact notice is rendered outside an empty live composer, proving that the
-    /// harness moved it into its submitted or queued surface.
+    /// The expected notice text is visible in the harness's submitted-prompt or queued-message
+    /// pattern while the live composer is empty or an accepted idle placeholder.
     Accepted,
     /// The exact notice remains the complete live composer and Return is currently safe.
     RetainedSafe,
@@ -55,14 +55,15 @@ pub(super) trait Harness {
     fn classify(&self, screen: &Screen<'_>, expected: &str) -> ComposerState;
 
     /// Classify post-submit evidence for one exact notice. Implementations may return `Accepted`
-    /// only when the lowest live composer is empty and the unique exact notice is rendered
-    /// elsewhere in that maintained harness's screen.
+    /// only when the lowest live composer is empty or an accepted idle placeholder and the
+    /// expected notice text is visible in that harness's submitted-prompt or queued-message
+    /// pattern.
     fn receipt(&self, screen: &Screen<'_>, expected: &str) -> ReceiptState;
 }
 
-/// The unique normalized notice is visible in a harness-owned accepted surface: either a submitted
-/// prompt for that harness or the explicit queued-message region. Whitespace normalization admits
-/// renderer soft wraps; the caller separately proves that the lowest live composer is empty.
+/// The normalized expected notice text is visible after this harness's submitted-prompt glyph or
+/// after the explicit queued-message heading. Whitespace compaction admits renderer soft wraps;
+/// the caller separately proves that the lowest live composer is empty or an accepted placeholder.
 pub(super) fn screen_has_accepted_notice(
     screen: &Screen<'_>,
     submitted_prompt: char,

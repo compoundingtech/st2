@@ -64,9 +64,9 @@ draft, because a draft is not empty.
 The exact notice as the complete lowest live composer is `RetainedSafe` only
 with the ordinary idle proof and no blocking state; otherwise it is
 `RetainedBlocked`. `Accepted` requires both an empty or recognized placeholder
-in the lowest live composer and the unique exact notice rendered elsewhere in
-the pane as a submitted or queued turn. A placeholder alone, disappearance, a
-different live draft, and unrecognized pixels are `Unproven`.
+in the lowest live composer and the expected notice text in the adapter's
+submitted-prompt or queued-message pattern. A placeholder alone, disappearance,
+a different live draft, and unrecognized pixels are `Unproven`.
 
 ## Blocked states
 

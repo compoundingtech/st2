@@ -50,9 +50,9 @@ enumeration in [`../spec.md`](../spec.md).
 The exact notice as the complete lowest live composer is `RetainedSafe` only
 with the ordinary idle proof and no blocking state; otherwise it is
 `RetainedBlocked`. `Accepted` requires both an empty lowest live composer and
-the unique exact notice rendered elsewhere in the pane, such as the submitted
-turn or queued-message surface. An empty composer alone, disappearance, a
-different live draft, and unrecognized pixels are `Unproven`.
+the expected notice text in the adapter's submitted-prompt or queued-message
+pattern. An empty composer alone, disappearance, a different live draft, and
+unrecognized pixels are `Unproven`.
 
 ## Blocked states
 

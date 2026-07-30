@@ -41,21 +41,22 @@ is in [`spec.md`](./spec.md).
 
 ## Requirements
 
-### Must never disturb a human
+### Must preserve initial transport and gate every retry
 
-- **DING-R01 Positive idle precondition:** Text is pasted only after a
-  maintained harness's composer has been positively identified as present,
-  empty, and idle. Absence of evidence that a human is typing is not evidence
-  of an idle composer.
-- **DING-R02 Two adjacent exact observations:** Return is pressed only after the
-  exact staged notice has been observed as the complete composer contents twice
-  in immediately adjacent inspections, with the final observation adjacent to
-  the Return itself. Any change, block, or uncertainty between them prevents
-  submission.
-- **DING-R03 Fail-closed default:** A changed composer, a human draft, an
-  active turn, a modal, an unreadable screen, an unrecognized harness, and a
-  bounded observation timeout all withhold Return. The default for anything not
-  positively understood is deferral.
+- **DING-R01 Combined initial transport:** A fresh notice uses one bounded PTY
+  transaction containing the bracketed paste, the accepted 0.5 second delay,
+  and Return. Ownership is recorded before that command starts. Composer
+  heuristics do not split or suppress this initial transport.
+- **DING-R02 Two adjacent retained-safe retry observations:** A later bare
+  Return is permitted only for a transport-owned payload whose exact notice is
+  still the complete composer and is classified `RetainedSafe` in two
+  immediately adjacent inspections. The final observation is adjacent to the
+  Return itself. Any change, block, or uncertainty prevents retry submission.
+- **DING-R03 Fail-closed receipt and retry:** After the initial transport, a
+  changed composer, a human draft, an active turn, a modal, an unreadable
+  screen, an unrecognized harness, and a bounded observation timeout never
+  become `Delivered` and receive no retry input. Anything not positively
+  understood retains staged ownership.
 
 ### Must classify the surface it will actually type into
 
@@ -87,12 +88,12 @@ is in [`spec.md`](./spec.md).
 - **DING-R09 Presence gate:** Declared `busy` is observable but never suppresses
   delivery; only fresh `dnd` defers it. Delivery may wake a working agent.
 - **DING-R10 Positive harness receipt:** `Delivered` requires adapter-provided
-  positive evidence that the unique exact notice moved from the lowest live
-  composer into the maintained harness's rendered submitted or queued surface.
-  PTY command success, generic screen change, disappearance alone, and
-  ambiguous pixels are not receipts. Until that evidence exists, a transport
-  attempt retains staged ownership and retries by inspection without
-  re-pasting.
+  classification that the expected notice text is visible in that harness's
+  submitted-prompt or queued-message pattern while its lowest live composer is
+  empty or an accepted idle placeholder. PTY command success, generic screen
+  change, disappearance alone, and ambiguous pixels are not receipts. Until
+  that evidence exists, a transport attempt retains staged ownership and
+  retries by inspection without re-pasting.
 
 ## Evidence
 

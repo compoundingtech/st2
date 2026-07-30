@@ -1,14 +1,14 @@
 //! Native inbox-to-terminal DING delivery.
 //!
-//! Every maintained harness uses the same fail-closed transport: positively identify an empty
-//! composer, bracketed-paste the normalized notice without Return, and submit only after two exact
-//! safe-composer observations. A human draft, active turn, modal, changed composer, unreadable
-//! screen, or bounded observation timeout never receives Return.
+//! Fresh delivery preserves one bounded production transport containing the normalized
+//! bracketed-paste, a 0.5 second delay, and Return. Once that transaction has started, any command
+//! or receipt ambiguity retains staged ownership. A later bare-Return retry is allowed only after
+//! two adjacent adapter observations prove the exact retained composer is safe.
 //!
 //! Once a paste command starts, the sidecar owns that payload and retries by inspection only. It
 //! never pastes the same notice again while that transport attempt remains owned.
-//! PTY or Return success is not delivery: a harness adapter must positively prove that the unique
-//! exact notice moved into its rendered submitted or queued surface.
+//! PTY or Return success is not delivery: a harness adapter must positively classify the expected
+//! notice text in its submitted-prompt or queued-message pattern while the live composer is empty.
 //! This preserves FIFO/archive behavior without letting a command timeout create duplicate text.
 //! Startup can adopt an exact staged recovery or backlog notice before coalescing remaining unread
 //! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
@@ -334,7 +334,7 @@ fn transport_and_observe_with_window(
 }
 
 /// Observe one bounded post-submit window. PTY success, disappearance, and generic screen change
-/// are not receipts; only adapter-provided positive evidence for the unique exact notice completes
+/// are not receipts; only the adapter's positive accepted-pattern classification completes
 /// delivery.
 fn observe_receipt_with_window(
     text: &str,
@@ -1806,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_notice_outside_an_empty_live_composer_is_a_positive_receipt() {
+    fn adapter_recognized_notice_with_an_empty_live_composer_is_a_positive_receipt() {
         let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
         assert_eq!(
             classify_receipt(&queued_codex_screen(text), text),
@@ -1826,7 +1826,7 @@ mod tests {
                 text
             ),
             ReceiptState::Unproven,
-            "exact text outside an adapter-owned accepted surface is not a receipt"
+            "notice text outside an adapter-recognized accepted pattern is not a receipt"
         );
         assert_eq!(
             classify_receipt(
