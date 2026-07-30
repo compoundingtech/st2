@@ -125,14 +125,13 @@
 
         # Narrow sandbox-safe integration gate for the atomic snapshot boundary. The main package
         # deliberately omits the broad doctor suite because some doctor cases exercise facilities
-        # unavailable in the Nix sandbox; this derivation executes the one hermetic regression by
-        # its unique test name so it cannot be present-but-invisible to CI.
+        # unavailable in the Nix sandbox. A dedicated target containing exactly one test makes the
+        # gate structurally non-vacuous: a missing target is a cargo error, never a zero-match pass.
         st2AtomicPtySnapshot = st2.overrideAttrs (_: {
           pname = "st2-atomic-pty-snapshot-check";
           cargoTestFlags = [
             "--test"
-            "doctor"
-            "doctor_rejects_a_partial_pty_snapshot_atomically"
+            "atomic_pty_snapshot"
           ];
         });
 
