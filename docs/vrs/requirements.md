@@ -104,10 +104,12 @@ accepted.
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
-  uniquely named, order-independent Resource bindings. Each binding preserves
-  an opaque type discriminator and an RFC 3986 absolute URI byte-for-byte without
-  normalization. The generic envelope does not imply resolution, access,
-  readiness, or lifecycle semantics.
+  order-independent Resource bindings. Each binding has a non-empty, agent-local
+  unique name and preserves a non-empty, opaque type discriminator and an RFC
+  3986 absolute URI byte-for-byte without normalization. The generic envelope
+  does not imply resolution, access, readiness, or lifecycle semantics;
+  declarations that add such unsupported policy are rejected rather than
+  silently ignored.
 - **R21 Nondisruptive Resource observation:** Machine-readable catalog
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
