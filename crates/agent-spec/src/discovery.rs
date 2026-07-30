@@ -202,7 +202,7 @@ fn resolve_spec(
         (None, None) => None,
     };
 
-    let spec = raw.into_agent_spec(identity, host, path.to_path_buf());
+    let spec = raw.into_agent_spec(identity, host, path.to_path_buf())?;
     Ok(Some((spec, warnings)))
 }
 

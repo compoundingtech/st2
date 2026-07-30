@@ -65,8 +65,12 @@ pub struct Task {
     pub name: String,
     /// Explicit on-disk id. `None` → `<host>.<identity>.<name>` at spawn.
     pub id: Option<String>,
-    /// The exec command line, run verbatim under `sh -c`. No command → not a launch target.
+    /// A shell program, run verbatim under `sh -c`.
     pub command: Option<String>,
+    /// A direct program invocation. Element 0 is the program and the rest are its arguments.
+    ///
+    /// Mutually exclusive with [`Task::command`]. Neither field means this is not a launch target.
+    pub argv: Option<Vec<String>>,
     /// Working dir; `None` → the agent's `workspace`, else the spec file's directory.
     pub cwd: Option<String>,
     /// Arbitrary metadata (values are `$`-expanded at spawn).
@@ -135,12 +139,12 @@ impl AgentSpec {
         self.host.as_deref().unwrap_or(this_host)
     }
 
-    /// True once at least one authored task carries an explicit `command` (i.e. the job was
-    /// rendered). A generated sidecar cannot make an otherwise-empty job runnable.
+    /// True once at least one authored task carries an explicit shell command or direct argv (i.e.
+    /// the job was rendered). A generated sidecar cannot make an otherwise-empty job runnable.
     pub fn is_runnable(&self) -> bool {
         self.tasks
             .iter()
-            .any(|task| !task.derived && task.command.is_some())
+            .any(|task| !task.derived && (task.command.is_some() || task.argv.is_some()))
     }
 
     /// The restart policy in effect (declared, else the runner default).
@@ -197,6 +201,8 @@ pub(crate) struct RawSpec {
     pub restart: Option<RawRestart>,
     /// Compact catalog form: the agent itself is one pty carrying this command.
     pub command: Option<String>,
+    /// Compact catalog form: the agent itself is one pty launched directly with this argv.
+    pub argv: Option<Vec<String>>,
     /// Compact catalog form: environment inherited by the agent pty and every sidecar.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -215,6 +221,7 @@ pub(crate) struct RawSpec {
 pub(crate) struct RawTask {
     pub id: Option<String>,
     pub command: Option<String>,
+    pub argv: Option<Vec<String>>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -261,6 +268,7 @@ impl RawSpec {
         self.identity.is_some()
             || self.job_type.is_some()
             || self.command.is_some()
+            || self.argv.is_some()
             || self.ding
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -272,18 +280,29 @@ impl RawSpec {
         identity: String,
         host: Option<String>,
         path: PathBuf,
-    ) -> AgentSpec {
+    ) -> anyhow::Result<AgentSpec> {
+        validate_launch(
+            &identity,
+            self.command.as_ref(),
+            self.argv.as_ref(),
+            "compact task",
+        )?;
+        if (self.command.is_some() || self.argv.is_some()) && self.pty.contains_key("agent") {
+            anyhow::bail!(
+                "agent '{identity}' declares both a compact launch and `pty \"agent\"`; choose one form"
+            );
+        }
         let bus_id = format!("{}.{}", host.as_deref().unwrap_or_default(), identity)
             .trim_start_matches('.')
             .to_string();
         let mut tasks: Vec<Task> = Vec::new();
         for (name, t) in self.pty {
-            tasks.push(t.lower(TaskKind::Pty, name, &self.env));
+            tasks.push(t.lower(&identity, TaskKind::Pty, name, &self.env)?);
         }
         for (name, t) in self.exec {
-            tasks.push(t.lower(TaskKind::Exec, name, &self.env));
+            tasks.push(t.lower(&identity, TaskKind::Exec, name, &self.env)?);
         }
-        if let Some(command) = self.command {
+        if self.command.is_some() || self.argv.is_some() {
             let mut tags = BTreeMap::new();
             tags.insert("role".to_string(), "agent".to_string());
             tasks.push(Task {
@@ -292,7 +311,8 @@ impl RawSpec {
                 name: "agent".to_string(),
                 // An agent IS its pty: ding defaults its poke target to this same bus id.
                 id: Some(bus_id.clone()),
-                command: Some(command),
+                command: self.command,
+                argv: self.argv,
                 cwd: None,
                 tags,
                 env: self.env.clone(),
@@ -306,6 +326,7 @@ impl RawSpec {
                 name: "ding".to_string(),
                 id: Some(format!("{bus_id}.ding")),
                 command: Some(format!("st2 ding --identity {bus_id} --root $ST_ROOT")),
+                argv: None,
                 cwd: None,
                 tags: BTreeMap::new(),
                 env: self.env,
@@ -317,7 +338,7 @@ impl RawSpec {
         // `service` is the only job type; a stray `type` string is caught by validate (unknown-type).
         let job_type = JobType::Service;
 
-        AgentSpec {
+        Ok(AgentSpec {
             identity,
             host,
             role: self.role,
@@ -329,31 +350,59 @@ impl RawSpec {
             restart: self.restart.map(RawRestart::lower),
             tasks,
             path,
-        }
+        })
     }
 }
 
 impl RawTask {
     pub(crate) fn lower(
         self,
+        identity: &str,
         kind: TaskKind,
         name: String,
         inherited_env: &BTreeMap<String, String>,
-    ) -> Task {
+    ) -> anyhow::Result<Task> {
+        validate_launch(
+            identity,
+            self.command.as_ref(),
+            self.argv.as_ref(),
+            &format!("{kind:?} task '{name}'"),
+        )?;
         let mut env = inherited_env.clone();
         env.extend(self.env);
-        Task {
+        Ok(Task {
             kind,
             derived: false,
             name,
             id: self.id,
             command: self.command,
+            argv: self.argv,
             cwd: self.cwd,
             tags: self.tags,
             env,
             keep: self.keep,
-        }
+        })
     }
+}
+
+fn validate_launch(
+    identity: &str,
+    command: Option<&String>,
+    argv: Option<&Vec<String>>,
+    location: &str,
+) -> anyhow::Result<()> {
+    if command.is_some() && argv.is_some() {
+        anyhow::bail!(
+            "agent '{identity}' {location} declares both `command` and `argv`; choose one launch form"
+        );
+    }
+    if argv.is_some_and(Vec::is_empty) {
+        anyhow::bail!("agent '{identity}' {location} declares an empty `argv`");
+    }
+    if argv.is_some_and(|argv| argv.first().is_some_and(String::is_empty)) {
+        anyhow::bail!("agent '{identity}' {location} declares an empty `argv` program");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

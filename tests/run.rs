@@ -1,17 +1,414 @@
 //! M1 correctness net: plan execution against a fake Runner (no real processes spawned).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use st2::message;
 use st2::reconcile::{Session, TaskTarget};
 use st2::run::Runner;
-use st2::message;
-use st2::run::{CrashLoop, surface_crash_loop};
+use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
+use st2::spec::{AgentSpec, JobType, Task, TaskKind};
+
+fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
+    format!(
+        r#"agent "{identity}" {{
+  host "host"
+  type "service"
+  workspace "{}"
+  pty "work" {{
+    id "host.{identity}.work"
+    command "true"
+  }}
+  render {{
+    {render}
+  }}
+}}
+"#,
+        workspace.display()
+    )
+}
+
+fn write_selected_catalog(
+    catalog: &Path,
+    owner_workspace: &Path,
+    sibling_workspace: &Path,
+    owner_render: &str,
+) {
+    fs::create_dir_all(owner_workspace).unwrap();
+    fs::create_dir_all(sibling_workspace).unwrap();
+    write(
+        catalog,
+        "agents/host/owner/agent.kdl",
+        &selected_catalog_agent("owner", owner_workspace, owner_render),
+    );
+    write(
+        catalog,
+        "agents/host/sibling/agent.kdl",
+        &selected_catalog_agent(
+            "sibling",
+            sibling_workspace,
+            r#"file "SIBLING.txt" "sibling""#,
+        ),
+    );
+}
+
+#[test]
+fn selected_catalog_two_agent_kdl_recording_runner_matrix() {
+    enum Actual {
+        Missing,
+        Live,
+        Dead,
+    }
+
+    for actual in [Actual::Missing, Actual::Live, Actual::Dead] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let owner_workspace = tmp.path().join("owner-workspace");
+        let sibling_workspace = tmp.path().join("sibling-workspace");
+        write_selected_catalog(
+            &catalog,
+            &owner_workspace,
+            &sibling_workspace,
+            r#"file "OWNER.txt" "owner""#,
+        );
+
+        let mut sessions = vec![live("host.sibling.work")];
+        match actual {
+            Actual::Missing => {}
+            Actual::Live => sessions.push(live("host.owner.work")),
+            Actual::Dead => sessions.push(dead("host.owner.work")),
+        }
+        let runner = FakeRunner {
+            sessions,
+            ..Default::default()
+        };
+
+        let report = up_once_selected(&catalog, "host.owner.work", "host", &runner).unwrap();
+
+        assert_eq!(runner.list_calls.get(), 1);
+        assert_eq!(
+            fs::read_to_string(owner_workspace.join("OWNER.txt")).unwrap(),
+            "owner"
+        );
+        assert!(
+            !sibling_workspace.join("SIBLING.txt").exists(),
+            "the unrelated owner must not be materialized"
+        );
+        assert!(runner.killed.borrow().is_empty());
+        assert!(runner.removed.borrow().is_empty());
+        match actual {
+            Actual::Missing => {
+                assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
+                assert!(runner.reaped.borrow().is_empty());
+                assert_eq!(report.launched, ["host.owner.work"]);
+            }
+            Actual::Live => {
+                assert!(runner.spawned.borrow().is_empty());
+                assert!(runner.reaped.borrow().is_empty());
+                assert_eq!(report.adopted, ["owner"]);
+            }
+            Actual::Dead => {
+                assert_eq!(runner.reaped.borrow().as_slice(), ["host.owner.work"]);
+                assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
+                assert_eq!(report.gc, ["host.owner.work"]);
+                assert_eq!(report.launched, ["host.owner.work"]);
+            }
+        }
+        assert!(
+            runner
+                .spawned
+                .borrow()
+                .iter()
+                .chain(runner.reaped.borrow().iter())
+                .all(|id| id == "host.owner.work")
+        );
+    }
+}
+
+#[test]
+fn selected_catalog_surfaces_unrelated_malformed_diagnostics_without_blocking_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let owner_workspace = tmp.path().join("owner-workspace");
+    let sibling_workspace = tmp.path().join("sibling-workspace");
+    write_selected_catalog(
+        &catalog,
+        &owner_workspace,
+        &sibling_workspace,
+        r#"file "OWNER.txt" "owner""#,
+    );
+    write(
+        &catalog,
+        "agents/host/sibling/broken.kdl",
+        r#"agent "broken" {"#,
+    );
+    let runner = FakeRunner {
+        sessions: vec![live("host.sibling.work")],
+        ..Default::default()
+    };
+
+    let report = up_once_selected(&catalog, "host.owner.work", "host", &runner).unwrap();
+
+    assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
+    assert_eq!(
+        fs::read_to_string(owner_workspace.join("OWNER.txt")).unwrap(),
+        "owner"
+    );
+    assert!(!sibling_workspace.join("SIBLING.txt").exists());
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("broken.kdl") && error.contains("KDL")),
+        "{:?}",
+        report.errors
+    );
+}
+
+#[test]
+fn selected_catalog_owner_render_failure_refuses_runner_actions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let owner_workspace = tmp.path().join("owner-workspace");
+    let sibling_workspace = tmp.path().join("sibling-workspace");
+    write_selected_catalog(
+        &catalog,
+        &owner_workspace,
+        &sibling_workspace,
+        r#"copy "_templates/missing" "OWNER.txt""#,
+    );
+    let runner = FakeRunner {
+        sessions: vec![live("host.sibling.work")],
+        ..Default::default()
+    };
+
+    let report = up_once_selected(&catalog, "host.owner.work", "host", &runner).unwrap();
+
+    assert_eq!(runner.list_calls.get(), 0);
+    assert_refusal(&runner);
+    assert!(!owner_workspace.join("OWNER.txt").exists());
+    assert!(!sibling_workspace.join("SIBLING.txt").exists());
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("_templates/missing")),
+        "{:?}",
+        report.errors
+    );
+}
+
+#[test]
+fn selected_one_shot_unknown_refuses_before_runner_list() {
+    let runner = FakeRunner::default();
+    let error =
+        up_once_selected_specs(Path::new("/tmp"), &[], "host.missing.task", "host", &runner)
+            .unwrap_err();
+    assert!(error.to_string().contains("did not resolve"));
+    assert_eq!(runner.list_calls.get(), 0);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+}
+
+fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
+    AgentSpec {
+        identity: identity.into(),
+        host: host.map(str::to_owned),
+        role: None,
+        job_type: JobType::Service,
+        workspace: None,
+        supervisor: None,
+        retired: false,
+        keep: false,
+        restart: None,
+        tasks: vec![Task {
+            kind: TaskKind::Exec,
+            derived: false,
+            name: "work".into(),
+            id: Some(id.into()),
+            command: Some("true".into()),
+            argv: None,
+            cwd: None,
+            tags: BTreeMap::new(),
+            env: BTreeMap::new(),
+            keep: false,
+        }],
+        path: "/tmp/spec.kdl".into(),
+    }
+}
+
+fn assert_refusal(runner: &FakeRunner) {
+    assert_eq!(runner.list_calls.get(), 0);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+}
+
+fn two_task_spec(identity: &str, first: &str, second: &str) -> AgentSpec {
+    let mut spec = task_spec(identity, None, first);
+    spec.tasks.push(Task {
+        kind: TaskKind::Exec,
+        derived: false,
+        name: "side".into(),
+        id: Some(second.into()),
+        command: Some("true".into()),
+        argv: None,
+        cwd: None,
+        tags: BTreeMap::new(),
+        env: BTreeMap::new(),
+        keep: false,
+    });
+    spec
+}
+
+#[test]
+fn selected_one_shot_missing_spawns_only_selected_task() {
+    let runner = FakeRunner {
+        sessions: vec![live("host.agent.side"), live("host.sibling.work")],
+        ..Default::default()
+    };
+    let specs = vec![
+        two_task_spec("agent", "host.agent.work", "host.agent.side"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.launched, ["host.agent.work"]);
+}
+
+#[test]
+fn selected_one_shot_live_adopts_without_actions() {
+    let runner = FakeRunner {
+        sessions: vec![
+            live("host.agent.work"),
+            live("host.agent.side"),
+            live("host.sibling.work"),
+        ],
+        ..Default::default()
+    };
+    let specs = vec![
+        two_task_spec("agent", "host.agent.work", "host.agent.side"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.adopted, ["agent"]);
+}
+
+#[test]
+fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
+    let runner = FakeRunner {
+        sessions: vec![
+            dead("host.agent.work"),
+            live("host.agent.side"),
+            live("host.sibling.work"),
+        ],
+        ..Default::default()
+    };
+    let specs = vec![
+        two_task_spec("agent", "host.agent.work", "host.agent.side"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(runner.reaped.borrow().as_slice(), ["host.agent.work"]);
+    assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.gc, ["host.agent.work"]);
+    assert_eq!(report.launched, ["host.agent.work"]);
+}
+
+#[test]
+fn selected_one_shot_second_live_pass_is_a_noop() {
+    let runner = FakeRunner {
+        sessions: vec![live("host.agent.work"), live("host.sibling.work")],
+        ..Default::default()
+    };
+    let specs = vec![
+        task_spec("agent", None, "host.agent.work"),
+        task_spec("sibling", None, "host.sibling.work"),
+    ];
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(runner.list_calls.get(), 1);
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.killed.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
+    assert_eq!(report.adopted, ["agent"]);
+}
+
+#[test]
+fn selected_one_shot_ambiguous_refuses_before_runner_list() {
+    let runner = FakeRunner::default();
+    let specs = vec![task_spec("one", None, "dup"), task_spec("two", None, "dup")];
+    let error =
+        up_once_selected_specs(Path::new("/tmp"), &specs, "dup", "host", &runner).unwrap_err();
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+    assert_refusal(&runner);
+}
+
+#[test]
+fn selected_one_shot_wrong_host_refuses_before_runner_list() {
+    let runner = FakeRunner::default();
+    let specs = vec![task_spec("remote", Some("other"), "other.remote.work")];
+    let error = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "other.remote.work",
+        "host",
+        &runner,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("did not resolve"));
+    assert_refusal(&runner);
+}
 use st2::{FlappingCap, UpReport, discover, down, execute, reconcile, up_once};
 
 #[derive(Default)]
 struct FakeRunner {
+    list_calls: Cell<usize>,
     sessions: Vec<Session>,
     fail_list: bool,
     fail_spawn: Option<String>,
@@ -25,6 +422,7 @@ struct FakeRunner {
 
 impl Runner for FakeRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        self.list_calls.set(self.list_calls.get() + 1);
         if self.fail_list {
             anyhow::bail!("simulated list failure");
         }
@@ -64,10 +462,18 @@ fn write(root: &Path, rel: &str, contents: &str) {
 }
 
 fn live(id: &str) -> Session {
-    Session { pty_id: id.to_string(), alive: true, exit_code: None }
+    Session {
+        pty_id: id.to_string(),
+        alive: true,
+        exit_code: None,
+    }
 }
 fn dead(id: &str) -> Session {
-    Session { pty_id: id.to_string(), alive: false, exit_code: None }
+    Session {
+        pty_id: id.to_string(),
+        alive: false,
+        exit_code: None,
+    }
 }
 
 /// A v2 service job: a pty agent + an exec ding.
@@ -115,7 +521,10 @@ fn up_once_adopts_when_all_tasks_already_live() {
 fn up_once_launches_only_the_missing_task() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
-    let runner = FakeRunner { sessions: vec![live("hetz.demo-claude")], ..Default::default() };
+    let runner = FakeRunner {
+        sessions: vec![live("hetz.demo-claude")],
+        ..Default::default()
+    };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched, vec!["hetz.demo.ding"]);
 }
@@ -148,8 +557,16 @@ command = "st2 ding hetz.demo"
 #[test]
 fn up_once_skips_other_host_specs() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/here/agent.toml", "identity=\"here\"\n[pty.agent]\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/silber/there/agent.toml", "identity=\"there\"\n[pty.agent]\ncommand=\"y\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/here/agent.toml",
+        "identity=\"here\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/silber/there/agent.toml",
+        "identity=\"there\"\n[pty.agent]\ncommand=\"y\"\n",
+    );
     let runner = FakeRunner::default();
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched.len(), 1);
@@ -160,7 +577,10 @@ fn up_once_skips_other_host_specs() {
 fn up_once_collects_spawn_errors_without_aborting() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
-    let runner = FakeRunner { fail_spawn: Some("hetz.demo-claude".into()), ..Default::default() };
+    let runner = FakeRunner {
+        fail_spawn: Some("hetz.demo-claude".into()),
+        ..Default::default()
+    };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched, vec!["hetz.demo.ding"]);
     assert_eq!(report.errors.len(), 1);
@@ -242,7 +662,10 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
         "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[restart]\nattempts=3\ninterval=\"60s\"\nmode=\"fail\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
     );
     let found = discover(tmp.path());
-    let runner = FakeRunner { sessions: vec![dead("hetz.demo-claude")], ..Default::default() };
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo-claude")],
+        ..Default::default()
+    };
     let mut cap = FlappingCap::default();
 
     let mut last = UpReport::default();
@@ -298,12 +721,19 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
 
     let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos-claude"));
     let msgs = message::list_dir(&inbox).unwrap();
-    assert_eq!(msgs.len(), 1, "supervisor gets exactly one crash-loop message");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "supervisor gets exactly one crash-loop message"
+    );
     let m = &msgs[0];
     assert_eq!(m.from.as_deref(), Some("st2.hetz")); // the runner is the sender
     assert_eq!(m.subject.as_deref(), Some("crash-loop: hetz.demo parked"));
     assert!(m.tags.contains(&"crash-loop".to_string()));
-    assert!(m.body.contains("hetz.demo-claude"), "body names the parked task");
+    assert!(
+        m.body.contains("hetz.demo-claude"),
+        "body names the parked task"
+    );
 }
 
 /// `st2 down` kills every LIVE task of THIS host's catalog agents (the explicit teardown), skips
@@ -311,13 +741,29 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
 #[test]
 fn down_tears_down_this_hosts_live_tasks_only() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", "identity=\"demo\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/hetz/dead/agent.toml", "identity=\"dead\"\n[pty.agent]\nid=\"hetz.dead\"\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/silber/other/agent.toml", "identity=\"other\"\nhost=\"silber\"\n[pty.agent]\nid=\"silber.other\"\ncommand=\"x\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.toml",
+        "identity=\"demo\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/dead/agent.toml",
+        "identity=\"dead\"\n[pty.agent]\nid=\"hetz.dead\"\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/silber/other/agent.toml",
+        "identity=\"other\"\nhost=\"silber\"\n[pty.agent]\nid=\"silber.other\"\ncommand=\"x\"\n",
+    );
 
     // demo is live, dead is dead, other belongs to another host + is live.
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo-claude"), dead("hetz.dead"), live("silber.other")],
+        sessions: vec![
+            live("hetz.demo-claude"),
+            dead("hetz.dead"),
+            live("silber.other"),
+        ],
         ..Default::default()
     };
     let report = down(tmp.path(), "hetz", &runner).unwrap();
@@ -351,9 +797,21 @@ fn surface_crash_loop_without_supervisor_sends_nothing() {
 #[test]
 fn up_once_surfaces_discovery_errors_and_unrunnable() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/good/agent.toml", "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n");
-    write(tmp.path(), "agents/hetz/bad/agent.toml", "identity=\"b\"\nnot valid =");
-    write(tmp.path(), "agents/hetz/nr/agent.toml", "identity=\"nr\"\ntype=\"service\"\n");
+    write(
+        tmp.path(),
+        "agents/hetz/good/agent.toml",
+        "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/bad/agent.toml",
+        "identity=\"b\"\nnot valid =",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/nr/agent.toml",
+        "identity=\"nr\"\ntype=\"service\"\n",
+    );
     let runner = FakeRunner::default();
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert_eq!(report.launched, vec!["hetz.good.agent"]);

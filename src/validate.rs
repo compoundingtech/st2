@@ -247,7 +247,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
                 "not-runnable",
                 rp.clone(),
                 ag.clone(),
-                "service agent has no task with a command (unrendered, or the renderer emitted none)"
+                "service agent has no task with `command` or `argv` (unrendered, or the renderer emitted none)"
                     .to_string(),
             ));
         }

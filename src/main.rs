@@ -53,9 +53,13 @@ enum Command {
         /// Materialize every local agent's render block and exit without reconciling or spawning.
         #[arg(long, conflicts_with = "once")]
         materialize_only: bool,
-        /// Limit materialization/reconciliation to one declared agent identity.
+        /// Limit materialization to one declared agent identity.
         #[arg(long)]
         agent: Option<String>,
+        /// Select one exact local task. Use with --materialize-only to render only its owner, or
+        /// with --once to render its owner and reconcile only that task.
+        #[arg(long, conflicts_with = "agent")]
+        task: Option<String>,
         /// Seconds between timer-driven reconcile passes when looping (folder changes reconcile
         /// immediately regardless).
         #[arg(long, default_value_t = 30)]
@@ -533,9 +537,16 @@ fn main() -> Result<()> {
             materialize_only,
             interval,
             agent,
+            task,
         } => {
             let root = catalog_arg(root)?;
-            up(&root, host, once, materialize_only, interval, agent)
+            if task.is_some() && !materialize_only && !once {
+                anyhow::bail!("--task requires --once or --materialize-only");
+            }
+            if agent.is_some() && !materialize_only {
+                anyhow::bail!("--agent requires --materialize-only");
+            }
+            up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
@@ -589,7 +600,12 @@ fn main() -> Result<()> {
             env_cmd(&root)
         }
         Command::Pretrust { dirs } => pretrust_cmd(&dirs),
-        Command::Eval { folder, host, keep, json } => eval_cmd(&folder, host, keep, json),
+        Command::Eval {
+            folder,
+            host,
+            keep,
+            json,
+        } => eval_cmd(&folder, host, keep, json),
         Command::Validate {
             root,
             host,
@@ -728,12 +744,18 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
         )
     })?;
     let keep = keep || std::env::var_os("ST2_EVAL_KEEP").is_some();
-    if json { unsafe { std::env::set_var("ST2_EVAL_JSON", "1"); } }
+    if json {
+        unsafe {
+            std::env::set_var("ST2_EVAL_JSON", "1");
+        }
+    }
     let report = st2::eval_run::run_eval(&spec_file, host, keep)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        if report.passed() { return Ok(()); }
+        if report.passed() {
+            return Ok(());
+        }
         anyhow::bail!("VERDICT: FAIL")
     }
 
@@ -1742,10 +1764,14 @@ fn up(
     materialize_only: bool,
     interval: u64,
     agent: Option<String>,
+    task: Option<String>,
 ) -> Result<()> {
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
     if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
+        if task.is_some() {
+            anyhow::bail!("--task is for folder catalogs, not single-file specs");
+        }
         if materialize_only {
             anyhow::bail!(
                 "--materialize-only is for folder catalogs with agent render{{}} blocks, not single-file specs"
@@ -1759,6 +1785,14 @@ fn up(
 
     if materialize_only {
         let mut found = discover(&catalog_root);
+        if let Some(selector) = task.as_deref() {
+            let (owner, _, _) = st2::reconcile::resolve_task(&found.specs, selector, &this_host)?;
+            let owner_identity = owner.identity.clone();
+            let owner_path = owner.path.clone();
+            found
+                .specs
+                .retain(|spec| spec.identity == owner_identity && spec.path == owner_path);
+        }
         if let Some(identity) = agent.as_deref() {
             found
                 .specs
@@ -1770,7 +1804,7 @@ fn up(
         for error in &found.errors {
             eprintln!("error: {}: {}", error.path.display(), error.message);
         }
-        if st2::hooks::required_by_codex(&found.specs, &this_host) {
+        if st2::hooks::required_by_codex(&found.specs, &this_host, &catalog_root) {
             st2::hooks::verify_required_set().context(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
@@ -1798,7 +1832,7 @@ fn up(
         return Ok(());
     }
 
-    let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
+    let runner = SystemRunner::new(catalog_root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
     // the lock (it would double-spawn) — but it does NOT take the lock itself (that would clobber the
@@ -1810,11 +1844,20 @@ fn up(
     }
 
     if once {
-        let report = up_once(root, &this_host, &runner)?;
+        let targeted = task.is_some();
+        let report = match task.as_deref() {
+            Some(selector) => {
+                st2::run::up_once_selected(&catalog_root, selector, &this_host, &runner)?
+            }
+            None => up_once(root, &this_host, &runner)?,
+        };
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
         if report.skipped {
             anyhow::bail!("one-shot reconcile pass was skipped");
+        }
+        if targeted && !report.errors.is_empty() {
+            anyhow::bail!("targeted one-shot reconcile pass reported errors");
         }
         return Ok(());
     }
@@ -1914,7 +1957,7 @@ fn ls(root: &Path) -> Result<()> {
         let runnable = if spec.is_runnable() {
             ""
         } else {
-            "  [UNRENDERED: no task command]"
+            "  [UNRENDERED: no task launch]"
         };
         let retired = if spec.retired { "  [retired]" } else { "" };
         println!(
@@ -1929,8 +1972,12 @@ fn ls(root: &Path) -> Result<()> {
                 st2::TaskKind::Pty => "pty",
                 st2::TaskKind::Exec => "exec",
             };
-            let cmd = task.command.as_deref().unwrap_or("<none>");
-            println!("      - {tk} {name}: {cmd}", name = task.name);
+            let launch = match (&task.command, &task.argv) {
+                (Some(command), _) => format!("command {command}"),
+                (_, Some(argv)) => format!("argv {argv:?}"),
+                _ => "<none>".to_string(),
+            };
+            println!("      - {tk} {name}: {launch}", name = task.name);
         }
     }
 

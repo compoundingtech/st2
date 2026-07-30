@@ -25,47 +25,41 @@ impl AgentInput {
         format!("{}.{}", self.host, self.identity)
     }
 
-    fn command(&self) -> anyhow::Result<String> {
+    fn argv(&self) -> anyhow::Result<Vec<String>> {
         let boot = if self.role == "chief-of-staff" {
             "You just cold-started. Read AGENTS.md and run your st2 boot ritual now: set status available and drain your inbox. Before resuming or starting work, set status busy; set available only when yielding or ready for new work. Resume unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
         } else {
             "You just cold-started. Run your st2 boot ritual now: set status available and drain your inbox. Before resuming or starting work, set status busy; set available only when yielding or ready for new work. Resume unfinished durable work immediately; stand by for work delivered via ding only when no unfinished durable work remains."
         };
-        let model = self
-            .model
-            .as_deref()
-            .map(|model| format!(" --model {}", shell_single_quote(model)))
-            .unwrap_or_default();
-        let extra: String = self
-            .extra_args
-            .iter()
-            .map(|arg| format!(" {}", shell_single_quote(arg)))
-            .collect();
-        match self.harness.as_str() {
-            "claude" => Ok(format!(
-                "exec claude --permission-mode bypassPermissions{model}{extra} {}",
-                shell_single_quote(boot)
-            )),
-            "codex" => {
-                let project_trust = shell_single_quote(&codex_project_trust(&self.workspace));
-                let command = format!(
-                    "exec codex -c {project_trust} \
-                     --dangerously-bypass-approvals-and-sandbox \
-                     --dangerously-bypass-hook-trust{model}{extra} {}",
-                    shell_single_quote(boot)
-                );
-                Ok(command)
-            }
+        let mut argv = match self.harness.as_str() {
+            "claude" => vec![
+                "claude".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ],
+            "codex" => vec![
+                "codex".to_string(),
+                "-c".to_string(),
+                codex_project_trust(&self.workspace),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--dangerously-bypass-hook-trust".to_string(),
+            ],
             other => anyhow::bail!(
                 "compile-agent: harness '{other}' is not supported (expected claude or codex)"
             ),
+        };
+        if let Some(model) = &self.model {
+            argv.extend(["--model".to_string(), model.clone()]);
         }
+        argv.extend(self.extra_args.iter().cloned());
+        argv.push(boot.to_string());
+        Ok(argv)
     }
 }
 
-/// One generator-owned, command-local Codex config override. TOML's table serializer owns key
+/// One generator-owned, argv-local Codex config override. TOML's table serializer owns key
 /// escaping so the decoded key is byte-identical to the declared workspace even when it contains
-/// quotes or slashes. Generic catalog validation continues to treat the resulting command as opaque.
+/// quotes or slashes. Generic catalog validation continues to treat the resulting argv as opaque.
 fn codex_project_trust(workspace: &str) -> String {
     let mut project = toml::Table::new();
     project.insert(
@@ -77,22 +71,8 @@ fn codex_project_trust(workspace: &str) -> String {
     format!("projects={}", toml::Value::Table(projects))
 }
 
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn kdl_str(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn kdl_raw(value: &str) -> String {
-    for count in 1.. {
-        let hashes = "#".repeat(count);
-        if !value.contains(&format!("\"{hashes}")) {
-            return format!("{hashes}\"{value}\"{hashes}");
-        }
-    }
-    unreachable!("a finite string always has an unused raw-string delimiter")
 }
 
 fn kdl_multiline_raw(value: &str) -> String {
@@ -195,7 +175,7 @@ pub fn compile_agent(
         fs::write(templates.join(&agents_name), agents)?;
     }
 
-    let command = input.command()?;
+    let argv = input.argv()?;
     let hooks = serde_json::to_string_pretty(&hook_json(&input.harness))?;
     let mut kdl = String::new();
     kdl.push_str(
@@ -211,7 +191,12 @@ pub fn compile_agent(
     kdl.push_str("  env {\n");
     kdl.push_str(&format!("    ST_AGENT {}\n", kdl_str(&input.bus_id())));
     kdl.push_str("  }\n");
-    kdl.push_str(&format!("  command {}\n", kdl_raw(&command)));
+    kdl.push_str("  argv");
+    for arg in argv {
+        kdl.push(' ');
+        kdl.push_str(&kdl_str(&arg));
+    }
+    kdl.push('\n');
     kdl.push_str("  ding\n\n");
     kdl.push_str("  render {\n");
     if input.harness == "codex" {

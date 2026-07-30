@@ -2,25 +2,26 @@
 //!
 //! `pty` tasks go to the `pty` CLI (which allocates a pseudo-terminal — an agent harness). `exec`
 //! tasks (the ding, daemons, a stage's script) must NOT allocate a terminal, so st2 supervises them
-//! directly: `sh -c '<command>'` spawned in its own session (`setsid` — no controlling tty, and
-//! decoupled from st2 so it survives st2 exit, Nomad-style), stdout/stderr to a log file, and the pid
-//! recorded in a machine-local runner-state dir. Liveness is `kill(pid, 0)`; st2 best-effort reaps
-//! its own exited children so a zombie never reads as alive. The same `setsid` session doubles as the
-//! teardown unit: an explicit kill targets the whole process GROUP, so a task's children die with it
-//! (see [`ExecBackend::kill`]) — a plain stop of st2 never touches it.
+//! directly: shell source through `sh -c`, or a structured argv with no shell. The process is spawned
+//! in its own session (`setsid` — no controlling tty, and decoupled from st2 so it survives st2 exit,
+//! Nomad-style), stdout/stderr go to a log file, and the pid is recorded in a machine-local
+//! runner-state dir. Liveness is `kill(pid, 0)`; st2 best-effort reaps its own exited children so a
+//! zombie never reads as alive. The same `setsid` session doubles as the teardown unit: an explicit
+//! kill targets the whole process GROUP, so a task's children die with it (see
+//! [`ExecBackend::kill`]) — a plain stop of st2 never touches it.
 //!
 //! State is machine-local (pids don't sync across hosts) and keyed by host, so a restarted st2 on the
 //! same host adopts the exec processes it left running.
 
 use anyhow::Context;
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::host_lock::process_alive;
-use crate::reconcile::{Session, TaskTarget};
+use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
 
 /// Supervises `exec` tasks as terminal-free processes.
@@ -73,11 +74,25 @@ impl ExecBackend {
         // kill cannot take it; elsewhere a plain pass-through detached by the `setsid` below. Env, cwd,
         // and stdio set here reach the task in both modes.
         let unit = crate::isolate::scope_unit(&target.pty_id);
-        let mut cmd = crate::isolate::wrap(
-            &unit,
-            OsStr::new("sh"),
-            &[OsStr::new("-c"), OsStr::new(&target.command)],
-        );
+        let (program, args): (OsString, Vec<OsString>) = match &target.launch {
+            TaskLaunch::Shell(command) => (
+                OsString::from("sh"),
+                vec![OsString::from("-c"), OsString::from(command)],
+            ),
+            TaskLaunch::Argv(argv) => {
+                debug_assert!(!argv.is_empty());
+                let mut expanded = argv
+                    .iter()
+                    .map(|arg| {
+                        OsString::from(crate::expand::expand_catalog(arg, &self.catalog_root))
+                    })
+                    .collect::<Vec<_>>();
+                let program = expanded.remove(0);
+                (program, expanded)
+            }
+        };
+        let arg_refs = args.iter().map(OsString::as_os_str).collect::<Vec<_>>();
+        let mut cmd = crate::isolate::wrap(&unit, &program, &arg_refs);
         cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)

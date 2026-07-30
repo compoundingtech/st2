@@ -99,8 +99,8 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
 `copy` under `$CATALOG/_templates`. The Codex declaration repeats the exact decoded `<workspace>`
-bytes in its command-local `projects` trust table; keep both values byte-identical. This is a
-harness launch convention inside the opaque command, not agent-spec grammar enforced by st2.
+bytes in its argv-local `projects` trust table; keep both values byte-identical. This is a harness
+launch convention inside opaque argv, not agent-spec grammar enforced by st2.
 
 The compact declaration shape is:
 
@@ -112,7 +112,7 @@ agent "<identity>" {
   // role "worker"
   // supervisor "<supervisor-bus-id>"
   env { ST_AGENT "<host>.<identity>" }
-  command #"exec codex -c 'projects={"<workspace>"={trust_level="trusted"}}' --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
+  argv "codex" "-c" "projects={\"<workspace>\"={trust_level=\"trusted\"}}" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {
@@ -124,6 +124,12 @@ agent "<identity>" {
   }
 }
 ```
+
+`argv` launches its first value directly with the remaining values as arguments. It resolves a bare
+program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
+does not introduce a shell. Use `command #"..."#` instead when the task intentionally needs shell
+syntax such as pipelines, redirects, or variable expansion; `command` continues to run under
+`sh -c`. A runnable task must declare exactly one of `argv` or `command`.
 
 ### Scheduled work is coming soon, not implemented
 
@@ -187,6 +193,15 @@ st2 up --catalog "$CATALOG" --host <host> --once
 ```
 
 There is intentionally no resident macOS service path.
+
+For a shortest-path change to one exact task, render only its owning agent and reconcile only that
+task in a bounded pass:
+
+```sh
+st2 up --catalog "$CATALOG" --host <host> --once --task <host.agent.task>
+```
+
+Unknown, ambiguous, and wrong-host task selectors refuse before workspace writes or PTY inspection.
 
 `st2 doctor` accepts the absence of a live host lock as the normal manual/`--once` mode. For a
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the

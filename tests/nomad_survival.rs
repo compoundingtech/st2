@@ -191,7 +191,10 @@ impl Fixture {
         let bin_dir = self.xdg.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let installed = bin_dir.join("st2");
-        std::fs::copy(env!("CARGO_BIN_EXE_st2"), &installed).unwrap();
+        let staged = installed.with_extension("installing");
+        std::fs::copy(env!("CARGO_BIN_EXE_st2"), &staged).unwrap();
+        std::fs::File::open(&staged).unwrap().sync_all().unwrap();
+        std::fs::rename(&staged, &installed).unwrap();
         installed
     }
 
@@ -216,14 +219,27 @@ impl Fixture {
     }
 
     fn spawn_loop_from(&self, binary: &Path) -> Child {
-        self.st2_from(binary)
-            .arg("up")
-            .arg(&self.catalog)
-            .args(["--host", HOST, "--interval", "60"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
+        for attempt in 0..5 {
+            let result = self
+                .st2_from(binary)
+                .arg("up")
+                .arg(&self.catalog)
+                .args(["--host", HOST, "--interval", "60"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match result {
+                Ok(child) => return child,
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt + 1 < 5 => {
+                    // Some Linux filesystems briefly retain the writer exclusion after installing
+                    // a copied executable. Retry only that transient; every other spawn error stays
+                    // loud and immediate.
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("spawning fixture control plane failed: {error}"),
+            }
+        }
+        unreachable!("the bounded spawn loop always returns or panics")
     }
 
     /// One `st2 up --once` pass; returns its stdout (where launched/adopted/torn-down is reported).

@@ -2,10 +2,10 @@
 //! plus the supervisor loop that reconciles on a folder-watch + timer.
 //!
 //! Everything st2 does to the world goes through the [`Runner`] trait: list sessions, spawn a pty
-//! from its explicit command, kill a session, remove a dead one. The production [`PtyCli`] shells out
+//! from its explicit launch, kill a session, remove a dead one. The production [`PtyCli`] shells out
 //! to the `pty` CLI; tests swap in a fake, so plan execution is verified without spawning a single
-//! real process. st2 stays harness-agnostic here too — it runs the spec's `command` verbatim under
-//! `sh -c` and never inspects it.
+//! real process. st2 stays harness-agnostic here too — it either runs shell source verbatim under
+//! `sh -c` or passes a structured argv directly.
 //!
 //! The loop is decoupled Nomad-style: stopping st2 never tears down its agents — they are detached
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
+use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use agent_spec::spec::TaskKind;
 
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -104,7 +104,7 @@ pub(crate) fn resolve_task_cwd(
 pub trait Runner {
     /// ACTUAL state: every task session the runner can see (unioned across backends).
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>>;
-    /// Spawn `target` in the background from its explicit command. `spec_dir` is the spec file's
+    /// Spawn `target` in the background from its explicit launch. `spec_dir` is the spec file's
     /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
     /// SIGTERM a running session.
@@ -221,8 +221,8 @@ impl PtyCli {
     /// env can be unit-tested without spawning anything.
     ///
     /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, and `cwd` — because `pty` passes the child env through verbatim. The `command` is left
-    /// unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
+    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -260,8 +260,18 @@ impl PtyCli {
             assignment.push(value);
             cmd.arg("--env").arg(assignment);
         }
-        // Run the command verbatim under a shell — st2 never parses or splits it.
-        cmd.arg("--").arg("sh").arg("-c").arg(&target.command);
+        cmd.arg("--");
+        match &target.launch {
+            // Run shell source verbatim — st2 never parses or splits it.
+            TaskLaunch::Shell(command) => {
+                cmd.arg("sh").arg("-c").arg(command);
+            }
+            // Direct mode preserves argument boundaries and introduces no shell process.
+            TaskLaunch::Argv(argv) => {
+                debug_assert!(!argv.is_empty());
+                cmd.args(argv.iter().map(|arg| self.expand(arg)));
+            }
+        }
         cmd
     }
 }
@@ -554,6 +564,20 @@ pub struct UpReport {
 }
 
 impl UpReport {
+    fn absorb(&mut self, mut other: UpReport) {
+        self.skipped |= other.skipped;
+        self.launched.append(&mut other.launched);
+        self.torn_down.append(&mut other.torn_down);
+        self.gc.append(&mut other.gc);
+        self.deferred.append(&mut other.deferred);
+        self.flapping.append(&mut other.flapping);
+        self.crash_loops.append(&mut other.crash_loops);
+        self.adopted.append(&mut other.adopted);
+        self.other_host.append(&mut other.other_host);
+        self.unrunnable.append(&mut other.unrunnable);
+        self.warnings.append(&mut other.warnings);
+        self.errors.append(&mut other.errors);
+    }
     /// True when the pass actually changed something (or hit an error) — used to keep the loop's log
     /// quiet on no-op ticks.
     pub fn is_noteworthy(&self) -> bool {
@@ -759,7 +783,7 @@ fn reconcile_pass(
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
-    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
+    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host, root)
         .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
@@ -773,7 +797,7 @@ fn reconcile_pass(
         .specs
         .iter()
         .filter(|spec| {
-            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host)
+            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host, root)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -805,7 +829,7 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches_on_hooks(&mut plan, &mut report, || match &hook_error {
+    gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
@@ -822,6 +846,7 @@ fn reconcile_pass(
 /// the wrong state and could not satisfy the launched seat's trust gate.
 fn gate_codex_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
+    catalog_root: &Path,
     report: &mut UpReport,
     verify_hooks: V,
 ) where
@@ -830,7 +855,8 @@ fn gate_codex_launches_on_hooks<'a, V>(
     let mut gated_agents = Vec::new();
     for launch in &plan.launch {
         let Some(_) = launch.tasks.iter().find(|target| {
-            target.name == "agent" && crate::hooks::command_invokes_codex(&target.command)
+            target.name == "agent"
+                && crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
         }) else {
             continue;
         };
@@ -929,6 +955,91 @@ pub fn up_once_specs(
         &mut FlappingCap::default(),
         &mut debounce,
     )
+}
+
+/// One bounded task-scoped pass over already-discovered specs. Selector resolution precedes any runner call.
+pub fn up_once_selected_specs(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
+        crate::hooks::verify_installed().map(|_| ())
+    })
+}
+
+/// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
+/// materialize only that owner and execute the selected plan.
+pub fn up_once_selected(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    let found = crate::discovery::discover(catalog_root);
+    let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+    let mut report = UpReport::default();
+    report.warnings.extend(found.warnings);
+    report.errors.extend(
+        found
+            .errors
+            .into_iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.message)),
+    );
+    let owner = owner.clone();
+    if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
+        && let Err(error) = crate::hooks::verify_installed()
+    {
+        report
+            .errors
+            .push(format!("verify lifecycle hooks: {error}"));
+        return Ok(report);
+    }
+    let materialized = crate::materialize::materialize_catalog(
+        catalog_root,
+        std::slice::from_ref(&owner),
+        this_host,
+    );
+    report.warnings.extend(materialized.warnings);
+    let owner_materialization_failed = !materialized.failed_agents.is_empty();
+    report.errors.extend(materialized.errors);
+    if owner_materialization_failed {
+        return Ok(report);
+    }
+    let execution = up_once_selected_specs_with_gates(
+        catalog_root,
+        &found.specs,
+        selector,
+        this_host,
+        runner,
+        || Ok(()),
+    )?;
+    report.absorb(execution);
+    Ok(report)
+}
+
+fn up_once_selected_specs_with_gates<V>(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+    verify_hooks: V,
+) -> anyhow::Result<UpReport>
+where
+    V: FnOnce() -> anyhow::Result<()>,
+{
+    crate::reconcile::resolve_task(specs, selector, this_host)?;
+    let sessions = runner
+        .list_sessions()
+        .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
+    let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
+    let mut report = UpReport::default();
+    gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
+    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    Ok(report)
 }
 
 /// Supervise an in-memory spec team: keep-alive + respawn on a timer, behaving exactly like
@@ -1215,7 +1326,8 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::TaskKind;
+    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
@@ -1225,7 +1337,7 @@ mod tests {
             pty_id: id.to_string(),
             bus_id: "hetz.demo".to_string(),
             name: "agent".to_string(),
-            command: cmd.to_string(),
+            launch: TaskLaunch::Shell(cmd.to_string()),
             cwd: None,
             workspace: None,
             tags: BTreeMap::new(),
@@ -1234,26 +1346,72 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    struct EmptyRunner;
+    struct GateRunner {
+        list_calls: Cell<usize>,
+    }
 
-    #[cfg(target_os = "linux")]
-    impl Runner for EmptyRunner {
+    impl Runner for GateRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            self.list_calls.set(self.list_calls.get() + 1);
             Ok(Vec::new())
         }
 
         fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot launch")
+            panic!("gate runner must not spawn")
         }
 
         fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot kill")
+            panic!("gate runner must not kill")
         }
 
         fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot remove")
+            panic!("gate runner must not remove")
         }
+    }
+
+    #[test]
+    fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
+        let spec = AgentSpec {
+            identity: "codex".into(),
+            host: None,
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            retired: false,
+            keep: false,
+            restart: None,
+            tasks: vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: Some("test.codex.agent".into()),
+                command: None,
+                argv: Some(vec!["$CATALOG/bin/codex".into(), "--version".into()]),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+            }],
+            path: "/tmp/spec.kdl".into(),
+        };
+        let runner = GateRunner {
+            list_calls: Cell::new(0),
+        };
+        let report = up_once_selected_specs_with_gates(
+            Path::new("/tmp"),
+            &[spec],
+            "test.codex.agent",
+            "test",
+            &runner,
+            || anyhow::bail!("stale receipt"),
+        )
+        .unwrap();
+        assert_eq!(runner.list_calls.get(), 1);
+        assert!(report.launched.is_empty());
+        assert!(report.errors.iter().any(|error| {
+            error.contains("stale receipt") && error.contains("launch suppressed")
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -1271,7 +1429,9 @@ mod tests {
             up_loop_until(
                 catalog.path(),
                 "test-host",
-                &EmptyRunner,
+                &GateRunner {
+                    list_calls: Cell::new(0),
+                },
                 Duration::from_secs(60),
                 &stop,
                 |_| passes += 1,
@@ -1289,8 +1449,6 @@ mod tests {
     //    destructively GC/relaunch a HEALTHY agent; a stable death must still be reaped ──────────────
 
     use crate::reconcile::Launch;
-    use agent_spec::spec::{AgentSpec, JobType};
-
     fn sess(id: &str, alive: bool) -> Session {
         Session {
             pty_id: id.to_string(),
@@ -1449,7 +1607,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || Ok(()));
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || Ok(()),
+        );
 
         assert_eq!(
             plan.launch
@@ -1479,6 +1642,7 @@ mod tests {
 
         gate_codex_launches_on_hooks(
             &mut plan,
+            Path::new("/catalog"),
             &mut report,
             || panic!("an already-live Codex agent must not enter the hook gate"),
         );
@@ -1511,9 +1675,12 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || {
-            anyhow::bail!("stale receipt")
-        });
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || anyhow::bail!("stale receipt"),
+        );
 
         assert_eq!(
             plan.launch
@@ -1551,7 +1718,49 @@ mod tests {
         let name_pos = args.iter().position(|a| a == "--name").unwrap();
         assert_eq!(args[name_pos + 1], "hetz.demo");
         let sep = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
+        assert_eq!(
+            &args[sep + 1..],
+            &[
+                "sh",
+                "-c",
+                "exec claude --permission-mode bypassPermissions 'boot'"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_run_command_passes_direct_argv_without_a_shell() {
+        let cli = PtyCli::new(PathBuf::from("/my/catalog"));
+        let mut t = target("hetz.demo.agent", "unused");
+        t.launch = TaskLaunch::Argv(vec![
+            "axe".into(),
+            "agent".into(),
+            "exec".into(),
+            "--".into(),
+            "claude".into(),
+            "--resume".into(),
+            "$CATALOG/session id".into(),
+        ]);
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let sep = args.iter().position(|arg| arg == "--").unwrap();
+
+        assert_eq!(
+            &args[sep + 1..],
+            [
+                "axe",
+                "agent",
+                "exec",
+                "--",
+                "claude",
+                "--resume",
+                "/my/catalog/session id"
+            ]
+        );
+        assert!(!args[sep + 1..].iter().any(|arg| arg == "sh"));
     }
 
     #[test]

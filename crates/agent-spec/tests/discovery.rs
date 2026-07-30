@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::TaskKind;
-use agent_spec::{AgentSpec, JobType, discover};
+use agent_spec::{AgentSpec, JobType, Task, discover};
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -22,6 +22,15 @@ fn find<'a>(specs: &'a [AgentSpec], identity: &str) -> &'a AgentSpec {
         .iter()
         .find(|s| s.identity == identity)
         .unwrap_or_else(|| panic!("expected a spec with identity '{identity}'"))
+}
+
+fn argv(task: &Task) -> Vec<&str> {
+    task.argv
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(String::as_str)
+        .collect()
 }
 
 const FULL_KDL: &str = r####"
@@ -164,6 +173,155 @@ agent "cos" {
 }
 
 #[test]
+fn direct_argv_lowers_for_compact_and_explicit_kdl_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/compact/agent.kdl",
+        r#"agent "compact" {
+  host "h"
+  argv "axe" "agent" "exec" "--" "claude" "--resume" "session id"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/explicit/agent.kdl",
+        r#"agent "explicit" {
+  host "h"
+  pty "agent" { argv "/opt/bin/codex" "--model" "gpt 5" }
+  exec "probe" { argv "printf" "%s" "$CATALOG" }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+
+    let compact = find(&found.specs, "compact");
+    assert_eq!(
+        argv(&compact.tasks[0]),
+        [
+            "axe",
+            "agent",
+            "exec",
+            "--",
+            "claude",
+            "--resume",
+            "session id"
+        ]
+    );
+    assert!(compact.tasks[0].command.is_none());
+
+    let explicit = find(&found.specs, "explicit");
+    assert_eq!(
+        argv(
+            explicit
+                .tasks
+                .iter()
+                .find(|task| task.name == "agent")
+                .unwrap()
+        ),
+        ["/opt/bin/codex", "--model", "gpt 5"]
+    );
+    assert_eq!(
+        argv(
+            explicit
+                .tasks
+                .iter()
+                .find(|task| task.name == "probe")
+                .unwrap()
+        ),
+        ["printf", "%s", "$CATALOG"]
+    );
+}
+
+#[test]
+fn direct_argv_lowers_from_toml_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+host = "h"
+argv = ["claude", "--resume", "session id"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","pty":{"agent":{"argv":["codex","resume","abc"]}}}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(
+        argv(&find(&found.specs, "toml").tasks[0]),
+        ["claude", "--resume", "session id"]
+    );
+    assert_eq!(
+        argv(&find(&found.specs, "json").tasks[0]),
+        ["codex", "resume", "abc"]
+    );
+}
+
+#[test]
+fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (identity, body) in [
+        ("empty-compact", r#"argv"#),
+        ("empty-program-compact", r#"argv """#),
+        (
+            "both-compact",
+            r#"command "true"
+  argv "true""#,
+        ),
+        ("empty-explicit", r#"pty "agent" { argv }"#),
+        (
+            "empty-program-explicit",
+            r#"pty "agent" { argv "" }"#,
+        ),
+        (
+            "both-explicit",
+            r#"pty "agent" { command "true"; argv "true" }"#,
+        ),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; {body} }}"),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    let messages = found
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.ends_with("empty `argv`"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("both `command` and `argv`"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("empty `argv` program"))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn compact_and_explicit_agent_task_forms_cannot_be_mixed() {
     let tmp = tempfile::tempdir().unwrap();
     write(
@@ -180,7 +338,7 @@ fn compact_and_explicit_agent_task_forms_cannot_be_mixed() {
     assert!(
         found.errors[0]
             .message
-            .contains("declares both compact `command`")
+            .contains("declares both a compact launch")
     );
 }
 

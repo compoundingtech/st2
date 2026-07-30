@@ -14,8 +14,8 @@ agent "<identity>" {
   // st2 owns the hook declaration and installed scripts for this unattended seat. The rendered bus
   // contract requires agent-declared status: busy while executing work, available only when
   // yielding/ready, and dnd only for an explicit hold.
-  // Codex-specific launch policy stays inside this opaque command; st2 does not parse its flags.
-  command #"exec codex -c 'projects={"<workspace>"={trust_level="trusted"}}' --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
+  // Codex-specific launch policy stays inside this opaque argv; st2 does not parse its flags.
+  argv "codex" "-c" "projects={\"<workspace>\"={trust_level=\"trusted\"}}" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {

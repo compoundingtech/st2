@@ -2,7 +2,6 @@
 //! declarations, leaves workspaces untouched until materialization, and has no removed CLI aliases.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use st2::discover;
@@ -76,7 +75,9 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     let kdl = fs::read_to_string(&declaration).unwrap();
     assert!(kdl.starts_with("// Experimental output from `st2 compile-agent`."));
     assert!(kdl.contains("supervisor \"lead\""));
-    assert!(kdl.contains("'--verbose'"));
+    assert!(kdl.contains("\"--verbose\""));
+    assert!(kdl.contains("argv \"claude\""));
+    assert!(!kdl.contains("command #\"exec claude"));
     assert!(kdl.contains("set status busy"));
     assert!(!kdl.contains("ST_SUPERVISOR"));
     assert!(!workspace.join(".st2/PERSONA.md").exists());
@@ -91,6 +92,16 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     assert_eq!(spec.host.as_deref(), Some("h"));
     assert_eq!(spec.role.as_deref(), Some("supervisor"));
     assert_eq!(spec.supervisor.as_deref(), Some("lead"));
+    assert_eq!(
+        spec.tasks
+            .iter()
+            .find(|task| task.name == "agent")
+            .unwrap()
+            .argv
+            .as_ref()
+            .unwrap()[0],
+        "claude"
+    );
 
     let validate = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("validate")
@@ -238,14 +249,15 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     );
 
     let kdl = fs::read_to_string(catalog.join("agents/h/worker/agent.kdl")).unwrap();
-    assert!(kdl.contains("exec codex"));
+    assert!(kdl.contains("argv \"codex\""));
+    assert!(!kdl.contains("exec codex"));
     assert!(kdl.contains("set status busy"));
     assert!(kdl.contains("--dangerously-bypass-hook-trust"));
     assert!(kdl.contains("json-upsert \".codex/hooks.json\""));
 }
 
 #[test]
-fn compile_agent_codex_trust_roundtrips_workspace_bytes_through_toml_shell_and_kdl() {
+fn compile_agent_codex_trust_roundtrips_workspace_bytes_through_toml_and_kdl() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp
@@ -291,11 +303,11 @@ fn compile_agent_codex_trust_roundtrips_workspace_bytes_through_toml_shell_and_k
         .unwrap();
     let workspace_text = workspace.to_str().unwrap();
     assert_eq!(spec.workspace.as_deref(), Some(workspace_text));
-    let command = spec
+    let argv = spec
         .tasks
         .iter()
         .find(|task| task.name == "agent")
-        .and_then(|task| task.command.as_deref())
+        .and_then(|task| task.argv.as_deref())
         .unwrap();
     let report = st2::validate::validate(&catalog);
     assert_eq!(
@@ -305,33 +317,9 @@ fn compile_agent_codex_trust_roundtrips_workspace_bytes_through_toml_shell_and_k
         report.issues
     );
 
-    // Exercise the emitted shell line against a real shell and capture the exact argv Codex gets.
-    let bin = tmp.path().join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let fake_codex = bin.join("codex");
-    fs::write(&fake_codex, "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").unwrap();
-    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
-    let shell_bin = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("sh"))
-        .find(|path| path.is_file())
-        .expect("sh is available on PATH");
-    let shell = Command::new(shell_bin)
-        .args(["-c", command])
-        .env("PATH", &bin)
-        .output()
-        .unwrap();
-    assert!(
-        shell.status.success(),
-        "{}",
-        String::from_utf8_lossy(&shell.stderr)
-    );
-    let args: Vec<&[u8]> = shell
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .collect();
-    assert_eq!(args.first().copied(), Some(b"-c".as_slice()));
-    let config = std::str::from_utf8(args.get(1).unwrap()).unwrap();
+    assert_eq!(argv.first().map(String::as_str), Some("codex"));
+    assert_eq!(argv.get(1).map(String::as_str), Some("-c"));
+    let config = argv.get(2).unwrap();
     let config = config.parse::<toml::Table>().unwrap();
     let projects = config["projects"].as_table().unwrap();
     let (key, project) = projects.iter().next().unwrap();
@@ -340,7 +328,7 @@ fn compile_agent_codex_trust_roundtrips_workspace_bytes_through_toml_shell_and_k
     assert_eq!(
         project["trust_level"].as_str(),
         Some("trusted"),
-        "argv: {args:?}"
+        "argv: {argv:?}"
     );
 }
 

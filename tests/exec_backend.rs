@@ -2,13 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
 use st2::exec_backend::ExecBackend;
 use st2::host_lock::process_alive;
-use st2::reconcile::TaskTarget;
+use st2::reconcile::{TaskLaunch, TaskTarget};
 use st2::spec::TaskKind;
 
 fn exec_target(id: &str, command: &str) -> TaskTarget {
@@ -17,13 +18,19 @@ fn exec_target(id: &str, command: &str) -> TaskTarget {
         pty_id: id.to_string(),
         bus_id: "hetz.demo".to_string(),
         name: "ding".to_string(),
-        command: command.to_string(),
+        launch: TaskLaunch::Shell(command.to_string()),
         cwd: None,
         workspace: None,
         tags: BTreeMap::new(),
         env: BTreeMap::new(),
         keep: false,
     }
+}
+
+fn argv_target(id: &str, argv: &[&str]) -> TaskTarget {
+    let mut target = exec_target(id, "unused");
+    target.launch = TaskLaunch::Argv(argv.iter().map(|arg| (*arg).to_string()).collect());
+    target
 }
 
 /// tty_nr from /proc/<pid>/stat (0 == no controlling terminal).
@@ -62,11 +69,18 @@ fn exec_spawns_terminal_free_process_tracks_liveness_kills_and_cleans_up() {
     // pid file recorded
     let pid_path = state.join(format!("{id}.pid"));
     assert!(pid_path.exists(), "pid file written");
-    let pid: i32 = fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
     // liveness: alive
     let sessions = backend.list().unwrap();
-    assert!(sessions.iter().any(|s| s.pty_id == id && s.alive), "reported alive");
+    assert!(
+        sessions.iter().any(|s| s.pty_id == id && s.alive),
+        "reported alive"
+    );
 
     // R09: the process has NO controlling terminal.
     assert_eq!(tty_nr(pid), Some(0), "exec process must be terminal-free");
@@ -74,7 +88,11 @@ fn exec_spawns_terminal_free_process_tracks_liveness_kills_and_cleans_up() {
     // kill → becomes dead
     backend.kill(id).unwrap();
     assert!(
-        wait_until(|| backend.list().unwrap().iter().any(|s| s.pty_id == id && !s.alive)),
+        wait_until(|| backend
+            .list()
+            .unwrap()
+            .iter()
+            .any(|s| s.pty_id == id && !s.alive)),
         "reported dead after kill"
     );
 
@@ -94,18 +112,60 @@ fn exec_expands_catalog_in_env_and_command() {
 
     let out = tmp.path().join("out.txt");
     // $CATALOG in the command (sh -c expands it via the injected CATALOG env) and an env value.
-    let mut target =
-        exec_target("hetz.demo.probe", &format!("printf '%s|%s' \"$CATALOG\" \"$DATA\" > {}", out.display()));
+    let mut target = exec_target(
+        "hetz.demo.probe",
+        &format!("printf '%s|%s' \"$CATALOG\" \"$DATA\" > {}", out.display()),
+    );
     target.env.insert("DATA".into(), "$CATALOG/x".into());
     backend.spawn(&target, tmp.path()).unwrap();
 
-    assert!(wait_until(|| out.exists() && !fs::read_to_string(&out).unwrap().is_empty()));
+    assert!(wait_until(
+        || out.exists() && !fs::read_to_string(&out).unwrap().is_empty()
+    ));
     let got = fs::read_to_string(&out).unwrap();
     let cat = catalog.display().to_string();
     assert_eq!(got, format!("{cat}|{cat}/x"));
 
     backend.kill("hetz.demo.probe").ok();
     backend.remove("hetz.demo.probe").ok();
+}
+
+#[test]
+fn exec_launches_direct_argv_with_literal_boundaries_and_catalog_expansion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let catalog = tmp.path().join("catalog");
+    fs::create_dir_all(&catalog).unwrap();
+    let backend = ExecBackend::new(state, catalog.clone());
+
+    let id = "hetz.demo.direct";
+    backend
+        .spawn(
+            &argv_target(
+                id,
+                &[
+                    "printf",
+                    "%s|%s|%s\n",
+                    "space arg",
+                    "$CATALOG/result",
+                    "; echo not-shell-syntax",
+                ],
+            ),
+            tmp.path(),
+        )
+        .unwrap();
+
+    let log = catalog.join("logs").join(format!("{id}.log"));
+    let expected = format!(
+        "space arg|{}/result|; echo not-shell-syntax\n",
+        catalog.display()
+    );
+    assert!(
+        wait_until(|| fs::read_to_string(&log).unwrap_or_default() == expected),
+        "direct argv was not preserved: {:?}",
+        fs::read_to_string(&log).ok()
+    );
+    backend.remove(id).unwrap();
 }
 
 /// Auto-log observability: a detached exec's stdout AND stderr must be captured to a discoverable
@@ -121,7 +181,10 @@ fn exec_auto_logs_stdout_and_stderr_to_catalog_logs() {
 
     let id = "hetz.demo.ding";
     backend
-        .spawn(&exec_target(id, "echo OUT_LINE; echo ERR_LINE 1>&2"), tmp.path())
+        .spawn(
+            &exec_target(id, "echo OUT_LINE; echo ERR_LINE 1>&2"),
+            tmp.path(),
+        )
         .unwrap();
 
     let log = catalog.join("logs").join(format!("{id}.log"));
@@ -263,8 +326,14 @@ fn exec_kill_reaps_the_whole_process_group_not_just_the_leader() {
     let id = "hetz.demo.forky";
     // dash backgrounds one sleep and foregrounds another → leader (dash) + 2 child sleeps, all in the
     // one setsid group, distinct pids. A kill-the-leader-only teardown would orphan the sleeps.
-    backend.spawn(&exec_target(id, "sleep 45 & sleep 45"), tmp.path()).unwrap();
-    let leader: i32 = fs::read_to_string(state.join(format!("{id}.pid"))).unwrap().trim().parse().unwrap();
+    backend
+        .spawn(&exec_target(id, "sleep 45 & sleep 45"), tmp.path())
+        .unwrap();
+    let leader: i32 = fs::read_to_string(state.join(format!("{id}.pid")))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
     assert!(
         wait_until(|| group_members(leader).len() >= 2),
