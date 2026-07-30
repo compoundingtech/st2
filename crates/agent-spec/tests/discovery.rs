@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use agent_spec::spec::TaskKind;
+use agent_spec::spec::{TaskKind, TaskLifecycle};
 use agent_spec::{AgentSpec, JobType, Resource, Task, discover};
 
 fn write(root: &Path, rel: &str, contents: &str) {
@@ -53,6 +53,7 @@ agent "fabric-claude" {
 
   pty "agent" {
     id      "silber.fabric-claude"
+    lifecycle "adopt-only"
     command #"exec claude --permission-mode bypassPermissions 'boot'"#
     tags role="agent" env="prod"
     env {
@@ -107,6 +108,7 @@ fn parses_full_kdl_service_job() {
     let agent = s.tasks.iter().find(|t| t.name == "agent").unwrap();
     assert_eq!(agent.kind, TaskKind::Pty);
     assert_eq!(agent.id.as_deref(), Some("silber.fabric-claude"));
+    assert_eq!(agent.lifecycle, TaskLifecycle::AdoptOnly);
     assert!(agent.command.as_deref().unwrap().starts_with("exec claude"));
     assert_eq!(agent.tags.get("role").map(String::as_str), Some("agent"));
     assert_eq!(
@@ -170,6 +172,47 @@ agent "cos" {
         ding.env.get("ST_AGENT").map(String::as_str),
         Some("Silber.cos")
     );
+}
+
+#[test]
+fn compact_adopt_only_lifecycle_lowers_to_the_generated_agent_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/migrant/agent.kdl",
+        r#"
+agent "migrant" {
+  host "h"
+  lifecycle "adopt-only"
+  command "codex"
+}
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs[0].tasks[0].lifecycle, TaskLifecycle::AdoptOnly);
+}
+
+#[test]
+fn unknown_task_lifecycle_is_rejected_instead_of_falling_back_to_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/unsafe/agent.kdl",
+        r#"
+agent "unsafe" {
+  host "h"
+  lifecycle "replace-maybe"
+  command "codex"
+}
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty());
+    assert_eq!(found.errors.len(), 1);
+    assert!(found.errors[0].message.contains("unknown lifecycle"));
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, `host`, `role` (metadata only), `type`, `workspace`, `retired`, `keep`, `supervisor`,
-//! `restart{}`, Resource bindings (declaration metadata), and the tasks. Everything render-only
+//! `restart{}`, task lifecycle, Resource bindings (declaration metadata), and the tasks. Everything render-only
 //! (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta{}`) is baked into
 //! the tasks/commands by the render layer and ignored here.
 //!
@@ -142,6 +142,9 @@ pub struct Task {
     pub env: BTreeMap<String, String>,
     /// Per-task GC pin.
     pub keep: bool,
+    /// Reconciliation policy. `adopt-only` is a migration fence: st2 may adopt a live generation,
+    /// but must not reap a dead generation or create a missing replacement.
+    pub lifecycle: TaskLifecycle,
 }
 
 /// Whether a task allocates a terminal.
@@ -151,6 +154,16 @@ pub enum TaskKind {
     Pty,
     /// Non-interactive — a plain process, no terminal (R09).
     Exec,
+}
+
+/// How st2 reconciles a declared task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskLifecycle {
+    /// Ordinary service lifecycle: launch when absent and replace when dead.
+    #[default]
+    Service,
+    /// Migration fence: adopt an already-live generation, otherwise hold without mutation.
+    AdoptOnly,
 }
 
 /// Restart policy (§4). Applies to long-running `service` tasks.
@@ -276,6 +289,8 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: include the built-in `st2 ding` sidecar.
     #[serde(default)]
     pub ding: bool,
+    /// Compact catalog form: reconciliation policy for the generated agent PTY.
+    pub lifecycle: Option<String>,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
     #[serde(default)]
     pub pty: BTreeMap<String, RawTask>,
@@ -307,6 +322,7 @@ pub(crate) struct RawTask {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub keep: bool,
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -606,6 +622,8 @@ impl RawSpec {
             tasks.push(t.lower(&identity, TaskKind::Exec, name, &self.env)?);
         }
         if self.command.is_some() || self.argv.is_some() {
+            let lifecycle =
+                parse_task_lifecycle(&identity, "compact task", self.lifecycle.as_deref())?;
             let mut tags = BTreeMap::new();
             tags.insert("role".to_string(), "agent".to_string());
             tasks.push(Task {
@@ -620,6 +638,7 @@ impl RawSpec {
                 tags,
                 env: self.env.clone(),
                 keep: false,
+                lifecycle,
             });
         }
         if self.ding {
@@ -634,6 +653,7 @@ impl RawSpec {
                 tags: BTreeMap::new(),
                 env: self.env,
                 keep: false,
+                lifecycle: TaskLifecycle::Service,
             });
         }
         tasks.sort_by(|a, b| a.name.cmp(&b.name));
@@ -675,6 +695,11 @@ impl RawTask {
         )?;
         let mut env = inherited_env.clone();
         env.extend(self.env);
+        let lifecycle = parse_task_lifecycle(
+            identity,
+            &format!("{kind:?} task '{name}'"),
+            self.lifecycle.as_deref(),
+        )?;
         Ok(Task {
             kind,
             derived: false,
@@ -686,7 +711,22 @@ impl RawTask {
             tags: self.tags,
             env,
             keep: self.keep,
+            lifecycle,
         })
+    }
+}
+
+fn parse_task_lifecycle(
+    identity: &str,
+    location: &str,
+    lifecycle: Option<&str>,
+) -> anyhow::Result<TaskLifecycle> {
+    match lifecycle {
+        None | Some("service") => Ok(TaskLifecycle::Service),
+        Some("adopt-only") => Ok(TaskLifecycle::AdoptOnly),
+        Some(other) => {
+            anyhow::bail!("agent '{identity}' {location} has unknown lifecycle '{other}'")
+        }
     }
 }
 

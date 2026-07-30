@@ -124,6 +124,25 @@ agent "<identity>" {
 }
 ```
 
+For a zero-interruption migration, add `lifecycle "adopt-only"` to the compact
+agent or to an explicit `pty`/`exec` task. st2 adopts that task when its current
+generation is alive. If the generation is dead or absent, st2 reports the task
+as `held` and does not remove or launch anything:
+
+```kdl
+agent "<identity>" {
+  host "<host>"
+  workspace "<workspace>"
+  lifecycle "adopt-only"
+  argv "codex" "<boot prompt>"
+}
+```
+
+This is a fence, not a restart policy. After inspecting or recovering the
+original generation, deliberately change the lifecycle back to `"service"` (or
+remove the field) to authorize ordinary absent launch and dead replacement.
+`retired #true` remains an explicit teardown instruction and takes precedence.
+
 `resource` binds an agent-local semantic name to an exact RFC 3986 absolute URI. `_tag` selects a
 concrete resource contract understood by downstream readers; st2 preserves arbitrary non-empty tags
 and URI bytes without normalization. It neither owns their schemas nor resolves their targets.

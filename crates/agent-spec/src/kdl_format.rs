@@ -83,6 +83,7 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
             "supervisor" => raw.supervisor = arg_string(child),
             "retired" => raw.retired = arg_bool(child),
             "keep" => raw.keep = arg_bool(child),
+            "lifecycle" => raw.lifecycle = arg_string(child),
             "restart" => raw.restart = Some(restart_node_to_raw(child)),
             "resource" => {
                 let (name, resource) = resource_node_to_raw(child)?;
@@ -199,6 +200,7 @@ fn task_node_to_raw(node: &KdlNode) -> anyhow::Result<RawTask> {
             "argv" => t.argv = Some(argv(child)?),
             "cwd" => t.cwd = arg_string(child),
             "keep" => t.keep = arg_bool(child),
+            "lifecycle" => t.lifecycle = arg_string(child),
             // `tags role="agent" "st.network"="$CATALOG"` — properties on the node.
             "tags" => {
                 for entry in child.entries() {

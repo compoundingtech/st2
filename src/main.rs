@@ -1901,6 +1901,7 @@ fn print_report(report: &UpReport) {
     report_line("launched", &report.launched);
     report_line("torn down", &report.torn_down);
     report_line("gc", &report.gc);
+    report_line("held", &report.held);
     report_line("flapping", &report.flapping);
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);
