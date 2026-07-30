@@ -42,12 +42,11 @@ pub fn is_catalog_path_excluded(root: &Path, path: &Path) -> bool {
     };
     relative
         .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        })
         .enumerate()
-        .any(|(index, name)| {
+        .any(|(index, component)| {
+            let Component::Normal(name) = component else {
+                return false;
+            };
             name == ".git"
                 || name == ".st2"
                 || (index == 0 && name == "pty")
@@ -308,5 +307,25 @@ mod path_tests {
             pd("/cat", "/cat/hetz/fabric-claude.toml"),
             (Some("fabric-claude".into()), Some("hetz".into()))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_pty_exclusion_counts_native_path_components() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = Path::new("/cat");
+        assert!(is_catalog_path_excluded(
+            root,
+            &root.join("pty").join("session.json")
+        ));
+        assert!(!is_catalog_path_excluded(
+            root,
+            &root
+                .join(OsString::from_vec(vec![0xff]))
+                .join("pty")
+                .join("agent.kdl")
+        ));
     }
 }
