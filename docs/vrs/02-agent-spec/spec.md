@@ -52,9 +52,9 @@ normalized effects also remain equal.
 | Task `kind`, `command`/`argv`, resolved effective `cwd`, agent/task `env`, task `tags`, synthesized managed environment including supervisor routing | [normalized task fields](../../../crates/agent-spec/src/spec.rs), [effective task target](../../../src/reconcile.rs), [spawn construction](../../../src/run.rs) | Change the desired launch/backend fingerprint. Dead/absent launches use the latest desired definition. A healthy older or unproven incarnation remains alive and reports `drifted` or `unknown` until an explicit task-scoped replacement. A source-path edit that changes effective cwd also belongs here. | Gap tracked by [#40](https://github.com/compoundingtech/st2/issues/40): current reconciliation adopts any healthy matching task ID without a desired/observed fingerprint or incarnation binding. `run.rs` currently passes task tags as backend spawn arguments, so they cannot be classified as pure metadata. |
 | `keep`, `restart`, task `lifecycle` | [policy fields/defaults](../../../crates/agent-spec/src/spec.rs), [policy reconcile](../../../src/reconcile.rs), [restart cap](../../../src/flapping.rs) | Apply on the next relevant liveness/reconciliation decision. Do not replace a healthy process merely because policy changed. Unknown policy values make the snapshot invalid rather than silently selecting a default. | `keep` and restart policy are prospective. `adopt-only` holds dead/absent tasks; returning to `service` authorizes ordinary replacement. Healthy matching IDs remain adopted. Unknown lifecycle values fail parsing, but malformed restart duration/mode values currently fall back to defaults. |
 | `retired #true` | [retired lowering](../../../crates/agent-spec/src/spec.rs), [retired plan](../../../src/reconcile.rs), [plan execution](../../../src/run.rs) | Explicitly tear down only the declaration's exact live tasks, clean eligible dead state, and never relaunch. If the same edit also removes a child, retirement of the remaining declared IDs is not proof about the now-invisible child; that child still requires exact host-local removal attribution. | Implemented for still-declared tasks. Safe removal of the retired declaration after completion remains [#42](https://github.com/compoundingtech/st2/issues/42); simultaneous child removal is not currently detected. |
-| Agent `identity` | [identity/host resolution](../../../crates/agent-spec/src/discovery.rs), [bus/task IDs](../../../crates/agent-spec/src/spec.rs) | Treat as retire-old/add-new, never an in-place rename. Complete old retirement before removing the old declaration or activating a colliding new identity. | A staged old declaration with `retired #true` is supported. Editing identity in place does not retire the old runtime; the new ID can launch while old state remains. Historical naming is separately tracked by [#21](https://github.com/compoundingtech/st2/issues/21) and [#89](https://github.com/compoundingtech/st2/issues/89). |
-| Task `name` or explicit `id` | [task lowering](../../../crates/agent-spec/src/spec.rs), [runtime ID resolution](../../../src/reconcile.rs) | Treat as remove-old/add-new after complete valid-owner and runtime-attribution proof; never infer that differently addressed tasks are the same incarnation. | Adding the new ID works; exact old-child teardown has the same missing ownership/incarnation-attribution gap as task removal. |
-| Agent `host` | [placement resolution](../../../crates/agent-spec/src/discovery.rs), [host filter](../../../src/reconcile.rs) | Treat as an explicit cross-host migration: retire/verify old placement, then add/activate new placement. Each host acts from a complete local snapshot without synchronous coordination. | A direct edit makes the old host stop seeing the declaration and lets the new host launch; it does not prove old teardown. Exact staged publication/acknowledgement remains unresolved. |
+| Agent `identity` | [identity/host resolution](../../../crates/agent-spec/src/discovery.rs), [bus/task IDs](../../../crates/agent-spec/src/spec.rs) | Treat an ordinary edit as retire-old/add-new, never an inferred in-place rename. Complete old retirement before removing the old declaration or activating a colliding new identity. An optional explicit moved mapping may guide the migration under the stricter contract below. | A staged old declaration with `retired #true` is supported. Editing identity in place does not retire the old runtime; the new ID can launch while old state remains. Historical naming is separately tracked by [#21](https://github.com/compoundingtech/st2/issues/21) and [#89](https://github.com/compoundingtech/st2/issues/89). Moved mappings are not implemented. |
+| Task `name` or explicit `id` | [task lowering](../../../crates/agent-spec/src/spec.rs), [runtime ID resolution](../../../src/reconcile.rs) | Treat an ordinary edit as remove-old/add-new after complete valid-owner and runtime-attribution proof; never infer that differently addressed tasks are the same incarnation. An optional explicit moved mapping may guide exact re-address or replacement. | Adding the new ID works; exact old-child teardown has the same missing ownership/incarnation-attribution gap as task removal. Moved mappings are not implemented. |
+| Agent `host` | [placement resolution](../../../crates/agent-spec/src/discovery.rs), [host filter](../../../src/reconcile.rs) | Treat an ordinary edit as an explicit cross-host migration: retire/verify old placement, then add/activate new placement. A moved mapping may express intent but remains local-first and held until old retirement is proven. Each host acts from a complete local snapshot without synchronous coordination. | A direct edit makes the old host stop seeing the declaration and lets the new host launch; it does not prove old teardown. Exact staged publication/acknowledgement and moved mappings are not implemented. |
 | Agent `workspace` | [workspace/cwd model](../../../crates/agent-spec/src/spec.rs), [render target resolution](../../../src/materialize.rs), [spawn construction](../../../src/run.rs) | Ordinarily classify the edit as launch drift when it changes effective cwd, plus any independently resolved render or Resource delta. Preserve a healthy process and require explicit replacement for launch drift; do not infer a state-root move. | Current ID-only adoption hides the launch drift while materialization may target the newly resolved workspace. `adopt-only` ([#98](https://github.com/compoundingtech/st2/issues/98)) can fence replacement during a cutover but is not a mover. |
 | Catalog root; effective `PTY_ROOT`; another explicitly selected sensitive root | [catalog root selection](../../../src/catalog.rs), [effective PTY root](../../../src/run.rs) | Treat as a guided state-bearing migration: freeze the affected scope, prove old-location quiescence, move/update state, and resume exactly once. | Guided catalog/PTY-root migration is specified but unimplemented in [#85](https://github.com/compoundingtech/st2/issues/85). Ordinary workspace edits are outside this boundary. |
 | Invalid, partial, ambiguous, conflicting, or unreadable desired/actual state | [discovery diagnostics](../../../crates/agent-spec/src/discovery.rs), [validation](../../../src/validate.rs), [materialization failures](../../../src/materialize.rs), [runtime-list failure](../../../src/run.rs) | Block the smallest owner/render-dependency set whose completeness cannot be proved; broaden only when attribution/isolation is unprovable. Invalid remote-host input does not block valid isolated local work. Retain last-known-good ownership and never infer removal from partial/invalid input. Report affected identities, refusal, and proof scope. | Runtime-list failure skips the affected pass and render conflicts fail affected owners before writes. Discovery collects errors while continuing with valid specs, but no explicit last-known-good/removal-attribution layer yet proves safe destructive deltas. |
@@ -78,6 +78,47 @@ incarnation; a stale or absent binding is `unknown`, never converged.
 | removed from complete valid owner with exact runtime attribution | healthy or dead | task-set removal | teardown/clean only the exactly attributed removed task ID |
 | retired | healthy or dead | retirement | teardown/clean declared IDs; never relaunch |
 | invalid, partial, ambiguous, conflicting, unreadable | any | refusal | no destructive action in the unproven scope; valid isolated scopes may proceed |
+
+## Optional explicit moved intent
+
+The default remains retire/remove-old plus add-new. st2 never guesses that two
+addresses are a rename. A future catalog-native mapping may make that intent
+explicit without requiring runtime support in this draft. Its exact syntax is
+provisional; an illustrative KDL shape is:
+
+```kdl
+moved from="Silber.old.agent" to="Silber.new.agent"
+```
+
+Both values are one fully qualified task address. The mapping is:
+
+- migration intent only, never a runtime alias, hidden history record, or
+  global identity authority;
+- one-to-one and acyclic across the complete valid affected mapping set;
+- accepted only after preflight proves the exact old catalog, host, owner, task
+  ID, and current runtime incarnation, plus no conflicting live incarnation or
+  competing desired owner at the destination; and
+- retained until status reports completion; removing it while `pending` or
+  `refused` fails closed and preserves the old last-known-good ownership.
+
+Preserving the live process is legal only when the selected backend can
+atomically re-address the exact same incarnation and that change leaves every
+process-visible identity and launch field unchanged. An agent identity,
+`ST_AGENT`, supervisor/environment, host, effective cwd/workspace, command,
+argv, or other launch/backend-fingerprint change cannot be relabeled as an
+in-place move. In those cases `moved` guides an explicit task-scoped replacement
+or staged host migration instead.
+
+Cross-host intent remains local-first: the destination holds until the old host
+has proven retirement, and each host can make its local decision from a
+complete local catalog and runtime proof. The contract requires no synchronous
+all-host availability, CAS, or external registry. Quiet status and true dry-run
+expose the affected addresses, proof scope, and `pending`, `refused`, or
+`completed` state.
+
+Core st2 does not currently parse or execute this mapping. The syntax above
+must not be treated as supported catalog input until a later runtime change and
+paired acceptance make it normative.
 
 ## Reporting and dry-run
 
@@ -125,6 +166,8 @@ machine-readable fingerprint state. A true no-write plan is tracked by
    uses proven remove-old/add-new. Workspace changes produce launch drift plus
    independently resolved render changes. Guided state migration is reserved
    for catalog root, PTY root, or another explicitly selected sensitive root.
+   A future optional `moved` mapping may explicitly guide rename/re-address
+   intent under SPEC-R11, but ordinary edits never infer it.
 
 After these decisions and merge, external acceptance should execute a
 table-driven field matrix against both PTY and exec tasks, including compact

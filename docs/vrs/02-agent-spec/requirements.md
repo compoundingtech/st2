@@ -113,6 +113,20 @@ wrong.
   invalid input retains last-known-good ownership and never authorizes removal.
   Status and true no-write dry-run surfaces quietly report affected task IDs,
   action/refusal class, proof scope, drift state, and reasons before mutation.
+- **SPEC-R11 Make moved intent explicit and optional:** Ordinary agent identity,
+  task name, task ID, or host edits remain retire/remove-old plus add-new; st2
+  never infers a rename. A future catalog-native `moved` mapping may explicitly
+  relate one fully qualified old address to one fully qualified new address as
+  migration intent, not an alias, hidden history, or global identity authority.
+  Preflight proves exact old catalog/host/owner/task/incarnation ownership, a
+  one-to-one acyclic mapping, and no conflicting live or desired destination.
+  The same live incarnation is preserved only when the backend can atomically
+  re-address it without changing any process-visible identity or launch field;
+  otherwise the mapping guides explicit scoped replacement or staged host
+  migration. Cross-host execution is local-first and holds until old retirement
+  is proven, without synchronous all-host availability, CAS, or an external
+  registry. Quiet status and true dry-run report `pending`, `refused`, or
+  `completed`; removing the mapping before completion fails closed.
 
 ## Evidence boundary
 
