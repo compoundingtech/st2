@@ -134,3 +134,17 @@ accepted.
   but performs zero lifecycle actions until the transaction is completed.
   Presence, messages, context, and Resource state remain independently writable
   and are never serialized behind catalog authoring.
+- **R23 Typed adoption inventory:** One read-only machine command must join a
+  coherent declaration snapshot to one complete runtime observation and expose
+  every desired local PTY and exec task by agent identity, task name, runtime
+  id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
+  time, and opaque runtime-generation id. Unknown, duplicate, malformed,
+  unreadable, timed-out, or PID-reused evidence is indeterminate and makes the
+  versioned envelope incomplete and the command unsuccessful; it is never
+  reported as absence. Observation holds the shared catalog boundary, does not
+  create a missing runtime root, and performs no reconciliation or cleanup.
+  A staged control-plane replacement must apply `adopt-only` to every active
+  task, record a complete baseline inventory behind that no-launch fence, stop
+  only the old supervisor and start the replacement, prove every desired task
+  running at its baseline generation through a second complete inventory, and
+  only then separately compare-and-swap the ordinary `service` lifecycle.
