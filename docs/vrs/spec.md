@@ -219,6 +219,40 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   lifecycle is the explicit authority to resume ordinary replacement.
   `retired #true` remains the separate explicit teardown path.
 
+- **R23:** `st2 tasks --json` is the read-only adoption boundary. It emits one
+  `st2.task-inventory.v1` envelope while holding the catalog shared lock across
+  declaration discovery and runtime observation. Rows are sorted by agent,
+  task, and runtime id and cover both PTY and terminal-free exec tasks.
+  `complete=false` plus a non-zero exit is a closed result: a consumer must not
+  turn a missing row into absence. A running row always carries the backend's
+  PID, creation time, and an opaque generation id derived from stable backend
+  evidence. A missing runtime root is positively empty and remains absent on
+  disk; malformed state, PID reuse, timeouts, duplicate ids, and observer
+  failures are indeterminate.
+
+  A zero-interruption control-plane cutover is two catalog transactions, not an
+  optimistic normal-service restart:
+
+  1. apply a prospective catalog in which every active task is `adopt-only`;
+  2. record the complete baseline inventory behind that no-launch fence;
+  3. stop only the old supervisor and start the replacement;
+  4. require a complete inventory whose desired active rows are all running at
+     exactly the recorded generations and whose retired rows are absent;
+  5. compare-and-swap the ordinary `service` lifecycle catalog only after that
+     proof.
+
+  An absent task remains `held` throughout the uncertain interval, so the new
+  supervisor cannot manufacture the evidence the gate is trying to measure.
+  Failure leaves the fence in place; it never authorizes teardown or launch.
+
+  Historical exec PID files are observed read-only. Same-tick or otherwise
+  ambiguous legacy evidence remains indeterminate: it is never silently
+  promoted. No safe per-task rollover command exists yet for that evidence, so
+  the cutover remains blocked before step 1 until the sidecar exits naturally or a separate,
+  explicitly authorized rollover seam is implemented and proved. The record
+  must not be rewritten as a workaround, and PTY-backed agent sessions must
+  not be restarted to satisfy this gate.
+
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
   can share a single registry across catalogs. Resolution is an exported
