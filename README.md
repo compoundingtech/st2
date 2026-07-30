@@ -65,6 +65,17 @@ systemd unit was installed with an ambient `PTY_ROOT`, reinstall the unit withou
 (`st2 service install`) — the export still wins, and leaving it pins the supervisor to the old
 registry while everything else follows the catalog.
 
+st2 records the last effective registry for each `(catalog, host)`. If that root changes, the next
+reconcile inspects the recorded previous registry before doing any materialization or lifecycle
+work. A live session whose id exactly matches a declared local PTY task makes the pass fail closed:
+st2 reports the previous and requested roots plus the surviving ids, and does not launch, adopt, or
+kill anything. Restore the previous root to adopt those survivors, or explicitly stop/migrate those
+exact tasks; once none remain, retrying advances the receipt and reconciles the new root. Unrelated
+sessions, including ids that merely share a prefix, remain untouched and do not block the catalog.
+When upgrading an older st2, run one reconcile on the existing root to establish this receipt before
+changing the export or declaration; an arbitrary root used only by an older process is not
+discoverable after both its configuration and control plane have already been replaced.
+
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
 verifies its own immutable set for Codex launches; any local workspace render that actually

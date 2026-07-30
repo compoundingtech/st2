@@ -1798,19 +1798,19 @@ fn up(
         return Ok(());
     }
 
-    let runner = SystemRunner::new(catalog_root, exec_state_dir(&this_host));
+    let runner = SystemRunner::new(catalog_root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
     // the lock (it would double-spawn) — but it does NOT take the lock itself (that would clobber the
     // loop's pid file); only the loop acquires + holds it.
-    let lock = HostLock::new(root, &this_host);
+    let lock = HostLock::new(&catalog_root, &this_host);
     if let Some(owner) = lock.live_owner() {
         eprintln!("st2: {}", lock.busy_warning(owner));
         std::process::exit(1);
     }
 
     if once {
-        let report = up_once(root, &this_host, &runner)?;
+        let report = up_once(&catalog_root, &this_host, &runner)?;
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
         if report.skipped {
@@ -1826,10 +1826,10 @@ fn up(
 
     eprintln!(
         "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",
-        root.display()
+        catalog_root.display()
     );
     let result = up_loop(
-        root,
+        &catalog_root,
         &this_host,
         &runner,
         Duration::from_secs(interval),

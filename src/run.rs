@@ -268,29 +268,7 @@ impl PtyCli {
 
 impl Runner for PtyCli {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
-        let out = output_with_timeout(
-            Command::new(&self.bin)
-                .args(["list", "--json"])
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
-            PTY_LIST_TIMEOUT,
-        )
-        .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "`pty list --json` failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("parsing `pty list --json`: {e}"))?;
-        Ok(entries
-            .into_iter()
-            .map(|e| Session {
-                pty_id: e.name,
-                alive: e.status == "running",
-                exit_code: e.exit_code,
-            })
-            .collect())
+        list_pty_sessions_at_with(&self.bin, &effective_pty_root(&self.catalog_root))
     }
 
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -409,6 +387,38 @@ impl Runner for PtyCli {
         }
         Ok(())
     }
+}
+
+/// Inspect one explicit PTY registry without changing the process-wide effective root.
+pub fn list_pty_sessions_at(root: &Path) -> anyhow::Result<Vec<Session>> {
+    list_pty_sessions_at_with("pty", root)
+}
+
+fn list_pty_sessions_at_with(bin: &str, root: &Path) -> anyhow::Result<Vec<Session>> {
+    let out = output_with_timeout(
+        Command::new(bin)
+            .args(["list", "--json"])
+            .env("PTY_ROOT", root),
+        PTY_LIST_TIMEOUT,
+    )
+    .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`pty list --json` failed for {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
+        .map_err(|e| anyhow::anyhow!("parsing `pty list --json` for {}: {e}", root.display()))?;
+    Ok(entries
+        .into_iter()
+        .map(|e| Session {
+            pty_id: e.name,
+            alive: e.status == "running",
+            exit_code: e.exit_code,
+        })
+        .collect())
 }
 
 /// The production [`Runner`]: routes `pty` tasks to the `pty` CLI and `exec` tasks to the
@@ -755,6 +765,18 @@ fn reconcile_pass(
             .collect(),
         ..Default::default()
     };
+
+    if let Err(error) = crate::pty_root_transition::ensure_safe_transition(
+        root,
+        this_host,
+        &effective_pty_root(root),
+        &found.specs,
+        list_pty_sessions_at,
+    ) {
+        report.skipped = true;
+        report.errors.push(error.to_string());
+        return report;
+    }
 
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation

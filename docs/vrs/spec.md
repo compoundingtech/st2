@@ -81,7 +81,14 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   uniformly to spawn, list, kill, and the bus environment st2 hands to native
   tools, so every reader that can resolve the catalog agrees about where its
   sessions are. A declaration whose field set does not match fails `st2
-  validate` rather than resolving silently back to the default.
+  validate` rather than resolving silently back to the default. The reconciler
+  persists the last effective root per `(catalog, host)`. Before a changed-root
+  pass it inspects that known previous registry and refuses all reconciliation
+  while an exact declared local PTY task survives there, or while the registry
+  cannot be inspected. It never kills or cross-root-adopts work implicitly.
+  After the exact survivors are explicitly stopped or migrated, a retry
+  advances the receipt and reconciles the new root; unrelated and prefix-only
+  session ids remain untouched.
 
 ## Message lifecycle
 

@@ -20,6 +20,7 @@ pub mod isolate;
 pub mod materialize;
 pub mod message;
 pub mod pretrust;
+pub mod pty_root_transition;
 pub mod reconcile;
 pub mod resource;
 pub mod run;
@@ -45,5 +46,5 @@ pub use host_lock::HostLock;
 pub use reconcile::{Launch, ReconcilePlan, Session, TaskTarget, Teardown, reconcile};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
-    up_loop, up_loop_specs, up_once, up_once_specs,
+    list_pty_sessions_at, up_loop, up_loop_specs, up_once, up_once_specs,
 };
