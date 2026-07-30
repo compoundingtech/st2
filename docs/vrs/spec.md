@@ -20,26 +20,27 @@ canonical in
 
 An eval may opt into `canonical-agents` after its fixture copy and deterministic
 run steps have populated the hermetic temporary catalog. The directive is
-mutually exclusive with compact `team` / `agent` seats. st2 discovers and
-materializes only declarations at
-`agents/<host>/<identity>/agent.kdl`, then carries that one Agent Spec vector
-unchanged through launch admission, kickoff resolution, supervision, logging,
-and teardown.
+mutually exclusive with compact `team` / `agent` declarations. st2 recursively
+discovers the catalog, preserves explicit `identity` and `host` authority
+independent of organizational placement, and projects only declarations
+resolved to the eval host. Each declaration parent remains its native
+state/resource anchor. The resulting local Agent Spec vector flows unchanged
+through launch admission, kickoff resolution, supervision, logging, and
+declaration-driven teardown; remote-host declarations remain inert.
 
 Admission applies `validate_for_host` strictly, then fails before spawn when
-discovery is empty, malformed, warning-bearing, duplicate, retired, nonlocal,
-noncanonical, root-overriding, unrunnable, or does not expose exactly one
-independently launchable service main PTY per declaration. Every resolved task
-runtime ID must be nonempty and fleet-unique, including collisions between a
-main PTY and another declaration's sidecar. Materialization warnings and
-backend launch errors are fatal. The kickoff target must resolve to exactly one member of the
-discovered fleet. The eval owns one native `CATALOG` / `ST_ROOT` and its
-`<catalog>/pty` registry; declarations cannot override those roots. Workspace
-renders are materialized before any seat starts.
+discovery is malformed or warning-bearing, when the selected local projection
+is empty, duplicate, retired, root-overriding, or unrunnable, or when any
+resolved local task runtime ID is empty or duplicates another local task.
+Materialization warnings and backend launch errors are fatal. The kickoff
+target must resolve to exactly one local agent. The eval owns one native
+`CATALOG` / `ST_ROOT` and its `<catalog>/pty` registry; declarations cannot
+override those roots. Local workspace renders are materialized before any
+agent task starts.
 
 Native inbox/archive paths are derived once from the admitted Agent Spec paths
 and carried as frozen data; routing never re-discovers the mutable catalog.
-The requester alone is an explicit eval-owned flat mailbox. Multi-seat
+The requester alone is an explicit eval-owned flat mailbox. Multi-agent
 completion retains the worker-report-before-supervisor-confirmation ordering.
 For a singleton, the eval snapshots the requester inbox before kickoff and
 completes only for a newly appearing interviewer reply whose timestamp is
@@ -52,11 +53,11 @@ Without `canonical-agents`, fixture declarations are not discovered or launched
 and compact evals retain their catalog-less flat bus. This explicit opt-in keeps
 ordinary fixtures inert while allowing the same canonical declaration to be
 exercised in an eval and real work. Parser and admission evidence lives in
-`eval_spec::tests::canonical_agents_is_bare_once_and_excludes_compact_seats` and
+`eval_spec::tests::canonical_agents_is_bare_once_and_excludes_compact_agents` and
 the `canonical_*` unit tests. Named-PTY end-to-end cases prove strict
 pre-spawn refusals, poisoned ambient-root isolation, real render
 materialization, frozen routing after declaration removal, singleton
-completion, custom main-ID supervision/logging/teardown, and the no-opt-in
+completion, custom task-ID supervision/logging/teardown, and the no-opt-in
 legacy control in `tests/eval_run_e2e.rs`.
 
 ## Resource bindings (R20-R21)

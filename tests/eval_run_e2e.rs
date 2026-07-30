@@ -454,19 +454,65 @@ eval {
 }
 
 #[test]
-fn canonical_agents_reject_noncanonical_declarations_before_spawn() {
+fn canonical_agents_accept_path_independent_local_tasks_and_ignore_remote_projection() {
+    if !pty_available() {
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
+        eprintln!(
+            "SKIP canonical_agents_accept_path_independent_local_tasks_and_ignore_remote_projection"
+        );
+        return;
+    }
     let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let cell = tmp.path().join("cell");
     let fixture = cell.join("fixture");
-    std::fs::create_dir_all(fixture.join("misplaced")).unwrap();
+    let local_dir = fixture.join("organization/.managed/arbitrary/declaration");
+    let remote_dir = fixture.join("fleet/remote/declaration");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::create_dir_all(fixture.join("scripts")).unwrap();
     std::fs::write(
-        fixture.join("misplaced/agent.kdl"),
-        r#"agent "bad" {
-  identity "bad"
+        local_dir.join("agent.kdl"),
+        r#"agent "local" {
+  identity "local"
   host "evalhost"
-  argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60"
+  pty "work" {
+    id "custom-local-task"
+    argv "sh" "$CATALOG/scripts/local.sh"
+  }
 }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        remote_dir.join("agent.kdl"),
+        r#"agent "remote" {
+  identity "remote"
+  host "other"
+  pty "work" {
+    id "remote-task"
+    command "touch \"$CATALOG/REMOTE-SPAWNED\"; sleep 60"
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/local.sh"),
+        r#"#!/bin/sh
+for _ in $(seq 1 100); do
+  set -- "$CATALOG/organization/.managed/arbitrary/declaration/resources/inbox/"*.md
+  if [ -e "$1" ]; then
+    st2 message send requester --root "$ST_ROOT" --as evalhost.local -m "done" >/dev/null 2>&1
+    exec sleep 60
+  fi
+  sleep 0.05
+done
+exit 42
 "#,
     )
     .unwrap();
@@ -477,16 +523,22 @@ host "evalhost"
 eval {
   copy "./fixture"
   canonical-agents
-  message { from "requester"; to "evalhost.bad"; content "go" }
+  message { from "requester"; to "evalhost.local"; content "go" }
   max-timeout "10s"
-  judges { judge "never reached" { exec "false" } }
+  judges {
+    judge "local projection only" {
+      exec "test -d $CATALOG/organization/.managed/arbitrary/declaration/resources/inbox && test ! -e $CATALOG/REMOTE-SPAWNED"
+    }
+  }
 }
 "#,
     )
     .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
     let child = Command::new(bin)
         .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
+        .env("PATH", path)
         .env_remove("CATALOG")
         .env_remove("ST_ROOT")
         .env_remove("PTY_ROOT")
@@ -498,14 +550,15 @@ eval {
     let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
     let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
     let out = child.wait_with_output().unwrap();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("team signalled done")
+            && stdout.contains("SCORE: 2 PASS / 0 FAIL"),
+        "path-independent local projection failed:\n{stdout}\n{stderr}"
     );
-    assert!(!out.status.success(), "noncanonical declaration was accepted:\n{combined}");
-    assert!(combined.contains("canonical path"), "wrong refusal:\n{combined}");
-    assert!(!catalog.join("SPAWNED").exists(), "seat spawned before canonical admission");
+    assert!(catalog.join("logs/custom-local-task.log").is_file());
 }
 
 #[test]
@@ -564,7 +617,7 @@ eval {
             && combined.contains("found 0"),
         "wrong refusal:\n{combined}"
     );
-    assert!(!catalog.join("SPAWNED").exists(), "seat spawned before kickoff admission");
+    assert!(!catalog.join("SPAWNED").exists(), "task spawned before kickoff admission");
 }
 
 #[test]
@@ -606,10 +659,7 @@ for _ in $(seq 1 100); do
   set -- "$CATALOG/agents/evalhost/interviewer/resources/inbox/"*.md
   if [ -e "$1" ]; then
     sleep 0.02
-    mkdir -p "$ST_ROOT/requester/inbox"
-    timestamp=$(date +%s%3N)
-    printf '%s\n' '---' 'from: evalhost.interviewer' '---' 'done' \
-      > "$ST_ROOT/requester/inbox/$timestamp-aaaaaa.md"
+    st2 message send requester --root "$ST_ROOT" --as evalhost.interviewer -m "done" >/dev/null 2>&1
     echo "completed through frozen route"
     break
   fi
@@ -699,34 +749,12 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
             )],
         ),
         (
-            "main PTY",
-            "evalhost.worker",
-            vec![(
-                "worker",
-                r#"agent "worker" { identity "worker"; host "evalhost"; pty "agent"; exec "poison" { command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
-            )],
-        ),
-        (
             "materialization warnings",
             "evalhost.worker",
             vec![(
                 "worker",
                 r#"agent "worker" { identity "worker"; host "evalhost"; workspace "$CATALOG/workspace"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60"; render { git-exclude ".st2/" } }"#,
             )],
-        ),
-        (
-            "duplicate main PTY",
-            "evalhost.one",
-            vec![
-                (
-                    "one",
-                    r#"agent "one" { identity "one"; host "evalhost"; pty "agent" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
-                ),
-                (
-                    "two",
-                    r#"agent "two" { identity "two"; host "evalhost"; pty "agent" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
-                ),
-            ],
         ),
         (
             "duplicate runtime task id",
@@ -751,7 +779,7 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
             )],
         ),
         (
-            "belongs to host",
+            "no local canonical Agent Specs",
             "other.worker",
             vec![(
                 "../other/worker",
@@ -767,7 +795,7 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
             )],
         ),
         (
-            "main PTY id must be nonempty",
+            "runtime task id must be nonempty",
             "evalhost.worker",
             vec![(
                 "worker",

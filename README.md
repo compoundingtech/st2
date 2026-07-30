@@ -406,13 +406,15 @@ eval {
 ```
 
 `copy` and deterministic `run` steps populate the hermetic temporary catalog first.
-`canonical-agents` then discovers and materializes declarations at
-`agents/<host>/<identity>/agent.kdl`. It is mutually exclusive with compact `team` / `agent` seats:
-the discovered vector is the sole authority for launch, kickoff routing, supervision, logs, and
-teardown. Strict catalog validation, main-PTY admission, fleet-unique nonempty task runtime IDs, and
-warning-free materialization all finish before a seat starts; backend launch errors are fatal. The
-native inbox/archive paths are frozen from that admitted vector, so later catalog mutation cannot
-redirect eval traffic. A multi-seat team completes only after the existing worker-report ordering.
+`canonical-agents` then recursively discovers the catalog and projects declarations resolved to the
+eval host. Explicit `identity` and `host` fields remain authoritative independent of organizational
+placement; each declaration parent remains its native state/resource anchor. The directive is
+mutually exclusive with compact `team` / `agent` declarations, so the local Agent Spec vector is the
+sole authority for launch, kickoff routing, supervision, logs, and teardown. Strict catalog
+validation, fleet-unique nonempty task runtime IDs, and warning-free local materialization all finish
+before an agent task starts; backend launch errors are fatal. Remote-host declarations remain inert.
+Native inbox/archive paths are frozen from the admitted local vector, so later catalog mutation
+cannot redirect eval traffic. A multi-agent team completes only after the existing worker-report ordering.
 For a singleton, the requester inbox is snapshotted before kickoff; only a newly appearing
 interviewer reply at-or-after the exact kickoff receipt completes it. Canonical completion gates the
 verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact

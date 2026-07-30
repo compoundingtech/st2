@@ -349,7 +349,7 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
         && (!agents.is_empty() || eval.as_ref().is_some_and(|eval| !eval.agents.is_empty()))
     {
         anyhow::bail!(
-            "eval `canonical-agents` is mutually exclusive with compact `team` / `agent` seats"
+            "eval `canonical-agents` is mutually exclusive with compact `team` / `agent` declarations"
         );
     }
     Ok(Spec { host, env: top_env, agents, eval })
@@ -859,7 +859,7 @@ team "mix" {
     }
 
     #[test]
-    fn canonical_agents_is_bare_once_and_excludes_compact_seats() {
+    fn canonical_agents_is_bare_once_and_excludes_compact_agents() {
         let canonical = parse_spec(
             "eval {\n  canonical-agents\n  message { from \"r\"; to \"h.sup\"; content \"go\" }\n  max-timeout \"5s\"\n}\n",
         )
