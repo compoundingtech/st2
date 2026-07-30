@@ -269,6 +269,9 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// EXPERIMENTAL, READ-ONLY: parse, validate, and inspect versioned catalog plans.
+    #[command(subcommand)]
+    Plan(PlanCmd),
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
@@ -337,6 +340,48 @@ enum HooksCmd {
     Verify,
     /// Verify this binary's immutable hook set without requiring it to be selected.
     VerifyOwn,
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// Validate every external and inline plan without executing or writing anything.
+    Validate {
+        /// Catalog folder or KDL file. Prefer --catalog; defaults to the selected catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+        /// Emit a machine-readable validation receipt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List normalized plan identity, owner, and derived frontier.
+    List {
+        /// Catalog folder or KDL file. Prefer --catalog; defaults to the selected catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+        /// Emit a machine-readable array.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show normalized intent for one explicit plan identity.
+    Show {
+        identity: String,
+        /// Catalog folder or KDL file. Prefer --catalog; defaults to the selected catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+        /// Emit machine-readable normalized intent.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one plan with source provenance, resolved file paths, and agent references.
+    Inspect {
+        identity: String,
+        /// Catalog folder or KDL file. Prefer --catalog; defaults to the selected catalog.
+        #[arg(conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+        /// Emit the complete machine-readable inspection record.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -571,6 +616,7 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
+        Command::Plan(command) => plan_cmd(command),
         Command::CompileAgent {
             catalog,
             identity,
@@ -636,6 +682,159 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn plan_cmd(command: PlanCmd) -> Result<()> {
+    match command {
+        PlanCmd::Validate { root, json } => {
+            let root = catalog_arg(root)?;
+            match st2::plans::load(&root) {
+                Ok(catalog) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "result": "valid",
+                                "plans": catalog.plans.len(),
+                                "errors": 0,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "valid: {} plan{}; read-only (no execution or writes)",
+                            catalog.plans.len(),
+                            plural(catalog.plans.len())
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "result": "invalid",
+                                "code": error.code(),
+                                "path": error.path(),
+                                "error": error.to_string(),
+                            }))?
+                        );
+                    }
+                    Err(error.into())
+                }
+            }
+        }
+        PlanCmd::List { root, json } => {
+            let catalog = st2::plans::load(&catalog_arg(root)?)?;
+            if json {
+                let rows = catalog
+                    .plans
+                    .iter()
+                    .map(|plan| {
+                        serde_json::json!({
+                            "identity": plan.identity,
+                            "owner": plan.owner,
+                            "frontier": plan.frontier,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for plan in catalog.plans {
+                    println!(
+                        "{}\towner={}\tfrontier={}",
+                        plan.identity,
+                        plan.owner,
+                        plan.frontier.join(",")
+                    );
+                }
+            }
+            Ok(())
+        }
+        PlanCmd::Show {
+            identity,
+            root,
+            json,
+        } => {
+            let catalog = st2::plans::load(&catalog_arg(root)?)?;
+            let plan = exact_plan(&catalog, &identity)?;
+            let intent = serde_json::json!({
+                "identity": plan.identity,
+                "owner": plan.owner,
+                "versions": plan.versions.iter().map(|version| serde_json::json!({
+                    "identity": version.identity,
+                    "parents": version.parents,
+                    "why": version.why,
+                    "resource": version.resource,
+                })).collect::<Vec<_>>(),
+                "frontier": plan.frontier,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&intent)?);
+            } else {
+                println!("plan {}  owner={}", plan.identity, plan.owner);
+                for version in &plan.versions {
+                    let marker = if plan.frontier.contains(&version.identity) {
+                        " [frontier]"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  version {}{marker}  resource={}",
+                        version.identity, version.resource
+                    );
+                    if !version.parents.is_empty() {
+                        println!("    parents: {}", version.parents.join(", "));
+                    }
+                    if let Some(why) = &version.why {
+                        println!("    why: {why}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        PlanCmd::Inspect {
+            identity,
+            root,
+            json,
+        } => {
+            let catalog = st2::plans::load(&catalog_arg(root)?)?;
+            let plan = exact_plan(&catalog, &identity)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(plan)?);
+            } else {
+                println!(
+                    "plan {}  owner={}  kind={:?}\n  source: {}\n  referenced-by: {}\n  frontier: {}",
+                    plan.identity,
+                    plan.owner,
+                    plan.source_kind,
+                    plan.source.display(),
+                    plan.referenced_by.join(","),
+                    plan.frontier.join(",")
+                );
+                for version in &plan.versions {
+                    println!(
+                        "  {}: {} -> {}",
+                        version.identity,
+                        version.resource,
+                        version.resolved_resource.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn exact_plan<'a>(
+    catalog: &'a st2::plans::PlanCatalog,
+    identity: &str,
+) -> Result<&'a st2::plans::Plan> {
+    catalog
+        .plans
+        .iter()
+        .find(|plan| plan.identity == identity)
+        .with_context(|| format!("no plan '{identity}' found"))
 }
 
 #[allow(clippy::too_many_arguments)]

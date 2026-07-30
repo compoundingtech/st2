@@ -183,6 +183,52 @@ agent "<identity>" {
 }
 ```
 
+## Experimental read-only plans
+
+The experimental `st2 plan` surface implements only the inspectable file model from the
+[st2 plans sketch at revision `5c1d142`](https://gist.github.com/myobie/d5ecfac24cd3965e095a5031cd2e00cb/5c1d1427c0556d95d13890e5c5086cd85b25d994).
+It parses either a top-level `plan.kdl`:
+
+```kdl
+plan "ship-remote-approvals" {
+  owner "app-web"
+  version "0000" resource="file:versions/0000.md"
+  version "0001" resource="file:versions/0001.md" {
+    parent "0000"
+    why "Browser proof exposed an approval race."
+  }
+}
+```
+
+or the equivalent agent-local form:
+
+```kdl
+agent "app-web" {
+  plan "review-follow-up" {
+    version "0000" resource="file:review-follow-up.md"
+  }
+}
+```
+
+An agent links an external declaration with `plan-ref "file:relative/plan.kdl"`. Plan identity is
+the explicit KDL value, never the directory. Inline ownership comes from the containing agent;
+external plans require one `owner`. Every version has one relative `file:` resource. Revisions have
+one or more immutable `parent` links and a non-empty `why`; root versions have no parent. The
+frontier is derived as every version with no child, so concurrent siblings remain visible.
+References resolve from the KDL file that declares them and must stay inside the selected catalog.
+
+```sh
+st2 plan validate --catalog examples/plans
+st2 plan list --catalog examples/plans
+st2 plan show ship-remote-approvals --catalog examples/plans
+st2 plan inspect ship-remote-approvals --catalog examples/plans --json
+```
+
+All four commands are read-only. They do not select a current version, write progress, emit events,
+execute a plan, reconcile agents, schedule work, interpret claims, or require CAS. Direct KDL and
+direct human-to-agent planning remain complete workflows; this experiment must earn any larger
+runtime.
+
 st2 provides `CATALOG`, flat native `ST_ROOT`, local `PTY_ROOT`, `ST_AGENT`, and `ST_HOOKS` to the
 task. The complete st2-managed overlay is also persisted in PTY metadata, so a manual `pty restart`
 retains those values. Declarations should not contain machine-specific install paths.

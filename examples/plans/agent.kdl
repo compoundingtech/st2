@@ -1,0 +1,13 @@
+agent "app-web" {
+  host "example"
+  command "true"
+  plan-ref "file:ship-remote-approvals/plan.kdl"
+}
+
+agent "reviewer" {
+  host "example"
+  command "true"
+  plan "review-follow-up" {
+    version "0000" resource="file:review-follow-up.md"
+  }
+}
