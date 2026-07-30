@@ -2,158 +2,58 @@
 
 ## Context
 
-This subnode decomposes the root requirements for Agent Spec compliance
-([R01](../requirements.md#must-implement-the-agent-contract)), restartable
-launch definitions ([R06](../requirements.md#must-preserve-delivery-and-launch-behavior)),
-nondisruptive control-plane replacement
-([R11](../requirements.md#must-preserve-delivery-and-launch-behavior)), and
-shortest-path and targeted reconciliation
-([R13–R19](../requirements.md#must-externalize-agent-state-and-scope)).
-It defines how one normalized declaration delta affects already-running work.
-It does not change the product vision, define provider or harness fields, or
-require a content-addressed catalog.
+This subnode defines how normalized Agent Spec changes affect running work under root
+[R01, R06, R11, and R13–R19](../requirements.md). It is harness-agnostic, complete
+from a valid local catalog plus host-local runtime state, and requires no CAS, lock
+service, cross-host RPC, or external registry. The exhaustive field contract and
+current gaps are in [spec.md](./spec.md); where the root VRS disagrees, it wins.
 
-The field matrix and current implementation gaps are in [spec.md](./spec.md).
-Where this file and the root VRS disagree, the root wins and this file is
-wrong.
+## Normative requirements
 
-## Assumptions
-
-- **SPEC-A01 Complete local declaration:** A destructive delta is computed only
-  from a complete, valid, unambiguous owner and render-dependency set in the
-  local catalog. A partially delivered or invalid input is not evidence that a
-  previously declared task was intentionally removed.
-- **SPEC-A02 Immutable running process:** A running process cannot be updated in
-  place. Its command, argv, working directory, environment, and backend
-  attributes were fixed when its exact incarnation launched.
-- **SPEC-A03 Stable task identity:** Reconciliation addresses a task by its
-  normalized host-qualified runtime ID. An identity change is a removal plus an
-  addition, not an update of the old process.
-- **SPEC-A04 Partition-local sufficiency:** Classification, preview,
-  materialization, and reconciliation use a complete local catalog plus
-  host-local runtime state. They require no online CAS service, lock server, or
-  cross-host RPC.
-
-## Acceptable tradeoffs
-
-- **SPEC-T01 Visible drift over surprise churn:** Preserving a healthy
-  interactive process and reporting launch drift is preferable to silently
-  restarting it.
-- **SPEC-T02 Explicit migration over inferred moves:** A host, identity,
-  task-ID, or explicitly selected sensitive-root move may require a staged
-  migration. Refusal is preferable to guessing that two differently addressed
-  states are the same live work.
-- **SPEC-T03 Safe removal over eager cleanup:** A task may remain until a
-  complete valid owner plus exact host-local runtime attribution prove
-  intentional removal. Legacy or unattributed work remains held for explicit
-  recovery; invalid or ambiguous input never authorizes guessed teardown.
-
-## Requirements
-
-- **SPEC-R01 Normalize before comparison:** Formatting, comments, declaration
-  order, and source-path changes are semantic no-ops only when they lower to the
-  same semantic field projection, render plan, task IDs, resolved paths, and
-  effective launch definitions. Explicit identity prevents a path move from
-  inventing a new identity; it does not hide a path-derived host or cwd, a
-  declared workspace, or a state-anchor change. A source-only no-op authorizes
-  no materialization or process-lifecycle action by itself; it does not suppress
-  ordinary actual-state reconciliation of an independently absent or dead task.
-- **SPEC-R02 Classify by effect:** Every normalized field delta receives an
-  action-driving class: source-only, declaration metadata, render input,
-  task-set identity, launch fingerprint, subsequent policy, retirement, or
-  migration boundary. Retirement and migration boundaries dominate
-  lower-impact effects of the same edit. Core st2 has no semantic state for
-  fields it deliberately ignores. compile-agent or another provider may
-  interpret those inputs and lower them into runner-normative fields; core
-  classifies only that lowered delta.
-- **SPEC-R03 Preserve unrelated work:** One field or task change affects only
-  its exact owner/task IDs or its proven shared render dependency set. It never
-  restarts, tears down, or rewrites an unrelated task or agent.
-- **SPEC-R04 Keep metadata nondisruptive:** Role and Resource binding changes
-  update observable declaration metadata. They do not stop, replace, or
-  relaunch a healthy task. A committed Resource change visible to a preserved
-  live incarnation follows SPEC-R12; a role-only edit is not by itself a
-  material file or Resource change.
-- **SPEC-R05 Materialize without process churn:** A render delta is preflighted
-  against the complete active local fleet, then applied idempotently. A
-  conflict fails every affected owner before the first write. Successful
-  materialization does not itself restart a healthy task. When committed bytes
-  or Resources become visible to an already-running agent whose incarnation is
-  preserved, reconciliation follows SPEC-R12.
-- **SPEC-R06 Reconcile task-set deltas narrowly:** Adding one uniquely
-  identified PTY or exec task launches only that missing child. Removing one
-  from a complete valid current owner explicitly tears down only an old child
-  whose ordinary host-local runtime metadata proves the exact catalog, host,
-  owner, task ID, and current incarnation. Legacy or unattributed tasks
-  hold/refuse for explicit recovery. No synced prior snapshot, tombstone, or
-  CAS is required. Compact DING addition and removal follow the same
-  derived-task rule.
-- **SPEC-R07 Expose launch drift:** Task kind, command or argv, effective cwd,
-  effective process environment, task tags passed to the backend, and every
-  other spawn-affecting field form a versioned desired launch fingerprint. An
-  absent or dead task launches the latest desired definition. A healthy task
-  whose observed incarnation does not match remains alive and is visibly
-  `drifted` or `unknown`; replacement is a separate explicit, task-scoped
-  action with an exact incarnation recheck.
-- **SPEC-R08 Apply policies prospectively:** `keep`, `restart`, and task
-  `lifecycle` changes alter subsequent reconciliation without replacing a
-  healthy process. `retired #true` is the explicit exception: it tears down the
-  declared task set and prevents relaunch. A simultaneous retirement plus child
-  removal does not make the removed child safe to forget: teardown still
-  requires the exact removal attribution in SPEC-R06.
-- **SPEC-R09 Treat address changes as migrations:** Agent identity changes are
-  retire-old/add-new. Task name or explicit ID changes are remove-old/add-new.
-  Host, catalog-root, PTY-root, and another explicitly selected sensitive-root
-  change are migration boundaries, not in-place updates. A workspace change
-  ordinarily produces launch drift through effective cwd plus any independently
-  resolved render or Resource delta; it does not inherently invoke
-  sensitive-root migration. `adopt-only` may fence launch/replacement during a
-  cutover, but it does not by itself move state or prove migration complete.
-- **SPEC-R10 Fail closed and explain first:** Invalid, partial, ambiguous,
-  conflicting, or unreadable desired/actual state blocks the smallest
-  owner/render-dependency set whose completeness cannot be proved. The block
-  broadens only when attribution or isolation itself is unprovable; an invalid
-  remote-host declaration does not block valid isolated local work. Partial or
-  invalid input retains last-known-good ownership and never authorizes removal.
-  Status and true no-write dry-run surfaces quietly report affected task IDs,
-  action/refusal class, proof scope, drift state, and reasons before mutation.
-- **SPEC-R11 Make moved intent explicit and optional:** Ordinary agent identity,
-  task name, task ID, or host edits remain retire/remove-old plus add-new; st2
-  never infers a rename. A future catalog-native `moved` mapping may explicitly
-  relate one fully qualified old address to one fully qualified new address as
-  migration intent, not an alias, hidden history, or global identity authority.
-  Preflight proves exact old catalog/host/owner/task/incarnation ownership, a
-  one-to-one acyclic mapping, and no conflicting live or desired destination.
-  The same live incarnation is preserved only when the backend can atomically
-  re-address it without changing any process-visible identity or launch field;
-  otherwise the mapping guides explicit scoped replacement or staged host
-  migration. Cross-host execution is local-first and holds until old retirement
-  is proven, without synchronous all-host availability, CAS, or an external
-  registry. Quiet status and true dry-run report `pending`, `refused`, or
-  `completed`; removing the mapping before completion fails closed.
-- **SPEC-R12 Notify a surviving agent after a material change:** When one
-  successful reconcile transaction materially changes files or Resources
-  visible to an already-running agent without replacing or retiring that
-  incarnation, st2 persists one targeted event in that agent's inbox after the
-  write transaction commits, then attempts DING. The event has a stable
-  idempotency identifier and includes the agent identity, host, a host-local
-  desired-state or reconcile identifier available without CAS, affected target
-  paths but never contents or secrets, the change class, and whether follow-up
-  is required. One transaction is coalesced to one event per affected agent;
-  replay or duplicate delivery is harmless. A semantic no-op, unchanged render
-  bytes, a failed or rolled-back write, a periodic check, or replacement or
-  retirement of the old incarnation emits no such event. The inbox record is
-  the durable fact: DING failure neither removes it nor rolls back a successful
-  write. The running agent decides how to incorporate the change; notification
-  alone never forces restart. Notification paths are excluded from
-  materialization-triggered reconciliation so delivery cannot recursively
-  trigger itself. This is a quiet event boundary, not routine status narration,
-  and requires no harness, CAS, or external registry.
+- **SPEC-R01 Normalize and classify before acting.** Compare the normalized
+  semantic projection, render plan, resolved addresses/paths, task set, launch
+  fingerprints, policy, retirement, and host membership—not source bytes. Formatting,
+  ordering, comments, or source movement are `no-op` only when all effects match. A
+  source-only no-op authorizes no mutation but does not suppress healing of independently
+  absent/dead actual state. Ignored provider fields have no core delta until lowered.
+- **SPEC-R02 Fail closed at the smallest proven local scope.** Before mutation,
+  require a complete valid local owner/render-dependency/conflict component and
+  exact actual-state attribution. Invalid, partial, unreadable, ambiguous, or conflicting
+  input retains last-known-good ownership, never proves removal, and blocks only the
+  smallest component whose isolation cannot be proved. Removal requires host-local
+  metadata binding exact catalog, host, owner, task ID, and current incarnation;
+  legacy/unattributed work holds. No prior synced snapshot, tombstone, or CAS is required.
+- **SPEC-R03 Preserve live work unless its action is explicit.** Role metadata
+  and prospective keep/restart/lifecycle policy do not churn a healthy task.
+  Agent `workspace` is live context: notify a survivor; boot absent/dead with latest.
+  Changed render/Resource state materializes idempotently and notifies survivors.
+  Explicit task `cwd`, command/argv, kind, env, tags, supervisor-derived env, and other
+  spawn inputs form a versioned launch fingerprint; visible `drifted`/`unknown` mismatch
+  never authorizes surprise replacement. Unrelated work receives no action.
+- **SPEC-R04 Reconcile membership and lifecycle narrowly.** Add only missing
+  IDs; remove only exactly attributed old IDs; retirement tears down the declared set
+  and prevents relaunch. Identity or task-name/ID changes are retire/remove-old plus
+  add-new, never inferred rename. Explicit moved intent is provisional, unsupported, and
+  local-host-only. Agent `host` is projection membership, never migration: old-host
+  present→absent removes locally and new-host absent→present adds locally, with no shared
+  transition, ordering, receipt, or proof. Skew may yield overlap/absence under local LKG.
+- **SPEC-R05 Plan and execute each local component in phases.** Compute every
+  action/refusal, component, proof, conflict, and rollback prerequisite before mutation.
+  Execute `FENCE → REMOVE/QUIESCE → MATERIALIZE → ADD/BOOT → NOTIFY survivors →
+  VERIFY/REPORT`, omitting empty phases. Conflicting add waits for exact old quiescence
+  and final bytes; deletion needs explicit desire plus ownership and never targets
+  canonical catalog source. On failure, roll back if proved, else hold/refuse before
+  dependent phases. Components are not a global barrier; drift needs replacement authority.
+- **SPEC-R06 Deliver one quiet post-commit event.** A committed workspace,
+  render, or Resource update visible to a surviving incarnation persists one coalesced
+  inbox event, then attempts DING. It carries a stable idempotency ID, agent/host, paths
+  and class, never contents/secrets; workspace may include old/new paths. Inbox is
+  durable; DING is best-effort and never rolls back the commit. No event follows no-op,
+  unchanged, failed/rolled-back, periodic, new/replaced, or retired work. Notification
+  cannot force restart or recurse.
 
 ## Evidence boundary
 
-This draft is normative documentation only. After approval, a paired external
-field matrix must prove every row in [spec.md](./spec.md) against the public CLI
-and isolated PTY/exec state, including exact notification inclusion, exclusion,
-deduplication, DING-failure, and non-recursion cases. Unit tests remain
-necessary source evidence but are not sufficient acceptance for this contract.
+After approval, a paired external matrix must prove every
+[field mapping and acceptance case](./spec.md) against public CLI behavior and isolated
+PTY/exec state; unit tests alone are insufficient.
