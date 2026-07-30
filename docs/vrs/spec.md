@@ -16,6 +16,35 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
+## Resource bindings (R20-R21)
+
+An agent may directly declare zero or more generic Resource bindings:
+
+```kdl
+resource "work" _tag="github-issue" uri="github-issue://example/project/123"
+```
+
+The positional name is an agent-local semantic role, `_tag` is the concrete
+type discriminator, and `uri` is the exact RFC 3986 absolute resource identity,
+preserved byte-for-byte without normalization.
+Declaration order has no meaning and binding names are unique within one
+agent. The public `agent-spec` read model preserves the bindings in name order
+across canonical KDL and the supported TOML/JSON forms. `st2 agents --json`
+projects the same descriptors for language-neutral inspection.
+
+st2 validates only this portable envelope. It does not define downstream type
+schemas, resolve targets, infer authority from URI possession, or attach
+required/optional, access, readiness, or lifecycle semantics. Those concerns
+remain outside the generic binding contract. A Resource binding is declaration
+metadata and is absent from task launch targets; changing only Resource
+bindings adopts an already-live task without stop, replacement, or relaunch.
+
+The unresolved-resource runtime discussion remains tracked in
+[st2#60](https://github.com/compoundingtech/st2/issues/60), read-oriented
+renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/61),
+and the portable Agent Spec envelope in
+[evals#41](https://github.com/compoundingtech/evals/issues/41).
+
 ## Host-local scheduling and supervision
 
 ```text

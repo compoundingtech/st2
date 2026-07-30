@@ -3,7 +3,7 @@
 //! One agent is one declarative file, Nomad-style: the agent is the job and its `pty`/`exec` blocks
 //! are the tasks. This crate owns the two halves any reader of that catalog needs and nothing else:
 //!
-//! - [`spec`] — the runner-normative model a declaration lowers to ([`AgentSpec`], [`Task`], …).
+//! - [`spec`] — the shared model a declaration lowers to ([`AgentSpec`], [`Task`], [`Resource`], …).
 //! - [`discovery`] — the catalog walk: parse every `*.{kdl,toml,json}` that looks like a
 //!   declaration, and resolve each one's `identity`/`host` with the catalog's precedence rule
 //!   (content wins, the path supplies defaults, a mismatch is a warning).
@@ -25,4 +25,6 @@ mod kdl_format;
 pub mod spec;
 
 pub use discovery::{Declared, Discovered, SpecError, discover, parse_declared, path_defaults};
-pub use spec::{AgentSpec, JobType, Restart, RestartMode, Task, TaskKind, parse_duration};
+pub use spec::{
+    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, parse_duration,
+};

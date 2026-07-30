@@ -260,7 +260,7 @@ enum Command {
         /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
         #[arg(long = "status")]
         status: Option<String>,
-        /// Machine-readable JSON array, including a `retired` boolean.
+        /// Machine-readable JSON array, including retirement and declared Resource bindings.
         #[arg(long)]
         json: bool,
         /// With `--json`, add `lastActivity` + `inbox` count per agent.

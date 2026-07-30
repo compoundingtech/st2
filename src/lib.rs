@@ -36,7 +36,7 @@ pub use agent_spec::{discovery, spec};
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover};
 pub use agent_spec::spec::{
-    AgentSpec, JobType, Restart, RestartMode, Task, TaskKind, parse_duration,
+    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, parse_duration,
 };
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
