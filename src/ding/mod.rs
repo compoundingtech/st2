@@ -6,7 +6,9 @@
 //! screen, or bounded observation timeout never receives Return.
 //!
 //! Once a paste command starts, the sidecar owns that payload and retries by inspection only. It
-//! never pastes the same notice again until the exact staged payload has disappeared or changed.
+//! never pastes the same notice again while that transport attempt remains owned.
+//! PTY or Return success is not delivery: a harness adapter must positively prove that the unique
+//! exact notice moved into its rendered submitted or queued surface.
 //! This preserves FIFO/archive behavior without letting a command timeout create duplicate text.
 //! Startup can adopt an exact staged recovery or backlog notice before coalescing remaining unread
 //! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
@@ -25,8 +27,9 @@ mod composer;
 mod harness;
 
 use crate::message::{self, Message};
-use composer::{ComposerState, classify_composer};
 use crate::status;
+use composer::{ComposerState, classify_composer, classify_receipt};
+use harness::ReceiptState;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
@@ -36,9 +39,7 @@ const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox
 // Must exceed face607's bounded 0.5s delivery delay plus PTY/Node startup overhead; otherwise a
 // successful pane write is misreported as a timeout and retried, duplicating the owned payload.
 const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
-#[allow(dead_code)]
 const COMPOSER_OBSERVATION_WINDOW: Duration = Duration::from_millis(450);
-#[allow(dead_code)]
 const COMPOSER_OBSERVATION_POLL: Duration = Duration::from_millis(10);
 /// A human or active turn can keep a staged notice unsafe for minutes. Retrying `pty peek` every
 /// inbox poll creates a short-lived child for each attempt, so keep the correctness fallback but
@@ -128,7 +129,10 @@ pub fn pty_submit_args(session: &str) -> Vec<String> {
     ]
 }
 
-/// Recovery delivery: one bounded PTY transaction containing paste and Return.
+/// Recovery transport: one bounded PTY transaction containing paste and Return.
+///
+/// A successful command proves only that the PTY accepted the input sequence. [`PokeOutcome::Delivered`]
+/// still requires a separate harness receipt for the exact notice.
 pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
     vec![
         "send".into(),
@@ -142,8 +146,8 @@ pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
     ]
 }
 
-/// One delivery attempt either submitted the notice, owns a paste that must be retried by
-/// inspection only, or performed no input because the target was not positively safe.
+/// One delivery attempt either has positive harness acceptance for the exact notice, owns an
+/// ambiguous or retained payload that must be retried by inspection only, or performed no input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PokeOutcome {
     Delivered,
@@ -207,20 +211,21 @@ impl PtyPoker {
         })
     }
 
-    /// Central production safety path shared by inbox DING and any caller that needs to record an
-    /// attempt immediately before the only command containing Return.
+    /// Central production path shared by inbox DING and any caller that needs to record an attempt
+    /// immediately before the command containing Return.
     pub fn poke_with(
         &self,
         text: &str,
         before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<PokeOutcome> {
-        // Recovery contract: PTY-alive delivery is transport-first. Keep one owned payload,
-        // stage it once, wait a bounded interval, then submit exactly once; pane heuristics remain
-        // diagnostic only and must not silently suppress messaging.
-        self.run(pty_delivery_args(&self.session, text), "send")
-            .map_err(|error| anyhow::anyhow!("staging DING payload: {error}"))?;
-        before_submit()?;
-        Ok(PokeOutcome::Delivered)
+        transport_and_observe_with_window(
+            text,
+            &mut || self.run(pty_delivery_args(&self.session, text), "send"),
+            &mut || self.peek(),
+            &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
+            before_submit,
+            COMPOSER_OBSERVATION_WINDOW,
+        )
     }
 }
 
@@ -230,10 +235,14 @@ impl Poker for PtyPoker {
     }
 
     fn retry_staged(&self, text: &str) -> anyhow::Result<PokeOutcome> {
-        let _ = text;
-        self.run(pty_submit_args(&self.session), "send")
-            .map_err(|error| anyhow::anyhow!("submitting staged DING payload: {error}"))?;
-        Ok(PokeOutcome::Delivered)
+        retry_staged_with_window(
+            text,
+            &mut || self.peek(),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
+            &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
+            &mut || Ok(()),
+            COMPOSER_OBSERVATION_WINDOW,
+        )
     }
 
     fn adopt_staged(&self, candidates: &[String]) -> anyhow::Result<Option<String>> {
@@ -306,6 +315,120 @@ fn exact_staged_candidate(screen: &str, candidates: &[String]) -> Option<String>
     })
 }
 
+fn transport_and_observe_with_window(
+    text: &str,
+    transport: &mut dyn FnMut() -> anyhow::Result<()>,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    poll: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    observation_window: Duration,
+) -> anyhow::Result<PokeOutcome> {
+    before_submit()?;
+    // Preserve the accepted transport-first transaction. Once it starts, any command or
+    // observation failure is ambiguous: the paste may have landed even if Return did not.
+    if let Err(error) = transport() {
+        eprintln!("st2 ding: DING transport became ambiguous; retaining staged ownership: {error}");
+        return Ok(PokeOutcome::Staged);
+    }
+    observe_receipt_with_window(text, peek, poll, observation_window)
+}
+
+/// Observe one bounded post-submit window. PTY success, disappearance, and generic screen change
+/// are not receipts; only adapter-provided positive evidence for the unique exact notice completes
+/// delivery.
+fn observe_receipt_with_window(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    poll: &mut dyn FnMut(),
+    observation_window: Duration,
+) -> anyhow::Result<PokeOutcome> {
+    let deadline = Instant::now() + observation_window;
+    loop {
+        let screen = match peek() {
+            Ok(screen) => screen,
+            Err(error) => {
+                eprintln!(
+                    "st2 ding: post-submit receipt observation failed; retaining staged ownership: {error}"
+                );
+                return Ok(PokeOutcome::Staged);
+            }
+        };
+        if classify_receipt(&screen, text) == ReceiptState::Accepted {
+            return Ok(PokeOutcome::Delivered);
+        }
+        if Instant::now() >= deadline {
+            return Ok(PokeOutcome::Staged);
+        }
+        poll();
+    }
+}
+
+/// Inspect-only retry for a transport-owned payload. It never pastes; one bare Return is allowed
+/// only after two adjacent adapter observations prove the exact retained composer is safe.
+fn retry_staged_with_window(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    poll: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    observation_window: Duration,
+) -> anyhow::Result<PokeOutcome> {
+    let screen = match peek() {
+        Ok(screen) => screen,
+        Err(error) => {
+            eprintln!("st2 ding: staged retry observation failed; retaining ownership: {error}");
+            return Ok(PokeOutcome::Staged);
+        }
+    };
+    match classify_receipt(&screen, text) {
+        ReceiptState::Accepted => Ok(PokeOutcome::Delivered),
+        ReceiptState::RetainedSafe => submit_retained_after_final_observation(
+            text,
+            peek,
+            submit,
+            poll,
+            before_submit,
+            observation_window,
+        ),
+        ReceiptState::RetainedBlocked | ReceiptState::Unproven => Ok(PokeOutcome::Staged),
+    }
+}
+
+fn submit_retained_after_final_observation(
+    text: &str,
+    peek: &mut dyn FnMut() -> anyhow::Result<String>,
+    submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    poll: &mut dyn FnMut(),
+    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    observation_window: Duration,
+) -> anyhow::Result<PokeOutcome> {
+    let screen = match peek() {
+        Ok(screen) => screen,
+        Err(error) => {
+            eprintln!(
+                "st2 ding: final retained-composer observation failed; retaining ownership: {error}"
+            );
+            return Ok(PokeOutcome::Staged);
+        }
+    };
+    match classify_receipt(&screen, text) {
+        ReceiptState::Accepted => return Ok(PokeOutcome::Delivered),
+        ReceiptState::RetainedSafe => {}
+        ReceiptState::RetainedBlocked | ReceiptState::Unproven => {
+            return Ok(PokeOutcome::Staged);
+        }
+    }
+    if let Err(error) = before_submit() {
+        eprintln!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
+        return Ok(PokeOutcome::Staged);
+    }
+    if let Err(error) = submit() {
+        eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
+        return Ok(PokeOutcome::Staged);
+    }
+    observe_receipt_with_window(text, peek, poll, observation_window)
+}
+
 #[allow(dead_code)]
 fn observed_poke(
     text: &str,
@@ -338,7 +461,14 @@ fn observed_poke_with_window(
 ) -> anyhow::Result<PokeOutcome> {
     match classify_composer(&peek()?, text) {
         ComposerState::ExactSafe => {
-            return submit_after_final_observation(text, peek, submit, before_submit);
+            return submit_after_final_observation(
+                text,
+                peek,
+                submit,
+                poll,
+                before_submit,
+                observation_window,
+            );
         }
         ComposerState::ExactBlocked => return Ok(PokeOutcome::Staged),
         ComposerState::EmptySafe => {}
@@ -367,10 +497,17 @@ fn observed_poke_with_window(
         };
         match classify_composer(&screen, text) {
             ComposerState::ExactSafe => {
-                return submit_after_final_observation(text, peek, submit, before_submit);
+                return submit_after_final_observation(
+                    text,
+                    peek,
+                    submit,
+                    poll,
+                    before_submit,
+                    observation_window,
+                );
             }
             ComposerState::ExactBlocked => return Ok(PokeOutcome::Staged),
-            ComposerState::Changed => return Ok(PokeOutcome::Deferred),
+            ComposerState::Changed => return Ok(PokeOutcome::Staged),
             ComposerState::EmptySafe | ComposerState::Ambiguous => {}
         }
         if Instant::now() >= deadline {
@@ -386,7 +523,9 @@ fn submit_after_final_observation(
     text: &str,
     peek: &mut dyn FnMut() -> anyhow::Result<String>,
     submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    poll: &mut dyn FnMut(),
     before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
+    observation_window: Duration,
 ) -> anyhow::Result<PokeOutcome> {
     let screen = match peek() {
         Ok(screen) => screen,
@@ -403,7 +542,7 @@ fn submit_after_final_observation(
             return Ok(PokeOutcome::Staged);
         }
         ComposerState::EmptySafe | ComposerState::Changed => {
-            return Ok(PokeOutcome::Deferred);
+            return Ok(PokeOutcome::Staged);
         }
     }
     if let Err(error) = before_submit() {
@@ -414,31 +553,7 @@ fn submit_after_final_observation(
         eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
         return Ok(PokeOutcome::Staged);
     }
-    Ok(PokeOutcome::Delivered)
-}
-
-/// Inspect-only retry for a payload whose paste command already started.
-#[allow(dead_code)]
-fn observed_retry_staged(
-    text: &str,
-    peek: &mut dyn FnMut() -> anyhow::Result<String>,
-    submit: &mut dyn FnMut() -> anyhow::Result<()>,
-    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-) -> anyhow::Result<PokeOutcome> {
-    let screen = match peek() {
-        Ok(screen) => screen,
-        Err(error) => {
-            eprintln!("st2 ding: staged retry observation failed; retaining ownership: {error}");
-            return Ok(PokeOutcome::Staged);
-        }
-    };
-    match classify_composer(&screen, text) {
-        ComposerState::ExactSafe => {
-            submit_after_final_observation(text, peek, submit, before_submit)
-        }
-        ComposerState::ExactBlocked | ComposerState::Ambiguous => Ok(PokeOutcome::Staged),
-        ComposerState::EmptySafe | ComposerState::Changed => Ok(PokeOutcome::Deferred),
-    }
+    observe_receipt_with_window(text, peek, poll, observation_window)
 }
 
 /// `<pty-session-dir>/<session>.pid` + `kill(pid, 0)`; any miss means gone. This mirrors the
@@ -1067,6 +1182,21 @@ mod tests {
         staged_codex_screen("please keep my half-written draft")
     }
 
+    fn accepted_codex_screen(text: &str) -> String {
+        format!(
+            "{}\r\n\r\n{}",
+            staged_codex_screen(text),
+            idle_codex_screen()
+        )
+    }
+
+    fn queued_codex_screen(text: &str) -> String {
+        format!(
+            "Messages to be submitted after next tool call:\r\n{text}\r\n\r\n{}",
+            idle_codex_screen()
+        )
+    }
+
     fn claude_rule() -> String {
         "─".repeat(80)
     }
@@ -1158,10 +1288,14 @@ mod tests {
     /// escape-heavy output. The escapes inflate the Codex byte offset far past the Claude
     /// composer's row, which is what makes the two locators' units observably disagree.
     fn live_claude_below_escape_heavy_codex_transcript() -> String {
-        let padding = "\x1b[1;32m\x1b[38;5;204mpadding with lots of escapes\x1b[0m\x1b[0m\r\n".repeat(10);
+        let padding =
+            "\x1b[1;32m\x1b[38;5;204mpadding with lots of escapes\x1b[0m\x1b[0m\r\n".repeat(10);
         let codex = staged_codex_screen("a stale pasted codex draft");
         let filler = "\x1b[1;32mmore padding\x1b[0m\r\n".repeat(6);
-        format!("{padding}{codex}\r\n{filler}{}", mature_idle_claude_screen())
+        format!(
+            "{padding}{codex}\r\n{filler}{}",
+            mature_idle_claude_screen()
+        )
     }
 
     /// A Codex pane whose scrollback holds a captured Claude screen — two ruled lines around a `❯`
@@ -1288,7 +1422,11 @@ mod tests {
         // shows a captured Codex composer still classifies from its own live Claude composer.
         assert_eq!(
             classify_composer(
-                &format!("{}\r\n{}", staged_codex_screen("a stale pasted codex draft"), mature_idle_claude_screen()),
+                &format!(
+                    "{}\r\n{}",
+                    staged_codex_screen("a stale pasted codex draft"),
+                    mature_idle_claude_screen()
+                ),
                 expected
             ),
             ComposerState::EmptySafe
@@ -1416,6 +1554,7 @@ mod tests {
             idle_codex_screen(),
             staged_codex_screen(text),
             staged_codex_screen(text),
+            accepted_codex_screen(text),
         ]));
         let actions = RefCell::new(Vec::new());
         let outcome = observed_poke_with_window(
@@ -1443,7 +1582,7 @@ mod tests {
         assert_eq!(outcome, PokeOutcome::Delivered);
         assert_eq!(
             *actions.borrow(),
-            ["peek", "paste", "peek", "peek", "receipt", "return"]
+            ["peek", "paste", "peek", "peek", "receipt", "return", "peek"]
         );
     }
 
@@ -1534,28 +1673,262 @@ mod tests {
             Duration::from_millis(10),
         )
         .unwrap();
-        assert_eq!(outcome, PokeOutcome::Deferred);
+        assert_eq!(outcome, PokeOutcome::Staged);
         assert_eq!(*actions.borrow(), ["paste"]);
 
         let retry_screens = RefCell::new(VecDeque::from([
             staged_claude_screen(text),
             staged_claude_screen(text),
+            format!("❯\u{00a0}{text}\r\n{}", idle_claude_screen()),
         ]));
         let retry_actions = RefCell::new(Vec::new());
         assert_eq!(
-            observed_retry_staged(
+            retry_staged_with_window(
                 text,
                 &mut || Ok(retry_screens.borrow_mut().pop_front().unwrap()),
                 &mut || {
                     retry_actions.borrow_mut().push("return");
                     Ok(())
                 },
+                &mut || {},
                 &mut || Ok(()),
+                Duration::ZERO,
             )
             .unwrap(),
             PokeOutcome::Delivered
         );
         assert_eq!(*retry_actions.borrow(), ["return"]);
+    }
+
+    #[test]
+    fn successful_transport_with_retained_or_unproven_pixels_is_not_delivered() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
+        for screen in [
+            staged_codex_screen(text),
+            idle_codex_screen(),
+            human_codex_screen(),
+            "unknown renderer".to_string(),
+        ] {
+            let actions = RefCell::new(Vec::new());
+            let outcome = transport_and_observe_with_window(
+                text,
+                &mut || {
+                    actions.borrow_mut().push("transport");
+                    Ok(())
+                },
+                &mut || {
+                    actions.borrow_mut().push("peek");
+                    Ok(screen.clone())
+                },
+                &mut || actions.borrow_mut().push("poll"),
+                &mut || {
+                    actions.borrow_mut().push("before-submit");
+                    Ok(())
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+            assert_eq!(outcome, PokeOutcome::Staged);
+            assert_eq!(
+                *actions.borrow(),
+                ["before-submit", "transport", "peek"],
+                "transport success alone must never become Delivered"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_transport_receipt_and_retry_errors_retain_staged_ownership() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] error truth (from cos); check your inbox";
+
+        let actions = RefCell::new(Vec::new());
+        assert_eq!(
+            transport_and_observe_with_window(
+                text,
+                &mut || {
+                    actions.borrow_mut().push("transport");
+                    anyhow::bail!("ambiguous transport")
+                },
+                &mut || {
+                    actions.borrow_mut().push("peek");
+                    Ok(idle_codex_screen())
+                },
+                &mut || {},
+                &mut || {
+                    actions.borrow_mut().push("before-submit");
+                    Ok(())
+                },
+                Duration::ZERO,
+            )
+            .unwrap(),
+            PokeOutcome::Staged
+        );
+        assert_eq!(*actions.borrow(), ["before-submit", "transport"]);
+
+        assert_eq!(
+            transport_and_observe_with_window(
+                text,
+                &mut || Ok(()),
+                &mut || anyhow::bail!("unreadable receipt"),
+                &mut || {},
+                &mut || Ok(()),
+                Duration::ZERO,
+            )
+            .unwrap(),
+            PokeOutcome::Staged
+        );
+
+        let screens = RefCell::new(VecDeque::from([
+            staged_codex_screen(text),
+            staged_codex_screen(text),
+        ]));
+        let submits = RefCell::new(0);
+        assert_eq!(
+            retry_staged_with_window(
+                text,
+                &mut || Ok(screens.borrow_mut().pop_front().unwrap()),
+                &mut || {
+                    *submits.borrow_mut() += 1;
+                    anyhow::bail!("ambiguous Return")
+                },
+                &mut || {},
+                &mut || Ok(()),
+                Duration::ZERO,
+            )
+            .unwrap(),
+            PokeOutcome::Staged
+        );
+        assert_eq!(*submits.borrow(), 1);
+    }
+
+    #[test]
+    fn exact_notice_outside_an_empty_live_composer_is_a_positive_receipt() {
+        let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
+        assert_eq!(
+            classify_receipt(&queued_codex_screen(text), text),
+            ReceiptState::Accepted
+        );
+        assert_eq!(
+            classify_receipt(&accepted_codex_screen(text), text),
+            ReceiptState::Accepted
+        );
+        assert_eq!(
+            classify_receipt(&staged_codex_screen(text), text),
+            ReceiptState::RetainedSafe
+        );
+        assert_eq!(
+            classify_receipt(
+                &format!("ordinary transcript: {text}\r\n{}", idle_codex_screen()),
+                text
+            ),
+            ReceiptState::Unproven,
+            "exact text outside an adapter-owned accepted surface is not a receipt"
+        );
+        assert_eq!(
+            classify_receipt(
+                &format!("old receipt: {text}\r\n{}", human_codex_screen()),
+                text
+            ),
+            ReceiptState::Unproven,
+            "a changed live composer cannot be accepted from transcript evidence"
+        );
+
+        assert_eq!(
+            classify_receipt(
+                &format!("❯\u{00a0}{text}\r\n{}", idle_claude_screen()),
+                text
+            ),
+            ReceiptState::Accepted
+        );
+        assert_eq!(
+            classify_receipt(&staged_claude_screen(text), text),
+            ReceiptState::RetainedSafe
+        );
+        assert_eq!(
+            classify_receipt(
+                &format!("ordinary transcript: {text}\r\n{}", idle_claude_screen()),
+                text
+            ),
+            ReceiptState::Unproven
+        );
+    }
+
+    #[test]
+    fn staged_retry_submits_only_retained_safe_and_requires_a_receipt() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] retry truth (from cos); check your inbox";
+
+        let retained = RefCell::new(VecDeque::from([
+            staged_codex_screen(text),
+            staged_codex_screen(text),
+            staged_codex_screen(text),
+        ]));
+        let submits = RefCell::new(0);
+        let outcome = retry_staged_with_window(
+            text,
+            &mut || Ok(retained.borrow_mut().pop_front().unwrap()),
+            &mut || {
+                *submits.borrow_mut() += 1;
+                Ok(())
+            },
+            &mut || {},
+            &mut || Ok(()),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(outcome, PokeOutcome::Staged);
+        assert_eq!(*submits.borrow(), 1);
+
+        for screen in [
+            format!("Create a plan?\r\n{}", staged_codex_screen(text)),
+            idle_codex_screen(),
+            human_codex_screen(),
+            "unknown renderer".to_string(),
+        ] {
+            let submits = RefCell::new(0);
+            let outcome = retry_staged_with_window(
+                text,
+                &mut || Ok(screen.clone()),
+                &mut || {
+                    *submits.borrow_mut() += 1;
+                    Ok(())
+                },
+                &mut || {},
+                &mut || Ok(()),
+                Duration::ZERO,
+            )
+            .unwrap();
+            assert_eq!(outcome, PokeOutcome::Staged);
+            assert_eq!(
+                *submits.borrow(),
+                0,
+                "blocked or unproven receipts must not receive Return"
+            );
+        }
+
+        let accepted = queued_codex_screen(text);
+        let submits = RefCell::new(0);
+        assert_eq!(
+            retry_staged_with_window(
+                text,
+                &mut || Ok(accepted.clone()),
+                &mut || {
+                    *submits.borrow_mut() += 1;
+                    Ok(())
+                },
+                &mut || {},
+                &mut || Ok(()),
+                Duration::ZERO,
+            )
+            .unwrap(),
+            PokeOutcome::Delivered
+        );
+        assert_eq!(*submits.borrow(), 0);
     }
 
     #[test]

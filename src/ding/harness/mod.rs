@@ -14,6 +14,23 @@ pub(super) mod codex;
 
 use super::composer::ComposerState;
 
+/// What one maintained harness can prove after a transport attempted to submit one exact notice.
+///
+/// The shared delivery state machine consumes only this type. Harness-specific screen vocabulary
+/// stays behind [`Harness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReceiptState {
+    /// The unique exact notice is rendered outside an empty live composer, proving that the
+    /// harness moved it into its submitted or queued surface.
+    Accepted,
+    /// The exact notice remains the complete live composer and Return is currently safe.
+    RetainedSafe,
+    /// The exact notice remains the complete live composer, but the harness is active or blocked.
+    RetainedBlocked,
+    /// No positive acceptance or exact retained-composer state was proven.
+    Unproven,
+}
+
 /// One peeked screen in both forms a harness may need: the raw bytes, in which the Codex composer
 /// markers are written as ANSI sequences, and the stripped text, in which the Claude rules are
 /// found. Both describe the same screen, so a row index is comparable across harnesses.
@@ -36,6 +53,44 @@ pub(super) trait Harness {
     /// implementation re-derives it rather than the registry threading a harness-specific payload
     /// through; a screen is one viewport, so the extra scan is a few string searches.
     fn classify(&self, screen: &Screen<'_>, expected: &str) -> ComposerState;
+
+    /// Classify post-submit evidence for one exact notice. Implementations may return `Accepted`
+    /// only when the lowest live composer is empty and the unique exact notice is rendered
+    /// elsewhere in that maintained harness's screen.
+    fn receipt(&self, screen: &Screen<'_>, expected: &str) -> ReceiptState;
+}
+
+/// The unique normalized notice is visible in a harness-owned accepted surface: either a submitted
+/// prompt for that harness or the explicit queued-message region. Whitespace normalization admits
+/// renderer soft wraps; the caller separately proves that the lowest live composer is empty.
+pub(super) fn screen_has_accepted_notice(
+    screen: &Screen<'_>,
+    submitted_prompt: char,
+    expected: &str,
+) -> bool {
+    const QUEUED_MESSAGES: &str = "Messages to be submitted after next tool call";
+
+    fn compact(input: &str) -> String {
+        input
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    let screen = super::normalize_line(screen.plain);
+    let expected = super::normalize_line(expected);
+    let submitted = format!("{submitted_prompt} {expected}");
+    let compact_screen = compact(&screen);
+    let compact_expected = compact(&expected);
+    let compact_submitted = format!("{submitted_prompt}{compact_expected}");
+
+    screen.contains(&submitted)
+        || compact_screen.contains(&compact_submitted)
+        || screen
+            .split_once(QUEUED_MESSAGES)
+            .is_some_and(|(_, queued)| {
+                queued.contains(&expected) || compact(queued).contains(&compact_expected)
+            })
 }
 
 /// Every registered harness. Claude is last so that an exact row tie resolves to Claude, which is

@@ -29,12 +29,15 @@ notice, yields exactly one state:
 ## Delivery
 
 ```text
-peek ─► classify ─┬─ ExactSafe ────► final observation ─► Return ─► Delivered
+peek ─► classify ─┬─ ExactSafe ────► final observation ─► Return ─► receipt
                   ├─ ExactBlocked ─────────────────────────────────► Staged
                   ├─ Changed / Ambiguous ──────────────────────────► Deferred
-                  └─ EmptySafe ─► paste ─► observe until deadline ─┬► Delivered
+                  └─ EmptySafe ─► paste ─► observe until deadline ─┬► Return ─► receipt
                                                                    ├► Staged
                                                                    └► Deferred
+
+receipt ─┬─ Accepted ──────────────────────────────────────────────► Delivered
+         └─ RetainedSafe / RetainedBlocked / Unproven ────────────► Staged
 ```
 
 Delivery is two-phase: a bracketed paste that carries no Return, then a separate
@@ -45,8 +48,26 @@ Return.
 Every failure of a terminal command after paste has begun resolves to `Staged`
 rather than `Deferred` (`DING-R07`): the paste may already have reached the
 harness, so ownership is retained and retry re-inspects instead of re-pasting. A
-retry of a staged payload is inspect-only — it may submit or defer, but it never
-pastes.
+retry of a staged payload is inspect-only — it may prove acceptance or submit a
+positively retained-safe composer, but it never pastes.
+
+Return is transport, not a delivery receipt. After any submission attempt, a
+bounded observation loop asks the selected harness adapter for one of four
+states:
+
+| Receipt state | Meaning |
+| --- | --- |
+| `Accepted` | The unique exact notice is rendered outside an empty lowest live composer, proving the harness moved it into its submitted or queued surface |
+| `RetainedSafe` | The exact notice remains the complete live composer and Return is currently safe |
+| `RetainedBlocked` | The exact notice remains the complete live composer but the harness is active or blocked |
+| `Unproven` | No positive acceptance or exact retained-composer state was proven |
+
+Only `Accepted` becomes `Delivered` (`DING-R10`). PTY command success, generic
+screen change, disappearance alone, a changed composer, unreadable output, and
+observation timeout retain `Staged` ownership. A staged retry completes without
+input when it observes `Accepted`; it may send one bare Return only after two
+adjacent `RetainedSafe` observations, then must obtain the same positive
+receipt. `RetainedBlocked` and `Unproven` send no input. No retry re-pastes.
 
 ## Harness dispatch
 
@@ -65,6 +86,11 @@ resolves harness-shaped transcript text — a captured screen from another harne
 pasted into a pane — without a per-pair special case. When exactly one harness
 locates a composer, that one is classified; when none do, the screen is
 `Ambiguous`.
+
+Post-submit receipt classification uses that same positional dispatch and a
+shared `ReceiptState` type. Each adapter owns the renderer-specific proof that
+the exact notice is retained or accepted; shared delivery code never matches
+Codex or Claude pixels directly (`DING-R06`, `DING-R10`).
 
 Positions are compared in one unit. Harnesses do not agree on what they match
 against: some locate against the raw screen including escape sequences, others

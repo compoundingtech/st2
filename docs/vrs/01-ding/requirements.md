@@ -86,6 +86,13 @@ is in [`spec.md`](./spec.md).
   terminal probe.
 - **DING-R09 Presence gate:** Declared `busy` is observable but never suppresses
   delivery; only fresh `dnd` defers it. Delivery may wake a working agent.
+- **DING-R10 Positive harness receipt:** `Delivered` requires adapter-provided
+  positive evidence that the unique exact notice moved from the lowest live
+  composer into the maintained harness's rendered submitted or queued surface.
+  PTY command success, generic screen change, disappearance alone, and
+  ambiguous pixels are not receipts. Until that evidence exists, a transport
+  attempt retains staged ownership and retries by inspection without
+  re-pasting.
 
 ## Evidence
 

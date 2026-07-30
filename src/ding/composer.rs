@@ -1,7 +1,7 @@
 //! What a peeked screen proves about one exact notice, and the routing that decides which
 //! composer on the screen is the live one.
 
-use super::harness::{self, Screen};
+use super::harness::{self, ReceiptState, Screen};
 
 /// What the current bottom composer proves about one exact normalized notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,10 @@ pub(super) enum ComposerState {
 /// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
 /// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
 /// unfamiliar multiline input remains literal and cannot equal a normalized single-line DING.
-pub(super) fn logical_soft_wrap_candidates(input: &str, minimum_first_content_chars: usize) -> Vec<String> {
+pub(super) fn logical_soft_wrap_candidates(
+    input: &str,
+    minimum_first_content_chars: usize,
+) -> Vec<String> {
     let rows: Vec<&str> = input.lines().collect();
     let Some(first) = rows.first() else {
         return vec![String::new()];
@@ -144,12 +147,39 @@ pub(super) fn strip_ansi(input: &str) -> String {
 /// construction, so picking the lowest needs no per-pair special case.
 pub(super) fn classify_composer(screen: &str, expected: &str) -> ComposerState {
     let plain = strip_ansi(screen);
-    let screen = Screen { raw: screen, plain: &plain };
+    let screen = Screen {
+        raw: screen,
+        plain: &plain,
+    };
     harness::all()
         .into_iter()
-        .filter_map(|harness| harness.locate(&screen).map(|located| (located.row, harness)))
+        .filter_map(|harness| {
+            harness
+                .locate(&screen)
+                .map(|located| (located.row, harness))
+        })
         .max_by_key(|(row, _)| *row)
         .map(|(_, harness)| harness.classify(&screen, expected))
         // No maintained composer is locatable, so nothing is proven either way.
         .unwrap_or(ComposerState::Ambiguous)
+}
+
+/// Route post-submit receipt classification through the lowest maintained live composer, using
+/// the same positional rule as pre-submit classification.
+pub(super) fn classify_receipt(screen: &str, expected: &str) -> ReceiptState {
+    let plain = strip_ansi(screen);
+    let screen = Screen {
+        raw: screen,
+        plain: &plain,
+    };
+    harness::all()
+        .into_iter()
+        .filter_map(|harness| {
+            harness
+                .locate(&screen)
+                .map(|located| (located.row, harness))
+        })
+        .max_by_key(|(row, _)| *row)
+        .map(|(_, harness)| harness.receipt(&screen, expected))
+        .unwrap_or(ReceiptState::Unproven)
 }
