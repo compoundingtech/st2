@@ -1382,6 +1382,7 @@ mod tests {
             retired: false,
             keep: false,
             restart: None,
+            resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
                 derived: false,
@@ -1469,6 +1470,7 @@ mod tests {
             retired: false,
             keep: false,
             restart: None,
+            resources: vec![],
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }

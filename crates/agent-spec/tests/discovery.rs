@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::TaskKind;
-use agent_spec::{AgentSpec, JobType, Task, discover};
+use agent_spec::{AgentSpec, JobType, Resource, Task, discover};
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -260,6 +260,170 @@ argv = ["claude", "--resume", "session id"]
     assert_eq!(
         argv(&find(&found.specs, "json").tasks[0]),
         ["codex", "resume", "abc"]
+    );
+}
+
+#[test]
+fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        r#"agent "kdl" {
+  host "h"
+  resource "source" _tag="worktree" uri="worktree://github.com/example/project/main"
+  resource "work" _tag="github-issue" uri="github-issue://example/project/41"
+  command "true"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{
+  "identity": "json",
+  "host": "h",
+  "resource": {
+    "work": {"_tag": "github-issue", "uri": "github-issue://example/project/41"},
+    "source": {"_tag": "worktree", "uri": "worktree://github.com/example/project/main"}
+  },
+  "command": "true"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+host = "h"
+command = "true"
+
+[resource.work]
+_tag = "github-issue"
+uri = "github-issue://example/project/41"
+
+[resource.source]
+_tag = "worktree"
+uri = "worktree://github.com/example/project/main"
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let expected = vec![
+        Resource {
+            name: "source".into(),
+            tag: "worktree".into(),
+            uri: "worktree://github.com/example/project/main".into(),
+        },
+        Resource {
+            name: "work".into(),
+            tag: "github-issue".into(),
+            uri: "github-issue://example/project/41".into(),
+        },
+    ];
+    for identity in ["json", "kdl", "toml"] {
+        assert_eq!(find(&found.specs, identity).resources, expected);
+    }
+
+    let json = serde_json::to_string(&expected).unwrap();
+    assert_eq!(
+        json,
+        r#"[{"name":"source","_tag":"worktree","uri":"worktree://github.com/example/project/main"},{"name":"work","_tag":"github-issue","uri":"github-issue://example/project/41"}]"#
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (identity, resource) in [
+        (
+            "duplicate",
+            r#"resource "work" _tag="issue" uri="issue://one"
+  resource "work" _tag="pull-request" uri="pull-request://two""#,
+        ),
+        ("missing-tag", r#"resource "work" uri="issue://example/1""#),
+        ("missing-uri", r#"resource "work" _tag="issue""#),
+        (
+            "relative-uri",
+            r#"resource "work" _tag="issue" uri="./issue/1""#,
+        ),
+        (
+            "policy",
+            r#"resource "work" _tag="issue" uri="issue://example/1" required=#true"#,
+        ),
+        (
+            "payload",
+            r#"resource "work" _tag="issue" uri="issue://example/1" { token "secret" }"#,
+        ),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{\n  host \"h\"\n  {resource}\n  command \"true\"\n}}"),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    let errors = found
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("duplicate resource binding"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("needs string `_tag`"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("needs string `uri`"))
+    );
+    assert!(errors.iter().any(|error| error.contains("absolute URI")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unsupported property `required`"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot have children"))
+    );
+}
+
+#[test]
+fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/dup/agent.json",
+        r#"{
+  "identity": "dup",
+  "command": "true",
+  "resource": {
+    "work": {"_tag": "issue", "uri": "issue://one"},
+    "work": {"_tag": "issue", "uri": "issue://two"}
+  }
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty());
+    assert_eq!(found.errors.len(), 1);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("duplicate resource binding 'work'")
     );
 }
 

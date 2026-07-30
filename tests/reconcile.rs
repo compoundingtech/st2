@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
-use st2::spec::{AgentSpec, JobType, Task, TaskKind};
+use st2::spec::{AgentSpec, JobType, Resource, Task, TaskKind};
 use st2::{Session, reconcile};
 
 #[test]
@@ -353,6 +353,7 @@ fn spec(
         retired,
         keep: false,
         restart: None,
+        resources: Vec::new(),
         tasks,
         path: PathBuf::from(format!(
             "/cat/agents/{}/{identity}/agent.kdl",
@@ -424,6 +425,27 @@ fn all_tasks_live_is_adopted() {
     let plan = reconcile(&specs, &sessions, HOST);
     assert!(plan.launch.is_empty());
     assert_eq!(plan.adopt.len(), 1);
+}
+
+#[test]
+fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
+    let mut spec = svc(
+        "a",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+    );
+    spec.resources.push(Resource {
+        name: "work".into(),
+        tag: "github-issue".into(),
+        uri: "github-issue://example/project/41".into(),
+    });
+
+    let specs = [spec];
+    let plan = reconcile(&specs, &[live("hetz.a")], HOST);
+    assert_eq!(plan.adopt.len(), 1);
+    assert!(plan.launch.is_empty());
+    assert!(plan.teardown.is_empty());
+    assert!(plan.gc.is_empty());
 }
 
 #[test]

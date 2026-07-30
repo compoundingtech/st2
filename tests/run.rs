@@ -225,6 +225,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         retired: false,
         keep: false,
         restart: None,
+        resources: vec![],
         tasks: vec![Task {
             kind: TaskKind::Exec,
             derived: false,

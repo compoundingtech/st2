@@ -4,9 +4,9 @@
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, `host`, `role` (metadata only), `type`, `workspace`, `retired`, `keep`, `supervisor`,
-//! `restart{}`, and the tasks. Everything render-only (`harness`, `model`, `persona`, `permissions`,
-//! `transport`, `strategy`, `meta{}`) is baked into the tasks/commands by the render layer and
-//! ignored here.
+//! `restart{}`, Resource bindings (declaration metadata), and the tasks. Everything render-only
+//! (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta{}`) is baked into
+//! the tasks/commands by the render layer and ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
 
-/// A rendered agent job, lowered to the fields st2 needs to run it.
+/// A rendered agent job, lowered to the shared declaration fields st2 and other readers inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
     /// Unique id; the bus id is `<host>.<identity>`.
@@ -39,10 +40,25 @@ pub struct AgentSpec {
     pub keep: bool,
     /// Crash/restart policy (§4). `None` → the runner's default policy.
     pub restart: Option<Restart>,
+    /// Named typed references used by the agent. st2 preserves these for readers but does not
+    /// resolve them or assign launch, readiness, access, or lifecycle semantics.
+    pub resources: Vec<Resource>,
     /// The runnable tasks (`pty` + `exec`), sorted by name for determinism.
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
     pub path: PathBuf,
+}
+
+/// One agent-local semantic binding to an externally identified resource.
+///
+/// `name` is the role the resource plays for this agent, `tag` selects the downstream resource
+/// contract, and `uri` is the exact absolute identity. The envelope deliberately carries no policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resource {
+    pub name: String,
+    #[serde(rename = "_tag")]
+    pub tag: String,
+    pub uri: String,
 }
 
 /// The kind of job. Only `service` (long-running) remains — `type = batch` is retired; the native
@@ -199,6 +215,10 @@ pub(crate) struct RawSpec {
     #[serde(default)]
     pub keep: bool,
     pub restart: Option<RawRestart>,
+    /// Named resource bindings. Singular `resource` matches canonical KDL and keeps TOML/JSON maps
+    /// aligned with `resource "<name>"`.
+    #[serde(default)]
+    pub resource: RawResources,
     /// Compact catalog form: the agent itself is one pty carrying this command.
     pub command: Option<String>,
     /// Compact catalog form: the agent itself is one pty launched directly with this argv.
@@ -215,6 +235,17 @@ pub(crate) struct RawSpec {
     /// `exec "<name>" {}` / `[exec.<name>]` — terminal-free tasks.
     #[serde(default)]
     pub exec: BTreeMap<String, RawTask>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RawResources(BTreeMap<String, RawResource>);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawResource {
+    #[serde(rename = "_tag")]
+    pub(crate) tag: String,
+    pub(crate) uri: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -261,6 +292,113 @@ impl RawRestart {
     }
 }
 
+impl RawResources {
+    pub(crate) fn insert(&mut self, name: String, resource: RawResource) -> anyhow::Result<()> {
+        if self.0.insert(name.clone(), resource).is_some() {
+            anyhow::bail!("duplicate resource binding '{name}'");
+        }
+        Ok(())
+    }
+
+    fn lower(self) -> anyhow::Result<Vec<Resource>> {
+        self.0
+            .into_iter()
+            .map(|(name, resource)| {
+                if name.is_empty() {
+                    anyhow::bail!("resource binding name cannot be empty");
+                }
+                if resource.tag.is_empty() {
+                    anyhow::bail!("resource binding '{name}' has an empty `_tag`");
+                }
+                validate_absolute_uri(&resource.uri).map_err(|reason| {
+                    anyhow::anyhow!(
+                        "resource binding '{name}' `uri` must be an exact absolute URI: {reason}"
+                    )
+                })?;
+                Ok(Resource {
+                    name,
+                    tag: resource.tag,
+                    uri: resource.uri,
+                })
+            })
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for RawResources {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ResourceMapVisitor;
+
+        impl<'de> Visitor<'de> for ResourceMapVisitor {
+            type Value = RawResources;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of uniquely named resource bindings")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut resources = BTreeMap::new();
+                while let Some((name, resource)) = map.next_entry::<String, RawResource>()? {
+                    if resources.insert(name.clone(), resource).is_some() {
+                        return Err(de::Error::custom(format!(
+                            "duplicate resource binding '{name}'"
+                        )));
+                    }
+                }
+                Ok(RawResources(resources))
+            }
+        }
+
+        deserializer.deserialize_map(ResourceMapVisitor)
+    }
+}
+
+fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
+    let Some(colon) = uri.find(':') else {
+        return Err("missing scheme");
+    };
+    let scheme = &uri[..colon];
+    let mut chars = scheme.chars();
+    if !chars
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        || !chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return Err("invalid scheme");
+    }
+    if !uri.is_ascii()
+        || uri
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err("contains characters outside URI syntax");
+    }
+    let bytes = uri.as_bytes();
+    let mut offset = colon + 1;
+    while offset < bytes.len() {
+        if bytes[offset] == b'%' {
+            if offset + 2 >= bytes.len()
+                || !bytes[offset + 1].is_ascii_hexdigit()
+                || !bytes[offset + 2].is_ascii_hexdigit()
+            {
+                return Err("contains an invalid percent escape");
+            }
+            offset += 3;
+        } else {
+            offset += 1;
+        }
+    }
+    Ok(())
+}
+
 impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity, a
     /// `type`, or task blocks. Random TOML/JSON in the tree has none of these and is skipped.
@@ -270,6 +408,7 @@ impl RawSpec {
             || self.command.is_some()
             || self.argv.is_some()
             || self.ding
+            || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
     }
@@ -337,6 +476,7 @@ impl RawSpec {
 
         // `service` is the only job type; a stray `type` string is caught by validate (unknown-type).
         let job_type = JobType::Service;
+        let resources = self.resource.lower()?;
 
         Ok(AgentSpec {
             identity,
@@ -348,6 +488,7 @@ impl RawSpec {
             retired: self.retired,
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
+            resources,
             tasks,
             path,
         })

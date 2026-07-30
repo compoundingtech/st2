@@ -49,6 +49,34 @@ fn compact_agent_catalog_is_clean() {
     assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
 }
 
+#[test]
+fn opaque_resource_bindings_are_structurally_valid() {
+    let c = catalog(&[(
+        "Silber/cos/agent.kdl",
+        r#"agent "cos" {
+  host "Silber"
+  resource "work" _tag="vendor-specific-type" uri="vendor+thing://authority/exact%20identity"
+  command "codex"
+}"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+}
+
+#[test]
+fn an_invalid_resource_binding_is_a_parse_error() {
+    let c = catalog(&[(
+        "Silber/cos/agent.kdl",
+        r#"agent "cos" {
+  host "Silber"
+  resource "work" _tag="github-issue" uri="not-an-absolute-uri"
+  command "codex"
+}"#,
+    )]);
+    assert!(has(&validate(c.path()), "parse-error", Severity::Error));
+}
+
 // ---- errors ----------------------------------------------------------------------------------
 
 #[test]
