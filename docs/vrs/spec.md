@@ -26,23 +26,34 @@ materializes only declarations at
 unchanged through launch admission, kickoff resolution, supervision, logging,
 and teardown.
 
-Admission fails before spawn when discovery is empty, malformed,
-warning-bearing, duplicate, retired, nonlocal, noncanonical, root-overriding,
-unrunnable, or does not expose exactly one main PTY per declaration. The
-kickoff target must resolve to exactly one member of the discovered fleet. The
-eval owns one native `CATALOG` / `ST_ROOT` and its `<catalog>/pty` registry;
-declarations cannot override those roots. Workspace renders are materialized
-before any seat starts.
+Admission applies `validate_for_host` strictly, then fails before spawn when
+discovery is empty, malformed, warning-bearing, duplicate, retired, nonlocal,
+noncanonical, root-overriding, unrunnable, or does not expose exactly one
+independently launchable service main PTY per declaration. Main runtime IDs
+must be nonempty and fleet-unique. Materialization warnings and backend launch
+errors are fatal. The kickoff target must resolve to exactly one member of the
+discovered fleet. The eval owns one native `CATALOG` / `ST_ROOT` and its
+`<catalog>/pty` registry; declarations cannot override those roots. Workspace
+renders are materialized before any seat starts.
+
+Native inbox/archive paths are derived once from the admitted Agent Spec paths
+and carried as frozen data; routing never re-discovers the mutable catalog.
+The requester alone is an explicit eval-owned flat mailbox. Multi-seat
+completion retains the worker-report-before-supervisor-confirmation ordering.
+A singleton canonical team completes when its interviewer-to-requester
+confirmation post-dates the exact kickoff receipt. Canonical completion is a
+gating judge, so a timeout cannot pass on unrelated final-state checks alone.
 
 Without `canonical-agents`, fixture declarations are not discovered or launched
 and compact evals retain their catalog-less flat bus. This explicit opt-in keeps
 ordinary fixtures inert while allowing the same canonical declaration to be
 exercised in an eval and real work. Parser and admission evidence lives in
 `eval_spec::tests::canonical_agents_is_bare_once_and_excludes_compact_seats` and
-the `canonical_eval_team_*` unit tests. End-to-end isolation, canonical inbox
-routing, the no-opt-in collision control, and pre-spawn path refusal are proven
-by the four `canonical_agents_*` / `fixture_agent_specs_*` cases in
-`tests/eval_run_e2e.rs`.
+the `canonical_*` unit tests. Named-PTY end-to-end cases prove strict
+pre-spawn refusals, poisoned ambient-root isolation, real render
+materialization, frozen routing after declaration removal, singleton
+completion, custom main-ID supervision/logging/teardown, and the no-opt-in
+legacy control in `tests/eval_run_e2e.rs`.
 
 ## Resource bindings (R20-R21)
 
