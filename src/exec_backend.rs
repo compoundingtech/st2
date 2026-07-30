@@ -29,13 +29,25 @@ pub struct ExecBackend {
     state_dir: PathBuf,
     /// The catalog root — the value of `$CATALOG` during expansion.
     catalog_root: PathBuf,
+    /// Immutable effective PTY root shared with the PTY backend for this runner's lifetime.
+    pty_root: PathBuf,
 }
 
 impl ExecBackend {
     pub fn new(state_dir: PathBuf, catalog_root: PathBuf) -> Self {
+        let pty_root = crate::run::effective_pty_root(&catalog_root);
+        Self::new_with_pty_root(state_dir, catalog_root, pty_root)
+    }
+
+    pub fn new_with_pty_root(
+        state_dir: PathBuf,
+        catalog_root: PathBuf,
+        pty_root: PathBuf,
+    ) -> Self {
         Self {
             state_dir,
             catalog_root,
+            pty_root,
         }
     }
 
@@ -84,10 +96,7 @@ impl ExecBackend {
             .stderr(log)
             .env("CATALOG", &self.catalog_root)
             .env("ST_ROOT", &self.catalog_root)
-            .env(
-                "PTY_ROOT",
-                crate::run::effective_pty_root(&self.catalog_root),
-            );
+            .env("PTY_ROOT", &self.pty_root);
         if let Ok(path) = crate::hooks::hooks_root() {
             cmd.env("ST_HOOKS", path);
         }
@@ -96,10 +105,7 @@ impl ExecBackend {
             // `$CATALOG/pty`) so a ding — an exec task that reads PTY_ROOT to find the pty it pokes —
             // targets the same partition st2's pty ops use.
             if k == "PTY_ROOT" {
-                cmd.env(
-                    "PTY_ROOT",
-                    crate::run::effective_pty_root(&self.catalog_root),
-                );
+                cmd.env("PTY_ROOT", &self.pty_root);
             } else {
                 cmd.env(k, crate::expand::expand_catalog(v, &self.catalog_root));
             }

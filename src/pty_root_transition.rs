@@ -43,6 +43,7 @@ pub fn ensure_safe_transition(
     host: &str,
     effective_root: &Path,
     specs: &[AgentSpec],
+    discovery_complete: bool,
     inspect: impl FnOnce(&Path) -> anyhow::Result<Vec<Session>>,
 ) -> anyhow::Result<()> {
     let receipt = receipt_path(catalog_root, host);
@@ -73,6 +74,18 @@ pub fn ensure_safe_transition(
 
     if previous == requested {
         return Ok(());
+    }
+
+    if !discovery_complete {
+        anyhow::bail!(
+            "effective PTY root changed for catalog host '{host}', but agent discovery was incomplete; \
+             refusing to reconcile or advance the PTY-root receipt\n  previous: {}\n  requested: {}\n  \
+             receipt: {}\nFix every discovery error before retrying. st2 has not killed, adopted, or \
+             launched any task.",
+            previous.display(),
+            requested.display(),
+            receipt.display()
+        );
     }
 
     let sessions = inspect(&previous).with_context(|| {
@@ -248,11 +261,11 @@ mod tests {
     fn first_root_persists_and_same_root_never_probes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("a");
-        ensure_safe_transition(tmp.path(), "h", &root, &specs(), |_| {
+        ensure_safe_transition(tmp.path(), "h", &root, &specs(), true, |_| {
             panic!("first selection must not probe another registry")
         })
         .unwrap();
-        ensure_safe_transition(tmp.path(), "h", &root, &specs(), |_| {
+        ensure_safe_transition(tmp.path(), "h", &root, &specs(), true, |_| {
             panic!("same-root adoption must not probe another registry")
         })
         .unwrap();
@@ -267,8 +280,9 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let from = tmp.path().join(from);
             let to = tmp.path().join(to);
-            ensure_safe_transition(tmp.path(), "h", &from, &specs(), |_| unreachable!()).unwrap();
-            let error = ensure_safe_transition(tmp.path(), "h", &to, &specs(), |probed| {
+            ensure_safe_transition(tmp.path(), "h", &from, &specs(), true, |_| unreachable!())
+                .unwrap();
+            let error = ensure_safe_transition(tmp.path(), "h", &to, &specs(), true, |probed| {
                 assert_eq!(probed, from);
                 Ok(vec![live(survivor)])
             })
@@ -294,8 +308,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let from = tmp.path().join("a");
         let to = tmp.path().join("b");
-        ensure_safe_transition(tmp.path(), "h", &from, &specs(), |_| unreachable!()).unwrap();
-        ensure_safe_transition(tmp.path(), "h", &to, &specs(), |probed| {
+        ensure_safe_transition(tmp.path(), "h", &from, &specs(), true, |_| unreachable!()).unwrap();
+        ensure_safe_transition(tmp.path(), "h", &to, &specs(), true, |probed| {
             assert_eq!(probed, from);
             Ok(vec![live("h.seat.agent-sibling"), live("h.other.agent")])
         })
@@ -307,12 +321,32 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_discovery_refuses_a_changed_root_without_probing_or_advancing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("a");
+        let to = tmp.path().join("b");
+        ensure_safe_transition(tmp.path(), "h", &from, &specs(), true, |_| unreachable!()).unwrap();
+
+        let error = ensure_safe_transition(tmp.path(), "h", &to, &specs(), false, |_| {
+            panic!("incomplete declarations must fail before inspecting or advancing")
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("discovery was incomplete"), "{error}");
+        assert!(error.contains("has not killed, adopted, or launched"), "{error}");
+        let receipt: PtyRootReceipt =
+            serde_json::from_slice(&fs::read(receipt_path(tmp.path(), "h")).unwrap()).unwrap();
+        assert_eq!(receipt.pty_root, from);
+    }
+
+    #[test]
     fn unreadable_previous_registry_fails_closed_without_advancing() {
         let tmp = tempfile::tempdir().unwrap();
         let from = tmp.path().join("a");
         let to = tmp.path().join("b");
-        ensure_safe_transition(tmp.path(), "h", &from, &specs(), |_| unreachable!()).unwrap();
-        let error = ensure_safe_transition(tmp.path(), "h", &to, &specs(), |_| {
+        ensure_safe_transition(tmp.path(), "h", &from, &specs(), true, |_| unreachable!()).unwrap();
+        let error = ensure_safe_transition(tmp.path(), "h", &to, &specs(), true, |_| {
             anyhow::bail!("synthetic list failure")
         })
         .unwrap_err()

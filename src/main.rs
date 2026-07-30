@@ -1698,7 +1698,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     }
 
     if once {
-        let report = st2::up_once_specs(&specs, &this_host, &runner);
+        let report = st2::up_once_specs(&specs, &root, &this_host, &runner);
         println!(
             "booted team from spec {} on host '{this_host}' (once):",
             spec_file.display()

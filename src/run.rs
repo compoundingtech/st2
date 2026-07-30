@@ -102,6 +102,11 @@ pub(crate) fn resolve_task_cwd(
 
 /// The set of task operations st2 needs. Abstracted so execution is testable against a fake.
 pub trait Runner {
+    /// The immutable PTY registry selected for this runner's lifetime, when the runner owns PTY
+    /// operations. Reconciliation uses this same snapshot for transition admission and execution.
+    fn pty_root(&self) -> Option<&Path> {
+        None
+    }
     /// ACTUAL state: every task session the runner can see (unioned across backends).
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>>;
     /// Spawn `target` in the background from its explicit command. `spec_dir` is the spec file's
@@ -124,13 +129,18 @@ pub struct PtyCli {
     bin: String,
     /// The catalog root — the value of `$CATALOG` during `$`-expansion (spec.md §2 / R11).
     catalog_root: PathBuf,
+    /// Immutable effective PTY root. A pass must not validate one registry and operate on another if
+    /// ambient configuration changes concurrently.
+    pty_root: PathBuf,
 }
 
 impl Default for PtyCli {
     fn default() -> Self {
+        let catalog_root = PathBuf::from(".");
         Self {
             bin: "pty".to_string(),
-            catalog_root: PathBuf::from("."),
+            pty_root: effective_pty_root(&catalog_root),
+            catalog_root,
         }
     }
 }
@@ -168,9 +178,11 @@ fn effective_pty_root_from(catalog_root: &Path, ambient: Option<std::ffi::OsStri
 impl PtyCli {
     /// A `PtyCli` rooted at `catalog_root` (used for `$CATALOG` expansion).
     pub fn new(catalog_root: PathBuf) -> Self {
+        let pty_root = effective_pty_root(&catalog_root);
         Self {
             bin: "pty".to_string(),
             catalog_root,
+            pty_root,
         }
     }
 
@@ -199,7 +211,7 @@ impl PtyCli {
             ),
             (
                 OsString::from("PTY_ROOT"),
-                effective_pty_root(&self.catalog_root).into_os_string(),
+                self.pty_root.clone().into_os_string(),
             ),
             (OsString::from("TERM"), OsString::from("xterm-256color")),
         ]);
@@ -208,7 +220,7 @@ impl PtyCli {
         }
         for (key, value) in &target.env {
             let value = if key == "PTY_ROOT" {
-                effective_pty_root(&self.catalog_root).into_os_string()
+                self.pty_root.clone().into_os_string()
             } else {
                 OsString::from(self.expand(value))
             };
@@ -267,8 +279,12 @@ impl PtyCli {
 }
 
 impl Runner for PtyCli {
+    fn pty_root(&self) -> Option<&Path> {
+        Some(&self.pty_root)
+    }
+
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
-        list_pty_sessions_at_with(&self.bin, &effective_pty_root(&self.catalog_root))
+        list_pty_sessions_at_with(&self.bin, &self.pty_root)
     }
 
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
@@ -315,7 +331,7 @@ impl Runner for PtyCli {
             let _ = Command::new(&self.bin)
                 .arg("rm")
                 .arg(&target.pty_id)
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+                .env("PTY_ROOT", &self.pty_root)
                 .output();
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
@@ -326,7 +342,7 @@ impl Runner for PtyCli {
         let out = Command::new(&self.bin)
             .arg("kill")
             .arg(pty_id)
-            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+            .env("PTY_ROOT", &self.pty_root)
             .output()?;
         if !out.status.success() {
             anyhow::bail!(
@@ -343,7 +359,7 @@ impl Runner for PtyCli {
         // can unlink the new generation's socket/pid and leave `pty run` waiting for its full startup
         // timeout. Wait for the recorded daemon to finish its bounded shutdown before removing the
         // corpse. PTY may self-reap the files while we wait; "not found" is therefore success here.
-        let pty_root = effective_pty_root(&self.catalog_root);
+        let pty_root = self.pty_root.clone();
         let daemon_pid = std::fs::read_to_string(pty_root.join(format!("{pty_id}.pid")))
             .ok()
             .and_then(|raw| raw.trim().parse::<i32>().ok());
@@ -377,7 +393,7 @@ impl Runner for PtyCli {
         let out = Command::new(&self.bin)
             .arg("rm")
             .arg(pty_id)
-            .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+            .env("PTY_ROOT", &self.pty_root)
             .output()?;
         if !out.status.success() {
             anyhow::bail!(
@@ -434,15 +450,24 @@ pub struct SystemRunner {
 impl SystemRunner {
     /// `catalog_root` roots `$CATALOG`; `exec_state_dir` is where exec pids/logs live (machine-local).
     pub fn new(catalog_root: PathBuf, exec_state_dir: PathBuf) -> Self {
+        let pty = PtyCli::new(catalog_root.clone());
         Self {
-            pty: PtyCli::new(catalog_root.clone()),
-            exec: ExecBackend::new(exec_state_dir, catalog_root),
+            exec: ExecBackend::new_with_pty_root(
+                exec_state_dir,
+                catalog_root,
+                pty.pty_root.clone(),
+            ),
+            pty,
             index: RefCell::new(HashMap::new()),
         }
     }
 }
 
 impl Runner for SystemRunner {
+    fn pty_root(&self) -> Option<&Path> {
+        Some(&self.pty.pty_root)
+    }
+
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let mut idx = self.index.borrow_mut();
         idx.clear();
@@ -756,6 +781,10 @@ fn reconcile_pass(
     debounce: &mut LivenessDebounce,
 ) -> UpReport {
     let found = crate::discover(root);
+    let pty_root = runner
+        .pty_root()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| effective_pty_root(root));
     let mut report = UpReport {
         warnings: found.warnings.clone(),
         errors: found
@@ -769,8 +798,9 @@ fn reconcile_pass(
     if let Err(error) = crate::pty_root_transition::ensure_safe_transition(
         root,
         this_host,
-        &effective_pty_root(root),
+        &pty_root,
         &found.specs,
+        found.errors.is_empty(),
         list_pty_sessions_at,
     ) {
         report.skipped = true;
@@ -802,8 +832,12 @@ fn reconcile_pass(
 
     // Ordered, idempotent pre-boot materialization. A gating render failure removes only that agent
     // from this pass; advisory git-exclude failures remain warnings and never block a launch.
-    let materialized =
-        crate::materialize::materialize_catalog(root, &materializable_specs, this_host);
+    let materialized = crate::materialize::materialize_catalog_at_pty_root(
+        root,
+        &pty_root,
+        &materializable_specs,
+        this_host,
+    );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
     let eligible_specs: Vec<_> = found
@@ -896,12 +930,29 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 /// transient `pty list` misread of a healthy seat).
 pub fn reconcile_pass_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
 ) -> UpReport {
     let mut report = UpReport::default();
+    let pty_root = runner
+        .pty_root()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| effective_pty_root(root));
+    if let Err(error) = crate::pty_root_transition::ensure_safe_transition(
+        root,
+        this_host,
+        &pty_root,
+        specs,
+        true,
+        list_pty_sessions_at,
+    ) {
+        report.skipped = true;
+        report.errors.push(error.to_string());
+        return report;
+    }
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
@@ -940,12 +991,14 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
 /// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
 pub fn up_once_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
 ) -> UpReport {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     reconcile_pass_specs(
         specs,
+        root,
         this_host,
         runner,
         &mut FlappingCap::default(),
@@ -971,7 +1024,7 @@ pub fn up_loop_specs(
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut reported_flapping: HashSet<String> = HashSet::new();
     loop {
-        let report = reconcile_pass_specs(specs, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass_specs(specs, root, this_host, runner, &mut cap, &mut debounce);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1406,6 +1459,32 @@ mod tests {
         assert_eq!(
             effective_pty_root_from(cat, Some("/tmp/stev-abc123".into())),
             std::path::PathBuf::from("/tmp/stev-abc123")
+        );
+    }
+
+    #[test]
+    fn production_runner_pins_one_effective_pty_root_for_its_lifetime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = tmp.path();
+        let root_a = cat.join("root-a");
+        let root_b = cat.join("root-b");
+        std::fs::write(
+            cat.join(crate::catalog::CONFIG_FILE),
+            format!("catalog {{ pty-root \"{}\" }}\n", root_a.display()),
+        )
+        .unwrap();
+        let runner = SystemRunner::new(cat.to_path_buf(), cat.join("exec"));
+        assert_eq!(runner.pty_root(), Some(root_a.as_path()));
+
+        std::fs::write(
+            cat.join(crate::catalog::CONFIG_FILE),
+            format!("catalog {{ pty-root \"{}\" }}\n", root_b.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            runner.pty_root(),
+            Some(root_a.as_path()),
+            "a concurrent config rewrite must not retarget later operations on the same runner"
         );
     }
 

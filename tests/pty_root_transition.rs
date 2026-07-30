@@ -63,6 +63,17 @@ impl Fixture {
             .unwrap()
     }
 
+    fn up_spec(&self, root: &Path, spec_dir: &Path) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_st2"))
+            .arg("up")
+            .arg(spec_dir)
+            .arg("--once")
+            .env("XDG_STATE_HOME", &self.xdg)
+            .env("PTY_ROOT", root)
+            .output()
+            .unwrap()
+    }
+
     fn sessions(&self, root: &Path) -> Vec<serde_json::Value> {
         let out = Command::new("pty")
             .args(["list", "--json"])
@@ -229,4 +240,37 @@ fn root_a_to_b_refuses_survivors_then_advances_after_exact_cleanup() {
 #[test]
 fn root_b_to_a_refuses_survivors_then_advances_after_exact_cleanup() {
     prove_transition(|fx| &fx.root_b, |fx| &fx.root_a);
+}
+
+#[test]
+fn single_file_fleet_refuses_to_duplicate_a_survivor_across_roots() {
+    let fx = Fixture::new();
+    let spec_dir = fx.catalog.join("single-file");
+    fs::create_dir_all(&spec_dir).unwrap();
+    fs::write(
+        spec_dir.join("team.kdl"),
+        r#"team "single" {
+  agent "seat" { command "exec sleep 120" }
+}
+"#,
+    )
+    .unwrap();
+    let id = "single.seat";
+
+    let launched = fx.up_spec(&fx.root_a, &spec_dir);
+    assert!(
+        launched.status.success(),
+        "initial single-file reconcile failed: {}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    let source_pid = fx.running_pid(&fx.root_a, id).unwrap();
+
+    let refused = fx.up_spec(&fx.root_b, &spec_dir);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(stderr.contains(id), "{stderr}");
+    assert_eq!(fx.running_pid(&fx.root_a, id), Some(source_pid));
+    assert_eq!(fx.running_pid(&fx.root_b, id), None);
+
+    fx.remove(&fx.root_a, id);
 }

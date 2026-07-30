@@ -817,6 +817,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                         }
                         Err(_) => crate::run::reconcile_pass_specs(
                             &specs,
+                            catalog,
                             host,
                             &supervise_runner,
                             &mut sup_cap,

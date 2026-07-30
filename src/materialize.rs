@@ -240,14 +240,16 @@ pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
     }
 }
 
-fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
+fn render_env(
+    root: &Path,
+    pty_root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
         ("CATALOG".to_string(), root.display().to_string()),
         ("ST_ROOT".to_string(), root.display().to_string()),
-        (
-            "PTY_ROOT".to_string(),
-            crate::run::effective_pty_root(root).display().to_string(),
-        ),
+        ("PTY_ROOT".to_string(), pty_root.display().to_string()),
         ("ST_AGENT".to_string(), spec.bus_id(this_host)),
     ]);
     if let Ok(path) = crate::hooks::versioned_hooks_dir() {
@@ -454,6 +456,20 @@ enum PreparedOp {
 
 /// Execute one agent's render plan in declaration order.
 pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
+    materialize_agent_at_pty_root(
+        root,
+        &crate::run::effective_pty_root(root),
+        spec,
+        this_host,
+    )
+}
+
+fn materialize_agent_at_pty_root(
+    root: &Path,
+    pty_root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<Vec<String>> {
     let plan = parse_plan(spec)?;
     if plan.ops.is_empty() {
         return Ok(Vec::new());
@@ -470,7 +486,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         .workspace
         .as_deref()
         .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
-    let env = render_env(root, spec, this_host);
+    let env = render_env(root, pty_root, spec, this_host);
     let workspace = PathBuf::from(expand(workspace_raw, &env));
     if !workspace.is_dir() {
         anyhow::bail!(
@@ -665,7 +681,7 @@ pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<
         .workspace
         .as_deref()
         .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
-    let env = render_env(root, spec, this_host);
+    let env = render_env(root, &crate::run::effective_pty_root(root), spec, this_host);
     let workspace = PathBuf::from(expand(workspace_raw, &env));
     let spec_dir = spec.path.parent().unwrap_or(root);
     for op in plan.ops {
@@ -699,13 +715,29 @@ pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<
 
 /// Materialize every active agent assigned to `this_host`.
 pub fn materialize_catalog(root: &Path, specs: &[AgentSpec], this_host: &str) -> MaterializeReport {
+    materialize_catalog_at_pty_root(
+        root,
+        &crate::run::effective_pty_root(root),
+        specs,
+        this_host,
+    )
+}
+
+/// Materialize against an already selected PTY registry. Reconcile passes use this form so render
+/// inputs and subsequent task operations share one root snapshot.
+pub fn materialize_catalog_at_pty_root(
+    root: &Path,
+    pty_root: &Path,
+    specs: &[AgentSpec],
+    this_host: &str,
+) -> MaterializeReport {
     let mut report = MaterializeReport::default();
     for spec in specs {
         if spec.retired || spec.resolved_host(this_host) != this_host {
             continue;
         }
         let bus_id = spec.bus_id(this_host);
-        match materialize_agent(root, spec, this_host) {
+        match materialize_agent_at_pty_root(root, pty_root, spec, this_host) {
             Ok(notes) => {
                 for note in notes {
                     if note.starts_with("WARN ") {
