@@ -803,10 +803,16 @@ fn reconcile_pass(
         .cloned()
         .collect::<Vec<_>>();
 
-    // Ordered, idempotent pre-boot materialization. A gating render failure removes only that agent
-    // from this pass; advisory git-exclude failures remain warnings and never block a launch.
-    let materialized =
-        crate::materialize::materialize_catalog(root, &materializable_specs, this_host);
+    // Ordered, idempotent pre-boot materialization, with ownership checked against the complete
+    // active fleet even when another gate defers one owner's writes. A gating render failure removes
+    // only that agent from this pass; advisory git-exclude failures remain warnings and never block
+    // a launch.
+    let materialized = crate::materialize::materialize_catalog_against(
+        root,
+        &materializable_specs,
+        &found.specs,
+        this_host,
+    );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
     let eligible_specs: Vec<_> = found
