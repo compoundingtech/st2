@@ -392,5 +392,26 @@ The sole canonical agent contract is
 repository. Eval corpus definitions, execution/readiness evidence, authorization, and results belong
 to that repository; st2 does not duplicate or pin its ledgers here.
 
+An eval that exercises production Agent Specs opts in explicitly:
+
+```kdl
+eval {
+  copy "./fixture"
+  run "publish-canonical-team" { command "..." }
+  canonical-agents
+  message { from "requester"; to "evalhost.supervisor"; content "./task.md" }
+  max-timeout "300s"
+  judges { /* held-out checks */ }
+}
+```
+
+`copy` and deterministic `run` steps populate the hermetic temporary catalog first.
+`canonical-agents` then discovers and materializes declarations at
+`agents/<host>/<identity>/agent.kdl`. It is mutually exclusive with compact `team` / `agent` seats:
+the discovered vector is the sole authority for launch, kickoff routing, supervision, logs, and
+teardown. Missing, malformed, duplicate, retired, nonlocal, noncanonical, root-overriding, or
+unrunnable declarations fail before a seat starts. Without the directive, Agent Spec-shaped files
+inside a fixture remain inert and compact evals retain their flat bus semantics.
+
 `st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
 interface, and generated output must be reviewed before materialization.

@@ -1,8 +1,8 @@
 //! The **st2 spec** — the native, legible eval/agent format (`st2 eval ./folder`), nailed down in
-//! review. One `.kdl` file describes a team
-//! and (optionally) an `eval` that copies a fixture, kicks off the team, waits for the sup's
-//! confirmation, and runs judges. This module is the PARSER + model (P1); `st2 up`/`st2 eval` (team
-//! boot + eval flow + judge engine) build on it.
+//! review. One `.kdl` file describes a compact team, or explicitly selects canonical Agent Specs
+//! already materialized in the eval's hermetic catalog, and an optional `eval` that copies a
+//! fixture, kicks off the team, waits for the sup's confirmation, and runs judges. This module is
+//! the PARSER + model (P1); `st2 up`/`st2 eval` (team boot + eval flow + judge engine) build on it.
 //!
 //! Principles (from the design — do not violate): legible top-to-bottom, everything in one file, st2
 //! self-contained (`st2 ding`, only `pty` on PATH). Ergonomic collapses (review-driven): a bare `ding`
@@ -86,6 +86,10 @@ pub struct Eval {
     /// cell. Recovery remains respawn-from-spec rather than `pty restart`, so eval supervision stays
     /// owned by st2 even though PTY metadata can now restore the managed environment manually.
     pub supervise: bool,
+    /// Opt-in: after `copy` and `run` finish, discover the eval team from canonical Agent Specs in
+    /// the hermetic catalog. Mutually exclusive with the compact `team` / `agent` grammar: one eval
+    /// has one declaration authority.
+    pub canonical_agents: bool,
 }
 
 /// The kickoff. `content` is a file path (relative to the spec folder) or inline text — resolved at
@@ -341,6 +345,13 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
     // Re-fold: agents parsed before `env` would miss it, so parse env first. Enforce order simply:
     // if any agent has empty env but a top-level env exists, it means `env` came after — reject for
     // legibility (declare env at the top).
+    if eval.as_ref().is_some_and(|eval| eval.canonical_agents)
+        && (!agents.is_empty() || eval.as_ref().is_some_and(|eval| !eval.agents.is_empty()))
+    {
+        anyhow::bail!(
+            "eval `canonical-agents` is mutually exclusive with compact `team` / `agent` seats"
+        );
+    }
     Ok(Spec { host, env: top_env, agents, eval })
 }
 
@@ -472,6 +483,7 @@ fn parse_eval(node: &KdlNode, top_env: &BTreeMap<String, String>) -> anyhow::Res
     let mut run_steps = Vec::new();
     let mut judges = Vec::new();
     let mut supervise = false;
+    let mut canonical_agents = false;
 
     for c in ch.nodes() {
         match c.name().value() {
@@ -489,8 +501,18 @@ fn parse_eval(node: &KdlNode, top_env: &BTreeMap<String, String>) -> anyhow::Res
             "judges" => judges = parse_judges(c)?,
             // Opt-in: a bare `supervise` directive turns on respawn-from-spec during the run.
             "supervise" => supervise = true,
+            // Opt-in: use canonical Agent Specs materialized in the hermetic eval catalog.
+            "canonical-agents" => {
+                if canonical_agents {
+                    anyhow::bail!("eval: `canonical-agents` may occur only once");
+                }
+                if !c.entries().is_empty() || c.children().is_some() {
+                    anyhow::bail!("eval: `canonical-agents` is a bare directive");
+                }
+                canonical_agents = true;
+            }
             other => anyhow::bail!(
-                "eval: unexpected node '{other}' (expected copy|message|max-timeout|agent|team|run|judges|supervise)"
+                "eval: unexpected node '{other}' (expected copy|message|max-timeout|agent|team|run|judges|supervise|canonical-agents)"
             ),
         }
     }
@@ -506,6 +528,7 @@ fn parse_eval(node: &KdlNode, top_env: &BTreeMap<String, String>) -> anyhow::Res
         run_steps,
         judges,
         supervise,
+        canonical_agents,
     })
 }
 
@@ -833,6 +856,28 @@ team "mix" {
         };
         assert!(parse_spec(&ev("  supervise\n")).unwrap().eval.unwrap().supervise);
         assert!(!parse_spec(&ev("")).unwrap().eval.unwrap().supervise);
+    }
+
+    #[test]
+    fn canonical_agents_is_bare_once_and_excludes_compact_seats() {
+        let canonical = parse_spec(
+            "eval {\n  canonical-agents\n  message { from \"r\"; to \"h.sup\"; content \"go\" }\n  max-timeout \"5s\"\n}\n",
+        )
+        .unwrap();
+        assert!(canonical.eval.unwrap().canonical_agents);
+
+        for invalid in [
+            "eval { canonical-agents \"./fleet\"; max-timeout \"5s\"; run \"x\" { command \"true\" } }",
+            "eval { canonical-agents { }; max-timeout \"5s\"; run \"x\" { command \"true\" } }",
+            "eval { canonical-agents; canonical-agents; max-timeout \"5s\"; run \"x\" { command \"true\" } }",
+            "agent \"a\" { command \"true\" }\neval { canonical-agents; message { from \"r\"; to \"a\"; content \"go\" }; max-timeout \"5s\" }",
+            "eval { canonical-agents; agent \"a\" { command \"true\" }; message { from \"r\"; to \"a\"; content \"go\" }; max-timeout \"5s\" }",
+        ] {
+            assert!(
+                parse_spec(invalid).is_err(),
+                "accepted ambiguous canonical agent authority:\n{invalid}"
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,34 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
+## Canonical Agent Spec eval teams
+
+An eval may opt into `canonical-agents` after its fixture copy and deterministic
+run steps have populated the hermetic temporary catalog. The directive is
+mutually exclusive with compact `team` / `agent` seats. st2 discovers and
+materializes only declarations at
+`agents/<host>/<identity>/agent.kdl`, then carries that one Agent Spec vector
+unchanged through launch admission, kickoff resolution, supervision, logging,
+and teardown.
+
+Admission fails before spawn when discovery is empty, malformed,
+warning-bearing, duplicate, retired, nonlocal, noncanonical, root-overriding,
+unrunnable, or does not expose exactly one main PTY per declaration. The
+kickoff target must resolve to exactly one member of the discovered fleet. The
+eval owns one native `CATALOG` / `ST_ROOT` and its `<catalog>/pty` registry;
+declarations cannot override those roots. Workspace renders are materialized
+before any seat starts.
+
+Without `canonical-agents`, fixture declarations are not discovered or launched
+and compact evals retain their catalog-less flat bus. This explicit opt-in keeps
+ordinary fixtures inert while allowing the same canonical declaration to be
+exercised in an eval and real work. Parser and admission evidence lives in
+`eval_spec::tests::canonical_agents_is_bare_once_and_excludes_compact_seats` and
+the `canonical_eval_team_*` unit tests. End-to-end isolation, canonical inbox
+routing, the no-opt-in collision control, and pre-spawn path refusal are proven
+by the four `canonical_agents_*` / `fixture_agent_specs_*` cases in
+`tests/eval_run_e2e.rs`.
+
 ## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:
