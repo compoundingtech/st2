@@ -2,7 +2,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
@@ -73,61 +72,4 @@ fn spec_up_once_exits_nonzero_when_the_pass_is_skipped() {
             .env("PATH", bin.path())
             .env("XDG_STATE_HOME", tmp.path().join("state")),
     );
-}
-
-#[test]
-fn catalog_up_once_accepts_a_slow_bounded_fleet_census() {
-    let tmp = tempfile::tempdir().unwrap();
-    let catalog = tmp.path().join("catalog");
-    let declaration = catalog.join("agents/h/gone/agent.kdl");
-    let bin = tmp.path().join("bin");
-    let sessions = tmp.path().join("sessions.json");
-    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
-    fs::create_dir_all(&bin).unwrap();
-    fs::write(
-        declaration,
-        "agent \"gone\" { host \"h\"; retired #true; command \"true\" }\n",
-    )
-    .unwrap();
-    let fleet = (0..45)
-        .map(|index| {
-            serde_json::json!({
-                "name": format!("seat-{index}"),
-                "status": "running",
-                "exit_code": null
-            })
-        })
-        .collect::<Vec<_>>();
-    fs::write(&sessions, serde_json::to_vec(&fleet).unwrap()).unwrap();
-    executable(
-        &bin.join("pty"),
-        &format!(
-            "#!/bin/sh\nif [ \"$1\" = list ]; then sleep 3; cat '{}'; fi\n",
-            sessions.display()
-        ),
-    );
-    let path = std::env::join_paths(
-        std::iter::once(bin.as_path().to_path_buf())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-
-    let started = Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
-        .arg("up")
-        .arg("--catalog")
-        .arg(&catalog)
-        .args(["--host", "h", "--once"])
-        .env("PATH", path)
-        .env("XDG_STATE_HOME", tmp.path().join("state"))
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "a bounded fleet census skipped the reconcile pass\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(started.elapsed() >= Duration::from_secs(3));
 }

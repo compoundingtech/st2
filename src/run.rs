@@ -29,9 +29,8 @@ use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use agent_spec::spec::TaskKind;
 
-// One complete registry census may traverse a busy, shared fleet. Keep the query bounded without
-// treating ordinary multi-session latency as a wedged control plane.
-const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+// This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
+const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
