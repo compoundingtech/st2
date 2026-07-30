@@ -16,6 +16,50 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
+## Canonical Agent Spec eval teams
+
+An eval may opt into `canonical-agents` after its fixture copy and deterministic
+run steps have populated the hermetic temporary catalog. The directive is
+mutually exclusive with compact `team` / `agent` declarations. st2 recursively
+discovers the catalog, preserves explicit `identity` and `host` authority
+independent of organizational placement, and projects only declarations
+resolved to the eval host. Each declaration parent remains its native
+state/resource anchor. The resulting local Agent Spec vector flows unchanged
+through launch admission, kickoff resolution, supervision, logging, and
+declaration-driven teardown; remote-host declarations remain inert.
+
+Admission applies `validate_for_host` strictly, then fails before spawn when
+discovery is malformed or warning-bearing, when the selected local projection
+is empty, duplicate, retired, root-overriding, or unrunnable, or when any
+resolved local task runtime ID is empty or duplicates another local task.
+Materialization warnings and backend launch errors are fatal. The kickoff
+target must resolve to exactly one local agent. The eval owns one native
+`CATALOG` / `ST_ROOT` and its `<catalog>/pty` registry; declarations cannot
+override those roots. Local workspace renders are materialized before any
+agent task starts.
+
+Native inbox/archive paths are derived once from the admitted Agent Spec paths
+and carried as frozen data; routing never re-discovers the mutable catalog.
+The requester alone is an explicit eval-owned flat mailbox. Multi-agent
+completion retains the worker-report-before-supervisor-confirmation ordering.
+For a singleton, the eval snapshots the requester inbox before kickoff and
+completes only for a newly appearing interviewer reply whose timestamp is
+at-or-after the exact kickoff receipt. The filename snapshot rejects
+future-dated pre-seeded messages while `>=` accepts a causally new same-ms
+reply. Canonical completion is a gating judge, so a timeout cannot pass on
+unrelated final-state checks alone.
+
+Without `canonical-agents`, fixture declarations are not discovered or launched
+and compact evals retain their catalog-less flat bus. This explicit opt-in keeps
+ordinary fixtures inert while allowing the same canonical declaration to be
+exercised in an eval and real work. Parser and admission evidence lives in
+`eval_spec::tests::canonical_agents_is_bare_once_and_excludes_compact_agents` and
+the `canonical_*` unit tests. Named-PTY end-to-end cases prove strict
+pre-spawn refusals, poisoned ambient-root isolation, real render
+materialization, frozen routing after declaration removal, singleton
+completion, custom task-ID supervision/logging/teardown, and the no-opt-in
+legacy control in `tests/eval_run_e2e.rs`.
+
 ## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:

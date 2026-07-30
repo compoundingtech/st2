@@ -392,5 +392,33 @@ The sole canonical agent contract is
 repository. Eval corpus definitions, execution/readiness evidence, authorization, and results belong
 to that repository; st2 does not duplicate or pin its ledgers here.
 
+An eval that exercises production Agent Specs opts in explicitly:
+
+```kdl
+eval {
+  copy "./fixture"
+  run "publish-canonical-team" { command "..." }
+  canonical-agents
+  message { from "requester"; to "evalhost.supervisor"; content "./task.md" }
+  max-timeout "300s"
+  judges { /* held-out checks */ }
+}
+```
+
+`copy` and deterministic `run` steps populate the hermetic temporary catalog first.
+`canonical-agents` then recursively discovers the catalog and projects declarations resolved to the
+eval host. Explicit `identity` and `host` fields remain authoritative independent of organizational
+placement; each declaration parent remains its native state/resource anchor. The directive is
+mutually exclusive with compact `team` / `agent` declarations, so the local Agent Spec vector is the
+sole authority for launch, kickoff routing, supervision, logs, and teardown. Strict catalog
+validation, fleet-unique nonempty task runtime IDs, and warning-free local materialization all finish
+before an agent task starts; backend launch errors are fatal. Remote-host declarations remain inert.
+Native inbox/archive paths are frozen from the admitted local vector, so later catalog mutation
+cannot redirect eval traffic. A multi-agent team completes only after the existing worker-report ordering.
+For a singleton, the requester inbox is snapshotted before kickoff; only a newly appearing
+interviewer reply at-or-after the exact kickoff receipt completes it. Canonical completion gates the
+verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
+evals retain their flat bus and completion semantics.
+
 `st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
 interface, and generated output must be reviewed before materialization.

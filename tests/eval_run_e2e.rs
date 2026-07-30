@@ -194,6 +194,722 @@ sleep 60
     assert!(!invalid.status.success(), "invalid eval input must retain nonzero exit");
 }
 
+#[test]
+fn canonical_agents_run_from_the_hermetic_catalog_with_one_root_and_native_bus() {
+    if !pty_available() {
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
+        eprintln!("SKIP canonical_agents_run_from_the_hermetic_catalog_with_one_root_and_native_bus");
+        return;
+    }
+
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    for path in [
+        "agents/evalhost/sup",
+        "agents/evalhost/worker",
+        "scripts",
+        "sup",
+        "templates",
+        "worker",
+    ] {
+        std::fs::create_dir_all(fixture.join(path)).unwrap();
+    }
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+host "evalhost"
+eval {
+  copy "./fixture"
+  canonical-agents
+  supervise
+  message { from "requester"; to "evalhost.sup"; content "do the bounded work" }
+  max-timeout "30s"
+  judges {
+    judge "canonical team completed" { exec "test -f $CATALOG/worker/DONE" }
+    judge "one eval-owned root" {
+      exec "test -f $CATALOG/sup/roots-ok && test -f $CATALOG/worker/roots-ok"
+    }
+    judge "render materialized before launch" {
+      exec "test -f $CATALOG/sup/render-seen-at-process-start"
+    }
+    judge "custom main id survived supervision" {
+      exec "test -f $CATALOG/worker/restarted-once"
+    }
+    judge "kickoff used canonical inbox" {
+      exec "test -d $CATALOG/agents/evalhost/sup/resources/inbox && test ! -e $CATALOG/evalhost.sup/inbox"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("agents/evalhost/sup/agent.kdl"),
+        r#"agent "sup" {
+  identity "sup"
+  host "evalhost"
+  workspace "$CATALOG/sup"
+  env { ST_AGENT "evalhost.sup" }
+  pty "agent" {
+    id "canonical-sup-main"
+    argv "sh" "$CATALOG/scripts/sup.sh"
+  }
+  render {
+    copy "templates/proof.txt" "materialized.txt"
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("agents/evalhost/worker/agent.kdl"),
+        r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  workspace "$CATALOG/worker"
+  supervisor "sup"
+  env { ST_AGENT "evalhost.worker" }
+  pty "agent" {
+    id "canonical-worker-main"
+    argv "sh" "$CATALOG/scripts/worker.sh"
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(fixture.join("templates/proof.txt"), "rendered\n").unwrap();
+    std::fs::write(
+        fixture.join("scripts/worker.sh"),
+        r#"#!/bin/sh
+echo "canonical worker main"
+test "$CATALOG" = "$ST_ROOT" &&
+  test "$PTY_ROOT" = "$CATALOG/pty" &&
+  test "$ST_AGENT" = "evalhost.worker" &&
+  : > "$CATALOG/worker/roots-ok"
+if [ ! -e "$CATALOG/worker/restarted-once" ]; then
+  : > "$CATALOG/worker/restarted-once"
+  sleep 2
+  exit 17
+fi
+: > "$CATALOG/worker/DONE"
+st2 message send evalhost.sup --root "$ST_ROOT" --as evalhost.worker -m "worker done" >/dev/null 2>&1
+exec sleep 60
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/sup.sh"),
+        r#"#!/bin/sh
+test "$(cat "$CATALOG/sup/materialized.txt")" = rendered || exit 41
+: > "$CATALOG/sup/render-seen-at-process-start"
+echo "canonical supervisor main"
+test "$CATALOG" = "$ST_ROOT" &&
+  test "$PTY_ROOT" = "$CATALOG/pty" &&
+  test "$ST_AGENT" = "evalhost.sup" &&
+  : > "$CATALOG/sup/roots-ok"
+for _ in $(seq 1 150); do
+  kick=$(st2 message ls evalhost.sup --root "$ST_ROOT" --from requester --count 2>/dev/null || echo 0)
+  report=$(st2 message ls evalhost.sup --root "$ST_ROOT" --from evalhost.worker --count 2>/dev/null || echo 0)
+  [ "$kick" -gt 0 ] && [ "$report" -gt 0 ] && break
+  sleep 0.2
+done
+st2 message send requester --root "$ST_ROOT" --as evalhost.sup -m "done" >/dev/null 2>&1
+exec sleep 60
+"#,
+    )
+    .unwrap();
+
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let poison = tmp.path().join("ambient-poison");
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("CATALOG", poison.join("catalog"))
+        .env("ST_ROOT", poison.join("bus"))
+        .env("PTY_ROOT", poison.join("pty"))
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("team signalled done")
+            && stdout.contains("SCORE: 6 PASS / 0 FAIL"),
+        "canonical eval did not close:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
+    assert!(
+        !poison.exists(),
+        "ambient CATALOG/ST_ROOT/PTY_ROOT leaked outside the eval-owned catalog"
+    );
+    assert_eq!(
+        std::fs::read_to_string(catalog.join("sup/materialized.txt")).unwrap(),
+        "rendered\n"
+    );
+    for id in ["canonical-sup-main", "canonical-worker-main"] {
+        let log = catalog.join("logs").join(format!("{id}.log"));
+        assert!(log.exists(), "custom main id did not flow into log capture: {}", log.display());
+    }
+    let sessions = Command::new("pty")
+        .args(["ls", "--json"])
+        .env("PTY_ROOT", catalog.join("pty"))
+        .output()
+        .unwrap();
+    let sessions = String::from_utf8_lossy(&sessions.stdout);
+    assert!(
+        !sessions.contains("canonical-sup-main") && !sessions.contains("canonical-worker-main"),
+        "custom main ids survived teardown: {sessions}"
+    );
+}
+
+#[test]
+fn fixture_agent_specs_are_inert_without_canonical_agents_opt_in() {
+    if !pty_available() {
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
+        eprintln!("SKIP fixture_agent_specs_are_inert_without_canonical_agents_opt_in");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    std::fs::create_dir_all(fixture.join("agents/evalhost/legacy")).unwrap();
+    std::fs::create_dir_all(fixture.join("scripts")).unwrap();
+    std::fs::write(
+        fixture.join("agents/evalhost/legacy/agent.kdl"),
+        r#"agent "legacy" {
+  identity "legacy"
+  host "evalhost"
+  argv "sh" "-c" "touch \"$CATALOG/CANONICAL-SHOULD-NOT-LAUNCH\"; sleep 60"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/legacy.sh"),
+        r#"#!/bin/sh
+for _ in $(seq 1 100); do
+  set -- "$ST_ROOT/legacy/inbox/"*.md
+  [ -e "$1" ] && : > "$CATALOG/SAW-FLAT-KICKOFF" && break
+  sleep 0.05
+done
+exec sleep 60
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+host "evalhost"
+agent "legacy" {
+  env { ST_AGENT "legacy" }
+  command "sh $CATALOG/scripts/legacy.sh"
+}
+eval {
+  copy "./fixture"
+  message { from "requester"; to "legacy"; content "go" }
+  max-timeout "2s"
+  judges {
+    judge "legacy flat authority stayed intact" {
+      exec "test -f $CATALOG/SAW-FLAT-KICKOFF && test ! -e $CATALOG/CANONICAL-SHOULD-NOT-LAUNCH && test ! -e $CATALOG/agents/evalhost/legacy/resources/inbox"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let out = Command::new(bin)
+        .args(["eval", "--host", "evalhost"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "colliding fixture Agent Spec changed legacy eval semantics:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn canonical_agents_accept_path_independent_local_tasks_and_ignore_remote_projection() {
+    if !pty_available() {
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
+        eprintln!(
+            "SKIP canonical_agents_accept_path_independent_local_tasks_and_ignore_remote_projection"
+        );
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    let local_dir = fixture.join("organization/.managed/arbitrary/declaration");
+    let remote_dir = fixture.join("fleet/remote/declaration");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::create_dir_all(fixture.join("scripts")).unwrap();
+    std::fs::write(
+        local_dir.join("agent.kdl"),
+        r#"agent "local" {
+  identity "local"
+  host "evalhost"
+  pty "work" {
+    id "custom-local-task"
+    argv "sh" "$CATALOG/scripts/local.sh"
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        remote_dir.join("agent.kdl"),
+        r#"agent "remote" {
+  identity "remote"
+  host "other"
+  pty "work" {
+    id "remote-task"
+    command "touch \"$CATALOG/REMOTE-SPAWNED\"; sleep 60"
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/local.sh"),
+        r#"#!/bin/sh
+for _ in $(seq 1 100); do
+  set -- "$CATALOG/organization/.managed/arbitrary/declaration/resources/inbox/"*.md
+  if [ -e "$1" ]; then
+    st2 message send requester --root "$ST_ROOT" --as evalhost.local -m "done" >/dev/null 2>&1
+    exec sleep 60
+  fi
+  sleep 0.05
+done
+exit 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+host "evalhost"
+eval {
+  copy "./fixture"
+  canonical-agents
+  message { from "requester"; to "evalhost.local"; content "go" }
+  max-timeout "10s"
+  judges {
+    judge "local projection only" {
+      exec "test -d $CATALOG/organization/.managed/arbitrary/declaration/resources/inbox && test ! -e $CATALOG/REMOTE-SPAWNED"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("team signalled done")
+            && stdout.contains("SCORE: 2 PASS / 0 FAIL"),
+        "path-independent local projection failed:\n{stdout}\n{stderr}"
+    );
+    assert!(catalog.join("logs/custom-local-task.log").is_file());
+}
+
+#[test]
+fn canonical_agents_reject_an_unknown_kickoff_target_before_spawn() {
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    std::fs::create_dir_all(fixture.join("agents/evalhost/valid")).unwrap();
+    std::fs::write(
+        fixture.join("agents/evalhost/valid/agent.kdl"),
+        r#"agent "valid" {
+  identity "valid"
+  host "evalhost"
+  argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+host "evalhost"
+eval {
+  copy "./fixture"
+  canonical-agents
+  message { from "requester"; to "evalhost.missing"; content "go" }
+  max-timeout "10s"
+  judges { judge "never reached" { exec "false" } }
+}
+"#,
+    )
+    .unwrap();
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
+        .arg(&cell)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "unknown kickoff target was accepted:\n{combined}");
+    assert!(
+        combined.contains("kickoff target `evalhost.missing`")
+            && combined.contains("found 0"),
+        "wrong refusal:\n{combined}"
+    );
+    assert!(!catalog.join("SPAWNED").exists(), "task spawned before kickoff admission");
+}
+
+#[test]
+fn canonical_agents_freeze_the_admitted_route_across_post_boot_catalog_mutation() {
+    if !pty_available() {
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
+        eprintln!(
+            "SKIP canonical_agents_freeze_the_admitted_route_across_post_boot_catalog_mutation"
+        );
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    std::fs::create_dir_all(fixture.join("agents/evalhost/interviewer")).unwrap();
+    std::fs::create_dir_all(fixture.join("scripts")).unwrap();
+    std::fs::create_dir_all(fixture.join("workspace")).unwrap();
+    std::fs::write(
+        fixture.join("agents/evalhost/interviewer/agent.kdl"),
+        r#"agent "interviewer" {
+  identity "interviewer"
+  host "evalhost"
+  workspace "$CATALOG/workspace"
+  argv "sh" "$CATALOG/scripts/interviewer.sh"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("scripts/interviewer.sh"),
+        r#"#!/bin/sh
+rm "$CATALOG/agents/evalhost/interviewer/agent.kdl"
+for _ in $(seq 1 100); do
+  set -- "$CATALOG/agents/evalhost/interviewer/resources/inbox/"*.md
+  if [ -e "$1" ]; then
+    sleep 0.02
+    st2 message send requester --root "$ST_ROOT" --as evalhost.interviewer -m "done" >/dev/null 2>&1
+    echo "completed through frozen route"
+    break
+  fi
+  sleep 0.05
+done
+exec sleep 60
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+host "evalhost"
+eval {
+  copy "./fixture"
+  canonical-agents
+  message { from "requester"; to "evalhost.interviewer"; content "go" }
+  max-timeout "10s"
+  judges {
+    judge "mutation happened after admission" {
+      exec "test ! -e $CATALOG/agents/evalhost/interviewer/agent.kdl"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let log =
+        std::fs::read_to_string(catalog.join("logs/evalhost.interviewer.log")).unwrap_or_default();
+    assert!(
+        out.status.success()
+            && stdout.contains("team signalled done")
+            && stdout.contains("SCORE: 2 PASS / 0 FAIL"),
+        "frozen canonical route did not survive declaration removal:\n{stdout}\n{stderr}\n--log--\n{log}"
+    );
+}
+
+#[test]
+fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let cases: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+        (
+            "unknown-type",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; type "srvice"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+            )],
+        ),
+        (
+            "unknown-task-kind",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60"; pty { command "true" } }"#,
+            )],
+        ),
+        (
+            "dangling-supervisor",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; supervisor "missing"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+            )],
+        ),
+        (
+            "bad-path",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; workspace "$CATALOG/missing"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+            )],
+        ),
+        (
+            "materialization warnings",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; workspace "$CATALOG/workspace"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60"; render { git-exclude ".st2/" } }"#,
+            )],
+        ),
+        (
+            "duplicate runtime task id",
+            "evalhost.one",
+            vec![
+                (
+                    "one",
+                    r#"agent "one" { identity "one"; host "evalhost"; pty "agent" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
+                ),
+                (
+                    "two",
+                    r#"agent "two" { identity "two"; host "evalhost"; pty "agent" { id "two-main"; command "sleep 60" }; exec "poison" { id "shared"; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
+                ),
+            ],
+        ),
+        (
+            "retired Agent Spec",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; retired #true; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+            )],
+        ),
+        (
+            "no local canonical Agent Specs",
+            "other.worker",
+            vec![(
+                "../other/worker",
+                r#"agent "worker" { identity "worker"; host "other"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+            )],
+        ),
+        (
+            "override eval-owned `ST_ROOT`",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; pty "agent" { command "touch \"$CATALOG/SPAWNED\"; sleep 60"; env { ST_ROOT "/tmp/poison" } } }"#,
+            )],
+        ),
+        (
+            "runtime task id must be nonempty",
+            "evalhost.worker",
+            vec![(
+                "worker",
+                r#"agent "worker" { identity "worker"; host "evalhost"; pty "agent" { id ""; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
+            )],
+        ),
+    ];
+    for (expected, target, declarations) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let cell = tmp.path().join("cell");
+        let fixture = cell.join("fixture");
+        std::fs::create_dir_all(fixture.join("workspace")).unwrap();
+        for (identity, declaration) in declarations {
+            let dir = fixture.join(format!("agents/evalhost/{identity}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.kdl"), declaration).unwrap();
+        }
+        std::fs::write(
+            cell.join("cell.kdl"),
+            format!(
+                r#"
+host "evalhost"
+eval {{
+  copy "./fixture"
+  canonical-agents
+  message {{ from "requester"; to "{target}"; content "go" }}
+  max-timeout "10s"
+  judges {{ judge "never reached" {{ exec "false" }} }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let child = Command::new(bin)
+            .args(["eval", "--keep", "--host", "evalhost"])
+            .arg(&cell)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+        let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+        let out = child.wait_with_output().unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "`{expected}` case launched:\n{combined}");
+        assert!(
+            combined.contains(expected),
+            "`{expected}` case produced the wrong refusal:\n{combined}"
+        );
+        assert!(
+            !catalog.join("SPAWNED").exists(),
+            "`{expected}` case allowed a pre-admission side effect"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    let fixture = cell.join("fixture");
+    let agent_dir = fixture.join("agents/evalhost/worker");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        fixture.join("catalog.kdl"),
+        "catalog { pty_root \"/tmp/poison\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        agent_dir.join("agent.kdl"),
+        r#"agent "worker" { identity "worker"; host "evalhost"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cell.join("cell.kdl"),
+        r#"
+host "evalhost"
+eval {
+  copy "./fixture"
+  canonical-agents
+  message { from "requester"; to "evalhost.worker"; content "go" }
+  max-timeout "10s"
+  judges { judge "never reached" { exec "false" } }
+}
+"#,
+    )
+    .unwrap();
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
+        .arg(&cell)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "malformed catalog config launched:\n{combined}");
+    assert!(
+        combined.contains("catalog-config") && combined.contains("pty_root"),
+        "malformed catalog config produced the wrong refusal:\n{combined}"
+    );
+    assert!(
+        !catalog.join("SPAWNED").exists(),
+        "malformed catalog config allowed a pre-admission side effect"
+    );
+}
+
 /// Under `supervise`, teardown reaps RUNTIME-spawned seats too (the team-standup pattern: a seat spins
 /// up an undeclared peer mid-run), not just the declared team. The seat spawns an undeclared `rtpeer`
 /// into the eval's hermetic PTY_ROOT; after the eval, no orphan carrying the peer's marker survives.
