@@ -458,6 +458,9 @@ enum MessageCmd {
         /// List the archive instead of the inbox.
         #[arg(long)]
         archive: bool,
+        /// Recovery-only: list the raw flat `<root>/<identity>` box without catalog resolution.
+        #[arg(long)]
+        orphan: bool,
         /// Print only the message count.
         #[arg(long)]
         count: bool,
@@ -1326,6 +1329,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Ls {
             identity,
             archive,
+            orphan,
             count,
             include_body,
             from,
@@ -1338,10 +1342,11 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(id) => id,
                 None => acting_id(&ctx)?,
             };
+            let dir = message::resolve_list_box(&root, &id, &host, archive, orphan)?;
             let mut msgs = if archive {
-                message::list_dir(&message::resolve_archive(&root, &id, &host))?
+                message::list_dir(&dir)?
             } else {
-                message::list_inbox(&message::resolve_inbox(&root, &id, &host))?
+                message::list_inbox(&dir)?
             };
             if let Some(sender) = &from {
                 msgs.retain(|m| m.from.as_deref() == Some(sender.as_str()));
