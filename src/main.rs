@@ -123,6 +123,9 @@ enum Command {
     /// Transactionally publish one canonical Agent Spec into the live catalog.
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// Canonical declaration snapshots and crash-recoverable whole-catalog application.
+    #[command(subcommand)]
+    Catalog(CatalogCmd),
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
     /// tasks (stopping/crashing st2 never does). Idempotent.
     Down {
@@ -248,6 +251,28 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AgentCmd {
+    /// Compute the authoritative digest bound by `agent publish --input-sha256`.
+    Digest {
+        /// A canonical KDL file containing exactly one top-level `agent` node.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        spec: Option<PathBuf>,
+        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "spec",
+            conflicts_with = "spec"
+        )]
+        bundle: Option<PathBuf>,
+        /// Emit the typed source-digest receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Publish exactly one explicit-host, explicit-identity agent under a catalog-wide CAS lock.
     Publish {
         /// A canonical KDL file containing exactly one top-level `agent` node.
@@ -281,7 +306,48 @@ enum AgentCmd {
             conflicts_with = "expect_absent"
         )]
         expect_sha256: Option<String>,
+        /// SHA-256 returned by `st2 agent digest` for the exact source capability.
+        #[arg(long, value_name = "HEX")]
+        input_sha256: String,
         /// Emit the typed publication result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCmd {
+    /// Capture the coherent declaration plane into a create-only canonical directory.
+    Snapshot {
+        /// Destination directory. It must be outside the live catalog.
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+        /// Emit the typed snapshot receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a complete canonical declaration directory under declaration-root CAS.
+    Apply {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "resume",
+            conflicts_with = "resume"
+        )]
+        prepared: Option<PathBuf>,
+        /// Expected canonical declaration-root SHA-256 of the live catalog.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required_unless_present = "resume",
+            conflicts_with = "resume"
+        )]
+        expect_sha256: Option<String>,
+        /// Resume the durable incomplete marker and internal stage without the original source.
+        #[arg(long, conflicts_with_all = ["prepared", "expect_sha256"])]
+        resume: bool,
+        /// Emit the typed application receipt as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -579,6 +645,7 @@ fn main() -> Result<()> {
             bundle,
             expect_absent,
             expect_sha256,
+            input_sha256,
             json,
         }) => {
             let catalog = catalog_arg(None)?;
@@ -596,6 +663,7 @@ fn main() -> Result<()> {
                 catalog,
                 source,
                 expectation,
+                input_sha256,
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -608,6 +676,76 @@ fn main() -> Result<()> {
                     },
                     result.bus_id,
                     result.path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Agent(AgentCmd::Digest { spec, bundle, json }) => {
+            let source = match (spec, bundle) {
+                (Some(path), None) => st2::agent_publish::PublishSource::Spec(path),
+                (None, Some(path)) => st2::agent_publish::PublishSource::Bundle(path),
+                _ => unreachable!("clap enforces one source"),
+            };
+            let digest = st2::agent_publish::digest_source(source)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&digest)?);
+            } else {
+                println!("{}", digest.sha256);
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Snapshot { output, json }) => {
+            let result =
+                st2::catalog_transaction::snapshot(st2::catalog_transaction::SnapshotRequest {
+                    catalog: catalog_arg(None)?,
+                    output,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {} {}",
+                    match result.status {
+                        st2::catalog_transaction::SnapshotStatus::Created => "created",
+                        st2::catalog_transaction::SnapshotStatus::Unchanged => "unchanged",
+                    },
+                    result.root_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Apply {
+            prepared,
+            expect_sha256,
+            resume,
+            json,
+        }) => {
+            let mode = if resume {
+                st2::catalog_transaction::ApplyMode::Resume
+            } else {
+                let prepared = prepared.context("clap requires --prepared unless --resume")?;
+                let expect_sha256 =
+                    expect_sha256.context("clap requires --expect-sha256 unless --resume")?;
+                st2::catalog_transaction::ApplyMode::Prepared {
+                    prepared,
+                    expect_sha256,
+                }
+            };
+            let result = st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
+                catalog: catalog_arg(None)?,
+                mode,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {}",
+                    match result.status {
+                        st2::catalog_transaction::ApplyStatus::Applied => "applied",
+                        st2::catalog_transaction::ApplyStatus::Unchanged => "unchanged",
+                    },
+                    result.after_sha256
                 );
             }
             Ok(())
@@ -1208,7 +1346,7 @@ fn ding_cmd(
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
         .unwrap_or_else(|| catalog_root.join(&id));
-    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
+    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
@@ -1284,7 +1422,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
+            let dir = message::resolve_inbox(&root, &to, &host)?;
             let filename = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1304,7 +1442,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
-            let my_inbox = message::resolve_inbox(&root, &from, &host);
+            let my_inbox = message::resolve_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
@@ -1313,7 +1451,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
+            let dir = message::resolve_inbox(&root, &to, &host)?;
             let sent = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1392,7 +1530,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 message::resolve_archive(&root, &id, &host)
             } else {
                 message::resolve_inbox(&root, &id, &host)
-            };
+            }?;
             if raw {
                 print!("{}", std::fs::read_to_string(dir.join(&filename))?);
                 return Ok(());
@@ -1419,11 +1557,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            message::archive_msg(
-                &message::resolve_inbox(&root, &id, &host),
-                &message::resolve_archive(&root, &id, &host),
-                &filename,
-            )?;
+            let inbox = message::resolve_inbox(&root, &id, &host)?;
+            let archive = message::resolve_archive(&root, &id, &host)?;
+            message::archive_msg(&inbox, &archive, &filename)?;
             println!("archived");
             Ok(())
         }

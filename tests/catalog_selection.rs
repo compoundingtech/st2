@@ -6,6 +6,8 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use sha2::{Digest as _, Sha256};
+
 fn write_agent(catalog: &Path, host: &str, identity: &str) {
     let dir = catalog.join("agents").join(host).join(identity);
     fs::create_dir_all(&dir).unwrap();
@@ -118,12 +120,14 @@ fn agent_publish_can_target_only_the_global_catalog_flag() {
         "agent \"worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
     )
     .unwrap();
+    let input_sha256 = format!("{:x}", Sha256::digest(fs::read(&spec).unwrap()));
 
     let out = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(&catalog)
         .args(["agent", "publish", "--spec"])
         .arg(&spec)
+        .args(["--input-sha256", &input_sha256])
         .arg("--expect-absent")
         .output()
         .unwrap();

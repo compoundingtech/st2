@@ -240,6 +240,35 @@ pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
     }
 }
 
+/// Catalog-owned files read by this agent's `render { copy ... }` operations.
+///
+/// Absolute/external sources are deliberately absent: a declaration snapshot owns catalog bytes,
+/// not arbitrary workspace or host files. The returned paths are exact existing files; callers
+/// still decide which file kinds are admissible for their transaction.
+pub(crate) fn catalog_owned_render_inputs(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<Vec<PathBuf>> {
+    let plan = parse_plan(spec)?;
+    let env = render_env(root, spec, this_host);
+    let spec_dir = spec.path.parent().unwrap_or(root);
+    let mut inputs = BTreeSet::new();
+    for operation in plan.ops {
+        let RenderOp::Copy {
+            source: raw_source, ..
+        } = operation
+        else {
+            continue;
+        };
+        let resolved = source(root, spec_dir, &raw_source, &env)?;
+        if resolved.strip_prefix(root).is_ok() {
+            inputs.insert(resolved);
+        }
+    }
+    Ok(inputs.into_iter().collect())
+}
+
 fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
         ("CATALOG".to_string(), root.display().to_string()),

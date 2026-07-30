@@ -91,9 +91,11 @@ and the portable Agent Spec envelope in
 
 ## Transactional catalog authoring
 
+`st2 agent digest (--spec FILE | --bundle DIR)` captures a source through
+retained no-follow file descriptors and returns its authoritative digest.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
-(--expect-absent | --expect-sha256 HEX) --json` is the sole supported
-declaration writer. It accepts exactly one canonical KDL `agent` node with an
+--input-sha256 HEX (--expect-absent | --expect-sha256 HEX) --json` binds
+publication to that exact capture. It accepts exactly one canonical KDL `agent` node with an
 explicit, path-safe host and identity. st2 no longer exposes an intent compiler:
 external renderers own the transformation from human intent to exact Agent Spec
 bytes or a create-only publication bundle.
@@ -104,17 +106,71 @@ read/write transaction domain:
 ```text
 publisher (EX)  : snapshot input -> CAS -> full-catalog admission -> atomic publish + fsync
 reader (SH)     : discover -> materialize/observe -> plan -> execute
-state plane     : message | context | Resource | status                 (unlocked)
+bulk apply (EX) : root CAS -> durable stage+marker -> converge -> verify+clear
+state plane     : message | context | Resource | status                    (unlocked)
 ```
+
+The lock file is a persistent real inode: replacing or removing it would split
+the lock domain for a process that already has it open. Consequently, the first
+coherent declaration reader may initialize exactly `.st2` and this lock even
+when its requested operation later refuses. Refusal still performs no
+declaration, workspace, or state mutation.
 
 The publisher derives the destination from the captured declaration, replaces
 only `agent.kdl` for a hash-authorized update, and preserves all sibling runtime
 state. A bundle is create-only and is renamed from a hidden same-filesystem
 stage; retry reports `unchanged` only when every projected bundle file already
 matches. `--expect-absent` is idempotent for identical input.
-`--expect-sha256` rejects a stale writer. Full-catalog admission rejects any
+`--input-sha256` rejects a caller/source swap and `--expect-sha256` rejects a
+stale declaration writer. Full-catalog admission rejects any
 structural validation error before publication. The typed result is
 `published` or `unchanged`.
+
+`st2 catalog snapshot --catalog ROOT --output DIR --json` holds SH while it
+captures the canonical declaration projection: `catalog.kdl`, exact
+`agents/<host>/<identity>/agent.kdl` files, static files inside those bounded
+agent bundles, and every regular file in `_templates` whether or not a current
+render references it. `_templates` is bounded to depth 8 below its root, 256
+files, 1 MiB per file, and 32 MiB total; symlinks, hard links, special nodes,
+and reserved control/state names are rejected. Runtime state, `.git`, `.st2`,
+the native `pty` registry, and workspace content are excluded. A
+catalog-contained Agent `workspace` or Task `cwd` is valid only when it names
+that agent bundle's canonical real `.workspace`; the empty directory itself is
+an exact declaration fact, while its descendants are never traversed. The
+classification uses launch-equivalent variable expansion, resolves relative
+values from the Agent Spec bundle, and lexically normalizes before comparing
+against the logical catalog. A relative spelling is accepted only when it
+normalizes to that bundle's canonical `.workspace`; unresolved variables and
+every other effective relative path fail closed. The
+scanner always excludes a canonical `.workspace` subtree, including an orphan
+left after an agent move or removal. External workspaces remain valid and are
+not part of the projection. The output is a create-only durable directory; an
+identical retry is `unchanged`. Its domain-separated, path-sorted root SHA-256
+covers normalized relative paths, file bytes, executable bits, and empty
+workspace directory facts.
+
+`st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
+rejects any prepared state/control path, symlink, special node, unprojected
+file/directory, malformed declaration, nonempty prepared workspace fact,
+catalog-local/default PTY root, or effective PTY-root change. Hash-CAS captures
+and validates exact prepared bytes, takes EX, rechecks the canonical live root,
+and either reports `unchanged` for exact equality or creates a durable
+content-addressed stage before publishing the marker. Version 1 requires an
+explicit PTY root outside the canonical catalog. Fresh bootstrap is a separate
+cross-producer transaction because catalog EX cannot reserve a PTY registry
+against external producers. Hash-CAS permits declared live workspace facts and
+their real ancestry to contain content. It changes
+declaration leaves only; desired workspace facts must already exist, and
+workspace content and canonical state are never traversed, deleted, or hashed.
+When an identity path is absent, its complete bundle uses an exclusive
+directory rename. When its declared workspace skeleton already exists, the
+durable marker fences declaration readers and marker-time state routing until
+every declaration leaf has been published and verified. Applied leaves and
+their parents are fsynced, the live root is re-hashed and fully admitted, then
+the marker is unlinked and `.st2` is fsynced.
+The catalog parent is fsynced when `.st2` is first created, including the
+concurrent create/observe race. Retained source capture rejects a staging
+destination contained by its source before enumerating that source.
 
 The lock file is never removed: replacing its inode would split the transaction
 domain for processes that already hold it open. Reconciliation holds SH from
@@ -128,7 +184,7 @@ transaction fence. Any presence is authoritative, including malformed content.
 The reserved canonical record is:
 
 ```json
-{"schema":"st2.catalog-apply-incomplete.v1","desiredStorePath":"/nix/store/..."}
+{"schema":"st2.catalog-apply-incomplete.v1","stageName":"catalog-apply-stage-<prepared-root-sha256>","expectedRootSha256":"<previous-root-sha256>","preparedRootSha256":"<prepared-root-sha256>","originalPaths":["<sorted-owned-declaration-leaf>", "..."]}
 ```
 
 After taking its authoring lock, st2 refuses publication, validation,
@@ -136,10 +192,21 @@ materialization, teardown, roster, doctor, and catalog listing while the marker
 exists. One-shot and selected reconcile fail explicitly. A resident supervisor
 instead remains alive, reports a skipped/incomplete pass, and performs no
 runtime observation or lifecycle action, avoiding a service restart storm.
-Message, context, Resource, and status operations remain available. The future
-whole-catalog apply command owns marker creation, admission, durable apply,
-verification, and clearing inside one transaction; external lock execution and
-bypass flags are not part of the contract.
+Message, context, Resource, and status operations remain available. While the
+marker exists they resolve canonical state independently of live declaration
+discovery; an existing state-only orphan remains addressable, an incomplete new
+identity does not fall back to a flat bus. A dotted bare identity is tried as
+the complete local identity alongside every possible qualified bus-address
+split; exactly one distinct canonical address must exist. Only real state
+directories and a real regular status file can establish marker-time
+addressability. Only `catalog apply --resume --catalog ROOT --json` may open an
+existing marker. The closed marker and internal content-addressed stage are
+sufficient recovery authority; the original prepared path and CAS precondition are
+neither required nor consulted. Marker authority proves the original
+precondition already passed, so recovery converges the partial live tree from
+the durable desired stage and original owned-leaf list without re-enforcing
+that stale precondition. Malformed or mismatched records remain fenced.
+External lock execution and bypass flags are not part of the contract.
 
 ## Host-local scheduling and supervision
 

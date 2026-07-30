@@ -134,3 +134,18 @@ accepted.
   but performs zero lifecycle actions until the transaction is completed.
   Presence, messages, context, and Resource state remain independently writable
   and are never serialized behind catalog authoring.
+  A caller binds single-agent publication to the exact no-follow source capture
+  with an authoritative input digest. A canonical whole-catalog snapshot
+  externalizes the declaration-root digest while excluding runtime state and
+  workspace content. Its closed projection includes every regular file in a
+  bounded `_templates` library and exact declared canonical workspace directory
+  facts. Whole-catalog apply accepts only that projection, rechecks the root
+  digest under the exclusive lock, durably stages the desired bytes, and resumes
+  after interruption solely from a closed marker and its content-addressed
+  stage. Version 1 requires one explicit external PTY root and rejects effective
+  PTY-root changes. Fresh-catalog bootstrap is a separate cross-producer
+  transaction, not a catalog-apply mode. Apply never traverses, hashes, deletes,
+  or relocates workspace or runtime state. An absent canonical identity becomes
+  visible only as a complete bundle; a preexisting declared workspace skeleton
+  remains safe because the durable marker fences declaration readers and
+  marker-time state routing throughout leaf publication and verification.

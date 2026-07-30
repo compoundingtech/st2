@@ -8,6 +8,7 @@ pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
 pub mod catalog_lock;
+pub mod catalog_transaction;
 pub mod context;
 pub mod ding;
 pub mod eval_run;

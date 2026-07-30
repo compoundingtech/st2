@@ -1,12 +1,9 @@
 //! Transactional publication of one canonical Agent Spec into a live catalog.
 
-use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read as _, Write};
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use agent_spec::discovery::parse_declared;
@@ -16,8 +13,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::catalog_lock::CatalogLock;
+use crate::catalog_transaction::{rename_noreplace, sync_dir};
 
 const SCHEMA: &str = "st2.agent-publish.v1";
+const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
+const BUNDLE_DIGEST_DOMAIN: &[u8] = b"st2.agent-publish-bundle.v1\0";
 
 #[derive(Debug, Clone)]
 pub enum PublishSource {
@@ -36,6 +36,7 @@ pub struct PublishRequest {
     pub catalog: PathBuf,
     pub source: PublishSource,
     pub expectation: PublishExpectation,
+    pub input_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -52,6 +53,7 @@ pub struct PublishResult {
     pub status: PublishStatus,
     pub bus_id: String,
     pub path: PathBuf,
+    pub input_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_sha256: Option<String>,
     pub after_sha256: String,
@@ -70,39 +72,53 @@ struct Candidate {
     bytes: Vec<u8>,
     host: String,
     identity: String,
+    input_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Spec,
+    Bundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceDigest {
+    pub schema: &'static str,
+    pub kind: SourceKind,
+    pub sha256: String,
 }
 
 impl Candidate {
     fn stage(catalog: &Path, source: PublishSource) -> Result<Self> {
         let control = catalog.join(crate::catalog_lock::CONTROL_DIR);
+        Self::stage_in(&control, source)
+    }
+
+    fn stage_in(parent: &Path, source: PublishSource) -> Result<Self> {
         let stage = tempfile::Builder::new()
             .prefix("agent-publish-")
-            .tempdir_in(&control)
-            .with_context(|| format!("stage publication in {}", control.display()))?;
+            .tempdir_in(parent)
+            .with_context(|| format!("stage publication in {}", parent.display()))?;
         let kind = match &source {
             PublishSource::Spec(path) => {
-                let metadata = fs::symlink_metadata(path)
-                    .with_context(|| format!("read candidate spec {}", path.display()))?;
+                let mut input = open_regular_nofollow(path)
+                    .with_context(|| format!("open candidate spec {}", path.display()))?;
+                let metadata = input.metadata()?;
                 anyhow::ensure!(
-                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    metadata.is_file(),
                     "candidate spec is not a regular file: {}",
                     path.display()
                 );
-                let bytes = fs::read(path)
-                    .with_context(|| format!("read candidate spec {}", path.display()))?;
+                let mut bytes = Vec::new();
+                input.read_to_end(&mut bytes)?;
                 write_synced(&stage.path().join("agent.kdl"), &bytes)?;
                 CandidateKind::Spec
             }
             PublishSource::Bundle(path) => {
-                let metadata = fs::symlink_metadata(path)
-                    .with_context(|| format!("read bundle {}", path.display()))?;
-                anyhow::ensure!(
-                    metadata.is_dir() && !metadata.file_type().is_symlink(),
-                    "bundle is not a real directory: {}",
-                    path.display()
-                );
-                validate_bundle_tree(path)?;
-                copy_tree(path, stage.path(), true)?;
+                crate::catalog_transaction::capture_real_tree(path, stage.path())
+                    .with_context(|| format!("capture bundle {}", path.display()))?;
                 File::open(stage.path())?.sync_all()?;
                 CandidateKind::Bundle
             }
@@ -151,12 +167,17 @@ impl Candidate {
             .context("candidate must declare a non-empty explicit identity")?;
         validate_component("host", host)?;
         validate_component("identity", identity)?;
+        let input_sha256 = match kind {
+            CandidateKind::Spec => sha256(&bytes),
+            CandidateKind::Bundle => bundle_sha256(stage.path())?,
+        };
         Ok(Self {
             stage,
             kind,
             bytes,
             host: host.to_string(),
             identity: identity.to_string(),
+            input_sha256,
         })
     }
 
@@ -165,14 +186,34 @@ impl Candidate {
     }
 }
 
+pub fn digest_source(source: PublishSource) -> Result<SourceDigest> {
+    let parent = tempfile::tempdir().context("create source-digest staging root")?;
+    let candidate = Candidate::stage_in(parent.path(), source)?;
+    Ok(SourceDigest {
+        schema: DIGEST_SCHEMA,
+        kind: match candidate.kind {
+            CandidateKind::Spec => SourceKind::Spec,
+            CandidateKind::Bundle => SourceKind::Bundle,
+        },
+        sha256: candidate.input_sha256,
+    })
+}
+
 /// Publish one spec under the catalog's exclusive authoring lock.
 pub fn publish(request: PublishRequest) -> Result<PublishResult> {
+    validate_sha256(&request.input_sha256)?;
     let catalog = request
         .catalog
         .canonicalize()
         .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
     let _lock = CatalogLock::exclusive(&catalog)?;
     let candidate = Candidate::stage(&catalog, request.source)?;
+    anyhow::ensure!(
+        candidate.input_sha256 == request.input_sha256,
+        "publication input precondition failed: expected sha256 {}, captured {}",
+        request.input_sha256,
+        candidate.input_sha256
+    );
     let target_dir = catalog
         .join("agents")
         .join(&candidate.host)
@@ -296,6 +337,7 @@ fn result(
         status,
         bus_id: candidate.bus_id(),
         path,
+        input_sha256: candidate.input_sha256.clone(),
         before_sha256,
         after_sha256,
     }
@@ -371,29 +413,8 @@ fn validate_overlay(catalog: &Path, candidate: &Candidate) -> Result<()> {
         CandidateKind::Bundle => overlay_tree(candidate.stage.path(), &target)?,
     }
 
-    let found = crate::discovery::discover(shadow.path());
-    let hosts: BTreeSet<_> = found
-        .specs
-        .iter()
-        .filter_map(|spec| spec.host.clone())
-        .collect();
-    let mut errors = BTreeSet::new();
-    for host in hosts {
-        let report = crate::validate::validate_for_host(shadow.path(), &host);
-        errors.extend(
-            report
-                .issues
-                .iter()
-                .filter(|issue| issue.severity == crate::validate::Severity::Error)
-                .map(|issue| format!("{} [{}]: {}", issue.path, issue.code, issue.message)),
-        );
-    }
-    anyhow::ensure!(
-        errors.is_empty(),
-        "candidate fails full-catalog validation:\n{}",
-        errors.into_iter().collect::<Vec<_>>().join("\n")
-    );
-    Ok(())
+    crate::catalog_transaction::validate_full_catalog(shadow.path())
+        .context("candidate fails full-catalog validation")
 }
 
 fn copy_filtered_catalog(
@@ -479,20 +500,44 @@ fn overlay_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_bundle_tree(root: &Path) -> Result<()> {
-    anyhow::ensure!(
-        root.join("agent.kdl").is_file(),
-        "bundle must contain agent.kdl at its root"
-    );
-    for entry in fs::read_dir(root).with_context(|| format!("read bundle {}", root.display()))? {
-        let path = entry?.path();
+fn open_regular_nofollow(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open regular file {}", path.display()))
+}
+
+fn bundle_sha256(root: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(BUNDLE_DIGEST_DOMAIN);
+    hash_bundle_dir(root, root, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_bundle_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<()> {
+    for entry in sorted_entries(dir)? {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("bundle path is not UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            validate_bundle_tree_entries(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            hash_record(hasher, b'd', &relative, false, &[]);
+            hash_bundle_dir(root, &path, hasher)?;
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            hash_record(
+                hasher,
+                b'f',
+                &relative,
+                metadata.permissions().mode() & 0o111 != 0,
+                &fs::read(&path)?,
+            );
         } else {
-            anyhow::ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "bundle contains a non-regular entry: {}",
+            anyhow::bail!(
+                "staged bundle contains a symlink or special entry: {}",
                 path.display()
             );
         }
@@ -500,45 +545,19 @@ fn validate_bundle_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_bundle_tree_entries(root: &Path) -> Result<()> {
-    for entry in fs::read_dir(root).with_context(|| format!("read bundle {}", root.display()))? {
-        let path = entry?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            validate_bundle_tree_entries(&path)?;
-        } else {
-            anyhow::ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "bundle contains a non-regular entry: {}",
-                path.display()
-            );
-        }
-    }
-    Ok(())
+fn hash_record(hasher: &mut Sha256, kind: u8, path: &str, executable: bool, bytes: &[u8]) {
+    hasher.update([kind]);
+    hasher.update((path.len() as u64).to_be_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update([u8::from(executable)]);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
-fn copy_tree(source: &Path, destination: &Path, sync: bool) -> Result<()> {
-    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.is_dir() {
-            fs::create_dir(&to)?;
-            copy_tree(&from, &to, sync)?;
-            if sync {
-                File::open(&to)?.sync_all()?;
-            }
-        } else if metadata.is_file() {
-            fs::copy(&from, &to)?;
-            if sync {
-                OpenOptions::new().read(true).open(&to)?.sync_all()?;
-            }
-        } else {
-            anyhow::bail!("unsupported bundle entry type: {}", from.display());
-        }
-    }
-    Ok(())
+fn sorted_entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    Ok(entries)
 }
 
 fn ensure_real_dir_chain(catalog: &Path, target: &Path) -> Result<()> {
@@ -666,50 +685,6 @@ fn validate_existing_ancestry(catalog: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rename_noreplace(source: &Path, target: &Path) -> std::io::Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source contains NUL")
-    })?;
-    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target contains NUL")
-    })?;
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    let result = {
-        let _ = (source, target);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "atomic no-replace directory rename is unsupported on this platform",
-        ));
-    };
-
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -719,11 +694,4 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
-}
-
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("open directory {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("sync directory {}", path.display()))
 }
