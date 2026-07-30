@@ -71,11 +71,15 @@ wrong.
   restarts, tears down, or rewrites an unrelated task or agent.
 - **SPEC-R04 Keep metadata nondisruptive:** Role and Resource binding changes
   update observable declaration metadata. They do not stop, replace, or
-  relaunch a healthy task.
+  relaunch a healthy task. A committed Resource change visible to a preserved
+  live incarnation follows SPEC-R12; a role-only edit is not by itself a
+  material file or Resource change.
 - **SPEC-R05 Materialize without process churn:** A render delta is preflighted
   against the complete active local fleet, then applied idempotently. A
   conflict fails every affected owner before the first write. Successful
-  materialization does not itself restart a healthy task.
+  materialization does not itself restart a healthy task. When committed bytes
+  or Resources become visible to an already-running agent whose incarnation is
+  preserved, reconciliation follows SPEC-R12.
 - **SPEC-R06 Reconcile task-set deltas narrowly:** Adding one uniquely
   identified PTY or exec task launches only that missing child. Removing one
   from a complete valid current owner explicitly tears down only an old child
@@ -127,10 +131,29 @@ wrong.
   is proven, without synchronous all-host availability, CAS, or an external
   registry. Quiet status and true dry-run report `pending`, `refused`, or
   `completed`; removing the mapping before completion fails closed.
+- **SPEC-R12 Notify a surviving agent after a material change:** When one
+  successful reconcile transaction materially changes files or Resources
+  visible to an already-running agent without replacing or retiring that
+  incarnation, st2 persists one targeted event in that agent's inbox after the
+  write transaction commits, then attempts DING. The event has a stable
+  idempotency identifier and includes the agent identity, host, a host-local
+  desired-state or reconcile identifier available without CAS, affected target
+  paths but never contents or secrets, the change class, and whether follow-up
+  is required. One transaction is coalesced to one event per affected agent;
+  replay or duplicate delivery is harmless. A semantic no-op, unchanged render
+  bytes, a failed or rolled-back write, a periodic check, or replacement or
+  retirement of the old incarnation emits no such event. The inbox record is
+  the durable fact: DING failure neither removes it nor rolls back a successful
+  write. The running agent decides how to incorporate the change; notification
+  alone never forces restart. Notification paths are excluded from
+  materialization-triggered reconciliation so delivery cannot recursively
+  trigger itself. This is a quiet event boundary, not routine status narration,
+  and requires no harness, CAS, or external registry.
 
 ## Evidence boundary
 
 This draft is normative documentation only. After approval, a paired external
 field matrix must prove every row in [spec.md](./spec.md) against the public CLI
-and isolated PTY/exec state. Unit tests remain necessary source evidence but are
-not sufficient acceptance for this contract.
+and isolated PTY/exec state, including exact notification inclusion, exclusion,
+deduplication, DING-failure, and non-recursion cases. Unit tests remain
+necessary source evidence but are not sufficient acceptance for this contract.

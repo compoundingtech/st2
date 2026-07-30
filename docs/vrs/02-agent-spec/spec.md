@@ -44,9 +44,10 @@ normalized effects also remain equal.
 | Formatting, comments, KDL node order, map order | [KDL lowering](../../../crates/agent-spec/src/kdl_format.rs), [shared lowering](../../../crates/agent-spec/src/spec.rs) | If the complete normalized model and render plan are unchanged, the desired delta is `no-op` and authorizes no materialization or process-lifecycle action. Ordinary actual-state reconciliation may still discover and heal a separately absent/dead task. | Parsing is order-insensitive for agent env and maps; the resident watcher still treats a write as evidence and runs an ordinary pass. It does not yet publish a semantic-delta classification. |
 | Declaration path with explicit identity and host | [path/default resolution](../../../crates/agent-spec/src/discovery.rs), [cwd resolution and bus environment](../../../src/run.rs) | A move is a source-only no-op only when task IDs, resolved cwd/workspace, and state/resource anchors are unchanged. Otherwise classify the affected path or placement boundary explicitly. | Explicit identity plus host are path-independent. A moved file can still change fallback cwd or the declaration-relative state anchor, so unconditional path no-op is not implemented. |
 | Agent `type` | [job type model and lowering](../../../crates/agent-spec/src/spec.rs), [validation](../../../src/validate.rs) | Omitted and explicit `service` are equivalent. Any other value makes that owner scope invalid and authorizes no launch or destructive action in the unproven scope. | The normalized model supports only `service`, and `validate` reports other values. Lowering currently maps every raw value to `service`, so a caller that reconciles without a clean validation gate can still treat an invalid type as runnable. |
-| `role`, `resource` | [Agent Spec fields](../../../crates/agent-spec/src/spec.rs), [catalog inspection](../../../src/agents.rs) | Update observable declaration metadata. Do not change the launch fingerprint or churn a healthy task. | These fields do not drive the current ID-only adoption decision. Resource inspection exists. No general field-delta event/status surface exists. |
+| `role`, `resource` | [Agent Spec fields](../../../crates/agent-spec/src/spec.rs), [catalog inspection](../../../src/agents.rs) | Update observable declaration metadata. Do not change the launch fingerprint or churn a healthy task. If a committed Resource projection materially changes what a preserved live incarnation can observe, enqueue the targeted post-commit event below; a role-only edit is not itself a material file or Resource change. | These fields do not drive the current ID-only adoption decision. Resource inspection exists. No general field-delta event/status surface exists. |
 | Unknown `harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta`, or provider extension | [ignored KDL fields](../../../crates/agent-spec/src/kdl_format.rs), [runner model boundary](../../../crates/agent-spec/src/spec.rs) | Exclude ignored source from core semantic equality: core cannot compare it or wake a specialized consumer for it. A compiler/provider may observe its own input and lower a change into render, task-set, launch, or metadata fields; core acts only on that lowered delta. | Core parsing ignores these fields. Their effects become visible only after a provider lowers them into runner-normative fields or render operations. |
-| `render {}` operation, template bytes, resolved destination | [render parsing and execution](../../../src/materialize.rs), [full-pass gate](../../../src/run.rs) | Preflight all resolved claims against the complete active local fleet; reject incompatible shared ownership before any write; otherwise apply idempotently. Never restart a healthy task merely because workspace bytes changed. | Implemented for full and selected materialization, including complete-fleet conflict analysis and tracked-file safety. The watcher does not yet compute the smallest template dependency set described by root R13. |
+| `render {}` operation, template bytes, resolved destination | [render parsing and execution](../../../src/materialize.rs), [full-pass gate](../../../src/run.rs) | Preflight all resolved claims against the complete active local fleet; reject incompatible shared ownership before any write; otherwise apply idempotently. Never restart a healthy task merely because workspace bytes changed. After changed bytes commit for an already-running unchanged incarnation, persist the targeted event specified below and then attempt DING. | Implemented for full and selected materialization, including complete-fleet conflict analysis and tracked-file safety. The watcher does not yet compute the smallest template dependency set described by root R13, and successful changed writes do not yet enqueue a targeted reconciliation event. |
+| Successful in-place file or Resource transaction visible to a live agent | [materialization report](../../../src/materialize.rs), [message storage](../../../src/message.rs), [DING consumer](../../../src/ding/mod.rs) | After commit, coalesce one targeted durable inbox event per affected surviving agent, then attempt DING. Do not notify for no-op/unchanged bytes, failed or rolled-back writes, periodic checks, or an incarnation being replaced or retired. | Gap: materialization reports changed operations and inbox/DING transport exists independently, but reconciliation does not yet connect a committed material change to a targeted agent event. |
 | Add one explicit `pty`/`exec`, or add compact `ding` | [compact/explicit task lowering](../../../crates/agent-spec/src/spec.rs), [task-level reconcile](../../../src/reconcile.rs) | Launch only the uniquely missing child from desired bytes. Preserve every existing sibling PID/incarnation. | Implemented by task-ID reconciliation; generated compact DING is a normal derived exec task. |
 | Remove one explicit `pty`/`exec`, or remove compact `ding` | [discovery](../../../crates/agent-spec/src/discovery.rs), [task-level reconcile](../../../src/reconcile.rs), [PTY/exec runtime state](../../../src/run.rs) | A complete valid current owner plus ordinary host-local runtime metadata must attribute the old child to the exact catalog, host, owner, task ID, and current incarnation. Then tear down only that child. Legacy/unattributed records hold/refuse explicit recovery; no synced prior snapshot, tombstone, or CAS is required. | Gap: current reconciliation sees only current declarations, while runtime records do not yet provide the full ownership/incarnation proof, so a removed task becomes invisible and may remain running. |
 | Task `kind`, `command`/`argv`, resolved effective `cwd`, agent/task `env`, task `tags`, synthesized managed environment including supervisor routing | [normalized task fields](../../../crates/agent-spec/src/spec.rs), [effective task target](../../../src/reconcile.rs), [spawn construction](../../../src/run.rs) | Change the desired launch/backend fingerprint. Dead/absent launches use the latest desired definition. A healthy older or unproven incarnation remains alive and reports `drifted` or `unknown` until an explicit task-scoped replacement. A source-path edit that changes effective cwd also belongs here. | Gap tracked by [#40](https://github.com/compoundingtech/st2/issues/40): current reconciliation adopts any healthy matching task ID without a desired/observed fingerprint or incarnation binding. `run.rs` currently passes task tags as backend spawn arguments, so they cannot be classified as pure metadata. |
@@ -68,7 +69,8 @@ incarnation; a stale or absent binding is `unknown`, never converged.
 
 | Desired task | Actual task | Delta class | Normative action |
 | --- | --- | --- | --- |
-| unchanged active | healthy | source/metadata/render/policy no-op | adopt; materialize or update declaration state only when that class requires it |
+| unchanged active | healthy | source/metadata/policy no-op or unchanged render bytes | adopt; perform no write and emit no material-change event |
+| unchanged active | healthy | committed material in-place change | adopt; persist one coalesced targeted event after commit, then attempt DING without forcing restart |
 | active | absent | any launch definition | launch latest desired bytes once |
 | active | dead | `service` | retain diagnostics, reap eligible dead state, launch latest desired bytes once |
 | active | dead or absent | `adopt-only` | hold; do not reap or launch |
@@ -120,6 +122,49 @@ Core st2 does not currently parse or execute this mapping. The syntax above
 must not be treated as supported catalog input until a later runtime change and
 paired acceptance make it normative.
 
+## Targeted material-change notification
+
+This boundary applies only when a reconcile transaction commits a material
+change visible to an agent whose exact live incarnation remains in place. A
+successful changed `render {}` upsert is the primary case. After the write
+transaction commits, st2 must first persist one event in the affected agent's
+inbox and then attempt DING:
+
+```text
+commit changed targets -> persist targeted inbox event -> attempt DING
+```
+
+One transaction produces at most one event per affected agent, even when it
+changes multiple targets. The event carries:
+
+- a stable event/idempotency identifier for the logical committed transaction;
+- the affected agent identity and pinned host;
+- the available host-local desired-state or reconcile identifier, without a
+  CAS dependency;
+- affected render or Resource target paths, never file contents, rendered
+  bytes, environment values, credentials, or other secrets;
+- the normalized change class; and
+- whether the agent must perform follow-up.
+
+Retries and duplicate delivery reuse the stable event identity and are
+harmless. The inbox record is the durable delivery fact; DING is only the wake
+attempt. A failed DING leaves the event queued and never rolls back the already
+committed write. The live agent chooses when and how to incorporate the update,
+and st2 does not restart it merely to deliver the event.
+
+A semantic no-op, unchanged destination bytes, a failed or rolled-back write,
+a periodic audit with no material delta, and replacement or retirement of the
+old incarnation produce no event under this contract. Inbox creation and the
+delivery sidecar's own state remain supervisor no-ops, so an inbox beneath
+watched or materialized state cannot recursively start another reconciliation
+or notification transaction. This targeted post-commit edge replaces polling;
+it does not add routine narration to quiet status.
+
+Core st2 does not currently emit this reconciliation event. Runtime support and
+paired acceptance must prove changed-render inclusion, every exclusion above,
+one-event coalescing, duplicate idempotency, durable retention after DING
+failure, and absence of watcher recursion.
+
 ## Reporting and dry-run
 
 Before mutation, quiet status and true dry-run must expose, per affected task or
@@ -128,7 +173,8 @@ refused proof scope:
 - normalized desired task ID and pinned host;
 - changed field category, without leaking secret environment values;
 - action class: `no-op`, `materialize`, `launch`, `hold`, `adopt`,
-  `drifted`, `replace-required`, `teardown`, `migrate`, or `refuse`;
+  `notify-after-commit`, `drifted`, `replace-required`, `teardown`, `migrate`,
+  or `refuse`;
 - desired and observed launch-fingerprint identities and exact-incarnation
   binding state when available;
 - actionable refusal reasons.
@@ -168,7 +214,12 @@ machine-readable fingerprint state. A true no-write plan is tracked by
    for catalog root, PTY root, or another explicitly selected sensitive root.
    A future optional `moved` mapping may explicitly guide rename/re-address
    intent under SPEC-R11, but ordinary edits never infer it.
+6. **Post-commit notification:** A material transaction affecting a surviving
+   live incarnation produces one durable targeted inbox event after commit,
+   followed by a best-effort DING. No-op, failure, polling, replacement, and
+   retirement paths remain silent; notification never forces process churn.
 
 After these decisions and merge, external acceptance should execute a
 table-driven field matrix against both PTY and exec tasks, including compact
-DING, partitions, invalid snapshots, and unrelated-sibling identity proofs.
+DING, targeted material-change notification, partitions, invalid snapshots,
+and unrelated-sibling identity proofs.
