@@ -4,9 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Runtime compatibility gate: this is the smallest pty revision containing both the
-    # ambiguity-safe PID read and the single fleet-wide socket fallback budget.
-    pty.url = "github:compoundingtech/pty/6de78841e05ac5b9f4fbe844a71b6dfcc7c7f9a5";
+    # Runtime compatibility gate: reviewed coherent lifecycle baseline containing the
+    # ambiguity-safe PID read, EPERM handling, and single fleet-wide socket fallback budget.
+    pty.url = "github:compoundingtech/pty/afeb3b6234b7010b7db802fd029766ad17c14219";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -163,6 +163,8 @@
         checks.pty-fleet-contract = pkgs.runCommand "st2-pty-fleet-contract-${version}" {
           nativeBuildInputs = [
             pkgs.coreutils
+            pkgs.jq
+            pkgs.nodejs
             pty.packages.${system}.default
             st2
           ];
@@ -174,6 +176,16 @@
             'agent "gone" { host "contract"; retired #true; command "true" }' \
             > "$catalog/agents/contract/gone/agent.kdl"
 
+          # Run the exact packaged producer's deterministic fault seams. These prove EPERM avoids
+          # socket fallback and hundreds of indefinitely-hung ambiguous probes share one deadline.
+          test_config=$(mktemp --suffix=.mjs)
+          printf '%s\n' 'export default { test: {} }' > "$test_config"
+          node \
+            ${pty.packages.${system}.default}/lib/pty/node_modules/vitest/vitest.mjs \
+            run tests/list-liveness-budget.test.ts \
+            --config "$test_config" \
+            --root ${pty.packages.${system}.default}/lib/pty
+
           for fleet_size in 0 75 100 500; do
             root=$(mktemp -d)
             i=0
@@ -184,10 +196,16 @@
               i=$((i + 1))
             done
 
+            PTY_ROOT="$root" timeout 2s pty list --json > "pty-$fleet_size.json"
+            jq -e --argjson size "$fleet_size" \
+              'length == $size and all(.status == "running")' \
+              "pty-$fleet_size.json" >/dev/null
+
             PTY_ROOT="$root" timeout 2s \
               st2 doctor --catalog "$catalog" --host contract \
               > "doctor-$fleet_size.out"
-            grep -F 'contract.gone retirement complete' "doctor-$fleet_size.out" >/dev/null
+            grep -F 'contract.gone retirement complete' \
+              "doctor-$fleet_size.out" >/dev/null
           done
 
           touch $out
