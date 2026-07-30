@@ -5,6 +5,8 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 fn write(root: &Path, relative: &str, contents: &str) {
     let path = root.join(relative);
@@ -341,7 +343,7 @@ fn concurrent_cli_writers_serialize_without_losing_either_field() {
         &declaration("worker", None, "catalog"),
     );
     fs::create_dir(root.join(".st2")).unwrap();
-    let lock_path = root.join(".st2/presentation-authoring.lock");
+    let lock_path = root.join(".st2/catalog-authoring.lock");
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -396,7 +398,93 @@ fn concurrent_cli_writers_serialize_without_losing_either_field() {
 }
 
 #[test]
-fn presentation_lock_refuses_a_symlinked_control_directory() {
+fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("catalog");
+    let declaration_path = root.join("agents/h/worker/agent.kdl");
+    write(
+        &root,
+        "agents/h/worker/agent.kdl",
+        &declaration("worker", None, "catalog"),
+    );
+    fs::create_dir(root.join(".st2")).unwrap();
+    let lock_path = root.join(".st2/catalog-authoring.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let inode = fs::metadata(&lock_path).unwrap().ino();
+
+    let mut rename = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "rename",
+            "h.worker",
+            "Build owner",
+            "--host",
+            "h",
+            "--json",
+        ])
+        .env_remove("ST_AGENT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(rename.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let output = rename.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let candidate = temporary.path().join("candidate.kdl");
+    fs::copy(&declaration_path, &candidate).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let mut publish = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            root.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--expect-absent",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(publish.try_wait().unwrap().is_none());
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let output = publish.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(fs::metadata(lock_path).unwrap().ino(), inode);
+    assert!(
+        fs::read_to_string(declaration_path)
+            .unwrap()
+            .contains("name \"Build owner\"")
+    );
+}
+
+#[test]
+fn catalog_lock_refuses_a_symlinked_control_directory() {
     use std::os::unix::fs::symlink;
 
     let temporary = tempfile::tempdir().unwrap();
@@ -419,12 +507,12 @@ fn presentation_lock_refuses_a_symlinked_control_directory() {
     );
     assert!(!output.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["code"], "presentation-lock-failed");
-    assert!(!outside.join("presentation-authoring.lock").exists());
+    assert_eq!(receipt["code"], "catalog-lock-failed");
+    assert!(!outside.join("catalog-authoring.lock").exists());
 }
 
 #[test]
-fn presentation_lock_refuses_a_symlinked_lock_file() {
+fn catalog_lock_refuses_a_symlinked_lock_file() {
     use std::os::unix::fs::symlink;
 
     let temporary = tempfile::tempdir().unwrap();
@@ -438,7 +526,7 @@ fn presentation_lock_refuses_a_symlinked_lock_file() {
         "h/worker/agent.kdl",
         &declaration("worker", None, "catalog"),
     );
-    symlink(&outside, root.join(".st2/presentation-authoring.lock")).unwrap();
+    symlink(&outside, root.join(".st2/catalog-authoring.lock")).unwrap();
 
     let output = run(
         &root,
@@ -448,6 +536,6 @@ fn presentation_lock_refuses_a_symlinked_lock_file() {
     );
     assert!(!output.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["code"], "presentation-lock-failed");
+    assert_eq!(receipt["code"], "catalog-lock-failed");
     assert_eq!(fs::read_to_string(outside).unwrap(), "unchanged");
 }

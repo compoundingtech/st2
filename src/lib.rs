@@ -5,9 +5,10 @@
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
 pub mod agent_author;
+pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
-pub mod compile_agent;
+pub mod catalog_lock;
 pub mod context;
 pub mod ding;
 pub mod eval_run;
@@ -41,6 +42,7 @@ pub use agent_spec::spec::{
     AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
     parse_duration,
 };
+pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
