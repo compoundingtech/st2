@@ -122,3 +122,25 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+- **R23 Runner-owned stable launch identity:** Before child start, st2 derives
+  `ST_AGENT=<host.identity>` for every declared task; a matching authored value
+  is accepted, while a conflicting value is a validation error and is never
+  silently overwritten ([decision #64](https://github.com/compoundingtech/st2/issues/64)).
+  The canonical `pty "agent"` additionally receives `role=agent` for
+  compatibility, `run.role=coding-agent`, and
+  `agent.actor.path=<host.identity>`; matching authored tags are accepted and
+  conflicts fail validation ([decision #64](https://github.com/compoundingtech/st2/issues/64),
+  [current compact-form partial evidence](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/src/spec.rs#L624-L656)).
+  Compact `command`/`argv` and explicit canonical `pty "agent"` forms have the
+  same guarantees; sidecars receive `ST_AGENT` but none of the canonical-agent
+  PTY tags ([decision #64](https://github.com/compoundingtech/st2/issues/64),
+  [current env parsing](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/src/kdl_format.rs#L68-L105),
+  [current task lowering](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/src/spec.rs#L682-L715)).
+  Harness, provider, model, account, and other mutable runtime facts remain
+  outside stable identity ([decision #64](https://github.com/compoundingtech/st2/issues/64),
+  [render-agnostic boundary](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/validate.rs#L15-L16)).
+  An optional display name is mutable presentation metadata outside launch
+  identity. Changing or clearing it does not change `ST_AGENT`, bus paths, task
+  IDs, resource anchors, or the running process, and never restarts the agent
+  ([display-name decision #108](https://github.com/compoundingtech/st2/issues/108),
+  [current roster projection](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/agents.rs#L21-L47)).
