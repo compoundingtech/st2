@@ -306,6 +306,17 @@ enum AgentCmd {
         #[arg(long, conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
     },
+    /// Author retirement intent without moving source or claiming runtime completion.
+    Retire {
+        /// Exact `<host>.<identity>` bus identity.
+        identity: String,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
+        /// Legacy catalog override. Prefer global --catalog.
+        #[arg(long, conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+    },
 }
 
 /// Shared context for message subcommands: where the catalog is, who "I" am, and the local host.
@@ -703,6 +714,47 @@ fn agent_cmd(command: AgentCmd) -> Result<()> {
                             }
                         };
                         println!("{}: {action}", receipt.identity);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "result": "error",
+                                "code": error.code(),
+                                "identity": identity,
+                                "error": error.to_string(),
+                            })
+                        );
+                    }
+                    Err(error.into())
+                }
+            }
+        }
+        AgentCmd::Retire {
+            identity,
+            json,
+            root,
+        } => {
+            let root = catalog_arg(root)?;
+            let host = detect_host();
+            match st2::agent_author::retire_agent(&root, &identity, &host) {
+                Ok(receipt) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&receipt)?);
+                    } else {
+                        let action = match receipt.result {
+                            st2::agent_author::RetireOutcome::Authored => "retirement authored",
+                            st2::agent_author::RetireOutcome::Unchanged => {
+                                "retirement already authored"
+                            }
+                        };
+                        println!(
+                            "{}: {action}; runtime retirement not observed",
+                            receipt.identity
+                        );
                     }
                     Ok(())
                 }

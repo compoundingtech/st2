@@ -1,6 +1,12 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use st2::exec_backend::ExecBackend;
+use st2::host_lock::process_alive;
+use st2::{Runner, Session, TaskTarget};
 
 struct LiveChild(Child);
 
@@ -43,6 +49,62 @@ fn task_ids(root: &Path) -> Vec<String> {
         .flat_map(|launch| launch.tasks.iter())
         .map(|task| task.pty_id.clone())
         .collect()
+}
+
+struct ExecOnlyRunner {
+    backend: ExecBackend,
+    task_ids: Vec<String>,
+}
+
+impl ExecOnlyRunner {
+    fn new(state: &Path, catalog: &Path, task_ids: &[&str]) -> Self {
+        Self {
+            backend: ExecBackend::new(state.to_path_buf(), catalog.to_path_buf()),
+            task_ids: task_ids.iter().map(|value| (*value).to_string()).collect(),
+        }
+    }
+}
+
+impl Runner for ExecOnlyRunner {
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        self.backend.list()
+    }
+
+    fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
+        self.backend.spawn(target, spec_dir)
+    }
+
+    fn kill(&self, task_id: &str) -> anyhow::Result<()> {
+        self.backend.kill(task_id)
+    }
+
+    fn reap_for_restart(&self, task_id: &str) -> anyhow::Result<()> {
+        self.backend.reap_for_restart(task_id)
+    }
+
+    fn remove(&self, task_id: &str) -> anyhow::Result<()> {
+        self.backend.remove(task_id)
+    }
+}
+
+impl Drop for ExecOnlyRunner {
+    fn drop(&mut self) {
+        for task_id in &self.task_ids {
+            let _ = self.backend.kill(task_id);
+            let _ = self.backend.remove(task_id);
+        }
+    }
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    condition()
 }
 
 #[test]
@@ -222,4 +284,153 @@ fn cli_reports_ambiguous_missing_invalid_and_retired_remote_targets() {
         fs::read_to_string(root.join("remote/worker/name")).unwrap(),
         "Retired owner\n"
     );
+}
+
+#[test]
+fn cli_retirement_is_source_preserving_and_reports_runtime_as_unobserved() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let declaration = root.join("unusual/folder/seat.kdl");
+    let original = r#"// authored source
+agent "worker" {
+  host "h"
+  role "builder" // stays byte-identical
+  command "sleep 300"
+}
+"#;
+    write(root, "unusual/folder/seat.kdl", original);
+    write(root, "unusual/folder/status", "available\n");
+    write(root, "unusual/folder/resources/context/now.md", "durable\n");
+
+    let authored = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "agent",
+            "retire",
+            "h.worker",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        authored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&authored.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&authored.stdout).unwrap();
+    assert_eq!(receipt["result"], "authored");
+    assert_eq!(receipt["identity"], "h.worker");
+    assert_eq!(receipt["retired"], true);
+    assert_eq!(receipt["runtimeRetirement"], "not-observed");
+    assert_eq!(
+        fs::read_to_string(&declaration).unwrap(),
+        r#"// authored source
+agent "worker" {
+  host "h"
+  role "builder" // stays byte-identical
+  command "sleep 300"
+  retired #true
+}
+"#
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("unusual/folder/status")).unwrap(),
+        "available\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("unusual/folder/resources/context/now.md")).unwrap(),
+        "durable\n"
+    );
+    assert!(!root.join("exec").exists());
+
+    let unchanged = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "agent",
+            "retire",
+            "h.worker",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(unchanged.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unchanged.stdout).unwrap()["result"],
+        "unchanged"
+    );
+}
+
+#[test]
+fn retirement_tears_down_only_the_selected_live_task_and_never_relaunches_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "fleet.kdl",
+        r#"agent "one" {
+  host "h"
+  exec "task" { command "sleep 300" }
+}
+agent "two" {
+  host "h"
+  exec "task" { command "sleep 300" }
+}
+"#,
+    );
+    let state = temporary.path().join("exec-state");
+    let runner = ExecOnlyRunner::new(&state, root, &["h.one.task", "h.two.task"]);
+
+    let launched = st2::up_once(root, "h", &runner).unwrap();
+    assert!(launched.errors.is_empty(), "{:?}", launched.errors);
+    assert_eq!(launched.launched, ["h.one.task", "h.two.task"]);
+    let one_pid: i32 = fs::read_to_string(state.join("h.one.task.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let two_pid: i32 = fs::read_to_string(state.join("h.two.task.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(process_alive(one_pid));
+    assert!(process_alive(two_pid));
+
+    let receipt = st2::agent_author::retire_agent(root, "h.one", "h").unwrap();
+    assert_eq!(receipt.result, st2::agent_author::RetireOutcome::Authored);
+    assert_eq!(
+        receipt.runtime_retirement,
+        st2::agent_author::RuntimeRetirement::NotObserved
+    );
+    let torn_down = st2::up_once(root, "h", &runner).unwrap();
+    assert!(torn_down.errors.is_empty(), "{:?}", torn_down.errors);
+    assert_eq!(torn_down.torn_down, ["h.one.task"]);
+    assert!(torn_down.launched.is_empty());
+    assert!(wait_until(|| {
+        runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.pty_id == "h.one.task" && !session.alive)
+    }));
+    assert!(process_alive(two_pid), "unselected task was disrupted");
+
+    let cleanup = st2::up_once(root, "h", &runner).unwrap();
+    assert!(cleanup.errors.is_empty(), "{:?}", cleanup.errors);
+    assert_eq!(cleanup.gc, ["h.one.task"]);
+    assert!(cleanup.launched.is_empty());
+    assert!(!state.join("h.one.task.pid").exists());
+    assert_eq!(
+        fs::read_to_string(state.join("h.two.task.pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap(),
+        two_pid
+    );
+
+    let stable = st2::up_once(root, "h", &runner).unwrap();
+    assert!(stable.errors.is_empty(), "{:?}", stable.errors);
+    assert!(stable.launched.is_empty());
+    assert!(!state.join("h.one.task.pid").exists());
+    assert!(process_alive(two_pid));
 }
