@@ -45,6 +45,30 @@ renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/6
 and the portable Agent Spec envelope in
 [evals#41](https://github.com/compoundingtech/evals/issues/41).
 
+## Catalog hierarchy (R22)
+
+Discovery recursively considers non-dot-prefixed `*.kdl`, `*.toml`, and
+`*.json` files. Directory visibility is neutral: a leading dot does not hide a
+directory from discovery, validation, or declaration-event classification.
+For example, both `agents/.children/<host>/<identity>/agent.kdl` and
+`agents/.retired/<host>/<identity>/agent.kdl` are ordinary declaration paths.
+The latter has no implicit lifecycle behavior; only the declaration's
+`retired` field retires an agent.
+
+The excluded declaration namespaces are semantic and shared by discovery and
+watcher classification:
+
+| Namespace | Scope | Reason |
+| --- | --- | --- |
+| `.git`, `.st2` | any depth | version-control and st2-private state |
+| `pty` | catalog root only | task-runner registry |
+| `resources`, `archive`, `inbox` | any depth | agent runtime/resource state |
+
+Dot-prefixed files remain non-declaration inputs. Identity and host path
+defaults still use the declaration path's final directory suffix; explicit
+content retains precedence. Referenced `_templates/**` mutations remain a
+separate watcher input and are not declaration candidates.
+
 ## Host-local scheduling and supervision
 
 ```text
@@ -160,7 +184,7 @@ Watchers are deny-by-default. The classifier/action contract is:
 
 | Event | Minimal action |
 | --- | --- |
-| `agents/**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
+| discoverable `**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
 | referenced `_templates/**` mutation | converge dependent agents only |
 | inbox create/archive/remove | DING consumer only; supervisor no-op |
 | plan/resource/status mutation | specialized consumer only; supervisor no-op |

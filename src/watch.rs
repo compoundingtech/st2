@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
+use agent_spec::discovery::is_catalog_path_excluded;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 /// Watch a directory recursively, forwarding only events that can change reconciled state.
@@ -58,6 +59,9 @@ fn is_declaration_path(root: &Path, path: &Path) -> bool {
     ) {
         return true;
     }
+    if is_catalog_path_excluded(root, path) {
+        return false;
+    }
     path.file_name().and_then(|n| n.to_str()) == Some("agent.kdl")
 }
 
@@ -105,7 +109,27 @@ mod tests {
         ));
         assert!(is_declaration_path(
             root,
+            Path::new("/catalog/agents/.retired/hetz/old/agent.kdl")
+        ));
+        assert!(is_declaration_path(
+            root,
             Path::new("/catalog/_templates/base.kdl")
+        ));
+        assert!(is_declaration_path(
+            root,
+            Path::new("/catalog/_templates/resources/base.kdl")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            Path::new("/catalog/.git/agents/hetz/git-state/agent.kdl")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            Path::new("/catalog/.st2/agents/hetz/runner-state/agent.kdl")
+        ));
+        assert!(!is_declaration_path(
+            root,
+            Path::new("/catalog/agents/hetz/worker/resources/agent.kdl")
         ));
         assert!(!is_declaration_path(
             root,

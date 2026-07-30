@@ -822,14 +822,59 @@ fn nonexistent_root_yields_empty_not_error() {
 }
 
 #[test]
-fn hidden_runner_state_and_resources_are_ignored() {
+fn dot_prefixed_directories_are_ordinary_catalog_hierarchy() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/.retired/hetz/old/agent.kdl",
+        r#"agent "old" { host "hetz"; retired #true; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/.children/hetz/worker/agent.kdl",
+        r#"agent "worker" { host "hetz"; command "true" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(
+        found.errors.is_empty(),
+        "unexpected errors: {:?}",
+        found.errors
+    );
+    assert!(
+        found.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        found.warnings
+    );
+    assert_eq!(found.specs.len(), 2);
+    assert!(find(&found.specs, "old").retired);
+    assert_eq!(find(&found.specs, "worker").host.as_deref(), Some("hetz"));
+}
+
+#[test]
+fn explicit_runner_state_and_resources_are_ignored() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
         "agents/hetz/a/agent.toml",
         "identity=\"a\"\n[pty.agent]\ncommand=\"x\"\n",
     );
-    // dot-prefixed runner state (R03) + a resource message — neither is a spec.
+    write(
+        tmp.path(),
+        ".git/agents/hetz/git-state/agent.kdl",
+        r#"agent "git-state" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        ".st2/agents/hetz/runner-state/agent.kdl",
+        r#"agent "runner-state" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/hidden-file/.agent.kdl",
+        r#"agent "hidden-file" { host "hetz"; command "true" }"#,
+    );
+    // A lock file and a resource message are runtime state, not declarations.
     write(tmp.path(), ".st2.hetz.lock", "12345");
     write(
         tmp.path(),

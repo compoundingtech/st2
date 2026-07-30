@@ -32,6 +32,31 @@ pub struct SpecError {
 /// Extensions discovery will attempt to parse as specs.
 const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 
+/// Whether `path` belongs to an explicitly non-declaration catalog namespace.
+///
+/// Ordinary directory names, including dot-prefixed names, are catalog hierarchy. Exclusions are
+/// semantic: version-control and st2 state, the root PTY registry, and per-agent runtime resources.
+pub fn is_catalog_path_excluded(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .enumerate()
+        .any(|(index, name)| {
+            name == ".git"
+                || name == ".st2"
+                || (index == 0 && name == "pty")
+                || name == "resources"
+                || name == "archive"
+                || name == "inbox"
+        })
+}
+
 /// Walk `root` recursively and lower every agent spec found. Returns empty (no error) when `root`
 /// does not exist yet — a fresh, un-seeded folder is a valid state.
 pub fn discover(root: &Path) -> Discovered {
@@ -54,10 +79,10 @@ pub fn discover(root: &Path) -> Discovered {
     out
 }
 
-/// Recursively gather candidate spec files, skipping dotfiles/dotdirs (`.git`, hidden config), the
-/// top-level `pty/` runtime registry, and anything that isn't one of [`SPEC_EXTS`]. `pty` session
-/// metadata includes JSON that can resemble an agent spec; it is runner state, never catalog input.
-/// Unreadable directories are skipped, not fatal.
+/// Recursively gather candidate spec files, skipping dotfiles, explicit non-declaration namespaces,
+/// and anything that isn't one of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can
+/// resemble an agent spec; it is runner state, never catalog input. Unreadable directories are
+/// skipped, not fatal.
 fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -67,23 +92,17 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue; // skip hidden files and directories
-        }
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
         };
         if ft.is_dir() {
-            if path == root.join("pty")
-                || name == "resources"
-                || name == "archive"
-                || name == "inbox"
-            {
+            if is_catalog_path_excluded(root, &path) {
                 continue;
             }
             collect_spec_files(root, &path, acc);
         } else if ft.is_file()
+            && !name.starts_with('.')
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && SPEC_EXTS.contains(&ext)
         {

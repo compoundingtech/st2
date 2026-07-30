@@ -114,3 +114,8 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+- **R22 Directory visibility neutrality:** Catalog discovery, validation, and
+  watcher classification treat leading-dot directory names like any other
+  organizational hierarchy at arbitrary depth. Only explicitly named
+  runtime/internal namespaces are excluded, and directory names never assign
+  agent lifecycle state.

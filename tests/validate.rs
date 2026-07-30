@@ -65,6 +65,18 @@ fn opaque_resource_bindings_are_structurally_valid() {
 }
 
 #[test]
+fn a_dot_prefixed_catalog_hierarchy_is_clean() {
+    let c = catalog(&[(
+        "agents/.retired/hetz/old/agent.kdl",
+        r#"agent "old" { host "hetz"; retired #true; command "true" }"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+    assert_eq!(r.agents, 1);
+}
+
+#[test]
 fn an_invalid_resource_binding_is_a_parse_error() {
     let c = catalog(&[(
         "Silber/cos/agent.kdl",

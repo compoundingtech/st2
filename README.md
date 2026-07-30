@@ -100,6 +100,13 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
 `copy` under `$CATALOG/_templates`.
 
+You may add organizational prefixes, including dot-prefixed directories, before the conventional
+`<host>/<identity>` suffix. For example, `agents/.retired/<host>/<identity>/agent.kdl` is discovered
+normally, but `.retired` is only an organizational name: set `retired #true` in the declaration to
+retire the agent. st2 excludes only its explicit non-declaration namespaces (`.git`, `.st2`, the
+root `pty`, and `resources`, `archive`, or `inbox` trees); dot-prefixed declaration files remain
+ignored.
+
 The compact declaration shape is:
 
 ```kdl
