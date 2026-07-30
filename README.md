@@ -288,6 +288,7 @@ st2 message archive <filename>
 st2 agents --json --enrich
 st2 agent name <host.identity> "Display name"
 st2 agent name <host.identity> --clear
+st2 agent retire <host.identity>
 st2 context read --full
 ```
 
@@ -302,6 +303,11 @@ targets, and reports changed/unchanged/error receipts with `--json`. Setting or 
 name never changes the bus identity or task ID, reconciles work, or restarts a running task.
 Qualified remote and retired declarations remain authorable because this metadata has no runtime
 authority.
+
+`st2 agent retire` atomically authors `retired #true` in one exact canonical KDL declaration
+without moving its source folder or touching adjacent state. Its receipt reports only authored
+intent; it does not inspect or claim runtime teardown. A running supervisor observes the declaration
+and owns teardown, while a stopped supervisor is a valid authoring-only state.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
