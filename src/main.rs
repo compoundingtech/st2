@@ -69,6 +69,9 @@ enum Command {
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
     #[command(subcommand)]
     Message(MessageCmd),
+    /// Explicit authoring operations for one catalog agent.
+    #[command(subcommand)]
+    Agent(AgentCmd),
     /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
@@ -274,6 +277,34 @@ enum Command {
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Set or clear a mutable display name without changing identity or restarting work.
+    Name {
+        /// Exact bus identity, or a bare identity only when unique in the selected catalog.
+        identity: String,
+        /// One printable display-name line. Use --clear to remove the name.
+        #[arg(
+            value_name = "DISPLAY_NAME",
+            required_unless_present = "clear",
+            conflicts_with = "clear"
+        )]
+        display_name: Option<String>,
+        /// Remove the optional display name.
+        #[arg(long)]
+        clear: bool,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
+        /// Host used only to resolve declarations whose host is omitted.
+        #[arg(long)]
+        host: Option<String>,
+        /// Legacy catalog override. Prefer global --catalog.
+        #[arg(long, conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
     },
 }
 
@@ -552,6 +583,7 @@ fn main() -> Result<()> {
             up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Agent(cmd) => agent_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
@@ -634,6 +666,61 @@ fn main() -> Result<()> {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "st2", &mut std::io::stdout());
             Ok(())
+        }
+    }
+}
+
+fn agent_cmd(command: AgentCmd) -> Result<()> {
+    match command {
+        AgentCmd::Name {
+            identity,
+            display_name,
+            clear,
+            json,
+            host,
+            root,
+        } => {
+            let root = catalog_arg(root)?;
+            let host = host.unwrap_or_else(detect_host);
+            let requested = if clear { None } else { display_name.as_deref() };
+            match st2::agent_author::set_display_name(&root, &identity, &host, requested) {
+                Ok(receipt) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&receipt)?);
+                    } else {
+                        let action = match (receipt.result, receipt.name.as_deref()) {
+                            (st2::agent_author::AuthorOutcome::Changed, Some(name)) => {
+                                format!("display name set to {name:?}")
+                            }
+                            (st2::agent_author::AuthorOutcome::Changed, None) => {
+                                "display name cleared".to_string()
+                            }
+                            (st2::agent_author::AuthorOutcome::Unchanged, Some(name)) => {
+                                format!("display name already {name:?}")
+                            }
+                            (st2::agent_author::AuthorOutcome::Unchanged, None) => {
+                                "display name already clear".to_string()
+                            }
+                        };
+                        println!("{}: {action}", receipt.identity);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "result": "error",
+                                "code": error.code(),
+                                "identity": identity,
+                                "error": error.to_string(),
+                            })
+                        );
+                    }
+                    Err(error.into())
+                }
+            }
         }
     }
 }

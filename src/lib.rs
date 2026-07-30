@@ -4,6 +4,7 @@
 //! declared task running and delivers native messages. Harness-specific behavior stays explicit in
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
+pub mod agent_author;
 pub mod agents;
 pub mod catalog;
 pub mod compile_agent;

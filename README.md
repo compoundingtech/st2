@@ -286,6 +286,8 @@ st2 message read <filename>
 st2 message reply <filename> -m "Handled."
 st2 message archive <filename>
 st2 agents --json --enrich
+st2 agent name <host.identity> "Display name"
+st2 agent name <host.identity> --clear
 st2 context read --full
 ```
 
@@ -293,6 +295,13 @@ The roster includes retired declarations instead of silently conflating them wit
 presence. Both JSON shapes contain `retired` and the declaration's ordered `resources` descriptors;
 `--enrich` additionally supplies `lastActivity` and `inbox`. Human output leaves active rows
 unchanged and appends `[retired]` to a retired row.
+
+`st2 agent name` changes only the optional `<agent-dir>/name` presentation file. It resolves the
+Agent Spec's declared identity instead of trusting folder spelling, refuses missing or ambiguous
+targets, and reports changed/unchanged/error receipts with `--json`. Setting or clearing a display
+name never changes the bus identity or task ID, reconciles work, or restarts a running task.
+Qualified remote and retired declarations remain authorable because this metadata has no runtime
+authority.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
