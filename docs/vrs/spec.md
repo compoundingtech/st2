@@ -179,6 +179,36 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   closed instead of hanging reconciliation. The deadline is containment, not
   the mechanism for admitting a larger fleet.
 
+## Stable launch identity (R23)
+
+The accepted boundary is runner-owned: every declared task starts with
+`ST_AGENT=<host.identity>`, while only the canonical agent PTY starts with
+`role=agent`, `run.role=coding-agent`, and
+`agent.actor.path=<host.identity>`. Matching authored values are allowed;
+conflicts fail validation and are never silently overwritten. Compact and
+explicit canonical-agent forms are equivalent; sidecars receive `ST_AGENT` but
+none of those canonical-agent PTY tags. Mutable harness/provider/model/account
+facts remain outside this contract
+([decision #64](https://github.com/compoundingtech/st2/issues/64)).
+
+An optional display name is mutable presentation metadata, not stable routing
+or actor identity. Changing or clearing it leaves `ST_AGENT`, bus paths, task
+IDs, resource anchors, and the running process unchanged and does not restart
+the agent ([decision #108](https://github.com/compoundingtech/st2/issues/108)).
+The current roster already projects the adjacent `name` file on each read
+([roster source](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/agents.rs#L34-L47));
+#108 owns the explicit authoring surface without widening this identity
+contract.
+
+This is an accepted requirement with an implementation gap, not a description
+of current behavior:
+
+| Surface | Current evidence | Status against R23 |
+| --- | --- | --- |
+| Task environment | Agent-level authored environment currently cascades into compact and explicit tasks ([parser](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/src/kdl_format.rs#L68-L105), [executable proof](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/tests/discovery.rs#L127-L175)). Reconciliation derives `ST_SUPERVISOR` but otherwise transports authored task environment ([target construction](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/reconcile.rs#L262-L297)). | **Gap:** `ST_AGENT` is preserved when authored, but is not yet runner-derived or conflict-checked. |
+| Canonical PTY tags | Compact lowering currently adds only `role=agent`; an explicit `pty "agent"` keeps only authored tags ([compact lowering](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/src/spec.rs#L624-L656), [explicit task lowering](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/crates/agent-spec/src/spec.rs#L682-L715)). | **Gap:** explicit-form parity, `run.role`, `agent.actor.path`, and conflict checks are not implemented. |
+| Launch transport | The PTY runner passes resolved tags and environment at initial launch and persists the environment for restart ([PTY launch](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/run.rs#L188-L218), [tag transport](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/run.rs#L227-L264)); the exec runner passes the same task environment before spawn ([exec launch](https://github.com/compoundingtech/st2/blob/c6846f6239329f0803142afc06c15a07b93937c1/src/exec_backend.rs#L59-L121)). Authored `ST_AGENT` restart preservation is executable evidence, not derivation evidence ([#30 receipt](https://github.com/compoundingtech/st2/issues/30#issuecomment-5110670601)). | **Implemented substrate:** no new PTY feature or metadata protocol is required; derivation and validation remain the missing slice. |
+
 ## Message lifecycle
 
 ```text
