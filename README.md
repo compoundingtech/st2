@@ -192,6 +192,15 @@ st2 up --catalog "$CATALOG" --host <host> --once
 
 There is intentionally no resident macOS service path.
 
+For a shortest-path change to one exact task, render only its owning agent and reconcile only that
+task in a bounded pass:
+
+```sh
+st2 up --catalog "$CATALOG" --host <host> --once --task <host.agent.task>
+```
+
+Unknown, ambiguous, and wrong-host task selectors refuse before workspace writes or PTY inspection.
+
 `st2 doctor` accepts the absence of a live host lock as the normal manual/`--once` mode. For a
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the
 health check. A stale lock left by a dead supervisor is always a failure. The underlying

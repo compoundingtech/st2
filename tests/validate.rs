@@ -200,7 +200,7 @@ fn ls_marks_a_generated_ding_only_agent_as_unrendered() {
         .unwrap();
     assert!(output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("[UNRENDERED: no task command]"),
+        String::from_utf8_lossy(&output.stdout).contains("[UNRENDERED: no task launch]"),
         "stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );

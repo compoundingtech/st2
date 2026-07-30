@@ -564,6 +564,20 @@ pub struct UpReport {
 }
 
 impl UpReport {
+    fn absorb(&mut self, mut other: UpReport) {
+        self.skipped |= other.skipped;
+        self.launched.append(&mut other.launched);
+        self.torn_down.append(&mut other.torn_down);
+        self.gc.append(&mut other.gc);
+        self.deferred.append(&mut other.deferred);
+        self.flapping.append(&mut other.flapping);
+        self.crash_loops.append(&mut other.crash_loops);
+        self.adopted.append(&mut other.adopted);
+        self.other_host.append(&mut other.other_host);
+        self.unrunnable.append(&mut other.unrunnable);
+        self.warnings.append(&mut other.warnings);
+        self.errors.append(&mut other.errors);
+    }
     /// True when the pass actually changed something (or hit an error) — used to keep the loop's log
     /// quiet on no-op ticks.
     pub fn is_noteworthy(&self) -> bool {
@@ -943,6 +957,91 @@ pub fn up_once_specs(
     )
 }
 
+/// One bounded task-scoped pass over already-discovered specs. Selector resolution precedes any runner call.
+pub fn up_once_selected_specs(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
+        crate::hooks::verify_installed().map(|_| ())
+    })
+}
+
+/// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
+/// materialize only that owner and execute the selected plan.
+pub fn up_once_selected(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    let found = crate::discovery::discover(catalog_root);
+    let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+    let mut report = UpReport::default();
+    report.warnings.extend(found.warnings);
+    report.errors.extend(
+        found
+            .errors
+            .into_iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.message)),
+    );
+    let owner = owner.clone();
+    if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
+        && let Err(error) = crate::hooks::verify_installed()
+    {
+        report
+            .errors
+            .push(format!("verify lifecycle hooks: {error}"));
+        return Ok(report);
+    }
+    let materialized = crate::materialize::materialize_catalog(
+        catalog_root,
+        std::slice::from_ref(&owner),
+        this_host,
+    );
+    report.warnings.extend(materialized.warnings);
+    let owner_materialization_failed = !materialized.failed_agents.is_empty();
+    report.errors.extend(materialized.errors);
+    if owner_materialization_failed {
+        return Ok(report);
+    }
+    let execution = up_once_selected_specs_with_gates(
+        catalog_root,
+        &found.specs,
+        selector,
+        this_host,
+        runner,
+        || Ok(()),
+    )?;
+    report.absorb(execution);
+    Ok(report)
+}
+
+fn up_once_selected_specs_with_gates<V>(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+    verify_hooks: V,
+) -> anyhow::Result<UpReport>
+where
+    V: FnOnce() -> anyhow::Result<()>,
+{
+    crate::reconcile::resolve_task(specs, selector, this_host)?;
+    let sessions = runner
+        .list_sessions()
+        .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
+    let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
+    let mut report = UpReport::default();
+    gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
+    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    Ok(report)
+}
+
 /// Supervise an in-memory spec team: keep-alive + respawn on a timer, behaving exactly like
 /// [`up_loop`] over a catalog (same
 /// FlappingCap, LivenessDebounce, crash-loop surfacing, and "stop leaves sessions running"). Timer-only
@@ -1227,7 +1326,8 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::TaskKind;
+    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
@@ -1246,26 +1346,72 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    struct EmptyRunner;
+    struct GateRunner {
+        list_calls: Cell<usize>,
+    }
 
-    #[cfg(target_os = "linux")]
-    impl Runner for EmptyRunner {
+    impl Runner for GateRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            self.list_calls.set(self.list_calls.get() + 1);
             Ok(Vec::new())
         }
 
         fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot launch")
+            panic!("gate runner must not spawn")
         }
 
         fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot kill")
+            panic!("gate runner must not kill")
         }
 
         fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot remove")
+            panic!("gate runner must not remove")
         }
+    }
+
+    #[test]
+    fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
+        let spec = AgentSpec {
+            identity: "codex".into(),
+            host: None,
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            retired: false,
+            keep: false,
+            restart: None,
+            tasks: vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: Some("test.codex.agent".into()),
+                command: None,
+                argv: Some(vec!["$CATALOG/bin/codex".into(), "--version".into()]),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+            }],
+            path: "/tmp/spec.kdl".into(),
+        };
+        let runner = GateRunner {
+            list_calls: Cell::new(0),
+        };
+        let report = up_once_selected_specs_with_gates(
+            Path::new("/tmp"),
+            &[spec],
+            "test.codex.agent",
+            "test",
+            &runner,
+            || anyhow::bail!("stale receipt"),
+        )
+        .unwrap();
+        assert_eq!(runner.list_calls.get(), 1);
+        assert!(report.launched.is_empty());
+        assert!(report.errors.iter().any(|error| {
+            error.contains("stale receipt") && error.contains("launch suppressed")
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -1283,7 +1429,9 @@ mod tests {
             up_loop_until(
                 catalog.path(),
                 "test-host",
-                &EmptyRunner,
+                &GateRunner {
+                    list_calls: Cell::new(0),
+                },
                 Duration::from_secs(60),
                 &stop,
                 |_| passes += 1,
@@ -1301,8 +1449,6 @@ mod tests {
     //    destructively GC/relaunch a HEALTHY agent; a stable death must still be reaped ──────────────
 
     use crate::reconcile::Launch;
-    use agent_spec::spec::{AgentSpec, JobType};
-
     fn sess(id: &str, alive: bool) -> Session {
         Session {
             pty_id: id.to_string(),

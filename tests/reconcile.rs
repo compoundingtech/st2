@@ -3,8 +3,323 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use st2::reconcile::reconcile_selected;
+use st2::reconcile::resolve_task;
 use st2::spec::{AgentSpec, JobType, Task, TaskKind};
 use st2::{Session, reconcile};
+
+#[test]
+fn exact_task_selector_matrix() {
+    let specs = vec![
+        svc(
+            "a",
+            None,
+            vec![
+                task(TaskKind::Pty, "agent", None, Some("run")),
+                task(TaskKind::Exec, "ding", Some("host.a.ding"), Some("ding")),
+            ],
+        ),
+        svc(
+            "b",
+            None,
+            vec![task(
+                TaskKind::Pty,
+                "agent",
+                Some("host.a.agent"),
+                Some("other"),
+            )],
+        ),
+        svc(
+            "remote",
+            Some("other"),
+            vec![task(TaskKind::Pty, "agent", None, Some("remote"))],
+        ),
+    ];
+    let (_, selected, runtime) = resolve_task(&specs, "host.a.ding", "host").unwrap();
+    assert_eq!(selected.name, "ding");
+    assert_eq!(runtime, "host.a.ding");
+    assert!(resolve_task(&specs, "host.a.agent", "host").is_err()); // explicit-id collision is ambiguous
+    assert!(resolve_task(&specs, "a", "host").is_err());
+    assert!(resolve_task(&specs, "other.remote.agent", "host").is_err());
+    assert!(resolve_task(&specs, "host.a.missing", "host").is_err());
+}
+
+#[test]
+fn selector_derived_id_success() {
+    let s = vec![svc(
+        "plain",
+        None,
+        vec![task(TaskKind::Exec, "work", None, Some("cmd"))],
+    )];
+    let (owner, t, id) = resolve_task(&s, "host.plain.work", "host").unwrap();
+    assert_eq!(
+        (
+            owner.identity.as_str(),
+            t.name.as_str(),
+            t.command.as_deref(),
+            id.as_str()
+        ),
+        ("plain", "work", Some("cmd"), "host.plain.work")
+    );
+}
+
+#[test]
+fn selector_explicit_id_and_qualified_alias_return_explicit_runtime() {
+    let s = vec![svc(
+        "agent",
+        None,
+        vec![task(TaskKind::Exec, "work", Some("custom"), Some("cmd"))],
+    )];
+    for selector in ["custom", "host.agent.work"] {
+        let (o, t, id) = resolve_task(&s, selector, "host").unwrap();
+        assert_eq!(
+            (
+                o.identity.as_str(),
+                t.name.as_str(),
+                t.command.as_deref(),
+                id.as_str()
+            ),
+            ("agent", "work", Some("cmd"), "custom")
+        );
+    }
+}
+
+#[test]
+fn selector_agent_command_runtime_id_and_inputs_immutable() {
+    let s = vec![svc(
+        "agent",
+        None,
+        vec![task(
+            TaskKind::Pty,
+            "agent",
+            Some("host.agent"),
+            Some("run"),
+        )],
+    )];
+    let before = s.clone();
+    let (o, t, id) = resolve_task(&s, "host.agent", "host").unwrap();
+    assert_eq!(
+        (
+            o.identity.as_str(),
+            t.name.as_str(),
+            t.command.as_deref(),
+            id.as_str()
+        ),
+        ("agent", "agent", Some("run"), "host.agent")
+    );
+    assert_eq!(s, before);
+    assert!(resolve_task(&s, "host.missing", "host").is_err());
+    assert_eq!(s, before);
+}
+
+#[test]
+fn selected_reconcile_launches_missing_and_adopts_live_without_siblings() {
+    let specs = vec![
+        svc(
+            "a",
+            None,
+            vec![
+                task(TaskKind::Exec, "x", None, Some("a")),
+                task(TaskKind::Exec, "y", None, Some("b")),
+            ],
+        ),
+        svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))]),
+    ];
+    let plan = reconcile_selected(&specs, &[], "host", "host.a.x").unwrap();
+    assert_eq!(plan.launch.len(), 1);
+    assert_eq!(plan.launch[0].tasks.len(), 1);
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "host.a.x");
+    let plan2 = reconcile_selected(&specs, &[live("host.a.x"), live("host.a.y"), live("host.b.z")], "host", "host.a.x").unwrap();
+    assert!(plan2.launch.is_empty() && plan2.gc.is_empty() && plan2.teardown.is_empty());
+    assert_eq!(plan2.adopt.iter().map(|s| s.identity.as_str()).collect::<Vec<_>>(), vec!["a"]);
+}
+
+#[test]
+fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
+    let keep = svc(
+        "a",
+        None,
+        vec![{
+            let mut t = task(TaskKind::Exec, "x", None, Some("a"));
+            t.keep = true;
+            t
+        }],
+    );
+    let specs = [keep];
+    let p = reconcile_selected(
+        &specs,
+        &[Session {
+            pty_id: "host.a.x".into(),
+            alive: false,
+            exit_code: Some(7),
+        }],
+        "host",
+        "host.a.x",
+    )
+    .unwrap();
+    assert!(p.launch.is_empty() && p.gc.is_empty() && p.adopt.len() == 1);
+    let mut retired = svc(
+        "b",
+        None,
+        vec![{
+            let mut t = task(TaskKind::Exec, "x", None, Some("b"));
+            t.keep = true;
+            t
+        }],
+    );
+    retired.retired = true;
+    let specs = [retired];
+    let p = reconcile_selected(
+        &specs,
+        &[Session {
+            pty_id: "host.b.x".into(),
+            alive: false,
+            exit_code: Some(7),
+        }],
+        "host",
+        "host.b.x",
+    )
+    .unwrap();
+    assert!(p.teardown.is_empty() && p.gc.is_empty());
+}
+
+#[test]
+fn selected_reconcile_action_ids_are_exact_and_refusals_immutable() {
+    let specs = vec![
+        svc(
+            "a",
+            None,
+            vec![
+                task(TaskKind::Exec, "x", None, Some("a")),
+                task(TaskKind::Exec, "y", None, Some("b")),
+            ],
+        ),
+        svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))]),
+    ];
+    let sessions = vec![live("host.a.y"), live("host.b.z")];
+    let before = (specs.clone(), sessions.clone());
+    let p = reconcile_selected(&specs, &sessions, "host", "host.a.x").unwrap();
+    assert_eq!(
+        p.launch
+            .iter()
+            .flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec!["host.a.x"]
+    );
+    assert!(p.gc.is_empty() && p.teardown.is_empty());
+    assert!(reconcile_selected(&specs, &sessions, "host", "host.a.missing").is_err());
+    assert_eq!((specs, sessions), before);
+}
+
+#[test]
+fn selected_dead_non_keep_gc_and_relaunch_only_selected() {
+    let specs = vec![
+        svc(
+            "a",
+            None,
+            vec![
+                task(TaskKind::Exec, "x", None, Some("a")),
+                task(TaskKind::Exec, "y", None, Some("b")),
+            ],
+        ),
+        svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))]),
+    ];
+    let p = reconcile_selected(
+        &specs,
+        &[
+            Session {
+                pty_id: "host.a.x".into(),
+                alive: false,
+                exit_code: Some(1),
+            },
+            Session {
+                pty_id: "host.a.y".into(),
+                alive: false,
+                exit_code: Some(1),
+            },
+            Session {
+                pty_id: "host.b.z".into(),
+                alive: false,
+                exit_code: Some(1),
+            },
+        ],
+        "host",
+        "host.a.x",
+    )
+    .unwrap();
+    assert_eq!(p.gc, vec!["host.a.x"]);
+    assert_eq!(p.launch.iter().flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str())).collect::<Vec<_>>(), vec!["host.a.x"]);
+    assert!(p.teardown.is_empty());
+}
+#[test]
+fn selected_retired_live_tears_down_only_selected() {
+    let mut s = svc("a", None, vec![task(TaskKind::Exec, "x", None, Some("a")), task(TaskKind::Exec, "sib", None, Some("b"))]);
+    s.retired = true;
+    let specs = [s, svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))])];
+    let p = reconcile_selected(
+        &specs,
+        &[live("host.a.x"), live("host.a.sib"), live("host.b.z")],
+        "host",
+        "host.a.x",
+    )
+    .unwrap();
+    assert_eq!(p.teardown.iter().flat_map(|t| t.pty_ids.iter().map(String::as_str)).collect::<Vec<_>>(), vec!["host.a.x"]);
+    assert!(p.launch.is_empty() && p.gc.is_empty());
+}
+#[test]
+fn selected_refusals_ambiguous_and_unknown_preserve_inputs() {
+    let specs = vec![
+        svc(
+            "a",
+            None,
+            vec![task(TaskKind::Exec, "x", Some("dup"), Some("a"))],
+        ),
+        svc(
+            "b",
+            None,
+            vec![task(TaskKind::Exec, "y", Some("dup"), Some("b"))],
+        ),
+    ];
+    let sessions = vec![live("dup")];
+    let before = (specs.clone(), sessions.clone());
+    assert!(reconcile_selected(&specs, &sessions, "host", "dup").is_err());
+    assert!(reconcile_selected(&specs, &sessions, "host", "none").is_err());
+    assert_eq!((specs, sessions), before);
+}
+#[test]
+fn selected_unrunnable_is_runner_action_free() {
+    let specs = vec![svc("a", None, vec![task(TaskKind::Exec, "x", None, None)])];
+    let before = specs.clone();
+    let p = reconcile_selected(&specs, &[], "host", "host.a.x").unwrap();
+    assert!(p.launch.is_empty() && p.gc.is_empty() && p.teardown.is_empty());
+    assert_eq!(specs, before);
+}
+
+#[test]
+fn selector_rejects_duplicate_explicit_and_runtime_collision() {
+    let dup = vec![
+        svc(
+            "a",
+            None,
+            vec![task(TaskKind::Exec, "x", Some("dup"), Some("a"))],
+        ),
+        svc(
+            "b",
+            None,
+            vec![task(TaskKind::Exec, "y", Some("dup"), Some("b"))],
+        ),
+    ];
+    assert!(resolve_task(&dup, "dup", "host").is_err());
+    let collision = vec![
+        svc("a", None, vec![task(TaskKind::Exec, "x", None, Some("a"))]),
+        svc(
+            "b",
+            None,
+            vec![task(TaskKind::Exec, "y", Some("host.a.x"), Some("b"))],
+        ),
+    ];
+    assert!(resolve_task(&collision, "host.a.x", "host").is_err());
+}
 
 fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> Task {
     Task {
@@ -21,7 +336,13 @@ fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> 
     }
 }
 
-fn spec(identity: &str, host: Option<&str>, job_type: JobType, retired: bool, tasks: Vec<Task>) -> AgentSpec {
+fn spec(
+    identity: &str,
+    host: Option<&str>,
+    job_type: JobType,
+    retired: bool,
+    tasks: Vec<Task>,
+) -> AgentSpec {
     AgentSpec {
         identity: identity.to_string(),
         host: host.map(String::from),
@@ -33,7 +354,10 @@ fn spec(identity: &str, host: Option<&str>, job_type: JobType, retired: bool, ta
         keep: false,
         restart: None,
         tasks,
-        path: PathBuf::from(format!("/cat/agents/{}/{identity}/agent.kdl", host.unwrap_or("this"))),
+        path: PathBuf::from(format!(
+            "/cat/agents/{}/{identity}/agent.kdl",
+            host.unwrap_or("this")
+        )),
     }
 }
 
@@ -42,10 +366,18 @@ fn svc(identity: &str, host: Option<&str>, tasks: Vec<Task>) -> AgentSpec {
 }
 
 fn live(id: &str) -> Session {
-    Session { pty_id: id.to_string(), alive: true, exit_code: None }
+    Session {
+        pty_id: id.to_string(),
+        alive: true,
+        exit_code: None,
+    }
 }
 fn dead(id: &str) -> Session {
-    Session { pty_id: id.to_string(), alive: false, exit_code: None }
+    Session {
+        pty_id: id.to_string(),
+        alive: false,
+        exit_code: None,
+    }
 }
 
 const HOST: &str = "hetz";
@@ -56,8 +388,18 @@ fn fresh_service_launches_all_tasks_pty_and_exec() {
         "st2-claude",
         Some(HOST),
         vec![
-            task(TaskKind::Pty, "agent", Some("hetz.st2-claude"), Some("exec claude 'boot'")),
-            task(TaskKind::Exec, "ding", Some("hetz.st2.ding"), Some("st2 ding hetz.st2")),
+            task(
+                TaskKind::Pty,
+                "agent",
+                Some("hetz.st2-claude"),
+                Some("exec claude 'boot'"),
+            ),
+            task(
+                TaskKind::Exec,
+                "ding",
+                Some("hetz.st2.ding"),
+                Some("st2 ding hetz.st2"),
+            ),
         ],
     )];
     let plan = reconcile(&specs, &[], HOST);
@@ -102,7 +444,11 @@ fn one_dead_task_launches_only_the_missing_one() {
 
 #[test]
 fn exited_session_is_reaped_and_relaunched() {
-    let specs = vec![svc("a", Some(HOST), vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))])];
+    let specs = vec![svc(
+        "a",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+    )];
     let plan = reconcile(&specs, &[dead("hetz.a")], HOST);
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.gc, vec!["hetz.a"]); // reap the corpse, then respawn
@@ -136,8 +482,21 @@ fn retired_with_live_sessions_is_torn_down() {
 #[test]
 fn other_host_specs_are_skipped() {
     let specs = vec![
-        svc("here", Some(HOST), vec![task(TaskKind::Pty, "agent", Some("hetz.here"), Some("x"))]),
-        svc("there", Some("silber"), vec![task(TaskKind::Pty, "agent", Some("silber.there"), Some("y"))]),
+        svc(
+            "here",
+            Some(HOST),
+            vec![task(TaskKind::Pty, "agent", Some("hetz.here"), Some("x"))],
+        ),
+        svc(
+            "there",
+            Some("silber"),
+            vec![task(
+                TaskKind::Pty,
+                "agent",
+                Some("silber.there"),
+                Some("y"),
+            )],
+        ),
     ];
     let plan = reconcile(&specs, &[], HOST);
     assert_eq!(plan.launch.len(), 1);
@@ -148,7 +507,11 @@ fn other_host_specs_are_skipped() {
 
 #[test]
 fn host_none_defaults_to_this_host_with_fallback_id() {
-    let specs = vec![svc("local", None, vec![task(TaskKind::Pty, "agent", None, Some("x"))])];
+    let specs = vec![svc(
+        "local",
+        None,
+        vec![task(TaskKind::Pty, "agent", None, Some("x"))],
+    )];
     let plan = reconcile(&specs, &[], HOST);
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.local.agent"); // <bus_id>.<name>
@@ -156,7 +519,11 @@ fn host_none_defaults_to_this_host_with_fallback_id() {
 
 #[test]
 fn unrendered_job_without_commands_is_unrunnable() {
-    let specs = vec![svc("nr", Some(HOST), vec![task(TaskKind::Pty, "agent", None, None)])];
+    let specs = vec![svc(
+        "nr",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", None, None)],
+    )];
     let plan = reconcile(&specs, &[], HOST);
     assert!(plan.launch.is_empty());
     assert_eq!(plan.unrunnable.len(), 1);
@@ -179,12 +546,7 @@ fn generated_ding_only_job_is_unrunnable_and_does_not_launch() {
 
 #[test]
 fn generated_ding_launches_alongside_authored_work() {
-    let agent = task(
-        TaskKind::Pty,
-        "agent",
-        Some("hetz.runnable"),
-        Some("codex"),
-    );
+    let agent = task(TaskKind::Pty, "agent", Some("hetz.runnable"), Some("codex"));
     let mut ding = task(
         TaskKind::Exec,
         "ding",
@@ -215,10 +577,17 @@ fn agent_level_keep_pins_all_task_targets() {
 
 #[test]
 fn workspace_is_carried_into_task_targets_for_cwd_defaulting() {
-    let mut s = svc("w", Some(HOST), vec![task(TaskKind::Pty, "agent", Some("hetz.w"), Some("x"))]);
+    let mut s = svc(
+        "w",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", Some("hetz.w"), Some("x"))],
+    );
     s.workspace = Some("/repos/w".into());
     let plan = reconcile(std::slice::from_ref(&s), &[], HOST);
-    assert_eq!(plan.launch[0].tasks[0].workspace.as_deref(), Some("/repos/w"));
+    assert_eq!(
+        plan.launch[0].tasks[0].workspace.as_deref(),
+        Some("/repos/w")
+    );
 }
 
 #[test]

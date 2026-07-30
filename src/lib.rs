@@ -45,5 +45,5 @@ pub use host_lock::HostLock;
 pub use reconcile::{Launch, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
-    up_loop, up_loop_specs, up_once, up_once_specs,
+    up_loop, up_loop_specs, up_once, up_once_selected, up_once_selected_specs, up_once_specs,
 };

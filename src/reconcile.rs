@@ -89,6 +89,105 @@ pub struct ReconcilePlan<'a> {
     pub gc: Vec<String>,
 }
 
+/// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
+pub fn resolve_task<'a>(
+    specs: &'a [AgentSpec],
+    selector: &str,
+    this_host: &str,
+) -> anyhow::Result<(&'a AgentSpec, &'a crate::spec::Task, String)> {
+    let mut matches = Vec::new();
+    for spec in specs {
+        if spec.resolved_host(this_host) != this_host {
+            continue;
+        }
+        for task in &spec.tasks {
+            let runtime = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+            let qualified = format!("{}.{}", spec.bus_id(this_host), task.name);
+            if selector == runtime || selector == qualified {
+                matches.push((spec, task, runtime));
+            }
+        }
+    }
+    match matches.as_slice() {
+        [(spec, task, runtime)] => Ok((*spec, *task, runtime.clone())),
+        [] => anyhow::bail!("task selector {selector:?} did not resolve to one local task"),
+        _ => anyhow::bail!("task selector {selector:?} is ambiguous"),
+    }
+}
+
+/// Pure task-scoped plan: resolve first, then retain only the selected runtime target.
+pub fn reconcile_selected<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+    selector: &str,
+) -> anyhow::Result<ReconcilePlan<'a>> {
+    let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
+    let mut plan = ReconcilePlan::default();
+    let actual = sessions.iter().find(|s| s.pty_id == runtime);
+    if owner.retired {
+        if let Some(s) = actual {
+            if s.alive {
+                plan.teardown.push(Teardown {
+                    spec: owner,
+                    pty_ids: vec![runtime],
+                });
+            } else if !(task.keep || owner.keep) {
+                plan.gc.push(runtime);
+            }
+        }
+        return Ok(plan);
+    }
+    let launch = match (&task.command, &task.argv) {
+        (Some(command), None) => TaskLaunch::Shell(command.clone()),
+        (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
+        (None, None) => {
+            plan.unrunnable.push(owner);
+            return Ok(plan);
+        }
+        (Some(_), Some(_)) => {
+            unreachable!("discovery rejects tasks carrying both command and argv")
+        }
+    };
+    let bus_id = owner.bus_id(this_host);
+    let mut env = task.env.clone();
+    if let Some(supervisor) = &owner.supervisor {
+        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
+    } else {
+        env.remove("ST_SUPERVISOR");
+    }
+    let target = TaskTarget {
+        kind: task.kind,
+        pty_id: runtime.clone(),
+        bus_id,
+        name: task.name.clone(),
+        launch,
+        cwd: task.cwd.clone(),
+        workspace: owner.workspace.clone(),
+        tags: task.tags.clone(),
+        env,
+        keep: task.keep || owner.keep,
+    };
+    match actual {
+        Some(s) if s.alive || target.keep => plan.adopt.push(owner),
+        Some(_) => {
+            plan.gc.push(runtime);
+            plan.launch.push(Launch {
+                spec: owner,
+                tasks: vec![target],
+            });
+        }
+        _ => plan.launch.push(Launch {
+            spec: owner,
+            tasks: vec![target],
+        }),
+    }
+    Ok(plan)
+}
+
 /// The state of a declared task's session in the ACTUAL world.
 enum SessionState {
     Alive,
