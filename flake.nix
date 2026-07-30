@@ -4,8 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Runtime compatibility gate: reviewed coherent lifecycle baseline containing the
-    # ambiguity-safe PID read, EPERM handling, and single fleet-wide socket fallback budget.
+    # Packaged PTY fleet-observation gate: the exact `pty list --json` producer revision with
+    # ambiguity-safe PID reads, EPERM handling, and one fleet-wide socket fallback budget.
     pty.url = "github:compoundingtech/pty/afeb3b6234b7010b7db802fd029766ad17c14219";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -171,7 +171,7 @@
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
-        # output and a wedged child; this check proves the healthy 0/75/100/500-seat path crosses
+        # output and a wedged child; this check proves the healthy 0/75/100/500-session path crosses
         # both packaged binaries within st2's short outer deadline.
         checks.pty-fleet-contract = pkgs.runCommand "st2-pty-fleet-contract-${version}" {
           nativeBuildInputs = [
@@ -203,9 +203,9 @@
             root=$(mktemp -d)
             i=0
             while test "$i" -lt "$fleet_size"; do
-              seat=$(printf 'seat-%03d' "$i")
-              : > "$root/$seat.sock"
-              printf '%s\n' "$$" > "$root/$seat.pid"
+              session=$(printf 'session-%03d' "$i")
+              : > "$root/$session.sock"
+              printf '%s\n' "$$" > "$root/$session.pid"
               i=$((i + 1))
             done
 
