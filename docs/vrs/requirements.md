@@ -52,6 +52,18 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R22 Quiet, evented coordination:** A network using minimal or default
+  personas remains quiet while useful work proceeds. Agents coordinate only
+  when a real event requires it: an inbox DING, a durable failure, a true
+  blocker, a completion or decision handoff, or an explicitly declared named
+  schedule. Once admitted, coordination is vigilant and outcome-focused until
+  the need is cleared; chatty status loops and polling are not substitutes.
+  Ordinary supervisors are exception handlers for failures and truly blocked
+  work, not continuous managers of healthy work. An intentionally extended
+  supervisor persona may declare a higher coordination cadence; CoS is one
+  non-normative example, not a core role that st2 requires, types, or
+  standardizes. Transport loss never blocks host-local work that does not
+  require coordination.
 
 ### Must preserve delivery and launch behavior
 

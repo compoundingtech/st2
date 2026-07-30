@@ -180,6 +180,31 @@ positive declaration/template wakes, negative runtime/bus events, bounded
 discovery/materialization/PTY queries and writes, continuous-event starvation,
 and no-op desired-equals-actual behavior.
 
+## Quiet, evented coordination (R22)
+
+Useful work is silent by default. Presence, status, and durable plan state are
+inspectable facts, not invitations to send status messages or poll peers.
+Coordination begins only at an understandable event boundary:
+
+| Admitted event | Coordination obligation |
+| --- | --- |
+| unread inbox message | DING the recipient; process or hand off the request |
+| durable failure or true blocker | notify the responsible supervisor; diagnose, recover, or escalate until cleared |
+| completion or decision | hand the outcome to the agent or principal that needs it, then become quiet |
+| explicitly declared named schedule | perform that named coordination; do not emulate it with an ambient chat or polling loop |
+
+The inbox path follows the source contract in
+[DING requirements](./01-ding/requirements.md). A normal supervisor is an
+exception handler for failure and truly blocked work, not a continuous manager
+of healthy agents. An intentionally extended supervisor persona may declare a
+higher coordination cadence. CoS is one non-normative example only: st2 does not
+require or type that role, and R22 grants it no standardized authority.
+
+This boundary does not define the still-open schedule grammar in DQ1; it only
+requires a named declared event rather than an implicit loop. A transport
+partition may delay coordination, but it does not stop independent host-local
+work or create a global availability dependency.
+
 ## Targeted reconciliation (R19)
 
 `st2 up --materialize-only --task <host.agent.task>` resolves one exact local
