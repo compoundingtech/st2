@@ -548,6 +548,8 @@ pub struct UpReport {
     /// not-alive but was alive within the grace window, i.e. a transient `pty list` flicker under load,
     /// left alone rather than destructively reaped (R21c). Not "noteworthy" (it's a no-op by design).
     pub deferred: Vec<String>,
+    /// dead or absent adopt-only task ids held without reap or launch.
+    pub held: Vec<String>,
     /// pty ids the flapping-cap refused to (re)launch this pass (parked / crash-looping).
     pub flapping: Vec<String>,
     /// Rich crash-loop records (a superset of `flapping`) — the source for supervisor surfacing.
@@ -571,6 +573,7 @@ impl UpReport {
         self.torn_down.append(&mut other.torn_down);
         self.gc.append(&mut other.gc);
         self.deferred.append(&mut other.deferred);
+        self.held.append(&mut other.held);
         self.flapping.append(&mut other.flapping);
         self.crash_loops.append(&mut other.crash_loops);
         self.adopted.append(&mut other.adopted);
@@ -679,6 +682,7 @@ pub fn execute(
     report
         .adopted
         .extend(plan.adopt.iter().map(|s| s.identity.clone()));
+    report.held.extend(plan.held.iter().cloned());
     report
         .other_host
         .extend(plan.other_host.iter().map(|s| s.identity.clone()));
@@ -1327,7 +1331,7 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
+    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
     use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
@@ -1394,6 +1398,7 @@ mod tests {
                 tags: BTreeMap::new(),
                 env: BTreeMap::new(),
                 keep: false,
+                lifecycle: TaskLifecycle::Service,
             }],
             path: "/tmp/spec.kdl".into(),
         };

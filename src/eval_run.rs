@@ -16,7 +16,7 @@ use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
 use crate::reconcile::reconcile;
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
-use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
+use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 macro_rules! eval_log {
     ($($arg:tt)*) => {
@@ -71,6 +71,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 tags: ptags,
                 env: a.env.clone(),
                 keep: false,
+                lifecycle: TaskLifecycle::Service,
             });
             for ex in &a.execs {
                 tasks.push(Task {
@@ -84,6 +85,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                     tags: BTreeMap::new(),
                     env: ex.env.clone(),
                     keep: false,
+                    lifecycle: TaskLifecycle::Service,
                 });
             }
             AgentSpec {

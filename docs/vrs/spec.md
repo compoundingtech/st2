@@ -110,6 +110,13 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   binary, starts the control plane again, and proves adoption with the same
   agent PID/creation identity and no duplicate process.
 
+- **Adopt-only migration fence:** A compact agent or explicit task may declare
+  `lifecycle "adopt-only"`. Reconciliation adopts an already-live generation,
+  but classifies a dead or absent generation as `held` without garbage
+  collection or launch. Returning the declaration to the default `service`
+  lifecycle is the explicit authority to resume ordinary replacement.
+  `retired #true` remains the separate explicit teardown path.
+
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
   can share a single registry across catalogs. Resolution is an exported
