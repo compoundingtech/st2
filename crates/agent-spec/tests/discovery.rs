@@ -496,10 +496,7 @@ fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
   argv "true""#,
         ),
         ("empty-explicit", r#"pty "agent" { argv }"#),
-        (
-            "empty-program-explicit",
-            r#"pty "agent" { argv "" }"#,
-        ),
+        ("empty-program-explicit", r#"pty "agent" { argv "" }"#),
         (
             "both-explicit",
             r#"pty "agent" { command "true"; argv "true" }"#,
@@ -657,11 +654,10 @@ fn path_supplies_identity_and_host_when_content_omits_them() {
 }
 
 #[test]
-fn content_wins_over_path_and_mismatch_warns() {
+fn an_explicit_identity_with_an_implicit_host_keeps_the_path_warning() {
     let tmp = tempfile::tempdir().unwrap();
     let spec = r#"
 identity = "real-name"
-host     = "real-host"
 [pty.agent]
 command = "exec claude 'boot'"
 "#;
@@ -671,15 +667,61 @@ command = "exec claude 'boot'"
     assert!(found.errors.is_empty());
     let s = &found.specs[0];
     assert_eq!(s.identity, "real-name");
-    assert_eq!(s.host.as_deref(), Some("real-host"));
-    assert_eq!(found.warnings.len(), 2);
+    assert_eq!(s.host.as_deref(), Some("wrong-host"));
+    assert_eq!(found.warnings.len(), 1);
     assert!(
         found
             .warnings
             .iter()
             .any(|w| w.contains("identity mismatch"))
     );
+}
+
+#[test]
+fn an_explicit_host_with_an_implicit_identity_keeps_the_path_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = r#"
+host = "real-host"
+[pty.agent]
+command = "exec claude 'boot'"
+"#;
+    write(tmp.path(), "agents/wrong-host/path-name/agent.toml", spec);
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty());
+    let s = &found.specs[0];
+    assert_eq!(s.identity, "path-name");
+    assert_eq!(s.host.as_deref(), Some("real-host"));
+    assert_eq!(found.warnings.len(), 1);
     assert!(found.warnings.iter().any(|w| w.contains("host mismatch")));
+}
+
+#[test]
+fn an_explicit_identity_and_host_are_path_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rel = "teams/.managed/groups/archive/project/declaration/agent.kdl";
+    write(
+        tmp.path(),
+        rel,
+        r#"agent "stable-agent" { host "stable-host"; command "exec codex" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
+    assert!(found.warnings.is_empty(), "warnings: {:?}", found.warnings);
+    assert_eq!(found.specs.len(), 1);
+    let spec = &found.specs[0];
+    assert_eq!(spec.identity, "stable-agent");
+    assert_eq!(spec.host.as_deref(), Some("stable-host"));
+    assert_eq!(
+        spec.path.parent(),
+        Some(
+            tmp.path()
+                .join("teams/.managed/groups/archive/project/declaration")
+                .as_path()
+        ),
+        "the declaration parent remains the state/resource anchor"
+    );
 }
 
 #[test]
@@ -822,29 +864,64 @@ fn nonexistent_root_yields_empty_not_error() {
 }
 
 #[test]
-fn hidden_runner_state_and_resources_are_ignored() {
+fn only_contextually_reserved_namespaces_are_ignored() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/a/agent.toml",
-        "identity=\"a\"\n[pty.agent]\ncommand=\"x\"\n",
+        "agents/hetz/live/agent.kdl",
+        r#"agent "live" { host "hetz"; command "x" }"#,
     );
-    // dot-prefixed runner state (R03) + a resource message — neither is a spec.
-    write(tmp.path(), ".st2.hetz.lock", "12345");
-    write(
-        tmp.path(),
-        "agents/hetz/a/resources/inbox/1784-abc.md",
-        "a message",
-    );
-    // The canonical PTY_ROOT is `<catalog>/pty`. Its session JSON contains command/cwd fields and
-    // must never be mistaken for a catalog agent declaration.
-    write(
-        tmp.path(),
-        "pty/hetz.a.json",
-        r#"{"name":"hetz.a","status":"running","command":"sh -c x","cwd":"/tmp"}"#,
-    );
+    for (path, identity) in [
+        (".managed/team/agent.kdl", "managed"),
+        (".retired/team/agent.kdl", "dot-retired"),
+        ("agents/archive/project/agent.kdl", "archive-project"),
+        ("agents/resources/project/agent.kdl", "resources-project"),
+        ("agents/inbox/project/agent.kdl", "inbox-project"),
+    ] {
+        write(
+            tmp.path(),
+            path,
+            &format!(r#"agent "{identity}" {{ host "h"; command "x" }}"#),
+        );
+    }
+
+    for path in [
+        ".git/project/agent.kdl",
+        ".st2/project/agent.kdl",
+        "pty/project/agent.kdl",
+        "agents/hetz/live/resources/project/agent.kdl",
+        "agents/hetz/live/archive/project/agent.kdl",
+        "agents/hetz/live/inbox/project/agent.kdl",
+    ] {
+        write(
+            tmp.path(),
+            path,
+            r#"agent "excluded" { host "h"; command "x" }"#,
+        );
+    }
 
     let found = discover(tmp.path());
-    assert_eq!(found.specs.len(), 1);
-    assert_eq!(found.specs[0].identity, "a");
+    assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
+    assert_eq!(found.specs.len(), 6, "specs: {:?}", found.specs);
+    for identity in [
+        "live",
+        "managed",
+        "dot-retired",
+        "archive-project",
+        "resources-project",
+        "inbox-project",
+    ] {
+        assert!(
+            found.specs.iter().any(|spec| spec.identity == identity),
+            "{identity} must remain discoverable"
+        );
+    }
+    assert!(
+        !find(&found.specs, "dot-retired").retired,
+        "a .retired folder has no lifecycle meaning"
+    );
+    assert!(
+        found.specs.iter().all(|spec| spec.identity != "excluded"),
+        "reserved control/state namespaces must not become declarations"
+    );
 }

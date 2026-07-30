@@ -66,7 +66,14 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
 - **R01–R03:** Fleet validation separates structural errors from selected-host
   runtime facts. Materialization is inspectable and host reconciliation starts
-  only declarations pinned to the local host.
+  only declarations pinned to the local host. Discovery is recursive: an
+  explicit `identity` and `host` pair is authoritative independent of the
+  declaration's path, whose parent remains the state/resource anchor. When
+  either field is omitted, the path supplies defaults and mismatches remain
+  diagnostic. Dot-prefixed folders, including `.managed` and `.retired`, are
+  ordinary declaration space; only the catalog root's `.git`, `.st2`, and
+  `pty` children and a declaration parent's `resources`, `archive`, and `inbox`
+  children are excluded.
 - **R04:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads
@@ -160,7 +167,7 @@ Watchers are deny-by-default. The classifier/action contract is:
 
 | Event | Minimal action |
 | --- | --- |
-| `agents/**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
+| declaration-space `**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
 | referenced `_templates/**` mutation | converge dependent agents only |
 | inbox create/archive/remove | DING consumer only; supervisor no-op |
 | plan/resource/status mutation | specialized consumer only; supervisor no-op |

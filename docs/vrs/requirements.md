@@ -33,8 +33,15 @@ accepted.
 
 - **R01 Agent-spec compliance:** st2 validates and implements every agent-spec
   capability it claims to support, and identifies unsupported capabilities.
-- **R02 Canonical KDL:** Hand-authored KDL is the canonical declaration; any
-  generator is optional and its output is inspectable before reconciliation.
+- **R02 Canonical KDL and declaration identity:** Hand-authored KDL is the
+  canonical declaration; any generator is optional and its output is
+  inspectable before reconciliation. Declarations are discovered recursively.
+  An explicit `identity` and `host` pair is authoritative independent of its
+  folder path, while either omitted field retains path-derived defaults and
+  mismatch diagnostics. The declaration's parent remains its state/resource
+  anchor. Dot-prefixed and other organizational folders have no implicit
+  lifecycle meaning; discovery excludes only explicit catalog control/runtime
+  roots and state namespaces directly owned by a declaration.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
 
