@@ -203,6 +203,18 @@ fn a_duplicate_bus_id_is_an_error() {
 }
 
 #[test]
+fn explicit_identity_and_host_are_path_independent_but_still_unique() {
+    let c = catalog(&[(
+        "organization/.managed/archive/arbitrary/declaration/agent.kdl",
+        r#"agent "stable" { host "pinned"; command "x" }"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+    assert_eq!(r.agents, 1);
+}
+
+#[test]
 fn an_unrendered_service_is_not_runnable() {
     let c = catalog(&[(
         "hetz/w/agent.kdl",
@@ -328,7 +340,7 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
 fn an_identity_folder_mismatch_is_a_warning() {
     let c = catalog(&[(
         "hetz/folder-name/agent.kdl",
-        r#"agent "content-name" { host "hetz"; type "service"; pty "agent" { command "x" } }"#,
+        r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(&validate(c.path()), "id-path-mismatch", Severity::Warn));
 }
@@ -337,7 +349,7 @@ fn an_identity_folder_mismatch_is_a_warning() {
 fn a_host_folder_mismatch_is_a_warning() {
     let c = catalog(&[(
         "folderhost/w/agent.kdl",
-        r#"agent "w" { host "confighost"; type "service"; pty "agent" { command "x" } }"#,
+        r#"agent { host "confighost"; type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(
         &validate(c.path()),
