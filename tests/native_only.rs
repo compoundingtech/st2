@@ -108,11 +108,26 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
     }
 
     for bundle in [&codex_bundle, &claude_bundle] {
+        let digest = clean_st2(bin.path(), &state, &hooks)
+            .args(["agent", "digest", "--bundle"])
+            .arg(bundle)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(
+            digest.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&digest.stdout),
+            String::from_utf8_lossy(&digest.stderr)
+        );
+        let digest: serde_json::Value = serde_json::from_slice(&digest.stdout).unwrap();
         let publish = clean_st2(bin.path(), &state, &hooks)
             .args(["agent", "publish", "--catalog"])
             .arg(&catalog)
             .arg("--bundle")
             .arg(bundle)
+            .arg("--input-sha256")
+            .arg(digest["sha256"].as_str().unwrap())
             .args(["--expect-absent", "--json"])
             .output()
             .unwrap();

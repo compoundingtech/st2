@@ -104,12 +104,35 @@ mkdir -p "$bundle/assets"
 cp examples/native/agent-codex.kdl "$bundle/agent.kdl"
 cp ./composed-AGENTS.md "$bundle/assets/AGENTS.md"
 ${EDITOR:-vi} "$bundle/agent.kdl"
-st2 agent publish --catalog "$CATALOG" --bundle "$bundle" --expect-absent --json
+input_sha256="$(st2 agent digest --bundle "$bundle")"
+st2 agent publish --catalog "$CATALOG" --bundle "$bundle" \
+  --input-sha256 "$input_sha256" --expect-absent --json
 ```
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Include every file referenced by
 `copy` in the bundle. For a later declaration-only update, publish `agent.kdl` with the current
 declaration's SHA-256 via `--spec ... --expect-sha256 HEX`; sibling assets and state are preserved.
+Bind either operation to the exact captured source with the SHA-256 returned by
+`st2 agent digest`.
+
+To prepare and apply a complete declaration-plane replacement without copying
+runtime state or workspaces:
+
+```sh
+st2 catalog snapshot --catalog "$CATALOG" --output ./prepared --json
+# Edit/render ./prepared, then retain the rootSha256 from the snapshot receipt.
+st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
+  --expect-sha256 <rootSha256> --json
+```
+
+`catalog apply` is policy-free. It rejects state/control content, symlinks,
+unprojected workspace facts, catalog-local/default PTY roots, and effective
+PTY-root changes. Fresh bootstrap is a separate st2+pty transaction, not an
+apply mode. A crash leaves a durable marker and content-addressed stage;
+`st2 catalog apply --catalog "$CATALOG" --resume --json` resumes without the
+original prepared source. Snapshots own the complete bounded `_templates`
+library and empty canonical per-agent `.workspace` directory facts, but never
+traverse, hash, copy, or delete workspace content.
 
 The compact declaration shape is:
 
@@ -415,7 +438,8 @@ ls, up, down, validate, doctor
 message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, eval
-agent publish
+agent digest, agent publish
+catalog snapshot, catalog apply
 completions
 ```
 
@@ -475,6 +499,9 @@ interviewer reply at-or-after the exact kickoff receipt completes it. Canonical 
 verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
 evals retain their flat bus and completion semantics.
 
-`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) (--expect-absent |
---expect-sha256 HEX)` is the sole catalog-declaration writer. The publisher admits the complete
-prospective catalog under a compare-and-swap lock before making one atomic change.
+`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) --input-sha256 HEX
+(--expect-absent | --expect-sha256 HEX)` is the single-agent declaration writer.
+`st2 catalog apply --catalog ROOT
+(--prepared DIR --expect-sha256 ROOT_HEX | --resume)` is the complete
+declaration-plane writer. Each admits the complete prospective catalog under a
+compare-and-swap lock before making one atomic change.

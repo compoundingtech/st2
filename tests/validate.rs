@@ -152,6 +152,77 @@ fn a_relative_path_is_an_error() {
 }
 
 #[test]
+fn canonical_relative_workspace_and_task_cwd_are_clean() {
+    let c = catalog(&[
+        (
+            "hetz/w/agent.kdl",
+            r#"agent "w" {
+  host "hetz"
+  workspace ".workspace"
+  pty "agent" { cwd ".workspace"; command "x" }
+}"#,
+        ),
+        ("hetz/w/.workspace/.keep", ""),
+    ]);
+    assert!(!has(&validate(c.path()), "bad-path", Severity::Error));
+}
+
+#[test]
+fn normalized_relative_workspace_is_clean_but_indeterminate_relative_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    for (identity, workspace) in [
+        ("dotted", "./.workspace"),
+        ("indeterminate", "$ST2_TEST_UNSET_WORKSPACE"),
+    ] {
+        let bundle = temp.path().join(format!("agents/host/{identity}"));
+        std::fs::create_dir_all(bundle.join(".workspace")).unwrap();
+        std::fs::write(
+            bundle.join("agent.kdl"),
+            format!(
+                "agent \"{identity}\" {{\n  host \"host\"\n  workspace \"{workspace}\"\n  argv \"true\"\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let report = validate(temp.path());
+    let bad_paths = report
+        .issues
+        .iter()
+        .filter(|issue| issue.code == "bad-path")
+        .collect::<Vec<_>>();
+    assert_eq!(bad_paths.len(), 1, "{:#?}", report.issues);
+    assert!(
+        bad_paths
+            .iter()
+            .all(|issue| issue.message.contains("unresolved environment variable"))
+    );
+}
+
+#[test]
+fn environment_expanded_canonical_relative_workspace_is_clean() {
+    let c = catalog(&[
+        (
+            "hetz/w/agent.kdl",
+            r#"agent "w" { host "hetz"; workspace "$ST2_TEST_WORKSPACE"; argv "true" }"#,
+        ),
+        ("hetz/w/.workspace/.keep", ""),
+    ]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(c.path())
+        .args(["validate", "--json"])
+        .env("ST2_TEST_WORKSPACE", ".workspace")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn a_missing_catalog_rooted_path_is_an_error() {
     // The renderer's own output — its absence is a real render bug.
     let c = catalog(&[(
@@ -196,8 +267,7 @@ fn a_remote_hosts_missing_external_path_is_not_a_local_warning() {
 }
 
 #[test]
-fn a_path_bearing_another_var_is_skipped() {
-    // SD3: an unset var is a literal token — do not guess, do not flag.
+fn an_environment_expanded_absolute_path_is_checked_normally() {
     let c = catalog(&[(
         "hetz/w/agent.kdl",
         r#"agent "w" { host "hetz"; type "service"; workspace "$HOME/repo"; pty "agent" { command "x" } }"#,

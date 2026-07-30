@@ -11,12 +11,14 @@
 //! This module is location-agnostic: it operates on an inbox/agent directory a caller resolves (from
 //! the catalog for VRS-native, or `$ST_ROOT` for a compat shim).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::Context as _;
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
 /// a strict subset of what the reader accepts: the frozen bus grammar is `[0-9a-z]{6}`, so a peer
@@ -400,6 +402,19 @@ pub fn resolve_list_box(
     if orphan {
         return Ok(flat());
     }
+    if apply_incomplete(root) {
+        return resolve_agent_dir(root, id, host)
+            .map(|agent_dir| {
+                if archive {
+                    archive_dir(&agent_dir)
+                } else {
+                    inbox_dir(&agent_dir)
+                }
+            })
+            .with_context(|| {
+                format!("agent '{id}' is not addressable while catalog apply is incomplete")
+            });
+    }
     let discovered = crate::discover(root);
     if let Some(agent_dir) = discovered
         .specs
@@ -423,12 +438,81 @@ pub fn resolve_list_box(
 /// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
 /// catalog, via content discovery. Returns `None` if no agent matches.
 pub fn resolve_agent_dir(catalog_root: &Path, recipient: &str, this_host: &str) -> Option<PathBuf> {
+    if apply_incomplete(catalog_root) {
+        let mut candidates = BTreeSet::new();
+        candidates.extend(marker_agent_dir(catalog_root, this_host, recipient));
+        for (index, _) in recipient.match_indices('.') {
+            let (host, identity) = recipient.split_at(index);
+            candidates.extend(marker_agent_dir(catalog_root, host, &identity[1..]));
+        }
+        // Dots are valid in both host and hierarchical identity names, so every split point is a
+        // possible qualified address. Never guess when more than one canonical path is live.
+        return (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten();
+    }
     let found = crate::discover(catalog_root);
     found
         .specs
         .into_iter()
         .find(|s| s.bus_id(this_host) == recipient || s.identity == recipient)
         .and_then(|s| s.path.parent().map(Path::to_path_buf))
+}
+
+fn marker_agent_dir(catalog_root: &Path, host: &str, identity: &str) -> Option<PathBuf> {
+    if !safe_component(host) || !safe_component(identity) {
+        return None;
+    }
+    let candidate = catalog_root.join("agents").join(host).join(identity);
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let complete_spec = fs::symlink_metadata(candidate.join("agent.kdl"))
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+    let existing_state = marker_state_exists(&candidate)?;
+    (complete_spec || existing_state).then_some(candidate)
+}
+
+fn marker_state_exists(agent_dir: &Path) -> Option<bool> {
+    let mut found = false;
+    for name in ["resources", "archive", "inbox"] {
+        let path = agent_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => found = true,
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    match fs::symlink_metadata(agent_dir.join("status")) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => found = true,
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let resources = agent_dir.join("resources");
+    if resources.is_dir() {
+        for relative in ["inbox", "archive", "context", "context/decisions", "links"] {
+            match fs::symlink_metadata(resources.join(relative)) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => return None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+    }
+    Some(found)
+}
+
+fn apply_incomplete(root: &Path) -> bool {
+    fs::symlink_metadata(crate::catalog_lock::apply_marker_path(root)).is_ok()
+}
+
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | ".." | ".git" | ".st2")
+        && Path::new(value).components().count() == 1
 }
 
 /// The default subject for a reply to a message whose subject was `original`: the original prefixed

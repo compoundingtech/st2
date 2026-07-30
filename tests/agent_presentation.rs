@@ -448,6 +448,10 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
 
     let candidate = temporary.path().join("candidate.kdl");
     fs::copy(&declaration_path, &candidate).unwrap();
+    let digest = st2::agent_publish::digest_source(st2::agent_publish::PublishSource::Spec(
+        candidate.clone(),
+    ))
+    .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
     let mut publish = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args([
@@ -457,6 +461,8 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
             root.to_str().unwrap(),
             "--spec",
             candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest.sha256,
             "--expect-absent",
             "--json",
         ])

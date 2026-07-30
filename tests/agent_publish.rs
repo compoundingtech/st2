@@ -18,6 +18,7 @@ fn valid_spec(retired: bool) -> String {
 }
 
 fn publish(catalog: &Path, spec: &Path, expectation: &[&str]) -> Output {
+    let input_sha256 = sha256(&fs::read(spec).unwrap());
     st2()
         .args([
             "agent",
@@ -27,10 +28,29 @@ fn publish(catalog: &Path, spec: &Path, expectation: &[&str]) -> Output {
             "--spec",
             spec.to_str().unwrap(),
         ])
+        .args(["--input-sha256", &input_sha256])
         .args(expectation)
         .arg("--json")
         .output()
         .unwrap()
+}
+
+fn source_digest(flag: &str, path: &Path) -> String {
+    let output = st2()
+        .args(["agent", "digest", flag])
+        .arg(path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<Value>(&output.stdout).unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -59,6 +79,7 @@ fn spec_create_is_typed_and_idempotent() {
     assert_eq!(first["schema"], "st2.agent-publish.v1");
     assert_eq!(first["status"], "published");
     assert_eq!(first["busId"], "host.worker");
+    assert_eq!(first["inputSha256"], sha256(valid_spec(false).as_bytes()));
     assert_eq!(first["afterSha256"], sha256(valid_spec(false).as_bytes()));
     assert_eq!(
         fs::read_to_string(target(&catalog)).unwrap(),
@@ -73,6 +94,110 @@ fn spec_create_is_typed_and_idempotent() {
     );
     let second: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second["status"], "unchanged");
+}
+
+#[test]
+fn caller_source_digest_rejects_mutation_and_symlink_swaps_before_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, valid_spec(false)).unwrap();
+    let reserved = source_digest("--spec", &spec);
+
+    fs::write(&spec, valid_spec(true)).unwrap();
+    let changed = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            spec.to_str().unwrap(),
+            "--input-sha256",
+            &reserved,
+            "--expect-absent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!changed.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed.stderr).contains("input precondition failed"),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    assert!(!target(&catalog).exists());
+
+    let replacement = temp.path().join("replacement.kdl");
+    fs::write(&replacement, valid_spec(false)).unwrap();
+    fs::remove_file(&spec).unwrap();
+    std::os::unix::fs::symlink(&replacement, &spec).unwrap();
+    let swapped = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            spec.to_str().unwrap(),
+            "--input-sha256",
+            &reserved,
+            "--expect-absent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!swapped.status.success());
+    assert!(!target(&catalog).exists());
+
+    fs::remove_file(&spec).unwrap();
+    let bundle = temp.path().join("bundle");
+    fs::create_dir(&bundle).unwrap();
+    fs::write(bundle.join("agent.kdl"), valid_spec(false)).unwrap();
+    fs::write(bundle.join("asset.txt"), "reserved").unwrap();
+    let bundle_reserved = source_digest("--bundle", &bundle);
+    fs::write(bundle.join("asset.txt"), "changed").unwrap();
+    let changed_bundle = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--bundle",
+            bundle.to_str().unwrap(),
+            "--input-sha256",
+            &bundle_reserved,
+            "--expect-absent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!changed_bundle.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_bundle.stderr).contains("input precondition failed"),
+        "{}",
+        String::from_utf8_lossy(&changed_bundle.stderr)
+    );
+    assert!(!target(&catalog).exists());
+
+    let external_asset = temp.path().join("external-asset");
+    fs::write(&external_asset, "reserved").unwrap();
+    fs::remove_file(bundle.join("asset.txt")).unwrap();
+    std::os::unix::fs::symlink(&external_asset, bundle.join("asset.txt")).unwrap();
+    let symlink_bundle = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--bundle",
+            bundle.to_str().unwrap(),
+            "--input-sha256",
+            &bundle_reserved,
+            "--expect-absent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!symlink_bundle.status.success());
+    assert!(!target(&catalog).exists());
 }
 
 #[test]
@@ -422,6 +547,7 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
     fs::create_dir_all(bundle.join("resources/inbox")).unwrap();
     fs::write(bundle.join("agent.kdl"), valid_spec(false)).unwrap();
     fs::write(bundle.join("resources/inbox/kickoff.md"), "start").unwrap();
+    let bundle_digest = source_digest("--bundle", &bundle);
 
     let first = st2()
         .args([
@@ -431,6 +557,8 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
             catalog.to_str().unwrap(),
             "--bundle",
             bundle.to_str().unwrap(),
+            "--input-sha256",
+            &bundle_digest,
             "--expect-absent",
             "--json",
         ])
@@ -454,6 +582,8 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
             catalog.to_str().unwrap(),
             "--bundle",
             bundle.to_str().unwrap(),
+            "--input-sha256",
+            &bundle_digest,
             "--expect-absent",
             "--json",
         ])
@@ -476,6 +606,8 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
             catalog.to_str().unwrap(),
             "--bundle",
             bundle.to_str().unwrap(),
+            "--input-sha256",
+            &bundle_digest,
             "--expect-absent",
         ])
         .output()
@@ -485,6 +617,7 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
     fs::write(&target_payload, "start").unwrap();
 
     fs::write(bundle.join("resources/inbox/kickoff.md"), "different").unwrap();
+    let changed_digest = source_digest("--bundle", &bundle);
     let mismatch = st2()
         .args([
             "agent",
@@ -493,6 +626,8 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
             catalog.to_str().unwrap(),
             "--bundle",
             bundle.to_str().unwrap(),
+            "--input-sha256",
+            &changed_digest,
             "--expect-absent",
         ])
         .output()
@@ -517,11 +652,20 @@ fn compile_agent_is_not_a_cli_writer_anymore() {
         "--bundle",
         "--expect-absent",
         "--expect-sha256",
+        "--input-sha256",
+        "--prepared",
+        "--resume",
         "--json",
     ] {
         assert!(
             completions.contains(flag),
             "generated completion omitted {flag}"
+        );
+    }
+    for command in ["digest", "catalog", "snapshot", "apply"] {
+        assert!(
+            completions.contains(command),
+            "generated completion omitted {command}"
         );
     }
     assert!(!completions.contains("compile-agent"));
@@ -562,6 +706,8 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
             one.to_str().unwrap(),
             "--expect-sha256",
             &expected,
+            "--input-sha256",
+            &sha256(fs::read(&one).unwrap().as_slice()),
             "--json",
         ])
         .stdout(Stdio::piped())
@@ -578,6 +724,8 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
             two.to_str().unwrap(),
             "--expect-sha256",
             &expected,
+            "--input-sha256",
+            &sha256(fs::read(&two).unwrap().as_slice()),
             "--json",
         ])
         .stdout(Stdio::piped())
@@ -672,6 +820,8 @@ fn retirement_cannot_commit_between_reconcile_discovery_and_launch() {
             retired.to_str().unwrap(),
             "--expect-sha256",
             &sha256(active.as_bytes()),
+            "--input-sha256",
+            &sha256(fs::read(&retired).unwrap().as_slice()),
             "--json",
         ])
         .stdout(Stdio::piped())

@@ -29,14 +29,21 @@ pub struct CatalogLock {
 
 impl CatalogLock {
     pub fn shared(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared)
+        Self::acquire(catalog, Mode::Shared, false)
     }
 
     pub fn exclusive(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive)
+        Self::acquire(catalog, Mode::Exclusive, false)
     }
 
-    fn acquire(catalog: &Path, mode: Mode) -> Result<Self> {
+    /// The whole-catalog transaction is the only operation allowed to inspect and recover an
+    /// incomplete apply. Every other declaration reader/writer must keep using `shared` or
+    /// `exclusive`, which fail closed while the marker exists.
+    pub(crate) fn exclusive_for_catalog_apply(catalog: &Path) -> Result<Self> {
+        Self::acquire(catalog, Mode::Exclusive, true)
+    }
+
+    fn acquire(catalog: &Path, mode: Mode, allow_incomplete_apply: bool) -> Result<Self> {
         let catalog = catalog
             .canonicalize()
             .with_context(|| format!("canonicalize catalog root {}", catalog.display()))?;
@@ -49,15 +56,22 @@ impl CatalogLock {
         );
 
         let control = catalog.join(CONTROL_DIR);
-        match fs::symlink_metadata(&control) {
-            Ok(metadata) => anyhow::ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "catalog control path is not a real directory: {}",
-                control.display()
-            ),
+        let control_branch = match fs::symlink_metadata(&control) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "catalog control path is not a real directory: {}",
+                    control.display()
+                );
+                "observed"
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&control) {
-                    Ok(()) => {}
+                test_control_creation_checkpoint();
+                let branch = match fs::create_dir(&control) {
+                    Ok(()) => {
+                        test_control_created_checkpoint();
+                        "created"
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         let metadata = fs::symlink_metadata(&control).with_context(|| {
                             format!("re-read catalog control dir {}", control.display())
@@ -67,18 +81,32 @@ impl CatalogLock {
                             "catalog control path is not a real directory: {}",
                             control.display()
                         );
+                        "raced"
                     }
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!("create catalog control dir {}", control.display())
                         });
                     }
-                }
+                };
+                branch
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("read catalog control dir {}", control.display()));
             }
+        };
+        // The control directory is the durability root for the persistent lock, apply stage, and
+        // incomplete marker. Persist its catalog-parent entry before any caller can publish
+        // declaration leaves. This is unconditional after observing a real control dir: its creator
+        // may have crashed after mkdir but before its own parent fsync.
+        File::open(&catalog)
+            .with_context(|| format!("open catalog root {}", catalog.display()))?
+            .sync_all()
+            .with_context(|| format!("sync catalog root {}", catalog.display()))?;
+        #[cfg(debug_assertions)]
+        if let Ok(path) = std::env::var("ST2_TEST_CATALOG_CONTROL_BRANCH") {
+            let _ = fs::write(path, control_branch);
         }
 
         let path = control.join(LOCK_FILE);
@@ -94,6 +122,12 @@ impl CatalogLock {
             Mode::Shared => libc::LOCK_SH,
             Mode::Exclusive => libc::LOCK_EX,
         };
+        #[cfg(debug_assertions)]
+        if matches!(mode, Mode::Exclusive)
+            && let Ok(path) = std::env::var("ST2_TEST_CATALOG_LOCK_ATTEMPT")
+        {
+            let _ = fs::write(path, b"exclusive");
+        }
         // SAFETY: `file` owns a valid descriptor for the duration of this call and the returned
         // guard. flock does not access Rust memory.
         let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
@@ -101,21 +135,64 @@ impl CatalogLock {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("lock catalog authoring lock {}", path.display()));
         }
-        let marker = control.join(APPLY_MARKER);
-        match fs::symlink_metadata(&marker) {
-            Ok(_) => anyhow::bail!(
-                "catalog apply is incomplete: marker present at {}",
-                marker.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect catalog apply marker {}", marker.display()));
+        if !allow_incomplete_apply {
+            let marker = control.join(APPLY_MARKER);
+            match fs::symlink_metadata(&marker) {
+                Ok(_) => anyhow::bail!(
+                    "catalog apply is incomplete: marker present at {}",
+                    marker.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect catalog apply marker {}", marker.display())
+                    });
+                }
             }
         }
         Ok(Self { file })
     }
 }
+
+#[cfg(debug_assertions)]
+fn test_control_creation_checkpoint() {
+    use std::time::{Duration, Instant};
+
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_CATALOG_CONTROL_READY"),
+        std::env::var("ST2_TEST_CATALOG_CONTROL_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(&release).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_control_creation_checkpoint() {}
+
+#[cfg(debug_assertions)]
+fn test_control_created_checkpoint() {
+    use std::time::{Duration, Instant};
+
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_CATALOG_CONTROL_CREATED_READY"),
+        std::env::var("ST2_TEST_CATALOG_CONTROL_CREATED_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(&release).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_control_created_checkpoint() {}
 
 impl Drop for CatalogLock {
     fn drop(&mut self) {
