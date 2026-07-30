@@ -19,10 +19,24 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
+
+/// Read-only identity observation for the existing plain-PID exec record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecGenerationObservation {
+    Running {
+        pid: u32,
+        created_at: String,
+        generation_id: String,
+    },
+    Indeterminate {
+        reason: String,
+    },
+}
 
 /// Supervises `exec` tasks as terminal-free processes.
 pub struct ExecBackend {
@@ -222,11 +236,310 @@ impl ExecBackend {
         Ok(())
     }
 
+    /// Observe exactly one desired exec id without changing its state record or
+    /// any lifecycle behavior. `None` means only that the record is absent.
+    pub fn observe_generation_optional(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<ExecGenerationObservation>> {
+        let path = self.pid_path(id);
+        match path.try_exists() {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("checking exec generation {}", path.display()));
+            }
+        }
+        Ok(Some(observe_legacy_generation(id, &path)))
+    }
+
     fn read_pid(&self, id: &str) -> anyhow::Result<i32> {
         let raw = fs::read_to_string(self.pid_path(id))
             .map_err(|e| anyhow::anyhow!("reading pid for exec '{id}': {e}"))?;
         raw.trim()
             .parse::<i32>()
             .map_err(|_| anyhow::anyhow!("bad pid file for exec '{id}'"))
+    }
+}
+
+fn observe_legacy_generation(id: &str, path: &Path) -> ExecGenerationObservation {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return indeterminate(format!("reading {}: {error}", path.display()));
+        }
+    };
+    let pid = match raw.trim().parse::<i32>() {
+        Ok(pid) => pid,
+        Err(error) => {
+            return indeterminate(format!(
+                "parsing legacy pid record {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if pid <= 0 || !process_alive(pid) {
+        return indeterminate("legacy pid is not a live process");
+    }
+    let start_time_ticks = match process_start_time_ticks(pid) {
+        Ok(value) => value,
+        Err(error) => {
+            return indeterminate(format!("cannot read legacy process start token: {error:#}"));
+        }
+    };
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return indeterminate(format!("cannot stat legacy pid file: {error}"));
+        }
+    };
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(error) => {
+            return indeterminate(format!("legacy pid file has no usable mtime: {error}"));
+        }
+    };
+    match legacy_pid_predates_record(start_time_ticks, modified) {
+        Ok(true) => {}
+        Ok(false) => {
+            return indeterminate("legacy pid file predates the current process generation");
+        }
+        Err(error) => {
+            return indeterminate(format!(
+                "cannot order legacy pid file and process start: {error:#}"
+            ));
+        }
+    }
+    // Close the observation window: a changed process generation is never promoted.
+    if process_start_time_ticks(pid).ok() != Some(start_time_ticks) {
+        return indeterminate("legacy process generation changed while observed");
+    }
+    let created_at = match process_created_at(start_time_ticks).and_then(rfc3339_utc) {
+        Ok(value) => value,
+        Err(error) => {
+            return indeterminate(format!(
+                "cannot encode legacy process start time: {error:#}"
+            ));
+        }
+    };
+    let generation_id = crate::task_inventory::generation_id(
+        "exec",
+        id,
+        pid as u32,
+        &created_at,
+        Some(start_time_ticks),
+    );
+    ExecGenerationObservation::Running {
+        pid: pid as u32,
+        created_at,
+        generation_id,
+    }
+}
+
+fn indeterminate(reason: impl Into<String>) -> ExecGenerationObservation {
+    ExecGenerationObservation::Indeterminate {
+        reason: reason.into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after_comm = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| anyhow::anyhow!("malformed /proc/{pid}/stat"))?
+        .1;
+    // Fields after comm begin at field 3 (state); starttime is field 22, therefore index 19.
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("missing starttime in /proc/{pid}/stat"))?
+        .parse()
+        .with_context(|| format!("parsing starttime in /proc/{pid}/stat"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskallinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKALLINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    if read != expected {
+        anyhow::bail!("proc_pidinfo({pid}) returned {read}, expected {expected}");
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(info
+        .pbsd
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbsd.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_pid_predates_record(start_time_ticks: u64, modified: SystemTime) -> anyhow::Result<bool> {
+    let ticks_per_second = clock_ticks_per_second()?;
+    let uptime: f64 = fs::read_to_string("/proc/uptime")?
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing /proc/uptime value"))?
+        .parse()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let modified = modified.duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let tick = 1.0 / ticks_per_second as f64;
+    // The start token denotes a clock-tick bucket. The record must follow the
+    // end of that bucket, otherwise PID reuse cannot be ruled out.
+    let latest_start = now - uptime + start_time_ticks as f64 * tick + tick;
+    Ok(modified >= latest_start)
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_pid_predates_record(start_time_ticks: u64, modified: SystemTime) -> anyhow::Result<bool> {
+    let modified_micros = modified.duration_since(UNIX_EPOCH)?.as_micros();
+    Ok(u128::from(start_time_ticks) <= modified_micros)
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second() -> anyhow::Result<u64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        anyhow::bail!("sysconf(_SC_CLK_TCK) failed");
+    }
+    Ok(ticks as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn process_created_at(start_time_ticks: u64) -> anyhow::Result<SystemTime> {
+    let boot_seconds = fs::read_to_string("/proc/stat")?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .ok_or_else(|| anyhow::anyhow!("missing btime in /proc/stat"))?
+        .parse::<u64>()?;
+    let ticks_per_second = clock_ticks_per_second()?;
+    let seconds = start_time_ticks / ticks_per_second;
+    let remainder = start_time_ticks % ticks_per_second;
+    let nanos = remainder.saturating_mul(1_000_000_000) / ticks_per_second;
+    Ok(UNIX_EPOCH
+        + Duration::from_secs(boot_seconds.saturating_add(seconds))
+        + Duration::from_nanos(nanos))
+}
+
+#[cfg(target_os = "macos")]
+fn process_created_at(start_time_ticks: u64) -> anyhow::Result<SystemTime> {
+    Ok(UNIX_EPOCH + Duration::from_micros(start_time_ticks))
+}
+
+fn rfc3339_utc(time: SystemTime) -> anyhow::Result<String> {
+    let duration = time.duration_since(UNIX_EPOCH)?;
+    let seconds = duration.as_secs() as libc::time_t;
+    let millis = duration.subsec_millis();
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    if unsafe { libc::gmtime_r(&seconds, tm.as_mut_ptr()) }.is_null() {
+        anyhow::bail!("gmtime_r failed");
+    }
+    let tm = unsafe { tm.assume_init() };
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        millis
+    ))
+}
+
+#[cfg(test)]
+mod generation_observation_tests {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn legacy_plain_pid_is_observed_without_rewriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let backend = ExecBackend::new(state, tmp.path().join("catalog"));
+        let id = "host.test.legacy";
+        let pid = std::process::id();
+        // Leave an unambiguous interval between process creation and record publication.
+        sleep(Duration::from_millis(20));
+        let legacy = pid.to_string();
+        fs::write(backend.pid_path(id), &legacy).unwrap();
+
+        assert!(matches!(
+            backend.observe_generation_optional(id).unwrap(),
+            Some(ExecGenerationObservation::Running {
+                pid: observed,
+                ref created_at,
+                ref generation_id,
+            }) if observed == pid
+                && crate::task_inventory::is_rfc3339_utc_millis(created_at)
+                && generation_id.starts_with("sha256:")
+        ));
+        assert_eq!(
+            fs::read_to_string(backend.pid_path(id)).unwrap(),
+            legacy,
+            "observation rewrote the legacy state record"
+        );
+    }
+
+    #[test]
+    fn absent_record_is_none_and_does_not_create_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("missing-state");
+        let backend = ExecBackend::new(state.clone(), tmp.path().join("catalog"));
+        assert_eq!(
+            backend
+                .observe_generation_optional("host.test.absent")
+                .unwrap(),
+            None
+        );
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn malformed_and_dead_legacy_records_are_indeterminate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let backend = ExecBackend::new(state, tmp.path().join("catalog"));
+        fs::write(backend.pid_path("host.test.bad"), "not-a-pid").unwrap();
+        fs::write(backend.pid_path("host.test.dead"), "2000000000").unwrap();
+
+        assert!(matches!(
+            backend
+                .observe_generation_optional("host.test.bad")
+                .unwrap(),
+            Some(ExecGenerationObservation::Indeterminate { reason })
+                if reason.contains("parsing legacy pid record")
+        ));
+        assert!(matches!(
+            backend
+                .observe_generation_optional("host.test.dead")
+                .unwrap(),
+            Some(ExecGenerationObservation::Indeterminate { reason })
+                if reason.contains("not a live process")
+        ));
+    }
+
+    #[test]
+    fn record_older_than_current_process_generation_cannot_be_promoted() {
+        let pid = std::process::id() as i32;
+        let start = process_start_time_ticks(pid).unwrap();
+        assert!(
+            !legacy_pid_predates_record(start, UNIX_EPOCH + Duration::from_secs(1)).unwrap(),
+            "an ancient record must not identify the current PID generation"
+        );
     }
 }

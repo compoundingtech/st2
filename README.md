@@ -250,6 +250,25 @@ For a foreground supervisor on any host:
 st2 up --catalog "$CATALOG" --host <host>
 ```
 
+### Typed task inventory (diagnostic only)
+
+Use the typed inventory instead of parsing `doctor` prose:
+
+```sh
+st2 tasks --catalog "$CATALOG" --host <host> --json
+```
+
+The `st2.task-inventory.v1` envelope joins the selected host's desired PTY and exec tasks to
+read-only runtime evidence. A complete observation exits zero. Catalog parse errors, declaration
+drift during observation, duplicate runtime IDs, timeouts, malformed output, PID reuse, and
+otherwise unprovable generations emit `complete: false` and exit non-zero. Missing runtime rows
+become `absent` only when the corresponding backend observation is complete; uncertainty remains
+`indeterminate`.
+
+Observation never creates a missing PTY or exec state root and never rewrites an existing exec PID
+record. It also does not serialize catalog writers, reconcile tasks, or authorize a control-plane
+cutover. Consumers that require a transactional declaration boundary need a separate protocol.
+
 ### Staged control-plane replacement gate
 
 `st2 up` is a replaceable control plane, not the lifetime owner of an agent. Stopping it normally
