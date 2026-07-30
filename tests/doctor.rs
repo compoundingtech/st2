@@ -163,10 +163,15 @@ fn doctor_bounds_a_hung_pty_probe_and_reports_the_runtime_error() {
     )
     .unwrap();
     let escaped_pid = tmp.path().join("escaped.pid");
+    let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("sleep"))
+        .find(|candidate| candidate.is_file())
+        .expect("sleep on the test runner's PATH");
     executable(
         &bin.join("pty"),
         &format!(
-            "#!/bin/sh\nset -m\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+            "#!/bin/sh\nset -m\n'{}' 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+            sleep.display(),
             escaped_pid.display()
         ),
     );
@@ -179,13 +184,13 @@ fn doctor_bounds_a_hung_pty_probe_and_reports_the_runtime_error() {
         }
     }
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(13),
         "doctor did not bound a hung `pty list --json`"
     );
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("✗ task runtime readable"), "{stdout}");
-    assert!(stdout.contains("timed out after 2.0s"), "{stdout}");
+    assert!(stdout.contains("timed out after 10.0s"), "{stdout}");
 }
 
 #[test]
