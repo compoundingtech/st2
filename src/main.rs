@@ -1781,7 +1781,7 @@ fn up(
         for error in &found.errors {
             eprintln!("error: {}: {}", error.path.display(), error.message);
         }
-        if st2::hooks::required_by_codex(&found.specs, &this_host) {
+        if st2::hooks::required_by_codex(&found.specs, &this_host, &catalog_root) {
             st2::hooks::verify_required_set().context(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;

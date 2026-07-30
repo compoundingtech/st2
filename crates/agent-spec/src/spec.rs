@@ -399,6 +399,9 @@ fn validate_launch(
     if argv.is_some_and(Vec::is_empty) {
         anyhow::bail!("agent '{identity}' {location} declares an empty `argv`");
     }
+    if argv.is_some_and(|argv| argv.first().is_some_and(String::is_empty)) {
+        anyhow::bail!("agent '{identity}' {location} declares an empty `argv` program");
+    }
     Ok(())
 }
 

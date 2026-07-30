@@ -268,12 +268,17 @@ fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
     let tmp = tempfile::tempdir().unwrap();
     for (identity, body) in [
         ("empty-compact", r#"argv"#),
+        ("empty-program-compact", r#"argv """#),
         (
             "both-compact",
             r#"command "true"
   argv "true""#,
         ),
         ("empty-explicit", r#"pty "agent" { argv }"#),
+        (
+            "empty-program-explicit",
+            r#"pty "agent" { argv "" }"#,
+        ),
         (
             "both-explicit",
             r#"pty "agent" { command "true"; argv "true" }"#,
@@ -287,7 +292,7 @@ fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
     }
 
     let found = discover(tmp.path());
-    assert_eq!(found.errors.len(), 4, "{:?}", found.errors);
+    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
     let messages = found
         .errors
         .iter()
@@ -296,7 +301,7 @@ fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
     assert_eq!(
         messages
             .iter()
-            .filter(|message| message.contains("empty `argv`"))
+            .filter(|message| message.ends_with("empty `argv`"))
             .count(),
         2
     );
@@ -304,6 +309,13 @@ fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
         messages
             .iter()
             .filter(|message| message.contains("both `command` and `argv`"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("empty `argv` program"))
             .count(),
         2
     );

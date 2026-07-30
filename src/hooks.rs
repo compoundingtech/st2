@@ -125,32 +125,54 @@ pub fn versioned_hooks_dir_at(root: &Path) -> PathBuf {
 }
 
 /// Whether this host has a Codex agent whose rendered settings and next launch need this hook set.
-pub fn required_by_codex(specs: &[agent_spec::spec::AgentSpec], this_host: &str) -> bool {
+/// Direct programs are expanded exactly as the execution backends expand them.
+pub fn required_by_codex(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    catalog_root: &Path,
+) -> bool {
     specs
         .iter()
-        .any(|spec| required_by_codex_agent(spec, this_host))
+        .any(|spec| required_by_codex_agent(spec, this_host, catalog_root))
 }
 
 /// Whether one local declaration owns a Codex agent task.
-pub fn required_by_codex_agent(spec: &agent_spec::spec::AgentSpec, this_host: &str) -> bool {
+pub fn required_by_codex_agent(
+    spec: &agent_spec::spec::AgentSpec,
+    this_host: &str,
+    catalog_root: &Path,
+) -> bool {
     spec.host.as_deref().is_none_or(|host| host == this_host)
         && spec.tasks.iter().any(|task| {
             task.name == "agent"
                 && (task.command.as_deref().is_some_and(command_invokes_codex)
-                    || task.argv.as_deref().is_some_and(argv_invokes_codex))
+                    || task
+                        .argv
+                        .as_deref()
+                        .is_some_and(|argv| argv_invokes_codex(argv, catalog_root)))
         })
 }
 
-pub(crate) fn launch_invokes_codex(launch: &crate::reconcile::TaskLaunch) -> bool {
+pub(crate) fn launch_invokes_codex(
+    launch: &crate::reconcile::TaskLaunch,
+    catalog_root: &Path,
+) -> bool {
     match launch {
         crate::reconcile::TaskLaunch::Shell(command) => command_invokes_codex(command),
-        crate::reconcile::TaskLaunch::Argv(argv) => argv_invokes_codex(argv),
+        crate::reconcile::TaskLaunch::Argv(argv) => argv_invokes_codex(argv, catalog_root),
     }
 }
 
-fn argv_invokes_codex(argv: &[String]) -> bool {
+fn argv_invokes_codex(argv: &[String], catalog_root: &Path) -> bool {
+    argv_invokes_codex_with(argv, |program| {
+        crate::expand::expand_catalog(program, catalog_root)
+    })
+}
+
+fn argv_invokes_codex_with(argv: &[String], expand: impl FnOnce(&str) -> String) -> bool {
     argv.first().is_some_and(|program| {
-        Path::new(program)
+        let program = expand(program);
+        Path::new(&program)
             .file_name()
             .is_some_and(|name| name == "codex")
     })
@@ -412,17 +434,25 @@ mod tests {
         assert!(!command_invokes_codex(
             "exec /opt/bin/codex-wrapper --model x"
         ));
-        assert!(argv_invokes_codex(&[
-            "codex".into(),
-            "--model".into(),
-            "x".into()
-        ]));
-        assert!(argv_invokes_codex(&[
-            "/opt/bin/codex".into(),
-            "resume".into()
-        ]));
-        assert!(!argv_invokes_codex(&[]));
-        assert!(!argv_invokes_codex(&["codex-wrapper".into()]));
+        let root = Path::new("/catalog");
+        assert!(argv_invokes_codex(
+            &["codex".into(), "--model".into(), "x".into()],
+            root
+        ));
+        assert!(argv_invokes_codex(
+            &["/opt/bin/codex".into(), "resume".into()],
+            root
+        ));
+        assert!(argv_invokes_codex(
+            &["$CATALOG/bin/codex".into(), "resume".into()],
+            root
+        ));
+        assert!(argv_invokes_codex_with(
+            &["$CODEX_BIN".into(), "resume".into()],
+            |_| "/opt/bin/codex".into()
+        ));
+        assert!(!argv_invokes_codex(&[], root));
+        assert!(!argv_invokes_codex(&["codex-wrapper".into()], root));
     }
 
     #[test]

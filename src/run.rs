@@ -769,7 +769,7 @@ fn reconcile_pass(
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
-    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
+    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host, root)
         .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
@@ -783,7 +783,7 @@ fn reconcile_pass(
         .specs
         .iter()
         .filter(|spec| {
-            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host)
+            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host, root)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -815,7 +815,7 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches_on_hooks(&mut plan, &mut report, || match &hook_error {
+    gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
@@ -832,6 +832,7 @@ fn reconcile_pass(
 /// the wrong state and could not satisfy the launched seat's trust gate.
 fn gate_codex_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
+    catalog_root: &Path,
     report: &mut UpReport,
     verify_hooks: V,
 ) where
@@ -840,7 +841,8 @@ fn gate_codex_launches_on_hooks<'a, V>(
     let mut gated_agents = Vec::new();
     for launch in &plan.launch {
         let Some(_) = launch.tasks.iter().find(|target| {
-            target.name == "agent" && crate::hooks::launch_invokes_codex(&target.launch)
+            target.name == "agent"
+                && crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
         }) else {
             continue;
         };
@@ -1459,7 +1461,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || Ok(()));
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || Ok(()),
+        );
 
         assert_eq!(
             plan.launch
@@ -1487,9 +1494,12 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || {
-            panic!("an already-live Codex agent must not enter the hook gate")
-        });
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || panic!("an already-live Codex agent must not enter the hook gate"),
+        );
 
         assert_eq!(plan.adopt, [&spec]);
         assert_eq!(plan.launch.len(), 1);
@@ -1519,7 +1529,12 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || anyhow::bail!("stale receipt"));
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || anyhow::bail!("stale receipt"),
+        );
 
         assert_eq!(
             plan.launch
