@@ -123,6 +123,19 @@
           };
         };
 
+        # Narrow sandbox-safe integration gate for the atomic snapshot boundary. The main package
+        # deliberately omits the broad doctor suite because some doctor cases exercise facilities
+        # unavailable in the Nix sandbox; this derivation executes the one hermetic regression by
+        # its unique test name so it cannot be present-but-invisible to CI.
+        st2AtomicPtySnapshot = st2.overrideAttrs (_: {
+          pname = "st2-atomic-pty-snapshot-check";
+          cargoTestFlags = [
+            "--test"
+            "doctor"
+            "doctor_rejects_a_partial_pty_snapshot_atomically"
+          ];
+        });
+
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
           chmod -R u+w $out
@@ -155,6 +168,7 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
+        checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
