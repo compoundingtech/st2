@@ -110,7 +110,7 @@ agent "<identity>" {
   // role "worker"
   // supervisor "<supervisor-bus-id>"
   env { ST_AGENT "<host>.<identity>" }
-  command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '<boot prompt>'"#
+  argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {
@@ -122,6 +122,12 @@ agent "<identity>" {
   }
 }
 ```
+
+`argv` launches its first value directly with the remaining values as arguments. It resolves a bare
+program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
+does not introduce a shell. Use `command #"..."#` instead when the task intentionally needs shell
+syntax such as pipelines, redirects, or variable expansion; `command` continues to run under
+`sh -c`. A runnable task must declare exactly one of `argv` or `command`.
 
 ### Scheduled work is coming soon, not implemented
 

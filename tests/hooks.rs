@@ -357,7 +357,7 @@ fn hook_free_claude_materialization_does_not_require_a_receipt() {
 }
 
 #[test]
-fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
+fn up_once_suppresses_an_expanded_direct_codex_agent_without_mutating_hooks() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
@@ -372,7 +372,7 @@ fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
         &declaration,
         format!(
             "agent \"worker\" {{\n  host \"h\"\n  workspace \"{}\"\n  \
-             env {{ ST_AGENT \"h.worker\" }}\n  command \"exec codex\"\n  \
+             env {{ ST_AGENT \"h.worker\" }}\n  argv \"$CODEX_BIN\"\n  \
              render {{ file \"hook-proof\" \"must-not-write\" }}\n}}\n",
             workspace.display()
         ),
@@ -391,6 +391,7 @@ fn up_once_suppresses_a_new_codex_agent_without_mutating_hooks() {
         .arg(&catalog)
         .args(["--host", "h", "--once"])
         .env("PATH", &bin)
+        .env("CODEX_BIN", "/opt/bin/codex")
         .output()
         .unwrap();
     assert!(output.status.success());
