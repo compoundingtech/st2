@@ -1785,6 +1785,7 @@ fn up(
 
     if materialize_only {
         let mut found = discover(&catalog_root);
+        let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
             let (owner, _, _) = st2::reconcile::resolve_task(&found.specs, selector, &this_host)?;
             let owner_identity = owner.identity.clone();
@@ -1809,7 +1810,12 @@ fn up(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
         }
-        let report = st2::materialize::materialize_catalog(&catalog_root, &found.specs, &this_host);
+        let report = st2::materialize::materialize_catalog_against(
+            &catalog_root,
+            &found.specs,
+            &ownership_specs,
+            &this_host,
+        );
         for item in &report.materialized {
             println!("{item}");
         }

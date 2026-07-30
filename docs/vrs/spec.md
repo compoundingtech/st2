@@ -74,6 +74,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   ordinary declaration space; only `.git` and `.st2` directories at any depth,
   the catalog root's `pty` child, and a declaration parent's `resources`,
   `archive`, and `inbox` children are excluded.
+  A resolved workspace-relative render destination has one coherent desired
+  state across the active local fleet: byte-equivalent idempotent claims may
+  share it, while incompatible
+  claims fail every conflicting owner before the first workspace write.
+  Targeted reconciliation checks the selected owner against the full fleet, so
+  selection cannot bypass this ownership boundary.
 - **R04:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads

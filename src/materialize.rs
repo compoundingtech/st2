@@ -3,7 +3,7 @@
 //! The runner stays harness-agnostic: these are generic, ordered file operations. Content operations
 //! gate an agent's boot; `git-exclude` is advisory and can never prevent a launch.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -452,6 +452,143 @@ enum PreparedOp {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum RenderClaim {
+    Replace(Vec<u8>),
+    JsonUpsert(serde_json::Value),
+    EnsureLine(String),
+}
+
+#[derive(Debug)]
+pub struct RenderOwnershipConflict {
+    pub destination: PathBuf,
+    pub owners: BTreeSet<String>,
+}
+
+impl RenderOwnershipConflict {
+    fn error(&self) -> String {
+        format!(
+            "conflicting render ownership for '{}': active agents {} declare incompatible content for one shared workspace target",
+            self.destination.display(),
+            self.owners.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+fn claims_for_agent(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<BTreeMap<PathBuf, Vec<RenderClaim>>> {
+    let plan = parse_plan(spec)?;
+    if plan.ops.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let workspace_raw = spec
+        .workspace
+        .as_deref()
+        .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
+    let env = render_env(root, spec, this_host);
+    let workspace = PathBuf::from(expand(workspace_raw, &env));
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
+    let spec_dir = spec.path.parent().unwrap_or(root);
+    let mut claims = BTreeMap::<PathBuf, Vec<RenderClaim>>::new();
+    for op in plan.ops {
+        let (destination, claim) = match op {
+            RenderOp::Copy {
+                source: raw_source,
+                destination: raw_destination,
+            } => {
+                let source = source(root, spec_dir, &raw_source, &env)?;
+                let bytes = fs::read(&source)
+                    .with_context(|| format!("reading copy source {}", source.display()))?;
+                (
+                    destination(&workspace, &raw_destination, &env)?,
+                    RenderClaim::Replace(bytes),
+                )
+            }
+            RenderOp::File {
+                destination: raw_destination,
+                content,
+            } => (
+                destination(&workspace, &raw_destination, &env)?,
+                RenderClaim::Replace(expand(&content, &env).into_bytes()),
+            ),
+            RenderOp::JsonUpsert {
+                destination: raw_destination,
+                content,
+            } => {
+                let patch = serde_json::from_str(&expand(&content, &env)).with_context(|| {
+                    format!(
+                        "expanded json-upsert for '{}' is not valid JSON",
+                        spec.identity
+                    )
+                })?;
+                (
+                    destination(&workspace, &raw_destination, &env)?,
+                    RenderClaim::JsonUpsert(patch),
+                )
+            }
+            RenderOp::EnsureLine {
+                destination: raw_destination,
+                line,
+            } => (
+                destination(&workspace, &raw_destination, &env)?,
+                RenderClaim::EnsureLine(expand(&line, &env)),
+            ),
+            // Every git-exclude is additive by contract and resolves through Git's own shared
+            // metadata path rather than a declared workspace-relative render destination.
+            RenderOp::GitExclude { .. } => continue,
+        };
+        claims.entry(destination).or_default().push(claim);
+    }
+    Ok(claims)
+}
+
+/// Find active local agents that declare incompatible desired content for one resolved workspace
+/// destination. Equivalent idempotent plans may share a target; differing plans have no implicit
+/// last-writer-wins semantics.
+pub fn render_ownership_conflicts(
+    root: &Path,
+    specs: &[AgentSpec],
+    this_host: &str,
+) -> Vec<RenderOwnershipConflict> {
+    let mut by_destination = BTreeMap::<PathBuf, BTreeMap<String, Vec<RenderClaim>>>::new();
+    for spec in specs {
+        if spec.retired || spec.resolved_host(this_host) != this_host {
+            continue;
+        }
+        let Ok(claims) = claims_for_agent(root, spec, this_host) else {
+            // The normal per-agent materialization path reports malformed plans and unavailable
+            // inputs. Ownership analysis only compares claims it can resolve without writing.
+            continue;
+        };
+        let owner = spec.bus_id(this_host);
+        for (destination, plan) in claims {
+            by_destination
+                .entry(destination)
+                .or_default()
+                .insert(owner.clone(), plan);
+        }
+    }
+
+    by_destination
+        .into_iter()
+        .filter_map(|(destination, claims)| {
+            let mut plans = claims.values();
+            let first = plans.next()?;
+            plans
+                .any(|plan| plan != first)
+                .then(|| RenderOwnershipConflict {
+                    destination,
+                    owners: claims.into_keys().collect(),
+                })
+        })
+        .collect()
+}
+
 /// Execute one agent's render plan in declaration order.
 pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
     let plan = parse_plan(spec)?;
@@ -699,12 +836,45 @@ pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<
 
 /// Materialize every active agent assigned to `this_host`.
 pub fn materialize_catalog(root: &Path, specs: &[AgentSpec], this_host: &str) -> MaterializeReport {
+    materialize_catalog_against(root, specs, specs, this_host)
+}
+
+/// Materialize `selected_specs` after checking their workspace target ownership against the complete
+/// active fleet. This preserves shortest-path selection while preventing a selected owner from
+/// bypassing a collision declared by an unselected sibling.
+pub fn materialize_catalog_against(
+    root: &Path,
+    selected_specs: &[AgentSpec],
+    ownership_specs: &[AgentSpec],
+    this_host: &str,
+) -> MaterializeReport {
     let mut report = MaterializeReport::default();
-    for spec in specs {
+    let selected_ids = selected_specs
+        .iter()
+        .map(|spec| spec.bus_id(this_host))
+        .collect::<HashSet<_>>();
+    for conflict in render_ownership_conflicts(root, ownership_specs, this_host) {
+        let affected = conflict
+            .owners
+            .iter()
+            .filter(|owner| selected_ids.contains(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        if affected.is_empty() {
+            continue;
+        }
+        report.failed_agents.extend(affected);
+        report.errors.push(conflict.error());
+    }
+
+    for spec in selected_specs {
         if spec.retired || spec.resolved_host(this_host) != this_host {
             continue;
         }
         let bus_id = spec.bus_id(this_host);
+        if report.failed_agents.contains(&bus_id) {
+            continue;
+        }
         match materialize_agent(root, spec, this_host) {
             Ok(notes) => {
                 for note in notes {

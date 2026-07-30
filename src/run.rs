@@ -998,9 +998,10 @@ pub fn up_once_selected(
             .push(format!("verify lifecycle hooks: {error}"));
         return Ok(report);
     }
-    let materialized = crate::materialize::materialize_catalog(
+    let materialized = crate::materialize::materialize_catalog_against(
         catalog_root,
         std::slice::from_ref(&owner),
+        &found.specs,
         this_host,
     );
     report.warnings.extend(materialized.warnings);
