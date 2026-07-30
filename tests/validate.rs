@@ -495,9 +495,9 @@ fn a_hand_authored_native_catalog_validates_without_errors() {
     let path = catalog.path().join("agents/h/worker/agent.kdl");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, declaration).unwrap();
-    std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
+    std::fs::create_dir_all(catalog.path().join("agents/h/worker/assets")).unwrap();
     std::fs::write(
-        catalog.path().join("_templates/h.worker.AGENTS.md"),
+        catalog.path().join("agents/h/worker/assets/AGENTS.md"),
         "# Worker\n",
     )
     .unwrap();

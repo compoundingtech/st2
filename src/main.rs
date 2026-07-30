@@ -120,40 +120,9 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// EXPERIMENTAL: generate one compact agent declaration plus catalog-owned templates. Hand-authored
-    /// KDL is canonical. Inspect the full generated KDL and every workspace `render {}` target before
-    /// materialization. The workspace remains untouched until `st2 up --materialize-only` or `st2 up`.
-    #[command(name = "compile-agent")]
-    CompileAgent {
-        /// Optional positional catalog folder. Prefer --catalog; defaults to $CATALOG, then the
-        /// standard st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog: Option<PathBuf>,
-        #[arg(long)]
-        identity: String,
-        #[arg(long, default_value = "worker")]
-        role: String,
-        /// The agent's workspace directory (its cwd).
-        #[arg(long)]
-        dir: String,
-        /// Persona source file to vendor into the catalog-owned overlay.
-        #[arg(long)]
-        persona: PathBuf,
-        #[arg(long, default_value = "claude")]
-        harness: String,
-        /// Host (defaults to the local hostname).
-        #[arg(long)]
-        host: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        supervisor: Option<String>,
-        /// Extra harness arg spliced into the seat's `exec claude/codex …` command before the boot
-        /// prompt (repeatable, hyphen values allowed) — e.g. `--extra-arg=--plugin-dir
-        /// --extra-arg=/path`. The st2 analog of a per-seat command edit; omit for a normal seat.
-        #[arg(long = "extra-arg", allow_hyphen_values = true)]
-        extra_arg: Vec<String>,
-    },
+    /// Transactionally publish one canonical Agent Spec into the live catalog.
+    #[command(subcommand)]
+    Agent(AgentCmd),
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
     /// tasks (stopping/crashing st2 never does). Idempotent.
     Down {
@@ -274,6 +243,47 @@ enum Command {
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Publish exactly one explicit-host, explicit-identity agent under a catalog-wide CAS lock.
+    Publish {
+        /// A canonical KDL file containing exactly one top-level `agent` node.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        spec: Option<PathBuf>,
+        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "spec",
+            conflicts_with = "spec"
+        )]
+        bundle: Option<PathBuf>,
+        /// Create only. An identical existing agent.kdl is reported as `unchanged`.
+        #[arg(
+            long,
+            required_unless_present = "expect_sha256",
+            conflicts_with = "expect_sha256"
+        )]
+        expect_absent: bool,
+        /// Replace only when the current agent.kdl has this lowercase SHA-256.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required_unless_present = "expect_absent",
+            conflicts_with = "expect_absent"
+        )]
+        expect_sha256: Option<String>,
+        /// Emit the typed publication result as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -564,6 +574,44 @@ fn main() -> Result<()> {
             interval,
         } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Agent(AgentCmd::Publish {
+            spec,
+            bundle,
+            expect_absent,
+            expect_sha256,
+            json,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let source = match (spec, bundle) {
+                (Some(path), None) => st2::agent_publish::PublishSource::Spec(path),
+                (None, Some(path)) => st2::agent_publish::PublishSource::Bundle(path),
+                _ => unreachable!("clap enforces one publication source"),
+            };
+            let expectation = match (expect_absent, expect_sha256) {
+                (true, None) => st2::agent_publish::PublishExpectation::Absent,
+                (false, Some(hash)) => st2::agent_publish::PublishExpectation::Sha256(hash),
+                _ => unreachable!("clap enforces one publication expectation"),
+            };
+            let result = st2::agent_publish::publish(st2::agent_publish::PublishRequest {
+                catalog,
+                source,
+                expectation,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {} {}",
+                    match result.status {
+                        st2::agent_publish::PublishStatus::Published => "published",
+                        st2::agent_publish::PublishStatus::Unchanged => "unchanged",
+                    },
+                    result.bus_id,
+                    result.path.display()
+                );
+            }
+            Ok(())
+        }
         Command::Agents {
             catalog,
             status,
@@ -571,24 +619,6 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
-        Command::CompileAgent {
-            catalog,
-            identity,
-            role,
-            dir,
-            persona,
-            harness,
-            host,
-            model,
-            supervisor,
-            extra_arg,
-        } => {
-            let catalog = catalog_arg(catalog)?;
-            compile_agent_cmd(
-                &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
-                extra_arg,
-            )
-        }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
                 anyhow::bail!(
@@ -636,43 +666,6 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_agent_cmd(
-    catalog: &Path,
-    identity: &str,
-    role: &str,
-    dir: &str,
-    persona: &Path,
-    harness: &str,
-    host: Option<String>,
-    model: Option<String>,
-    supervisor: Option<String>,
-    extra_arg: Vec<String>,
-) -> Result<()> {
-    let host = host.unwrap_or_else(detect_host);
-    let input = st2::compile_agent::AgentInput {
-        identity: identity.to_string(),
-        host: host.clone(),
-        role: role.to_string(),
-        harness: harness.to_string(),
-        model,
-        workspace: dir.to_string(),
-        supervisor,
-        extra_args: extra_arg,
-    };
-    let agent_dir = st2::compile_agent::compile_agent(&input, catalog, persona)
-        .with_context(|| format!("compiling agent '{identity}'"))?;
-    println!(
-        "compiled {host}.{identity} → {}  \
-         (next: st2 hooks install; st2 validate --catalog {}; st2 up --catalog {} --host {host} --materialize-only; then st2 up --catalog {} --host {host} --once)",
-        agent_dir.display(),
-        catalog.display(),
-        catalog.display(),
-        catalog.display()
-    );
-    Ok(())
 }
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
@@ -802,6 +795,8 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
 fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let host = host.unwrap_or_else(detect_host);
+    let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+        .context("acquire shared catalog-authoring lock for validation")?;
     let report = st2::validate::validate_for_host(&catalog_root, &host);
     let (errors, warnings) = (report.errors(), report.warnings());
 
@@ -1012,6 +1007,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
 
     // 3) Per this-host declaration: active tasks must be alive with fresh presence; retired tasks
     // must all be absent and need no presence file.
+    let _catalog_lock = st2::CatalogLock::shared(&catalog)
+        .context("acquire shared catalog-authoring lock for doctor snapshot")?;
     let found = discover(&catalog);
     for e in &found.errors {
         report_check(
@@ -1166,6 +1163,8 @@ fn agents_cmd(
         ctx.root = catalog;
     }
     let (root, host) = resolve_ctx(&ctx)?;
+    let _catalog_lock = st2::CatalogLock::shared(&root)
+        .context("acquire shared catalog-authoring lock for agent roster")?;
     let mut rows = st2::agents::roster(&root, &host);
     if let Some(f) = &status_filter {
         rows.retain(|r| r.status.as_str() == f);
@@ -1789,6 +1788,8 @@ fn up(
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     if materialize_only {
+        let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+            .context("acquire shared catalog-authoring lock for materialization")?;
         let mut found = discover(&catalog_root);
         let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
@@ -1956,6 +1957,8 @@ fn ls(root: &Path) -> Result<()> {
         }
         return Ok(());
     }
+    let _catalog_lock = st2::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for catalog listing")?;
     let found = discover(root);
 
     if found.specs.is_empty() {

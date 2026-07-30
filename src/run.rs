@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use serde::Deserialize;
 
 use crate::exec_backend::ExecBackend;
@@ -774,6 +775,18 @@ fn reconcile_pass(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
 ) -> UpReport {
+    let _catalog_lock = match crate::CatalogLock::shared(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "acquire shared catalog-authoring lock (pass skipped): {error:#}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -989,6 +1002,8 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    let _catalog_lock = crate::CatalogLock::shared(catalog_root)
+        .context("acquire shared catalog-authoring lock for selected reconcile")?;
     let found = crate::discovery::discover(catalog_root);
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
     let mut report = UpReport::default();
@@ -1108,6 +1123,8 @@ pub fn up_loop_specs(
 /// one operation that ends tasks (the Nomad model: stopping the supervisor never does). Idempotent:
 /// tasks already gone are simply not in the live set. Per-kill errors are collected, never fatal.
 pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let _catalog_lock = crate::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for teardown")?;
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),

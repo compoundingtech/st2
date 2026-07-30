@@ -122,3 +122,15 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+- **R22 Transactional catalog authoring:** One st2 publication operation admits
+  exactly one canonical KDL Agent Spec, with explicit host and identity, against
+  the complete prospective catalog. Publication is compare-and-swap, durable,
+  and atomic: readers observe either the previous declaration set or the next
+  complete set. Reconciliation holds one coherent declaration snapshot through
+  materialization, runtime observation, planning, and execution, so a retirement
+  cannot commit and then be followed by a launch from stale catalog input.
+  A durable incomplete-apply marker fences every declaration-plane snapshot and
+  action after a crashed whole-catalog apply; a resident supervisor stays alive
+  but performs zero lifecycle actions until the transaction is completed.
+  Presence, messages, context, and Resource state remain independently writable
+  and are never serialized behind catalog authoring.

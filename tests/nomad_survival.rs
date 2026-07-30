@@ -120,8 +120,7 @@ impl Fixture {
         (boots, heartbeat)
     }
 
-    /// Write a compact agent whose primary pty id is exactly its bus identity — the shape emitted
-    /// by current `compile-agent` catalogs.
+    /// Write a compact canonical agent whose primary pty id is exactly its bus identity.
     fn write_compact_agent(&self, identity: &str) {
         self.pty_sessions
             .borrow_mut()

@@ -89,6 +89,58 @@ renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/6
 and the portable Agent Spec envelope in
 [evals#41](https://github.com/compoundingtech/evals/issues/41).
 
+## Transactional catalog authoring
+
+`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
+(--expect-absent | --expect-sha256 HEX) --json` is the sole supported
+declaration writer. It accepts exactly one canonical KDL `agent` node with an
+explicit, path-safe host and identity. st2 no longer exposes an intent compiler:
+external renderers own the transformation from human intent to exact Agent Spec
+bytes or a create-only publication bundle.
+
+The persistent `<catalog>/.st2/catalog-authoring.lock` defines one cooperative
+read/write transaction domain:
+
+```text
+publisher (EX)  : snapshot input -> CAS -> full-catalog admission -> atomic publish + fsync
+reader (SH)     : discover -> materialize/observe -> plan -> execute
+state plane     : message | context | Resource | status                 (unlocked)
+```
+
+The publisher derives the destination from the captured declaration, replaces
+only `agent.kdl` for a hash-authorized update, and preserves all sibling runtime
+state. A bundle is create-only and is renamed from a hidden same-filesystem
+stage; retry reports `unchanged` only when every projected bundle file already
+matches. `--expect-absent` is idempotent for identical input.
+`--expect-sha256` rejects a stale writer. Full-catalog admission rejects any
+structural validation error before publication. The typed result is
+`published` or `unchanged`.
+
+The lock file is never removed: replacing its inode would split the transaction
+domain for processes that already hold it open. Reconciliation holds SH from
+discovery through execution. Validation, doctor, roster, listing,
+materialization-only, targeted reconciliation, and catalog teardown take a
+coherent SH snapshot. State-plane commands deliberately do not: their atomic
+files remain live while a declaration is admitted.
+
+`<catalog>/.st2/catalog-apply-incomplete` is the durable whole-catalog
+transaction fence. Any presence is authoritative, including malformed content.
+The reserved canonical record is:
+
+```json
+{"schema":"st2.catalog-apply-incomplete.v1","desiredStorePath":"/nix/store/..."}
+```
+
+After taking its authoring lock, st2 refuses publication, validation,
+materialization, teardown, roster, doctor, and catalog listing while the marker
+exists. One-shot and selected reconcile fail explicitly. A resident supervisor
+instead remains alive, reports a skipped/incomplete pass, and performs no
+runtime observation or lifecycle action, avoiding a service restart storm.
+Message, context, Resource, and status operations remain available. The future
+whole-catalog apply command owns marker creation, admission, durable apply,
+verification, and clearing inside one transaction; external lock execution and
+bypass flags are not part of the contract.
+
 ## Host-local scheduling and supervision
 
 ```text
