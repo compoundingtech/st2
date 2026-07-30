@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # Runtime compatibility gate: this is the smallest pty revision containing both the
+    # ambiguity-safe PID read and the single fleet-wide socket fallback budget.
+    pty.url = "github:compoundingtech/pty/6de78841e05ac5b9f4fbe844a71b6dfcc7c7f9a5";
+    pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -11,6 +15,7 @@
       self,
       nixpkgs,
       flake-utils,
+      pty,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -150,6 +155,43 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
+
+        # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
+        # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
+        # output and a wedged child; this check proves the healthy 0/75/100/500-seat path crosses
+        # both packaged binaries within st2's short outer deadline.
+        checks.pty-fleet-contract = pkgs.runCommand "st2-pty-fleet-contract-${version}" {
+          nativeBuildInputs = [
+            pkgs.coreutils
+            pty.packages.${system}.default
+            st2
+          ];
+        } ''
+          export HOME=$(mktemp -d)
+          catalog=$(mktemp -d)
+          mkdir -p "$catalog/agents/contract/gone"
+          printf '%s\n' \
+            'agent "gone" { host "contract"; retired #true; command "true" }' \
+            > "$catalog/agents/contract/gone/agent.kdl"
+
+          for fleet_size in 0 75 100 500; do
+            root=$(mktemp -d)
+            i=0
+            while test "$i" -lt "$fleet_size"; do
+              seat=$(printf 'seat-%03d' "$i")
+              : > "$root/$seat.sock"
+              printf '%s\n' "$$" > "$root/$seat.pid"
+              i=$((i + 1))
+            done
+
+            PTY_ROOT="$root" timeout 2s \
+              st2 doctor --catalog "$catalog" --host contract \
+              > "doctor-$fleet_size.out"
+            grep -F 'contract.gone retirement complete' "doctor-$fleet_size.out" >/dev/null
+          done
+
+          touch $out
+        '';
 
         # Smoke test that the built binary actually runs and its command tree is
         # wired, independent of the in-tree `cargo test`.

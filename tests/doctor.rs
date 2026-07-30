@@ -194,6 +194,36 @@ fn doctor_bounds_a_hung_pty_probe_and_reports_the_runtime_error() {
 }
 
 #[test]
+fn doctor_rejects_a_partial_pty_snapshot_atomically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/gone/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        declaration,
+        "agent \"gone\" { host \"h\"; retired #true; command \"true\" }\n",
+    )
+    .unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nprintf '[{\"name\":\"h.gone.agent\",\"status\":\"running\"},'\n",
+    );
+
+    let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("✗ task runtime readable"), "{stdout}");
+    assert!(stdout.contains("parsing `pty list --json`"), "{stdout}");
+    assert!(
+        !stdout.contains("retirement complete"),
+        "a valid prefix must never be consumed as a partial snapshot:\n{stdout}"
+    );
+}
+
+#[test]
 fn retired_declaration_is_healthy_when_tasks_and_presence_are_absent() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");

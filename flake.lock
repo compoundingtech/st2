@@ -34,10 +34,32 @@
         "type": "github"
       }
     },
+    "pty": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1784735673,
+        "narHash": "sha256-j3Tw85l2JmhnmwRCzHS5NB9/ERe4R0Dk3cHy1t3tbdc=",
+        "owner": "compoundingtech",
+        "repo": "pty",
+        "rev": "6de78841e05ac5b9f4fbe844a71b6dfcc7c7f9a5",
+        "type": "github"
+      },
+      "original": {
+        "owner": "compoundingtech",
+        "repo": "pty",
+        "rev": "6de78841e05ac5b9f4fbe844a71b6dfcc7c7f9a5",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "pty": "pty"
       }
     },
     "systems": {
