@@ -18,16 +18,36 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
 
-const EXEC_GENERATION_SCHEMA: &str = "st2.exec-generation.v1";
+const EXEC_GENERATION_SCHEMA_V1: &str = "st2.exec-generation.v1";
+const EXEC_GENERATION_SCHEMA_V2: &str = "st2.exec-generation.v2";
+
+/// Exact Linux cgroup-v2 capability published with a generation. Path names
+/// alone are never authority: retirement must reopen the path without
+/// symlinks and match both device and inode.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecIsolation {
+    pub kind: String,
+    pub unit: String,
+    pub cgroup_path: String,
+    pub cgroup_device: u64,
+    pub cgroup_inode: u64,
+}
 
 /// The immutable identity of one exec process generation.
 ///
@@ -42,6 +62,8 @@ pub struct ExecGeneration {
     pub created_at: String,
     pub start_time_ticks: u64,
     pub generation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<ExecIsolation>,
 }
 
 /// A generation observation is explicitly indeterminate when legacy evidence cannot safely identify
@@ -186,12 +208,50 @@ impl ExecBackend {
                     .with_context(|| format!("timestamping exec generation '{}'", target.pty_id));
             }
         };
+        let isolation = match crate::isolate::mode() {
+            crate::isolate::Isolation::Scope => match capture_scope_isolation(pid, &unit) {
+                Ok(isolation) => Some(isolation),
+                Err(error) => {
+                    // A legitimately short task can exit and have its `--collect` scope removed
+                    // before the parent gets scheduled to capture it. It no longer needs a kill
+                    // capability; retain a v1 record so observation/restart can report the exit.
+                    // A still-running task without exact scope authority is never published.
+                    let exited = unsafe {
+                        let mut status = 0;
+                        libc::waitpid(pid as i32, &mut status, libc::WNOHANG) == pid as i32
+                    };
+                    if exited {
+                        None
+                    } else {
+                        terminate_unpublished(pid);
+                        return Err(error).with_context(|| {
+                            format!("capturing exact exec scope '{}'", target.pty_id)
+                        });
+                    }
+                }
+            },
+            crate::isolate::Isolation::Detached | crate::isolate::Isolation::DegradedDetached => {
+                None
+            }
+        };
+        let schema = if isolation.is_some() {
+            EXEC_GENERATION_SCHEMA_V2
+        } else {
+            EXEC_GENERATION_SCHEMA_V1
+        };
         let generation = ExecGeneration {
-            schema: EXEC_GENERATION_SCHEMA.to_string(),
+            schema: schema.to_string(),
             pid,
-            generation_id: generation_id(&target.pty_id, pid, &created_at, start_time_ticks),
+            generation_id: generation_id(
+                &target.pty_id,
+                pid,
+                &created_at,
+                start_time_ticks,
+                isolation.as_ref(),
+            ),
             created_at,
             start_time_ticks,
+            isolation,
         };
         if let Err(error) = self.publish_generation(&target.pty_id, &generation) {
             // Publication is the ownership boundary. If it fails, tear down the otherwise-untracked
@@ -445,11 +505,12 @@ impl ExecBackend {
             }
         };
         let generation = ExecGeneration {
-            schema: EXEC_GENERATION_SCHEMA.to_string(),
+            schema: EXEC_GENERATION_SCHEMA_V1.to_string(),
             pid: pid as u32,
-            generation_id: generation_id(id, pid as u32, &created_at, start_time_ticks),
+            generation_id: generation_id(id, pid as u32, &created_at, start_time_ticks, None),
             created_at,
             start_time_ticks,
+            isolation: None,
         };
         // Observation is read-only. Existing legacy files remain unchanged until normal lifecycle
         // replacement; only future spawns publish strict JSON.
@@ -487,6 +548,100 @@ fn terminate_unpublished(pid: u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn capture_scope_isolation(pid: u32, unit: &str) -> anyhow::Result<ExecIsolation> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match capture_scope_isolation_once(pid, unit) {
+            Ok(capability) => return Ok(capability),
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_scope_isolation_once(pid: u32, unit: &str) -> anyhow::Result<ExecIsolation> {
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .with_context(|| format!("read /proc/{pid}/cgroup"))?;
+    let cgroup_path = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| anyhow::anyhow!("process {pid} is not in unified cgroup v2"))?;
+    anyhow::ensure!(
+        Path::new(cgroup_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(unit),
+        "process {pid} cgroup {:?} does not name exact scope {unit:?}",
+        cgroup_path
+    );
+
+    let control_group = Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=ControlGroup", "--value"])
+        .output()
+        .with_context(|| format!("query exact systemd scope {unit}"))?;
+    anyhow::ensure!(
+        control_group.status.success(),
+        "systemd did not confirm exact scope {unit}: {}",
+        String::from_utf8_lossy(&control_group.stderr).trim()
+    );
+    let control_group = String::from_utf8(control_group.stdout)?.trim().to_string();
+    anyhow::ensure!(
+        control_group == cgroup_path,
+        "scope {unit} ControlGroup {:?} differs from process cgroup {:?}",
+        control_group,
+        cgroup_path
+    );
+
+    let relative = cgroup_path
+        .strip_prefix('/')
+        .ok_or_else(|| anyhow::anyhow!("cgroup path must be absolute"))?;
+    anyhow::ensure!(
+        !relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".."),
+        "cgroup path contains an unsafe component"
+    );
+    let path = Path::new("/sys/fs/cgroup").join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("stat exact cgroup {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "exact cgroup is not a real directory: {}",
+        path.display()
+    );
+    let members = fs::read_to_string(path.join("cgroup.procs"))
+        .with_context(|| format!("read exact cgroup members {}", path.display()))?;
+    anyhow::ensure!(
+        members.lines().any(|line| line.trim() == pid.to_string()),
+        "exact scope {unit} does not contain leader {pid}"
+    );
+    for control in ["cgroup.freeze", "cgroup.events", "cgroup.kill"] {
+        let metadata = fs::symlink_metadata(path.join(control))
+            .with_context(|| format!("stat exact cgroup control {control}"))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "exact cgroup control {control} is not a real file"
+        );
+    }
+    Ok(ExecIsolation {
+        kind: "systemd-cgroup-v2-scope".to_string(),
+        unit: unit.to_string(),
+        cgroup_path: cgroup_path.to_string(),
+        cgroup_device: metadata.dev(),
+        cgroup_inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_scope_isolation(_pid: u32, _unit: &str) -> anyhow::Result<ExecIsolation> {
+    anyhow::bail!("exact cgroup-v2 scope capture is unsupported on this platform")
+}
+
 fn indeterminate(
     pid: Option<i32>,
     reason: impl Into<String>,
@@ -510,8 +665,26 @@ fn observation_alive_for_reconcile(observation: ExecGenerationObservation) -> bo
 }
 
 fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), String> {
-    if generation.schema != EXEC_GENERATION_SCHEMA {
+    if !matches!(
+        generation.schema.as_str(),
+        EXEC_GENERATION_SCHEMA_V1 | EXEC_GENERATION_SCHEMA_V2
+    ) {
         return Err(format!("unsupported schema {:?}", generation.schema));
+    }
+    match (generation.schema.as_str(), generation.isolation.as_ref()) {
+        (EXEC_GENERATION_SCHEMA_V1, None) => {}
+        (EXEC_GENERATION_SCHEMA_V2, Some(isolation)) => {
+            if isolation.kind != "systemd-cgroup-v2-scope"
+                || !isolation.unit.ends_with(".scope")
+                || !isolation.cgroup_path.starts_with('/')
+                || isolation.cgroup_path.contains("/../")
+                || isolation.cgroup_device == 0
+                || isolation.cgroup_inode == 0
+            {
+                return Err("invalid exact cgroup-v2 isolation capability".to_string());
+            }
+        }
+        _ => return Err("generation schema and isolation capability disagree".to_string()),
     }
     if generation.pid == 0 || generation.pid > i32::MAX as u32 {
         return Err("pid must be positive".to_string());
@@ -524,6 +697,7 @@ fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), Stri
         generation.pid,
         &generation.created_at,
         generation.start_time_ticks,
+        generation.isolation.as_ref(),
     );
     if generation.generation_id != expected {
         return Err("generationId does not match the generation fields".to_string());
@@ -561,14 +735,38 @@ fn generation_process_state(generation: &ExecGeneration) -> GenerationProcessSta
     }
 }
 
-fn generation_id(runtime_id: &str, pid: u32, created_at: &str, start_time_ticks: u64) -> String {
-    crate::task_inventory::generation_id(
+fn generation_id(
+    runtime_id: &str,
+    pid: u32,
+    created_at: &str,
+    start_time_ticks: u64,
+    isolation: Option<&ExecIsolation>,
+) -> String {
+    let base = crate::task_inventory::generation_id(
         "exec",
         runtime_id,
         pid,
         created_at,
         Some(start_time_ticks),
-    )
+    );
+    let Some(isolation) = isolation else {
+        return base;
+    };
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"st2.exec-generation.v2\0");
+    for field in [
+        base.as_bytes(),
+        isolation.kind.as_bytes(),
+        isolation.unit.as_bytes(),
+        isolation.cgroup_path.as_bytes(),
+        isolation.cgroup_device.to_string().as_bytes(),
+        isolation.cgroup_inode.to_string().as_bytes(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[cfg(target_os = "linux")]
@@ -699,23 +897,35 @@ mod generation_tests {
         backend.spawn(&target(id), temp.path()).unwrap();
         let raw = fs::read_to_string(backend.pid_path(id)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            value
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            [
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            keys == [
                 "createdAt",
                 "generationId",
                 "pid",
                 "schema",
-                "startTimeTicks"
-            ]
+                "startTimeTicks",
+            ] || keys
+                == [
+                    "createdAt",
+                    "generationId",
+                    "isolation",
+                    "pid",
+                    "schema",
+                    "startTimeTicks",
+                ],
+            "unexpected generation keys: {keys:?}"
         );
         let generation: ExecGeneration = serde_json::from_value(value).unwrap();
-        assert_eq!(generation.schema, EXEC_GENERATION_SCHEMA);
+        assert!(matches!(
+            generation.schema.as_str(),
+            EXEC_GENERATION_SCHEMA_V1 | EXEC_GENERATION_SCHEMA_V2
+        ));
         assert!(crate::task_inventory::is_rfc3339_utc_millis(
             &generation.created_at
         ));
@@ -725,7 +935,8 @@ mod generation_tests {
                 id,
                 generation.pid,
                 &generation.created_at,
-                generation.start_time_ticks
+                generation.start_time_ticks,
+                generation.isolation.as_ref(),
             )
         );
         assert!(matches!(
@@ -787,7 +998,7 @@ mod generation_tests {
         fs::write(
             backend.pid_path(id),
             format!(
-                "{{\"schema\":\"{EXEC_GENERATION_SCHEMA}\",\"pid\":{},\
+                "{{\"schema\":\"{EXEC_GENERATION_SCHEMA_V1}\",\"pid\":{},\
                  \"createdAt\":\"2026-07-31T00:00:00.000Z\",\"startTimeTicks\":1,\
                  \"generationId\":\"sha256:nope\",\"extra\":true}}",
                 std::process::id()
@@ -825,6 +1036,7 @@ mod generation_tests {
             generation.pid,
             &generation.created_at,
             generation.start_time_ticks,
+            generation.isolation.as_ref(),
         );
         backend.publish_generation(id, &generation).unwrap();
 
@@ -878,7 +1090,7 @@ mod generation_tests {
                 generation,
                 alive: true
             } if generation.pid == pid as u32
-                && generation.schema == EXEC_GENERATION_SCHEMA
+                && generation.schema == EXEC_GENERATION_SCHEMA_V1
                 && crate::task_inventory::is_rfc3339_utc_millis(&generation.created_at)
         ));
         assert_eq!(

@@ -117,6 +117,19 @@ impl DeclarationProjection {
     }
 }
 
+/// Recompute the canonical declaration-root digest while the caller retains a
+/// [`CatalogLock`] for `catalog`.
+///
+/// Lifecycle transactions use this instead of duplicating the projection
+/// algorithm. The lock is intentionally supplied by the caller so it can be
+/// held continuously from authority validation through the runtime mutation.
+pub fn declaration_root_sha256_locked(catalog: &Path) -> Result<String> {
+    let catalog = canonical_real_dir(catalog, "catalog")?;
+    let projection = project(&catalog, ProjectionSource::Current, &catalog)?;
+    validate_live_workspace_facts(&catalog, &projection.workspace_dirs)?;
+    Ok(projection.root_sha256)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectionSource {
     Current,
