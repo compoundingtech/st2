@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +25,10 @@ const TEMPLATE_MAX_DEPTH: usize = 8;
 const TEMPLATE_MAX_FILES: usize = 256;
 const TEMPLATE_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const TEMPLATE_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const PROJECTION_BUNDLE_MAX_DEPTH: usize = 16;
+const PROJECTION_BUNDLE_MAX_FILES: usize = 4096;
+const PROJECTION_BUNDLE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const PROJECTION_BUNDLE_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SnapshotRequest {
@@ -49,6 +53,15 @@ pub enum SnapshotStatus {
     Created,
     Unchanged,
 }
+
+#[path = "catalog_projection.rs"]
+mod projection;
+pub use projection::{
+    CatalogProjectionAdmission, CatalogProjectionAdmissionEvidence,
+    CatalogProjectionAdmissionException, CatalogProjectionApplyRequest, CatalogProjectionArtifact,
+    CatalogProjectionChild, CatalogProjectionEquality, CatalogProjectionReceipt,
+    CatalogProjectionRequest, CatalogProjectionResult, apply_projection_bundle, project_catalog,
+};
 
 #[derive(Debug)]
 pub struct ApplyRequest {
@@ -491,11 +504,27 @@ fn collect_canonical_specs(
     for host_entry in host_entries {
         let host_path = host_entry.path();
         ensure_safe_component(&host_entry.file_name(), "host")?;
-        ensure_real_dir(&host_path, "canonical host directory")?;
+        let host_metadata = fs::symlink_metadata(&host_path)?;
+        if host_metadata.is_file() && !host_metadata.file_type().is_symlink() {
+            continue;
+        }
+        anyhow::ensure!(
+            host_metadata.is_dir() && !host_metadata.file_type().is_symlink(),
+            "canonical host address is not a real directory: {}",
+            host_path.display()
+        );
         for identity_entry in sorted_entries(&host_path)? {
             let identity_path = identity_entry.path();
             ensure_safe_component(&identity_entry.file_name(), "identity")?;
-            ensure_real_dir(&identity_path, "canonical identity directory")?;
+            let identity_metadata = fs::symlink_metadata(&identity_path)?;
+            if identity_metadata.is_file() && !identity_metadata.file_type().is_symlink() {
+                continue;
+            }
+            anyhow::ensure!(
+                identity_metadata.is_dir() && !identity_metadata.file_type().is_symlink(),
+                "canonical identity address is not a real directory: {}",
+                identity_path.display()
+            );
             let spec = identity_path.join("agent.kdl");
             match fs::symlink_metadata(&spec) {
                 Ok(metadata) => {
@@ -1361,6 +1390,150 @@ pub(crate) fn capture_real_tree(source: &Path, destination: &Path) -> Result<()>
     capture_tree(source, destination, CaptureMode::General)
 }
 
+/// Capture the exact closed projection-bundle shape through retained descriptors with resource
+/// bounds applied before bytes are copied.
+pub(crate) fn capture_projection_bundle(source: &Path, destination: &Path) -> Result<()> {
+    let source = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(source)
+        .context("open retained projection bundle")?;
+    let names = capability_dir_entries_bounded(&source, 6)?;
+    let expected = [
+        "adopt-only",
+        "bundle.sha256",
+        "provider-witness",
+        "receipt.json",
+        "service",
+    ];
+    anyhow::ensure!(
+        names.iter().map(|name| name.to_string_lossy()).eq(expected),
+        "projection bundle must contain exactly service, adopt-only, provider-witness, receipt.json, and bundle.sha256"
+    );
+    let source_root = retained_dir_path(&source)?.canonicalize()?;
+    let destination_root = destination.canonicalize()?;
+    anyhow::ensure!(
+        !destination_root.starts_with(&source_root),
+        "projection bundle capture destination is contained by its source"
+    );
+    let mut budget = ProjectionBundleCaptureBudget::default();
+    for name in names {
+        budget.visit_entry()?;
+        let input = openat_nofollow(&source, &name)?;
+        let metadata = input.metadata()?;
+        let target = destination.join(&name);
+        let text = name.to_string_lossy();
+        if matches!(text.as_ref(), "service" | "adopt-only" | "provider-witness") {
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "projection child must be a real directory"
+            );
+            fs::create_dir(&target)?;
+            capture_projection_bundle_dir(&input, &target, 0, &mut budget)?;
+        } else {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "projection receipt/digest must be a real file"
+            );
+            capture_projection_bundle_file(input, &target, &metadata, &mut budget)?;
+        }
+    }
+    sync_tree_dirs(destination)
+}
+
+#[derive(Default)]
+struct ProjectionBundleCaptureBudget {
+    entries: usize,
+    files: usize,
+    bytes: u64,
+}
+
+impl ProjectionBundleCaptureBudget {
+    fn visit_entry(&mut self) -> Result<()> {
+        self.entries += 1;
+        anyhow::ensure!(
+            self.entries <= PROJECTION_BUNDLE_MAX_FILES,
+            "projection bundle exceeds {PROJECTION_BUNDLE_MAX_FILES} filesystem entries"
+        );
+        Ok(())
+    }
+}
+
+fn capture_projection_bundle_dir(
+    source: &File,
+    destination: &Path,
+    depth: usize,
+    budget: &mut ProjectionBundleCaptureBudget,
+) -> Result<()> {
+    anyhow::ensure!(
+        depth <= PROJECTION_BUNDLE_MAX_DEPTH,
+        "projection bundle exceeds maximum depth {PROJECTION_BUNDLE_MAX_DEPTH}"
+    );
+    let remaining = PROJECTION_BUNDLE_MAX_FILES.saturating_sub(budget.entries);
+    for name in capability_dir_entries_bounded(source, remaining)? {
+        budget.visit_entry()?;
+        let input = openat_nofollow(source, &name)?;
+        let metadata = input.metadata()?;
+        let target = destination.join(&name);
+        if metadata.is_dir() {
+            fs::create_dir(&target)?;
+            capture_projection_bundle_dir(&input, &target, depth + 1, budget)?;
+        } else if metadata.is_file() {
+            capture_projection_bundle_file(input, &target, &metadata, budget)?;
+        } else {
+            anyhow::bail!(
+                "projection bundle contains a symlink or special entry: {}",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn capture_projection_bundle_file(
+    mut input: File,
+    target: &Path,
+    metadata: &fs::Metadata,
+    budget: &mut ProjectionBundleCaptureBudget,
+) -> Result<()> {
+    anyhow::ensure!(
+        metadata.nlink() == 1,
+        "projection bundle contains a hard-linked file: {}",
+        target.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= PROJECTION_BUNDLE_MAX_FILE_BYTES,
+        "projection bundle file exceeds {PROJECTION_BUNDLE_MAX_FILE_BYTES} bytes"
+    );
+    budget.files += 1;
+    budget.bytes = budget.bytes.saturating_add(metadata.len());
+    anyhow::ensure!(
+        budget.files <= PROJECTION_BUNDLE_MAX_FILES,
+        "projection bundle exceeds {PROJECTION_BUNDLE_MAX_FILES} files"
+    );
+    anyhow::ensure!(
+        budget.bytes <= PROJECTION_BUNDLE_MAX_TOTAL_BYTES,
+        "projection bundle exceeds {PROJECTION_BUNDLE_MAX_TOTAL_BYTES} bytes"
+    );
+    let executable = metadata.permissions().mode() & 0o111 != 0;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(if executable { 0o755 } else { 0o644 })
+        .open(target)?;
+    let copied = std::io::copy(
+        &mut std::io::Read::by_ref(&mut input).take(PROJECTION_BUNDLE_MAX_FILE_BYTES + 1),
+        &mut output,
+    )?;
+    anyhow::ensure!(
+        copied == metadata.len(),
+        "projection bundle file changed while captured: {}",
+        target.display()
+    );
+    output.sync_all()?;
+    Ok(())
+}
+
 fn capture_prepared_catalog(source: &Path, destination: &Path) -> Result<()> {
     capture_tree(source, destination, CaptureMode::PreparedCatalog)
 }
@@ -1495,6 +1668,20 @@ fn capability_dir_entries(dir: &File) -> Result<Vec<std::ffi::OsString>> {
     let mut names = fs::read_dir(&path)?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn capability_dir_entries_bounded(dir: &File, maximum: usize) -> Result<Vec<std::ffi::OsString>> {
+    let path = retained_dir_path(dir)?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&path)? {
+        anyhow::ensure!(
+            names.len() < maximum,
+            "projection bundle filesystem entries exceed bounded enumeration"
+        );
+        names.push(entry?.file_name());
+    }
     names.sort();
     Ok(names)
 }

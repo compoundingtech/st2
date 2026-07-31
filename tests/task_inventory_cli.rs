@@ -62,6 +62,27 @@ fn tasks(catalog: &Path, bin: &Path, state: &Path) -> Output {
         .unwrap()
 }
 
+fn tasks_selected(catalog: &Path, bin: &Path, state: &Path, desired_state: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "tasks",
+            "--host",
+            "h",
+            "--desired-state",
+            desired_state,
+            "--json",
+            "--catalog",
+        ])
+        .arg(catalog)
+        .env("PATH", bin)
+        .env("XDG_STATE_HOME", state)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .output()
+        .unwrap()
+}
+
 struct RealPtyCleanup {
     root: PathBuf,
     id: &'static str,
@@ -168,6 +189,10 @@ fn tasks_cli_emits_stable_complete_generation_without_doctor_prose() {
     assert_eq!(first.stdout, second.stdout, "unchanged generation drifted");
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(value["schema"], "st2.task-inventory.v1");
+    assert_eq!(
+        value["selection"]["desiredStates"],
+        serde_json::json!(["running", "absent"])
+    );
     assert_eq!(value["complete"], true);
     assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(value["tasks"][0]["agent"], "h.worker");
@@ -184,6 +209,45 @@ fn tasks_cli_emits_stable_complete_generation_without_doctor_prose() {
             .unwrap()
             .starts_with("sha256:")
     );
+}
+
+#[test]
+fn desired_state_is_closed_and_running_scope_excludes_retired_before_observation() {
+    let (tmp, catalog, bin) = fixture(
+        r#"[{"name":"h.worker","status":"running","pid":77,"createdAt":"2026-07-31T10:00:00.000Z"}]"#,
+    );
+    fs::create_dir_all(catalog.join("agents/h/retired")).unwrap();
+    fs::write(
+        catalog.join("agents/h/retired/agent.kdl"),
+        r#"
+agent "retired" {
+  host "h"
+  retired #true
+  pty "agent" {
+    id "h.retired"
+  }
+}
+"#,
+    )
+    .unwrap();
+    let running = tasks_selected(&catalog, &bin, &tmp.path().join("state"), "running");
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&running.stdout).unwrap();
+    assert_eq!(
+        value["selection"]["desiredStates"],
+        serde_json::json!(["running"])
+    );
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(value["tasks"][0]["runtimeId"], "h.worker");
+
+    let invalid = tasks_selected(&catalog, &bin, &tmp.path().join("state"), "stopped");
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("possible values: running, absent"));
 }
 
 #[test]

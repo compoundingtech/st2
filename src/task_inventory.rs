@@ -16,6 +16,29 @@ use crate::Discovered;
 
 pub const TASK_INVENTORY_SCHEMA: &str = "st2.task-inventory.v1";
 
+/// Optional closed desired-state selection. Omission means both states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DesiredStateSelection {
+    Running,
+    Absent,
+}
+
+impl DesiredStateSelection {
+    fn matches(self, retired: bool) -> bool {
+        matches!(
+            (self, retired),
+            (Self::Running, false) | (Self::Absent, true)
+        )
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Absent => "absent",
+        }
+    }
+}
+
 /// Opaque identity over one backend's stable process-generation evidence.
 pub(crate) fn generation_id(
     backend: &str,
@@ -165,17 +188,30 @@ pub struct TaskInventory {
     schema: &'static str,
     catalog: PathBuf,
     host: String,
+    selection: TaskSelection,
     complete: bool,
     errors: Vec<String>,
     tasks: Vec<TaskRow>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskSelection {
+    desired_states: Vec<&'static str>,
+}
+
 impl TaskInventory {
-    pub fn incomplete(catalog: PathBuf, host: String, error: String) -> Self {
+    pub fn incomplete(
+        catalog: PathBuf,
+        host: String,
+        error: String,
+        selection: Option<DesiredStateSelection>,
+    ) -> Self {
         Self {
             schema: TASK_INVENTORY_SCHEMA,
             catalog,
             host,
+            selection: selection_receipt(selection),
             complete: false,
             errors: vec![error],
             tasks: Vec::new(),
@@ -233,6 +269,7 @@ pub fn inventory(
     host: &str,
     found: &Discovered,
     observer: &dyn RuntimeObserver,
+    selection: Option<DesiredStateSelection>,
 ) -> TaskInventory {
     let mut errors = found
         .errors
@@ -282,6 +319,9 @@ pub fn inventory(
         }
     }
 
+    // Catalog/identity/duplicate admission above is global. Desired-state selection is applied
+    // only after those declaration errors are known, and before any runtime backend observation.
+    desired.retain(|task| selection.is_none_or(|selection| selection.matches(task.retired)));
     let desired_runtimes = desired
         .iter()
         .map(|task| DesiredRuntime {
@@ -403,9 +443,19 @@ pub fn inventory(
         schema: TASK_INVENTORY_SCHEMA,
         catalog: catalog.to_path_buf(),
         host: host.to_owned(),
+        selection: selection_receipt(selection),
         complete: errors.is_empty() && observation_complete,
         errors,
         tasks,
+    }
+}
+
+fn selection_receipt(selection: Option<DesiredStateSelection>) -> TaskSelection {
+    TaskSelection {
+        desired_states: match selection {
+            Some(selection) => vec![selection.wire_name()],
+            None => vec!["running", "absent"],
+        },
     }
 }
 
@@ -417,6 +467,7 @@ fn push_error(errors: &mut Vec<String>, error: String) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
 
     use serde_json::Value;
@@ -432,6 +483,21 @@ mod tests {
         }
     }
 
+    struct RecordingObserver {
+        desired: RefCell<Vec<String>>,
+        batch: ObservationBatch,
+    }
+
+    impl RuntimeObserver for RecordingObserver {
+        fn observe(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+            *self.desired.borrow_mut() = desired
+                .iter()
+                .map(|runtime| runtime.runtime_id.clone())
+                .collect();
+            self.batch.clone()
+        }
+    }
+
     fn write_agent(catalog: &Path, host: &str, identity: &str, body: &str) {
         let dir = catalog.join("agents").join(host).join(identity);
         fs::create_dir_all(&dir).unwrap();
@@ -444,8 +510,10 @@ mod tests {
 
     fn json(catalog: &Path, host: &str, observer: ObservationBatch) -> serde_json::Value {
         let found = crate::discover(catalog);
-        serde_json::from_str(&inventory(catalog, host, &found, &FixedObserver(observer)).to_json())
-            .unwrap()
+        serde_json::from_str(
+            &inventory(catalog, host, &found, &FixedObserver(observer), None).to_json(),
+        )
+        .unwrap()
     }
 
     fn running(id: &str, pid: u32) -> RuntimeObservation {
@@ -496,6 +564,10 @@ mod tests {
         assert_eq!(value["schema"], TASK_INVENTORY_SCHEMA);
         assert_eq!(value["catalog"], tmp.path().to_str().unwrap());
         assert_eq!(value["host"], "h");
+        assert_eq!(
+            value["selection"]["desiredStates"],
+            serde_json::json!(["running", "absent"])
+        );
         assert_eq!(value["complete"], true);
         assert_eq!(value["errors"], Value::Array(vec![]));
         assert_eq!(value["tasks"].as_array().unwrap().len(), 2);
@@ -595,6 +667,102 @@ mod tests {
         assert_eq!(value["tasks"][0]["desiredState"], "absent");
         assert_eq!(value["tasks"][0]["runtime"]["state"], "running");
         assert_eq!(value["tasks"][0]["runtime"]["pid"], 42);
+    }
+
+    #[test]
+    fn running_selection_filters_before_observation_and_serializes_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "active",
+            r#"pty "agent" { id "h.active"; argv "agent-bin" }"#,
+        );
+        write_agent(
+            tmp.path(),
+            "h",
+            "retired",
+            r#"retired #true; pty "agent" { id "h.retired" }"#,
+        );
+        let observer = RecordingObserver {
+            desired: RefCell::new(Vec::new()),
+            batch: ObservationBatch {
+                complete: true,
+                observations: vec![running("h.active", 7)],
+                errors: vec![],
+            },
+        };
+        let found = crate::discover(tmp.path());
+        let value: Value = serde_json::from_str(
+            &inventory(
+                tmp.path(),
+                "h",
+                &found,
+                &observer,
+                Some(DesiredStateSelection::Running),
+            )
+            .to_json(),
+        )
+        .unwrap();
+        assert_eq!(&*observer.desired.borrow(), &["h.active"]);
+        assert_eq!(
+            value["selection"]["desiredStates"],
+            serde_json::json!(["running"])
+        );
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(value["tasks"][0]["runtimeId"], "h.active");
+    }
+
+    #[test]
+    fn selection_keeps_global_errors_and_selected_runtime_uncertainty() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "active",
+            r#"pty "agent" { id "shared"; argv "agent-bin" }"#,
+        );
+        write_agent(
+            tmp.path(),
+            "h",
+            "retired",
+            r#"retired #true; pty "agent" { id "shared" }"#,
+        );
+        let found = crate::discover(tmp.path());
+        let value: Value = serde_json::from_str(
+            &inventory(
+                tmp.path(),
+                "h",
+                &found,
+                &FixedObserver(ObservationBatch {
+                    complete: true,
+                    observations: vec![RuntimeObservation {
+                        runtime_id: "shared".into(),
+                        state: ObservedState::Indeterminate("selected runtime unreadable".into()),
+                    }],
+                    errors: vec![],
+                }),
+                Some(DesiredStateSelection::Running),
+            )
+            .to_json(),
+        )
+        .unwrap();
+        assert_eq!(value["complete"], false);
+        assert!(
+            value["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error.as_str().unwrap().contains("duplicate runtime id"))
+        );
+        assert!(
+            value["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error.as_str().unwrap().contains("unreadable"))
+        );
     }
 
     #[test]

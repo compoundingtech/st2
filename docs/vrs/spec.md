@@ -149,6 +149,86 @@ identical retry is `unchanged`. Its domain-separated, path-sorted root SHA-256
 covers normalized relative paths, file bytes, executable bits, and empty
 workspace directory facts.
 
+`st2 catalog project --catalog ROOT --snapshot DIR --expect-sha256 HEX
+--output DIR --json` derives one create-only, atomically published migration
+bundle from one retained snapshot capture. `ROOT` is read only and supplies
+the canonical logical address needed to interpret absolute catalog-local
+workspace facts; the receipt binds that address and the source root digest.
+The snapshot argument must be its canonical absolute path, and the resolved
+create-only output must be beneath neither the snapshot nor `ROOT`, including
+through a symlinked parent.
+The bundle is closed and restart-safe:
+
+```text
+DIR/
+  service/           exact retained declaration projection
+  adopt-only/        exact declarations; every PTY lifecycle is adopt-only
+  provider-witness/  all Agent identities and Resources; active PTYs only,
+                     all exec/Ding and retired desired-absent PTYs suppressed
+  receipt.json       source/child roots, typed predecessors, identity sets,
+                     active/retired partition
+  bundle.sha256      domain hash of receipt bytes and the three child roots
+```
+
+Projection parses and transforms canonical KDL nodes; it never edits KDL as
+text or reconstructs direct argv through a shell. `service` and `adopt-only`
+retain every Agent identity, Resource, provider task ID, exec task ID, and
+retired provider declaration. `provider-witness` retains every Agent identity
+and Resource, while its provider task IDs equal exactly the source's active
+provider partition. The receipt separately records all Agent IDs,
+provider-bearing Agent IDs, every provider task ID, active provider task IDs,
+retired desired-absent provider task IDs, exec task IDs, and the equality
+proofs between projections. A pre-existing output is an error rather than an
+implicit recovery mode.
+Immediately before receipt construction, all three materialized private-stage
+children are independently reprojected and their actual roots and identity
+sets become the attested values.
+
+Projection admission may carry one exact pre-existing error class,
+`render-owner-conflict`, as sorted path/agent/message evidence and sets
+`admission.applyAdmissible` to false. Every other structural, parsing, path,
+identity, or task error rejects projection. This exception creates evidence;
+it grants no apply or reconcile authority. Ordinary `catalog apply` retains
+full admission and rejects the bundle until those conflicts are resolved.
+Regular files directly beneath `agents/` or `agents/<host>/` are outside the
+canonical host/identity address grammar and excluded; symlinks and special
+nodes at those positions still fail closed.
+
+`st2 catalog apply` has exactly three closed modes: ordinary
+`--prepared DIR --expect-sha256 HEX`, typed projected
+`--projection-bundle DIR --projection-child service|adopt-only
+--expect-bundle-sha256 HEX --expect-sha256 HEX`, or `--resume`. The mandatory
+bundle digest is the caller-held capability returned by `catalog project`; the
+bundle's own digest file is never sufficient authority. Projected apply first
+requires the exact five-entry outer shape, then captures the complete public
+bundle once through retained no-follow descriptors with explicit depth,
+filesystem-entry-count, per-file, and total-byte bounds. It reparses the private typed
+receipt, verifies the exact receipt bytes and outer bundle digest, requires
+`expect-sha256` to equal the selected child's receipt-bound predecessor and the
+receipt's canonical `logicalCatalog` to equal `ROOT`, and reprojects all three
+materialized private children against their receipt roots, entry counts,
+identity sets, and projection admission. Only then does the selected child
+enter the same ordinary full-admission/CAS transaction without reopening the
+public bundle. `provider-witness` is
+deliberately not apply authority. A child root digest alone cannot authorize
+reuse at another catalog address.
+
+The receipt's closed transition graph is:
+
+```text
+service/source root --apply adopt-only--> adopt-only root
+adopt-only root     --apply service-----> service/source root
+provider-witness                         no apply predecessor
+```
+
+Each edge names exactly one predecessor digest; arbitrary child transitions
+are rejected before ordinary apply. A completed-edge retry remains idempotent
+because ordinary apply returns `unchanged` when the current root already equals
+the selected target before evaluating the predecessor CAS. Once a durable apply
+marker exists, generic `catalog apply --resume` uses only its captured
+content-addressed stage and predecessor record; replaying the bundle is rejected
+until recovery completes.
+
 `st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
 rejects any prepared state/control path, symlink, special node, unprojected
 file/directory, malformed declaration, nonempty prepared workspace fact,
@@ -207,6 +287,17 @@ precondition already passed, so recovery converges the partial live tree from
 the durable desired stage and original owned-leaf list without re-enforcing
 that stale precondition. Malformed or mismatched records remain fenced.
 External lock execution and bypass flags are not part of the contract.
+
+`st2 tasks --desired-state running|absent --json` optionally scopes the typed
+runtime receipt to one closed desired-state set. Omission retains the original
+all-task behavior and serializes `selection.desiredStates` as
+`["running","absent"]`; a selected receipt serializes its one selected value.
+Catalog parse errors and duplicate runtime IDs are derived globally before
+selection. Selection then filters desired rows before backend observation, so
+the observer receives only selected runtime IDs and completeness/runtime
+errors are scoped to that selected set. A retired desired-absent task therefore
+cannot make a `running` receipt incomplete, while an indeterminate active task
+still does. Selection never turns a global declaration error into success.
 
 ## Host-local scheduling and supervision
 
