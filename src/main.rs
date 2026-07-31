@@ -141,6 +141,10 @@ enum Command {
         persona: PathBuf,
         #[arg(long, default_value = "claude")]
         harness: String,
+        /// Add an argv-local Codex project trust override for the exact workspace. This is opt-in
+        /// and requires `--harness codex`.
+        #[arg(long)]
+        trust_workspace: bool,
         /// Host (defaults to the local hostname).
         #[arg(long)]
         host: Option<String>,
@@ -268,6 +272,16 @@ enum Command {
         enrich: bool,
         #[command(flatten)]
         ctx: MsgCtx,
+    },
+    /// Emit one fail-closed desired-task/runtime diagnostic snapshot. This is
+    /// read-only observation, not reconciliation or cutover authority.
+    Tasks {
+        /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
     },
     /// EXPERIMENTAL, READ-ONLY: parse, validate, and inspect versioned catalog plans.
     #[command(subcommand)]
@@ -616,6 +630,13 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
+        Command::Tasks { host, json } => {
+            if !json {
+                anyhow::bail!("`st2 tasks` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            tasks_cmd(&catalog, host)
+        }
         Command::Plan(command) => plan_cmd(command),
         Command::CompileAgent {
             catalog,
@@ -624,6 +645,7 @@ fn main() -> Result<()> {
             dir,
             persona,
             harness,
+            trust_workspace,
             host,
             model,
             supervisor,
@@ -631,7 +653,16 @@ fn main() -> Result<()> {
         } => {
             let catalog = catalog_arg(catalog)?;
             compile_agent_cmd(
-                &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
+                &catalog,
+                &identity,
+                &role,
+                &dir,
+                &persona,
+                &harness,
+                trust_workspace,
+                host,
+                model,
+                supervisor,
                 extra_arg,
             )
         }
@@ -845,6 +876,7 @@ fn compile_agent_cmd(
     dir: &str,
     persona: &Path,
     harness: &str,
+    trust_workspace: bool,
     host: Option<String>,
     model: Option<String>,
     supervisor: Option<String>,
@@ -856,6 +888,7 @@ fn compile_agent_cmd(
         host: host.clone(),
         role: role.to_string(),
         harness: harness.to_string(),
+        trust_workspace,
         model,
         workspace: dir.to_string(),
         supervisor,
@@ -1308,6 +1341,33 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         Ok(())
     } else {
         anyhow::bail!("{problems} problem(s) found")
+    }
+}
+
+fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = match root.canonicalize() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let detail = format!("canonicalize catalog {}: {error}", root.display());
+            let inventory =
+                st2::task_inventory::TaskInventory::incomplete(root.to_path_buf(), host, detail);
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let found = discover(&catalog);
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    let after = discover(&catalog);
+    if !st2::task_inventory::same_discovery(&found, &after) {
+        inventory.mark_incomplete("catalog declarations changed during task observation");
+    }
+    println!("{}", inventory.to_json());
+    if inventory.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("task inventory incomplete")
     }
 }
 
@@ -2098,6 +2158,7 @@ fn up(
 
 fn print_report(report: &UpReport) {
     report_line("launched", &report.launched);
+    report_line("restarted", &report.restarted);
     report_line("torn down", &report.torn_down);
     report_line("gc", &report.gc);
     report_line("held", &report.held);

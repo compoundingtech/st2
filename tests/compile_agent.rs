@@ -251,9 +251,129 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     let kdl = fs::read_to_string(catalog.join("agents/h/worker/agent.kdl")).unwrap();
     assert!(kdl.contains("argv \"codex\""));
     assert!(!kdl.contains("exec codex"));
+    assert!(!kdl.contains("\"-c\""));
+    assert!(!kdl.contains("projects="));
     assert!(kdl.contains("set status busy"));
     assert!(kdl.contains("--dangerously-bypass-hook-trust"));
     assert!(kdl.contains("json-upsert \".codex/hooks.json\""));
+}
+
+#[test]
+fn compile_agent_opt_in_codex_trust_roundtrips_workspace_bytes_through_toml_and_kdl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp
+        .path()
+        .join("workspace with 'single \"# double and \\backslash");
+    let hooks_root = tmp.path().join("hooks");
+    let persona = tmp.path().join("worker.md");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&persona, "# Worker\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("compile-agent")
+        .arg(&catalog)
+        .args([
+            "--role",
+            "worker",
+            "--identity",
+            "worker",
+            "--host",
+            "h",
+            "--harness",
+            "codex",
+            "--trust-workspace",
+        ])
+        .arg("--dir")
+        .arg(&workspace)
+        .arg("--persona")
+        .arg(&persona)
+        .env("ST_HOOKS", &hooks_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    let workspace_text = workspace.to_str().unwrap();
+    assert_eq!(spec.workspace.as_deref(), Some(workspace_text));
+    let argv = spec
+        .tasks
+        .iter()
+        .find(|task| task.name == "agent")
+        .and_then(|task| task.argv.as_deref())
+        .unwrap();
+    let report = st2::validate::validate(&catalog);
+    assert_eq!(
+        report.errors(),
+        0,
+        "generated output must validate: {:?}",
+        report.issues
+    );
+
+    assert_eq!(argv.first().map(String::as_str), Some("codex"));
+    assert_eq!(argv.get(1).map(String::as_str), Some("-c"));
+    let config = argv.get(2).unwrap();
+    let config = config.parse::<toml::Table>().unwrap();
+    let projects = config["projects"].as_table().unwrap();
+    let (key, project) = projects.iter().next().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(key.as_bytes(), workspace_text.as_bytes());
+    assert_eq!(
+        project["trust_level"].as_str(),
+        Some("trusted"),
+        "argv: {argv:?}"
+    );
+}
+
+#[test]
+fn compile_agent_rejects_workspace_trust_for_non_codex_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    let persona = tmp.path().join("worker.md");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&persona, "# Worker\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("compile-agent")
+        .arg(&catalog)
+        .args([
+            "--identity",
+            "worker",
+            "--host",
+            "h",
+            "--harness",
+            "claude",
+            "--trust-workspace",
+        ])
+        .arg("--dir")
+        .arg(&workspace)
+        .arg("--persona")
+        .arg(&persona)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--trust-workspace requires --harness codex"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !catalog.exists(),
+        "a rejected trust/harness combination wrote catalog output"
+    );
 }
 
 #[test]

@@ -98,7 +98,11 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 ```
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`.
+`copy` under `$CATALOG/_templates`. The maintained declaration does not add workspace trust.
+`compile-agent` also omits trust by default. Pass `--harness codex --trust-workspace` to opt in to an
+argv-local Codex `projects` trust override. The generator serializes the declared workspace as the
+exact decoded key; other harnesses reject the flag. This is a launch convention inside opaque argv,
+not agent-spec grammar enforced by st2.
 
 The compact declaration shape is:
 
@@ -295,6 +299,29 @@ For a foreground supervisor on any host:
 ```sh
 st2 up --catalog "$CATALOG" --host <host>
 ```
+
+### Typed task inventory (diagnostic only)
+
+Use the typed inventory instead of parsing `doctor` prose:
+
+```sh
+st2 tasks --catalog "$CATALOG" --host <host> --json
+```
+
+The `st2.task-inventory.v1` envelope joins the selected host's desired PTY and exec tasks to
+read-only runtime evidence. A complete observation exits zero. Catalog parse errors, declaration
+drift during observation, duplicate runtime IDs, timeouts, malformed output, PID reuse, and
+otherwise unprovable generations emit `complete: false` and exit non-zero. Missing runtime rows
+become `absent` only when the corresponding backend observation is complete; uncertainty remains
+`indeterminate`.
+
+A PTY root positively absent at admission is not passed to `pty` and remains absent; an absent exec
+state root likewise remains absent. If an admitted PTY root is concurrently removed, the result is
+incomplete because its filesystem identity changed, but the external `pty list` implementation may
+recreate its registry before st2 can detect the race. Observation never rewrites an existing exec PID
+record. It also does not serialize catalog or runtime writers, reconcile tasks, or authorize a
+control-plane cutover. Consumers that require a zero-write boundary under concurrent root deletion
+or a transactional declaration boundary need a separate protocol.
 
 ### Staged control-plane replacement gate
 

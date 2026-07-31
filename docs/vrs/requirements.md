@@ -52,6 +52,16 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R22 Quiet coordination after events:** A network with minimal or default
+  personas stays quiet while useful work continues. Agents coordinate only after
+  an inbox DING, a durable failure, a real blocker, a completion or decision
+  handoff, or a declared schedule with a name. They continue until they resolve
+  the need or hand it off. Repeated status messages and peer polling are not
+  substitutes. Normal supervisors handle failures and blocked work. They do not
+  continuously manage healthy work. A custom supervisor persona can require
+  more frequent coordination. CoS is only an example. st2 does not define or
+  require that role, and it gives the role no standard authority. Transport
+  loss does not stop independent host-local work.
 
 ### Must preserve delivery and launch behavior
 
@@ -122,3 +132,17 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+- **R23 Fail-closed task inventory:** One read-only machine command exposes
+  every desired local PTY and exec task by agent identity, task name, runtime
+  id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
+  time, and opaque runtime-generation id. Unknown, duplicate, malformed,
+  unreadable, timed-out, PID-reused, or otherwise unprovable evidence is
+  indeterminate and makes the versioned envelope incomplete and the command
+  unsuccessful; it is never reported as absence. Observation detects semantic
+  declaration drift across its runtime probe, does not invoke a backend for a
+  root positively absent at admission, and performs no reconciliation, cleanup,
+  lifecycle change, or state rewrite. An admitted PTY root that changes
+  filesystem identity during the backend probe makes the observation
+  incomplete; the external backend may already have recreated a concurrently
+  removed registry. This diagnostic boundary is not transactionally serialized
+  with catalog or runtime writers and is not control-plane cutover authority.
