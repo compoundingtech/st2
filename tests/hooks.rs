@@ -547,3 +547,69 @@ fn missing_hooks_do_not_rewrite_or_stop_an_already_live_codex_agent() {
     );
     assert!(!hooks_root.exists());
 }
+
+#[test]
+fn missing_hooks_cannot_hide_a_shared_workspace_render_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    let hooks_root = tmp.path().join("hooks");
+    let bin = tmp.path().join("bin");
+    let pty_log = tmp.path().join("pty.log");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let declaration = |identity: &str, command: &str, content: &str| {
+        format!(
+            "agent \"{identity}\" {{\n  host \"h\"\n  workspace \"{}\"\n  \
+             env {{ ST_AGENT \"h.{identity}\" }}\n  command \"{command}\"\n  \
+             render {{ file \"shared\" \"{content}\" }}\n}}\n",
+            workspace.display()
+        )
+    };
+    let codex = catalog.join("agents/h/codex/agent.kdl");
+    let sibling = catalog.join("agents/h/sibling/agent.kdl");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    fs::write(&codex, declaration("codex", "exec codex", "codex")).unwrap();
+    fs::write(&sibling, declaration("sibling", "exec sibling", "sibling")).unwrap();
+    write_executable(
+        &bin.join("pty"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
+            pty_log.display()
+        ),
+    );
+
+    let output = command(&hooks_root)
+        .arg("up")
+        .arg(&catalog)
+        .args(["--host", "h", "--once"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "{report}");
+    assert!(report.contains("materialization deferred"), "{report}");
+    assert!(report.contains("conflicting render ownership"), "{report}");
+    assert!(
+        !workspace.join("shared").exists(),
+        "a hook-gated owner must remain visible to fleet-wide conflict preflight"
+    );
+    assert_eq!(
+        fs::read_to_string(&pty_log)
+            .unwrap_or_default()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["list --json"],
+        "neither conflicting owner may launch"
+    );
+    assert!(
+        !hooks_root.exists(),
+        "ordinary up must not create or rewrite the hook root"
+    );
+}

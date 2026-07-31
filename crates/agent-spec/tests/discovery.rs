@@ -8,8 +8,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use agent_spec::spec::TaskKind;
-use agent_spec::{AgentSpec, JobType, Task, discover};
+use agent_spec::spec::{TaskKind, TaskLifecycle};
+use agent_spec::{AgentSpec, JobType, Resource, Task, discover};
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -53,6 +53,7 @@ agent "fabric-claude" {
 
   pty "agent" {
     id      "silber.fabric-claude"
+    lifecycle "adopt-only"
     command #"exec claude --permission-mode bypassPermissions 'boot'"#
     tags role="agent" env="prod"
     env {
@@ -107,6 +108,7 @@ fn parses_full_kdl_service_job() {
     let agent = s.tasks.iter().find(|t| t.name == "agent").unwrap();
     assert_eq!(agent.kind, TaskKind::Pty);
     assert_eq!(agent.id.as_deref(), Some("silber.fabric-claude"));
+    assert_eq!(agent.lifecycle, TaskLifecycle::AdoptOnly);
     assert!(agent.command.as_deref().unwrap().starts_with("exec claude"));
     assert_eq!(agent.tags.get("role").map(String::as_str), Some("agent"));
     assert_eq!(
@@ -170,6 +172,47 @@ agent "cos" {
         ding.env.get("ST_AGENT").map(String::as_str),
         Some("Silber.cos")
     );
+}
+
+#[test]
+fn compact_adopt_only_lifecycle_lowers_to_the_generated_agent_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/migrant/agent.kdl",
+        r#"
+agent "migrant" {
+  host "h"
+  lifecycle "adopt-only"
+  command "codex"
+}
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs[0].tasks[0].lifecycle, TaskLifecycle::AdoptOnly);
+}
+
+#[test]
+fn unknown_task_lifecycle_is_rejected_instead_of_falling_back_to_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/unsafe/agent.kdl",
+        r#"
+agent "unsafe" {
+  host "h"
+  lifecycle "replace-maybe"
+  command "codex"
+}
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty());
+    assert_eq!(found.errors.len(), 1);
+    assert!(found.errors[0].message.contains("unknown lifecycle"));
 }
 
 #[test]
@@ -264,6 +307,227 @@ argv = ["claude", "--resume", "session id"]
 }
 
 #[test]
+fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        r#"agent "kdl" {
+  host "h"
+  resource "source" _tag="worktree" uri="worktree://github.com/example/project/main"
+  resource "work" _tag="github-issue" uri="github-issue://example/project/41"
+  command "true"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{
+  "identity": "json",
+  "host": "h",
+  "resource": {
+    "work": {"_tag": "github-issue", "uri": "github-issue://example/project/41"},
+    "source": {"_tag": "worktree", "uri": "worktree://github.com/example/project/main"}
+  },
+  "command": "true"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+host = "h"
+command = "true"
+
+[resource.work]
+_tag = "github-issue"
+uri = "github-issue://example/project/41"
+
+[resource.source]
+_tag = "worktree"
+uri = "worktree://github.com/example/project/main"
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let expected = vec![
+        Resource::new(
+            "source".into(),
+            "worktree".into(),
+            "worktree://github.com/example/project/main".into(),
+        )
+        .unwrap(),
+        Resource::new(
+            "work".into(),
+            "github-issue".into(),
+            "github-issue://example/project/41".into(),
+        )
+        .unwrap(),
+    ];
+    for identity in ["json", "kdl", "toml"] {
+        assert_eq!(find(&found.specs, identity).resources, expected);
+    }
+
+    let json = serde_json::to_string(&expected).unwrap();
+    assert_eq!(
+        json,
+        r#"[{"name":"source","_tag":"worktree","uri":"worktree://github.com/example/project/main"},{"name":"work","_tag":"github-issue","uri":"github-issue://example/project/41"}]"#
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (identity, resource) in [
+        (
+            "duplicate",
+            r#"resource "work" _tag="issue" uri="issue://one"
+  resource "work" _tag="pull-request" uri="pull-request://two""#,
+        ),
+        ("missing-tag", r#"resource "work" uri="issue://example/1""#),
+        ("missing-uri", r#"resource "work" _tag="issue""#),
+        (
+            "relative-uri",
+            r#"resource "work" _tag="issue" uri="./issue/1""#,
+        ),
+        (
+            "policy",
+            r#"resource "work" _tag="issue" uri="issue://example/1" required=#true"#,
+        ),
+        (
+            "payload",
+            r#"resource "work" _tag="issue" uri="issue://example/1" { token "secret" }"#,
+        ),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{\n  host \"h\"\n  {resource}\n  command \"true\"\n}}"),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    let errors = found
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("duplicate resource binding"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("needs string `_tag`"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("needs string `uri`"))
+    );
+    assert!(errors.iter().any(|error| error.contains("absolute URI")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unsupported property `required`"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("cannot have children"))
+    );
+}
+
+#[test]
+fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/dup/agent.json",
+        r#"{
+  "identity": "dup",
+  "command": "true",
+  "resource": {
+    "work": {"_tag": "issue", "uri": "issue://one"},
+    "work": {"_tag": "issue", "uri": "issue://two"}
+  }
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty());
+    assert_eq!(found.errors.len(), 1);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("duplicate resource binding 'work'")
+    );
+}
+
+#[test]
+fn public_resource_json_deserialization_enforces_the_catalog_invariants() {
+    for descriptor in [
+        r#"{"name":"","_tag":"issue","uri":"issue://one"}"#,
+        r#"{"name":"work","_tag":"","uri":"issue://one"}"#,
+        r#"{"name":"work","_tag":"issue","uri":"./relative"}"#,
+        r#"{"name":"work","_tag":"issue","uri":"issue://one","required":true}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<Resource>(descriptor).is_err(),
+            "{descriptor}"
+        );
+    }
+}
+
+#[test]
+fn forbidden_raw_uri_characters_are_rejected_across_declaration_formats() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        r##"agent "kdl" {
+  command "true"
+  resource "work" _tag="opaque" uri=#"thing://bad\slash"#
+}"##,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{
+  "identity": "json",
+  "command": "true",
+  "resource": {"work": {"_tag": "opaque", "uri": "thing://bad<left"}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+command = "true"
+
+[resource.work]
+_tag = "opaque"
+uri = 'thing://bad"quote'
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
+    assert!(found.errors.iter().all(|error| error
+        .message
+        .contains("must be an exact absolute URI")));
+}
+
+#[test]
 fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
     let tmp = tempfile::tempdir().unwrap();
     for (identity, body) in [
@@ -275,10 +539,7 @@ fn empty_or_ambiguous_argv_is_rejected_in_every_task_shape() {
   argv "true""#,
         ),
         ("empty-explicit", r#"pty "agent" { argv }"#),
-        (
-            "empty-program-explicit",
-            r#"pty "agent" { argv "" }"#,
-        ),
+        ("empty-program-explicit", r#"pty "agent" { argv "" }"#),
         (
             "both-explicit",
             r#"pty "agent" { command "true"; argv "true" }"#,
@@ -436,11 +697,10 @@ fn path_supplies_identity_and_host_when_content_omits_them() {
 }
 
 #[test]
-fn content_wins_over_path_and_mismatch_warns() {
+fn an_explicit_identity_with_an_implicit_host_keeps_the_path_warning() {
     let tmp = tempfile::tempdir().unwrap();
     let spec = r#"
 identity = "real-name"
-host     = "real-host"
 [pty.agent]
 command = "exec claude 'boot'"
 "#;
@@ -450,15 +710,61 @@ command = "exec claude 'boot'"
     assert!(found.errors.is_empty());
     let s = &found.specs[0];
     assert_eq!(s.identity, "real-name");
-    assert_eq!(s.host.as_deref(), Some("real-host"));
-    assert_eq!(found.warnings.len(), 2);
+    assert_eq!(s.host.as_deref(), Some("wrong-host"));
+    assert_eq!(found.warnings.len(), 1);
     assert!(
         found
             .warnings
             .iter()
             .any(|w| w.contains("identity mismatch"))
     );
+}
+
+#[test]
+fn an_explicit_host_with_an_implicit_identity_keeps_the_path_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = r#"
+host = "real-host"
+[pty.agent]
+command = "exec claude 'boot'"
+"#;
+    write(tmp.path(), "agents/wrong-host/path-name/agent.toml", spec);
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty());
+    let s = &found.specs[0];
+    assert_eq!(s.identity, "path-name");
+    assert_eq!(s.host.as_deref(), Some("real-host"));
+    assert_eq!(found.warnings.len(), 1);
     assert!(found.warnings.iter().any(|w| w.contains("host mismatch")));
+}
+
+#[test]
+fn an_explicit_identity_and_host_are_path_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rel = "teams/.managed/groups/archive/project/declaration/agent.kdl";
+    write(
+        tmp.path(),
+        rel,
+        r#"agent "stable-agent" { host "stable-host"; command "exec codex" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
+    assert!(found.warnings.is_empty(), "warnings: {:?}", found.warnings);
+    assert_eq!(found.specs.len(), 1);
+    let spec = &found.specs[0];
+    assert_eq!(spec.identity, "stable-agent");
+    assert_eq!(spec.host.as_deref(), Some("stable-host"));
+    assert_eq!(
+        spec.path.parent(),
+        Some(
+            tmp.path()
+                .join("teams/.managed/groups/archive/project/declaration")
+                .as_path()
+        ),
+        "the declaration parent remains the state/resource anchor"
+    );
 }
 
 #[test]
@@ -601,29 +907,66 @@ fn nonexistent_root_yields_empty_not_error() {
 }
 
 #[test]
-fn hidden_runner_state_and_resources_are_ignored() {
+fn only_contextually_reserved_namespaces_are_ignored() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/a/agent.toml",
-        "identity=\"a\"\n[pty.agent]\ncommand=\"x\"\n",
+        "agents/hetz/live/agent.kdl",
+        r#"agent "live" { host "hetz"; command "x" }"#,
     );
-    // dot-prefixed runner state (R03) + a resource message — neither is a spec.
-    write(tmp.path(), ".st2.hetz.lock", "12345");
-    write(
-        tmp.path(),
-        "agents/hetz/a/resources/inbox/1784-abc.md",
-        "a message",
-    );
-    // The canonical PTY_ROOT is `<catalog>/pty`. Its session JSON contains command/cwd fields and
-    // must never be mistaken for a catalog agent declaration.
-    write(
-        tmp.path(),
-        "pty/hetz.a.json",
-        r#"{"name":"hetz.a","status":"running","command":"sh -c x","cwd":"/tmp"}"#,
-    );
+    for (path, identity) in [
+        (".managed/team/agent.kdl", "managed"),
+        (".retired/team/agent.kdl", "dot-retired"),
+        ("agents/archive/project/agent.kdl", "archive-project"),
+        ("agents/resources/project/agent.kdl", "resources-project"),
+        ("agents/inbox/project/agent.kdl", "inbox-project"),
+    ] {
+        write(
+            tmp.path(),
+            path,
+            &format!(r#"agent "{identity}" {{ host "h"; command "x" }}"#),
+        );
+    }
+
+    for path in [
+        ".git/project/agent.kdl",
+        ".st2/project/agent.kdl",
+        "organizations/project/.git/nested/agent.kdl",
+        "organizations/project/.st2/nested/agent.kdl",
+        "pty/project/agent.kdl",
+        "agents/hetz/live/resources/project/agent.kdl",
+        "agents/hetz/live/archive/project/agent.kdl",
+        "agents/hetz/live/inbox/project/agent.kdl",
+    ] {
+        write(
+            tmp.path(),
+            path,
+            r#"agent "excluded" { host "h"; command "x" }"#,
+        );
+    }
 
     let found = discover(tmp.path());
-    assert_eq!(found.specs.len(), 1);
-    assert_eq!(found.specs[0].identity, "a");
+    assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
+    assert_eq!(found.specs.len(), 6, "specs: {:?}", found.specs);
+    for identity in [
+        "live",
+        "managed",
+        "dot-retired",
+        "archive-project",
+        "resources-project",
+        "inbox-project",
+    ] {
+        assert!(
+            found.specs.iter().any(|spec| spec.identity == identity),
+            "{identity} must remain discoverable"
+        );
+    }
+    assert!(
+        !find(&found.specs, "dot-retired").retired,
+        "a .retired folder has no lifecycle meaning"
+    );
+    assert!(
+        found.specs.iter().all(|spec| spec.identity != "excluded"),
+        "reserved control/state namespaces must not become declarations"
+    );
 }

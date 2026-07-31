@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::message;
 use crate::status::{self, State};
+use crate::Resource;
 
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
@@ -22,6 +23,8 @@ pub struct AgentRow {
     pub name: Option<String>,
     /// Whether the declaration is explicitly retired. Presence remains a separate runtime signal.
     pub retired: bool,
+    /// Typed Resource bindings declared directly by the agent.
+    pub resources: Vec<Resource>,
     /// Newest mtime (unix ms) across the agent's inbox, archive, and status file; `None` if nothing
     /// has been touched. `--enrich` only.
     pub last_activity_ms: Option<f64>,
@@ -43,6 +46,7 @@ pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: read_name(agent_dir),
                 retired: s.retired,
+                resources: s.resources.clone(),
                 last_activity_ms: newest_mtime_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
             })
@@ -59,6 +63,7 @@ struct SummaryJson<'a> {
     status: &'a str,
     name: Option<&'a str>,
     retired: bool,
+    resources: &'a [Resource],
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -68,6 +73,7 @@ struct EnrichedJson<'a> {
     status: &'a str,
     name: Option<&'a str>,
     retired: bool,
+    resources: &'a [Resource],
     #[serde(rename = "lastActivity")]
     last_activity: Option<f64>,
     inbox: usize,
@@ -83,6 +89,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 status: r.status.as_str(),
                 name: r.name.as_deref(),
                 retired: r.retired,
+                resources: &r.resources,
                 last_activity: r.last_activity_ms,
                 inbox: r.inbox,
             })
@@ -96,6 +103,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 status: r.status.as_str(),
                 name: r.name.as_deref(),
                 retired: r.retired,
+                resources: &r.resources,
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -162,6 +170,7 @@ mod tests {
             status,
             name: name.map(str::to_string),
             retired,
+            resources: Vec::new(),
             last_activity_ms: last,
             inbox,
         }
@@ -184,13 +193,38 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"retired":false},{"identity":"hetz.st2-claude","status":"busy","name":"owner","retired":true}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"retired":false,"resources":[]},{"identity":"hetz.st2-claude","status":"busy","name":"owner","retired":true,"resources":[]}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"retired":false,"lastActivity":1784653027733.6138,"inbox":1},{"identity":"hetz.st2-claude","status":"busy","name":"owner","retired":true,"lastActivity":null,"inbox":0}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1},{"identity":"hetz.st2-claude","status":"busy","name":"owner","retired":true,"resources":[],"lastActivity":null,"inbox":0}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
+    }
+
+    #[test]
+    fn agents_json_preserves_opaque_declared_resource_descriptors() {
+        let mut resource_row = row(
+            "hetz.worker",
+            State::Available,
+            None,
+            false,
+            None,
+            0,
+        );
+        resource_row.resources.push(
+            Resource::new(
+                "work".into(),
+                "vendor-specific-type".into(),
+                "vendor+thing://authority/exact%20identity".into(),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            to_json(&[resource_row], false),
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"retired":false,"resources":[{"name":"work","_tag":"vendor-specific-type","uri":"vendor+thing://authority/exact%20identity"}]}]"#
+        );
     }
 }

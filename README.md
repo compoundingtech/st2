@@ -108,6 +108,7 @@ The compact declaration shape is:
 agent "<identity>" {
   host "<host>"
   workspace "<workspace>"
+  resource "work" _tag="github-issue" uri="github-issue://example/project/123"
   // Optional metadata:
   // role "worker"
   // supervisor "<supervisor-bus-id>"
@@ -124,6 +125,41 @@ agent "<identity>" {
   }
 }
 ```
+
+For a zero-interruption migration, add `lifecycle "adopt-only"` to the compact
+agent or to an explicit `pty`/`exec` task. st2 adopts that task when its current
+generation is alive. If the generation is dead or absent, st2 reports the task
+as `held` and does not remove or launch anything:
+
+```kdl
+agent "<identity>" {
+  host "<host>"
+  workspace "<workspace>"
+  lifecycle "adopt-only"
+  argv "codex" "<boot prompt>"
+}
+```
+
+This is a fence, not a restart policy. After inspecting or recovering the
+original generation, deliberately change the lifecycle back to `"service"` (or
+remove the field) to authorize ordinary absent launch and dead replacement.
+`retired #true` remains an explicit teardown instruction and takes precedence.
+
+`resource` binds an agent-local semantic name to an exact RFC 3986 absolute URI. `_tag` selects a
+concrete resource contract understood by downstream readers; st2 preserves arbitrary non-empty tags
+and URI bytes without normalization. It neither owns their schemas nor resolves their targets.
+Binding order is irrelevant and names must be unique within the agent:
+
+```kdl
+resource "work" _tag="github-issue" uri="github-issue://example/project/123"
+resource "source" _tag="worktree" uri="worktree://github.com/example/project/change"
+resource "delivery" _tag="ding" uri="ding://host/agent"
+```
+
+The envelope is intentionally only `name` + `_tag` + `uri`. It carries no required/optional,
+access, readiness, or lifecycle policy, and URI possession conveys no authority. Resource-only
+declaration edits do not stop, replace, or relaunch a live task. Resource types and resolvers remain
+opaque to st2; catalog readers use the public `agent-spec` crate to inspect the typed bindings.
 
 `argv` launches its first value directly with the remaining values as arguments. It resolves a bare
 program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
@@ -207,15 +243,37 @@ Unknown, ambiguous, and wrong-host task selectors refuse before workspace writes
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the
 health check. A stale lock left by a dead supervisor is always a failure. The underlying
 non-interactive `pty list --json` runtime probe is bounded; a wedged client becomes an explicit
-doctor failure instead of hanging the health check. The shared-registry census has a 10-second
-deadline so a busy multi-session fleet can complete without turning the bound into an unbounded
-health probe.
+doctor failure instead of hanging the health check. Its short outer deadline is containment for a
+wedged runtime, not a fleet-scalability mechanism.
 
 For a foreground supervisor on any host:
 
 ```sh
 st2 up --catalog "$CATALOG" --host <host>
 ```
+
+### Typed task inventory (diagnostic only)
+
+Use the typed inventory instead of parsing `doctor` prose:
+
+```sh
+st2 tasks --catalog "$CATALOG" --host <host> --json
+```
+
+The `st2.task-inventory.v1` envelope joins the selected host's desired PTY and exec tasks to
+read-only runtime evidence. A complete observation exits zero. Catalog parse errors, declaration
+drift during observation, duplicate runtime IDs, timeouts, malformed output, PID reuse, and
+otherwise unprovable generations emit `complete: false` and exit non-zero. Missing runtime rows
+become `absent` only when the corresponding backend observation is complete; uncertainty remains
+`indeterminate`.
+
+A PTY root positively absent at admission is not passed to `pty` and remains absent; an absent exec
+state root likewise remains absent. If an admitted PTY root is concurrently removed, the result is
+incomplete because its filesystem identity changed, but the external `pty list` implementation may
+recreate its registry before st2 can detect the race. Observation never rewrites an existing exec PID
+record. It also does not serialize catalog or runtime writers, reconcile tasks, or authorize a
+control-plane cutover. Consumers that require a zero-write boundary under concurrent root deletion
+or a transactional declaration boundary need a separate protocol.
 
 ### Staged control-plane replacement gate
 
@@ -257,14 +315,16 @@ st2 context read --full
 ```
 
 The roster includes retired declarations instead of silently conflating them with runtime
-presence. Both JSON shapes contain an additive `retired` boolean; `--enrich` additionally supplies
-`lastActivity` and `inbox`. Human output leaves active rows unchanged and appends `[retired]` to a
-retired row.
+presence. Both JSON shapes contain `retired` and the declaration's ordered `resources` descriptors;
+`--enrich` additionally supplies `lastActivity` and `inbox`. Human output leaves active rows
+unchanged and appends `[retired]` to a retired row.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
 links live under `<agent-dir>/resources/`. The flat `<root>/<identity>` layout remains only as the
-intentional catalog-less fallback used by isolated folder evals.
+intentional catalog-less fallback used by isolated folder evals. In a catalog-backed root,
+`st2 message ls` rejects an absent identity; recovery inspection of a deliberately orphaned flat
+box must be explicit with `st2 message ls <identity> --orphan` (and optionally `--archive`).
 
 Adopters should cut directly to the native layout. Before launching a migrated identity, install and
 verify hooks, validate and materialize its hand-authored declaration, stop any predecessor transport,
@@ -356,6 +416,34 @@ The sole canonical agent contract is
 [`AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md) in the evals
 repository. Eval corpus definitions, execution/readiness evidence, authorization, and results belong
 to that repository; st2 does not duplicate or pin its ledgers here.
+
+An eval that exercises production Agent Specs opts in explicitly:
+
+```kdl
+eval {
+  copy "./fixture"
+  run "publish-canonical-team" { command "..." }
+  canonical-agents
+  message { from "requester"; to "evalhost.supervisor"; content "./task.md" }
+  max-timeout "300s"
+  judges { /* held-out checks */ }
+}
+```
+
+`copy` and deterministic `run` steps populate the hermetic temporary catalog first.
+`canonical-agents` then recursively discovers the catalog and projects declarations resolved to the
+eval host. Explicit `identity` and `host` fields remain authoritative independent of organizational
+placement; each declaration parent remains its native state/resource anchor. The directive is
+mutually exclusive with compact `team` / `agent` declarations, so the local Agent Spec vector is the
+sole authority for launch, kickoff routing, supervision, logs, and teardown. Strict catalog
+validation, fleet-unique nonempty task runtime IDs, and warning-free local materialization all finish
+before an agent task starts; backend launch errors are fatal. Remote-host declarations remain inert.
+Native inbox/archive paths are frozen from the admitted local vector, so later catalog mutation
+cannot redirect eval traffic. A multi-agent team completes only after the existing worker-report ordering.
+For a singleton, the requester inbox is snapshotted before kickoff; only a newly appearing
+interviewer reply at-or-after the exact kickoff receipt completes it. Canonical completion gates the
+verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
+evals retain their flat bus and completion semantics.
 
 `st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
 interface, and generated output must be reviewed before materialization.

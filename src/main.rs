@@ -260,7 +260,7 @@ enum Command {
         /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
         #[arg(long = "status")]
         status: Option<String>,
-        /// Machine-readable JSON array, including a `retired` boolean.
+        /// Machine-readable JSON array, including retirement and declared Resource bindings.
         #[arg(long)]
         json: bool,
         /// With `--json`, add `lastActivity` + `inbox` count per agent.
@@ -268,6 +268,16 @@ enum Command {
         enrich: bool,
         #[command(flatten)]
         ctx: MsgCtx,
+    },
+    /// Emit one fail-closed desired-task/runtime diagnostic snapshot. This is
+    /// read-only observation, not reconciliation or cutover authority.
+    Tasks {
+        /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
@@ -458,6 +468,9 @@ enum MessageCmd {
         /// List the archive instead of the inbox.
         #[arg(long)]
         archive: bool,
+        /// Recovery-only: list the raw flat `<root>/<identity>` box without catalog resolution.
+        #[arg(long)]
+        orphan: bool,
         /// Print only the message count.
         #[arg(long)]
         count: bool,
@@ -568,6 +581,13 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
+        Command::Tasks { host, json } => {
+            if !json {
+                anyhow::bail!("`st2 tasks` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            tasks_cmd(&catalog, host)
+        }
         Command::CompileAgent {
             catalog,
             identity,
@@ -1109,6 +1129,33 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
     }
 }
 
+fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = match root.canonicalize() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let detail = format!("canonicalize catalog {}: {error}", root.display());
+            let inventory =
+                st2::task_inventory::TaskInventory::incomplete(root.to_path_buf(), host, detail);
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let found = discover(&catalog);
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    let after = discover(&catalog);
+    if !st2::task_inventory::same_discovery(&found, &after) {
+        inventory.mark_incomplete("catalog declarations changed during task observation");
+    }
+    println!("{}", inventory.to_json());
+    if inventory.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("task inventory incomplete")
+    }
+}
+
 fn tool_on_path(tool: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
@@ -1326,6 +1373,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Ls {
             identity,
             archive,
+            orphan,
             count,
             include_body,
             from,
@@ -1338,10 +1386,11 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(id) => id,
                 None => acting_id(&ctx)?,
             };
+            let dir = message::resolve_list_box(&root, &id, &host, archive, orphan)?;
             let mut msgs = if archive {
-                message::list_dir(&message::resolve_archive(&root, &id, &host))?
+                message::list_dir(&dir)?
             } else {
-                message::list_inbox(&message::resolve_inbox(&root, &id, &host))?
+                message::list_inbox(&dir)?
             };
             if let Some(sender) = &from {
                 msgs.retain(|m| m.from.as_deref() == Some(sender.as_str()));
@@ -1785,6 +1834,7 @@ fn up(
 
     if materialize_only {
         let mut found = discover(&catalog_root);
+        let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
             let (owner, _, _) = st2::reconcile::resolve_task(&found.specs, selector, &this_host)?;
             let owner_identity = owner.identity.clone();
@@ -1809,7 +1859,12 @@ fn up(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
         }
-        let report = st2::materialize::materialize_catalog(&catalog_root, &found.specs, &this_host);
+        let report = st2::materialize::materialize_catalog_against(
+            &catalog_root,
+            &found.specs,
+            &ownership_specs,
+            &this_host,
+        );
         for item in &report.materialized {
             println!("{item}");
         }
@@ -1890,6 +1945,7 @@ fn print_report(report: &UpReport) {
     report_line("launched", &report.launched);
     report_line("torn down", &report.torn_down);
     report_line("gc", &report.gc);
+    report_line("held", &report.held);
     report_line("flapping", &report.flapping);
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);

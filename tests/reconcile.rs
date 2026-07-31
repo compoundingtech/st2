@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
-use st2::spec::{AgentSpec, JobType, Task, TaskKind};
+use st2::spec::{AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile};
 
 #[test]
@@ -184,6 +184,28 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
 }
 
 #[test]
+fn selected_reconcile_holds_adopt_only_dead_or_absent_without_mutation() {
+    let mut t = task(TaskKind::Pty, "agent", None, Some("codex"));
+    t.lifecycle = TaskLifecycle::AdoptOnly;
+    let specs = [svc("a", None, vec![t])];
+
+    for sessions in [
+        vec![Session {
+            pty_id: "host.a.agent".into(),
+            alive: false,
+            exit_code: Some(1),
+        }],
+        vec![],
+    ] {
+        let plan = reconcile_selected(&specs, &sessions, "host", "host.a.agent").unwrap();
+        assert!(plan.launch.is_empty());
+        assert!(plan.gc.is_empty());
+        assert!(plan.adopt.is_empty());
+        assert_eq!(plan.held, ["host.a.agent"]);
+    }
+}
+
+#[test]
 fn selected_reconcile_action_ids_are_exact_and_refusals_immutable() {
     let specs = vec![
         svc(
@@ -199,13 +221,7 @@ fn selected_reconcile_action_ids_are_exact_and_refusals_immutable() {
     let sessions = vec![live("host.a.y"), live("host.b.z")];
     let before = (specs.clone(), sessions.clone());
     let p = reconcile_selected(&specs, &sessions, "host", "host.a.x").unwrap();
-    assert_eq!(
-        p.launch
-            .iter()
-            .flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str()))
-            .collect::<Vec<_>>(),
-        vec!["host.a.x"]
-    );
+    assert_eq!(p.launch.iter().flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str())).collect::<Vec<_>>(), vec!["host.a.x"]);
     assert!(p.gc.is_empty() && p.teardown.is_empty());
     assert!(reconcile_selected(&specs, &sessions, "host", "host.a.missing").is_err());
     assert_eq!((specs, sessions), before);
@@ -248,7 +264,13 @@ fn selected_dead_non_keep_gc_and_relaunch_only_selected() {
     )
     .unwrap();
     assert_eq!(p.gc, vec!["host.a.x"]);
-    assert_eq!(p.launch.iter().flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str())).collect::<Vec<_>>(), vec!["host.a.x"]);
+    assert_eq!(
+        p.launch
+            .iter()
+            .flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec!["host.a.x"]
+    );
     assert!(p.teardown.is_empty());
 }
 #[test]
@@ -333,6 +355,7 @@ fn task(kind: TaskKind, name: &str, id: Option<&str>, command: Option<&str>) -> 
         tags: BTreeMap::new(),
         env: BTreeMap::new(),
         keep: false,
+        lifecycle: TaskLifecycle::Service,
     }
 }
 
@@ -353,6 +376,7 @@ fn spec(
         retired,
         keep: false,
         restart: None,
+        resources: Vec::new(),
         tasks,
         path: PathBuf::from(format!(
             "/cat/agents/{}/{identity}/agent.kdl",
@@ -427,6 +451,30 @@ fn all_tasks_live_is_adopted() {
 }
 
 #[test]
+fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
+    let mut spec = svc(
+        "a",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+    );
+    spec.resources.push(
+        Resource::new(
+            "work".into(),
+            "github-issue".into(),
+            "github-issue://example/project/41".into(),
+        )
+        .unwrap(),
+    );
+
+    let specs = [spec];
+    let plan = reconcile(&specs, &[live("hetz.a")], HOST);
+    assert_eq!(plan.adopt.len(), 1);
+    assert!(plan.launch.is_empty());
+    assert!(plan.teardown.is_empty());
+    assert!(plan.gc.is_empty());
+}
+
+#[test]
 fn one_dead_task_launches_only_the_missing_one() {
     let specs = vec![svc(
         "a",
@@ -452,6 +500,33 @@ fn exited_session_is_reaped_and_relaunched() {
     let plan = reconcile(&specs, &[dead("hetz.a")], HOST);
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.gc, vec!["hetz.a"]); // reap the corpse, then respawn
+}
+
+#[test]
+fn adopt_only_task_holds_dead_or_absent_generation_without_replacement() {
+    let mut t = task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"));
+    t.lifecycle = TaskLifecycle::AdoptOnly;
+    let specs = vec![svc("a", Some(HOST), vec![t])];
+
+    for sessions in [vec![dead("hetz.a")], vec![]] {
+        let plan = reconcile(&specs, &sessions, HOST);
+        assert!(plan.launch.is_empty());
+        assert!(plan.gc.is_empty());
+        assert_eq!(plan.held, vec!["hetz.a"]);
+    }
+}
+
+#[test]
+fn leaving_adopt_only_explicitly_restores_replacement_lifecycle() {
+    let specs = vec![svc(
+        "a",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+    )];
+    let plan = reconcile(&specs, &[dead("hetz.a")], HOST);
+    assert_eq!(plan.gc, vec!["hetz.a"]);
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.a");
+    assert!(plan.held.is_empty());
 }
 
 #[test]

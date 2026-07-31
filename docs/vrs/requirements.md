@@ -33,8 +33,16 @@ accepted.
 
 - **R01 Agent-spec compliance:** st2 validates and implements every agent-spec
   capability it claims to support, and identifies unsupported capabilities.
-- **R02 Canonical KDL:** Hand-authored KDL is the canonical declaration; any
-  generator is optional and its output is inspectable before reconciliation.
+- **R02 Canonical KDL and declaration identity:** Hand-authored KDL is the
+  canonical declaration; any generator is optional and its output is
+  inspectable before reconciliation. Declarations are discovered recursively.
+  An explicit `identity` and `host` pair is authoritative independent of its
+  folder path, while either omitted field retains path-derived defaults and
+  mismatch diagnostics. The declaration's parent remains its state/resource
+  anchor. Dot-prefixed and other organizational folders have no implicit
+  lifecycle meaning; discovery excludes `.git` and `.st2` control directories
+  at any depth, the catalog-root `pty` runtime directory, and state namespaces
+  directly owned by a declaration.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
 
@@ -44,6 +52,16 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R22 Quiet coordination after events:** A network with minimal or default
+  personas stays quiet while useful work continues. Agents coordinate only after
+  an inbox DING, a durable failure, a real blocker, a completion or decision
+  handoff, or a declared schedule with a name. They continue until they resolve
+  the need or hand it off. Repeated status messages and peer polling are not
+  substitutes. Normal supervisors handle failures and blocked work. They do not
+  continuously manage healthy work. A custom supervisor persona can require
+  more frequent coordination. CoS is only an example. st2 does not define or
+  require that role, and it gives the role no standard authority. Transport
+  loss does not stop independent host-local work.
 
 ### Must preserve delivery and launch behavior
 
@@ -103,3 +121,28 @@ accepted.
   gates, PTY inspection, and plan execution are limited to the selected
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
+- **R20 Portable Resource bindings:** An agent may directly carry zero or more
+  order-independent Resource bindings. Each binding has a non-empty, agent-local
+  unique name and preserves a non-empty, opaque type discriminator and an RFC
+  3986 absolute URI byte-for-byte without normalization. The generic envelope
+  does not imply resolution, access, readiness, or lifecycle semantics;
+  declarations that add such unsupported policy are rejected rather than
+  silently ignored.
+- **R21 Nondisruptive Resource observation:** Machine-readable catalog
+  inspection exposes every Resource binding without interpreting its type or URI.
+  Resource-only declaration changes do not alter a task's effective launch
+  definition and do not stop, replace, or relaunch healthy work.
+- **R23 Fail-closed task inventory:** One read-only machine command exposes
+  every desired local PTY and exec task by agent identity, task name, runtime
+  id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
+  time, and opaque runtime-generation id. Unknown, duplicate, malformed,
+  unreadable, timed-out, PID-reused, or otherwise unprovable evidence is
+  indeterminate and makes the versioned envelope incomplete and the command
+  unsuccessful; it is never reported as absence. Observation detects semantic
+  declaration drift across its runtime probe, does not invoke a backend for a
+  root positively absent at admission, and performs no reconciliation, cleanup,
+  lifecycle change, or state rewrite. An admitted PTY root that changes
+  filesystem identity during the backend probe makes the observation
+  incomplete; the external backend may already have recreated a concurrently
+  removed registry. This diagnostic boundary is not transactionally serialized
+  with catalog or runtime writers and is not control-plane cutover authority.

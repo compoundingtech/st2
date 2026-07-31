@@ -184,13 +184,13 @@ fn doctor_bounds_a_hung_pty_probe_and_reports_the_runtime_error() {
         }
     }
     assert!(
-        started.elapsed() < Duration::from_secs(13),
+        started.elapsed() < Duration::from_secs(5),
         "doctor did not bound a hung `pty list --json`"
     );
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("✗ task runtime readable"), "{stdout}");
-    assert!(stdout.contains("timed out after 10.0s"), "{stdout}");
+    assert!(stdout.contains("timed out after 2.0s"), "{stdout}");
 }
 
 #[test]

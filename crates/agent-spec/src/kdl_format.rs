@@ -9,7 +9,7 @@
 
 use kdl::{KdlDocument, KdlNode};
 
-use crate::spec::{RawRestart, RawSpec, RawTask};
+use crate::spec::{RawResource, RawRestart, RawSpec, RawTask};
 
 /// Parse a KDL document into zero or more raw specs (one per top-level `agent` node).
 pub(crate) fn parse_kdl(text: &str) -> anyhow::Result<Vec<RawSpec>> {
@@ -83,7 +83,12 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
             "supervisor" => raw.supervisor = arg_string(child),
             "retired" => raw.retired = arg_bool(child),
             "keep" => raw.keep = arg_bool(child),
+            "lifecycle" => raw.lifecycle = arg_string(child),
             "restart" => raw.restart = Some(restart_node_to_raw(child)),
+            "resource" => {
+                let (name, resource) = resource_node_to_raw(child)?;
+                raw.resource.insert(name, resource)?;
+            }
             "command" => raw.command = arg_string(child),
             "argv" => raw.argv = Some(argv(child)?),
             "ding" => raw.ding = true,
@@ -109,6 +114,60 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
         );
     }
     Ok(raw)
+}
+
+fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)> {
+    if node.children().is_some() {
+        anyhow::bail!("resource binding cannot have children");
+    }
+
+    let mut name = None;
+    let mut tag = None;
+    let mut uri = None;
+    for entry in node.entries() {
+        let Some(property) = entry.name() else {
+            if name.is_some() {
+                anyhow::bail!("resource binding accepts exactly one positional name");
+            }
+            name = entry.value().as_string().map(String::from);
+            if name.is_none() {
+                anyhow::bail!("resource binding needs a string name");
+            }
+            continue;
+        };
+
+        let property = property.value();
+        let value = entry.value().as_string().map(String::from);
+        match property {
+            "_tag" => {
+                if tag.is_some() {
+                    anyhow::bail!("resource binding has duplicate `_tag`");
+                }
+                tag = value;
+                if tag.is_none() {
+                    anyhow::bail!("resource binding needs string `_tag`");
+                }
+            }
+            "uri" => {
+                if uri.is_some() {
+                    anyhow::bail!("resource binding has duplicate `uri`");
+                }
+                uri = value;
+                if uri.is_none() {
+                    anyhow::bail!("resource binding needs string `uri`");
+                }
+            }
+            other => anyhow::bail!("resource binding has unsupported property `{other}`"),
+        }
+    }
+
+    Ok((
+        name.ok_or_else(|| anyhow::anyhow!("resource binding needs a string name"))?,
+        RawResource {
+            tag: tag.ok_or_else(|| anyhow::anyhow!("resource binding needs string `_tag`"))?,
+            uri: uri.ok_or_else(|| anyhow::anyhow!("resource binding needs string `uri`"))?,
+        },
+    ))
 }
 
 fn restart_node_to_raw(node: &KdlNode) -> RawRestart {
@@ -141,6 +200,7 @@ fn task_node_to_raw(node: &KdlNode) -> anyhow::Result<RawTask> {
             "argv" => t.argv = Some(argv(child)?),
             "cwd" => t.cwd = arg_string(child),
             "keep" => t.keep = arg_bool(child),
+            "lifecycle" => t.lifecycle = arg_string(child),
             // `tags role="agent" "st.network"="$CATALOG"` — properties on the node.
             "tags" => {
                 for entry in child.entries() {

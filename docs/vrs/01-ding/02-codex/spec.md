@@ -45,6 +45,15 @@ markers rather than by inspecting recovered text.
 Comparison against the expected notice uses the shared soft-wrap candidate
 enumeration in [`../spec.md`](../spec.md).
 
+## Post-submit receipt
+
+The exact notice as the complete lowest live composer is `RetainedSafe` only
+with the ordinary idle proof and no blocking state; otherwise it is
+`RetainedBlocked`. `Accepted` requires both an empty lowest live composer and
+the expected notice text in the adapter's submitted-prompt or queued-message
+pattern. An empty composer alone, disappearance, a different live draft, and
+unrecognized pixels are `Unproven`.
+
 ## Blocked states
 
 Active-turn and modal detection is owned here rather than shared

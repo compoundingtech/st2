@@ -1,7 +1,7 @@
 //! The Codex composer: a `›` prompt written directly as an ANSI sequence, with the model/cwd
 //! status line below it.
 
-use super::{Harness, Located, Screen};
+use super::{Harness, Located, ReceiptState, Screen, screen_has_accepted_notice};
 use crate::ding::composer::{
     ComposerState, logical_soft_wrap_candidates, looks_like_choice_menu, strip_ansi,
 };
@@ -13,12 +13,39 @@ impl Harness for Codex {
         // The markers are ANSI, so this locator works in raw byte offsets while the router compares
         // stripped rows. Every marker starts at an `\x1b[` boundary, so stripping the prefix is
         // faithful and its newline count is that composer's row.
-        located_bottom_codex_composer(screen.raw)
-            .map(|(start, _)| Located { row: strip_ansi(&screen.raw[..start]).matches('\n').count() })
+        located_bottom_codex_composer(screen.raw).map(|(start, _)| Located {
+            row: strip_ansi(&screen.raw[..start]).matches('\n').count(),
+        })
     }
 
     fn classify(&self, screen: &Screen<'_>, expected: &str) -> ComposerState {
         classify_codex_composer(screen.raw, screen.plain, expected)
+    }
+
+    fn receipt(&self, screen: &Screen<'_>, expected: &str) -> ReceiptState {
+        let blocked = interaction_blocked(screen.plain);
+        let Some((start, composer)) = located_bottom_codex_composer(screen.raw) else {
+            return ReceiptState::Unproven;
+        };
+        let idle_footer = codex_idle_footer(&screen.raw[start..]);
+        match composer {
+            CodexComposer::Empty if screen_has_accepted_notice(screen, '›', expected) => {
+                ReceiptState::Accepted
+            }
+            CodexComposer::Empty => ReceiptState::Unproven,
+            CodexComposer::Typed(input) => {
+                let exact = logical_soft_wrap_candidates(&input, 70)
+                    .iter()
+                    .any(|input| input == expected);
+                if exact && !blocked && idle_footer {
+                    ReceiptState::RetainedSafe
+                } else if exact {
+                    ReceiptState::RetainedBlocked
+                } else {
+                    ReceiptState::Unproven
+                }
+            }
+        }
     }
 }
 

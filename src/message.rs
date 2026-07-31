@@ -335,6 +335,45 @@ pub fn resolve_archive(root: &Path, id: &str, host: &str) -> PathBuf {
     }
 }
 
+/// Resolve one box for `message ls`.
+///
+/// The permissive flat layout is automatic only when discovery proves that `root` is catalog-less.
+/// Once any valid or malformed declaration makes it a catalog, an absent identity is an error.
+/// `orphan` is the explicit recovery path for inspecting a raw flat box inside such a root.
+pub fn resolve_list_box(
+    root: &Path,
+    id: &str,
+    host: &str,
+    archive: bool,
+    orphan: bool,
+) -> anyhow::Result<PathBuf> {
+    let flat = || {
+        root.join(id)
+            .join(if archive { "archive" } else { "inbox" })
+    };
+    if orphan {
+        return Ok(flat());
+    }
+    let discovered = crate::discover(root);
+    if let Some(agent_dir) = discovered
+        .specs
+        .iter()
+        .find(|spec| spec.bus_id(host) == id || spec.identity == id)
+        .and_then(|spec| spec.path.parent())
+    {
+        return Ok(if archive {
+            archive_dir(agent_dir)
+        } else {
+            inbox_dir(agent_dir)
+        });
+    }
+
+    if discovered.specs.is_empty() && discovered.errors.is_empty() {
+        return Ok(flat());
+    }
+    anyhow::bail!("no agent '{id}' found in catalog {}", root.display())
+}
+
 /// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
 /// catalog, via content discovery. Returns `None` if no agent matches.
 pub fn resolve_agent_dir(catalog_root: &Path, recipient: &str, this_host: &str) -> Option<PathBuf> {

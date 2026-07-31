@@ -9,7 +9,7 @@ use st2::message;
 use st2::reconcile::{Session, TaskTarget};
 use st2::run::Runner;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
-use st2::spec::{AgentSpec, JobType, Task, TaskKind};
+use st2::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
     format!(
@@ -225,6 +225,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         retired: false,
         keep: false,
         restart: None,
+        resources: vec![],
         tasks: vec![Task {
             kind: TaskKind::Exec,
             derived: false,
@@ -236,6 +237,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            lifecycle: TaskLifecycle::Service,
         }],
         path: "/tmp/spec.kdl".into(),
     }
@@ -262,6 +264,7 @@ fn two_task_spec(identity: &str, first: &str, second: &str) -> AgentSpec {
         tags: BTreeMap::new(),
         env: BTreeMap::new(),
         keep: false,
+        lifecycle: TaskLifecycle::Service,
     });
     spec
 }
@@ -290,6 +293,29 @@ fn selected_one_shot_missing_spawns_only_selected_task() {
     assert!(runner.reaped.borrow().is_empty());
     assert!(runner.removed.borrow().is_empty());
     assert_eq!(report.launched, ["host.agent.work"]);
+}
+
+#[test]
+fn selected_adopt_only_absent_task_is_reported_held_without_runner_mutation() {
+    let mut spec = task_spec("agent", None, "host.agent.work");
+    spec.tasks[0].lifecycle = TaskLifecycle::AdoptOnly;
+    let runner = FakeRunner::default();
+
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &[spec],
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
+
+    assert_eq!(report.held, ["host.agent.work"]);
+    assert!(report.launched.is_empty());
+    assert!(report.gc.is_empty());
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+    assert!(runner.removed.borrow().is_empty());
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! The Claude Code composer: a `❯` row between two full-width rules, with the permission-mode
 //! footer below it.
 
-use super::{Harness, Located, Screen};
+use super::{Harness, Located, ReceiptState, Screen, screen_has_accepted_notice};
 use crate::ding::composer::{ComposerState, logical_soft_wrap_candidates, looks_like_choice_menu};
 
 pub(super) struct Claude;
@@ -16,6 +16,26 @@ impl Harness for Claude {
             return ComposerState::Ambiguous;
         };
         classify_claude_composer(screen.plain, (logical_inputs, footer), expected)
+    }
+
+    fn receipt(&self, screen: &Screen<'_>, expected: &str) -> ReceiptState {
+        let Some((_, logical_inputs, footer)) = located_bottom_claude_composer(screen.plain) else {
+            return ReceiptState::Unproven;
+        };
+        let exact = logical_inputs.iter().any(|input| input == expected);
+        let placeholder = logical_inputs.len() == 1
+            && (logical_inputs[0].is_empty() || is_claude_idle_placeholder(&logical_inputs[0]));
+        let idle_footer = footer.contains("⏵⏵") && footer.contains("permissions on");
+        let blocked = interaction_blocked(screen.plain);
+        if exact && idle_footer && !blocked {
+            ReceiptState::RetainedSafe
+        } else if exact {
+            ReceiptState::RetainedBlocked
+        } else if placeholder && screen_has_accepted_notice(screen, '❯', expected) {
+            ReceiptState::Accepted
+        } else {
+            ReceiptState::Unproven
+        }
     }
 }
 

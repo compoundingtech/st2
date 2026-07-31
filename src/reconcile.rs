@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use agent_spec::spec::{AgentSpec, TaskKind};
+use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
 
 /// ACTUAL state: one running/known task as st2 observes it (unioned across backends).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +87,8 @@ pub struct ReconcilePlan<'a> {
     pub unrunnable: Vec<&'a AgentSpec>,
     /// Dead, non-`keep` sessions of declared tasks → reap (`rm`).
     pub gc: Vec<String>,
+    /// Dead or absent `adopt-only` task ids held without reap or launch.
+    pub held: Vec<String>,
 }
 
 /// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
@@ -172,7 +174,9 @@ pub fn reconcile_selected<'a>(
         keep: task.keep || owner.keep,
     };
     match actual {
-        Some(s) if s.alive || target.keep => plan.adopt.push(owner),
+        Some(s) if s.alive => plan.adopt.push(owner),
+        _ if task.lifecycle == TaskLifecycle::AdoptOnly => plan.held.push(runtime),
+        Some(_) if target.keep => plan.adopt.push(owner),
         Some(_) => {
             plan.gc.push(runtime);
             plan.launch.push(Launch {
@@ -255,7 +259,7 @@ pub fn reconcile<'a>(
             continue;
         }
 
-        let targets: Vec<TaskTarget> = spec
+        let targets: Vec<(TaskTarget, TaskLifecycle)> = spec
             .tasks
             .iter()
             .filter_map(|t| {
@@ -276,27 +280,36 @@ pub fn reconcile<'a>(
                 } else {
                     env.remove("ST_SUPERVISOR");
                 }
-                Some(TaskTarget {
-                    kind: t.kind,
-                    pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
-                    bus_id: bus_id.clone(),
-                    name: t.name.clone(),
-                    launch,
-                    cwd: t.cwd.clone(),
-                    workspace: spec.workspace.clone(),
-                    tags: t.tags.clone(),
-                    env,
-                    keep: t.keep || spec.keep,
-                })
+                Some((
+                    TaskTarget {
+                        kind: t.kind,
+                        pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
+                        bus_id: bus_id.clone(),
+                        name: t.name.clone(),
+                        launch,
+                        cwd: t.cwd.clone(),
+                        workspace: spec.workspace.clone(),
+                        tags: t.tags.clone(),
+                        env,
+                        keep: t.keep || spec.keep,
+                    },
+                    t.lifecycle,
+                ))
             })
             .collect();
 
         debug_assert!(!targets.is_empty());
 
         let mut to_launch = Vec::new();
-        for target in targets {
+        let held_before = plan.held.len();
+        for (target, lifecycle) in targets {
             match session_state(&by_id, &target.pty_id) {
                 SessionState::Alive => {}
+                SessionState::Dead | SessionState::Absent
+                    if lifecycle == TaskLifecycle::AdoptOnly =>
+                {
+                    plan.held.push(target.pty_id.clone());
+                }
                 SessionState::Dead if target.keep => {}
                 SessionState::Dead => {
                     plan.gc.push(target.pty_id.clone());
@@ -306,9 +319,9 @@ pub fn reconcile<'a>(
             }
         }
 
-        if to_launch.is_empty() {
+        if to_launch.is_empty() && plan.held.len() == held_before {
             plan.adopt.push(spec);
-        } else {
+        } else if !to_launch.is_empty() {
             plan.launch.push(Launch {
                 spec,
                 tasks: to_launch,
