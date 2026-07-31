@@ -16,6 +16,9 @@
 use anyhow::Context;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{Read as _, Seek as _, SeekFrom};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -243,15 +246,22 @@ impl ExecBackend {
         id: &str,
     ) -> anyhow::Result<Option<ExecGenerationObservation>> {
         let path = self.pid_path(id);
-        match path.try_exists() {
-            Ok(false) => return Ok(None),
-            Ok(true) => {}
+        let record = match open_legacy_pid_record(&path) {
+            Ok(record) => record,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("checking exec generation {}", path.display()));
+                return Ok(Some(indeterminate(format!(
+                    "opening legacy pid record {}: {error}",
+                    path.display()
+                ))));
             }
-        }
-        Ok(Some(observe_legacy_generation(id, &path)))
+        };
+        Ok(Some(observe_open_legacy_generation(
+            id,
+            &path,
+            record,
+            || {},
+        )))
     }
 
     fn read_pid(&self, id: &str) -> anyhow::Result<i32> {
@@ -263,14 +273,89 @@ impl ExecBackend {
     }
 }
 
-fn observe_legacy_generation(id: &str, path: &Path) -> ExecGenerationObservation {
-    let raw = match fs::read_to_string(path) {
+const MAX_LEGACY_PID_RECORD_BYTES: u64 = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordEvidence {
+    device: u64,
+    inode: u64,
+    links: u64,
+    length: u64,
+    mode: u32,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl RecordEvidence {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            links: metadata.nlink(),
+            length: metadata.len(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+fn open_legacy_pid_record(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn read_legacy_pid_record(record: &mut File) -> std::io::Result<Vec<u8>> {
+    record.seek(SeekFrom::Start(0))?;
+    let mut raw = Vec::new();
+    record
+        .take(MAX_LEGACY_PID_RECORD_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_LEGACY_PID_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy pid record exceeds 64 bytes",
+        ));
+    }
+    Ok(raw)
+}
+
+fn observe_open_legacy_generation(
+    id: &str,
+    path: &Path,
+    mut record: File,
+    midpoint: impl FnOnce(),
+) -> ExecGenerationObservation {
+    let initial_metadata = match record.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return indeterminate("legacy pid record is not a regular file"),
+        Err(error) => {
+            return indeterminate(format!("cannot stat legacy pid record: {error}"));
+        }
+    };
+    let initial_evidence = RecordEvidence::from_metadata(&initial_metadata);
+    let raw = match read_legacy_pid_record(&mut record) {
         Ok(raw) => raw,
         Err(error) => {
             return indeterminate(format!("reading {}: {error}", path.display()));
         }
     };
-    let pid = match raw.trim().parse::<i32>() {
+    let raw_text = match std::str::from_utf8(&raw) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return indeterminate(format!(
+                "parsing legacy pid record {} as UTF-8: {error}",
+                path.display()
+            ));
+        }
+    };
+    let pid = match raw_text.trim().parse::<i32>() {
         Ok(pid) => pid,
         Err(error) => {
             return indeterminate(format!(
@@ -279,6 +364,7 @@ fn observe_legacy_generation(id: &str, path: &Path) -> ExecGenerationObservation
             ));
         }
     };
+    midpoint();
     if pid <= 0 || !process_alive(pid) {
         return indeterminate("legacy pid is not a live process");
     }
@@ -288,13 +374,7 @@ fn observe_legacy_generation(id: &str, path: &Path) -> ExecGenerationObservation
             return indeterminate(format!("cannot read legacy process start token: {error:#}"));
         }
     };
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return indeterminate(format!("cannot stat legacy pid file: {error}"));
-        }
-    };
-    let modified = match metadata.modified() {
+    let modified = match initial_metadata.modified() {
         Ok(modified) => modified,
         Err(error) => {
             return indeterminate(format!("legacy pid file has no usable mtime: {error}"));
@@ -311,7 +391,13 @@ fn observe_legacy_generation(id: &str, path: &Path) -> ExecGenerationObservation
             ));
         }
     }
-    // Close the observation window: a changed process generation is never promoted.
+    if let Err(reason) =
+        prove_legacy_pid_record_unchanged(path, &mut record, initial_evidence, &raw)
+    {
+        return indeterminate(reason);
+    }
+    // Close the observation window on both resources: neither a changed path
+    // record nor a changed process generation is ever promoted.
     if process_start_time_ticks(pid).ok() != Some(start_time_ticks) {
         return indeterminate("legacy process generation changed while observed");
     }
@@ -335,6 +421,51 @@ fn observe_legacy_generation(id: &str, path: &Path) -> ExecGenerationObservation
         created_at,
         generation_id,
     }
+}
+
+fn prove_legacy_pid_record_unchanged(
+    path: &Path,
+    retained: &mut File,
+    initial_evidence: RecordEvidence,
+    initial_raw: &[u8],
+) -> Result<(), String> {
+    let retained_raw = read_legacy_pid_record(retained)
+        .map_err(|error| format!("re-reading retained legacy pid record: {error}"))?;
+    let retained_metadata = retained
+        .metadata()
+        .map_err(|error| format!("re-statting retained legacy pid record: {error}"))?;
+    if RecordEvidence::from_metadata(&retained_metadata) != initial_evidence
+        || retained_raw != initial_raw
+    {
+        return Err("legacy pid record changed while observed".into());
+    }
+
+    // Re-open by name without following symlinks. The retained descriptor keeps
+    // the original inode allocated, so an atomic replacement cannot reuse its
+    // identity while this comparison is in progress.
+    let mut current = open_legacy_pid_record(path)
+        .map_err(|error| format!("re-opening legacy pid record by name: {error}"))?;
+    let current_metadata_before = current
+        .metadata()
+        .map_err(|error| format!("stating current legacy pid record: {error}"))?;
+    if !current_metadata_before.is_file() {
+        return Err("current legacy pid record is not a regular file".into());
+    }
+    let current_raw = read_legacy_pid_record(&mut current)
+        .map_err(|error| format!("re-reading current legacy pid record: {error}"))?;
+    let current_metadata_after = current
+        .metadata()
+        .map_err(|error| format!("re-statting current legacy pid record: {error}"))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("checking final legacy pid record path: {error}"))?;
+    if RecordEvidence::from_metadata(&current_metadata_before) != initial_evidence
+        || RecordEvidence::from_metadata(&current_metadata_after) != initial_evidence
+        || RecordEvidence::from_metadata(&path_metadata) != initial_evidence
+        || current_raw != initial_raw
+    {
+        return Err("legacy pid record path changed while observed".into());
+    }
+    Ok(())
 }
 
 fn indeterminate(reason: impl Into<String>) -> ExecGenerationObservation {
@@ -476,6 +607,8 @@ mod generation_observation_tests {
         sleep(Duration::from_millis(20));
         let legacy = pid.to_string();
         fs::write(backend.pid_path(id), &legacy).unwrap();
+        let before =
+            RecordEvidence::from_metadata(&fs::symlink_metadata(backend.pid_path(id)).unwrap());
 
         assert!(matches!(
             backend.observe_generation_optional(id).unwrap(),
@@ -491,6 +624,11 @@ mod generation_observation_tests {
             fs::read_to_string(backend.pid_path(id)).unwrap(),
             legacy,
             "observation rewrote the legacy state record"
+        );
+        assert_eq!(
+            RecordEvidence::from_metadata(&fs::symlink_metadata(backend.pid_path(id)).unwrap()),
+            before,
+            "observation changed legacy record identity or write metadata"
         );
     }
 
@@ -540,6 +678,53 @@ mod generation_observation_tests {
         assert!(
             !legacy_pid_predates_record(start, UNIX_EPOCH + Duration::from_secs(1)).unwrap(),
             "an ancient record must not identify the current PID generation"
+        );
+    }
+
+    #[test]
+    fn truncate_in_place_during_observation_is_indeterminate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("task.pid");
+        sleep(Duration::from_millis(20));
+        fs::write(&path, std::process::id().to_string()).unwrap();
+        let record = open_legacy_pid_record(&path).unwrap();
+
+        let observation = observe_open_legacy_generation("host.test.exec", &path, record, || {
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+        });
+        let ExecGenerationObservation::Indeterminate { reason } = observation else {
+            panic!("truncate-in-place was promoted: {observation:?}");
+        };
+        assert!(
+            reason.contains("record") && reason.contains("changed"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn atomic_replace_during_observation_is_indeterminate_even_with_same_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("task.pid");
+        let replacement = tmp.path().join("replacement.pid");
+        let raw = std::process::id().to_string();
+        sleep(Duration::from_millis(20));
+        fs::write(&path, &raw).unwrap();
+        let record = open_legacy_pid_record(&path).unwrap();
+
+        let observation = observe_open_legacy_generation("host.test.exec", &path, record, || {
+            fs::write(&replacement, &raw).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        });
+        let ExecGenerationObservation::Indeterminate { reason } = observation else {
+            panic!("atomic replacement was promoted: {observation:?}");
+        };
+        assert!(
+            reason.contains("record") && reason.contains("changed"),
+            "{reason}"
         );
     }
 }

@@ -265,9 +265,13 @@ otherwise unprovable generations emit `complete: false` and exit non-zero. Missi
 become `absent` only when the corresponding backend observation is complete; uncertainty remains
 `indeterminate`.
 
-Observation never creates a missing PTY or exec state root and never rewrites an existing exec PID
-record. It also does not serialize catalog writers, reconcile tasks, or authorize a control-plane
-cutover. Consumers that require a transactional declaration boundary need a separate protocol.
+A PTY root positively absent at admission is not passed to `pty` and remains absent; an absent exec
+state root likewise remains absent. If an admitted PTY root is concurrently removed, the result is
+incomplete because its filesystem identity changed, but the external `pty list` implementation may
+recreate its registry before st2 can detect the race. Observation never rewrites an existing exec PID
+record. It also does not serialize catalog or runtime writers, reconcile tasks, or authorize a
+control-plane cutover. Consumers that require a zero-write boundary under concurrent root deletion
+or a transactional declaration boundary need a separate protocol.
 
 ### Staged control-plane replacement gate
 

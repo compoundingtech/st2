@@ -13,7 +13,9 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::{Read as _, Seek as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -304,8 +306,11 @@ impl PtyCli {
                 ..ObservationBatch::default()
             };
         }
-        let metadata = match std::fs::metadata(root) {
-            Ok(metadata) => metadata,
+        // Retain the admitted directory inode across the external probe. `pty
+        // list` creates PTY_ROOT when absent, so a path removed and recreated
+        // during the call must never be confused with the admitted registry.
+        let root_handle = match File::open(root) {
+            Ok(handle) => handle,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return ObservationBatch {
                     complete: true,
@@ -318,6 +323,19 @@ impl PtyCli {
                     observations: Vec::new(),
                     errors: vec![format!(
                         "cannot inspect PTY root {}: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        let metadata = match root_handle.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "cannot inspect admitted PTY root {}: {error}",
                         root.display()
                     )],
                 };
@@ -340,6 +358,32 @@ impl PtyCli {
                 };
             }
         };
+        let final_metadata = match std::fs::metadata(root) {
+            Ok(final_metadata) => final_metadata,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "PTY root {} disappeared during observation: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        if !final_metadata.is_dir()
+            || final_metadata.dev() != metadata.dev()
+            || final_metadata.ino() != metadata.ino()
+        {
+            return ObservationBatch {
+                complete: false,
+                observations: Vec::new(),
+                errors: vec![format!(
+                    "PTY root {} changed identity during observation",
+                    root.display()
+                )],
+            };
+        }
         let mut observations = Vec::with_capacity(entries.len());
         let mut errors = Vec::new();
         for entry in entries {
@@ -2293,6 +2337,37 @@ mod tests {
         assert!(batch.observations.is_empty());
         assert!(
             batch.errors[0].contains("cannot inspect PTY root"),
+            "{:?}",
+            batch.errors
+        );
+    }
+
+    #[test]
+    fn removed_and_recreated_pty_root_is_indeterminate_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pty");
+        std::fs::create_dir(&root).unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nrmdir \"$PTY_ROOT\"\nmkdir \"$PTY_ROOT\"\nprintf '%s\\n' '[]'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let batch = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: tmp.path().join("catalog"),
+        }
+        .task_observations_at_root(&HashSet::from(["h.worker"]), &root);
+        assert!(!batch.complete);
+        assert!(batch.observations.is_empty());
+        assert!(
+            batch.errors[0].contains("changed identity during observation"),
             "{:?}",
             batch.errors
         );
