@@ -779,14 +779,15 @@ pub struct UpReport {
     /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
     /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
     pub skipped: bool,
-    /// Task ids first spawned this pass (no prior runtime record was reaped).
+    /// Task IDs that st2 started without a restart reap in this pass.
     pub launched: Vec<String>,
-    /// Task ids successfully restarted this pass: a dead active record was reaped, then its
-    /// replacement was spawned. Kept distinct from both first launch and final garbage collection.
+    /// Task IDs that st2 restarted successfully in this pass. st2 reaped a dead active record
+    /// before it spawned the replacement. These IDs are not first launches or final garbage
+    /// collection.
     pub restarted: Vec<String>,
     /// pty ids torn down (retired agents) this pass.
     pub torn_down: Vec<String>,
-    /// Task ids finally garbage-collected this pass, with no replacement spawned.
+    /// Task IDs in final garbage collection. st2 did not spawn replacements.
     pub gc: Vec<String>,
     /// pty ids whose GC/relaunch was DEFERRED this pass by the liveness debounce — a task that read
     /// not-alive but was alive within the grace window, i.e. a transient `pty list` flicker under load,
@@ -814,6 +815,7 @@ impl UpReport {
     fn absorb(&mut self, mut other: UpReport) {
         self.skipped |= other.skipped;
         self.launched.append(&mut other.launched);
+        self.restarted.append(&mut other.restarted);
         self.torn_down.append(&mut other.torn_down);
         self.gc.append(&mut other.gc);
         self.deferred.append(&mut other.deferred);
@@ -892,8 +894,8 @@ pub fn execute(
                 crate::flapping::RestartDecision::Delaying
                 | crate::flapping::RestartDecision::RateLimited => continue,
             }
-            // Reap the corpse first (a dead session blocks respawn), preserving any backend-owned
-            // bounded diagnostics, then respawn.
+            // Reap the dead record before st2 starts a replacement. A dead record blocks the
+            // replacement. The backend preserves its bounded diagnostics.
             let restarting = gc_set.contains(target.pty_id.as_str());
             if restarting {
                 match runner.reap_for_restart(&target.pty_id) {

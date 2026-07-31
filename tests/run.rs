@@ -103,17 +103,23 @@ fn selected_catalog_two_agent_kdl_recording_runner_matrix() {
                 assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
                 assert!(runner.reaped.borrow().is_empty());
                 assert_eq!(report.launched, ["host.owner.work"]);
+                assert!(report.restarted.is_empty());
+                assert!(report.gc.is_empty());
             }
             Actual::Live => {
                 assert!(runner.spawned.borrow().is_empty());
                 assert!(runner.reaped.borrow().is_empty());
                 assert_eq!(report.adopted, ["owner"]);
+                assert!(report.launched.is_empty());
+                assert!(report.restarted.is_empty());
+                assert!(report.gc.is_empty());
             }
             Actual::Dead => {
                 assert_eq!(runner.reaped.borrow().as_slice(), ["host.owner.work"]);
                 assert_eq!(runner.spawned.borrow().as_slice(), ["host.owner.work"]);
-                assert_eq!(report.gc, ["host.owner.work"]);
-                assert_eq!(report.launched, ["host.owner.work"]);
+                assert!(report.launched.is_empty());
+                assert_eq!(report.restarted, ["host.owner.work"]);
+                assert!(report.gc.is_empty());
             }
         }
         assert!(
@@ -349,7 +355,7 @@ fn selected_one_shot_live_adopts_without_actions() {
 }
 
 #[test]
-fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
+fn selected_one_shot_reports_a_dead_task_only_as_restarted() {
     let runner = FakeRunner {
         sessions: vec![
             dead("host.agent.work"),
@@ -375,8 +381,9 @@ fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
     assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
     assert!(runner.killed.borrow().is_empty());
     assert!(runner.removed.borrow().is_empty());
-    assert_eq!(report.gc, ["host.agent.work"]);
-    assert_eq!(report.launched, ["host.agent.work"]);
+    assert!(report.launched.is_empty());
+    assert_eq!(report.restarted, ["host.agent.work"]);
+    assert!(report.gc.is_empty());
 }
 
 #[test]
@@ -621,7 +628,7 @@ fn up_once_collects_spawn_errors_without_aborting() {
 }
 
 #[test]
-fn up_once_reports_dead_active_reap_spawn_as_restart_not_gc_or_launch() {
+fn up_once_reports_a_successful_replacement_only_as_restarted() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
     let runner = FakeRunner {
@@ -634,7 +641,7 @@ fn up_once_reports_dead_active_reap_spawn_as_restart_not_gc_or_launch() {
     assert_eq!(reaped, vec!["hetz.demo-claude", "hetz.demo.ding"]);
     assert!(
         runner.removed.borrow().is_empty(),
-        "a crash restart is not final retirement cleanup"
+        "a restart must not remove final retirement state"
     );
     assert!(report.launched.is_empty());
     let mut restarted = report.restarted.clone();
@@ -642,7 +649,7 @@ fn up_once_reports_dead_active_reap_spawn_as_restart_not_gc_or_launch() {
     assert_eq!(restarted, vec!["hetz.demo-claude", "hetz.demo.ding"]);
     assert!(
         report.gc.is_empty(),
-        "a successful restart must not be reported as final GC"
+        "a successful restart must not be reported as final garbage collection"
     );
     assert_eq!(
         runner.ops.borrow().as_slice(),
@@ -652,7 +659,7 @@ fn up_once_reports_dead_active_reap_spawn_as_restart_not_gc_or_launch() {
             "reap:hetz.demo.ding",
             "spawn:hetz.demo.ding",
         ],
-        "report taxonomy must not change reap-before-spawn execution ordering"
+        "st2 must reap each dead record before it starts the replacement"
     );
 }
 
@@ -681,7 +688,7 @@ fn up_once_does_not_restart_a_task_when_diagnostic_reap_fails() {
 }
 
 #[test]
-fn up_once_does_not_report_a_failed_replacement_as_restarted() {
+fn up_once_does_not_report_failed_replacement_as_restarted() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
     let runner = FakeRunner {
@@ -695,7 +702,7 @@ fn up_once_does_not_report_a_failed_replacement_as_restarted() {
     assert_eq!(
         runner.reaped.borrow().as_slice(),
         ["hetz.demo-claude"],
-        "the stale record is still reaped before the replacement attempt"
+        "st2 must reap the stale record before it starts a replacement"
     );
     assert!(report.launched.is_empty());
     assert!(report.restarted.is_empty());
