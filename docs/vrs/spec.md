@@ -263,6 +263,33 @@ positive declaration/template wakes, negative runtime/bus events, bounded
 discovery/materialization/PTY queries and writes, continuous-event starvation,
 and no-op desired-equals-actual behavior.
 
+## Quiet coordination after events (R22)
+
+Useful work is quiet by default. Presence, status, and durable plan data are
+facts. They do not cause a status message or a peer poll.
+
+Coordination starts only after one of these events:
+
+- An unread inbox message. DING the recipient. Process or hand off the request.
+- A durable failure or real blocker. Tell the responsible supervisor. Find the cause.
+  Repair the failure or escalate it.
+- A completion or decision. Give the result to the agent or principal that needs it.
+- A declared schedule with a name. Do that work. Do not replace the schedule
+  with repeated messages or polls.
+
+After an event, continue until you resolve the need or hand it off. Then become quiet.
+
+The inbox uses the source contract in
+[DING requirements](./01-ding/requirements.md). A normal supervisor handles
+failures and blocked work. It does not continuously manage healthy agents. A
+custom supervisor persona can ask for more frequent coordination. CoS is only
+an example. st2 does not require or define that role, and R22 gives it no
+standard authority.
+
+R22 does not define the schedule grammar in DQ1. A schedule must have a declared
+name. Transport loss can delay coordination. It does not stop independent
+host-local work. Local work does not depend on a global service.
+
 ## Targeted reconciliation (R19)
 
 `st2 up --materialize-only --task <host.agent.task>` resolves one exact local
