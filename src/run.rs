@@ -649,8 +649,15 @@ impl RuntimeObserver for SystemRunner {
                         state,
                     });
                 }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Exited { .. })) => {
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Exited,
+                    });
+                }
                 Ok(Some(crate::exec_backend::ExecGenerationObservation::Indeterminate {
                     reason,
+                    ..
                 })) => {
                     let message = format!(
                         "exec task {:?} is indeterminate: {reason}",
