@@ -222,6 +222,46 @@ pub fn send_to_inbox(
     )
 }
 
+/// Atomically materialize one already-rendered canonical message filename.
+///
+/// Repeating the same filename and bytes is success; the same filename with different bytes is an
+/// error. Request publication uses this after durably reserving its random filename, so a replay
+/// finishes an interrupted send without allocating a second bus message.
+pub fn materialize_message_once(
+    inbox_dir: &Path,
+    filename: &str,
+    contents: &str,
+) -> anyhow::Result<bool> {
+    if !is_message_filename(filename) {
+        anyhow::bail!("invalid canonical message filename `{filename}`");
+    }
+    fs::create_dir_all(inbox_dir)?;
+    let destination = inbox_dir.join(filename);
+    if destination.is_file() {
+        let existing = fs::read_to_string(&destination)?;
+        if existing == contents {
+            return Ok(false);
+        }
+        anyhow::bail!("message filename collision with different bytes: {filename}");
+    }
+    let temporary = inbox_dir.join(tmp_name());
+    fs::write(&temporary, contents)?;
+    let result = match fs::hard_link(&temporary, &destination) {
+        Ok(()) => Ok(true),
+        Err(_) if destination.is_file() => {
+            let existing = fs::read_to_string(&destination)?;
+            if existing == contents {
+                Ok(false)
+            } else {
+                anyhow::bail!("message filename collision with different bytes: {filename}")
+            }
+        }
+        Err(error) => Err(error.into()),
+    };
+    let _ = fs::remove_file(temporary);
+    result
+}
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_name() -> String {
@@ -646,6 +686,22 @@ mod tests {
         // Source already absent + receipt present is idempotent success too.
         archive_msg(&inbox, &archive, &filename).unwrap();
         assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);
+    }
+
+    #[test]
+    fn reserved_message_materialization_is_idempotent_but_never_clobbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        let filename = "1784649988123-abc23z.md";
+        let contents = render_message("service", Some("request"), None, &[], "{}\n");
+
+        assert!(materialize_message_once(&inbox, filename, &contents).unwrap());
+        assert!(!materialize_message_once(&inbox, filename, &contents).unwrap());
+        let error = materialize_message_once(&inbox, filename, "different")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("collision with different bytes"));
+        assert_eq!(fs::read_to_string(inbox.join(filename)).unwrap(), contents);
     }
 
     #[test]

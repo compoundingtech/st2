@@ -60,6 +60,33 @@ materialization, frozen routing after declaration removal, singleton
 completion, custom task-ID supervision/logging/teardown, and the no-opt-in
 legacy control in `tests/eval_run_e2e.rs`.
 
+## Service-principal request transport
+
+A non-agent service that needs bounded judgment work may declare only its bus
+endpoint at
+`principals/<host>/<identity>/principal.kdl`:
+
+```kdl
+principal "hypermerge" host="dev3"
+```
+
+The declaration creates no task, presence, persona, or Agent Spec authority.
+Its content must exactly match its canonical path. `st2 request send` accepts
+only such a principal as the caller and only a discovered Agent Spec as the
+recipient, so a service neither impersonates an agent nor depends on the flat
+orphan-recovery layout.
+
+The caller supplies an idempotency key, a JSON body, and typed string tags.
+Before the native message is published, st2 atomically reserves one random
+canonical message filename and the exact request envelope under the
+principal's `resources/request-state/`. Replays finish that same publication;
+reuse of the key with different caller, recipient, body, or tags fails. An
+agent's `st2 request reply` similarly publishes at most one typed reply to the
+principal's canonical inbox. `st2 request status --json` returns the tagged
+union `pending | replied`, suitable for a durable workflow to observe between
+its own durable waits. st2 provides no wait loop or timer and does not turn the
+request into agent lifecycle authority.
+
 ## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:

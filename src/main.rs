@@ -69,6 +69,9 @@ enum Command {
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
     #[command(subcommand)]
     Message(MessageCmd),
+    /// Idempotent JSON request/reply transport for declared non-agent service principals.
+    #[command(subcommand)]
+    Request(RequestCmd),
     /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
@@ -531,6 +534,62 @@ enum MessageCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum RequestCmd {
+    /// Publish one idempotent JSON request from a declared service principal to an agent.
+    Send {
+        /// Recipient agent: a bus id (`<host>.<identity>`) or a local bare identity.
+        to: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        /// Typed request tag as `key=value` (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// JSON body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        /// Emit the machine receipt as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Decode one typed request from an agent's inbox.
+    Read {
+        request_filename: String,
+        /// Emit the request envelope as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Reply once to a typed request in an agent's inbox.
+    Reply {
+        request_filename: String,
+        /// Typed reply tag as `key=value` (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// JSON body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        /// Emit the machine receipt as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Observe the typed reply for one previously published request.
+    Status {
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        /// Emit the tagged status union as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
 fn main() -> Result<()> {
     let Cli {
         catalog_path,
@@ -562,6 +621,7 @@ fn main() -> Result<()> {
             up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Request(cmd) => request_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
@@ -1504,6 +1564,132 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn request_cmd(cmd: RequestCmd) -> Result<()> {
+    match cmd {
+        RequestCmd::Send {
+            to,
+            idempotency_key,
+            tags,
+            body,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let principal = acting_id(&ctx)?;
+            let body = parse_json_body(body)?;
+            let receipt = st2::request::publish(
+                &root,
+                &host,
+                &principal,
+                &to,
+                &idempotency_key,
+                parse_typed_tags(tags)?,
+                body,
+            )?;
+            print_publish_receipt(&receipt, json)
+        }
+        RequestCmd::Reply {
+            request_filename,
+            tags,
+            body,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let agent = acting_id(&ctx)?;
+            let body = parse_json_body(body)?;
+            let receipt = st2::request::reply(
+                &root,
+                &host,
+                &agent,
+                &request_filename,
+                parse_typed_tags(tags)?,
+                body,
+            )?;
+            print_publish_receipt(&receipt, json)
+        }
+        RequestCmd::Read {
+            request_filename,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let agent = acting_id(&ctx)?;
+            let request = st2::request::read(&root, &host, &agent, &request_filename)?;
+            if json {
+                println!("{}", serde_json::to_string(&request)?);
+            } else {
+                println!(
+                    "request {} from {} ({})",
+                    request.idempotency_key, request.from, request.request_filename
+                );
+            }
+            Ok(())
+        }
+        RequestCmd::Status {
+            idempotency_key,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let principal = acting_id(&ctx)?;
+            let status = st2::request::status(
+                &root,
+                &host,
+                &principal,
+                &idempotency_key,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                match status {
+                    st2::request::RequestStatus::Pending {
+                        idempotency_key,
+                        request_filename,
+                    } => println!("pending {idempotency_key} ({request_filename})"),
+                    st2::request::RequestStatus::Replied {
+                        idempotency_key,
+                        request_filename,
+                        from,
+                        ..
+                    } => println!("replied {idempotency_key} ({request_filename}) from {from}"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_json_body(body: Option<String>) -> Result<serde_json::Value> {
+    let body = body_or_stdin(body)?;
+    serde_json::from_str(&body).context("request body must be valid JSON")
+}
+
+fn parse_typed_tags(tags: Vec<String>) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut parsed = std::collections::BTreeMap::new();
+    for tag in tags {
+        let (key, value) = tag
+            .split_once('=')
+            .with_context(|| format!("typed tag must be `key=value`, got `{tag}`"))?;
+        if key.is_empty() || value.is_empty() {
+            anyhow::bail!("typed tag must have a non-empty key and value: `{tag}`");
+        }
+        if parsed.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("duplicate typed tag key `{key}`");
+        }
+    }
+    Ok(parsed)
+}
+
+fn print_publish_receipt(receipt: &st2::request::PublishReceipt, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(receipt)?);
+    } else {
+        println!("{}", receipt.filename);
+    }
+    Ok(())
 }
 
 /// `st2 message ls --json` row (stable st2 wire contract).
