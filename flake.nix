@@ -6,7 +6,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     # Packaged PTY contract: the exact fleet-observation producer revision, including persisted
     # environment removals used by managed agent restarts.
-    pty.url = "github:compoundingtech/pty/c0a1e636aea2ba3ce71dc0e72942394fb7f4fe25";
+    pty.url = "github:compoundingtech/pty/d5fabc3917407aeb937a012bd97679c303e18033";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 
