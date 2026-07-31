@@ -1959,6 +1959,7 @@ fn up(
 
 fn print_report(report: &UpReport) {
     report_line("launched", &report.launched);
+    report_line("restarted", &report.restarted);
     report_line("torn down", &report.torn_down);
     report_line("gc", &report.gc);
     report_line("held", &report.held);
