@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
+use agent_spec::spec::{AgentSpec, Restart, Task, TaskKind, TaskLifecycle};
 
 /// ACTUAL state: one running/known task as st2 observes it (unioned across backends).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,8 +45,46 @@ pub struct TaskTarget {
     pub workspace: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
+    /// Effective supervision policy; part of the desired launch generation.
+    pub restart: Restart,
+    /// Whether st2 may launch the task or may only adopt an existing runtime.
+    pub lifecycle: TaskLifecycle,
     /// GC pin (task-level `keep`, or the agent-level `keep`).
     pub keep: bool,
+}
+
+/// Lower one runnable declared task to the exact backend target shared by
+/// reconciliation, generation inspection, and explicit replacement.
+pub(crate) fn task_target(spec: &AgentSpec, task: &Task, this_host: &str) -> Option<TaskTarget> {
+    let launch = match (&task.command, &task.argv) {
+        (Some(command), None) => TaskLaunch::Shell(command.clone()),
+        (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
+        (None, None) => return None,
+        (Some(_), Some(_)) => {
+            unreachable!("discovery rejects tasks carrying both command and argv")
+        }
+    };
+    let bus_id = spec.bus_id(this_host);
+    let mut env = task.env.clone();
+    if let Some(supervisor) = &spec.supervisor {
+        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
+    } else {
+        env.remove("ST_SUPERVISOR");
+    }
+    Some(TaskTarget {
+        kind: task.kind,
+        pty_id: resolve_task_id(&bus_id, &task.name, task.id.as_deref()),
+        bus_id,
+        name: task.name.clone(),
+        launch,
+        cwd: task.cwd.clone(),
+        workspace: spec.workspace.clone(),
+        tags: task.tags.clone(),
+        env,
+        restart: spec.restart_policy(),
+        lifecycle: task.lifecycle,
+        keep: task.keep || spec.keep,
+    })
 }
 
 /// A resolved task launch accepted by the execution backends.
@@ -143,35 +181,9 @@ pub fn reconcile_selected<'a>(
         }
         return Ok(plan);
     }
-    let launch = match (&task.command, &task.argv) {
-        (Some(command), None) => TaskLaunch::Shell(command.clone()),
-        (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
-        (None, None) => {
-            plan.unrunnable.push(owner);
-            return Ok(plan);
-        }
-        (Some(_), Some(_)) => {
-            unreachable!("discovery rejects tasks carrying both command and argv")
-        }
-    };
-    let bus_id = owner.bus_id(this_host);
-    let mut env = task.env.clone();
-    if let Some(supervisor) = &owner.supervisor {
-        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
-    } else {
-        env.remove("ST_SUPERVISOR");
-    }
-    let target = TaskTarget {
-        kind: task.kind,
-        pty_id: runtime.clone(),
-        bus_id,
-        name: task.name.clone(),
-        launch,
-        cwd: task.cwd.clone(),
-        workspace: owner.workspace.clone(),
-        tags: task.tags.clone(),
-        env,
-        keep: task.keep || owner.keep,
+    let Some(target) = task_target(owner, task, this_host) else {
+        plan.unrunnable.push(owner);
+        return Ok(plan);
     };
     match actual {
         Some(s) if s.alive => plan.adopt.push(owner),
@@ -262,40 +274,7 @@ pub fn reconcile<'a>(
         let targets: Vec<(TaskTarget, TaskLifecycle)> = spec
             .tasks
             .iter()
-            .filter_map(|t| {
-                let launch = match (&t.command, &t.argv) {
-                    (Some(command), None) => TaskLaunch::Shell(command.clone()),
-                    (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
-                    (None, None) => return None,
-                    (Some(_), Some(_)) => {
-                        unreachable!("discovery rejects tasks carrying both command and argv")
-                    }
-                };
-                // `supervisor` is the single source of truth. Hooks and harnesses consume the
-                // derived environment variable, but catalog authors/renderers never need to
-                // duplicate the relationship in env{} (and cannot accidentally make it disagree).
-                let mut env = t.env.clone();
-                if let Some(supervisor) = &spec.supervisor {
-                    env.insert("ST_SUPERVISOR".to_string(), supervisor.clone());
-                } else {
-                    env.remove("ST_SUPERVISOR");
-                }
-                Some((
-                    TaskTarget {
-                        kind: t.kind,
-                        pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
-                        bus_id: bus_id.clone(),
-                        name: t.name.clone(),
-                        launch,
-                        cwd: t.cwd.clone(),
-                        workspace: spec.workspace.clone(),
-                        tags: t.tags.clone(),
-                        env,
-                        keep: t.keep || spec.keep,
-                    },
-                    t.lifecycle,
-                ))
-            })
+            .filter_map(|t| task_target(spec, t, this_host).map(|target| (target, t.lifecycle)))
             .collect();
 
         debug_assert!(!targets.is_empty());

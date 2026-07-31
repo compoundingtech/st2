@@ -282,11 +282,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Explicit task lifecycle operations. Declaration publication never enters this path.
+    #[command(subcommand)]
+    Task(TaskCmd),
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCmd {
+    /// Replace one healthy task after rechecking its exact running generation.
+    Replace {
+        /// Exact local task id or qualified `<host>.<agent>.<task>` selector.
+        task: String,
+        /// Runtime generationId previously returned by `st2 tasks --json`.
+        #[arg(long)]
+        expected_running_generation: String,
+        /// Host whose declaration and runtime are selected. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned replacement receipt. Required in v1.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -647,6 +668,18 @@ fn main() -> Result<()> {
             }
             let catalog = catalog_arg(None)?;
             tasks_cmd(&catalog, host)
+        }
+        Command::Task(TaskCmd::Replace {
+            task,
+            expected_running_generation,
+            host,
+            json,
+        }) => {
+            if !json {
+                anyhow::bail!("`st2 task replace` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            replace_task_cmd(&catalog, host, &task, &expected_running_generation)
         }
         Command::CompileAgent {
             catalog,
@@ -1214,6 +1247,40 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
     } else {
         anyhow::bail!("task inventory incomplete")
     }
+}
+
+fn replace_task_cmd(
+    root: &Path,
+    host: Option<String>,
+    selector: &str,
+    expected_running_generation: &str,
+) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", root.display()))?;
+    let lock = HostLock::new(&catalog, &host);
+    if let Some(owner) = lock.live_owner() {
+        anyhow::bail!(
+            "replacement requires the supervisor to be stopped; catalog is owned by pid {owner}"
+        );
+    }
+    lock.acquire().context("acquiring replacement host lock")?;
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+    let result = st2::task_inventory::replace_task(
+        &catalog,
+        &host,
+        selector,
+        expected_running_generation,
+        &runner,
+    );
+    lock.release();
+    let receipt = result?;
+    println!("{}", receipt.to_json());
+    if receipt.launch_generation_state != "converged" {
+        anyhow::bail!("replacement completed but launch generation is drifted");
+    }
+    Ok(())
 }
 
 fn tool_on_path(tool: &str) -> bool {

@@ -76,6 +76,30 @@ fn real_tasks(catalog: &Path, state: &Path) -> Output {
         .unwrap()
 }
 
+fn st2(catalog: &Path, state: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(args)
+        .args(["--catalog"])
+        .arg(catalog)
+        .env("XDG_STATE_HOME", state)
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .output()
+        .unwrap()
+}
+
+struct ExecCleanup {
+    catalog: PathBuf,
+    state: PathBuf,
+}
+
+impl Drop for ExecCleanup {
+    fn drop(&mut self) {
+        let _ = st2(&self.catalog, &self.state, &["down", "--host", "h"]);
+    }
+}
+
 #[test]
 fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     let (tmp, catalog, bin) = fixture(
@@ -436,5 +460,129 @@ fn packaged_tasks_tracks_real_pty_generation_replacement() {
             .as_str()
             .unwrap(),
         first_generation
+    );
+}
+
+#[test]
+fn task_replace_preserves_drift_until_expected_generation_is_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(catalog.join("agents/h/worker")).unwrap();
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("sleep"))
+        .find(|path| path.is_file())
+        .expect("sleep executable on PATH");
+    let write_version = |seconds: u32| {
+        fs::write(
+            &declaration,
+            format!(
+                r#"agent "worker" {{
+  host "h"
+  exec "job" {{ argv {:?} "{seconds}" }}
+}}
+"#,
+                sleep.display().to_string()
+            ),
+        )
+        .unwrap();
+    };
+    write_version(120);
+    let _cleanup = ExecCleanup {
+        catalog: catalog.clone(),
+        state: state.clone(),
+    };
+
+    let launched = st2(&catalog, &state, &["up", "--once", "--host", "h"]);
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    let before = real_tasks(&catalog, &state);
+    assert!(before.status.success());
+    let before: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(
+        before["tasks"][0]["launchGenerationState"],
+        "converged",
+        "launch: {}\ninventory: {}",
+        String::from_utf8_lossy(&launched.stdout),
+        serde_json::to_string_pretty(&before).unwrap()
+    );
+    let previous_pid = before["tasks"][0]["runtime"]["pid"].as_u64().unwrap();
+    let previous_runtime_generation = before["tasks"][0]["runtime"]["generationId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    write_version(121);
+    let drifted = real_tasks(&catalog, &state);
+    assert!(drifted.status.success());
+    let drifted: serde_json::Value = serde_json::from_slice(&drifted.stdout).unwrap();
+    assert_eq!(drifted["tasks"][0]["launchGenerationState"], "drifted");
+    assert_eq!(drifted["tasks"][0]["runtime"]["pid"], previous_pid);
+
+    let stale = st2(
+        &catalog,
+        &state,
+        &[
+            "task",
+            "replace",
+            "h.worker.job",
+            "--expected-running-generation",
+            "sha256:not-current",
+            "--host",
+            "h",
+            "--json",
+        ],
+    );
+    assert!(!stale.status.success());
+    let still_running = real_tasks(&catalog, &state);
+    let still_running: serde_json::Value = serde_json::from_slice(&still_running.stdout).unwrap();
+    assert_eq!(still_running["tasks"][0]["runtime"]["pid"], previous_pid);
+
+    let replaced = st2(
+        &catalog,
+        &state,
+        &[
+            "task",
+            "replace",
+            "h.worker.job",
+            "--expected-running-generation",
+            &previous_runtime_generation,
+            "--host",
+            "h",
+            "--json",
+        ],
+    );
+    assert!(
+        replaced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&replaced.stdout).unwrap();
+    assert_eq!(receipt["schema"], "st2.task-replacement.v1");
+    assert_eq!(
+        receipt["previousRuntimeGeneration"],
+        previous_runtime_generation
+    );
+    assert_eq!(receipt["launchGenerationState"], "converged");
+
+    let after = real_tasks(&catalog, &state);
+    assert!(after.status.success());
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["tasks"][0]["launchGenerationState"], "converged");
+    assert_ne!(after["tasks"][0]["runtime"]["pid"], previous_pid);
+    assert_ne!(
+        after["tasks"][0]["runtime"]["generationId"],
+        previous_runtime_generation
+    );
+
+    let down = st2(&catalog, &state, &["down", "--host", "h"]);
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
     );
 }
