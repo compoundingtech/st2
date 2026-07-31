@@ -135,6 +135,19 @@ impl Fixture {
         std::fs::write(path, kdl).unwrap();
     }
 
+    fn write_presented_compact_agent(&self, identity: &str, name: &str, description: &str) {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}"));
+        let kdl = format!(
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{HOST}\"\n  \
+             type \"service\"\n  name {name:?}\n  description {description:?}\n  command \"{TASK_CMD}\"\n}}\n"
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+    }
+
     /// Write a PTY task that records every st2-managed environment value and its cwd on each boot.
     /// The append-only snapshot lets a test compare the initial launch with a manual `pty restart`.
     fn write_restart_env_agent(&self, identity: &str) -> PathBuf {
@@ -492,6 +505,165 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
             "down did not stop {session_id}"
         );
     }
+}
+
+#[test]
+fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
+    if !pty_gate("presentation_changes_patch_the_exact_live_pty_without_restarting_it") {
+        return;
+    }
+    let fx = Fixture::new();
+    let identity = "presented";
+    let session_id = format!("{HOST}.{identity}");
+    fx.write_presented_compact_agent(identity, "Build owner", "Owns build delivery");
+
+    let launched = fx.up_once();
+    assert!(launched.contains(&session_id), "output:\n{launched}");
+    let pidfile = fx.pty_root.join(format!("{session_id}.pid"));
+    let initial_pid = read_pid(&pidfile).unwrap();
+    let list_session = || {
+        let output = Command::new("pty")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["list", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["name"] == session_id)
+            .unwrap()
+            .clone()
+    };
+    let event_count = || {
+        let output = Command::new("pty")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["events", "--recent", "--json", &session_id])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .matches("metadata_change")
+            .count()
+    };
+    let initial = list_session();
+    let created_at = initial["createdAt"].clone();
+    assert_eq!(initial["displayName"], "Build owner");
+    assert_eq!(initial["tags"]["agent.presentation.schema"], "1");
+    assert_eq!(initial["tags"]["agent.actor.path"], session_id);
+    assert_eq!(
+        initial["tags"]["agent.presentation.description"],
+        "Owns build delivery"
+    );
+    let initial_events = event_count();
+
+    for (command, value) in [
+        ("rename", "Release owner"),
+        ("describe", "Owns release delivery"),
+    ] {
+        let output = fx
+            .st2()
+            .env_remove("ST_AGENT")
+            .args([
+                "--catalog",
+                fx.catalog.to_str().unwrap(),
+                command,
+                &session_id,
+                value,
+            ])
+            .args(["--host", HOST, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let adopted = fx.up_once();
+    assert!(
+        adopted.contains("adopted (1): presented"),
+        "output:\n{adopted}"
+    );
+    let changed = list_session();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(changed["createdAt"], created_at);
+    assert_eq!(changed["displayName"], "Release owner");
+    assert_eq!(
+        changed["tags"]["agent.presentation.description"],
+        "Owns release delivery"
+    );
+    assert_eq!(event_count(), initial_events + 1);
+
+    fx.up_once();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(
+        event_count(),
+        initial_events + 1,
+        "unchanged projection emitted an event"
+    );
+
+    for command in ["rename", "describe"] {
+        let output = fx
+            .st2()
+            .env_remove("ST_AGENT")
+            .args([
+                "--catalog",
+                fx.catalog.to_str().unwrap(),
+                command,
+                &session_id,
+                "--clear",
+            ])
+            .args(["--host", HOST, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fx.up_once();
+    let cleared = list_session();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(cleared["createdAt"], created_at);
+    assert!(cleared.get("displayName").is_none());
+    assert!(
+        cleared["tags"]
+            .get("agent.presentation.description")
+            .is_none()
+    );
+    assert_eq!(event_count(), initial_events + 2);
+
+    let declaration = fx.catalog.join(HOST).join(identity).join("agent.kdl");
+    let source = std::fs::read_to_string(&declaration).unwrap();
+    std::fs::write(
+        &declaration,
+        source.replace(
+            "  type \"service\"\n",
+            "  type \"service\"\n  retired #true\n",
+        ),
+    )
+    .unwrap();
+    let retired = fx.up_once();
+    assert!(
+        retired.contains(&format!("torn down (1): {session_id}")),
+        "output:\n{retired}"
+    );
+    assert!(
+        poll_until(DEATH_TIMEOUT, || !read_alive(&pidfile)),
+        "the genuine retirement lifecycle change did not stop the PTY"
+    );
 }
 
 #[test]

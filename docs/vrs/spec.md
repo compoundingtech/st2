@@ -60,6 +60,64 @@ materialization, frozen routing after declaration removal, singleton
 completion, custom task-ID supervision/logging/teardown, and the no-opt-in
 legacy control in `tests/eval_run_e2e.rs`.
 
+## Stable identity and mutable presentation (R02, R08, R11, R13, R19, R24-R26)
+
+The positional value in `agent "<identity>"` remains the stable Agent Spec ID.
+The supported child/TOML/JSON `identity` spelling and roster JSON `identity`
+field remain unchanged. Host qualification produces the existing
+`<host>.<identity>` bus ID. Only that stable identity controls routing,
+selection, authorization, state paths, task identity, adoption, and lifecycle.
+There is no display-name resolver, stable-ID alias, or stable-ID rename command.
+
+```kdl
+agent "worker" {
+  host "host"
+  name "Release worker"
+  description "Owns release preparation and verification."
+}
+```
+
+`name` is a non-unique human label and `description` is the enduring
+responsibility boundary. Omission is the only cleared representation. Name is
+limited to 160 Unicode scalars and description to 1,000. Explicit empty,
+surrounding-whitespace, Cc-control, U+2028/U+2029, or over-limit values are
+invalid; slash and backslash remain ordinary printable characters. The Agent
+Spec declaration is the sole source of truth. `<agent-dir>/name` is hard-retired:
+st2 neither reads, writes, migrates, nor interprets it.
+
+`st2 rename` and `st2 describe` accept one stable selector and either a value or
+`--clear`. They edit canonical KDL only. The operation:
+
+1. acquires the persistent exclusive
+   `<catalog>/.st2/presentation-authoring.lock` before discovery;
+2. resolves exactly one declaration and checks the caller's `ST_AGENT`
+   self/descendant relationship when present;
+3. refuses `meta { managed-by "nix" }`, unsupported formats, malformed catalogs,
+   and ambiguous targets;
+4. applies one span-bounded edit, reparses and validates the candidate;
+5. fsyncs a same-directory temporary, rechecks the original inode/version and
+   bytes, atomically renames it, then fsyncs the declaration directory.
+
+The lock file is a persistent real inode and is never removed or stale-recovered.
+It serializes cooperating st2 presentation writers in one local POSIX
+filesystem/kernel lock domain. Direct same-UID writes and independently
+synchronized hosts do not participate; the source recheck detects observed
+interference but is not a distributed CAS or lock service. The classified
+refusal codes are an operational trusted-fleet boundary, not adversarial OS
+isolation.
+
+For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
+`pty metadata patch --id <task-id>` request. Every PTY receives the versioned
+st2-owned tags `agent.presentation.schema=1`,
+`agent.actor.path=<host>.<identity>`, and the optional
+`agent.presentation.description`. The primary task named `agent` additionally
+maps `name` to native `displayName`; secondary tasks retain their task-specific
+display convention. Name is not duplicated in tags. Clearing removes only the
+owned native value or tag, and unrelated PTY metadata is preserved. Repeating
+the same projection is a no-op. Failure is reported and retried by the ordinary
+loop, never converted into launch, teardown, garbage collection, replacement,
+or flapping authority.
+
 ## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:

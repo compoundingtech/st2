@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read as _, Seek as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -23,12 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::reconcile::{PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use crate::task_inventory::{
     DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
     RuntimeObserver, generation_id,
@@ -43,10 +44,22 @@ const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    output_with_input_timeout(command, timeout, None)
+}
+
+fn output_with_input_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::from(stdout.try_clone()?))
         .stderr(Stdio::from(stderr.try_clone()?));
     unsafe {
@@ -59,6 +72,13 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
         });
     }
     let mut child = command.spawn()?;
+    if let Some(input) = input {
+        child
+            .stdin
+            .take()
+            .context("metadata patch child has no piped stdin")?
+            .write_all(input)?;
+    }
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -114,6 +134,11 @@ pub trait Runner {
     /// Spawn `target` in the background from its explicit launch. `spec_dir` is the spec file's
     /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
+    /// Atomically reconcile display metadata and the complete st2-owned tag snapshot for one exact
+    /// existing PTY ID. The default is a no-op for non-PTY test/backends.
+    fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// SIGTERM a running session.
     fn kill(&self, pty_id: &str) -> anyhow::Result<()>;
     /// Reap an exited session before restarting it. Backends may preserve bounded diagnostics here.
@@ -158,6 +183,13 @@ struct PtyListEntry {
     /// PTY-owned generation creation time.
     #[serde(rename = "createdAt", default)]
     created_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PtyMetadataPatch<'a> {
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a Option<String>>,
+    tags: &'a BTreeMap<String, Option<String>>,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -243,17 +275,40 @@ impl PtyCli {
             .arg("-d") // detached: leave it running in the background
             .arg("--force") // st2 itself may run inside a pty session; allow nesting
             .args(["--id", &target.pty_id]);
-        // Keep the adoption key task-specific, but make a differing human-facing label the owning
-        // agent's stable bus identity instead of pty's auto-derived `<cwd>-sh` label. When the
-        // lifecycle id already IS that identity, suppress pty's automatic `<cwd>-sh` alias: pty
-        // rejects displayName == id, and no displayName makes the UI fall back to the stable id.
-        if target.pty_id == target.bus_id {
-            cmd.arg("--no-display-name");
-        } else {
-            cmd.args(["--name", &target.bus_id]);
+        match target
+            .presentation
+            .as_ref()
+            .map(|presentation| &presentation.display_name)
+        {
+            Some(Some(Some(name))) => {
+                cmd.args(["--name", name]);
+            }
+            Some(Some(None)) => {
+                cmd.arg("--no-display-name");
+            }
+            // Secondary tasks retain the established task-specific presentation convention.
+            _ if target.pty_id == target.bus_id => {
+                cmd.arg("--no-display-name");
+            }
+            _ => {
+                cmd.args(["--name", &target.bus_id]);
+            }
         }
         cmd.arg("--cwd").arg(&cwd);
-        for (k, v) in &target.tags {
+        let mut tags = target.tags.clone();
+        if let Some(presentation) = &target.presentation {
+            for (key, value) in &presentation.tags {
+                match value {
+                    Some(value) => {
+                        tags.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        tags.remove(key);
+                    }
+                }
+            }
+        }
+        for (k, v) in &tags {
             cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
         }
         // Managed agent and DING sessions retain PTY exit evidence until the lifecycle owner records
@@ -436,6 +491,29 @@ impl PtyCli {
         }
     }
 
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        let payload = serde_json::to_vec(&PtyMetadataPatch {
+            display_name: presentation.display_name.as_ref(),
+            tags: &presentation.tags,
+        })?;
+        let out = output_with_input_timeout(
+            Command::new(&self.bin)
+                .args(["metadata", "patch", "--id", &presentation.pty_id])
+                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+            PTY_LIST_TIMEOUT,
+            Some(&payload),
+        )
+        .map_err(|error| anyhow::anyhow!("`pty metadata patch --id` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty metadata patch --id {}` failed: {}",
+                presentation.pty_id,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     fn list_entries(&self) -> anyhow::Result<Vec<PtyListEntry>> {
         self.list_entries_at(&effective_pty_root(&self.catalog_root))
     }
@@ -521,6 +599,10 @@ impl Runner for PtyCli {
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
         anyhow::bail!("spawning pty '{}' failed: {last_err}", target.pty_id);
+    }
+
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        PtyCli::patch_presentation(self, presentation)
     }
 
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -707,6 +789,10 @@ impl Runner for SystemRunner {
         }
     }
 
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        self.pty.patch_presentation(presentation)
+    }
+
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         match self.index.borrow().get(pty_id) {
             Some(TaskKind::Exec) => self.exec.kill(pty_id),
@@ -850,6 +936,15 @@ pub fn execute(
     cap: &mut FlappingCap,
     report: &mut UpReport,
 ) {
+    // Presentation is an independent metadata path. A failure is visible and retried by the next
+    // reconcile pass, but never authorizes stop, reap, restart, or replacement.
+    for presentation in &plan.presentation {
+        if let Err(error) = runner.patch_presentation(presentation) {
+            report
+                .errors
+                .push(format!("metadata patch {}: {error}", presentation.pty_id));
+        }
+    }
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -1592,7 +1687,7 @@ mod tests {
     use super::*;
     use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
     use std::cell::Cell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
 
     fn target(id: &str, cmd: &str) -> TaskTarget {
@@ -1607,6 +1702,7 @@ mod tests {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            presentation: None,
         }
     }
 
@@ -1637,6 +1733,8 @@ mod tests {
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
             identity: "codex".into(),
+            name: None,
+            description: None,
             host: None,
             role: None,
             job_type: JobType::Service,
@@ -1726,6 +1824,8 @@ mod tests {
     fn spec_fixture() -> AgentSpec {
         AgentSpec {
             identity: "demo".into(),
+            name: None,
+            description: None,
             host: Some("hetz".into()),
             role: None,
             job_type: JobType::Service,
@@ -1962,7 +2062,7 @@ mod tests {
     }
 
     /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
-    /// and the owning agent's bus identity as its human-facing name.
+    /// and the established fallback presentation when no Agent Spec name is projected.
     #[test]
     fn build_run_command_wraps_command_in_sh_c() {
         let cli = PtyCli::default();
@@ -1992,6 +2092,96 @@ mod tests {
                 "-c",
                 "exec claude --permission-mode bypassPermissions 'boot'"
             ]
+        );
+    }
+
+    #[test]
+    fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo", "codex");
+        t.bus_id = "hetz.demo".to_owned();
+        t.tags.insert("unrelated".to_owned(), "preserved".to_owned());
+        t.presentation = Some(PtyPresentation {
+            pty_id: "hetz.demo".to_owned(),
+            display_name: Some(Some("Build owner".to_owned())),
+            tags: BTreeMap::from([
+                (
+                    "agent.presentation.schema".to_owned(),
+                    Some("1".to_owned()),
+                ),
+                (
+                    "agent.actor.path".to_owned(),
+                    Some("hetz.demo".to_owned()),
+                ),
+                ("agent.presentation.description".to_owned(), None),
+            ]),
+        });
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let name = args.iter().position(|arg| arg == "--name").unwrap();
+        assert_eq!(args[name + 1], "Build owner");
+        let tags = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--tag")
+            .map(|pair| pair[1].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(tags.contains("unrelated=preserved"));
+        assert!(tags.contains("agent.presentation.schema=1"));
+        assert!(tags.contains("agent.actor.path=hetz.demo"));
+        assert!(
+            !tags
+                .iter()
+                .any(|tag| tag.starts_with("agent.presentation.description="))
+        );
+    }
+
+    #[test]
+    fn metadata_patch_uses_exact_id_and_one_json_stdin_payload() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("pty-capture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = PtyCli {
+            bin: executable.display().to_string(),
+            catalog_root: temporary.path().to_path_buf(),
+        };
+        let presentation = PtyPresentation {
+            pty_id: "stable.agent.id".to_owned(),
+            display_name: Some(None),
+            tags: BTreeMap::from([
+                (
+                    "agent.presentation.schema".to_owned(),
+                    Some("1".to_owned()),
+                ),
+                ("agent.presentation.description".to_owned(), None),
+            ]),
+        };
+
+        cli.patch_presentation(&presentation).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(executable.with_extension("args")).unwrap(),
+            "metadata\npatch\n--id\nstable.agent.id\n"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(executable.with_extension("stdin")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["displayName"], serde_json::Value::Null);
+        assert_eq!(payload["tags"]["agent.presentation.schema"], "1");
+        assert_eq!(
+            payload["tags"]["agent.presentation.description"],
+            serde_json::Value::Null
         );
     }
 

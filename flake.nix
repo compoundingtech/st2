@@ -6,7 +6,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     # Packaged PTY fleet-observation gate: the exact `pty list --json` producer revision with
     # ambiguity-safe PID reads, EPERM handling, and one fleet-wide socket fallback budget.
-    pty.url = "github:compoundingtech/pty/afeb3b6234b7010b7db802fd029766ad17c14219";
+    pty.url = "github:compoundingtech/pty/706e4f5e4cd88fe24ce5b8afb7dbd507bd3e215c";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 

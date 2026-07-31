@@ -120,6 +120,10 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Set or clear an agent's human-facing name without changing stable identity.
+    Rename(PresentationArgs),
+    /// Set or clear an agent's enduring responsibility description.
+    Describe(PresentationArgs),
     /// EXPERIMENTAL: generate one compact agent declaration plus catalog-owned templates. Hand-authored
     /// KDL is canonical. Inspect the full generated KDL and every workspace `render {}` target before
     /// materialization. The workspace remains untouched until `st2 up --materialize-only` or `st2 up`.
@@ -296,8 +300,9 @@ enum Command {
 /// running agent needs no flags.
 #[derive(Args)]
 struct MsgCtx {
-    /// Legacy catalog/bus root override. Prefer global `--catalog`; defaults to `$CATALOG`, then the
-    /// default st2 catalog.
+    /// Low-level bus root override. Declared identities use native resource boxes; any absent
+    /// identity is treated as an exact flat mailbox id. Prefer global `--catalog` for strict Agent
+    /// Spec routing.
     #[arg(long, conflicts_with = "catalog_path")]
     root: Option<PathBuf>,
     /// The acting identity — who the message is `from` / whose inbox is "mine". Defaults to
@@ -305,6 +310,28 @@ struct MsgCtx {
     #[arg(long = "as")]
     as_id: Option<String>,
     /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(Args)]
+struct PresentationArgs {
+    /// Exact bus identity, or a bare stable identity only when unique in the selected catalog.
+    identity: String,
+    /// Presentation text. Use --clear to remove the field.
+    #[arg(
+        value_name = "TEXT",
+        required_unless_present = "clear",
+        conflicts_with = "clear"
+    )]
+    value: Option<String>,
+    /// Remove the optional field.
+    #[arg(long)]
+    clear: bool,
+    /// Emit a stable JSON receipt or classified refusal.
+    #[arg(long)]
+    json: bool,
+    /// Host used only to resolve declarations whose host is omitted.
     #[arg(long)]
     host: Option<String>,
 }
@@ -578,6 +605,10 @@ fn main() -> Result<()> {
             interval,
         } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
+        Command::Describe(args) => {
+            presentation_cmd(st2::agent_author::PresentationField::Description, args)
+        }
         Command::Agents {
             catalog,
             status,
@@ -1191,6 +1222,69 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
     }
 }
 
+fn presentation_cmd(
+    field: st2::agent_author::PresentationField,
+    args: PresentationArgs,
+) -> Result<()> {
+    let PresentationArgs {
+        identity,
+        value,
+        clear,
+        json,
+        host,
+    } = args;
+    let root = catalog_arg(None)?;
+    let host = host.unwrap_or_else(detect_host);
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let requested = if clear { None } else { value.as_deref() };
+    match st2::agent_author::set_presentation(
+        &root,
+        &identity,
+        &host,
+        actor.as_deref(),
+        field,
+        requested,
+    ) {
+        Ok(receipt) => {
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                let state = match (receipt.result, receipt.value.as_deref()) {
+                    (st2::agent_author::AuthorOutcome::Changed, Some(value)) => {
+                        format!("set to {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Changed, None) => "cleared".to_owned(),
+                    (st2::agent_author::AuthorOutcome::Unchanged, Some(value)) => {
+                        format!("already {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Unchanged, None) => {
+                        "already clear".to_owned()
+                    }
+                };
+                println!("{} {}: {state}", receipt.identity, field.as_str());
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "error",
+                        "code": error.code(),
+                        "identity": identity,
+                        "field": field,
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Result<()> {
     let (root, host) = resolve_ctx(&ctx)?;
     let id = match identity {
@@ -1236,10 +1330,11 @@ fn agents_cmd(
         for r in &rows {
             let retired = if r.retired { "\t[retired]" } else { "" };
             println!(
-                "{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 r.name.as_deref().unwrap_or(""),
+                r.description.as_deref().unwrap_or(""),
                 retired,
             );
         }
@@ -1265,11 +1360,11 @@ fn ding_cmd(
     // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
     // optional). An explicit positional still overrides for the rare non-agent case.
     let session = session.unwrap_or_else(|| id.clone());
-    // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
-    // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
+    // Explicit-root transport still resolves a declared agent to its native resource inbox; only
+    // an absent identity uses the exact flat <root>/<id> mailbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
         .unwrap_or_else(|| catalog_root.join(&id));
-    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
+    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host, routing_mode(&ctx))?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
@@ -1291,6 +1386,14 @@ fn resolve_ctx(ctx: &MsgCtx) -> Result<(PathBuf, String)> {
     };
     let host = ctx.host.clone().unwrap_or_else(detect_host);
     Ok((root, host))
+}
+
+fn routing_mode(ctx: &MsgCtx) -> message::RoutingMode {
+    if ctx.root.is_some() {
+        message::RoutingMode::ExplicitRoot
+    } else {
+        message::RoutingMode::Catalog
+    }
 }
 
 /// The acting identity (`from` / whose inbox is "mine"): `--as`, else `$ST_AGENT`.
@@ -1343,9 +1446,10 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let mode = routing_mode(&ctx);
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
+            let dir = message::resolve_inbox(&root, &to, &host, mode)?;
             let filename = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1364,8 +1468,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let mode = routing_mode(&ctx);
             let from = acting_id(&ctx)?;
-            let my_inbox = message::resolve_inbox(&root, &from, &host);
+            let my_inbox = message::resolve_inbox(&root, &from, &host, mode)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
@@ -1374,7 +1479,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
+            let dir = message::resolve_inbox(&root, &to, &host, mode)?;
             let sent = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1398,11 +1503,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let mode = routing_mode(&ctx);
             let id = match identity {
                 Some(id) => id,
                 None => acting_id(&ctx)?,
             };
-            let dir = message::resolve_list_box(&root, &id, &host, archive, orphan)?;
+            let dir = message::resolve_list_box(&root, &id, &host, archive, orphan, mode)?;
             let mut msgs = if archive {
                 message::list_dir(&dir)?
             } else {
@@ -1448,12 +1554,13 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let mode = routing_mode(&ctx);
             let (id, filename) = box_target(first, second, &ctx)?;
             let dir = if archive {
-                message::resolve_archive(&root, &id, &host)
+                message::resolve_archive(&root, &id, &host, mode)
             } else {
-                message::resolve_inbox(&root, &id, &host)
-            };
+                message::resolve_inbox(&root, &id, &host, mode)
+            }?;
             if raw {
                 print!("{}", std::fs::read_to_string(dir.join(&filename))?);
                 return Ok(());
@@ -1479,12 +1586,11 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         }
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let mode = routing_mode(&ctx);
             let (id, filename) = box_target(first, second, &ctx)?;
-            message::archive_msg(
-                &message::resolve_inbox(&root, &id, &host),
-                &message::resolve_archive(&root, &id, &host),
-                &filename,
-            )?;
+            let inbox = message::resolve_inbox(&root, &id, &host, mode)?;
+            let archive = message::resolve_archive(&root, &id, &host, mode)?;
+            message::archive_msg(&inbox, &archive, &filename)?;
             println!("archived");
             Ok(())
         }

@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
-use agent_spec::spec::{Restart, RestartMode, parse_duration};
+use agent_spec::spec::{
+    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, Restart, RestartMode, parse_duration,
+    validate_presentation,
+};
 
 /// A parsed st2 spec: a base team (`st2 up` boots this) plus an optional `eval` (`st2 eval` runs it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,8 @@ pub struct Spec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecAgent {
     pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
     pub workspace: Option<String>,
     /// This agent's supervisor (the id its crash escalates to). The chain of `supervisor` fields is
     /// walked to the root (the root's is `None` — that is the cos) for crash-ding escalation.
@@ -186,6 +191,28 @@ fn child_arg(node: &KdlNode, name: &str) -> Option<String> {
         .iter()
         .find(|n| n.name().value() == name)
         .and_then(arg)
+}
+
+fn parse_agent_presentation(
+    node: &KdlNode,
+    agent_id: &str,
+    field: &str,
+    destination: &mut Option<String>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        destination.is_none(),
+        "agent '{agent_id}' declares `{field}` more than once"
+    );
+    anyhow::ensure!(
+        node.children().is_none()
+            && node.entries().len() == 1
+            && node.entries()[0].name().is_none(),
+        "agent '{agent_id}' `{field}` must contain exactly one positional string"
+    );
+    let value = arg(node)
+        .ok_or_else(|| anyhow::anyhow!("agent '{agent_id}' `{field}` must contain a string"))?;
+    *destination = Some(value);
+    Ok(())
 }
 
 /// Parse a flat `run "label" { … }` node into one [`RunStep`], appended in order. The `run` node IS
@@ -389,6 +416,8 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
     let name = arg(node).ok_or_else(|| anyhow::anyhow!("agent needs an id"))?;
     let id = if prefix.is_empty() { name } else { format!("{prefix}.{name}") };
 
+    let mut display_name = None;
+    let mut description = None;
     let mut workspace = None;
     let mut supervisor = None;
     let mut agent_env = BTreeMap::new();
@@ -406,6 +435,10 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
         for c in ch.nodes() {
             match c.name().value() {
                 "env" => {}
+                "name" => parse_agent_presentation(c, &id, "name", &mut display_name)?,
+                "description" => {
+                    parse_agent_presentation(c, &id, "description", &mut description)?
+                }
                 "workspace" => workspace = arg(c),
                 "supervisor" => supervisor = arg(c),
                 "command" => command = arg(c),
@@ -456,13 +489,21 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
                     });
                 }
                 other => anyhow::bail!(
-                    "agent '{id}': unexpected node '{other}' (expected workspace|supervisor|env|command|ding|exec)"
+                    "agent '{id}': unexpected node '{other}' (expected name|description|workspace|supervisor|env|command|ding|exec)"
                 ),
             }
         }
+        validate_presentation("name", display_name.as_deref(), AGENT_NAME_MAX_CHARS)?;
+        validate_presentation(
+            "description",
+            description.as_deref(),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )?;
         let env = cascade(parent_env, &agent_env);
         return Ok(SpecAgent {
             id: id.clone(),
+            name: display_name,
+            description,
             workspace,
             supervisor,
             env,
@@ -756,6 +797,39 @@ eval {
             env: BTreeMap::new(),
             derived: true,
         });
+    }
+
+    #[test]
+    fn compact_agents_lower_bounded_presentation_without_changing_identity() {
+        let spec = parse_spec(
+            r#"agent "worker" {
+  name "Build owner"
+  description "Own build delivery"
+  command "true"
+}"#,
+        )
+        .unwrap();
+        let agent = &spec.agents[0];
+        assert_eq!(agent.id, "worker");
+        assert_eq!(agent.name.as_deref(), Some("Build owner"));
+        assert_eq!(agent.description.as_deref(), Some("Own build delivery"));
+
+        for field in ["name", "description"] {
+            for separator in ['\u{2028}', '\u{2029}'] {
+                let source = format!(
+                    "agent \"worker\" {{ {field} \"left{separator}right\"; command \"true\" }}"
+                );
+                assert!(parse_spec(&source).is_err(), "accepted {field} U+{:04X}", separator as u32);
+            }
+            let duplicate = format!(
+                "agent \"worker\" {{ {field} \"one\"; {field} \"two\"; command \"true\" }}"
+            );
+            assert!(parse_spec(&duplicate).is_err(), "accepted duplicate {field}");
+
+            let malformed =
+                format!("agent \"worker\" {{ {field} 1; command \"true\" }}");
+            assert!(parse_spec(&malformed).is_err(), "accepted malformed {field}");
+        }
     }
 
     #[test]

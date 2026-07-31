@@ -307,6 +307,148 @@ argv = ["claude", "--resume", "session id"]
 }
 
 #[test]
+fn presentation_metadata_lowers_from_kdl_toml_and_json_without_changing_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/kdl/agent.kdl",
+        r#"agent "kdl" {
+  host "h"
+  name "Display label"
+  description "Enduring responsibility"
+  command "true"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+host = "h"
+name = "Display label"
+description = "Enduring responsibility"
+command = "true"
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","name":"Display label","description":"Enduring responsibility","command":"true"}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    for identity in ["kdl", "toml", "json"] {
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.identity, identity);
+        assert_eq!(spec.name.as_deref(), Some("Display label"));
+        assert_eq!(spec.description.as_deref(), Some("Enduring responsibility"));
+    }
+}
+
+#[test]
+fn malformed_or_duplicate_kdl_presentation_is_rejected() {
+    for (case, body) in [
+        ("duplicate", "name \"one\"; name \"two\""),
+        ("wrong-type", "description 42"),
+        ("children", "description { nested \"no\" }"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{case}/agent.kdl"),
+            &format!("agent {case:?} {{ host \"h\"; {body}; command \"true\" }}"),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{case}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{case}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains("must contain")
+                || found.errors[0].message.contains("more than once"),
+            "{case}: {}",
+            found.errors[0].message
+        );
+    }
+}
+
+#[test]
+fn presentation_bounds_count_unicode_scalars_and_reject_noncanonical_values() {
+    use agent_spec::spec::{
+        AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, validate_presentation,
+    };
+
+    let name_at_limit = "é".repeat(AGENT_NAME_MAX_CHARS);
+    let description_at_limit = "界".repeat(AGENT_DESCRIPTION_MAX_CHARS);
+    assert!(validate_presentation("name", Some(&name_at_limit), AGENT_NAME_MAX_CHARS).is_ok());
+    assert!(
+        validate_presentation(
+            "description",
+            Some(&description_at_limit),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_presentation(
+            "name",
+            Some(&format!("{name_at_limit}x")),
+            AGENT_NAME_MAX_CHARS,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_presentation(
+            "description",
+            Some(&format!("{description_at_limit}x")),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )
+        .is_err()
+    );
+    for (field, max_chars) in [
+        ("name", AGENT_NAME_MAX_CHARS),
+        ("description", AGENT_DESCRIPTION_MAX_CHARS),
+    ] {
+        assert!(validate_presentation(field, Some(r"slash/name\path"), max_chars).is_ok());
+        for invalid in [
+            "",
+            " leading",
+            "trailing ",
+            "two\nlines",
+            "control\u{7f}",
+            "line\u{2028}separator",
+            "paragraph\u{2029}separator",
+        ] {
+            assert!(
+                validate_presentation(field, Some(invalid), max_chars).is_err(),
+                "accepted {field} {invalid:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn presentation_parser_rejects_unicode_line_and_paragraph_separators() {
+    for field in ["name", "description"] {
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "agents/h/worker/agent.kdl",
+                &format!(
+                    "agent \"worker\" {{\n  host \"h\"\n  type \"service\"\n  {field} \"left{separator}right\"\n  pty \"agent\" {{ command \"true\" }}\n}}\n"
+                ),
+            );
+            let found = discover(tmp.path());
+            assert!(
+                found.specs.is_empty(),
+                "accepted {field} U+{:04X}",
+                separator as u32
+            );
+            assert_eq!(found.errors.len(), 1, "{field}: {:?}", found.errors);
+        }
+    }
+}
+
+#[test]
 fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
     let tmp = tempfile::tempdir().unwrap();
     write(

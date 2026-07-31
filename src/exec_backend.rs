@@ -938,6 +938,7 @@ mod generation_observation_tests {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            presentation: None,
         }
     }
 
