@@ -11,6 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlNode};
 
+use crate::cutover_admission::RuntimeMutate;
 use agent_spec::spec::AgentSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,10 +49,8 @@ fn references_variable(input: &str, variable: &str) -> bool {
     while input.contains(&marker) {
         marker.push('\0');
     }
-    crate::expand::expand_vars(input, |name| {
-        (name == variable).then(|| marker.clone())
-    })
-    .contains(&marker)
+    crate::expand::expand_vars(input, |name| (name == variable).then(|| marker.clone()))
+        .contains(&marker)
 }
 
 impl RenderOp {
@@ -61,8 +60,7 @@ impl RenderOp {
                 source,
                 destination,
             } => {
-                references_variable(source, variable)
-                    || references_variable(destination, variable)
+                references_variable(source, variable) || references_variable(destination, variable)
             }
             Self::File {
                 destination,
@@ -72,12 +70,10 @@ impl RenderOp {
                 destination,
                 content,
             } => {
-                references_variable(destination, variable)
-                    || references_variable(content, variable)
+                references_variable(destination, variable) || references_variable(content, variable)
             }
             Self::EnsureLine { destination, line } => {
-                references_variable(destination, variable)
-                    || references_variable(line, variable)
+                references_variable(destination, variable) || references_variable(line, variable)
             }
             Self::GitExclude { path } => references_variable(path, variable),
         }
@@ -238,6 +234,35 @@ pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
         Some(render) => parse_render_node(render, &spec.identity),
         None => Ok(RenderPlan::default()),
     }
+}
+
+/// Catalog-owned files read by this agent's `render { copy ... }` operations.
+///
+/// Absolute/external sources are deliberately absent: a declaration snapshot owns catalog bytes,
+/// not arbitrary workspace or host files. The returned paths are exact existing files; callers
+/// still decide which file kinds are admissible for their transaction.
+pub(crate) fn catalog_owned_render_inputs(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<Vec<PathBuf>> {
+    let plan = parse_plan(spec)?;
+    let env = render_env(root, spec, this_host);
+    let spec_dir = spec.path.parent().unwrap_or(root);
+    let mut inputs = BTreeSet::new();
+    for operation in plan.ops {
+        let RenderOp::Copy {
+            source: raw_source, ..
+        } = operation
+        else {
+            continue;
+        };
+        let resolved = source(root, spec_dir, &raw_source, &env)?;
+        if resolved.strip_prefix(root).is_ok() {
+            inputs.insert(resolved);
+        }
+    }
+    Ok(inputs.into_iter().collect())
 }
 
 fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
@@ -590,7 +615,28 @@ pub fn render_ownership_conflicts(
 }
 
 /// Execute one agent's render plan in declaration order.
-pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
+fn require_permission(permission: &RuntimeMutate<'_>, root: &Path, this_host: &str) -> Result<()> {
+    let canonical = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", root.display()))?;
+    if permission.catalog().as_path() != canonical || permission.host().as_str() != this_host {
+        anyhow::bail!(
+            "runtime mutation permission is for ({}, {}), not ({}, {this_host})",
+            permission.catalog().as_path().display(),
+            permission.host().as_str(),
+            canonical.display(),
+        );
+    }
+    Ok(())
+}
+
+pub fn materialize_agent(
+    permission: &RuntimeMutate<'_>,
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<Vec<String>> {
+    require_permission(permission, root, this_host)?;
     let plan = parse_plan(spec)?;
     if plan.ops.is_empty() {
         return Ok(Vec::new());
@@ -839,6 +885,15 @@ pub fn materialize_catalog(root: &Path, specs: &[AgentSpec], this_host: &str) ->
     materialize_catalog_against(root, specs, specs, this_host)
 }
 
+pub fn materialize_catalog_admitted(
+    permission: &RuntimeMutate<'_>,
+    root: &Path,
+    specs: &[AgentSpec],
+    this_host: &str,
+) -> MaterializeReport {
+    materialize_catalog_against_admitted(permission, root, specs, specs, this_host)
+}
+
 /// Materialize `selected_specs` after checking their workspace target ownership against the complete
 /// active fleet. This preserves shortest-path selection while preventing a selected owner from
 /// bypassing a collision declared by an unselected sibling.
@@ -848,7 +903,47 @@ pub fn materialize_catalog_against(
     ownership_specs: &[AgentSpec],
     this_host: &str,
 ) -> MaterializeReport {
+    let ownership = match crate::host_lock::HostOwnership::acquire(root, this_host) {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            return MaterializeReport {
+                errors: vec![format!(
+                    "acquire runtime host ownership for materialization: {error}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
+    let admission = match crate::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return MaterializeReport {
+                errors: vec![format!("runtime mutation admission denied: {error}")],
+                ..Default::default()
+            };
+        }
+    };
+    materialize_catalog_against_admitted(
+        &admission.permission(),
+        root,
+        selected_specs,
+        ownership_specs,
+        this_host,
+    )
+}
+
+pub fn materialize_catalog_against_admitted(
+    permission: &RuntimeMutate<'_>,
+    root: &Path,
+    selected_specs: &[AgentSpec],
+    ownership_specs: &[AgentSpec],
+    this_host: &str,
+) -> MaterializeReport {
     let mut report = MaterializeReport::default();
+    if let Err(error) = require_permission(permission, root, this_host) {
+        report.errors.push(error.to_string());
+        return report;
+    }
     let selected_ids = selected_specs
         .iter()
         .map(|spec| spec.bus_id(this_host))
@@ -875,7 +970,7 @@ pub fn materialize_catalog_against(
         if report.failed_agents.contains(&bus_id) {
             continue;
         }
-        match materialize_agent(root, spec, this_host) {
+        match materialize_agent(permission, root, spec, this_host) {
             Ok(notes) => {
                 for note in notes {
                     if note.starts_with("WARN ") {

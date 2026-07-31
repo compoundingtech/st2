@@ -89,6 +89,216 @@ renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/6
 and the portable Agent Spec envelope in
 [evals#41](https://github.com/compoundingtech/evals/issues/41).
 
+## Transactional catalog authoring
+
+`st2 agent digest (--spec FILE | --bundle DIR)` captures a source through
+retained no-follow file descriptors and returns its authoritative digest.
+`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
+--input-sha256 HEX (--expect-absent | --expect-sha256 HEX) --json` binds
+publication to that exact capture. It accepts exactly one canonical KDL `agent` node with an
+explicit, path-safe host and identity. st2 no longer exposes an intent compiler:
+external renderers own the transformation from human intent to exact Agent Spec
+bytes or a create-only publication bundle.
+
+The persistent `<catalog>/.st2/catalog-authoring.lock` defines one cooperative
+read/write transaction domain:
+
+```text
+publisher (EX)  : snapshot input -> CAS -> full-catalog admission -> atomic publish + fsync
+reader (SH)     : discover -> materialize/observe -> plan -> execute
+bulk apply (EX) : root CAS -> durable stage+marker -> converge -> verify+clear
+state plane     : message | context | Resource | status                    (unlocked)
+```
+
+The lock file is a persistent real inode: replacing or removing it would split
+the lock domain for a process that already has it open. Consequently, the first
+coherent declaration reader may initialize exactly `.st2` and this lock even
+when its requested operation later refuses. Refusal still performs no
+declaration, workspace, or state mutation.
+
+The publisher derives the destination from the captured declaration, replaces
+only `agent.kdl` for a hash-authorized update, and preserves all sibling runtime
+state. A bundle is create-only and is renamed from a hidden same-filesystem
+stage; retry reports `unchanged` only when every projected bundle file already
+matches. `--expect-absent` is idempotent for identical input.
+`--input-sha256` rejects a caller/source swap and `--expect-sha256` rejects a
+stale declaration writer. Full-catalog admission rejects any
+structural validation error before publication. The typed result is
+`published` or `unchanged`.
+
+`st2 catalog snapshot --catalog ROOT --output DIR --json` holds SH while it
+captures the canonical declaration projection: `catalog.kdl`, exact
+`agents/<host>/<identity>/agent.kdl` files, static files inside those bounded
+agent bundles, and every regular file in `_templates` whether or not a current
+render references it. `_templates` is bounded to depth 8 below its root, 256
+files, 1 MiB per file, and 32 MiB total; symlinks, hard links, special nodes,
+and reserved control/state names are rejected. Runtime state, `.git`, `.st2`,
+the native `pty` registry, and workspace content are excluded. A
+catalog-contained Agent `workspace` or Task `cwd` is valid only when it names
+that agent bundle's canonical real `.workspace`; the empty directory itself is
+an exact declaration fact, while its descendants are never traversed. The
+classification uses launch-equivalent variable expansion, resolves relative
+values from the Agent Spec bundle, and lexically normalizes before comparing
+against the logical catalog. A relative spelling is accepted only when it
+normalizes to that bundle's canonical `.workspace`; unresolved variables and
+every other effective relative path fail closed. The
+scanner always excludes a canonical `.workspace` subtree, including an orphan
+left after an agent move or removal. External workspaces remain valid and are
+not part of the projection. The output is a create-only durable directory; an
+identical retry is `unchanged`. Its domain-separated, path-sorted root SHA-256
+covers normalized relative paths, file bytes, executable bits, and empty
+workspace directory facts.
+
+`st2 catalog project --catalog ROOT --snapshot DIR --expect-sha256 HEX
+--output DIR --json` derives one create-only, atomically published migration
+bundle from one retained snapshot capture. `ROOT` is read only and supplies
+the canonical logical address needed to interpret absolute catalog-local
+workspace facts; the receipt binds that address and the source root digest.
+The snapshot argument must be its canonical absolute path, and the resolved
+create-only output must be beneath neither the snapshot nor `ROOT`, including
+through a symlinked parent.
+The bundle is closed and restart-safe:
+
+```text
+DIR/
+  service/           exact retained declaration projection
+  adopt-only/        exact declarations; every PTY lifecycle is adopt-only
+  provider-witness/  all Agent identities and Resources; active PTYs only,
+                     all exec/Ding and retired desired-absent PTYs suppressed
+  receipt.json       source/child roots, typed predecessors, identity sets,
+                     active/retired partition
+  bundle.sha256      domain hash of receipt bytes and the three child roots
+```
+
+Projection parses and transforms canonical KDL nodes; it never edits KDL as
+text or reconstructs direct argv through a shell. `service` and `adopt-only`
+retain every Agent identity, Resource, provider task ID, exec task ID, and
+retired provider declaration. `provider-witness` retains every Agent identity
+and Resource, while its provider task IDs equal exactly the source's active
+provider partition. The receipt separately records all Agent IDs,
+provider-bearing Agent IDs, every provider task ID, active provider task IDs,
+retired desired-absent provider task IDs, exec task IDs, and the equality
+proofs between projections. A pre-existing output is an error rather than an
+implicit recovery mode.
+Immediately before receipt construction, all three materialized private-stage
+children are independently reprojected and their actual roots and identity
+sets become the attested values.
+
+Projection admission may carry one exact pre-existing error class,
+`render-owner-conflict`, as sorted path/agent/message evidence and sets
+`admission.applyAdmissible` to false. Every other structural, parsing, path,
+identity, or task error rejects projection. This exception creates evidence;
+it grants no apply or reconcile authority. Ordinary `catalog apply` retains
+full admission and rejects the bundle until those conflicts are resolved.
+Regular files directly beneath `agents/` or `agents/<host>/` are outside the
+canonical host/identity address grammar and excluded; symlinks and special
+nodes at those positions still fail closed.
+
+`st2 catalog apply` has exactly three closed modes: ordinary
+`--prepared DIR --expect-sha256 HEX`, typed projected
+`--projection-bundle DIR --projection-child service|adopt-only
+--expect-bundle-sha256 HEX --expect-sha256 HEX`, or `--resume`. The mandatory
+bundle digest is the caller-held capability returned by `catalog project`; the
+bundle's own digest file is never sufficient authority. Projected apply first
+requires the exact five-entry outer shape, then captures the complete public
+bundle once through retained no-follow descriptors with explicit depth,
+filesystem-entry-count, per-file, and total-byte bounds. It reparses the private typed
+receipt, verifies the exact receipt bytes and outer bundle digest, requires
+`expect-sha256` to equal the selected child's receipt-bound predecessor and the
+receipt's canonical `logicalCatalog` to equal `ROOT`, and reprojects all three
+materialized private children against their receipt roots, entry counts,
+identity sets, and projection admission. Only then does the selected child
+enter the same ordinary full-admission/CAS transaction without reopening the
+public bundle. `provider-witness` is
+deliberately not apply authority. A child root digest alone cannot authorize
+reuse at another catalog address.
+
+The receipt's closed transition graph is:
+
+```text
+service/source root --apply adopt-only--> adopt-only root
+adopt-only root     --apply service-----> service/source root
+provider-witness                         no apply predecessor
+```
+
+Each edge names exactly one predecessor digest; arbitrary child transitions
+are rejected before ordinary apply. A completed-edge retry remains idempotent
+because ordinary apply returns `unchanged` when the current root already equals
+the selected target before evaluating the predecessor CAS. Once a durable apply
+marker exists, generic `catalog apply --resume` uses only its captured
+content-addressed stage and predecessor record; replaying the bundle is rejected
+until recovery completes.
+
+`st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
+rejects any prepared state/control path, symlink, special node, unprojected
+file/directory, malformed declaration, nonempty prepared workspace fact,
+catalog-local/default PTY root, or effective PTY-root change. Hash-CAS captures
+and validates exact prepared bytes, takes EX, rechecks the canonical live root,
+and either reports `unchanged` for exact equality or creates a durable
+content-addressed stage before publishing the marker. Version 1 requires an
+explicit PTY root outside the canonical catalog. Fresh bootstrap is a separate
+cross-producer transaction because catalog EX cannot reserve a PTY registry
+against external producers. Hash-CAS permits declared live workspace facts and
+their real ancestry to contain content. It changes
+declaration leaves only; desired workspace facts must already exist, and
+workspace content and canonical state are never traversed, deleted, or hashed.
+When an identity path is absent, its complete bundle uses an exclusive
+directory rename. When its declared workspace skeleton already exists, the
+durable marker fences declaration readers and marker-time state routing until
+every declaration leaf has been published and verified. Applied leaves and
+their parents are fsynced, the live root is re-hashed and fully admitted, then
+the marker is unlinked and `.st2` is fsynced.
+The catalog parent is fsynced when `.st2` is first created, including the
+concurrent create/observe race. Retained source capture rejects a staging
+destination contained by its source before enumerating that source.
+
+The lock file is never removed: replacing its inode would split the transaction
+domain for processes that already hold it open. Reconciliation holds SH from
+discovery through execution. Validation, doctor, roster, listing,
+materialization-only, targeted reconciliation, and catalog teardown take a
+coherent SH snapshot. State-plane commands deliberately do not: their atomic
+files remain live while a declaration is admitted.
+
+`<catalog>/.st2/catalog-apply-incomplete` is the durable whole-catalog
+transaction fence. Any presence is authoritative, including malformed content.
+The reserved canonical record is:
+
+```json
+{"schema":"st2.catalog-apply-incomplete.v1","stageName":"catalog-apply-stage-<prepared-root-sha256>","expectedRootSha256":"<previous-root-sha256>","preparedRootSha256":"<prepared-root-sha256>","originalPaths":["<sorted-owned-declaration-leaf>", "..."]}
+```
+
+After taking its authoring lock, st2 refuses publication, validation,
+materialization, teardown, roster, doctor, and catalog listing while the marker
+exists. One-shot and selected reconcile fail explicitly. A resident supervisor
+instead remains alive, reports a skipped/incomplete pass, and performs no
+runtime observation or lifecycle action, avoiding a service restart storm.
+Message, context, Resource, and status operations remain available. While the
+marker exists they resolve canonical state independently of live declaration
+discovery; an existing state-only orphan remains addressable, an incomplete new
+identity does not fall back to a flat bus. A dotted bare identity is tried as
+the complete local identity alongside every possible qualified bus-address
+split; exactly one distinct canonical address must exist. Only real state
+directories and a real regular status file can establish marker-time
+addressability. Only `catalog apply --resume --catalog ROOT --json` may open an
+existing marker. The closed marker and internal content-addressed stage are
+sufficient recovery authority; the original prepared path and CAS precondition are
+neither required nor consulted. Marker authority proves the original
+precondition already passed, so recovery converges the partial live tree from
+the durable desired stage and original owned-leaf list without re-enforcing
+that stale precondition. Malformed or mismatched records remain fenced.
+External lock execution and bypass flags are not part of the contract.
+
+`st2 tasks --desired-state running|absent --json` optionally scopes the typed
+runtime receipt to one closed desired-state set. Omission retains the original
+all-task behavior and serializes `selection.desiredStates` as
+`["running","absent"]`; a selected receipt serializes its one selected value.
+Catalog parse errors and duplicate runtime IDs are derived globally before
+selection. Selection then filters desired rows before backend observation, so
+the observer receives only selected runtime IDs and completeness/runtime
+errors are scoped to that selected set. A retired desired-absent task therefore
+cannot make a `running` receipt incomplete, while an indeterminate active task
+still does. Selection never turns a global declaration error into success.
+
 ## Host-local scheduling and supervision
 
 ```text
@@ -166,6 +376,40 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   collection or launch. Returning the declaration to the default `service`
   lifecycle is the explicit authority to resume ordinary replacement.
   `retired #true` remains the separate explicit teardown path.
+
+- **R23:** `st2 tasks --json` is the read-only adoption boundary. It emits one
+  `st2.task-inventory.v1` envelope while holding the catalog shared lock across
+  declaration discovery and runtime observation. Rows are sorted by agent,
+  task, and runtime id and cover both PTY and terminal-free exec tasks.
+  `complete=false` plus a non-zero exit is a closed result: a consumer must not
+  turn a missing row into absence. A running row always carries the backend's
+  PID, creation time, and an opaque generation id derived from stable backend
+  evidence. A missing runtime root is positively empty and remains absent on
+  disk; malformed state, PID reuse, timeouts, duplicate ids, and observer
+  failures are indeterminate.
+
+  A zero-interruption control-plane cutover is two catalog transactions, not an
+  optimistic normal-service restart:
+
+  1. apply a prospective catalog in which every active task is `adopt-only`;
+  2. record the complete baseline inventory behind that no-launch fence;
+  3. stop only the old supervisor and start the replacement;
+  4. require a complete inventory whose desired active rows are all running at
+     exactly the recorded generations and whose retired rows are absent;
+  5. compare-and-swap the ordinary `service` lifecycle catalog only after that
+     proof.
+
+  An absent task remains `held` throughout the uncertain interval, so the new
+  supervisor cannot manufacture the evidence the gate is trying to measure.
+  Failure leaves the fence in place; it never authorizes teardown or launch.
+
+  Historical exec PID files are observed read-only. Same-tick or otherwise
+  ambiguous legacy evidence remains indeterminate: it is never silently
+  promoted. No safe per-task rollover command exists yet for that evidence, so
+  the cutover remains blocked before step 1 until the sidecar exits naturally or a separate,
+  explicitly authorized rollover seam is implemented and proved. The record
+  must not be rewritten as a workaround, and PTY-backed agent sessions must
+  not be restarted to satisfy this gate.
 
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
@@ -250,6 +494,247 @@ owner/task path.
 `st2 up --materialize-only --agent <id>` remains the agent-wide rendering
 selector. Targeted task reconciliation is intentionally bounded to `--once`;
 the resident supervisor continues to reconcile the complete local catalog.
+
+## Exact exec retirement (R24)
+
+The general closed operator entry point is prepare/apply:
+
+```text
+st2 --catalog <catalog> exec retirement prepare \
+  --host <host> \
+  --id <runtime-id> \
+  --expect-catalog-sha256 <lowercase-hex> \
+  --output <create-only-plan> \
+  --json
+
+st2 --catalog <catalog> exec retirement apply \
+  --plan <plan> \
+  --expect-plan-sha256 <lowercase-hex> \
+  --json
+```
+
+`--catalog` identifies the logical declaration plane. The expected catalog
+digest is caller-held authority produced from a coherent canonical snapshot;
+the create-only plan externalizes the exact runtime authority derived by st2.
+Apply accepts only the caller-held plan digest. Repeating the same apply resumes
+or returns the byte-identical completed receipt; there is no separate resume
+verb.
+
+The temporary legacy migration is a separately pinned predecessor transition
+tool, not a successor st2 subcommand. Its closed `--legacy-set` mode enumerates
+the complete host-local exec state namespace under the host lock and emits one
+exact-set digest plus one capability for every numeric record. Its immutable
+migration catalog contains only local retired agents, each declaring exactly
+one canonical Exec Ding. A provider, PTY, non-Ding task, non-retired agent,
+undeclared record, or declaration extra rejects before mutation. Preparation
+also fails without an artifact if any record is ambiguous, foreign, or
+otherwise unplanned. Live records carry exact process and dedicated-scope
+authority; positively stale/reused records carry exact record authority and a
+proof that signaling is unnecessary. Apply checks that the namespace is still
+exactly the original set minus durably completed entries. This predecessor tool
+is the only legacy-classification authority; consumers do not list files, parse
+PIDs, or derive generation ids. The plan and receipt carry the complete typed
+`legacyPartition`: every numeric record appears exactly once as a
+desired-absent retired Ding, and the declared local exec set has no extra row.
+Successor st2 consumes only that pinned typed receipt as a cutover checkpoint;
+it has no legacy-set drain API and never parses or mutates predecessor numeric
+records.
+
+`st2.cutover-request.v2` carries the receipt as the mandatory pre-fence input
+`predecessorRetirement = { receipt, expectSha256 }`; it carries no retirement
+selector or plan output. Before publishing the fence, the driver reads one
+bounded singly-linked regular file without following symlinks, requires
+byte-for-byte canonical `st2.exec-retirement.v1` JSON and the exact caller-held
+digest, and validates a completed forward-only journal whose host, canonical
+catalog, source digest, targets, and strictly ordered all-retired Ding partition
+form one exact bijection. `st2.cutover-transaction.v4` is born with the validated
+receipt digest and typed partition as non-optional evidence. Resume therefore
+does not reread the predecessor artifact. The successor action program starts
+only after this proof and has no predecessor runtime-mutation capability.
+
+The host exclusion path is
+`<canonical-catalog>/.st2.<host>.lock`. It is a persistent inode with a retained
+kernel `flock`; the PID text is diagnostic only. The old supervisor is stopped
+and proven absent before preparation. Preparation and apply each acquire the
+same lock and both run against the same pre-cutover declaration root. The
+durable cutover admission record covers gaps and process crashes; an ordinary
+service restart, reconcile, teardown, materializer, or publisher refuses while
+it is active. Apply still rechecks the exact catalog and remaining state
+namespace. Catalog CAS begins only after the completed retirement receipt.
+
+For a live numeric record, neither PID-file mtime nor reconstructed wall time is
+generation authority. Preparation may issue only `legacy-scope-v1`, never a
+normal generation id, and only after the dedicated scope proves: its exact
+runtime-id unit name; matching systemd ControlGroup, InvocationID, and nonzero
+monotonic activation identity; a pinned cgroup inode; the recorded PID in a
+stable exact membership snapshot; retained Ding executable/argv/cwd/uid; and no
+provider/shared scope. Preparation is read-only and does not freeze a process
+before durable recovery authority exists. Apply first durably enters the
+forward-only journal phase, then freezes the exact scope and revalidates the
+record, scope identity, and complete membership against the plan before any
+kill or record move. Any missing or ambiguous witness blocks. A positively
+dead/reused numeric record is record-only and apply performs no signal or
+cgroup control write.
+
+The operation writes a durable per-request journal under the host-local exec
+state directory and returns `st2.exec-retirement.v1`. Repeating the same request
+resumes or returns the completed receipt. A different request for the same
+runtime id conflicts while a journal is incomplete. The state transition is:
+
+```text
+prepared -> frozen -> killed -> record-retired -> completed
+```
+
+At every arrow, recovery reopens and revalidates capabilities rather than
+trusting path names. The generation record moves to a create-only private slot;
+it is never unlinked. Logs are diagnostics, not generation authority, and are
+not part of exact retirement. Before the first cgroup-control or record move,
+the journal durably records `forwardOnlyStarted=true`. After that boundary the
+old trajectory cannot be restored; every recovery continues forward or
+preserves a typed conflict.
+
+Only a Linux live generation with a dedicated cgroup-v2 systemd scope is
+retirable. The separately pinned predecessor legacy-set tool additionally
+permits record-only retirement after a positive stale/reused proof and performs
+no signal or cgroup write for that entry. Other platforms and degraded
+isolation remain observable but return a typed unsupported error. PTY tasks
+continue to use the PTY backend and never enter this transaction.
+
+### Durable cutover admission
+
+Admission distinguishes three closed permissions rather than conflating two
+lock domains:
+
+| Permission | Ordinary authority | Active-gate result |
+| --- | --- | --- |
+| `runtime-mutate` | retained `HostOwnership` plus short per-pass admission | typed busy |
+| `catalog-publish` | exclusive catalog lock plus digest CAS | typed busy |
+| `transaction` | exact active cutover record and phase CAS | only recorded next phase |
+
+The singleton active record lives at `.st2/cutover/active.json` under the
+catalog control plane and binds its schema,
+canonical catalog incarnation, validated host, gate/request identity, source
+declaration digest, forward-only retirement evidence, immutable ordered action
+program/cursor, typed external checkpoints, and deterministic candidate
+invocation/result. It is
+create-only, fsynced, survives process death, and has no time- or PID-based
+reclaim. Unknown or malformed active state is busy, not absent. Finalization
+first publishes the exact finalized record bytes create-only into durable
+history and fsyncs that destination, then compare-and-swap persists the same
+bytes as finalized active authority. A crash at that boundary therefore leaves
+an unfinalized active record plus exact history and resumes idempotently; the
+inverse finalized-active/missing-history state is unreachable for new writers
+and is repaired for an interrupted older writer only from the exact validated
+active record under retained host ownership and catalog exclusion. The
+finalized active name remains the gate until the successor has entered its
+supervision loop; only that readiness callback removes it and fsyncs the
+control directory. Recovery accepts only byte-identical pre-published history.
+
+This is a singleton per canonical writable catalog authority, not distributed
+consensus. The writable catalog and its locks live in one authoritative POSIX
+filesystem/kernel lock domain. Replicas remain read-only during the
+transaction; eventually synchronized independent writable copies are outside
+the v1 coordination model.
+
+Fence publication is the authorized stop signal: a resident supervisor observes
+the gate on its next pass, exits without mutating, and releases
+`HostOwnership`. Claim/resume then acquires that ownership under the already
+durable fence. Successful finalization returns the same retained ownership to
+`up_once_with_ownership` or `up_loop_with_ownership`; the successor never drops
+and reacquires the host lock.
+
+Ordinary host mutation retains `HostOwnership` across the supervisor lifetime.
+Each reconcile, materialize, teardown, or retirement pass then observes the
+global gate while briefly retaining the shared catalog lock. The shared lock is
+released between resident passes so ordinary declaration publishers are not
+starved. Fence creation briefly takes only the exclusive catalog lock, publishes
+the durable gate, and releases it before waiting for the prior supervisor to
+observe the fence and release host ownership. Transaction claim then uses
+host-first order and reacquires the exclusive catalog lock. Ordinary agent
+publication and catalog apply remain declaration
+transactions: while already holding the exclusive catalog lock they prove that
+no active gate exists. The exact cutover transaction may instead perform only
+its pre-recorded catalog CAS sequence. There is no generic force flag or
+untyped bypass token.
+
+The provider handoff is two different program actions rather than one generic
+candidate reconcile:
+
+1. `ProviderFleetProofAction` carries one canonical ordered entry for every
+   locally authored provider task. Each entry binds identity, host, provider,
+   account, persona, workspace, exact live generation, argv, runtime profile,
+   launch-scoped immutable prompt authority, harness, model, effort, and a
+   trajectory digest. Under one coherent declaration snapshot, the proof
+   requires a bijection with the complete runtime provider inventory and
+   requires every row to be running and exact. Each PTY generation carries the
+   exact path and digest of one bounded canonical
+   `axe.agent-launch-receipt.v1`; the receipt binds its PTY runtime id,
+   identity, workspace, provider/account/persona/harness/model/effort,
+   canonical provider argv and digest, runtime-profile path/digest, selected
+   persona-prompt path/digest, closed harness-injection kind, and trajectory
+   digest. The proof verifies that the profile maps the persona to that prompt
+   and that the receipt path/digest is attached to the same observed PTY
+   generation. Four unrelated files, mutable ambient state, or an unlinked
+   receipt cannot satisfy the proof. `.st2/PERSONA.md` and its loader must be
+   absent in every workspace.
+   It is read-only apart from advancing the transaction marker after the whole
+   fleet passes. It has no workspace materialization or provider
+   spawn/kill/reap/remove/GC capability. Any missing, extra, non-running,
+   non-primary drift, legacy prompt file/loader, or trajectory mismatch leaves
+   the cursor and marker bytes unchanged.
+2. `DingReconcileAction` runs only after legacy Ding retirement and adoption
+   proof. The provider proof classifies its precommitted successor notification
+   exec set separately as positively absent or exact journal-bound; Ding rows
+   never satisfy provider coverage. The action owns that exact set and a
+   durable per-Ding generation journal. Recovery accepts only an exact
+   already-published generation from that journal, so a crash cannot duplicate
+   a sidecar. Its API cannot address provider tasks or generic runtime
+   teardown/GC.
+
+Status/preflight can report either state without mutating it, allowing systemd
+`ExecStartPre` and publishers to refuse.
+`st2 cutover status --json` is the stable read-only preflight surface; it
+reports available or the typed `st2.mutation-busy.v1` record and never recovers
+or rewrites an active gate.
+
+`st2 cutover install` is the only candidate-service bootstrap. One retained
+systemd-user topology lock spans create-only publication or byte-verification
+of the request-digest unit, exclusion of every different candidate, daemon
+reload, persistent `enable --now`, and post-enable revalidation of the durable
+topology and loaded artifact. It does not retire the ordinary supervisor. On
+every start the candidate validates its
+current invocation and PID against one coherent loaded-unit snapshot. The
+loaded unit must have a canonical `FragmentPath` equal to that durable config
+file, exact rendered bytes, no `DropInPaths`, `NeedDaemonReload=no`,
+`UnitFileState=enabled`, `Transient=no`, `Restart=always`, and
+`RestartUSec=2s`. A same-named transient/runtime fragment, runtime-only
+enablement, stale daemon cache, or drop-in therefore cannot acquire cutover
+authority. The candidate enters successor supervision before its readiness
+callback retires the ordinary unit and archives the active gate. A later
+`Restart=always` start reacquires successor ownership from exact history rather
+than reopening the transaction.
+
+`st2 cutover run --request FILE --expect-request-sha256 HEX` is the sole normal
+mutation driver. It no-follow reads one bounded canonical
+`st2.cutover-request.v2`, verifies the caller-held digest, and resumes the exact
+next action. External-checkpoint request entries commit the typed input digest
+and canonical receipt path, not a future output digest. At the boundary the
+driver no-follow reads, hashes, and validates the produced receipt before
+recording it. After readiness archived the active gate, a repeated run first
+checks exact finalized history read-only, then reacquires `HostOwnership` and
+rechecks active absence plus that same exact history under catalog exclusion
+before entering successor supervision. It never reopens transaction or
+predecessor authority, and mismatched history never falls through to a fresh
+begin.
+
+The gate covers resident and one-shot reconciliation, selected tasks,
+materialization, teardown, retirement, Ding process lifecycle, broad `st2 pty`
+and `st2 shell` lifecycle passthrough, and service install/change. It does not
+cover message delivery/archive, context, Resource, status, or Ding delivery
+state, which remain usable throughout the cutover. Direct external same-UID
+filesystem or `pty` mutation is outside st2's cooperative writer boundary;
+repeated declaration, inode, membership, and record CAS detects conflicts
+without claiming to prevent them.
 
 ## Open design questions
 

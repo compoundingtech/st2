@@ -63,19 +63,19 @@ it via `st2 message reply` instead. Only address the REPL when a human directly 
 ## Adding agents — hand-authored KDL is canonical
 
 The network is the catalog: one `agents/<host>/<identity>/agent.kdl` declaration per agent. A
-supervisor or CoS authors the declaration, validates it, inspects its workspace targets, and lets the
-running `st2 up` reconcile it on the next pass:
+supervisor or CoS renders the exact declaration outside the catalog, publishes it transactionally,
+inspects its workspace targets, and lets the running `st2 up` reconcile it on the next pass:
 
 ```sh
-${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
+st2 agent publish --catalog "$CATALOG" --spec ./agent.kdl --expect-absent --json
 st2 hooks verify
 st2 validate --catalog "$CATALOG"
 st2 up --catalog "$CATALOG" --host <host> --materialize-only
 ```
 
-`st2 compile-agent` is an experimental generation aid, not the canonical authoring surface. Inspect
-its full KDL and every `render {}` target before validation or materialization. Workers do not add
-agents; surface the need to your supervisor.
+Canonical KDL or a create-only publication bundle is the authoring boundary. st2 does not compile
+human intent into a declaration. Inspect every `render {}` target before materialization. Workers do
+not add agents; surface the need to your supervisor.
 
 ## CLI inventory
 
@@ -104,8 +104,7 @@ Machine lifecycle hooks (explicit; `up` never installs or refreshes them):
 - `st2 hooks install [--allow-downgrade]`
 - `st2 hooks verify`
 
-Agent declarations: hand-authored `agents/<host>/<identity>/agent.kdl`; optional experimental
-`st2 compile-agent`; `st2 validate`; `st2 up --materialize-only`; `st2 up`.
+Agent declarations: `st2 agent publish`; `st2 validate`; `st2 up --materialize-only`; `st2 up`.
 
 Catalog selection on every catalog-aware command: `--catalog <path>` → `$CATALOG` →
 `${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`. Bus ops retain `--root` as an explicit

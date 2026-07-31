@@ -31,6 +31,7 @@ fn path_with(bin: &Path) -> String {
 fn pty_defaults_to_the_xdg_catalog_and_passes_args_through() {
     let bin = pty_shim();
     let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(state.path().join("st2/default/catalog")).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["pty", "peek", "sess1"])
@@ -106,6 +107,7 @@ fn pty_passes_hyphen_flags_through() {
     // trailing_var_arg + allow_hyphen_values: pty's own flags must reach pty, not be eaten by st2.
     let bin = pty_shim();
     let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(state.path().join("st2/default/catalog")).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["pty", "ls", "--json"])
@@ -128,6 +130,7 @@ fn shell_execs_the_shell_with_the_bus_env() {
     let bin = pty_shim();
     let shell = bin.path().join("pty");
     let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(state.path().join("st2/default/catalog")).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["shell", "-c", "noop"])
@@ -148,4 +151,31 @@ fn shell_execs_the_shell_with_the_bus_env() {
         s.contains("ARGS=-c noop"),
         "shell args not passed through: {s}"
     );
+}
+
+#[test]
+fn pty_refuses_before_exec_when_cutover_state_is_malformed() {
+    let bin = pty_shim();
+    let catalog = tempfile::tempdir().unwrap();
+    let cutover = catalog.path().join(".st2/cutover");
+    std::fs::create_dir_all(&cutover).unwrap();
+    std::fs::write(cutover.join("active.json"), "{}").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(catalog.path())
+        .args(["pty", "ls"])
+        .env("PATH", path_with(bin.path()))
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "pty shim must not execute while cutover admission is busy"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("runtime mutation refused"), "{err}");
+    assert!(err.contains("st2.mutation-busy.v1"), "{err}");
+    assert!(err.contains("malformed-active-marker"), "{err}");
 }

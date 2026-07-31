@@ -13,12 +13,40 @@ fn st2() -> std::process::Command {
 fn install_rejects_a_missing_catalog_before_touching_systemd() {
     // canonicalize() is the first thing install() does, so this errors out before any systemctl call.
     let out = st2()
-        .args(["service", "install", "/definitely/not/a/real/catalog/st2test"])
+        .args([
+            "service",
+            "install",
+            "/definitely/not/a/real/catalog/st2test",
+        ])
         .output()
         .unwrap();
     assert!(!out.status.success(), "should fail on a missing catalog");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("does not exist"), "expected a missing-catalog error, got: {err}");
+    assert!(
+        err.contains("does not exist"),
+        "expected a missing-catalog error, got: {err}"
+    );
+}
+
+#[test]
+fn install_rejects_busy_cutover_before_touching_systemd() {
+    let catalog = tempfile::tempdir().unwrap();
+    let cutover = catalog.path().join(".st2/cutover");
+    std::fs::create_dir_all(&cutover).unwrap();
+    std::fs::write(cutover.join("active.json"), "{}").unwrap();
+
+    let out = st2()
+        .arg("--catalog")
+        .arg(catalog.path())
+        .args(["service", "install"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("service mutation refused"), "{err}");
+    assert!(err.contains("st2.mutation-busy.v1"), "{err}");
+    assert!(err.contains("malformed-active-marker"), "{err}");
 }
 
 #[test]
@@ -33,7 +61,10 @@ fn service_exposes_install_status_uninstall() {
 
 #[test]
 fn install_exposes_a_machine_local_pty_root() {
-    let out = st2().args(["service", "install", "--help"]).output().unwrap();
+    let out = st2()
+        .args(["service", "install", "--help"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--pty-root"), "{help}");
@@ -46,7 +77,10 @@ fn ping_is_an_alias_for_ding() {
     let help = st2().args(["ping", "--help"]).output().unwrap();
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    assert!(text.contains("inbox"), "ping --help should be the ding help; got: {text}");
+    assert!(
+        text.contains("inbox"),
+        "ping --help should be the ding help; got: {text}"
+    );
 
     // And a bare `st2 ping` dispatches INTO the ding handler (past clap). Catalog selection now has
     // an XDG default, so the next required runtime input is the acting identity.
