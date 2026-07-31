@@ -37,6 +37,7 @@ const RECEIPT_SCHEMA: &str = "st2.exec-retirement.v1";
 const REQUEST_HASH_DOMAIN: &[u8] = b"st2.exec-retirement-request.v1\0";
 const CENSUS_HASH_DOMAIN: &[u8] = b"st2.exec-state-census.v1\0";
 const RECORD_HASH_DOMAIN: &[u8] = b"st2.exec-record.v1\0";
+const LEGACY_PARTITION_HASH_DOMAIN: &[u8] = b"st2.exec-retirement-legacy-partition.v1\0";
 const CONTROL_DIR: &str = ".retirements";
 const LOCK_FILE: &str = ".exec-retirement.lock";
 const PLAN_FILE: &str = "plan.json";
@@ -157,7 +158,26 @@ pub struct RetirementPreparation {
     pub state_dir: PathBuf,
     pub output: PathBuf,
     pub census_sha256: String,
+    pub legacy_partition_sha256: String,
     pub targets: usize,
+}
+
+impl RetirementPreparation {
+    pub fn plan_sha256(&self) -> &str {
+        &self.plan_sha256
+    }
+
+    pub fn catalog_sha256(&self) -> &str {
+        &self.catalog_sha256
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn legacy_partition_sha256(&self) -> &str {
+        &self.legacy_partition_sha256
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -261,26 +281,28 @@ enum StaleProof {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LegacyScopeWitness {
-    scope_id: String,
-    control_group: String,
-    invocation_id: String,
-    active_enter_timestamp_monotonic: u64,
-    slice: String,
-    member: LegacyProcessWitness,
+pub struct LegacyScopeWitness {
+    pub scope_id: String,
+    pub control_group: String,
+    pub invocation_id: String,
+    pub active_enter_timestamp_monotonic: u64,
+    pub slice: String,
+    pub member: LegacyProcessWitness,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LegacyProcessWitness {
-    pid: i32,
-    start_time_ticks: u64,
-    uid: u32,
-    executable: PathBuf,
-    executable_device: u64,
-    executable_inode: u64,
-    argv: Vec<String>,
-    cwd: PathBuf,
+pub struct LegacyProcessWitness {
+    pub pid: i32,
+    pub start_time_ticks: u64,
+    pub uid: u32,
+    pub executable: PathBuf,
+    pub executable_device: u64,
+    pub executable_inode: u64,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub cwd_device: u64,
+    pub cwd_inode: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -298,9 +320,16 @@ struct RecordEvidence {
 #[serde(rename_all = "kebab-case")]
 enum ItemPhase {
     Prepared,
+    MutationAuthorized,
     Frozen,
     Killed,
     RecordRetired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaderlessFreezeAction {
+    Freeze,
+    AlreadyFrozen,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -366,8 +395,37 @@ pub struct ExecRetirementReceipt {
     pub completed_at_unix_ms: u128,
     pub census_sha256: String,
     pub forward_only_started: bool,
+    pub legacy_partition_sha256: String,
     pub legacy_partition: Option<Vec<LegacySuccessorTask>>,
     pub targets: Vec<RetiredTarget>,
+}
+
+impl ExecRetirementReceipt {
+    pub fn canonical_sha256(&self) -> RetirementResult<String> {
+        canonical_json(self)
+            .map(|bytes| sha256(&bytes))
+            .map_err(public_error)
+    }
+
+    pub fn plan_sha256(&self) -> &str {
+        &self.plan_sha256
+    }
+
+    pub fn catalog_sha256(&self) -> &str {
+        &self.catalog_sha256
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn legacy_partition_sha256(&self) -> &str {
+        &self.legacy_partition_sha256
+    }
+
+    pub fn forward_only_started(&self) -> bool {
+        self.forward_only_started
+    }
 }
 
 /// The public apply result. The older internal name remains as an alias while the CLI wiring lands.
@@ -379,7 +437,7 @@ pub enum ExecRetirementStatus {
     Completed,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetiredTarget {
     pub runtime_id: String,
@@ -392,6 +450,7 @@ pub struct RetiredTarget {
     pub scope_unit: Option<String>,
     pub cgroup_device: Option<u64>,
     pub cgroup_inode: Option<u64>,
+    pub legacy_scope: Option<LegacyScopeWitness>,
     pub membership: Vec<MemberEvidence>,
     pub freeze_observed: bool,
     pub cgroup_outcome: Option<CgroupRetirementOutcome>,
@@ -422,7 +481,7 @@ pub struct MemberEvidence {
     pub start_time_ticks: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetiredRecordEvidence {
     pub relative_path: String,
@@ -438,36 +497,6 @@ struct StateLock {
     _control_dir: File,
     _lock: File,
     path: PathBuf,
-}
-
-struct RetirementHostGuard {
-    lock: crate::HostLock,
-}
-
-impl RetirementHostGuard {
-    fn acquire(catalog: &Path, host: &str) -> Result<Self> {
-        let lock = crate::HostLock::new(catalog, host);
-        if let Some(owner) = lock.live_owner() {
-            anyhow::bail!(
-                "host {host:?} has a live supervisor pid {owner}; exact retirement requires an \
-                 exclusively stopped supervisor"
-            );
-        }
-        lock.acquire()
-            .with_context(|| format!("claim retirement host ownership for {host:?}"))?;
-        let raw = fs::read_to_string(lock.pid_path())?;
-        anyhow::ensure!(
-            raw.trim().parse::<u32>().ok() == Some(std::process::id()),
-            "retirement host ownership was raced by another process"
-        );
-        Ok(Self { lock })
-    }
-}
-
-impl Drop for RetirementHostGuard {
-    fn drop(&mut self) {
-        self.lock.release();
-    }
 }
 
 impl StateLock {
@@ -528,8 +557,29 @@ fn prepare_inner(request: RetirementPrepareRequest) -> Result<RetirementPreparat
         .catalog
         .canonicalize()
         .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
-    let _catalog_lock = crate::CatalogLock::shared(&catalog)?;
-    let _host_guard = RetirementHostGuard::acquire(&catalog, &request.host)?;
+    let ownership = crate::host_lock::HostOwnership::acquire(&catalog, &request.host)
+        .with_context(|| format!("claim retirement host ownership for {:?}", request.host))?;
+    let admission = crate::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership)
+        .context("admit ordinary exec retirement")?;
+    prepare_admitted(request, &admission.permission())
+}
+
+/// Prepare a retirement while the caller retains exact runtime-mutation authority.
+///
+/// This is the composable seam used by a cutover transaction: it neither acquires another host
+/// lock nor re-enters catalog admission. The request is bound to the token before state locking,
+/// control-directory creation, or plan publication.
+pub(crate) fn prepare_admitted(
+    request: RetirementPrepareRequest,
+    permission: &crate::cutover_admission::RuntimeMutate<'_>,
+) -> Result<RetirementPreparation> {
+    validate_sha256(&request.expect_catalog_sha256)?;
+    validate_host_component(&request.host)?;
+    let catalog = request
+        .catalog
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
+    ensure_permission_matches(permission, &catalog, &request.host)?;
     let catalog_sha256 = crate::catalog_transaction::declaration_root_sha256_locked(&catalog)?;
     anyhow::ensure!(
         catalog_sha256 == request.expect_catalog_sha256,
@@ -562,6 +612,7 @@ fn prepare_inner(request: RetirementPrepareRequest) -> Result<RetirementPreparat
     } else {
         None
     };
+    let legacy_partition_sha256 = hash_legacy_partition(legacy_partition.as_deref())?;
     let legacy_by_runtime = legacy_partition
         .as_ref()
         .map(|partition| {
@@ -747,8 +798,29 @@ fn prepare_inner(request: RetirementPrepareRequest) -> Result<RetirementPreparat
         state_dir: locked.path,
         output,
         census_sha256: plan.census_sha256,
+        legacy_partition_sha256,
         targets: plan.targets.len(),
     })
+}
+
+fn ensure_permission_matches(
+    permission: &crate::cutover_admission::RuntimeMutate<'_>,
+    catalog: &Path,
+    host: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        permission.catalog().as_path() == catalog,
+        "runtime mutation authority belongs to catalog {}, not {}",
+        permission.catalog().as_path().display(),
+        catalog.display()
+    );
+    anyhow::ensure!(
+        permission.host().as_str() == host,
+        "runtime mutation authority belongs to host {:?}, not {:?}",
+        permission.host().as_str(),
+        host
+    );
+    Ok(())
 }
 
 /// Apply or resume the immutable plan selected by `expect_plan_sha256`.
@@ -778,8 +850,40 @@ fn apply_inner(request: RetirementApplyRequest) -> Result<RetirementApplyReceipt
         plan.catalog.display(),
         catalog.display()
     );
-    let _catalog_lock = crate::CatalogLock::shared(&catalog)?;
-    let _host_guard = RetirementHostGuard::acquire(&catalog, &plan.host)?;
+    let ownership = crate::host_lock::HostOwnership::acquire(&catalog, &plan.host)
+        .with_context(|| format!("claim retirement host ownership for {:?}", plan.host))?;
+    let admission = crate::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership)
+        .context("admit ordinary exec retirement")?;
+    apply_admitted(request, &admission.permission())
+}
+
+/// Apply or resume a retirement while the caller retains exact runtime-mutation authority.
+///
+/// The caller-held token makes this safe to compose inside a durable cutover without attempting
+/// to reacquire either the host lock or the ordinary catalog admission lock.
+pub(crate) fn apply_admitted(
+    request: RetirementApplyRequest,
+    permission: &crate::cutover_admission::RuntimeMutate<'_>,
+) -> Result<RetirementApplyReceipt> {
+    validate_sha256(&request.expect_plan_sha256)?;
+    let plan_bytes = read_regular_nofollow(&request.plan)?;
+    anyhow::ensure!(
+        sha256(&plan_bytes) == request.expect_plan_sha256,
+        "retirement plan digest does not match caller expectation"
+    );
+    let plan: RetirementPlan =
+        serde_json::from_slice(&plan_bytes).context("decode exec retirement plan")?;
+    let catalog = request
+        .catalog
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
+    anyhow::ensure!(
+        catalog == plan.catalog,
+        "retirement plan belongs to catalog {}, not {}",
+        plan.catalog.display(),
+        catalog.display()
+    );
+    ensure_permission_matches(permission, &catalog, &plan.host)?;
     let catalog_sha256 = crate::catalog_transaction::declaration_root_sha256_locked(&catalog)?;
     anyhow::ensure!(
         catalog_sha256 == plan.catalog_sha256,
@@ -791,10 +895,17 @@ fn apply_inner(request: RetirementApplyRequest) -> Result<RetirementApplyReceipt
     let locked = StateLock::acquire(&state_dir)?;
     let transaction =
         find_transaction_by_plan(&locked.capability_path(), &request.expect_plan_sha256)?;
+    let internal_plan_bytes = read_regular_nofollow(&transaction.join(PLAN_FILE))?;
+    anyhow::ensure!(
+        internal_plan_bytes == plan_bytes,
+        "private transaction plan differs from caller-held plan"
+    );
+    validate_plan(&locked, &plan, &request.expect_plan_sha256)?;
+    let mut journal: RetirementJournal = read_json(&transaction.join(JOURNAL_FILE))?;
+    validate_journal(&plan, &request.expect_plan_sha256, &journal)?;
     if let Some(receipt) =
         read_optional_json::<RetirementApplyReceipt>(&transaction.join(RECEIPT_FILE))?
     {
-        let completed_journal: RetirementJournal = read_json(&transaction.join(JOURNAL_FILE))?;
         anyhow::ensure!(
             receipt.schema == RECEIPT_SCHEMA
                 && receipt.plan_sha256 == request.expect_plan_sha256
@@ -806,23 +917,20 @@ fn apply_inner(request: RetirementApplyRequest) -> Result<RetirementApplyReceipt
                 && receipt.state_dir_inode == plan.state_dir_inode
                 && receipt.journal_schema == JOURNAL_SCHEMA
                 && receipt.journal_status == "completed"
+                && receipt.census_sha256 == plan.census_sha256
                 && receipt.forward_only_started
+                && receipt.legacy_partition_sha256
+                    == hash_legacy_partition(plan.legacy_partition.as_deref())?
                 && receipt.legacy_partition == plan.legacy_partition
-                && completed_journal.status == JournalStatus::Completed
-                && completed_journal.forward_only_started
-                && receipt.journal_sha256 == sha256(&canonical_json(&completed_journal)?),
+                && journal.status == JournalStatus::Completed
+                && journal.conflict.is_none()
+                && journal.forward_only_started
+                && receipt.journal_sha256 == sha256(&canonical_json(&journal)?)
+                && receipt_targets_bind_plan(&receipt, &plan, &journal, &transaction,)?,
             "stored retirement receipt does not bind the exact completed transaction"
         );
         return Ok(receipt);
     }
-    let internal_plan_bytes = read_regular_nofollow(&transaction.join(PLAN_FILE))?;
-    anyhow::ensure!(
-        internal_plan_bytes == plan_bytes,
-        "private transaction plan differs from caller-held plan"
-    );
-    validate_plan(&locked, &plan, &request.expect_plan_sha256)?;
-    let mut journal: RetirementJournal = read_json(&transaction.join(JOURNAL_FILE))?;
-    validate_journal(&plan, &request.expect_plan_sha256, &journal)?;
     anyhow::ensure!(
         journal.status != JournalStatus::Conflict,
         "retirement transaction is in conflict: {}",
@@ -858,6 +966,10 @@ fn apply_inner(request: RetirementApplyRequest) -> Result<RetirementApplyReceipt
                     journal.status = JournalStatus::Conflict;
                     journal.conflict = Some(format!("{:#}", error));
                     write_journal(&transaction, &journal)?;
+                    return Err(tagged(
+                        RetirementErrorCode::Conflict,
+                        format!("retirement transaction conflicted: {error:#}"),
+                    ));
                 }
                 return Err(error);
             }
@@ -869,6 +981,7 @@ fn apply_inner(request: RetirementApplyRequest) -> Result<RetirementApplyReceipt
     write_journal(&transaction, &journal)?;
     test_checkpoint("after-completed-journal");
     let journal_sha256 = sha256(&canonical_json(&journal)?);
+    let legacy_partition_sha256 = hash_legacy_partition(plan.legacy_partition.as_deref())?;
     let receipt = ExecRetirementReceipt {
         schema: RECEIPT_SCHEMA.to_string(),
         request_sha256: plan.request_sha256,
@@ -885,12 +998,38 @@ fn apply_inner(request: RetirementApplyRequest) -> Result<RetirementApplyReceipt
         completed_at_unix_ms: unix_ms()?,
         census_sha256: plan.census_sha256,
         forward_only_started: journal.forward_only_started,
+        legacy_partition_sha256,
         legacy_partition: plan.legacy_partition,
         targets: retired,
     };
     publish_create_only_json(&transaction.join(RECEIPT_FILE), &receipt)?;
     sync_dir(&transaction)?;
     Ok(receipt)
+}
+
+fn receipt_targets_bind_plan(
+    receipt: &RetirementApplyReceipt,
+    plan: &RetirementPlan,
+    journal: &RetirementJournal,
+    transaction: &Path,
+) -> Result<bool> {
+    if receipt.targets.len() != plan.targets.len() {
+        return Ok(false);
+    }
+    for (actual, expected) in receipt.targets.iter().zip(&plan.targets) {
+        let Some(item) = journal.items.get(&expected.runtime_id) else {
+            return Ok(false);
+        };
+        if item.phase != ItemPhase::RecordRetired {
+            return Ok(false);
+        }
+        let slot_relative = format!("{SLOT_DIR}/{}.pid", expected.runtime_id);
+        let after = verify_retired_slot(&transaction.join(&slot_relative), &expected.record)?;
+        if actual != &retired_target(expected, item, after, slot_relative) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn enter_forward_only(transaction: &Path, journal: &mut RetirementJournal) -> Result<()> {
@@ -1053,7 +1192,11 @@ fn apply_target(
             cgroup_device,
             cgroup_inode,
             legacy_scope,
-        } if matches!(phase, ItemPhase::Prepared | ItemPhase::Frozen) => {
+        } if matches!(
+            phase,
+            ItemPhase::Prepared | ItemPhase::MutationAuthorized | ItemPhase::Frozen
+        ) =>
+        {
             #[cfg(not(target_os = "linux"))]
             return Err(tagged(
                 RetirementErrorCode::Unsupported,
@@ -1100,6 +1243,15 @@ fn apply_target(
                             )?;
                         }
                         enter_forward_only(transaction, journal)?;
+                        journal
+                            .items
+                            .get_mut(&target.runtime_id)
+                            .context("retirement journal omitted target state")?
+                            .phase = ItemPhase::MutationAuthorized;
+                        write_journal(transaction, journal).map_err(|error| {
+                            recoverable(error, "persist exact mutation authorization")
+                        })?;
+                        test_checkpoint("after-mutation-authorized-journal");
                         cgroup
                             .freeze()
                             .map_err(|error| recoverable(error, "freeze exact exec cgroup"))?;
@@ -1115,14 +1267,7 @@ fn apply_target(
                         })?;
                         let pinned = cgroup.revalidate_members(*pid, *start_time_ticks, leader)?;
                         if let Some(legacy_scope) = legacy_scope {
-                            anyhow::ensure!(
-                                pinned.evidence
-                                    == vec![MemberEvidence {
-                                        pid: legacy_scope.member.pid,
-                                        start_time_ticks: legacy_scope.member.start_time_ticks,
-                                    }],
-                                "frozen legacy Ding membership differs from preparation"
-                            );
+                            verify_frozen_legacy_membership(legacy_scope, &pinned.evidence)?;
                             verify_legacy_process_witness(&legacy_scope.member, cgroup_path)?;
                         }
                         membership = pinned.evidence.clone();
@@ -1149,19 +1294,77 @@ fn apply_target(
                         if matches!(
                             error.raw_os_error(),
                             Some(libc::ESRCH) | Some(libc::ENOENT)
-                        ) && phase == ItemPhase::Frozen =>
+                        ) && leaderless_recovery_phase(phase) =>
                     {
                         match CgroupHandle::open(cgroup_path, *cgroup_device, *cgroup_inode) {
                             Ok(mut cgroup) => {
                                 verify_systemd_scope(scope_unit, cgroup_path)?;
                                 if !cgroup.is_empty()? {
-                                    anyhow::ensure!(
-                                        read_event(&cgroup.events_file, "frozen")?.as_deref()
-                                            == Some("1"),
-                                        "leaderless recovery found the exact scope populated but \
-                                         not frozen"
-                                    );
+                                    if let Some(legacy_scope) = legacy_scope {
+                                        verify_legacy_systemd_scope(
+                                            scope_unit,
+                                            cgroup_path,
+                                            legacy_scope,
+                                        )?;
+                                    }
+                                    let frozen = read_event(&cgroup.events_file, "frozen")?;
+                                    match leaderless_freeze_action(phase, frozen.as_deref())? {
+                                        LeaderlessFreezeAction::Freeze => {
+                                            cgroup.freeze().map_err(|error| {
+                                            recoverable(
+                                                error,
+                                                "freeze authorized leaderless exact exec cgroup",
+                                            )
+                                        })?;
+                                            let item =
+                                                journal.items.get_mut(&target.runtime_id).context(
+                                                    "retirement journal omitted target state",
+                                                )?;
+                                            item.phase = ItemPhase::Frozen;
+                                            item.freeze_observed = true;
+                                            write_journal(transaction, journal).map_err(
+                                                |error| {
+                                                    recoverable(
+                                                        error,
+                                                        "persist leaderless frozen retirement \
+                                                         phase",
+                                                    )
+                                                },
+                                            )?;
+                                        }
+                                        LeaderlessFreezeAction::AlreadyFrozen => {
+                                            let item =
+                                                journal.items.get_mut(&target.runtime_id).context(
+                                                    "retirement journal omitted target state",
+                                                )?;
+                                            if phase == ItemPhase::MutationAuthorized {
+                                                item.phase = ItemPhase::Frozen;
+                                                item.freeze_observed = true;
+                                                write_journal(transaction, journal).map_err(
+                                                    |error| {
+                                                        recoverable(
+                                                            error,
+                                                            "persist observed leaderless frozen \
+                                                             retirement phase",
+                                                        )
+                                                    },
+                                                )?;
+                                            } else {
+                                                anyhow::ensure!(
+                                                    item.freeze_observed,
+                                                    "durable Frozen phase omitted freeze \
+                                                     observation"
+                                                );
+                                            }
+                                        }
+                                    }
                                     let pinned = cgroup.revalidate_all_members()?;
+                                    if let Some(legacy_scope) = legacy_scope {
+                                        verify_frozen_legacy_membership(
+                                            legacy_scope,
+                                            &pinned.evidence,
+                                        )?;
+                                    }
                                     if membership.is_empty() {
                                         membership = pinned.evidence.clone();
                                         journal
@@ -1280,6 +1483,23 @@ fn apply_target(
     Ok(retired_target(target, item, after, slot_relative))
 }
 
+fn leaderless_recovery_phase(phase: ItemPhase) -> bool {
+    matches!(phase, ItemPhase::MutationAuthorized | ItemPhase::Frozen)
+}
+
+fn leaderless_freeze_action(
+    phase: ItemPhase,
+    frozen: Option<&str>,
+) -> Result<LeaderlessFreezeAction> {
+    match (phase, frozen) {
+        (ItemPhase::MutationAuthorized, Some("0")) => Ok(LeaderlessFreezeAction::Freeze),
+        (ItemPhase::MutationAuthorized | ItemPhase::Frozen, Some("1")) => {
+            Ok(LeaderlessFreezeAction::AlreadyFrozen)
+        }
+        _ => anyhow::bail!("leaderless recovery found an invalid exact-scope freeze state"),
+    }
+}
+
 fn retired_target(
     target: &PlannedTarget,
     item: &JournalItem,
@@ -1307,6 +1527,7 @@ fn retired_target(
             cgroup_path: None,
             cgroup_device: None,
             cgroup_inode: None,
+            legacy_scope: None,
             membership: item.membership.clone(),
             freeze_observed: item.freeze_observed,
             cgroup_outcome: item.cgroup_outcome,
@@ -1321,7 +1542,7 @@ fn retired_target(
             cgroup_path,
             cgroup_device,
             cgroup_inode,
-            ..
+            legacy_scope,
         } => RetiredTarget {
             runtime_id: target.runtime_id.clone(),
             generation_id: target.generation_id.clone(),
@@ -1333,6 +1554,7 @@ fn retired_target(
             cgroup_path: Some(cgroup_path.clone()),
             cgroup_device: Some(*cgroup_device),
             cgroup_inode: Some(*cgroup_inode),
+            legacy_scope: legacy_scope.clone(),
             membership: item.membership.clone(),
             freeze_observed: item.freeze_observed,
             cgroup_outcome: item.cgroup_outcome,
@@ -1685,8 +1907,25 @@ fn systemd_scope_witness(unit: &str) -> Result<SystemdScopeWitness> {
         "systemd did not acknowledge exact legacy scope {unit}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    parse_systemd_scope_witness(unit, &output.stdout)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_systemd_scope_witness(unit: &str, stdout: &[u8]) -> Result<SystemdScopeWitness> {
+    const PROPERTIES: [&str; 10] = [
+        "Id",
+        "Names",
+        "ControlGroup",
+        "InvocationID",
+        "ActiveEnterTimestampMonotonic",
+        "Transient",
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Slice",
+    ];
     let mut values = BTreeMap::new();
-    for line in String::from_utf8(output.stdout)
+    for line in String::from_utf8(stdout.to_vec())
         .context("systemd scope properties are not UTF-8")?
         .lines()
     {
@@ -1743,6 +1982,21 @@ fn systemd_scope_witness(unit: &str) -> Result<SystemdScopeWitness> {
     })
 }
 
+fn verify_frozen_legacy_membership(
+    expected: &LegacyScopeWitness,
+    actual: &[MemberEvidence],
+) -> Result<()> {
+    anyhow::ensure!(
+        actual
+            == [MemberEvidence {
+                pid: expected.member.pid,
+                start_time_ticks: expected.member.start_time_ticks,
+            }],
+        "frozen legacy Ding membership differs from preparation"
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn capture_legacy_process_witness(
     pid: i32,
@@ -1761,9 +2015,15 @@ fn capture_legacy_process_witness(
     let executable = executable
         .canonicalize()
         .context("canonicalize legacy Ding executable")?;
-    let executable_metadata = fs::metadata(&executable)?;
+    let executable_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(format!("/proc/{pid}/exe"))
+        .with_context(|| format!("open retained legacy Ding executable for pid {pid}"))?;
+    let executable_metadata = executable_file.metadata()?;
     anyhow::ensure!(
         executable_metadata.is_file()
+            && fs::read_link(format!("/proc/{pid}/exe"))?.canonicalize()? == executable
             && executable.file_name().and_then(OsStr::to_str) == Some("st2"),
         "legacy Ding executable is not one exact regular st2 binary"
     );
@@ -1776,6 +2036,11 @@ fn capture_legacy_process_witness(
         .with_context(|| format!("read legacy Ding cwd for pid {pid}"))?
         .canonicalize()
         .context("canonicalize legacy Ding cwd")?;
+    let cwd_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+        .open(format!("/proc/{pid}/cwd"))?;
+    let cwd_metadata = cwd_file.metadata()?;
     anyhow::ensure!(
         cwd == expected.cwd,
         "legacy Ding cwd differs from its catalog declaration"
@@ -1794,6 +2059,8 @@ fn capture_legacy_process_witness(
         executable_inode: executable_metadata.ino(),
         argv,
         cwd,
+        cwd_device: cwd_metadata.dev(),
+        cwd_inode: cwd_metadata.ino(),
     })
 }
 
@@ -1814,6 +2081,20 @@ fn verify_legacy_scope_witness(
             && expected.member.start_time_ticks == start_time_ticks,
         "legacy-scope-v1 plan does not bind the exact runtime boundary"
     );
+    verify_legacy_systemd_scope(unit, cgroup_path, expected)?;
+    verify_legacy_process_witness(&expected.member, cgroup_path)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_legacy_systemd_scope(
+    unit: &str,
+    cgroup_path: &str,
+    expected: &LegacyScopeWitness,
+) -> Result<()> {
+    anyhow::ensure!(
+        expected.scope_id == unit && expected.control_group == cgroup_path,
+        "legacy systemd witness does not bind the selected scope"
+    );
     let current = systemd_scope_witness(unit)?;
     anyhow::ensure!(
         current.id == expected.scope_id
@@ -1824,7 +2105,7 @@ fn verify_legacy_scope_witness(
             && current.slice == expected.slice,
         "legacy systemd scope identity changed since preparation"
     );
-    verify_legacy_process_witness(&expected.member, cgroup_path)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1842,14 +2123,27 @@ fn verify_legacy_process_witness(expected: &LegacyProcessWitness, cgroup_path: &
     let executable = fs::read_link(format!("/proc/{}/exe", expected.pid))?
         .canonicalize()
         .context("canonicalize retained legacy Ding executable")?;
-    let executable_metadata = fs::metadata(&executable)?;
+    let executable_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(format!("/proc/{}/exe", expected.pid))
+        .context("open retained legacy Ding executable")?;
+    let executable_metadata = executable_file.metadata()?;
+    let cwd = fs::read_link(format!("/proc/{}/cwd", expected.pid))?.canonicalize()?;
+    let cwd_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+        .open(format!("/proc/{}/cwd", expected.pid))?;
+    let cwd_metadata = cwd_file.metadata()?;
     anyhow::ensure!(
         executable == expected.executable
+            && fs::read_link(format!("/proc/{}/exe", expected.pid))?.canonicalize()? == executable
             && executable_metadata.dev() == expected.executable_device
             && executable_metadata.ino() == expected.executable_inode
             && process_argv(expected.pid)? == expected.argv
-            && fs::read_link(format!("/proc/{}/cwd", expected.pid))?.canonicalize()?
-                == expected.cwd,
+            && cwd == expected.cwd
+            && cwd_metadata.dev() == expected.cwd_device
+            && cwd_metadata.ino() == expected.cwd_inode,
         "legacy Ding executable, argv, or cwd changed"
     );
     Ok(())
@@ -2500,6 +2794,39 @@ fn validate_journal(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     anyhow::ensure!(actual == expected, "retirement journal target set changed");
+    for target in &plan.targets {
+        let item = journal
+            .items
+            .get(&target.runtime_id)
+            .context("retirement journal omitted target state")?;
+        match &target.classification {
+            PlannedClassification::Live { .. } => {
+                if matches!(
+                    item.phase,
+                    ItemPhase::Frozen | ItemPhase::Killed | ItemPhase::RecordRetired
+                ) {
+                    anyhow::ensure!(
+                        item.freeze_observed,
+                        "live retirement phase omitted its freeze observation"
+                    );
+                }
+                if matches!(item.phase, ItemPhase::Killed | ItemPhase::RecordRetired) {
+                    anyhow::ensure!(
+                        item.cgroup_outcome.is_some(),
+                        "live killed phase omitted its cgroup outcome"
+                    );
+                }
+            }
+            PlannedClassification::Stale { .. } => {
+                anyhow::ensure!(
+                    !item.freeze_observed
+                        && item.cgroup_outcome.is_none()
+                        && item.membership.is_empty(),
+                    "stale record-only journal contains cgroup mutation evidence"
+                );
+            }
+        }
+    }
     let advanced = journal
         .items
         .values()
@@ -2527,6 +2854,13 @@ fn hash_request(
     hash.update(census_sha256.as_bytes());
     hash.update(canonical_json(&legacy_partition)?);
     hash.update(canonical_json(targets)?);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn hash_legacy_partition(legacy_partition: Option<&[LegacySuccessorTask]>) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(LEGACY_PARTITION_HASH_DOMAIN);
+    hash.update(canonical_json(&legacy_partition)?);
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -3276,5 +3610,212 @@ mod tests {
         for unsafe_id in ["", ".hidden", "../escape", "a/b", "a b", "a\nb"] {
             assert!(!safe_runtime_id(unsafe_id), "{unsafe_id:?}");
         }
+    }
+
+    #[test]
+    fn legacy_partition_digest_binds_none_and_typed_contents() {
+        let mut none = Sha256::new();
+        none.update(LEGACY_PARTITION_HASH_DOMAIN);
+        none.update(b"null\n");
+        assert_eq!(
+            hash_legacy_partition(None).unwrap(),
+            format!("{:x}", none.finalize())
+        );
+
+        let partition = [LegacySuccessorTask {
+            runtime_id: "dev3.demo.ding".to_owned(),
+            agent: "dev3.demo".to_owned(),
+            task: "ding".to_owned(),
+            desired_state: SuccessorDesiredState::RunningDing,
+        }];
+        assert_ne!(
+            hash_legacy_partition(None).unwrap(),
+            hash_legacy_partition(Some(&partition)).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_partition_accepts_only_exact_declared_ding_namespace() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/dev3/demo");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("agent.kdl"),
+            "agent \"demo\" { host \"dev3\"; ding #true; argv \"agent-bin\" }\n",
+        )
+        .unwrap();
+        let census = [CensusEntry {
+            name: "dev3.demo.ding.pid".to_string(),
+            device: 1,
+            inode: 2,
+            length: 3,
+            sha256: "00".repeat(32),
+        }];
+        let partition = derive_legacy_successor_partition(catalog.path(), "dev3", &census).unwrap();
+        assert_eq!(
+            partition,
+            [LegacySuccessorTask {
+                runtime_id: "dev3.demo.ding".to_string(),
+                agent: "dev3.demo".to_string(),
+                task: "ding".to_string(),
+                desired_state: SuccessorDesiredState::RunningDing,
+            }]
+        );
+
+        let foreign = [CensusEntry {
+            name: "dev3.demo.provider.pid".to_string(),
+            ..census[0].clone()
+        }];
+        assert!(
+            derive_legacy_successor_partition(catalog.path(), "dev3", &foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("partition differ")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_systemd_witness_accepts_only_complete_exact_scope_identity() {
+        let unit = "st2-dev3.demo.ding-4242-7.scope";
+        let valid = format!(
+            "Id={unit}\n\
+             Names={unit}\n\
+             ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}\n\
+             InvocationID=0123456789abcdef0123456789abcdef\n\
+             ActiveEnterTimestampMonotonic=987654321\n\
+             Transient=yes\n\
+             LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=running\n\
+             Slice=app.slice\n"
+        );
+        let witness = parse_systemd_scope_witness(unit, valid.as_bytes()).unwrap();
+        assert_eq!(witness.id, unit);
+        assert_eq!(witness.invocation_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(witness.active_enter_timestamp_monotonic, 987654321);
+
+        for invalid in [
+            valid.replace(
+                "InvocationID=0123456789abcdef0123456789abcdef",
+                "InvocationID=",
+            ),
+            valid.replace(
+                "ActiveEnterTimestampMonotonic=987654321",
+                "ActiveEnterTimestampMonotonic=0",
+            ),
+            valid.replace("Slice=app.slice", "Slice=provider.slice"),
+            valid.replace("SubState=running", "SubState=dead"),
+            format!("{valid}ControlGroup=/duplicate\n"),
+        ] {
+            assert!(
+                parse_systemd_scope_witness(unit, invalid.as_bytes()).is_err(),
+                "accepted invalid systemd witness: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_frozen_membership_rejects_shared_or_changed_generation() {
+        let expected = LegacyScopeWitness {
+            scope_id: "st2-dev3.demo.ding-4242-7.scope".to_string(),
+            control_group: "/app.slice/st2-dev3.demo.ding-4242-7.scope".to_string(),
+            invocation_id: "0123456789abcdef0123456789abcdef".to_string(),
+            active_enter_timestamp_monotonic: 987654321,
+            slice: "app.slice".to_string(),
+            member: LegacyProcessWitness {
+                pid: 4242,
+                start_time_ticks: 12345,
+                uid: 1000,
+                executable: PathBuf::from("/nix/store/exact/bin/st2"),
+                executable_device: 1,
+                executable_inode: 2,
+                argv: vec!["st2".to_string(), "ding".to_string()],
+                cwd: PathBuf::from("/catalog/dev3/demo"),
+                cwd_device: 3,
+                cwd_inode: 4,
+            },
+        };
+        let exact = [MemberEvidence {
+            pid: 4242,
+            start_time_ticks: 12345,
+        }];
+        verify_frozen_legacy_membership(&expected, &exact).unwrap();
+        assert!(
+            verify_frozen_legacy_membership(
+                &expected,
+                &[
+                    exact[0].clone(),
+                    MemberEvidence {
+                        pid: 5000,
+                        start_time_ticks: 888,
+                    },
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            verify_frozen_legacy_membership(
+                &expected,
+                &[MemberEvidence {
+                    pid: 4242,
+                    start_time_ticks: 12346,
+                }],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn leaderless_recovery_is_scoped_to_durable_per_item_mutation_boundary() {
+        assert!(!leaderless_recovery_phase(ItemPhase::Prepared));
+        assert!(leaderless_recovery_phase(ItemPhase::MutationAuthorized));
+        assert!(leaderless_recovery_phase(ItemPhase::Frozen));
+        assert!(!leaderless_recovery_phase(ItemPhase::Killed));
+        assert!(!leaderless_recovery_phase(ItemPhase::RecordRetired));
+        assert_eq!(
+            leaderless_freeze_action(ItemPhase::MutationAuthorized, Some("0")).unwrap(),
+            LeaderlessFreezeAction::Freeze
+        );
+        assert_eq!(
+            leaderless_freeze_action(ItemPhase::MutationAuthorized, Some("1")).unwrap(),
+            LeaderlessFreezeAction::AlreadyFrozen
+        );
+        assert_eq!(
+            leaderless_freeze_action(ItemPhase::Frozen, Some("1")).unwrap(),
+            LeaderlessFreezeAction::AlreadyFrozen
+        );
+        assert!(leaderless_freeze_action(ItemPhase::Frozen, Some("0")).is_err());
+        assert!(leaderless_freeze_action(ItemPhase::Prepared, Some("0")).is_err());
+    }
+
+    #[test]
+    fn runtime_permission_is_bound_to_exact_catalog_and_host() {
+        let root = tempfile::tempdir().unwrap();
+        let expected_catalog = root.path().join("expected");
+        let other_catalog = root.path().join("other");
+        fs::create_dir_all(&expected_catalog).unwrap();
+        fs::create_dir_all(&other_catalog).unwrap();
+        let ownership =
+            crate::host_lock::HostOwnership::acquire(&expected_catalog, "expected-host").unwrap();
+        let admission =
+            crate::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership).unwrap();
+        let permission = admission.permission();
+        let expected_catalog = expected_catalog.canonicalize().unwrap();
+        let other_catalog = other_catalog.canonicalize().unwrap();
+
+        ensure_permission_matches(&permission, &expected_catalog, "expected-host").unwrap();
+        assert!(
+            ensure_permission_matches(&permission, &other_catalog, "expected-host")
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to catalog")
+        );
+        assert!(
+            ensure_permission_matches(&permission, &expected_catalog, "other-host")
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to host")
+        );
     }
 }

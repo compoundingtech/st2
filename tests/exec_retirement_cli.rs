@@ -5,9 +5,42 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
+use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 static LIVE_E2E: Mutex<()> = Mutex::new(());
+
+const LEGACY_PARTITION_HASH_DOMAIN: &[u8] = b"st2.exec-retirement-legacy-partition.v1\0";
+
+fn legacy_partition_sha256(partition: &Value) -> String {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TypedLegacyTask<'a> {
+        runtime_id: &'a str,
+        agent: &'a str,
+        task: &'a str,
+        desired_state: &'a str,
+    }
+
+    let typed = partition
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| TypedLegacyTask {
+            runtime_id: task["runtimeId"].as_str().unwrap(),
+            agent: task["agent"].as_str().unwrap(),
+            task: task["task"].as_str().unwrap(),
+            desired_state: task["desiredState"].as_str().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let mut hash = Sha256::new();
+    hash.update(LEGACY_PARTITION_HASH_DOMAIN);
+    let mut canonical = serde_json::to_vec(&typed).unwrap();
+    canonical.push(b'\n');
+    hash.update(canonical);
+    format!("{:x}", hash.finalize())
+}
 
 fn st2() -> Command {
     Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -160,7 +193,10 @@ fn legacy_set_stale_prepare_apply_and_replay_are_exact() {
     );
     let prepared: Value = serde_json::from_slice(&prepare.stdout).unwrap();
     let plan_sha = prepared["planSha256"].as_str().unwrap();
+    let plan_json: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    let partition_sha = legacy_partition_sha256(&plan_json["legacyPartition"]);
     assert_eq!(prepared["targets"], 2);
+    assert_eq!(prepared["legacyPartitionSha256"], partition_sha);
     assert!(plan.is_file());
     assert!(
         first.is_file() && second.is_file(),
@@ -192,6 +228,7 @@ fn legacy_set_stale_prepare_apply_and_replay_are_exact() {
     let receipt: Value = serde_json::from_slice(&applied.stdout).unwrap();
     assert_eq!(receipt["schema"], "st2.exec-retirement.v1");
     assert_eq!(receipt["forwardOnlyStarted"], true);
+    assert_eq!(receipt["legacyPartitionSha256"], partition_sha);
     assert_eq!(
         receipt["legacyPartition"][0]["desiredState"],
         "running-ding"
@@ -221,6 +258,29 @@ fn legacy_set_stale_prepare_apply_and_replay_are_exact() {
     assert_eq!(
         replay.stdout, applied.stdout,
         "replay returns the exact stored receipt"
+    );
+
+    let transaction = fs::read_dir(state.join(".retirements"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let receipt_path = transaction.join("receipt.json");
+    let mut tampered: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    tampered["legacyPartitionSha256"] = Value::String("0".repeat(64));
+    fs::write(&receipt_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let rejected = st2()
+        .arg("--catalog")
+        .arg(&catalog)
+        .args(apply_args)
+        .env("XDG_STATE_HOME", &xdg)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("stored retirement receipt does not bind the exact completed transaction")
     );
 }
 

@@ -13,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::catalog_lock::CatalogLock;
-use crate::catalog_transaction::{rename_noreplace, sync_dir};
+use crate::catalog_transaction::{RetainedCatalogMutationAuthority, rename_noreplace, sync_dir};
 use crate::cutover_admission::{CanonicalCatalog, admit_catalog_publish};
 
 const SCHEMA: &str = "st2.agent-publish.v1";
@@ -209,7 +209,26 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
     let canonical_catalog = CanonicalCatalog::open(&catalog)?;
     let lock = CatalogLock::exclusive(&catalog)?;
-    let _publication = admit_catalog_publish(&canonical_catalog, &lock)?;
+    let publication = admit_catalog_publish(&canonical_catalog, &lock)?;
+    publish_admitted(request, &publication)
+}
+
+/// Publish while the caller retains exact, non-forgeable catalog mutation authority.
+pub(crate) fn publish_admitted(
+    request: PublishRequest,
+    authority: &impl RetainedCatalogMutationAuthority,
+) -> Result<PublishResult> {
+    validate_sha256(&request.input_sha256)?;
+    let catalog = request
+        .catalog
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
+    anyhow::ensure!(
+        authority.catalog().as_path() == catalog,
+        "catalog mutation authority is bound to {}, not {}",
+        authority.catalog().as_path().display(),
+        catalog.display()
+    );
     let candidate = Candidate::stage(&catalog, request.source)?;
     anyhow::ensure!(
         candidate.input_sha256 == request.input_sha256,
@@ -619,6 +638,41 @@ fn atomic_publish_staged_bundle(stage: tempfile::TempDir, target: &Path) -> Resu
     rename_noreplace(&stage.keep(), target)
         .with_context(|| format!("publish bundle {}", target.display()))?;
     sync_dir(parent)
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_core_rejects_authority_for_another_catalog_before_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let authorized_catalog = temp.path().join("authorized");
+        let requested_catalog = temp.path().join("requested");
+        fs::create_dir(&authorized_catalog).unwrap();
+        fs::create_dir(&requested_catalog).unwrap();
+
+        let canonical = CanonicalCatalog::open(&authorized_catalog).unwrap();
+        let lock = CatalogLock::exclusive(&authorized_catalog).unwrap();
+        let authority = admit_catalog_publish(&canonical, &lock).unwrap();
+        let error = publish_admitted(
+            PublishRequest {
+                catalog: requested_catalog.clone(),
+                source: PublishSource::Spec(temp.path().join("must-not-be-opened.kdl")),
+                expectation: PublishExpectation::Absent,
+                input_sha256: "0".repeat(64),
+            },
+            &authority,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("catalog mutation authority is bound to")
+        );
+        assert!(!requested_catalog.join(".st2").exists());
+    }
 }
 
 fn bundle_projection_matches(source: &Path, target: &Path) -> Result<bool> {

@@ -160,6 +160,9 @@ pub enum ObservedState {
 pub struct RuntimeObservation {
     pub runtime_id: String,
     pub state: ObservedState,
+    /// Exact backend metadata observed with this runtime generation. Provider PTYs use this to bind
+    /// an Axe launch receipt to the same session; exec backends leave it empty.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// One coherent observation attempt. Any backend uncertainty makes the batch
@@ -373,6 +376,7 @@ pub fn inventory(
             RuntimeObservation {
                 runtime_id,
                 state: ObservedState::Indeterminate("duplicate runtime observation".into()),
+                tags: BTreeMap::new(),
             },
         );
     }
@@ -389,6 +393,7 @@ pub fn inventory(
                     RuntimeObservation {
                         runtime_id: task.runtime_id.clone(),
                         state: ObservedState::Absent,
+                        tags: BTreeMap::new(),
                     }
                 } else {
                     RuntimeObservation {
@@ -396,6 +401,7 @@ pub fn inventory(
                         state: ObservedState::Indeterminate(
                             "runtime observation incomplete".into(),
                         ),
+                        tags: BTreeMap::new(),
                     }
                 }
             });
@@ -527,6 +533,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            tags: BTreeMap::new(),
         }
     }
 
@@ -740,6 +747,7 @@ mod tests {
                     observations: vec![RuntimeObservation {
                         runtime_id: "shared".into(),
                         state: ObservedState::Indeterminate("selected runtime unreadable".into()),
+                        tags: BTreeMap::new(),
                     }],
                     errors: vec![],
                 }),
@@ -812,6 +820,7 @@ mod tests {
                     state: ObservedState::Indeterminate(
                         "running runtime lacks complete generation evidence".into(),
                     ),
+                    tags: BTreeMap::new(),
                 }],
                 errors: vec![],
             },
@@ -850,6 +859,7 @@ mod tests {
         let observation = RuntimeObservation {
             runtime_id: "h.worker.agent".into(),
             state: ObservedState::Indeterminate("backend evidence is invalid".into()),
+            tags: BTreeMap::new(),
         };
         let value = json(
             tmp.path(),
@@ -884,14 +894,17 @@ mod tests {
                     RuntimeObservation {
                         runtime_id: "h.a".into(),
                         state: ObservedState::Exited,
+                        tags: BTreeMap::new(),
                     },
                     RuntimeObservation {
                         runtime_id: "h.b".into(),
                         state: ObservedState::Vanished,
+                        tags: BTreeMap::new(),
                     },
                     RuntimeObservation {
                         runtime_id: "h.c".into(),
                         state: ObservedState::Indeterminate("unreadable".into()),
+                        tags: BTreeMap::new(),
                     },
                 ],
                 errors: vec!["one runtime unreadable".into()],

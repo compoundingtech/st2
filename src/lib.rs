@@ -11,7 +11,9 @@ pub mod catalog_lock;
 pub mod catalog_transaction;
 pub mod context;
 pub mod cutover_admission;
+pub mod cutover_driver;
 pub mod ding;
+pub mod ding_reconcile;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod exec_backend;
@@ -48,9 +50,10 @@ pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
-pub use host_lock::HostLock;
+pub use host_lock::{HostLock, HostOwnership};
 pub use reconcile::{Launch, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
-    up_loop, up_loop_specs, up_once, up_once_selected, up_once_selected_specs, up_once_specs,
+    up_loop, up_loop_specs, up_loop_with_ownership, up_once, up_once_selected,
+    up_once_selected_specs, up_once_specs, up_once_with_ownership,
 };

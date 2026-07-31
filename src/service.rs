@@ -90,6 +90,23 @@ impl ServiceSpec {
         }
         args
     }
+
+    /// Read-only durable-cutover admission check run immediately before each supervisor start.
+    fn preflight_arguments(&self) -> Vec<String> {
+        let mut args = vec![
+            self.exe.display().to_string(),
+            "--catalog".to_string(),
+            self.catalog.display().to_string(),
+            "cutover".to_string(),
+            "status".to_string(),
+        ];
+        if let Some(host) = &self.host {
+            args.push("--host".to_string());
+            args.push(host.clone());
+        }
+        args.push("--json".to_string());
+        args
+    }
 }
 
 /// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
@@ -116,6 +133,7 @@ pub fn install(
                 .with_context(|| format!("pty root {} does not exist", root.display()))
         })
         .transpose()?;
+    require_service_mutation_admission(&catalog, host.as_deref())?;
     let spec = ServiceSpec::new(exe, &catalog, host, path, pty_root, memory_max_mb)?;
 
     install_systemd_user(&spec)?;
@@ -156,10 +174,32 @@ pub fn status() -> Result<()> {
 }
 
 /// `st2 service uninstall` — stop, disable, and remove the unit. Idempotent.
-pub fn uninstall() -> Result<()> {
+pub fn uninstall(catalog: &Path) -> Result<()> {
+    let catalog = catalog.canonicalize().with_context(|| {
+        format!(
+            "catalog {} does not exist — select the installed service catalog before uninstalling",
+            catalog.display()
+        )
+    })?;
+    require_service_mutation_admission(&catalog, None)?;
     uninstall_systemd_user()?;
     println!("uninstalled");
     Ok(())
+}
+
+fn require_service_mutation_admission(catalog: &Path, host: Option<&str>) -> Result<()> {
+    let catalog = crate::cutover_admission::CanonicalCatalog::open(catalog)?;
+    let host = crate::cutover_admission::HostId::parse(
+        host.map(ToOwned::to_owned)
+            .unwrap_or_else(crate::detect_host),
+    )?;
+    match crate::cutover_admission::probe_mutation_admission(&catalog, Some(&host))? {
+        crate::cutover_admission::MutationAdmission::Available => Ok(()),
+        crate::cutover_admission::MutationAdmission::Busy(busy) => bail!(
+            "service mutation refused: {}",
+            serde_json::to_string(&busy)?
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -187,7 +227,10 @@ fn install_systemd_user(_spec: &ServiceSpec) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn status_systemd_user() -> Result<()> {
-    run_command("systemctl", &["--user", "status", SERVICE_NAME, "--no-pager"])
+    run_command(
+        "systemctl",
+        &["--user", "status", SERVICE_NAME, "--no-pager"],
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -238,7 +281,9 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from).context("HOME is not set")
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
 }
 
 #[cfg(target_os = "linux")]
@@ -252,6 +297,12 @@ fn systemd_user_unit_path() -> Result<PathBuf> {
 
 /// Render the systemd-user unit. Pure (no I/O) so it is unit-testable on any OS.
 pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
+    let exec_start_pre = spec
+        .preflight_arguments()
+        .iter()
+        .map(|arg| systemd_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
     let exec_start = spec
         .program_arguments()
         .iter()
@@ -267,6 +318,7 @@ After=network.target\n\
 Type=simple\n\
 Environment={}\n\
 {}\
+ExecStartPre={exec_start_pre}\n\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
@@ -334,15 +386,18 @@ mod tests {
         assert!(
             unit.contains("ExecStart=/home/user/.cargo/bin/st2 up --catalog /home/user/catalog")
         );
+        assert!(unit.contains(
+            "ExecStartPre=/home/user/.cargo/bin/st2 --catalog /home/user/catalog cutover status --json"
+        ));
         // No --host baked when unset → st2 up auto-detects, same as a manual run.
         assert!(!unit.contains("--host"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("RestartSec=5s"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("WorkingDirectory=/home/user/catalog"));
-        assert!(unit.contains(
-            "Environment=PATH=/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin"
-        ));
+        assert!(
+            unit.contains("Environment=PATH=/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin")
+        );
         assert!(!unit.contains("Environment=PTY_ROOT="));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("Description=st2 supervisor (st2 up)"));
@@ -365,6 +420,9 @@ mod tests {
         assert!(
             unit.contains("ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz")
         );
+        assert!(unit.contains(
+            "ExecStartPre=/usr/local/bin/st2 --catalog /srv/catalog cutover status --host hetz --json"
+        ));
         assert!(unit.contains("MemoryMax=512M"));
         assert!(unit.contains("Environment=PTY_ROOT=/srv/legacy-pty"));
         Ok(())
@@ -383,9 +441,10 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(
-            unit.contains("ExecStart=\"/opt/st2 tools/st2\" up --catalog \"/srv/cat 100%%\"")
-        );
+        assert!(unit.contains("ExecStart=\"/opt/st2 tools/st2\" up --catalog \"/srv/cat 100%%\""));
+        assert!(unit.contains(
+            "ExecStartPre=\"/opt/st2 tools/st2\" --catalog \"/srv/cat 100%%\" cutover status --json"
+        ));
         assert!(unit.contains("WorkingDirectory=\"/srv/cat 100%%\""));
         assert!(unit.contains("Environment=\"PATH=/opt/st2 tools:/usr/bin\""));
         assert!(unit.contains("Environment=\"PTY_ROOT=/srv/pty 100%%\""));

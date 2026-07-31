@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Seek as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -22,10 +23,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
+use crate::cutover_admission::{RuntimeMutate, RuntimeMutationAdmission};
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
+use crate::host_lock::HostOwnership;
 use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use crate::task_inventory::{
@@ -121,6 +125,17 @@ pub trait Runner {
     }
     /// Finally remove an exited session's files (retirement/final garbage collection).
     fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
+
+    /// Read-only, generation-bearing observation used by exact cutover adoption. Ordinary fake
+    /// runners need not implement this; refusing an incomplete observation is safer than inferring
+    /// an adoptable generation from the lossy [`Session`] view.
+    fn observe_runtime(&self, _desired: &[DesiredRuntime]) -> ObservationBatch {
+        ObservationBatch {
+            complete: false,
+            errors: vec!["runner does not provide generation-bearing runtime observation".into()],
+            ..ObservationBatch::default()
+        }
+    }
 }
 
 /// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
@@ -157,6 +172,9 @@ struct PtyListEntry {
     /// PTY-owned generation creation time.
     #[serde(rename = "createdAt", default)]
     created_at: Option<String>,
+    /// Immutable-at-proof launch metadata published by Axe onto this exact PTY.
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -384,6 +402,7 @@ impl PtyCli {
             observations.push(RuntimeObservation {
                 runtime_id: entry.name,
                 state,
+                tags: entry.tags,
             });
         }
         ObservationBatch {
@@ -611,6 +630,7 @@ impl RuntimeObserver for SystemRunner {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state,
+                        tags: BTreeMap::new(),
                     });
                 }
                 Ok(Some(crate::exec_backend::ExecGenerationObservation::Indeterminate {
@@ -625,6 +645,7 @@ impl RuntimeObserver for SystemRunner {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state: ObservedState::Indeterminate(message),
+                        tags: BTreeMap::new(),
                     });
                 }
                 Err(error) => {
@@ -633,6 +654,7 @@ impl RuntimeObserver for SystemRunner {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state: ObservedState::Indeterminate(message),
+                        tags: BTreeMap::new(),
                     });
                 }
             }
@@ -695,6 +717,10 @@ impl Runner for SystemRunner {
             }
         }
     }
+
+    fn observe_runtime(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        RuntimeObserver::observe(self, desired)
+    }
 }
 
 /// The machine-local runner-state dir for a host's exec tasks: `$XDG_STATE_HOME/st2/<host>/exec`
@@ -709,7 +735,8 @@ pub fn exec_state_dir(host: &str) -> PathBuf {
 
 /// A task st2 gave up restarting (crash-looped past its `restart{}` policy, mode=fail) — carries what
 /// the supervisor loop needs to SURFACE it: the parked task, its agent, and who to notify (M2.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CrashLoop {
     /// The parked task's pty id.
     pub pty_id: String,
@@ -732,7 +759,8 @@ impl CrashLoop {
 }
 
 /// Owned, human-readable summary of one reconcile+execute pass (no borrows of the plan/specs).
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpReport {
     /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
     /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
@@ -797,11 +825,30 @@ impl UpReport {
 /// flapping-cap. Order matters: reap standalone corpses, then (cap-gated) reap-and-respawn each
 /// launch target, then kill teardowns. Per-op errors are collected, never fatal.
 pub fn execute(
+    permission: &RuntimeMutate<'_>,
+    catalog_root: &Path,
+    this_host: &str,
     plan: &ReconcilePlan,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     report: &mut UpReport,
 ) {
+    let Ok(canonical_root) = catalog_root.canonicalize() else {
+        report.errors.push(format!(
+            "canonicalize runtime mutation catalog {}",
+            catalog_root.display()
+        ));
+        return;
+    };
+    if permission.catalog().as_path() != canonical_root || permission.host().as_str() != this_host {
+        report.errors.push(format!(
+            "runtime mutation permission is for ({}, {}), not ({}, {this_host})",
+            permission.catalog().as_path().display(),
+            permission.host().as_str(),
+            canonical_root.display(),
+        ));
+        return;
+    }
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -967,24 +1014,43 @@ impl LivenessDebounce {
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
 /// `debounce` carries per-id liveness so a transient not-alive flicker isn't destructively reaped.
 fn reconcile_pass(
+    ownership: &HostOwnership,
     root: &Path,
     this_host: &str,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
 ) -> UpReport {
-    let _catalog_lock = match crate::CatalogLock::shared(root) {
-        Ok(lock) => lock,
+    let admission = match RuntimeMutationAdmission::ordinary(ownership) {
+        Ok(admission) => admission,
         Err(error) => {
             return UpReport {
                 skipped: true,
                 errors: vec![format!(
-                    "acquire shared catalog-authoring lock (pass skipped): {error:#}"
+                    "runtime mutation admission denied (pass skipped): {error}"
                 )],
                 ..Default::default()
             };
         }
     };
+    reconcile_pass_admitted(
+        &admission.permission(),
+        root,
+        this_host,
+        runner,
+        cap,
+        debounce,
+    )
+}
+
+pub(crate) fn reconcile_pass_admitted(
+    permission: &RuntimeMutate<'_>,
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -1022,7 +1088,8 @@ fn reconcile_pass(
     // active fleet even when another gate defers one owner's writes. A gating render failure removes
     // only that agent from this pass; advisory git-exclude failures remain warnings and never block
     // a launch.
-    let materialized = crate::materialize::materialize_catalog_against(
+    let materialized = crate::materialize::materialize_catalog_against_admitted(
+        permission,
         root,
         &materializable_specs,
         &found.specs,
@@ -1055,7 +1122,7 @@ fn reconcile_pass(
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute(&plan, runner, cap, &mut report);
+    execute(permission, root, this_host, &plan, runner, cap, &mut report);
     report
 }
 
@@ -1102,14 +1169,416 @@ fn gate_codex_launches_on_hooks<'a, V>(
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for one-shot reconcile")?;
+    up_once_with_ownership(&ownership, runner)
+}
+
+/// Reconcile once while retaining caller-owned host authority.
+///
+/// Cutover finalization uses this seam to continue into the successor without a
+/// drop-and-reacquire window.
+pub fn up_once_with_ownership(
+    ownership: &HostOwnership,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     Ok(reconcile_pass(
-        root,
-        this_host,
+        &ownership,
+        ownership.catalog(),
+        ownership.host(),
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
     ))
+}
+
+pub(crate) trait RuntimeObservationSource {
+    fn observe_generations(&self, desired: &[DesiredRuntime]) -> ObservationBatch;
+}
+
+impl<T: Runner + ?Sized> RuntimeObservationSource for T {
+    fn observe_generations(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        Runner::observe_runtime(self, desired)
+    }
+}
+
+pub(crate) struct ProviderFleetRuntimeObserver<'a, O: RuntimeObservationSource + ?Sized> {
+    action: &'a crate::cutover_admission::ProviderFleetProofAction,
+    observer: &'a O,
+}
+
+impl<'a, O: RuntimeObservationSource + ?Sized> ProviderFleetRuntimeObserver<'a, O> {
+    pub(crate) fn new(
+        action: &'a crate::cutover_admission::ProviderFleetProofAction,
+        observer: &'a O,
+    ) -> Self {
+        Self { action, observer }
+    }
+}
+
+impl<O: RuntimeObservationSource + ?Sized> crate::cutover_admission::ProviderFleetObserver
+    for ProviderFleetRuntimeObserver<'_, O>
+{
+    fn observe_provider_rows(
+        &self,
+        catalog: &crate::cutover_admission::CanonicalCatalog,
+        host: &crate::cutover_admission::HostId,
+    ) -> crate::cutover_admission::AdmissionResult<
+        Vec<crate::cutover_admission::ProviderTaskObservation>,
+    > {
+        use crate::cutover_admission::{
+            AdmissionError, ProviderTaskObservation, ProviderTaskStatus,
+        };
+
+        let found = crate::discover(catalog.as_path());
+        if !found.errors.is_empty() {
+            return Err(AdmissionError::Invalid(
+                "provider runtime observation requires exact catalog discovery".to_owned(),
+            ));
+        }
+        let mut provider_runtime_ids = Vec::with_capacity(self.action.providers.len());
+        for entry in &self.action.providers {
+            let mut matches = found
+                .specs
+                .iter()
+                .filter(|spec| {
+                    spec.identity == entry.identity
+                        && spec.resolved_host(host.as_str()) == host.as_str()
+                })
+                .flat_map(|spec| {
+                    spec.tasks
+                        .iter()
+                        .filter(|task| task.name == "agent" && !task.derived)
+                        .map(move |task| (spec, task))
+                });
+            let Some((spec, task)) = matches.next() else {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} has no exact authored runtime",
+                    entry.identity
+                )));
+            };
+            if matches.next().is_some() {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} has multiple authored runtimes",
+                    entry.identity
+                )));
+            }
+            provider_runtime_ids.push((
+                entry,
+                task.id.clone().unwrap_or_else(|| {
+                    format!("{}.{}.{}", host.as_str(), spec.identity, task.name)
+                }),
+            ));
+        }
+        let desired = provider_runtime_ids
+            .iter()
+            .map(|(_, runtime_id)| DesiredRuntime {
+                runtime_id: runtime_id.clone(),
+                kind: TaskKind::Pty,
+            })
+            .collect::<Vec<_>>();
+        let batch = self.observer.observe_generations(&desired);
+        if !batch.complete || !batch.errors.is_empty() {
+            return Err(AdmissionError::Invalid(format!(
+                "provider fleet runtime observation is incomplete: {}",
+                batch.errors.join("; ")
+            )));
+        }
+        let expected_ids = desired
+            .iter()
+            .map(|runtime| runtime.runtime_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let observed_ids = batch
+            .observations
+            .iter()
+            .map(|runtime| runtime.runtime_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if expected_ids.len() != desired.len()
+            || observed_ids.len() != batch.observations.len()
+            || observed_ids != expected_ids
+        {
+            return Err(AdmissionError::Conflict(
+                "provider fleet runtime observation is not an exact id bijection".to_owned(),
+            ));
+        }
+
+        let mut authored_providers = Vec::with_capacity(provider_runtime_ids.len());
+        for (entry, runtime_id) in provider_runtime_ids {
+            let observed = batch
+                .observations
+                .iter()
+                .find(|observed| observed.runtime_id == runtime_id)
+                .expect("exact id bijection checked");
+            let (status, runtime_generation_id) = match &observed.state {
+                ObservedState::Running(generation) => (
+                    ProviderTaskStatus::Running,
+                    Some(generation.generation_id().to_owned()),
+                ),
+                ObservedState::Exited | ObservedState::Vanished => {
+                    (ProviderTaskStatus::Stopped, None)
+                }
+                ObservedState::Indeterminate(reason) => {
+                    return Err(AdmissionError::Invalid(format!(
+                        "provider {runtime_id:?} is indeterminate: {reason}"
+                    )));
+                }
+                ObservedState::Absent => (ProviderTaskStatus::Absent, None),
+            };
+            observe_prompt_authority(entry, host, &runtime_id, &observed.tags)?;
+            authored_providers.push(ProviderTaskObservation {
+                identity: entry.identity.clone(),
+                status,
+                runtime_generation_id,
+                prompt: Some(entry.prompt.clone()),
+            });
+        }
+
+        Ok(authored_providers)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchReceiptPathDigest {
+    path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchReceiptInjection {
+    kind: crate::cutover_admission::PromptInjectionKind,
+    seam: String,
+    prompt_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AxeLaunchReceipt {
+    schema: String,
+    phase: String,
+    runtime_id: String,
+    generation_id: String,
+    identity: String,
+    workspace: PathBuf,
+    provider: String,
+    account: String,
+    persona: String,
+    harness: String,
+    model: String,
+    effort: String,
+    mode: String,
+    boot_contract: String,
+    runtime_profile: LaunchReceiptPathDigest,
+    persona_prompt: LaunchReceiptPathDigest,
+    injection: LaunchReceiptInjection,
+    canonical_provider_argv: Vec<String>,
+    provider_argv_sha256: String,
+    trajectory_sha256: String,
+}
+
+fn observe_prompt_authority(
+    entry: &crate::cutover_admission::ProviderFleetEntry,
+    host: &crate::cutover_admission::HostId,
+    runtime_id: &str,
+    tags: &BTreeMap<String, String>,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+
+    let prompt = &entry.prompt;
+    let required_tags = [
+        ("agent.launch.receipt.schema", "axe.agent-launch-receipt.v1"),
+        (
+            "agent.launch.receipt.path",
+            prompt.launch_receipt_path.to_str().ok_or_else(|| {
+                AdmissionError::Invalid("launch receipt path is not UTF-8".to_owned())
+            })?,
+        ),
+        (
+            "agent.launch.receipt.sha256",
+            prompt.launch_receipt_sha256.as_str(),
+        ),
+        ("agent.generation.id", entry.launch_generation_id.as_str()),
+    ];
+    for (name, expected) in required_tags {
+        if tags.get(name).map(String::as_str) != Some(expected) {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} PTY tag {name:?} does not bind the exact launch receipt",
+                entry.identity
+            )));
+        }
+    }
+
+    let profile_bytes = read_bounded_regular(&prompt.runtime_profile_path, "runtime profile")
+        .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+    let observed_profile = format!("{:x}", Sha256::digest(&profile_bytes));
+    if observed_profile != prompt.runtime_profile_sha256 || observed_profile != entry.profile_sha256
+    {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} runtime profile digest mismatch",
+            entry.identity
+        )));
+    }
+    let profile: serde_json::Value = serde_json::from_slice(&profile_bytes).map_err(|error| {
+        AdmissionError::Invalid(format!("parse provider runtime profile: {error}"))
+    })?;
+    if profile
+        .pointer(&format!(
+            "/personas/prompts/{}",
+            entry.persona.replace('~', "~0").replace('/', "~1")
+        ))
+        .and_then(serde_json::Value::as_str)
+        != prompt.persona_prompt_path.to_str()
+    {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} runtime profile does not map its persona to the exact prompt",
+            entry.identity
+        )));
+    }
+    let persona_prompt_bytes = read_bounded_regular(&prompt.persona_prompt_path, "persona prompt")
+        .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+    let observed_prompt = format!("{:x}", Sha256::digest(&persona_prompt_bytes));
+    if observed_prompt != prompt.persona_prompt_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} persona prompt digest mismatch",
+            entry.identity
+        )));
+    }
+
+    let receipt_bytes = read_bounded_regular(&prompt.launch_receipt_path, "Axe launch receipt")
+        .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+    let observed_receipt = format!("{:x}", Sha256::digest(&receipt_bytes));
+    if observed_receipt != prompt.launch_receipt_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} launch receipt digest mismatch",
+            entry.identity
+        )));
+    }
+    let receipt: AxeLaunchReceipt = serde_json::from_slice(&receipt_bytes)
+        .map_err(|error| AdmissionError::Invalid(format!("parse Axe launch receipt: {error}")))?;
+    let canonical = serde_json::to_vec(&receipt).map_err(|error| {
+        AdmissionError::Invalid(format!("canonicalize Axe launch receipt: {error}"))
+    })?;
+    if canonical != receipt_bytes {
+        return Err(AdmissionError::Invalid(
+            "Axe launch receipt is not byte-for-byte canonical JSON".to_owned(),
+        ));
+    }
+    let expected_identity = format!("{}.{}", host.as_str(), entry.identity);
+    if receipt.schema != "axe.agent-launch-receipt.v1"
+        || receipt.phase != "prepared"
+        || receipt.runtime_id != runtime_id
+        || receipt.generation_id != entry.launch_generation_id
+        || receipt.identity != expected_identity
+        || receipt.workspace != entry.workspace
+        || receipt.provider != entry.provider
+        || receipt.account != entry.account
+        || receipt.persona != entry.persona
+        || receipt.harness != entry.harness
+        || receipt.model != entry.model
+        || receipt.effort != entry.effort
+        || receipt.mode != entry.mode
+        || receipt.boot_contract != entry.boot_contract
+        || receipt.runtime_profile.path != prompt.runtime_profile_path
+        || receipt.runtime_profile.sha256 != prompt.runtime_profile_sha256
+        || receipt.persona_prompt.path != prompt.persona_prompt_path
+        || receipt.persona_prompt.sha256 != prompt.persona_prompt_sha256
+        || receipt.injection.kind != prompt.injection_kind
+        || receipt.injection.seam
+            != match prompt.injection_kind {
+                PromptInjectionKind::ClaudeAppendSystemPromptFile => {
+                    "argv:--append-system-prompt-file"
+                }
+                PromptInjectionKind::CodexDeveloperInstructions => "argv:-c:developer_instructions",
+                PromptInjectionKind::OpencodeSystemPromptFile => "env:AGENT_SYSTEM_PROMPT_FILE",
+                PromptInjectionKind::PiAppendSystemPromptFile => "argv:--append-system-prompt",
+            }
+        || receipt.injection.prompt_sha256 != prompt.persona_prompt_sha256
+        || receipt.trajectory_sha256 != entry.trajectory_sha256
+        || receipt.canonical_provider_argv.is_empty()
+    {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} Axe launch receipt does not bind the exact trajectory",
+            entry.identity
+        )));
+    }
+    let provider_argv_sha256 = provider_argv_sha256(
+        &receipt.canonical_provider_argv,
+        prompt.injection_kind,
+        &prompt.persona_prompt_sha256,
+        &persona_prompt_bytes,
+    )?;
+    if provider_argv_sha256 != receipt.provider_argv_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} canonical provider argv digest mismatch",
+            entry.identity
+        )));
+    }
+    Ok(())
+}
+
+fn provider_argv_sha256(
+    projected: &[String],
+    injection_kind: crate::cutover_admission::PromptInjectionKind,
+    prompt_sha256: &str,
+    prompt_bytes: &[u8],
+) -> crate::cutover_admission::AdmissionResult<String> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+    let mut argv = projected.to_vec();
+    if injection_kind == PromptInjectionKind::CodexDeveloperInstructions {
+        let placeholder = format!("developer_instructions=<prompt-sha256:{prompt_sha256}>");
+        let indexes = argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == &placeholder).then_some(index))
+            .collect::<Vec<_>>();
+        let [index] = indexes.as_slice() else {
+            return Err(AdmissionError::Conflict(
+                "Codex provider argv must contain one exact redacted prompt placeholder".to_owned(),
+            ));
+        };
+        let prompt = std::str::from_utf8(prompt_bytes).map_err(|error| {
+            AdmissionError::Invalid(format!("Codex persona prompt is not UTF-8: {error}"))
+        })?;
+        let encoded = serde_json::to_string(prompt).map_err(|error| {
+            AdmissionError::Invalid(format!("encode Codex developer instructions: {error}"))
+        })?;
+        argv[*index] = format!("developer_instructions={encoded}");
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"axe.agent-launch-provider-argv.v1\0");
+    for argument in argv {
+        hash.update((argument.len() as u64).to_be_bytes());
+        hash.update(argument.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn read_bounded_regular(path: &Path, label: &str) -> anyhow::Result<Vec<u8>> {
+    const MAX_CANDIDATE_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_CANDIDATE_ARTIFACT_BYTES,
+        "{label} {} must be a regular file of at most {MAX_CANDIDATE_ARTIFACT_BYTES} bytes",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read {label} {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 == metadata.len(),
+        "{label} {} changed size while read",
+        path.display()
+    );
+    Ok(bytes)
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -1122,6 +1591,51 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 /// transient `pty list` misread of a healthy seat).
 pub fn reconcile_pass_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
+    let ownership = match HostOwnership::acquire(root, this_host) {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "acquire runtime host ownership (pass skipped): {error}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
+    let admission = match RuntimeMutationAdmission::ordinary(&ownership) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "runtime mutation admission denied (pass skipped): {error}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
+    reconcile_pass_specs_admitted(
+        &admission.permission(),
+        specs,
+        root,
+        this_host,
+        runner,
+        cap,
+        debounce,
+    )
+}
+
+fn reconcile_pass_specs_admitted(
+    permission: &RuntimeMutate<'_>,
+    specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
@@ -1138,7 +1652,9 @@ pub fn reconcile_pass_specs(
             return report;
         }
     };
-    reconcile_pass_specs_with_sessions(specs, &sessions, this_host, runner, cap, debounce)
+    reconcile_pass_specs_with_sessions(
+        permission, specs, root, &sessions, this_host, runner, cap, debounce,
+    )
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
@@ -1146,7 +1662,9 @@ pub fn reconcile_pass_specs(
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
 /// vanished crash on the next tick.
 pub(crate) fn reconcile_pass_specs_with_sessions(
+    permission: &RuntimeMutate<'_>,
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     sessions: &[Session],
     this_host: &str,
     runner: &dyn Runner,
@@ -1158,7 +1676,7 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     debounce.observe(sessions, now);
     let mut plan = crate::reconcile(specs, sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    execute(&plan, runner, cap, &mut report);
+    execute(permission, root, this_host, &plan, runner, cap, &mut report);
     report
 }
 
@@ -1166,12 +1684,14 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
 /// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
 pub fn up_once_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
 ) -> UpReport {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     reconcile_pass_specs(
         specs,
+        root,
         this_host,
         runner,
         &mut FlappingCap::default(),
@@ -1187,9 +1707,19 @@ pub fn up_once_selected_specs(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
-        crate::hooks::verify_installed().map(|_| ())
-    })
+    crate::reconcile::resolve_task(specs, selector, this_host)?;
+    let ownership = HostOwnership::acquire(catalog_root, this_host)
+        .context("acquire runtime host ownership for selected reconcile")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
+    up_once_selected_specs_with_gates(
+        &admission.permission(),
+        catalog_root,
+        specs,
+        selector,
+        this_host,
+        runner,
+        || crate::hooks::verify_installed().map(|_| ()),
+    )
 }
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
@@ -1200,8 +1730,9 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    let _catalog_lock = crate::CatalogLock::shared(catalog_root)
-        .context("acquire shared catalog-authoring lock for selected reconcile")?;
+    let ownership = HostOwnership::acquire(catalog_root, this_host)
+        .context("acquire runtime host ownership for selected reconcile")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
     let found = crate::discovery::discover(catalog_root);
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
     let mut report = UpReport::default();
@@ -1221,7 +1752,8 @@ pub fn up_once_selected(
             .push(format!("verify lifecycle hooks: {error}"));
         return Ok(report);
     }
-    let materialized = crate::materialize::materialize_catalog_against(
+    let materialized = crate::materialize::materialize_catalog_against_admitted(
+        &admission.permission(),
         catalog_root,
         std::slice::from_ref(&owner),
         &found.specs,
@@ -1234,6 +1766,7 @@ pub fn up_once_selected(
         return Ok(report);
     }
     let execution = up_once_selected_specs_with_gates(
+        &admission.permission(),
         catalog_root,
         &found.specs,
         selector,
@@ -1246,6 +1779,7 @@ pub fn up_once_selected(
 }
 
 fn up_once_selected_specs_with_gates<V>(
+    permission: &RuntimeMutate<'_>,
     catalog_root: &Path,
     specs: &[crate::spec::AgentSpec],
     selector: &str,
@@ -1263,7 +1797,15 @@ where
     let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
     gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
-    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    execute(
+        permission,
+        catalog_root,
+        this_host,
+        &plan,
+        runner,
+        &mut FlappingCap::default(),
+        &mut report,
+    );
     Ok(report)
 }
 
@@ -1280,12 +1822,31 @@ pub fn up_loop_specs(
     interval: Duration,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for spec supervisor")?;
     install_signal_handler();
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut reported_flapping: HashSet<String> = HashSet::new();
     loop {
-        let report = reconcile_pass_specs(specs, this_host, runner, &mut cap, &mut debounce);
+        let report = match RuntimeMutationAdmission::ordinary(&ownership) {
+            Ok(admission) => reconcile_pass_specs_admitted(
+                &admission.permission(),
+                specs,
+                root,
+                this_host,
+                runner,
+                &mut cap,
+                &mut debounce,
+            ),
+            Err(error) => UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "runtime mutation admission denied (pass skipped): {error}"
+                )],
+                ..Default::default()
+            },
+        };
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1321,8 +1882,9 @@ pub fn up_loop_specs(
 /// one operation that ends tasks (the Nomad model: stopping the supervisor never does). Idempotent:
 /// tasks already gone are simply not in the live set. Per-kill errors are collected, never fatal.
 pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
-    let _catalog_lock = crate::CatalogLock::shared(root)
-        .context("acquire shared catalog-authoring lock for teardown")?;
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for teardown")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -1333,7 +1895,14 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
             .collect(),
         ..Default::default()
     };
-    teardown_specs(&found.specs, this_host, runner, &mut report)?;
+    teardown_specs(
+        &admission.permission(),
+        root,
+        &found.specs,
+        this_host,
+        runner,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -1343,11 +1912,22 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
 /// stop them. `specs` are the already-resolved [`AgentSpec`]s (from `spec_to_agent_specs`).
 pub fn down_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for spec teardown")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
     let mut report = UpReport::default();
-    teardown_specs(specs, this_host, runner, &mut report)?;
+    teardown_specs(
+        &admission.permission(),
+        root,
+        specs,
+        this_host,
+        runner,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -1355,11 +1935,24 @@ pub fn down_specs(
 /// derived identically to how reconcile spawns them (explicit `task.id`, else `<bus_id>.<task>`), so
 /// the catalog `down` and the spec `down_specs` tear down exactly what `up`/`up_*_specs` launched.
 fn teardown_specs(
+    permission: &RuntimeMutate<'_>,
+    root: &Path,
     specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
     report: &mut UpReport,
 ) -> anyhow::Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize runtime mutation catalog {}", root.display()))?;
+    if permission.catalog().as_path() != canonical_root || permission.host().as_str() != this_host {
+        anyhow::bail!(
+            "runtime mutation permission is for ({}, {}), not ({}, {this_host})",
+            permission.catalog().as_path().display(),
+            permission.host().as_str(),
+            canonical_root.display(),
+        );
+    }
     let live: HashSet<String> = runner
         .list_sessions()?
         .into_iter()
@@ -1421,11 +2014,30 @@ pub fn up_loop(
     interval: Duration,
     on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for supervisor")?;
+    up_loop_with_ownership(ownership, runner, interval, on_report)
+}
+
+/// Enter the resident supervisor while consuming already-retained host authority.
+///
+/// This is the no-gap successor handoff from a finalized cutover.
+pub fn up_loop_with_ownership(
+    ownership: HostOwnership,
+    runner: &dyn Runner,
+    interval: Duration,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    let root = ownership.catalog().to_path_buf();
+    let this_host = ownership.host().to_owned();
     install_signal_handler();
-    up_loop_until(root, this_host, runner, interval, &STOP, on_report)
+    up_loop_until(
+        &ownership, &root, &this_host, runner, interval, &STOP, on_report,
+    )
 }
 
 fn up_loop_until(
+    ownership: &HostOwnership,
     root: &Path,
     this_host: &str,
     runner: &dyn Runner,
@@ -1446,7 +2058,7 @@ fn up_loop_until(
     let mut reported_flapping: HashSet<String> = HashSet::new();
 
     loop {
-        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass(ownership, root, this_host, runner, &mut cap, &mut debounce);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1558,6 +2170,191 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
+    #[test]
+    fn axe_launch_receipt_links_all_four_harnesses_to_the_exact_pty_generation() {
+        use crate::cutover_admission::{
+            HostId, LaunchPromptAuthority, PromptInjectionKind, ProviderFleetEntry,
+        };
+
+        for (provider, harness, kind, seam) in [
+            (
+                "claude-code",
+                "claude",
+                PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                "argv:--append-system-prompt-file",
+            ),
+            (
+                "codex",
+                "codex",
+                PromptInjectionKind::CodexDeveloperInstructions,
+                "argv:-c:developer_instructions",
+            ),
+            (
+                "opencode",
+                "opencode",
+                PromptInjectionKind::OpencodeSystemPromptFile,
+                "env:AGENT_SYSTEM_PROMPT_FILE",
+            ),
+            (
+                "pi-mono",
+                "pi",
+                PromptInjectionKind::PiAppendSystemPromptFile,
+                "argv:--append-system-prompt",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            let prompt_path = temp.path().join("worker-prompt.md");
+            let prompt_bytes = b"exact worker prompt\n";
+            std::fs::write(&prompt_path, prompt_bytes).unwrap();
+            let prompt_sha256 = format!("{:x}", Sha256::digest(prompt_bytes));
+            let profile_path = temp.path().join("profile.json");
+            let profile_bytes = serde_json::to_vec(&serde_json::json!({
+                "personas": {"prompts": {"worker": prompt_path}},
+            }))
+            .unwrap();
+            std::fs::write(&profile_path, &profile_bytes).unwrap();
+            let profile_sha256 = format!("{:x}", Sha256::digest(&profile_bytes));
+            let receipt_path = temp.path().join("receipt.json");
+            let adapter_argv = vec![
+                "/nix/store/axe/bin/axe".to_owned(),
+                "agent".to_owned(),
+                "launch".to_owned(),
+                "--harness".to_owned(),
+                harness.to_owned(),
+                "--persona".to_owned(),
+                "worker".to_owned(),
+                "--model".to_owned(),
+                "model-a".to_owned(),
+                "--effort".to_owned(),
+                "high".to_owned(),
+                "--mode".to_owned(),
+                "managed-unattended".to_owned(),
+                "--boot".to_owned(),
+                "managed-v1".to_owned(),
+            ];
+            let mut entry = ProviderFleetEntry {
+                identity: "worker-a".to_owned(),
+                host: HostId::parse("testhost").unwrap(),
+                provider: provider.to_owned(),
+                account: "account-a".to_owned(),
+                persona: "worker".to_owned(),
+                workspace: workspace.clone(),
+                prompt: LaunchPromptAuthority {
+                    runtime_profile_path: profile_path.clone(),
+                    runtime_profile_sha256: profile_sha256.clone(),
+                    persona_prompt_path: prompt_path.clone(),
+                    persona_prompt_sha256: prompt_sha256.clone(),
+                    launch_receipt_path: receipt_path.clone(),
+                    launch_receipt_sha256: String::new(),
+                    injection_kind: kind,
+                },
+                argv_sha256: crate::cutover_admission::candidate_argv_sha256(&adapter_argv),
+                canonical_argv: adapter_argv,
+                profile_sha256: profile_sha256.clone(),
+                harness: harness.to_owned(),
+                model: "model-a".to_owned(),
+                effort: "high".to_owned(),
+                mode: "managed-unattended".to_owned(),
+                boot_contract: "managed-v1".to_owned(),
+                launch_generation_id: "axe-generation-a".to_owned(),
+                runtime_generation_id: "pty-generation-a".to_owned(),
+                trajectory_sha256: String::new(),
+            };
+            entry.trajectory_sha256 =
+                crate::cutover_admission::provider_trajectory_sha256(&entry).unwrap();
+            let projected_argv = if kind == PromptInjectionKind::CodexDeveloperInstructions {
+                vec![
+                    "codex".to_owned(),
+                    "-c".to_owned(),
+                    format!("developer_instructions=<prompt-sha256:{prompt_sha256}>"),
+                ]
+            } else {
+                vec![
+                    harness.to_owned(),
+                    "--model".to_owned(),
+                    "model-a".to_owned(),
+                ]
+            };
+            let provider_argv_sha256 =
+                provider_argv_sha256(&projected_argv, kind, &prompt_sha256, prompt_bytes).unwrap();
+            let receipt = AxeLaunchReceipt {
+                schema: "axe.agent-launch-receipt.v1".to_owned(),
+                phase: "prepared".to_owned(),
+                runtime_id: "testhost.worker-a.agent".to_owned(),
+                generation_id: entry.launch_generation_id.clone(),
+                identity: "testhost.worker-a".to_owned(),
+                workspace: workspace.clone(),
+                provider: provider.to_owned(),
+                account: "account-a".to_owned(),
+                persona: "worker".to_owned(),
+                harness: harness.to_owned(),
+                model: "model-a".to_owned(),
+                effort: "high".to_owned(),
+                mode: "managed-unattended".to_owned(),
+                boot_contract: "managed-v1".to_owned(),
+                runtime_profile: LaunchReceiptPathDigest {
+                    path: profile_path,
+                    sha256: profile_sha256,
+                },
+                persona_prompt: LaunchReceiptPathDigest {
+                    path: prompt_path,
+                    sha256: prompt_sha256.clone(),
+                },
+                injection: LaunchReceiptInjection {
+                    kind,
+                    seam: seam.to_owned(),
+                    prompt_sha256,
+                },
+                canonical_provider_argv: projected_argv,
+                provider_argv_sha256,
+                trajectory_sha256: entry.trajectory_sha256.clone(),
+            };
+            let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+            std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+            entry.prompt.launch_receipt_sha256 = format!("{:x}", Sha256::digest(&receipt_bytes));
+            let mut tags = BTreeMap::from([
+                (
+                    "agent.launch.receipt.schema".to_owned(),
+                    "axe.agent-launch-receipt.v1".to_owned(),
+                ),
+                (
+                    "agent.launch.receipt.path".to_owned(),
+                    receipt_path.display().to_string(),
+                ),
+                (
+                    "agent.launch.receipt.sha256".to_owned(),
+                    entry.prompt.launch_receipt_sha256.clone(),
+                ),
+                (
+                    "agent.generation.id".to_owned(),
+                    entry.launch_generation_id.clone(),
+                ),
+            ]);
+            observe_prompt_authority(
+                &entry,
+                &HostId::parse("testhost").unwrap(),
+                "testhost.worker-a.agent",
+                &tags,
+            )
+            .unwrap();
+            tags.insert(
+                "agent.generation.id".to_owned(),
+                "foreign-generation".to_owned(),
+            );
+            assert!(
+                observe_prompt_authority(
+                    &entry,
+                    &HostId::parse("testhost").unwrap(),
+                    "testhost.worker-a.agent",
+                    &tags,
+                )
+                .is_err()
+            );
+        }
+    }
+
     fn target(id: &str, cmd: &str) -> TaskTarget {
         TaskTarget {
             kind: TaskKind::Pty,
@@ -1598,6 +2395,9 @@ mod tests {
 
     #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
+        let catalog = tempfile::tempdir().unwrap();
+        let ownership = HostOwnership::acquire(catalog.path(), "test").unwrap();
+        let admission = RuntimeMutationAdmission::ordinary(&ownership).unwrap();
         let spec = AgentSpec {
             identity: "codex".into(),
             host: None,
@@ -1622,13 +2422,14 @@ mod tests {
                 keep: false,
                 lifecycle: TaskLifecycle::Service,
             }],
-            path: "/tmp/spec.kdl".into(),
+            path: catalog.path().join("spec.kdl"),
         };
         let runner = GateRunner {
             list_calls: Cell::new(0),
         };
         let report = up_once_selected_specs_with_gates(
-            Path::new("/tmp"),
+            &admission.permission(),
+            catalog.path(),
             &[spec],
             "test.codex.agent",
             "test",
@@ -1649,6 +2450,7 @@ mod tests {
         let catalog = tempfile::tempdir().unwrap();
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
+        let ownership = HostOwnership::acquire(catalog.path(), "test-host").unwrap();
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -1656,6 +2458,7 @@ mod tests {
                 stop.store(true, Ordering::SeqCst);
             });
             up_loop_until(
+                &ownership,
                 catalog.path(),
                 "test-host",
                 &GateRunner {
@@ -1837,12 +2640,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || Ok(()),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || Ok(()));
 
         assert_eq!(
             plan.launch
@@ -1870,12 +2668,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || panic!("an already-live Codex agent must not enter the hook gate"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            panic!("an already-live Codex agent must not enter the hook gate")
+        });
 
         assert_eq!(plan.adopt, [&spec]);
         assert_eq!(plan.launch.len(), 1);
@@ -1905,12 +2700,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || anyhow::bail!("stale receipt"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            anyhow::bail!("stale receipt")
+        });
 
         assert_eq!(
             plan.launch

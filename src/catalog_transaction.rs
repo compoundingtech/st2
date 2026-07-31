@@ -15,7 +15,38 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::catalog_lock::{APPLY_MARKER, CONTROL_DIR, CatalogLock};
-use crate::cutover_admission::{CanonicalCatalog, admit_catalog_publish};
+use crate::cutover_admission::{
+    CanonicalCatalog, CatalogPublish, TransactionCatalog, admit_catalog_publish,
+};
+
+mod authority_seal {
+    pub trait Sealed {}
+}
+
+/// Retained, non-forgeable authority for a declaration-plane mutation.
+///
+/// This trait is crate-private and sealed in this writer module. Ordinary callers can only obtain
+/// it through `admit_catalog_publish`; the cutover transaction can later add its own opaque token
+/// here without adding a boolean/force bypass or reacquiring the catalog lock.
+pub(crate) trait RetainedCatalogMutationAuthority: authority_seal::Sealed {
+    fn catalog(&self) -> &CanonicalCatalog;
+}
+
+impl authority_seal::Sealed for CatalogPublish<'_> {}
+
+impl RetainedCatalogMutationAuthority for CatalogPublish<'_> {
+    fn catalog(&self) -> &CanonicalCatalog {
+        self.catalog()
+    }
+}
+
+impl authority_seal::Sealed for TransactionCatalog<'_> {}
+
+impl RetainedCatalogMutationAuthority for TransactionCatalog<'_> {
+    fn catalog(&self) -> &CanonicalCatalog {
+        self.catalog()
+    }
+}
 
 const SNAPSHOT_SCHEMA: &str = "st2.catalog-snapshot.v1";
 const APPLY_SCHEMA: &str = "st2.catalog-apply.v1";
@@ -77,6 +108,11 @@ pub enum ApplyMode {
         expect_sha256: String,
     },
     Resume,
+}
+
+pub(crate) struct PreparedCatalogApply {
+    catalog: CanonicalCatalog,
+    prepared_input: Option<(PathBuf, String, DeclarationProjection)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +254,18 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
 
 /// Apply a complete prepared declaration plane under one exclusive transaction.
 pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
+    let prepared = prepare_apply(request)?;
+    let catalog = prepared.catalog.as_path();
+    let lock = CatalogLock::exclusive_for_catalog_apply(catalog)?;
+    let authority_catalog = prepared.catalog.clone();
+    let publication = admit_catalog_publish(&authority_catalog, &lock)?;
+    apply_admitted(prepared, &publication)
+}
+
+/// Capture and validate caller-owned prepared bytes before acquiring catalog mutation authority.
+///
+/// This step never creates or changes a path in the live catalog.
+pub(crate) fn prepare_apply(request: ApplyRequest) -> Result<PreparedCatalogApply> {
     let catalog = canonical_real_dir(&request.catalog, "catalog")?;
     let canonical_catalog = CanonicalCatalog::open(&catalog)?;
     let prepared_input = match request.mode {
@@ -239,9 +287,25 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         }
         ApplyMode::Resume => None,
     };
+    Ok(PreparedCatalogApply {
+        catalog: canonical_catalog,
+        prepared_input,
+    })
+}
 
-    let lock = CatalogLock::exclusive_for_catalog_apply(&catalog)?;
-    let _publication = admit_catalog_publish(&canonical_catalog, &lock)?;
+/// Apply a previously captured declaration plane while retaining exact catalog authority.
+pub(crate) fn apply_admitted(
+    prepared: PreparedCatalogApply,
+    authority: &impl RetainedCatalogMutationAuthority,
+) -> Result<ApplyResult> {
+    anyhow::ensure!(
+        authority.catalog() == &prepared.catalog,
+        "catalog mutation authority is bound to {}, not {}",
+        authority.catalog().as_path().display(),
+        prepared.catalog.as_path().display()
+    );
+    let catalog = prepared.catalog.as_path().to_path_buf();
+    let prepared_input = prepared.prepared_input;
     let marker_path = catalog.join(CONTROL_DIR).join(APPLY_MARKER);
     let existing_marker = read_marker_optional(&marker_path)?;
     let recovered = existing_marker.is_some();
@@ -1788,5 +1852,31 @@ mod tests {
             hash_projection(&files, &no_facts),
             hash_projection(&files, &facts)
         );
+    }
+
+    #[test]
+    fn admitted_apply_rejects_authority_for_another_catalog_before_marker_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let authorized_catalog = temp.path().join("authorized");
+        let requested_catalog = temp.path().join("requested");
+        fs::create_dir(&authorized_catalog).unwrap();
+        fs::create_dir(&requested_catalog).unwrap();
+
+        let prepared = prepare_apply(ApplyRequest {
+            catalog: requested_catalog.clone(),
+            mode: ApplyMode::Resume,
+        })
+        .unwrap();
+        let canonical = CanonicalCatalog::open(&authorized_catalog).unwrap();
+        let lock = CatalogLock::exclusive(&authorized_catalog).unwrap();
+        let authority = admit_catalog_publish(&canonical, &lock).unwrap();
+        let error = apply_admitted(prepared, &authority).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("catalog mutation authority is bound to")
+        );
+        assert!(!requested_catalog.join(CONTROL_DIR).exists());
     }
 }

@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use st2::{
-    HostLock, Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message,
-    up_loop, up_once,
+    Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message, up_loop,
+    up_once,
 };
 
 #[derive(Parser)]
@@ -126,6 +126,9 @@ enum Command {
     /// Exact, crash-recoverable lifecycle transactions for terminal-free exec tasks.
     #[command(subcommand)]
     Exec(ExecCmd),
+    /// Read-only admission state for catalog cutover coordination.
+    #[command(subcommand)]
+    Cutover(CutoverCmd),
     /// Canonical declaration snapshots and crash-recoverable whole-catalog application.
     #[command(subcommand)]
     Catalog(CatalogCmd),
@@ -477,6 +480,32 @@ enum ServiceCmd {
 }
 
 #[derive(Subcommand)]
+enum CutoverCmd {
+    /// Run or resume one exact durable cutover request, then retain host ownership as the successor
+    /// supervisor after successful finalization.
+    Run {
+        /// Canonical bounded st2.cutover-request.v1 file.
+        #[arg(long, value_name = "FILE")]
+        request: PathBuf,
+        /// Caller-held SHA-256 of the exact request bytes.
+        #[arg(long, value_name = "HEX")]
+        expect_request_sha256: String,
+    },
+    /// Report whether ordinary runtime mutation is currently admitted.
+    ///
+    /// Exits non-zero while a durable cutover gate is active or malformed, making this suitable
+    /// for systemd ExecStartPre and other cooperative writers.
+    Status {
+        /// Host requesting runtime-mutation admission. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the stable machine-readable admission record.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum HooksCmd {
     /// Atomically publish this binary's immutable hook set and select it with a receipt.
     Install {
@@ -718,6 +747,7 @@ fn main() -> Result<()> {
             interval,
         } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Cutover(cmd) => cutover_cmd(cmd, catalog_path.as_deref()),
         Command::Agent(AgentCmd::Publish {
             spec,
             bundle,
@@ -1058,6 +1088,12 @@ fn hooks_cmd(command: HooksCmd) -> Result<()> {
             replace,
             allow_downgrade,
         } => {
+            let catalog = catalog_root_for_env()?;
+            // Hook publication may bootstrap before the default catalog exists. In that case no
+            // durable gate can exist yet; an existing selected catalog must pass admission.
+            if catalog.exists() {
+                require_runtime_mutation_admission(&catalog, None)?;
+            }
             let dir = st2::hooks::install(replace || allow_downgrade)?;
             let root = st2::hooks::hooks_root()?;
             println!(
@@ -1097,8 +1133,8 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
             .or_else(|| spec.host.clone())
             .unwrap_or_else(detect_host);
         let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &spec_root);
-        let runner = SystemRunner::new(spec_root, exec_state_dir(&this_host));
-        let report = st2::down_specs(&specs, &this_host, &runner)?;
+        let runner = SystemRunner::new(spec_root.clone(), exec_state_dir(&this_host));
+        let report = st2::down_specs(&specs, &spec_root, &this_host, &runner)?;
         println!(
             "teardown of spec {} on host '{this_host}':",
             spec_file.display()
@@ -1296,6 +1332,200 @@ fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
         .env("PTY_ROOT", st2::catalog::pty_root(root));
 }
 
+fn mutation_admission(
+    root: &Path,
+    host: Option<String>,
+) -> Result<(
+    st2::cutover_admission::CanonicalCatalog,
+    st2::cutover_admission::HostId,
+    st2::cutover_admission::MutationAdmission,
+)> {
+    let catalog = st2::cutover_admission::CanonicalCatalog::open(root)?;
+    let host = st2::cutover_admission::HostId::parse(host.unwrap_or_else(detect_host))?;
+    let admission = st2::cutover_admission::probe_mutation_admission(&catalog, Some(&host))?;
+    Ok((catalog, host, admission))
+}
+
+fn require_runtime_mutation_admission(root: &Path, host: Option<String>) -> Result<()> {
+    let (_, _, admission) = mutation_admission(root, host)?;
+    match admission {
+        st2::cutover_admission::MutationAdmission::Available => Ok(()),
+        st2::cutover_admission::MutationAdmission::Busy(busy) => {
+            anyhow::bail!(
+                "runtime mutation refused: {}",
+                serde_json::to_string(&busy)?
+            )
+        }
+    }
+}
+
+fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<()> {
+    match command {
+        CutoverCmd::Run {
+            request,
+            expect_request_sha256,
+        } => {
+            let loaded =
+                st2::cutover_driver::LoadedCutoverRequest::load(&request, &expect_request_sha256)?;
+            let catalog = loaded.request().canonical_catalog.clone();
+            let host = loaded.request().host.as_str().to_owned();
+            if let Some(explicit) = explicit_catalog {
+                let explicit = absolute_catalog_path(explicit)?;
+                if explicit != catalog {
+                    anyhow::bail!(
+                        "cutover request catalog {} conflicts with explicit --catalog {}",
+                        catalog.display(),
+                        explicit.display()
+                    );
+                }
+            }
+            // SAFETY: CLI dispatch remains single-threaded here. The request is the sole cutover
+            // authority; inherited ambient selection must not leak into a provider or helper.
+            unsafe {
+                std::env::set_var("CATALOG", &catalog);
+                std::env::set_var("ST_ROOT", &catalog);
+                std::env::set_var("PTY_ROOT", st2::catalog::pty_root(&catalog));
+            }
+            let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+            match loaded.run(&runner)? {
+                st2::cutover_driver::DriverRunOutcome::Completed {
+                    finalized,
+                    provider_fleet_proof,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "completed",
+                            "catalog": catalog,
+                            "host": host,
+                            "historyPath": finalized.finalized.history_path,
+                            "gateId": finalized.finalized.marker.gate_id,
+                            "requestSha256": finalized.finalized.marker.request_sha256,
+                            "providerFleetProof": provider_fleet_proof,
+                        }))?
+                    );
+                    eprintln!(
+                        "st2: cutover finalized; supervising {} on host '{}' with retained ownership",
+                        catalog.display(),
+                        host
+                    );
+                    st2::run::up_loop_with_ownership(
+                        finalized.ownership,
+                        &runner,
+                        Duration::from_secs(30),
+                        |report| {
+                            if report.is_noteworthy() {
+                                print_report(report);
+                            }
+                        },
+                    )
+                }
+                st2::cutover_driver::DriverRunOutcome::Finalized(finalized) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "finalized",
+                            "catalog": catalog,
+                            "host": host,
+                            "historyPath": finalized.history_path,
+                            "gateId": finalized.marker.gate_id,
+                            "requestSha256": finalized.marker.request_sha256,
+                        }))?
+                    );
+                    Ok(())
+                }
+                st2::cutover_driver::DriverRunOutcome::Fenced(fence) => {
+                    let detail = match fence {
+                        st2::cutover_driver::DriverFence::Active(busy) => serde_json::json!({
+                            "kind": "active",
+                            "busy": busy,
+                        }),
+                        st2::cutover_driver::DriverFence::Pending(pending) => serde_json::json!({
+                            "kind": "pending",
+                            "catalog": pending.catalog.as_path(),
+                            "host": pending.host,
+                            "gateId": pending.gate_id,
+                            "requestSha256": pending.request_sha256,
+                            "activePath": pending.active_path,
+                        }),
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "fenced",
+                            "detail": detail,
+                        }))?
+                    );
+                    anyhow::bail!("cutover is fenced by another active authority")
+                }
+                st2::cutover_driver::DriverRunOutcome::NeedsCheckpoint {
+                    action_index,
+                    kind,
+                    input_sha256,
+                    receipt,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "needs-checkpoint",
+                            "actionIndex": action_index,
+                            "kind": kind,
+                            "inputSha256": input_sha256,
+                            "receipt": receipt,
+                        }))?
+                    );
+                    anyhow::bail!(
+                        "cutover requires external checkpoint evidence at action {action_index}"
+                    )
+                }
+            }
+        }
+        CutoverCmd::Status { host, json } => {
+            let root = catalog_root_for_env()?;
+            let (catalog, host, admission) = mutation_admission(&root, host)?;
+            match admission {
+                st2::cutover_admission::MutationAdmission::Available => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "schema": "st2.mutation-available.v1",
+                                "catalog": catalog.as_path(),
+                                "requestedHost": host,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "available\tcatalog={}\thost={}",
+                            catalog.as_path().display(),
+                            host.as_str()
+                        );
+                    }
+                    Ok(())
+                }
+                st2::cutover_admission::MutationAdmission::Busy(busy) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&busy)?);
+                    } else {
+                        println!(
+                            "busy\treason={:?}\tcatalog={}\thost={}",
+                            busy.reason,
+                            busy.catalog.display(),
+                            host.as_str()
+                        );
+                        println!("active-marker\t{}", busy.active_marker.display());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 /// `st2 pty [<pty-args>…]` — a thin pass-through to `pty` with the catalog's bus env pre-set, so
 /// the maintainer never has to `eval "$(st2 env …)"` first. **Replaces** this process with `pty` (via exec)
 /// so the interactive UI keeps the tty, signals, and exit code.
@@ -1303,6 +1533,7 @@ fn pty_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    require_runtime_mutation_admission(&root, None)?;
     let mut cmd = std::process::Command::new("pty");
     cmd.args(args);
     with_bus_env(&mut cmd, &root);
@@ -1317,6 +1548,7 @@ fn shell_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    require_runtime_mutation_admission(&root, None)?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let mut cmd = std::process::Command::new(&shell);
     cmd.args(args);
@@ -2018,7 +2250,10 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
             st2::service::install(&catalog, host, pty_root, memory_max_mb)
         }
         ServiceCmd::Status => st2::service::status(),
-        ServiceCmd::Uninstall => st2::service::uninstall(),
+        ServiceCmd::Uninstall => {
+            let catalog = catalog_root_for_env()?;
+            st2::service::uninstall(&catalog)
+        }
     }
 }
 
@@ -2139,17 +2374,8 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
-    // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
-    let lock = HostLock::new(&root, &this_host);
-    if let Some(owner) = lock.live_owner() {
-        eprintln!("st2: {}", lock.busy_warning(owner));
-        std::process::exit(1);
-    }
-    let stale = lock.has_stale_lock();
-    lock.acquire().context("acquiring host lock")?;
-
     if once {
-        let report = st2::up_once_specs(&specs, &this_host, &runner);
+        let report = st2::up_once_specs(&specs, &root, &this_host, &runner);
         println!(
             "booted team from spec {} on host '{this_host}' (once):",
             spec_file.display()
@@ -2161,15 +2387,12 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         return Ok(());
     }
 
-    if stale {
-        eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
-    }
     eprintln!(
         "st2: supervising spec {} on host '{this_host}' ({} agents; reconcile every {interval}s; Ctrl-C to stop)",
         spec_file.display(),
         specs.len()
     );
-    let result = st2::up_loop_specs(
+    st2::up_loop_specs(
         &specs,
         &root,
         &this_host,
@@ -2180,9 +2403,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
                 print_report(report);
             }
         },
-    );
-    lock.release();
-    result
+    )
 }
 
 fn up(
@@ -2210,19 +2431,10 @@ fn up(
     let this_host = host.unwrap_or_else(detect_host);
     // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    // Every workspace/runtime mutation shares one persistent kernel lock with
-    // the resident supervisor and exact-retirement transactions.
-    let lock = HostLock::new(&catalog_root, &this_host);
-    if let Some(owner) = lock.live_owner() {
-        eprintln!("st2: {}", lock.busy_warning(owner));
-        std::process::exit(1);
-    }
-    let stale = lock.has_stale_lock();
-    lock.acquire().context("acquiring host lock")?;
-
     if materialize_only {
-        let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
-            .context("acquire shared catalog-authoring lock for materialization")?;
+        let ownership = st2::host_lock::HostOwnership::acquire(&catalog_root, &this_host)
+            .context("acquire runtime host ownership for materialization")?;
+        let admission = st2::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership)?;
         let mut found = discover(&catalog_root);
         let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
@@ -2249,7 +2461,8 @@ fn up(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
         }
-        let report = st2::materialize::materialize_catalog_against(
+        let report = st2::materialize::materialize_catalog_against_admitted(
+            &admission.permission(),
             &catalog_root,
             &found.specs,
             &ownership_specs,
@@ -2298,15 +2511,11 @@ fn up(
         return Ok(());
     }
 
-    if stale {
-        eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
-    }
-
     eprintln!(
         "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",
         root.display()
     );
-    let result = up_loop(
+    up_loop(
         root,
         &this_host,
         &runner,
@@ -2316,9 +2525,7 @@ fn up(
                 print_report(report);
             }
         },
-    );
-    lock.release();
-    result
+    )
 }
 
 fn print_report(report: &UpReport) {

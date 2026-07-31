@@ -35,6 +35,21 @@ use crate::run::resolve_task_cwd;
 
 pub(crate) const EXEC_GENERATION_SCHEMA_V1: &str = "st2.exec-generation.v1";
 pub(crate) const EXEC_GENERATION_SCHEMA_V2: &str = "st2.exec-generation.v2";
+pub(crate) const EXEC_GENERATION_SCHEMA_V3: &str = "st2.exec-generation.v3";
+
+/// Exact transaction authority carried by a Ding generation created during cutover.
+///
+/// A process without this binding is never adopted by the cutover reconciler, even when its
+/// runtime id happens to match. This makes a crash after backend publication but before the
+/// cutover journal update recoverable without risking a duplicate spawn.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecCutoverBinding {
+    pub gate_id: String,
+    pub action_index: usize,
+    pub ding_generation_id: String,
+    pub launch_sha256: String,
+}
 
 /// Exact Linux cgroup-v2 capability published with a generation. Path names
 /// alone are never authority: retirement must reopen the path without
@@ -64,6 +79,8 @@ pub struct ExecGeneration {
     pub generation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isolation: Option<ExecIsolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cutover: Option<ExecCutoverBinding>,
 }
 
 /// A generation observation is explicitly indeterminate when legacy evidence cannot safely identify
@@ -116,6 +133,45 @@ impl ExecBackend {
 
     /// Spawn `target` as a terminal-free, detached process and record its pid.
     pub fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
+        self.spawn_inner(target, spec_dir, None)
+    }
+
+    /// Spawn one Ding with immutable cutover authority embedded in its durable generation record.
+    ///
+    /// This is crate-private so ordinary reconciliation cannot forge a cutover generation.
+    pub(crate) fn spawn_cutover_ding(
+        &self,
+        target: &TaskTarget,
+        spec_dir: &Path,
+        binding: ExecCutoverBinding,
+    ) -> anyhow::Result<ExecGeneration> {
+        anyhow::ensure!(
+            crate::isolate::mode() == crate::isolate::Isolation::Scope,
+            "cutover Ding reconciliation requires exact systemd scope authority"
+        );
+        if let Some(generation) =
+            self.recover_cutover_ding_generation(target, spec_dir, &binding)?
+        {
+            return Ok(generation);
+        }
+        self.spawn_inner(target, spec_dir, Some(binding))?;
+        match self.observe_generation(&target.pty_id)? {
+            ExecGenerationObservation::Known { generation, .. } => Ok(generation),
+            ExecGenerationObservation::Indeterminate { reason, .. } => {
+                anyhow::bail!(
+                    "new cutover Ding generation '{}' is indeterminate: {reason}",
+                    target.pty_id
+                )
+            }
+        }
+    }
+
+    fn spawn_inner(
+        &self,
+        target: &TaskTarget,
+        spec_dir: &Path,
+        cutover: Option<ExecCutoverBinding>,
+    ) -> anyhow::Result<()> {
         fs::create_dir_all(&self.state_dir)?;
         let cwd = resolve_task_cwd(target, spec_dir, &self.catalog_root);
         let log_file = self.log_path(&target.pty_id);
@@ -131,7 +187,10 @@ impl ExecBackend {
         // scope (own cgroup, sibling of the transport unit) so a transport/supervisor cgroup-cascade
         // kill cannot take it; elsewhere a plain pass-through detached by the `setsid` below. Env, cwd,
         // and stdio set here reach the task in both modes.
-        let unit = crate::isolate::scope_unit(&target.pty_id);
+        let unit = cutover
+            .as_ref()
+            .map(|binding| cutover_scope_unit(&target.pty_id, binding))
+            .unwrap_or_else(|| crate::isolate::scope_unit(&target.pty_id));
         let (program, args): (OsString, Vec<OsString>) = match &target.launch {
             TaskLaunch::Shell(command) => (
                 OsString::from("sh"),
@@ -234,11 +293,14 @@ impl ExecBackend {
                 None
             }
         };
-        let schema = if isolation.is_some() {
+        let schema = if cutover.is_some() {
+            EXEC_GENERATION_SCHEMA_V3
+        } else if isolation.is_some() {
             EXEC_GENERATION_SCHEMA_V2
         } else {
             EXEC_GENERATION_SCHEMA_V1
         };
+        let is_cutover = cutover.is_some();
         let generation = ExecGeneration {
             schema: schema.to_string(),
             pid,
@@ -248,12 +310,33 @@ impl ExecBackend {
                 &created_at,
                 start_time_ticks,
                 isolation.as_ref(),
+                cutover.as_ref(),
             ),
             created_at,
             start_time_ticks,
             isolation,
+            cutover,
         };
-        if let Err(error) = self.publish_generation(&target.pty_id, &generation) {
+        #[cfg(test)]
+        {
+            if is_cutover
+                && std::env::var("ST2_TEST_CUTOVER_DING_CRASH_AFTER_SCOPE").as_deref()
+                    == Ok(target.pty_id.as_str())
+            {
+                // Test-only hard-crash boundary: the deterministic scope is live, but no v3 record
+                // exists yet. Deliberately do not terminate it; the next invocation must recover it.
+                drop(child);
+                anyhow::bail!(
+                    "injected cutover Ding crash after deterministic scope spawn before v3 record"
+                );
+            }
+        }
+        let publication = if is_cutover {
+            self.publish_generation_create_only(&target.pty_id, &generation)
+        } else {
+            self.publish_generation(&target.pty_id, &generation)
+        };
+        if let Err(error) = publication {
             // Publication is the ownership boundary. If it fails, tear down the otherwise-untracked
             // process group before returning the error.
             terminate_unpublished(pid);
@@ -507,10 +590,11 @@ impl ExecBackend {
         let generation = ExecGeneration {
             schema: EXEC_GENERATION_SCHEMA_V1.to_string(),
             pid: pid as u32,
-            generation_id: generation_id(id, pid as u32, &created_at, start_time_ticks, None),
+            generation_id: generation_id(id, pid as u32, &created_at, start_time_ticks, None, None),
             created_at,
             start_time_ticks,
             isolation: None,
+            cutover: None,
         };
         // Observation is read-only. Existing legacy files remain unchanged until normal lifecycle
         // replacement; only future spawns publish strict JSON.
@@ -539,6 +623,269 @@ impl ExecBackend {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+
+    fn publish_generation_create_only(
+        &self,
+        id: &str,
+        generation: &ExecGeneration,
+    ) -> anyhow::Result<()> {
+        let path = self.pid_path(id);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("exec generation path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let mut bytes = serde_json::to_vec(generation)?;
+        bytes.push(b'\n');
+        let mut temp = tempfile::Builder::new()
+            .prefix(".exec-generation.")
+            .tempfile_in(parent)?;
+        temp.write_all(&bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist_noclobber(&path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("create exact cutover exec generation {}", path.display()))?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recover_cutover_ding_generation(
+        &self,
+        target: &TaskTarget,
+        spec_dir: &Path,
+        binding: &ExecCutoverBinding,
+    ) -> anyhow::Result<Option<ExecGeneration>> {
+        let unit = cutover_scope_unit(&target.pty_id, binding);
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                &unit,
+                "--property=ControlGroup",
+                "--value",
+            ])
+            .output()
+            .with_context(|| format!("query deterministic cutover scope {unit}"))?;
+        let cgroup_path = String::from_utf8(output.stdout)?.trim().to_owned();
+        if !output.status.success() || cgroup_path.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            cgroup_path.starts_with('/') && !cgroup_path.contains("/../"),
+            "deterministic cutover scope returned unsafe cgroup path"
+        );
+        let cgroup = Path::new("/sys/fs/cgroup").join(cgroup_path.trim_start_matches('/'));
+        let metadata = fs::symlink_metadata(&cgroup)
+            .with_context(|| format!("inspect deterministic cgroup {}", cgroup.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "deterministic cutover cgroup is not one real directory"
+        );
+        // `systemd-run --scope` can expose its launcher and the workload briefly before the
+        // launcher execs away. Use the same bounded convergence window as initial scope capture;
+        // a scope that remains empty or multi-member still fails closed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let members = loop {
+            let members = fs::read_to_string(cgroup.join("cgroup.procs"))?
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::parse::<u32>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if members.len() == 1 || std::time::Instant::now() >= deadline {
+                break members;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        anyhow::ensure!(
+            members.len() == 1,
+            "deterministic cutover scope must converge to exactly one process, found {}",
+            members.len()
+        );
+        let pid = members[0];
+        anyhow::ensure!(
+            fs::metadata(format!("/proc/{pid}"))?.uid() == unsafe { libc::geteuid() },
+            "deterministic cutover Ding uid differs from st2"
+        );
+        let expected_argv = match &target.launch {
+            TaskLaunch::Argv(argv) => argv
+                .iter()
+                .map(|arg| crate::expand::expand_catalog(arg, &self.catalog_root))
+                .collect::<Vec<_>>(),
+            TaskLaunch::Shell(_) => {
+                anyhow::bail!("cutover Ding recovery requires canonical direct argv")
+            }
+        };
+        let observed_argv = process_argv(pid as i32)?;
+        anyhow::ensure!(
+            !observed_argv.is_empty()
+                && observed_argv.len() == expected_argv.len()
+                && observed_argv[1..] == expected_argv[1..],
+            "deterministic cutover Ding argv differs from the precommitted launch"
+        );
+        let expected_exe = resolve_executable(
+            expected_argv
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("precommitted Ding argv is empty"))?,
+        )?;
+        anyhow::ensure!(
+            fs::read_link(format!("/proc/{pid}/exe"))?.canonicalize()? == expected_exe,
+            "deterministic cutover Ding executable is not this exact st2 binary"
+        );
+        let expected_cwd = resolve_task_cwd(target, spec_dir, &self.catalog_root).canonicalize()?;
+        anyhow::ensure!(
+            fs::read_link(format!("/proc/{pid}/cwd"))?.canonicalize()? == expected_cwd,
+            "deterministic cutover Ding cwd differs from the precommitted launch"
+        );
+        let observed_env = process_env(pid as i32)?;
+        let mut expected_env = target
+            .env
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    if key == "PTY_ROOT" {
+                        crate::run::effective_pty_root(&self.catalog_root)
+                            .display()
+                            .to_string()
+                    } else {
+                        crate::expand::expand_catalog(value, &self.catalog_root)
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        expected_env.insert(
+            "CATALOG".to_owned(),
+            self.catalog_root.display().to_string(),
+        );
+        expected_env.insert(
+            "ST_ROOT".to_owned(),
+            self.catalog_root.display().to_string(),
+        );
+        expected_env.insert(
+            "PTY_ROOT".to_owned(),
+            crate::run::effective_pty_root(&self.catalog_root)
+                .display()
+                .to_string(),
+        );
+        if let Ok(path) = crate::hooks::hooks_root() {
+            expected_env.insert("ST_HOOKS".to_owned(), path.display().to_string());
+        }
+        anyhow::ensure!(
+            environment_contains(&observed_env, &expected_env),
+            "deterministic cutover Ding environment differs from the precommitted launch"
+        );
+        let start_time_ticks = process_start_time_ticks(pid as i32)?;
+        let created_at = rfc3339_utc(SystemTime::now())?;
+        let isolation = capture_scope_isolation_once(pid, &unit)?;
+        let generation = ExecGeneration {
+            schema: EXEC_GENERATION_SCHEMA_V3.to_owned(),
+            pid,
+            created_at: created_at.clone(),
+            start_time_ticks,
+            generation_id: generation_id(
+                &target.pty_id,
+                pid,
+                &created_at,
+                start_time_ticks,
+                Some(&isolation),
+                Some(binding),
+            ),
+            isolation: Some(isolation),
+            cutover: Some(binding.clone()),
+        };
+        self.publish_generation_create_only(&target.pty_id, &generation)?;
+        Ok(Some(generation))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recover_cutover_ding_generation(
+        &self,
+        _target: &TaskTarget,
+        _spec_dir: &Path,
+        _binding: &ExecCutoverBinding,
+    ) -> anyhow::Result<Option<ExecGeneration>> {
+        anyhow::bail!("cutover Ding reconciliation requires Linux systemd scope authority")
+    }
+}
+
+pub(crate) fn cutover_scope_unit(runtime_id: &str, binding: &ExecCutoverBinding) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"st2.cutover-ding-scope.v1\0");
+    for field in [
+        runtime_id.as_bytes(),
+        binding.gate_id.as_bytes(),
+        binding.action_index.to_string().as_bytes(),
+        binding.ding_generation_id.as_bytes(),
+        binding.launch_sha256.as_bytes(),
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    format!("st2-cutover-ding-{:x}.scope", hash.finalize())
+}
+
+#[cfg(target_os = "linux")]
+fn process_argv(pid: i32) -> anyhow::Result<Vec<String>> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline"))?;
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= 1024 * 1024 && bytes.last() == Some(&0),
+        "cutover Ding argv is empty, unterminated, or oversized"
+    );
+    bytes[..bytes.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|argument| String::from_utf8(argument.to_vec()).map_err(anyhow::Error::from))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_env(pid: i32) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let bytes = fs::read(format!("/proc/{pid}/environ"))?;
+    anyhow::ensure!(
+        bytes.len() <= 1024 * 1024 && (bytes.is_empty() || bytes.last() == Some(&0)),
+        "cutover Ding environment is unterminated or oversized"
+    );
+    let mut environment = std::collections::BTreeMap::new();
+    for item in bytes
+        .split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+    {
+        let item = String::from_utf8(item.to_vec())?;
+        let (key, value) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("cutover Ding environment entry omitted '='"))?;
+        anyhow::ensure!(
+            environment
+                .insert(key.to_owned(), value.to_owned())
+                .is_none(),
+            "cutover Ding environment repeats key {key:?}"
+        );
+    }
+    Ok(environment)
+}
+
+fn environment_contains(
+    observed: &std::collections::BTreeMap<String, String>,
+    expected: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    expected
+        .iter()
+        .all(|(key, value)| observed.get(key) == Some(value))
+}
+
+fn resolve_executable(program: &str) -> anyhow::Result<PathBuf> {
+    let program = Path::new(program);
+    if program.components().count() > 1 {
+        return Ok(program.canonicalize()?);
+    }
+    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let candidate = directory.join(program);
+        if candidate.is_file() {
+            return Ok(candidate.canonicalize()?);
+        }
+    }
+    anyhow::bail!("cannot resolve precommitted Ding executable {program:?} on PATH")
 }
 
 fn terminate_unpublished(pid: u32) {
@@ -667,13 +1014,18 @@ fn observation_alive_for_reconcile(observation: ExecGenerationObservation) -> bo
 pub(crate) fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), String> {
     if !matches!(
         generation.schema.as_str(),
-        EXEC_GENERATION_SCHEMA_V1 | EXEC_GENERATION_SCHEMA_V2
+        EXEC_GENERATION_SCHEMA_V1 | EXEC_GENERATION_SCHEMA_V2 | EXEC_GENERATION_SCHEMA_V3
     ) {
         return Err(format!("unsupported schema {:?}", generation.schema));
     }
-    match (generation.schema.as_str(), generation.isolation.as_ref()) {
-        (EXEC_GENERATION_SCHEMA_V1, None) => {}
-        (EXEC_GENERATION_SCHEMA_V2, Some(isolation)) => {
+    match (
+        generation.schema.as_str(),
+        generation.isolation.as_ref(),
+        generation.cutover.as_ref(),
+    ) {
+        (EXEC_GENERATION_SCHEMA_V1, None, None) => {}
+        (EXEC_GENERATION_SCHEMA_V2, Some(isolation), None)
+        | (EXEC_GENERATION_SCHEMA_V3, Some(isolation), Some(_)) => {
             if isolation.kind != "systemd-cgroup-v2-scope"
                 || !isolation.unit.ends_with(".scope")
                 || !isolation.cgroup_path.starts_with('/')
@@ -684,7 +1036,26 @@ pub(crate) fn validate_generation(id: &str, generation: &ExecGeneration) -> Resu
                 return Err("invalid exact cgroup-v2 isolation capability".to_string());
             }
         }
-        _ => return Err("generation schema and isolation capability disagree".to_string()),
+        (EXEC_GENERATION_SCHEMA_V3, None, Some(_)) => {}
+        _ => {
+            return Err(
+                "generation schema, isolation capability, and cutover binding disagree".to_string(),
+            );
+        }
+    }
+    if let Some(binding) = &generation.cutover {
+        if binding.gate_id.is_empty()
+            || binding.gate_id.len() > 128
+            || binding.ding_generation_id.is_empty()
+            || binding.ding_generation_id.len() > 128
+            || binding.launch_sha256.len() != 64
+            || !binding
+                .launch_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("invalid exact cutover Ding binding".to_string());
+        }
     }
     if generation.pid == 0 || generation.pid > i32::MAX as u32 {
         return Err("pid must be positive".to_string());
@@ -698,6 +1069,7 @@ pub(crate) fn validate_generation(id: &str, generation: &ExecGeneration) -> Resu
         &generation.created_at,
         generation.start_time_ticks,
         generation.isolation.as_ref(),
+        generation.cutover.as_ref(),
     );
     if generation.generation_id != expected {
         return Err("generationId does not match the generation fields".to_string());
@@ -741,6 +1113,7 @@ fn generation_id(
     created_at: &str,
     start_time_ticks: u64,
     isolation: Option<&ExecIsolation>,
+    cutover: Option<&ExecCutoverBinding>,
 ) -> String {
     let base = crate::task_inventory::generation_id(
         "exec",
@@ -749,19 +1122,37 @@ fn generation_id(
         created_at,
         Some(start_time_ticks),
     );
-    let Some(isolation) = isolation else {
-        return base;
+    let isolated = if let Some(isolation) = isolation {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"st2.exec-generation.v2\0");
+        for field in [
+            base.as_bytes(),
+            isolation.kind.as_bytes(),
+            isolation.unit.as_bytes(),
+            isolation.cgroup_path.as_bytes(),
+            isolation.cgroup_device.to_string().as_bytes(),
+            isolation.cgroup_inode.to_string().as_bytes(),
+        ] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        format!("sha256:{:x}", hasher.finalize())
+    } else {
+        base
+    };
+    let Some(cutover) = cutover else {
+        return isolated;
     };
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"st2.exec-generation.v2\0");
+    hasher.update(b"st2.exec-generation.v3\0");
     for field in [
-        base.as_bytes(),
-        isolation.kind.as_bytes(),
-        isolation.unit.as_bytes(),
-        isolation.cgroup_path.as_bytes(),
-        isolation.cgroup_device.to_string().as_bytes(),
-        isolation.cgroup_inode.to_string().as_bytes(),
+        isolated.as_bytes(),
+        cutover.gate_id.as_bytes(),
+        cutover.action_index.to_string().as_bytes(),
+        cutover.ding_generation_id.as_bytes(),
+        cutover.launch_sha256.as_bytes(),
     ] {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field);
@@ -937,6 +1328,7 @@ mod generation_tests {
                 &generation.created_at,
                 generation.start_time_ticks,
                 generation.isolation.as_ref(),
+                generation.cutover.as_ref(),
             )
         );
         assert!(matches!(
@@ -1037,6 +1429,7 @@ mod generation_tests {
             &generation.created_at,
             generation.start_time_ticks,
             generation.isolation.as_ref(),
+            generation.cutover.as_ref(),
         );
         backend.publish_generation(id, &generation).unwrap();
 
@@ -1128,5 +1521,20 @@ mod generation_tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn cutover_recovery_environment_refuses_any_precommitted_value_mismatch() {
+        let expected = std::collections::BTreeMap::from([
+            ("ST_AGENT".to_owned(), "host.worker".to_owned()),
+            ("ST_ROOT".to_owned(), "/catalog".to_owned()),
+        ]);
+        let mut observed = expected.clone();
+        observed.insert("UNRELATED".to_owned(), "allowed".to_owned());
+        assert!(environment_contains(&observed, &expected));
+        observed.insert("ST_ROOT".to_owned(), "/wrong".to_owned());
+        assert!(!environment_contains(&observed, &expected));
+        observed.remove("ST_AGENT");
+        assert!(!environment_contains(&observed, &expected));
     }
 }

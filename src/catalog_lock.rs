@@ -26,6 +26,7 @@ enum Mode {
 pub struct CatalogLock {
     file: File,
     mode: Mode,
+    catalog: PathBuf,
 }
 
 impl CatalogLock {
@@ -151,11 +152,15 @@ impl CatalogLock {
                 }
             }
         }
-        Ok(Self { file, mode })
+        Ok(Self {
+            file,
+            mode,
+            catalog,
+        })
     }
 
-    pub(crate) fn is_exclusive(&self) -> bool {
-        matches!(self.mode, Mode::Exclusive)
+    pub(crate) fn is_exclusive_for(&self, catalog: &Path) -> bool {
+        matches!(self.mode, Mode::Exclusive) && self.catalog == catalog
     }
 }
 
