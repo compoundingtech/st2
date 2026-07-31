@@ -4,20 +4,14 @@
 //! declared task running and delivers native messages. Harness-specific behavior stays explicit in
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
-pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
-pub mod catalog_lock;
-pub mod catalog_transaction;
+pub mod compile_agent;
 pub mod context;
-pub mod cutover_admission;
-pub mod cutover_driver;
 pub mod ding;
-pub mod ding_reconcile;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod exec_backend;
-pub mod exec_retirement;
 pub mod expand;
 pub mod flapping;
 pub mod hooks;
@@ -31,7 +25,6 @@ pub mod resource;
 pub mod run;
 pub mod service;
 pub mod status;
-pub mod task_inventory;
 pub mod validate;
 pub mod version;
 mod watch;
@@ -46,14 +39,12 @@ pub use agent_spec::spec::{
     AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
     parse_duration,
 };
-pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
-pub use host_lock::{HostLock, HostOwnership};
+pub use host_lock::HostLock;
 pub use reconcile::{Launch, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
-    up_loop, up_loop_specs, up_loop_with_ownership, up_once, up_once_selected,
-    up_once_selected_specs, up_once_specs, up_once_with_ownership,
+    up_loop, up_loop_specs, up_once, up_once_selected, up_once_selected_specs, up_once_specs,
 };

@@ -120,7 +120,8 @@ impl Fixture {
         (boots, heartbeat)
     }
 
-    /// Write a compact canonical agent whose primary pty id is exactly its bus identity.
+    /// Write a compact agent whose primary pty id is exactly its bus identity — the shape emitted
+    /// by current `compile-agent` catalogs.
     fn write_compact_agent(&self, identity: &str) {
         self.pty_sessions
             .borrow_mut()
@@ -310,12 +311,7 @@ impl Drop for Runner {
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    raw.trim().parse().ok().or_else(|| {
-        serde_json::from_str::<serde_json::Value>(&raw).ok()?["pid"]
-            .as_i64()
-            .and_then(|pid| i32::try_from(pid).ok())
-    })
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn read_alive(pidfile: &Path) -> bool {

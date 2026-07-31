@@ -17,8 +17,8 @@ agent "<identity>" {
   ding
 
   render {
-    copy "assets/PERSONA.md" ".st2/PERSONA.md"
-    copy "assets/bus.st2.md" ".st2/bus.md"
+    copy "_templates/<host>.<identity>.persona.md" ".st2/PERSONA.md"
+    copy "_templates/bus.st2.md" ".st2/bus.md"
     ensure-line ".claude/rules/st2.md" "@../../.st2/PERSONA.md"
     ensure-line ".claude/rules/st2.md" "@../../.st2/bus.md"
     json-upsert ".claude/settings.local.json" #"""

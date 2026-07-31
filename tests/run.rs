@@ -8,9 +8,7 @@ use std::path::Path;
 use st2::message;
 use st2::reconcile::{Session, TaskTarget};
 use st2::run::Runner;
-use st2::run::{
-    CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs, up_once_with_ownership,
-};
+use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
 use st2::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
@@ -206,7 +204,8 @@ fn selected_catalog_owner_render_failure_refuses_runner_actions() {
 fn selected_one_shot_unknown_refuses_before_runner_list() {
     let runner = FakeRunner::default();
     let error =
-        up_once_selected_specs_for_test(&[], "host.missing.task", "host", &runner).unwrap_err();
+        up_once_selected_specs(Path::new("/tmp"), &[], "host.missing.task", "host", &runner)
+            .unwrap_err();
     assert!(error.to_string().contains("did not resolve"));
     assert_eq!(runner.list_calls.get(), 0);
     assert!(runner.spawned.borrow().is_empty());
@@ -242,16 +241,6 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         }],
         path: "/tmp/spec.kdl".into(),
     }
-}
-
-fn up_once_selected_specs_for_test(
-    specs: &[AgentSpec],
-    selector: &str,
-    host: &str,
-    runner: &dyn Runner,
-) -> anyhow::Result<UpReport> {
-    let catalog = tempfile::tempdir()?;
-    up_once_selected_specs(catalog.path(), specs, selector, host, runner)
 }
 
 fn assert_refusal(runner: &FakeRunner) {
@@ -290,8 +279,14 @@ fn selected_one_shot_missing_spawns_only_selected_task() {
         two_task_spec("agent", "host.agent.work", "host.agent.side"),
         task_spec("sibling", None, "host.sibling.work"),
     ];
-    let report =
-        up_once_selected_specs_for_test(&specs, "host.agent.work", "host", &runner).unwrap();
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
     assert_eq!(runner.list_calls.get(), 1);
     assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
     assert!(runner.killed.borrow().is_empty());
@@ -306,8 +301,14 @@ fn selected_adopt_only_absent_task_is_reported_held_without_runner_mutation() {
     spec.tasks[0].lifecycle = TaskLifecycle::AdoptOnly;
     let runner = FakeRunner::default();
 
-    let report =
-        up_once_selected_specs_for_test(&[spec], "host.agent.work", "host", &runner).unwrap();
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &[spec],
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
 
     assert_eq!(report.held, ["host.agent.work"]);
     assert!(report.launched.is_empty());
@@ -331,8 +332,14 @@ fn selected_one_shot_live_adopts_without_actions() {
         two_task_spec("agent", "host.agent.work", "host.agent.side"),
         task_spec("sibling", None, "host.sibling.work"),
     ];
-    let report =
-        up_once_selected_specs_for_test(&specs, "host.agent.work", "host", &runner).unwrap();
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
     assert_eq!(runner.list_calls.get(), 1);
     assert!(runner.spawned.borrow().is_empty());
     assert!(runner.killed.borrow().is_empty());
@@ -355,8 +362,14 @@ fn selected_one_shot_dead_reaps_and_relaunches_only_selected() {
         two_task_spec("agent", "host.agent.work", "host.agent.side"),
         task_spec("sibling", None, "host.sibling.work"),
     ];
-    let report =
-        up_once_selected_specs_for_test(&specs, "host.agent.work", "host", &runner).unwrap();
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
     assert_eq!(runner.list_calls.get(), 1);
     assert_eq!(runner.reaped.borrow().as_slice(), ["host.agent.work"]);
     assert_eq!(runner.spawned.borrow().as_slice(), ["host.agent.work"]);
@@ -376,8 +389,14 @@ fn selected_one_shot_second_live_pass_is_a_noop() {
         task_spec("agent", None, "host.agent.work"),
         task_spec("sibling", None, "host.sibling.work"),
     ];
-    let report =
-        up_once_selected_specs_for_test(&specs, "host.agent.work", "host", &runner).unwrap();
+    let report = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "host.agent.work",
+        "host",
+        &runner,
+    )
+    .unwrap();
     assert_eq!(runner.list_calls.get(), 1);
     assert!(runner.spawned.borrow().is_empty());
     assert!(runner.killed.borrow().is_empty());
@@ -390,7 +409,8 @@ fn selected_one_shot_second_live_pass_is_a_noop() {
 fn selected_one_shot_ambiguous_refuses_before_runner_list() {
     let runner = FakeRunner::default();
     let specs = vec![task_spec("one", None, "dup"), task_spec("two", None, "dup")];
-    let error = up_once_selected_specs_for_test(&specs, "dup", "host", &runner).unwrap_err();
+    let error =
+        up_once_selected_specs(Path::new("/tmp"), &specs, "dup", "host", &runner).unwrap_err();
     assert!(error.to_string().contains("ambiguous"), "{error}");
     assert_refusal(&runner);
 }
@@ -399,8 +419,14 @@ fn selected_one_shot_ambiguous_refuses_before_runner_list() {
 fn selected_one_shot_wrong_host_refuses_before_runner_list() {
     let runner = FakeRunner::default();
     let specs = vec![task_spec("remote", Some("other"), "other.remote.work")];
-    let error =
-        up_once_selected_specs_for_test(&specs, "other.remote.work", "host", &runner).unwrap_err();
+    let error = up_once_selected_specs(
+        Path::new("/tmp"),
+        &specs,
+        "other.remote.work",
+        "host",
+        &runner,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("did not resolve"));
     assert_refusal(&runner);
 }
@@ -667,22 +693,12 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
         ..Default::default()
     };
     let mut cap = FlappingCap::default();
-    let ownership = st2::host_lock::HostOwnership::acquire(tmp.path(), "hetz").unwrap();
-    let admission = st2::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership).unwrap();
 
     let mut last = UpReport::default();
     for _ in 0..5 {
         let plan = reconcile(&found.specs, &runner.sessions, "hetz");
         last = UpReport::default();
-        execute(
-            &admission.permission(),
-            tmp.path(),
-            "hetz",
-            &plan,
-            &runner,
-            &mut cap,
-            &mut last,
-        );
+        execute(&plan, &runner, &mut cap, &mut last);
     }
     assert_eq!(last.launched.len(), 0);
     assert_eq!(last.flapping, vec!["hetz.demo-claude"]);
@@ -845,21 +861,5 @@ fn up_once_marks_a_list_failure_as_a_skipped_pass() {
     assert_eq!(
         report.errors,
         vec!["list sessions (pass skipped): simulated list failure"]
-    );
-}
-
-#[test]
-fn retained_host_ownership_runs_successor_without_reacquiring() {
-    let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
-    let ownership = st2::HostOwnership::acquire(tmp.path(), "hetz").unwrap();
-    let runner = FakeRunner::default();
-
-    let report = up_once_with_ownership(&ownership, &runner).unwrap();
-
-    assert_eq!(report.launched, vec!["hetz.demo-claude", "hetz.demo.ding"]);
-    assert!(
-        st2::HostOwnership::acquire(tmp.path(), "hetz").is_err(),
-        "the successor seam must retain the original host lock"
     );
 }
