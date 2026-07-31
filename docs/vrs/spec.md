@@ -548,11 +548,15 @@ For a live numeric record, neither PID-file mtime nor reconstructed wall time is
 generation authority. Preparation may issue only `legacy-scope-v1`, never a
 normal generation id, and only after the dedicated scope proves: its exact
 runtime-id unit name; matching systemd ControlGroup, InvocationID, and nonzero
-monotonic activation identity; a pinned cgroup inode; the
-recorded PID as a member; frozen exact membership; retained Ding
-executable/argv/cwd/uid; and no provider/shared scope. Any missing or ambiguous
-witness blocks. A positively dead/reused numeric record is record-only and
-apply performs no signal or cgroup control write.
+monotonic activation identity; a pinned cgroup inode; the recorded PID in a
+stable exact membership snapshot; retained Ding executable/argv/cwd/uid; and no
+provider/shared scope. Preparation is read-only and does not freeze a process
+before durable recovery authority exists. Apply first durably enters the
+forward-only journal phase, then freezes the exact scope and revalidates the
+record, scope identity, and complete membership against the plan before any
+kill or record move. Any missing or ambiguous witness blocks. A positively
+dead/reused numeric record is record-only and apply performs no signal or
+cgroup control write.
 
 The operation writes a durable per-request journal under the host-local exec
 state directory and returns `st2.exec-retirement.v1`. Repeating the same request
