@@ -50,6 +50,9 @@ pub(crate) fn watch_catalog_declarations(
 }
 
 fn is_declaration_path(root: &Path, path: &Path) -> bool {
+    if !agent_spec::is_catalog_path(root, path) {
+        return false;
+    }
     let rel = path.strip_prefix(root).unwrap_or(path);
     let mut components = rel.components();
     if matches!(
@@ -97,28 +100,60 @@ mod tests {
     }
 
     #[test]
-    fn declaration_filter_ignores_runtime_state() {
-        let root = Path::new("/catalog");
+    fn declaration_filter_uses_catalog_scoped_namespace_semantics() {
+        let catalog = tempfile::tempdir().unwrap();
+        let root = catalog.path();
+        std::fs::create_dir_all(root.join("agents/h/live")).unwrap();
+        std::fs::write(
+            root.join("agents/h/live/agent.kdl"),
+            r#"agent "live" { host "h"; command "x" }"#,
+        )
+        .unwrap();
+
         assert!(is_declaration_path(
             root,
-            Path::new("/catalog/team/agent.kdl")
+            &root.join("teams/.managed/project/agent.kdl")
         ));
         assert!(is_declaration_path(
             root,
-            Path::new("/catalog/_templates/base.kdl")
+            &root.join("teams/.retired/project/agent.kdl")
+        ));
+        assert!(is_declaration_path(
+            root,
+            &root.join("agents/archive/project/agent.kdl")
+        ));
+        assert!(is_declaration_path(
+            root,
+            &root.join("agents/resources/project/agent.kdl")
+        ));
+        assert!(is_declaration_path(root, &root.join("_templates/base.kdl")));
+        assert!(!is_declaration_path(
+            root,
+            &root.join(".git/project/agent.kdl")
         ));
         assert!(!is_declaration_path(
             root,
-            Path::new("/catalog/pty/session.json")
+            &root.join(".st2/project/agent.kdl")
         ));
         assert!(!is_declaration_path(
             root,
-            Path::new("/catalog/bus/inbox/msg")
+            &root.join("organizations/project/.git/nested/agent.kdl")
         ));
         assert!(!is_declaration_path(
             root,
-            Path::new("/catalog/team/rendered.kdl")
+            &root.join("organizations/project/.st2/nested/agent.kdl")
         ));
+        assert!(!is_declaration_path(
+            root,
+            &root.join("pty/project/agent.kdl")
+        ));
+        for reserved in ["resources", "archive", "inbox"] {
+            assert!(!is_declaration_path(
+                root,
+                &root.join(format!("agents/h/live/{reserved}/project/agent.kdl"))
+            ));
+        }
+        assert!(!is_declaration_path(root, &root.join("team/rendered.kdl")));
     }
 
     #[cfg(target_os = "linux")]

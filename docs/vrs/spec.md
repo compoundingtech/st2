@@ -16,6 +16,79 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
+## Canonical Agent Spec eval teams
+
+An eval may opt into `canonical-agents` after its fixture copy and deterministic
+run steps have populated the hermetic temporary catalog. The directive is
+mutually exclusive with compact `team` / `agent` declarations. st2 recursively
+discovers the catalog, preserves explicit `identity` and `host` authority
+independent of organizational placement, and projects only declarations
+resolved to the eval host. Each declaration parent remains its native
+state/resource anchor. The resulting local Agent Spec vector flows unchanged
+through launch admission, kickoff resolution, supervision, logging, and
+declaration-driven teardown; remote-host declarations remain inert.
+
+Admission applies `validate_for_host` strictly, then fails before spawn when
+discovery is malformed or warning-bearing, when the selected local projection
+is empty, duplicate, retired, root-overriding, or unrunnable, or when any
+resolved local task runtime ID is empty or duplicates another local task.
+Materialization warnings and backend launch errors are fatal. The kickoff
+target must resolve to exactly one local agent. The eval owns one native
+`CATALOG` / `ST_ROOT` and its `<catalog>/pty` registry; declarations cannot
+override those roots. Local workspace renders are materialized before any
+agent task starts.
+
+Native inbox/archive paths are derived once from the admitted Agent Spec paths
+and carried as frozen data; routing never re-discovers the mutable catalog.
+The requester alone is an explicit eval-owned flat mailbox. Multi-agent
+completion retains the worker-report-before-supervisor-confirmation ordering.
+For a singleton, the eval snapshots the requester inbox before kickoff and
+completes only for a newly appearing interviewer reply whose timestamp is
+at-or-after the exact kickoff receipt. The filename snapshot rejects
+future-dated pre-seeded messages while `>=` accepts a causally new same-ms
+reply. Canonical completion is a gating judge, so a timeout cannot pass on
+unrelated final-state checks alone.
+
+Without `canonical-agents`, fixture declarations are not discovered or launched
+and compact evals retain their catalog-less flat bus. This explicit opt-in keeps
+ordinary fixtures inert while allowing the same canonical declaration to be
+exercised in an eval and real work. Parser and admission evidence lives in
+`eval_spec::tests::canonical_agents_is_bare_once_and_excludes_compact_agents` and
+the `canonical_*` unit tests. Named-PTY end-to-end cases prove strict
+pre-spawn refusals, poisoned ambient-root isolation, real render
+materialization, frozen routing after declaration removal, singleton
+completion, custom task-ID supervision/logging/teardown, and the no-opt-in
+legacy control in `tests/eval_run_e2e.rs`.
+
+## Resource bindings (R20-R21)
+
+An agent may directly declare zero or more generic Resource bindings:
+
+```kdl
+resource "work" _tag="github-issue" uri="github-issue://example/project/123"
+```
+
+The positional name is an agent-local semantic role, `_tag` is the concrete
+type discriminator, and `uri` is the exact RFC 3986 absolute resource identity,
+preserved byte-for-byte without normalization.
+Declaration order has no meaning and binding names are unique within one
+agent. The public `agent-spec` read model preserves the bindings in name order
+across canonical KDL and the supported TOML/JSON forms. `st2 agents --json`
+projects the same descriptors for language-neutral inspection.
+
+st2 validates only this portable envelope. It does not define downstream type
+schemas, resolve targets, infer authority from URI possession, or attach
+required/optional, access, readiness, or lifecycle semantics. Those concerns
+remain outside the generic binding contract. A Resource binding is declaration
+metadata and is absent from task launch targets; changing only Resource
+bindings adopts an already-live task without stop, replacement, or relaunch.
+
+The unresolved-resource runtime discussion remains tracked in
+[st2#60](https://github.com/compoundingtech/st2/issues/60), read-oriented
+renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/61),
+and the portable Agent Spec envelope in
+[evals#41](https://github.com/compoundingtech/evals/issues/41).
+
 ## Host-local scheduling and supervision
 
 ```text
@@ -37,7 +110,20 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
 - **R01–R03:** Fleet validation separates structural errors from selected-host
   runtime facts. Materialization is inspectable and host reconciliation starts
-  only declarations pinned to the local host.
+  only declarations pinned to the local host. Discovery is recursive: an
+  explicit `identity` and `host` pair is authoritative independent of the
+  declaration's path, whose parent remains the state/resource anchor. When
+  either field is omitted, the path supplies defaults and mismatches remain
+  diagnostic. Dot-prefixed folders, including `.managed` and `.retired`, are
+  ordinary declaration space; only `.git` and `.st2` directories at any depth,
+  the catalog root's `pty` child, and a declaration parent's `resources`,
+  `archive`, and `inbox` children are excluded.
+  A resolved workspace-relative render destination has one coherent desired
+  state across the active local fleet: byte-equivalent idempotent claims may
+  share it, while incompatible
+  claims fail every conflicting owner before the first workspace write.
+  Targeted reconciliation checks the selected owner against the full fleet, so
+  selection cannot bypass this ownership boundary.
 - **R04:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads
@@ -74,6 +160,39 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   binary, starts the control plane again, and proves adoption with the same
   agent PID/creation identity and no duplicate process.
 
+- **Adopt-only migration fence:** A compact agent or explicit task may declare
+  `lifecycle "adopt-only"`. Reconciliation adopts an already-live generation,
+  but classifies a dead or absent generation as `held` without garbage
+  collection or launch. Returning the declaration to the default `service`
+  lifecycle is the explicit authority to resume ordinary replacement.
+  `retired #true` remains the separate explicit teardown path.
+
+- **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
+  `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
+  agent, task, and runtime id and cover both PTY and terminal-free exec tasks.
+  `complete=false` plus a non-zero exit is a closed result: a consumer must not
+  turn a missing row into absence. A running row always carries a PID, creation
+  time, and opaque generation id derived from stable backend evidence.
+
+  Discovery runs before and after runtime observation. A semantic declaration
+  change across those passes makes the result incomplete. This detects
+  observed drift but does not serialize catalog writers or claim a
+  transactional snapshot. A runtime root positively absent at admission is
+  empty and is not passed to its backend. An admitted PTY root that is removed
+  or replaced during `pty list` is indeterminate; because the external backend
+  creates an absent registry, concurrent root deletion is not a zero-write
+  boundary. Malformed state, PID reuse, timeouts, duplicate ids, and observer
+  failures are likewise indeterminate. Existing plain-PID exec records are
+  opened read-only without following symlinks and verified by retained file
+  identity, unchanged content and metadata, the final path identity, process
+  start token, and record mtime without rewriting them. If that proof is
+  unavailable on a supported OS, the generation remains indeterminate.
+
+  Inventory performs no reconciliation, launch, teardown, cleanup, lifecycle
+  edit, state migration, or catalog write. It does not authorize a staged
+  supervisor replacement; any cutover requiring transactional declaration
+  authority needs a separate protocol.
+
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
   can share a single registry across catalogs. Resolution is an exported
@@ -81,7 +200,10 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   uniformly to spawn, list, kill, and the bus environment st2 hands to native
   tools, so every reader that can resolve the catalog agrees about where its
   sessions are. A declaration whose field set does not match fails `st2
-  validate` rather than resolving silently back to the default.
+  validate` rather than resolving silently back to the default. Runtime
+  observation has a short outer deadline so a wedged client fails the pass
+  closed instead of hanging reconciliation. The deadline is containment, not
+  the mechanism for admitting a larger fleet.
 
 ## Message lifecycle
 
@@ -128,7 +250,7 @@ Watchers are deny-by-default. The classifier/action contract is:
 
 | Event | Minimal action |
 | --- | --- |
-| `agents/**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
+| declaration-space `**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
 | referenced `_templates/**` mutation | converge dependent agents only |
 | inbox create/archive/remove | DING consumer only; supervisor no-op |
 | plan/resource/status mutation | specialized consumer only; supervisor no-op |
@@ -141,14 +263,48 @@ positive declaration/template wakes, negative runtime/bus events, bounded
 discovery/materialization/PTY queries and writes, continuous-event starvation,
 and no-op desired-equals-actual behavior.
 
+## Quiet coordination after events (R22)
+
+Useful work is quiet by default. Presence, status, and durable plan data are
+facts. They do not cause a status message or a peer poll.
+
+Coordination starts only after one of these events:
+
+- An unread inbox message. DING the recipient. Process or hand off the request.
+- A durable failure or real blocker. Tell the responsible supervisor. Find the cause.
+  Repair the failure or escalate it.
+- A completion or decision. Give the result to the agent or principal that needs it.
+- A declared schedule with a name. Do that work. Do not replace the schedule
+  with repeated messages or polls.
+
+After an event, continue until you resolve the need or hand it off. Then become quiet.
+
+The inbox uses the source contract in
+[DING requirements](./01-ding/requirements.md). A normal supervisor handles
+failures and blocked work. It does not continuously manage healthy agents. A
+custom supervisor persona can ask for more frequent coordination. CoS is only
+an example. st2 does not require or define that role, and R22 gives it no
+standard authority.
+
+R22 does not define the schedule grammar in DQ1. A schedule must have a declared
+name. Transport loss can delay coordination. It does not stop independent
+host-local work. Local work does not depend on a global service.
+
+## Targeted reconciliation (R19)
+
+`st2 up --materialize-only --task <host.agent.task>` resolves one exact local
+task before writing and renders only its owning agent. `st2 up --once --task
+<host.agent.task>` performs the same owner-only materialization, then inspects
+PTY/exec state and executes a plan containing only that task. Unknown,
+ambiguous, and wrong-host selectors refuse before writes or runner inspection;
+unrelated discovery diagnostics remain visible without preventing the selected
+owner/task path.
+
+`st2 up --materialize-only --agent <id>` remains the agent-wide rendering
+selector. Targeted task reconciliation is intentionally bounded to `--once`;
+the resident supervisor continues to reconcile the complete local catalog.
+
 ## Open design questions
-
-### Targeted materialization (R13)
-
-`st2 up --materialize-only --agent <id>` filters discovery before rendering,
-so a declared agent/task change cannot be blocked by unrelated slow or
-unreadable workspaces. This selector is materialization-only; live
-reconciliation remains separately gated and host-local.
 
 - **DQ1 Scheduled work:** The vision includes per-machine schedulers that form a
   distributed workflow engine, but the KDL shape, event inbox, deduplication
