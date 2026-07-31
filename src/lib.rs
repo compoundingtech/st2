@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod catalog_lock;
 pub mod catalog_transaction;
 pub mod context;
+pub mod cutover_admission;
 pub mod ding;
 pub mod eval_run;
 pub mod eval_spec;

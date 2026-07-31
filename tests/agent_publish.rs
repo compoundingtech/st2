@@ -61,6 +61,38 @@ fn target(catalog: &Path) -> PathBuf {
     catalog.join("agents/host/worker/agent.kdl")
 }
 
+fn install_malformed_active_cutover(catalog: &Path) {
+    let cutover = catalog.join(".st2/cutover");
+    fs::create_dir_all(&cutover).unwrap();
+    fs::write(cutover.join("active.json"), b"{}").unwrap();
+}
+
+#[test]
+fn active_cutover_blocks_publication_before_catalog_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    install_malformed_active_cutover(&catalog);
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, valid_spec(false)).unwrap();
+
+    let blocked = publish(&catalog, &spec, &["--expect-absent"]);
+
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("mutation busy"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(!target(&catalog).exists());
+    assert!(
+        fs::read_dir(catalog.join(".st2"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("agent-publish-"))
+    );
+}
+
 #[test]
 fn spec_create_is_typed_and_idempotent() {
     let temp = tempfile::tempdir().unwrap();

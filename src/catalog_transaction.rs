@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::catalog_lock::{APPLY_MARKER, CONTROL_DIR, CatalogLock};
+use crate::cutover_admission::{CanonicalCatalog, admit_catalog_publish};
 
 const SNAPSHOT_SCHEMA: &str = "st2.catalog-snapshot.v1";
 const APPLY_SCHEMA: &str = "st2.catalog-apply.v1";
@@ -218,6 +219,7 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
 /// Apply a complete prepared declaration plane under one exclusive transaction.
 pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     let catalog = canonical_real_dir(&request.catalog, "catalog")?;
+    let canonical_catalog = CanonicalCatalog::open(&catalog)?;
     let prepared_input = match request.mode {
         ApplyMode::Prepared {
             prepared,
@@ -238,7 +240,8 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         ApplyMode::Resume => None,
     };
 
-    let _lock = CatalogLock::exclusive_for_catalog_apply(&catalog)?;
+    let lock = CatalogLock::exclusive_for_catalog_apply(&catalog)?;
+    let _publication = admit_catalog_publish(&canonical_catalog, &lock)?;
     let marker_path = catalog.join(CONTROL_DIR).join(APPLY_MARKER);
     let existing_marker = read_marker_optional(&marker_path)?;
     let recovered = existing_marker.is_some();

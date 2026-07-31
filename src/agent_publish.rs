@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog_lock::CatalogLock;
 use crate::catalog_transaction::{rename_noreplace, sync_dir};
+use crate::cutover_admission::{CanonicalCatalog, admit_catalog_publish};
 
 const SCHEMA: &str = "st2.agent-publish.v1";
 const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
@@ -206,7 +207,9 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         .catalog
         .canonicalize()
         .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
-    let _lock = CatalogLock::exclusive(&catalog)?;
+    let canonical_catalog = CanonicalCatalog::open(&catalog)?;
+    let lock = CatalogLock::exclusive(&catalog)?;
+    let _publication = admit_catalog_publish(&canonical_catalog, &lock)?;
     let candidate = Candidate::stage(&catalog, request.source)?;
     anyhow::ensure!(
         candidate.input_sha256 == request.input_sha256,

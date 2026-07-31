@@ -25,6 +25,7 @@ enum Mode {
 #[derive(Debug)]
 pub struct CatalogLock {
     file: File,
+    mode: Mode,
 }
 
 impl CatalogLock {
@@ -150,7 +151,11 @@ impl CatalogLock {
                 }
             }
         }
-        Ok(Self { file })
+        Ok(Self { file, mode })
+    }
+
+    pub(crate) fn is_exclusive(&self) -> bool {
+        matches!(self.mode, Mode::Exclusive)
     }
 }
 

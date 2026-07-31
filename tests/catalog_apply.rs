@@ -102,6 +102,49 @@ fn resume(catalog: &Path) -> Output {
 }
 
 #[test]
+fn active_cutover_blocks_catalog_apply_before_live_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    write_agent(&catalog, "worker", false);
+    let before = snapshot(&catalog, &temp.path().join("before"));
+    let before_sha256 = before["rootSha256"].as_str().unwrap();
+
+    write_agent(&catalog, "worker", true);
+    let prepared = temp.path().join("prepared");
+    snapshot(&catalog, &prepared);
+    write_agent(&catalog, "worker", false);
+
+    let cutover = catalog.join(".st2/cutover");
+    fs::create_dir_all(&cutover).unwrap();
+    fs::write(cutover.join("active.json"), b"{}").unwrap();
+    let blocked = apply(&catalog, &prepared, before_sha256);
+
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("mutation busy"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+        agent("worker", false)
+    );
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+    assert!(
+        fs::read_dir(catalog.join(".st2"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| {
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("catalog-apply-stage-")
+            })
+    );
+}
+
+#[test]
 fn catalog_apply_cli_exposes_exactly_the_three_closed_modes() {
     let help = st2().args(["catalog", "apply", "--help"]).output().unwrap();
     assert!(help.status.success());

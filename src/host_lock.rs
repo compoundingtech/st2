@@ -14,6 +14,58 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
+/// Retained, non-forgeable ownership of one canonical `(catalog, host)` runtime domain.
+///
+/// Runtime mutators accept this capability instead of accepting a path plus an independently
+/// constructed [`HostLock`]. The lock remains held until this value is dropped.
+pub struct HostOwnership {
+    catalog: PathBuf,
+    host: String,
+    _lock: HostLock,
+}
+
+impl HostOwnership {
+    pub fn acquire(catalog: &Path, host: &str) -> std::io::Result<Self> {
+        let catalog = catalog.canonicalize()?;
+        let metadata = fs::symlink_metadata(&catalog)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("catalog is not a real directory: {}", catalog.display()),
+            ));
+        }
+        if host.is_empty()
+            || host == "."
+            || host == ".."
+            || host.starts_with('.')
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host must be one safe path component",
+            ));
+        }
+        let lock = HostLock::new(&catalog, host);
+        lock.acquire()?;
+        Ok(Self {
+            catalog,
+            host: host.to_owned(),
+            _lock: lock,
+        })
+    }
+
+    pub fn catalog(&self) -> &Path {
+        &self.catalog
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+}
+
 /// A pid-file lock for one host's supervision of one folder.
 pub struct HostLock {
     path: PathBuf,
@@ -205,6 +257,24 @@ mod tests {
         );
         first.release();
         second.acquire().unwrap();
+    }
+
+    #[test]
+    fn ownership_is_canonical_validated_and_retains_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ownership = HostOwnership::acquire(tmp.path(), "hetz").unwrap();
+        assert_eq!(ownership.catalog(), tmp.path().canonicalize().unwrap());
+        assert_eq!(ownership.host(), "hetz");
+        assert_eq!(
+            HostOwnership::acquire(tmp.path(), "hetz")
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(HostOwnership::acquire(tmp.path(), "../hetz").is_err());
+        drop(ownership);
+        HostOwnership::acquire(tmp.path(), "hetz").unwrap();
     }
 
     #[test]
