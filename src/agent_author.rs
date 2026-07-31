@@ -714,7 +714,7 @@ fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
         .all(|value| matches!(value, ' ' | '\t'))
         && text[end..line_end]
             .chars()
-            .all(|value| matches!(value, ' ' | '\t'))
+            .all(|value| matches!(value, ' ' | '\t' | '\r'))
     {
         let mut replacement = text.to_owned();
         let remove_end = usize::min(line_end + usize::from(line_end < text.len()), text.len());
@@ -999,6 +999,31 @@ mod tests {
                 .unwrap()
                 .contains("name \"Build owner\"")
         );
+    }
+
+    #[test]
+    fn source_preserving_clear_accepts_a_crlf_dedicated_field() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let original = declaration("worker", "h", None, "catalog").replace('\n', "\r\n");
+        let with_name = original.replace(
+            "  command \"sleep 60\"",
+            "  name \"Build owner\"\r\n  command \"sleep 60\"",
+        );
+        let path = write(root, "h/worker/agent.kdl", &with_name);
+
+        let receipt = set_presentation(
+            root,
+            "h.worker",
+            "h",
+            None,
+            PresentationField::Name,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.result, AuthorOutcome::Changed);
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]
