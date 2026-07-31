@@ -11,10 +11,10 @@
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Seek as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -36,11 +36,12 @@ use crate::task_inventory::{
     DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
     RuntimeObserver, generation_id,
 };
-use agent_spec::spec::TaskKind;
+use agent_spec::spec::{TaskKind, TaskLifecycle};
 
 // This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+const OBSERVED_PROCESS_PID_TAG: &str = "st2.observation.process.pid";
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
@@ -136,6 +137,16 @@ pub trait Runner {
             ..ObservationBatch::default()
         }
     }
+
+    /// Complete read-only census of the effective PTY root. Provider cutover proof uses this
+    /// instead of a requested-id projection so an undeclared competing provider cannot hide.
+    fn observe_pty_root(&self) -> ObservationBatch {
+        ObservationBatch {
+            complete: false,
+            errors: vec!["runner does not provide a complete PTY-root census".into()],
+            ..ObservationBatch::default()
+        }
+    }
 }
 
 /// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
@@ -175,6 +186,26 @@ struct PtyListEntry {
     /// Immutable-at-proof launch metadata published by Axe onto this exact PTY.
     #[serde(default)]
     tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsEntry {
+    name: String,
+    process: PtyStatsProcess,
+    daemon: PtyStatsDaemon,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsProcess {
+    alive: bool,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsDaemon {
+    pid: u32,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -309,15 +340,31 @@ impl PtyCli {
     /// empty and is not passed to `pty`, because observation must not create it.
     fn task_observations(&self, desired_ids: &HashSet<&str>) -> ObservationBatch {
         let root = effective_pty_root(&self.catalog_root);
-        self.task_observations_at_root(desired_ids, &root)
+        self.task_observations_at_root(Some(desired_ids), &root)
+    }
+
+    fn all_task_observations(&self) -> ObservationBatch {
+        let root = effective_pty_root(&self.catalog_root);
+        let mut batch = self.task_observations_at_root(None, &root);
+        if batch.complete
+            && batch
+                .observations
+                .iter()
+                .any(|observed| matches!(observed.state, ObservedState::Running(_)))
+            && let Err(error) = self.enrich_running_process_pids(&root, &mut batch)
+        {
+            batch.complete = false;
+            batch.errors.push(error.to_string());
+        }
+        batch
     }
 
     fn task_observations_at_root(
         &self,
-        desired_ids: &HashSet<&str>,
+        desired_ids: Option<&HashSet<&str>>,
         root: &Path,
     ) -> ObservationBatch {
-        if desired_ids.is_empty() {
+        if desired_ids.is_some_and(HashSet::is_empty) {
             return ObservationBatch {
                 complete: true,
                 ..ObservationBatch::default()
@@ -362,7 +409,7 @@ impl PtyCli {
         let mut observations = Vec::with_capacity(entries.len());
         let mut errors = Vec::new();
         for entry in entries {
-            if !desired_ids.contains(entry.name.as_str()) {
+            if desired_ids.is_some_and(|ids| !ids.contains(entry.name.as_str())) {
                 continue;
             }
             let state = match entry.status.as_str() {
@@ -432,6 +479,68 @@ impl PtyCli {
         }
         serde_json::from_slice(&out.stdout)
             .map_err(|error| anyhow::anyhow!("parsing `pty list --json`: {error}"))
+    }
+
+    fn enrich_running_process_pids(
+        &self,
+        root: &Path,
+        batch: &mut ObservationBatch,
+    ) -> anyhow::Result<()> {
+        let out = output_with_timeout(
+            Command::new(&self.bin)
+                .args(["stats", "--json"])
+                .env("PTY_ROOT", root),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty stats --json` failed: {error}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "`pty stats --json` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stats = serde_json::from_slice::<Vec<PtyStatsEntry>>(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty stats --json`: {error}"))?;
+        let mut by_name = BTreeMap::new();
+        for entry in &stats {
+            anyhow::ensure!(
+                by_name.insert(entry.name.as_str(), entry).is_none(),
+                "`pty stats --json` contains duplicate session {:?}",
+                entry.name
+            );
+        }
+        for observed in &mut batch.observations {
+            let ObservedState::Running(generation) = &observed.state else {
+                continue;
+            };
+            let entry = by_name.get(observed.runtime_id.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`pty stats --json` is missing running session {:?}",
+                    observed.runtime_id
+                )
+            })?;
+            anyhow::ensure!(
+                entry.daemon.pid == generation.pid()
+                    && entry.created_at == generation.created_at()
+                    && entry.process.alive,
+                "`pty stats --json` generation differs for running session {:?}",
+                observed.runtime_id
+            );
+            let pid = entry.process.pid.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`pty stats --json` lacks child pid for running session {:?}",
+                    observed.runtime_id
+                )
+            })?;
+            anyhow::ensure!(
+                pid > 0,
+                "`pty stats --json` has invalid child pid for running session {:?}",
+                observed.runtime_id
+            );
+            observed
+                .tags
+                .insert(OBSERVED_PROCESS_PID_TAG.to_owned(), pid.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -720,6 +829,10 @@ impl Runner for SystemRunner {
 
     fn observe_runtime(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
         RuntimeObserver::observe(self, desired)
+    }
+
+    fn observe_pty_root(&self) -> ObservationBatch {
+        self.pty.all_task_observations()
     }
 }
 
@@ -1194,12 +1307,12 @@ pub fn up_once_with_ownership(
 }
 
 pub(crate) trait RuntimeObservationSource {
-    fn observe_generations(&self, desired: &[DesiredRuntime]) -> ObservationBatch;
+    fn observe_complete_pty_root(&self) -> ObservationBatch;
 }
 
 impl<T: Runner + ?Sized> RuntimeObservationSource for T {
-    fn observe_generations(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
-        Runner::observe_runtime(self, desired)
+    fn observe_complete_pty_root(&self) -> ObservationBatch {
+        Runner::observe_pty_root(self)
     }
 }
 
@@ -1238,6 +1351,32 @@ impl<O: RuntimeObservationSource + ?Sized> crate::cutover_admission::ProviderFle
             ));
         }
         let mut provider_runtime_ids = Vec::with_capacity(self.action.providers.len());
+        let mut catalog_provider_ids = BTreeSet::new();
+        for spec in found
+            .specs
+            .iter()
+            .filter(|spec| spec.resolved_host(host.as_str()) == host.as_str() && !spec.retired)
+        {
+            for task in spec
+                .tasks
+                .iter()
+                .filter(|task| task.name == "agent" && !task.derived && task.kind == TaskKind::Pty)
+            {
+                let runtime_id = task.id.clone().unwrap_or_else(|| {
+                    format!("{}.{}.{}", host.as_str(), spec.identity, task.name)
+                });
+                if task.lifecycle != TaskLifecycle::AdoptOnly {
+                    return Err(AdmissionError::Conflict(format!(
+                        "local provider PTY {runtime_id:?} is not adopt-only"
+                    )));
+                }
+                if !catalog_provider_ids.insert(runtime_id.clone()) {
+                    return Err(AdmissionError::Conflict(format!(
+                        "local provider PTY id {runtime_id:?} is declared more than once"
+                    )));
+                }
+            }
+        }
         for entry in &self.action.providers {
             let mut matches = found
                 .specs
@@ -1271,50 +1410,59 @@ impl<O: RuntimeObservationSource + ?Sized> crate::cutover_admission::ProviderFle
                 }),
             ));
         }
-        let desired = provider_runtime_ids
+        let expected_ids = provider_runtime_ids
             .iter()
-            .map(|(_, runtime_id)| DesiredRuntime {
-                runtime_id: runtime_id.clone(),
-                kind: TaskKind::Pty,
-            })
-            .collect::<Vec<_>>();
-        let batch = self.observer.observe_generations(&desired);
+            .map(|(_, runtime_id)| runtime_id.clone())
+            .collect::<BTreeSet<_>>();
+        if expected_ids.len() != provider_runtime_ids.len() || catalog_provider_ids != expected_ids
+        {
+            return Err(AdmissionError::Conflict(
+                "provider action is not an exact projection of all local adopt-only provider PTYs"
+                    .to_owned(),
+            ));
+        }
+
+        let batch = self.observer.observe_complete_pty_root();
         if !batch.complete || !batch.errors.is_empty() {
             return Err(AdmissionError::Invalid(format!(
-                "provider fleet runtime observation is incomplete: {}",
+                "complete PTY-root observation is incomplete: {}",
                 batch.errors.join("; ")
             )));
         }
-        let expected_ids = desired
-            .iter()
-            .map(|runtime| runtime.runtime_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let observed_ids = batch
-            .observations
-            .iter()
-            .map(|runtime| runtime.runtime_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        if expected_ids.len() != desired.len()
-            || observed_ids.len() != batch.observations.len()
-            || observed_ids != expected_ids
-        {
-            return Err(AdmissionError::Conflict(
-                "provider fleet runtime observation is not an exact id bijection".to_owned(),
-            ));
+        validate_complete_provider_pty_census(&expected_ids, &batch)?;
+        let mut observed_by_id = BTreeMap::new();
+        for observed in &batch.observations {
+            observed_by_id.insert(observed.runtime_id.as_str(), observed);
         }
 
         let mut authored_providers = Vec::with_capacity(provider_runtime_ids.len());
         for (entry, runtime_id) in provider_runtime_ids {
-            let observed = batch
-                .observations
-                .iter()
-                .find(|observed| observed.runtime_id == runtime_id)
-                .expect("exact id bijection checked");
+            let observed = observed_by_id
+                .get(runtime_id.as_str())
+                .expect("declared provider presence checked");
+            let receipt = observe_prompt_authority(entry, host, &runtime_id, &observed.tags)?;
             let (status, runtime_generation_id) = match &observed.state {
-                ObservedState::Running(generation) => (
-                    ProviderTaskStatus::Running,
-                    Some(generation.generation_id().to_owned()),
-                ),
+                ObservedState::Running(generation) => {
+                    let process_pid = observed
+                        .tags
+                        .get(OBSERVED_PROCESS_PID_TAG)
+                        .ok_or_else(|| {
+                            AdmissionError::Invalid(format!(
+                                "provider {runtime_id:?} lacks exact PTY child-process evidence"
+                            ))
+                        })?
+                        .parse::<u32>()
+                        .map_err(|error| {
+                            AdmissionError::Invalid(format!(
+                                "provider {runtime_id:?} child-process pid is invalid: {error}"
+                            ))
+                        })?;
+                    observe_effective_prompt_injection(entry, &receipt, process_pid)?;
+                    (
+                        ProviderTaskStatus::Running,
+                        Some(generation.generation_id().to_owned()),
+                    )
+                }
                 ObservedState::Exited | ObservedState::Vanished => {
                     (ProviderTaskStatus::Stopped, None)
                 }
@@ -1325,7 +1473,6 @@ impl<O: RuntimeObservationSource + ?Sized> crate::cutover_admission::ProviderFle
                 }
                 ObservedState::Absent => (ProviderTaskStatus::Absent, None),
             };
-            observe_prompt_authority(entry, host, &runtime_id, &observed.tags)?;
             authored_providers.push(ProviderTaskObservation {
                 identity: entry.identity.clone(),
                 status,
@@ -1334,8 +1481,282 @@ impl<O: RuntimeObservationSource + ?Sized> crate::cutover_admission::ProviderFle
             });
         }
 
+        let recheck = self.observer.observe_complete_pty_root();
+        validate_complete_provider_pty_census(&expected_ids, &recheck)?;
+        validate_provider_carriers_unchanged(&expected_ids, &batch, &recheck)?;
+
         Ok(authored_providers)
     }
+}
+
+pub(crate) fn validate_provider_action_preflight(
+    declaration_root: &Path,
+    logical_catalog: &Path,
+    host: &crate::cutover_admission::HostId,
+    action: &crate::cutover_admission::ProviderFleetProofAction,
+    expected_catalog_sha256: &str,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    let observed_sha256 = crate::catalog_transaction::declaration_root_sha256_locked(
+        declaration_root,
+    )
+    .map_err(|error| {
+        AdmissionError::Invalid(format!(
+            "compute prospective provider catalog digest: {error:#}"
+        ))
+    })?;
+    if observed_sha256 != expected_catalog_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "prospective provider catalog digest mismatch: expected {expected_catalog_sha256}, found {observed_sha256}"
+        )));
+    }
+    let found = crate::discover(declaration_root);
+    if !found.errors.is_empty() || !found.warnings.is_empty() {
+        return Err(AdmissionError::Invalid(
+            "provider preflight requires warning-free exact prospective catalog discovery"
+                .to_owned(),
+        ));
+    }
+    let authored = found
+        .specs
+        .iter()
+        .filter(|spec| spec.resolved_host(host.as_str()) == host.as_str() && !spec.retired)
+        .flat_map(|spec| {
+            spec.tasks
+                .iter()
+                .filter(|task| task.name == "agent" && !task.derived && task.kind == TaskKind::Pty)
+                .map(move |task| (spec, task))
+        })
+        .collect::<Vec<_>>();
+    if authored.len() != action.providers.len()
+        || authored
+            .iter()
+            .any(|(_, task)| task.lifecycle != TaskLifecycle::AdoptOnly)
+    {
+        return Err(AdmissionError::Conflict(
+            "prospective catalog provider inventory is not the exact adopt-only action fleet"
+                .to_owned(),
+        ));
+    }
+    for entry in &action.providers {
+        let matches = authored
+            .iter()
+            .filter(|(spec, _)| spec.identity == entry.identity)
+            .collect::<Vec<_>>();
+        let [(spec, task)] = matches.as_slice() else {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} is missing or non-unique in prospective catalog",
+                entry.identity
+            )));
+        };
+        if entry.host != *host {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} host differs from preflight host",
+                entry.identity
+            )));
+        }
+        let relative_spec = spec.path.strip_prefix(declaration_root).map_err(|_| {
+            AdmissionError::Invalid("prospective provider declaration escaped its root".to_owned())
+        })?;
+        let logical_spec_dir = logical_catalog
+            .join(relative_spec)
+            .parent()
+            .unwrap_or(logical_catalog)
+            .to_path_buf();
+        let workspace = spec
+            .workspace
+            .as_deref()
+            .map(|value| {
+                logical_spec_dir.join(crate::expand::expand_catalog(value, logical_catalog))
+            })
+            .ok_or_else(|| {
+                AdmissionError::Conflict(format!(
+                    "provider {:?} has no authored workspace",
+                    entry.identity
+                ))
+            })?;
+        if workspace != entry.workspace {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} workspace differs from prospective catalog",
+                entry.identity
+            )));
+        }
+        let argv = match (&task.command, &task.argv) {
+            (None, Some(argv)) => argv
+                .iter()
+                .map(|argument| crate::expand::expand_catalog(argument, logical_catalog))
+                .collect::<Vec<_>>(),
+            _ => {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} does not have one structured argv",
+                    entry.identity
+                )));
+            }
+        };
+        if argv != entry.canonical_argv {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} argv differs from prospective catalog",
+                entry.identity
+            )));
+        }
+        for (flag, expected) in [
+            ("--persona", entry.persona.as_str()),
+            ("--harness", entry.harness.as_str()),
+            ("--model", entry.model.as_str()),
+            ("--effort", entry.effort.as_str()),
+            ("--mode", entry.mode.as_str()),
+            ("--boot", entry.boot_contract.as_str()),
+        ] {
+            if exact_provider_argv_axis(&argv, flag)? != expected {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} {flag} differs from prospective catalog",
+                    entry.identity
+                )));
+            }
+        }
+        let persona = task
+            .env
+            .get("AGENT_PERSONA")
+            .map(|value| crate::expand::expand_catalog(value, logical_catalog));
+        if persona.as_deref() != Some(entry.persona.as_str()) {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} AGENT_PERSONA differs from prospective catalog",
+                entry.identity
+            )));
+        }
+        let profile = task
+            .env
+            .get("AGENT_RUNTIME_PROFILE")
+            .map(|value| PathBuf::from(crate::expand::expand_catalog(value, logical_catalog)));
+        if profile.as_deref() != Some(entry.prompt.runtime_profile_path.as_path()) {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} runtime profile differs from prospective catalog",
+                entry.identity
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn exact_provider_argv_axis<'a>(
+    argv: &'a [String],
+    flag: &str,
+) -> crate::cutover_admission::AdmissionResult<&'a str> {
+    use crate::cutover_admission::AdmissionError;
+
+    let inline = format!("{flag}=");
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        if argv[index] == flag {
+            let value = argv.get(index + 1).ok_or_else(|| {
+                AdmissionError::Invalid(format!("provider argv {flag} has no value"))
+            })?;
+            values.push(value.as_str());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argv[index].strip_prefix(&inline) {
+            values.push(value);
+        }
+        index += 1;
+    }
+    match values.as_slice() {
+        [value] if !value.is_empty() && !value.starts_with("--") => Ok(*value),
+        [] => Err(AdmissionError::Invalid(format!(
+            "provider argv omits {flag}"
+        ))),
+        _ => Err(AdmissionError::Invalid(format!(
+            "provider argv has invalid or repeated {flag}"
+        ))),
+    }
+}
+
+fn validate_complete_provider_pty_census(
+    expected_ids: &BTreeSet<String>,
+    batch: &ObservationBatch,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    if !batch.complete || !batch.errors.is_empty() {
+        return Err(AdmissionError::Invalid(
+            "provider proof requires one complete PTY-root census".to_owned(),
+        ));
+    }
+    let mut observed_ids = BTreeSet::new();
+    for observed in &batch.observations {
+        if !observed_ids.insert(observed.runtime_id.as_str()) {
+            return Err(AdmissionError::Conflict(format!(
+                "complete PTY-root census contains duplicate runtime id {:?}",
+                observed.runtime_id
+            )));
+        }
+        if !expected_ids.contains(&observed.runtime_id)
+            && (observed.runtime_id.ends_with(".agent")
+                || observed.tags.get("role").map(String::as_str) == Some("agent")
+                || observed.tags.get("run.role").map(String::as_str) == Some("coding-agent")
+                || observed.tags.contains_key("agent.provider")
+                || observed.tags.contains_key("agent.harness")
+                || observed.tags.contains_key("agent.tool")
+                || observed.tags.keys().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "agent.launch.receipt.schema"
+                            | "agent.launch.receipt.path"
+                            | "agent.launch.receipt.sha256"
+                            | "agent.generation.id"
+                    )
+                }))
+        {
+            return Err(AdmissionError::Conflict(format!(
+                "complete PTY-root census contains undeclared provider PTY {:?}",
+                observed.runtime_id
+            )));
+        }
+    }
+    if expected_ids
+        .iter()
+        .any(|runtime_id| !observed_ids.contains(runtime_id.as_str()))
+    {
+        return Err(AdmissionError::Conflict(
+            "complete PTY-root census is missing a declared provider PTY".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_carriers_unchanged(
+    expected_ids: &BTreeSet<String>,
+    before: &ObservationBatch,
+    after: &ObservationBatch,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    fn rows<'a>(
+        expected_ids: &BTreeSet<String>,
+        batch: &'a ObservationBatch,
+    ) -> BTreeMap<&'a str, &'a RuntimeObservation> {
+        batch
+            .observations
+            .iter()
+            .filter(|row| expected_ids.contains(&row.runtime_id))
+            .map(|row| (row.runtime_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>()
+    }
+    let before = rows(expected_ids, before);
+    let after = rows(expected_ids, after);
+    if before.len() != expected_ids.len()
+        || after.len() != expected_ids.len()
+        || before
+            .iter()
+            .any(|(runtime_id, row)| after.get(runtime_id).copied() != Some(*row))
+    {
+        return Err(AdmissionError::Conflict(
+            "provider carrier changed after live prompt-injection inspection".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1378,12 +1799,19 @@ struct AxeLaunchReceipt {
     trajectory_sha256: String,
 }
 
+struct ObservedPromptAuthority {
+    receipt: AxeLaunchReceipt,
+    account_executable: PathBuf,
+    account_environment: BTreeMap<String, String>,
+    all_account_environment_keys: BTreeSet<String>,
+}
+
 fn observe_prompt_authority(
     entry: &crate::cutover_admission::ProviderFleetEntry,
     host: &crate::cutover_admission::HostId,
     runtime_id: &str,
     tags: &BTreeMap<String, String>,
-) -> crate::cutover_admission::AdmissionResult<()> {
+) -> crate::cutover_admission::AdmissionResult<ObservedPromptAuthority> {
     use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
 
     let prompt = &entry.prompt;
@@ -1436,6 +1864,8 @@ fn observe_prompt_authority(
             entry.identity
         )));
     }
+    let (account_executable, account_environment, all_account_environment_keys) =
+        profile_account_binding(&profile, entry)?;
     let persona_prompt_bytes = read_bounded_regular(&prompt.persona_prompt_path, "persona prompt")
         .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
     let observed_prompt = format!("{:x}", Sha256::digest(&persona_prompt_bytes));
@@ -1515,7 +1945,79 @@ fn observe_prompt_authority(
             entry.identity
         )));
     }
-    Ok(())
+    Ok(ObservedPromptAuthority {
+        receipt,
+        account_executable,
+        account_environment,
+        all_account_environment_keys,
+    })
+}
+
+fn profile_account_binding(
+    profile: &serde_json::Value,
+    entry: &crate::cutover_admission::ProviderFleetEntry,
+) -> crate::cutover_admission::AdmissionResult<(PathBuf, BTreeMap<String, String>, BTreeSet<String>)>
+{
+    use crate::cutover_admission::AdmissionError;
+
+    let accounts = profile
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            AdmissionError::Invalid("runtime profile has no accounts array".to_owned())
+        })?;
+    let mut all_keys = BTreeSet::new();
+    let mut selected = Vec::new();
+    for account in accounts {
+        let env = account
+            .pointer("/execution/env")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                AdmissionError::Invalid("runtime profile account has no execution.env".to_owned())
+            })?;
+        for (key, value) in env {
+            if !value.is_string() {
+                return Err(AdmissionError::Invalid(format!(
+                    "runtime profile account env {key:?} is not a string"
+                )));
+            }
+            all_keys.insert(key.clone());
+        }
+        if account.get("accountId").and_then(serde_json::Value::as_str)
+            == Some(entry.account.as_str())
+        {
+            selected.push((account, env));
+        }
+    }
+    let [(account, env)] = selected.as_slice() else {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} account is missing or non-unique in runtime profile",
+            entry.identity
+        )));
+    };
+    if account.get("harness").and_then(serde_json::Value::as_str) != Some(entry.harness.as_str()) {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} account harness differs from runtime profile",
+            entry.identity
+        )));
+    }
+    let executable = account
+        .pointer("/execution/binPath")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            AdmissionError::Invalid("runtime profile account has no execution.binPath".to_owned())
+        })?;
+    let environment = env
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value.as_str().expect("validated string").to_owned(),
+            )
+        })
+        .collect();
+    Ok((executable, environment, all_keys))
 }
 
 fn provider_argv_sha256(
@@ -1553,6 +2055,364 @@ fn provider_argv_sha256(
         hash.update(argument.as_bytes());
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn observe_effective_prompt_injection(
+    entry: &crate::cutover_admission::ProviderFleetEntry,
+    authority: &ObservedPromptAuthority,
+    pid: u32,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (entry, authority, pid);
+        return Err(AdmissionError::Invalid(
+            "live provider injection observation is unsupported on this platform".to_owned(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let snapshot = read_stable_proc_snapshot(pid).map_err(|error| {
+            AdmissionError::Invalid(format!(
+                "read stable live provider {:?} process snapshot: {error:#}",
+                entry.identity
+            ))
+        })?;
+        let prompt_bytes =
+            read_bounded_regular(&entry.prompt.persona_prompt_path, "persona prompt")
+                .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+        validate_effective_prompt_injection(
+            entry.prompt.injection_kind,
+            &entry.prompt.persona_prompt_path,
+            &prompt_bytes,
+            &snapshot.argv,
+            &snapshot.env,
+        )?;
+        validate_live_provider_argv(
+            &authority.receipt.canonical_provider_argv,
+            &authority.receipt.provider_argv_sha256,
+            entry.prompt.injection_kind,
+            &entry.prompt.persona_prompt_sha256,
+            &prompt_bytes,
+            &snapshot.argv,
+            &authority.account_executable,
+            &snapshot.identity,
+        )?;
+        validate_live_account_environment(
+            &authority.account_environment,
+            &authority.all_account_environment_keys,
+            &snapshot.env,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcIdentity {
+    start_time_ticks: u64,
+    executable: PathBuf,
+    executable_device: u64,
+    executable_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcSnapshot {
+    identity: ProcIdentity,
+    argv: Vec<String>,
+    env: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_stable_proc_snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
+    let first = read_proc_snapshot_once(pid)?;
+    let second = read_proc_snapshot_once(pid)?;
+    validate_stable_proc_snapshots(&first, &second)?;
+    Ok(second)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_snapshot_once(pid: u32) -> anyhow::Result<ProcSnapshot> {
+    let before = read_proc_identity(pid)?;
+    let argv = read_proc_nul_list(pid, "cmdline")?;
+    let env = read_proc_nul_list(pid, "environ")?;
+    let after = read_proc_identity(pid)?;
+    anyhow::ensure!(
+        before == after,
+        "provider process identity changed while cmdline/environment were read"
+    );
+    Ok(ProcSnapshot {
+        identity: after,
+        argv,
+        env,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_stable_proc_snapshots(
+    first: &ProcSnapshot,
+    second: &ProcSnapshot,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        first == second,
+        "provider cmdline/environment changed between complete process snapshots"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_identity(pid: u32) -> anyhow::Result<ProcIdentity> {
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let stat = std::fs::read_to_string(root.join("stat"))
+        .with_context(|| format!("read {}/stat", root.display()))?;
+    let suffix = stat
+        .rsplit_once(") ")
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| anyhow::anyhow!("{}/stat has no process-name terminator", root.display()))?;
+    let start_time_ticks = suffix
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("{}/stat lacks starttime", root.display()))?
+        .parse::<u64>()
+        .with_context(|| format!("parse {}/stat starttime", root.display()))?;
+    let executable = std::fs::read_link(root.join("exe"))
+        .with_context(|| format!("read {}/exe", root.display()))?;
+    let executable_metadata = std::fs::metadata(root.join("exe"))
+        .with_context(|| format!("inspect {}/exe", root.display()))?;
+    Ok(ProcIdentity {
+        start_time_ticks,
+        executable,
+        executable_device: executable_metadata.dev(),
+        executable_inode: executable_metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_nul_list(pid: u32, name: &str) -> anyhow::Result<Vec<String>> {
+    const MAX_PROC_BYTES: u64 = 4 * 1024 * 1024;
+    let path = PathBuf::from(format!("/proc/{pid}/{name}"));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROC_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PROC_BYTES,
+        "{} exceeds {MAX_PROC_BYTES} bytes",
+        path.display()
+    );
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .map(|value| {
+            String::from_utf8(value.to_vec())
+                .with_context(|| format!("{} contains non-UTF-8 data", path.display()))
+        })
+        .collect()
+}
+
+fn validate_effective_prompt_injection(
+    kind: crate::cutover_admission::PromptInjectionKind,
+    prompt_path: &Path,
+    prompt_bytes: &[u8],
+    argv: &[String],
+    env: &[String],
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+
+    let prompt_path = prompt_path
+        .to_str()
+        .ok_or_else(|| AdmissionError::Invalid("persona prompt path is not UTF-8".to_owned()))?;
+    let prompt = std::str::from_utf8(prompt_bytes).map_err(|error| {
+        AdmissionError::Invalid(format!("persona prompt is not UTF-8: {error}"))
+    })?;
+    let encoded_prompt = serde_json::to_string(prompt).map_err(|error| {
+        AdmissionError::Invalid(format!("encode Codex developer instructions: {error}"))
+    })?;
+    let codex_value = format!("developer_instructions={encoded_prompt}");
+
+    let flag_values = |flag: &str| {
+        argv.iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_str() == flag)
+            .map(|(index, _)| argv.get(index + 1).map(String::as_str))
+            .collect::<Vec<_>>()
+    };
+    let claude = flag_values("--append-system-prompt-file");
+    let pi = flag_values("--append-system-prompt");
+    let codex = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == "-c")
+        .filter_map(|(index, _)| argv.get(index + 1).map(String::as_str))
+        .filter(|value| value.starts_with("developer_instructions="))
+        .collect::<Vec<_>>();
+    let opencode = env
+        .iter()
+        .filter_map(|value| value.strip_prefix("AGENT_SYSTEM_PROMPT_FILE="))
+        .collect::<Vec<_>>();
+
+    let exact = match kind {
+        PromptInjectionKind::ClaudeAppendSystemPromptFile => {
+            claude == [Some(prompt_path)]
+                && pi.is_empty()
+                && codex.is_empty()
+                && opencode.is_empty()
+        }
+        PromptInjectionKind::CodexDeveloperInstructions => {
+            codex == [codex_value.as_str()]
+                && claude.is_empty()
+                && pi.is_empty()
+                && opencode.is_empty()
+        }
+        PromptInjectionKind::OpencodeSystemPromptFile => {
+            opencode == [prompt_path] && claude.is_empty() && pi.is_empty() && codex.is_empty()
+        }
+        PromptInjectionKind::PiAppendSystemPromptFile => {
+            pi == [Some(prompt_path)]
+                && claude.is_empty()
+                && codex.is_empty()
+                && opencode.is_empty()
+        }
+    };
+    if !exact {
+        return Err(AdmissionError::Conflict(
+            "live provider process does not contain one exact harness-specific prompt injection"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_provider_argv(
+    projected: &[String],
+    expected_sha256: &str,
+    injection_kind: crate::cutover_admission::PromptInjectionKind,
+    prompt_sha256: &str,
+    prompt_bytes: &[u8],
+    actual: &[String],
+    account_executable: &Path,
+    process_identity: &ProcIdentity,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+
+    let projected_executable = projected.first().ok_or_else(|| {
+        AdmissionError::Invalid("canonical provider argv has no executable".to_owned())
+    })?;
+    if Path::new(projected_executable) != account_executable {
+        return Err(AdmissionError::Conflict(
+            "canonical provider executable differs from selected account binding".to_owned(),
+        ));
+    }
+    let executable = account_executable.canonicalize().map_err(|error| {
+        AdmissionError::Invalid(format!(
+            "canonicalize selected account executable {}: {error}",
+            account_executable.display()
+        ))
+    })?;
+    let metadata = std::fs::metadata(&executable).map_err(|error| {
+        AdmissionError::io(
+            format!(
+                "inspect selected account executable {}",
+                executable.display()
+            ),
+            error,
+        )
+    })?;
+    if executable != process_identity.executable
+        || metadata.dev() != process_identity.executable_device
+        || metadata.ino() != process_identity.executable_inode
+    {
+        return Err(AdmissionError::Conflict(
+            "live provider executable identity differs from selected account executable".to_owned(),
+        ));
+    }
+
+    let mut normalized = actual.to_vec();
+    if injection_kind == PromptInjectionKind::CodexDeveloperInstructions {
+        let prompt = std::str::from_utf8(prompt_bytes).map_err(|error| {
+            AdmissionError::Invalid(format!("Codex persona prompt is not UTF-8: {error}"))
+        })?;
+        let encoded = serde_json::to_string(prompt).map_err(|error| {
+            AdmissionError::Invalid(format!("encode Codex developer instructions: {error}"))
+        })?;
+        let exact = format!("developer_instructions={encoded}");
+        let indexes = normalized
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == &exact).then_some(index))
+            .collect::<Vec<_>>();
+        let [index] = indexes.as_slice() else {
+            return Err(AdmissionError::Conflict(
+                "live Codex argv does not contain one exact developer-instructions value"
+                    .to_owned(),
+            ));
+        };
+        normalized[*index] = format!("developer_instructions=<prompt-sha256:{prompt_sha256}>");
+    }
+    if normalized != projected {
+        return Err(AdmissionError::Conflict(
+            "live provider argv differs from the canonical Axe projection".to_owned(),
+        ));
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"axe.agent-launch-provider-argv.v1\0");
+    for argument in actual {
+        hash.update((argument.len() as u64).to_be_bytes());
+        hash.update(argument.as_bytes());
+    }
+    if format!("{:x}", hash.finalize()) != expected_sha256 {
+        return Err(AdmissionError::Conflict(
+            "live provider argv differs from the receipt provider argv digest".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_account_environment(
+    selected: &BTreeMap<String, String>,
+    all_account_keys: &BTreeSet<String>,
+    live: &[String],
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    let mut environment = BTreeMap::new();
+    for assignment in live {
+        let Some((key, value)) = assignment.split_once('=') else {
+            return Err(AdmissionError::Invalid(
+                "live provider environment contains an assignment without `=`".to_owned(),
+            ));
+        };
+        if environment.insert(key, value).is_some() {
+            return Err(AdmissionError::Conflict(format!(
+                "live provider environment repeats {key:?}"
+            )));
+        }
+    }
+    for key in all_account_keys {
+        match selected.get(key) {
+            Some(expected) if environment.get(key.as_str()).copied() == Some(expected.as_str()) => {
+            }
+            None if !environment.contains_key(key.as_str()) => {}
+            _ => {
+                return Err(AdmissionError::Conflict(format!(
+                    "live provider account environment key {key:?} differs from selected runtime-profile account"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_bounded_regular(path: &Path, label: &str) -> anyhow::Result<Vec<u8>> {
@@ -2028,9 +2888,22 @@ pub fn up_loop_with_ownership(
     interval: Duration,
     on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    up_loop_with_ownership_ready(ownership, runner, interval, || Ok(()), on_report)
+}
+
+/// Enter the resident supervisor and invoke `on_ready` exactly once while the caller's host
+/// authority is still retained and immediately before the first reconcile pass can begin.
+pub fn up_loop_with_ownership_ready(
+    ownership: HostOwnership,
+    runner: &dyn Runner,
+    interval: Duration,
+    on_ready: impl FnOnce() -> anyhow::Result<()>,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
     let root = ownership.catalog().to_path_buf();
     let this_host = ownership.host().to_owned();
     install_signal_handler();
+    on_ready().context("publish retained-ownership supervisor readiness")?;
     up_loop_until(
         &ownership, &root, &this_host, runner, interval, &STOP, on_report,
     )
@@ -2212,6 +3085,14 @@ mod tests {
             let profile_path = temp.path().join("profile.json");
             let profile_bytes = serde_json::to_vec(&serde_json::json!({
                 "personas": {"prompts": {"worker": prompt_path}},
+                "accounts": [{
+                    "accountId": "account-a",
+                    "harness": harness,
+                    "execution": {
+                        "binPath": format!("/nix/store/{harness}/bin/{harness}"),
+                        "env": {},
+                    },
+                }],
             }))
             .unwrap();
             std::fs::write(&profile_path, &profile_bytes).unwrap();
@@ -2353,6 +3234,449 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn live_prompt_injection_requires_one_exact_harness_specific_seam() {
+        use crate::cutover_admission::PromptInjectionKind;
+
+        let prompt_path = Path::new("/nix/store/persona/prompt.md");
+        let prompt_bytes = b"exact persona prompt\n";
+        let encoded = serde_json::to_string("exact persona prompt\n").unwrap();
+        let cases = [
+            (
+                PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                vec![
+                    "claude".to_owned(),
+                    "--append-system-prompt-file".to_owned(),
+                    prompt_path.display().to_string(),
+                ],
+                Vec::new(),
+            ),
+            (
+                PromptInjectionKind::CodexDeveloperInstructions,
+                vec![
+                    "codex".to_owned(),
+                    "-c".to_owned(),
+                    format!("developer_instructions={encoded}"),
+                ],
+                Vec::new(),
+            ),
+            (
+                PromptInjectionKind::OpencodeSystemPromptFile,
+                vec!["opencode".to_owned()],
+                vec![format!(
+                    "AGENT_SYSTEM_PROMPT_FILE={}",
+                    prompt_path.display()
+                )],
+            ),
+            (
+                PromptInjectionKind::PiAppendSystemPromptFile,
+                vec![
+                    "pi".to_owned(),
+                    "--append-system-prompt".to_owned(),
+                    prompt_path.display().to_string(),
+                ],
+                Vec::new(),
+            ),
+        ];
+        for (kind, argv, env) in cases {
+            validate_effective_prompt_injection(kind, prompt_path, prompt_bytes, &argv, &env)
+                .unwrap();
+
+            let mut duplicate = argv.clone();
+            match kind {
+                PromptInjectionKind::ClaudeAppendSystemPromptFile => duplicate.extend([
+                    "--append-system-prompt-file".to_owned(),
+                    prompt_path.display().to_string(),
+                ]),
+                PromptInjectionKind::CodexDeveloperInstructions => {
+                    duplicate.extend(["-c".to_owned(), format!("developer_instructions={encoded}")])
+                }
+                PromptInjectionKind::OpencodeSystemPromptFile => {}
+                PromptInjectionKind::PiAppendSystemPromptFile => duplicate.extend([
+                    "--append-system-prompt".to_owned(),
+                    prompt_path.display().to_string(),
+                ]),
+            }
+            let mut duplicate_env = env.clone();
+            if kind == PromptInjectionKind::OpencodeSystemPromptFile {
+                duplicate_env.push(format!(
+                    "AGENT_SYSTEM_PROMPT_FILE={}",
+                    prompt_path.display()
+                ));
+            }
+            assert!(
+                validate_effective_prompt_injection(
+                    kind,
+                    prompt_path,
+                    prompt_bytes,
+                    &duplicate,
+                    &duplicate_env,
+                )
+                .is_err(),
+                "duplicate {kind:?} injection was accepted"
+            );
+
+            let mut competing_env = env.clone();
+            competing_env.push(format!(
+                "AGENT_SYSTEM_PROMPT_FILE={}",
+                prompt_path.display()
+            ));
+            if kind != PromptInjectionKind::OpencodeSystemPromptFile {
+                assert!(
+                    validate_effective_prompt_injection(
+                        kind,
+                        prompt_path,
+                        prompt_bytes,
+                        &argv,
+                        &competing_env,
+                    )
+                    .is_err(),
+                    "competing {kind:?} injection was accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_provider_argv_rejects_binary_model_or_effort_drift_with_exact_prompt_seam() {
+        use crate::cutover_admission::PromptInjectionKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("claude");
+        std::fs::write(&executable, b"provider\n").unwrap();
+        let executable = executable.canonicalize().unwrap();
+        let executable_metadata = std::fs::metadata(&executable).unwrap();
+        let process_identity = ProcIdentity {
+            start_time_ticks: 42,
+            executable: executable.clone(),
+            executable_device: executable_metadata.dev(),
+            executable_inode: executable_metadata.ino(),
+        };
+        let prompt = b"exact persona prompt\n";
+        let prompt_sha256 = format!("{:x}", Sha256::digest(prompt));
+        let projected = vec![
+            executable.display().to_string(),
+            "--model".to_owned(),
+            "sonnet".to_owned(),
+            "--effort".to_owned(),
+            "high".to_owned(),
+            "--append-system-prompt-file".to_owned(),
+            "/nix/store/persona/prompt.md".to_owned(),
+        ];
+        let expected_sha256 = provider_argv_sha256(
+            &projected,
+            PromptInjectionKind::ClaudeAppendSystemPromptFile,
+            &prompt_sha256,
+            prompt,
+        )
+        .unwrap();
+        validate_live_provider_argv(
+            &projected,
+            &expected_sha256,
+            PromptInjectionKind::ClaudeAppendSystemPromptFile,
+            &prompt_sha256,
+            prompt,
+            &projected,
+            &executable,
+            &process_identity,
+        )
+        .unwrap();
+
+        for (index, replacement) in [(0, "/foreign/bin/claude"), (2, "opus"), (4, "low")] {
+            let mut changed = projected.clone();
+            changed[index] = replacement.to_owned();
+            assert!(
+                validate_live_provider_argv(
+                    &projected,
+                    &expected_sha256,
+                    PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                    &prompt_sha256,
+                    prompt,
+                    &changed,
+                    &executable,
+                    &process_identity,
+                )
+                .is_err()
+            );
+        }
+
+        let foreign_executable = temp.path().join("foreign-claude");
+        std::fs::write(&foreign_executable, b"foreign\n").unwrap();
+        let foreign_executable = foreign_executable.canonicalize().unwrap();
+        let foreign_metadata = std::fs::metadata(&foreign_executable).unwrap();
+        let foreign_identity = ProcIdentity {
+            start_time_ticks: process_identity.start_time_ticks,
+            executable: foreign_executable,
+            executable_device: foreign_metadata.dev(),
+            executable_inode: foreign_metadata.ino(),
+        };
+        assert!(
+            validate_live_provider_argv(
+                &projected,
+                &expected_sha256,
+                PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                &prompt_sha256,
+                prompt,
+                &projected,
+                &executable,
+                &foreign_identity,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_proc_snapshot_rejects_argv_or_environment_drift_with_same_carrier() {
+        let stable = ProcSnapshot {
+            identity: ProcIdentity {
+                start_time_ticks: 42,
+                executable: PathBuf::from("/nix/store/provider/bin/provider"),
+                executable_device: 7,
+                executable_inode: 8,
+            },
+            argv: vec!["provider".to_owned(), "--model=sonnet".to_owned()],
+            env: vec!["AGENT_SYSTEM_PROMPT_FILE=/nix/store/prompt".to_owned()],
+        };
+        validate_stable_proc_snapshots(&stable, &stable).unwrap();
+
+        let mut argv_drift = stable.clone();
+        argv_drift.argv[1] = "--model=opus".to_owned();
+        assert!(validate_stable_proc_snapshots(&stable, &argv_drift).is_err());
+
+        let mut env_drift = stable.clone();
+        env_drift.env[0] = "AGENT_SYSTEM_PROMPT_FILE=/foreign/prompt".to_owned();
+        assert!(validate_stable_proc_snapshots(&stable, &env_drift).is_err());
+    }
+
+    #[test]
+    fn live_account_environment_requires_selected_values_and_scrubs_unselected_keys() {
+        let selected = BTreeMap::from([("CODEX_HOME".to_owned(), "/accounts/codex-a".to_owned())]);
+        let all_keys = BTreeSet::from(["CODEX_HOME".to_owned(), "CLAUDE_CONFIG_DIR".to_owned()]);
+        validate_live_account_environment(
+            &selected,
+            &all_keys,
+            &[
+                "PATH=/bin".to_owned(),
+                "CODEX_HOME=/accounts/codex-a".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            validate_live_account_environment(
+                &selected,
+                &all_keys,
+                &["CODEX_HOME=/accounts/codex-b".to_owned()],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_live_account_environment(
+                &selected,
+                &all_keys,
+                &[
+                    "CODEX_HOME=/accounts/codex-a".to_owned(),
+                    "CLAUDE_CONFIG_DIR=/accounts/claude-b".to_owned(),
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_census_allows_unrelated_pty_but_rejects_undeclared_provider_and_duplicates() {
+        let expected = BTreeSet::from(["custom-provider-runtime".to_owned()]);
+        let provider = RuntimeObservation {
+            runtime_id: "custom-provider-runtime".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([(
+                "agent.launch.receipt.schema".to_owned(),
+                "axe.agent-launch-receipt.v1".to_owned(),
+            )]),
+        };
+        let unrelated = RuntimeObservation {
+            runtime_id: "host.shell".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([("run.role".to_owned(), "dev-server".to_owned())]),
+        };
+        let clean = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), unrelated],
+            errors: Vec::new(),
+        };
+        validate_complete_provider_pty_census(&expected, &clean).unwrap();
+        validate_provider_carriers_unchanged(&expected, &clean, &clean).unwrap();
+
+        let mut changed_carrier = clean.clone();
+        changed_carrier.observations[0].tags.insert(
+            OBSERVED_PROCESS_PID_TAG.to_owned(),
+            "different-child".to_owned(),
+        );
+        assert!(validate_provider_carriers_unchanged(&expected, &clean, &changed_carrier).is_err());
+
+        let foreign = RuntimeObservation {
+            runtime_id: "arbitrary-provider-id".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([("role".to_owned(), "agent".to_owned())]),
+        };
+        let foreign_batch = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), foreign],
+            errors: Vec::new(),
+        };
+        assert!(validate_complete_provider_pty_census(&expected, &foreign_batch).is_err());
+
+        let legacy = RuntimeObservation {
+            runtime_id: "co2-bear-a078".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([("run.role".to_owned(), "coding-agent".to_owned())]),
+        };
+        let legacy_batch = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), legacy],
+            errors: Vec::new(),
+        };
+        assert!(validate_complete_provider_pty_census(&expected, &legacy_batch).is_err());
+
+        let duplicate_batch = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), provider],
+            errors: Vec::new(),
+        };
+        assert!(validate_complete_provider_pty_census(&expected, &duplicate_batch).is_err());
+    }
+
+    #[test]
+    fn complete_pty_census_binds_daemon_generation_to_live_child_process_pid() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pty = temp.path().join("pty");
+        std::fs::write(
+            &pty,
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"custom-provider-runtime","process":{"alive":true,"pid":99},"daemon":{"pid":41},"createdAt":"2026-07-31T10:00:00.000Z"}]'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let observer = PtyCli {
+            bin: pty.display().to_string(),
+            catalog_root: temp.path().to_path_buf(),
+        };
+        let mut batch = ObservationBatch {
+            complete: true,
+            observations: vec![RuntimeObservation {
+                runtime_id: "custom-provider-runtime".to_owned(),
+                state: ObservedState::Running(
+                    RuntimeGeneration::new(
+                        41,
+                        "2026-07-31T10:00:00.000Z".to_owned(),
+                        "generation-a".to_owned(),
+                    )
+                    .unwrap(),
+                ),
+                tags: BTreeMap::new(),
+            }],
+            errors: Vec::new(),
+        };
+        observer
+            .enrich_running_process_pids(temp.path(), &mut batch)
+            .unwrap();
+        assert_eq!(
+            batch.observations[0]
+                .tags
+                .get(OBSERVED_PROCESS_PID_TAG)
+                .map(String::as_str),
+            Some("99")
+        );
+
+        if let ObservedState::Running(generation) = &mut batch.observations[0].state {
+            *generation = RuntimeGeneration::new(
+                42,
+                "2026-07-31T10:00:00.000Z".to_owned(),
+                "generation-b".to_owned(),
+            )
+            .unwrap();
+        }
+        assert!(
+            observer
+                .enrich_running_process_pids(temp.path(), &mut batch)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_observer_rejects_catalog_agent_pty_that_is_not_adopt_only_before_observation() {
+        use crate::cutover_admission::{
+            CanonicalCatalog, HostId, LaunchPromptAuthority, PromptInjectionKind,
+            ProviderFleetEntry, ProviderFleetObserver, ProviderFleetProofAction,
+        };
+
+        struct NeverObserve;
+        impl RuntimeObservationSource for NeverObserve {
+            fn observe_complete_pty_root(&self) -> ObservationBatch {
+                panic!("non-adopt-only catalog must fail before runtime observation")
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            temp.path().join("agent.kdl"),
+            format!(
+                r#"agent "worker" {{
+  identity "worker"
+  host "testhost"
+  workspace {:?}
+  pty "agent" {{
+    id "custom-provider-runtime"
+    argv "true"
+  }}
+}}
+"#,
+                workspace
+            ),
+        )
+        .unwrap();
+        let host = HostId::parse("testhost").unwrap();
+        let action = ProviderFleetProofAction {
+            providers: vec![ProviderFleetEntry {
+                identity: "worker".to_owned(),
+                host: host.clone(),
+                provider: "codex".to_owned(),
+                account: "account-a".to_owned(),
+                persona: "worker".to_owned(),
+                workspace: workspace.clone(),
+                prompt: LaunchPromptAuthority {
+                    runtime_profile_path: workspace.join("profile.json"),
+                    runtime_profile_sha256: "0".repeat(64),
+                    persona_prompt_path: workspace.join("prompt.md"),
+                    persona_prompt_sha256: "1".repeat(64),
+                    launch_receipt_path: workspace.join("receipt.json"),
+                    launch_receipt_sha256: "2".repeat(64),
+                    injection_kind: PromptInjectionKind::CodexDeveloperInstructions,
+                },
+                canonical_argv: vec!["axe".to_owned()],
+                argv_sha256: "3".repeat(64),
+                profile_sha256: "0".repeat(64),
+                harness: "codex".to_owned(),
+                model: "model-a".to_owned(),
+                effort: "high".to_owned(),
+                mode: "managed-unattended".to_owned(),
+                boot_contract: "managed-v1".to_owned(),
+                launch_generation_id: "launch-a".to_owned(),
+                runtime_generation_id: "runtime-a".to_owned(),
+                trajectory_sha256: "4".repeat(64),
+            }],
+            providers_sha256: "5".repeat(64),
+        };
+        let catalog = CanonicalCatalog::open(temp.path()).unwrap();
+        let runtime = ProviderFleetRuntimeObserver::new(&action, &NeverObserve);
+        assert!(runtime.observe_provider_rows(&catalog, &host).is_err());
     }
 
     fn target(id: &str, cmd: &str) -> TaskTarget {
@@ -3105,7 +4429,7 @@ mod tests {
         )
         .unwrap();
         let batch = PtyCli::new(catalog)
-            .task_observations_at_root(&HashSet::from(["h.worker.agent"]), &loop_path);
+            .task_observations_at_root(Some(&HashSet::from(["h.worker.agent"])), &loop_path);
         assert!(!batch.complete);
         assert!(batch.observations.is_empty());
         assert!(

@@ -8,6 +8,92 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn maybe_pause_at_cutover_test_boundary(boundary: &str) -> Result<()> {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    const BOUNDARY_ENV: &str = "ST2_TEST_CUTOVER_BOUNDARY";
+    const SENTINEL_ENV: &str = "ST2_TEST_CUTOVER_SENTINEL";
+    let (Some(requested_boundary), Some(sentinel)) = (
+        std::env::var_os(BOUNDARY_ENV),
+        std::env::var_os(SENTINEL_ENV),
+    ) else {
+        if std::env::var_os(BOUNDARY_ENV).is_some() || std::env::var_os(SENTINEL_ENV).is_some() {
+            anyhow::bail!(
+                "{BOUNDARY_ENV} and {SENTINEL_ENV} must be supplied together for a cutover test boundary"
+            );
+        }
+        return Ok(());
+    };
+    if requested_boundary != boundary {
+        return Ok(());
+    }
+    let sentinel = PathBuf::from(sentinel);
+    if !sentinel.is_absolute() {
+        anyhow::bail!("{SENTINEL_ENV} must be absolute");
+    }
+    let link_metadata = match std::fs::symlink_metadata(&sentinel) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect cutover test sentinel {}", sentinel.display()));
+        }
+    };
+    let canonical = sentinel
+        .canonicalize()
+        .with_context(|| format!("canonicalize cutover test sentinel {}", sentinel.display()))?;
+    if canonical != sentinel
+        || !link_metadata.is_file()
+        || link_metadata.file_type().is_symlink()
+        || link_metadata.nlink() != 1
+        || link_metadata.uid() != unsafe { libc::geteuid() }
+        || link_metadata.permissions().mode() & 0o022 != 0
+    {
+        anyhow::bail!(
+            "cutover test sentinel must be a canonical, singly linked, current-user regular file not writable by group or world"
+        );
+    }
+    let parent = sentinel
+        .parent()
+        .context("cutover test sentinel has no parent")?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect cutover test directory {}", parent.display()))?;
+    if parent.parent() != Some(Path::new("/tmp"))
+        || !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        anyhow::bail!(
+            "cutover test sentinel must be inside a private current-user temporary directory directly under /tmp"
+        );
+    }
+    let phase = sentinel.with_extension("phase");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&phase)
+        .with_context(|| format!("create cutover test phase {}", phase.display()))?;
+    writeln!(output, "{} {boundary}", std::process::id())?;
+    output.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    // SAFETY: this debug-only, explicitly armed boundary deliberately suspends the candidate so
+    // the live user-systemd test can SIGKILL this exact process.
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        anyhow::bail!("raise SIGSTOP at cutover test boundary");
+    }
+    Ok(())
+}
+
+#[cfg(not(all(debug_assertions, target_os = "linux")))]
+fn maybe_pause_at_cutover_test_boundary(_boundary: &str) -> Result<()> {
+    Ok(())
+}
+
 use st2::{
     Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message, up_loop,
     up_once,
@@ -349,15 +435,8 @@ enum ExecRetirementCmd {
         #[arg(long)]
         host: String,
         /// Prepare one exact runtime id.
-        #[arg(
-            long,
-            required_unless_present = "legacy_set",
-            conflicts_with = "legacy_set"
-        )]
-        id: Option<String>,
-        /// Temporary migration seam: prepare the complete numeric-record namespace.
-        #[arg(long, required_unless_present = "id", conflicts_with = "id")]
-        legacy_set: bool,
+        #[arg(long)]
+        id: String,
         /// Caller-held canonical declaration-root digest.
         #[arg(long, value_name = "HEX")]
         expect_catalog_sha256: String,
@@ -481,10 +560,19 @@ enum ServiceCmd {
 
 #[derive(Subcommand)]
 enum CutoverCmd {
+    /// Install and start the exact restart-always candidate service for one cutover request.
+    Install {
+        /// Canonical bounded st2.cutover-request.v2 file.
+        #[arg(long, value_name = "FILE")]
+        request: PathBuf,
+        /// Caller-held SHA-256 of the exact request bytes.
+        #[arg(long, value_name = "HEX")]
+        expect_request_sha256: String,
+    },
     /// Run or resume one exact durable cutover request, then retain host ownership as the successor
     /// supervisor after successful finalization.
     Run {
-        /// Canonical bounded st2.cutover-request.v1 file.
+        /// Canonical bounded st2.cutover-request.v2 file.
         #[arg(long, value_name = "FILE")]
         request: PathBuf,
         /// Caller-held SHA-256 of the exact request bytes.
@@ -805,7 +893,6 @@ fn main() -> Result<()> {
         Command::Exec(ExecCmd::Retirement(ExecRetirementCmd::Prepare {
             host,
             id,
-            legacy_set,
             expect_catalog_sha256,
             output,
             json,
@@ -815,16 +902,11 @@ fn main() -> Result<()> {
                 json,
                 "`exec retirement prepare` requires explicit --catalog <path>",
             )?;
-            let selector = match (id, legacy_set) {
-                (Some(id), false) => st2::exec_retirement::RetirementSelector::Id(id),
-                (None, true) => st2::exec_retirement::RetirementSelector::LegacySet,
-                _ => unreachable!("clap enforces exactly one retirement selector"),
-            };
             let result = exec_retirement_result(
                 st2::exec_retirement::prepare(st2::exec_retirement::RetirementPrepareRequest {
                     catalog,
                     host,
-                    selector,
+                    selector: st2::exec_retirement::RetirementSelector::Id(id),
                     expect_catalog_sha256,
                     output,
                 }),
@@ -1361,6 +1443,37 @@ fn require_runtime_mutation_admission(root: &Path, host: Option<String>) -> Resu
 
 fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<()> {
     match command {
+        CutoverCmd::Install {
+            request,
+            expect_request_sha256,
+        } => {
+            let loaded =
+                st2::cutover_driver::LoadedCutoverRequest::load(&request, &expect_request_sha256)?;
+            loaded.preflight()?;
+            let request = request
+                .canonicalize()
+                .with_context(|| format!("canonicalize cutover request {}", request.display()))?;
+            let spec = st2::service::CutoverCandidateServiceSpec::new(
+                std::env::current_exe()?.canonicalize()?,
+                loaded.request().canonical_catalog.clone(),
+                request,
+                expect_request_sha256,
+                loaded.request().host.as_str().to_owned(),
+                loaded.request().gate_id.as_str().to_owned(),
+            )?;
+            let unit = st2::service::install_cutover_candidate(&spec)?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema": "st2.cutover-candidate-service.v1",
+                    "unit": spec.unit_name,
+                    "unitPath": unit,
+                    "restart": "always",
+                    "restartSec": st2::service::CUTOVER_RESTART_SEC,
+                }))?
+            );
+            Ok(())
+        }
         CutoverCmd::Run {
             request,
             expect_request_sha256,
@@ -1379,6 +1492,18 @@ fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<(
                     );
                 }
             }
+            let candidate = st2::service::CutoverCandidateServiceSpec::new(
+                std::env::current_exe()?.canonicalize()?,
+                catalog.clone(),
+                request.canonicalize().with_context(|| {
+                    format!("canonicalize cutover request {}", request.display())
+                })?,
+                expect_request_sha256,
+                host.clone(),
+                loaded.request().gate_id.as_str().to_owned(),
+            )?;
+            st2::service::validate_cutover_candidate_process(&candidate)?;
+            maybe_pause_at_cutover_test_boundary("before-run")?;
             // SAFETY: CLI dispatch remains single-threaded here. The request is the sole cutover
             // authority; inherited ambient selection must not leak into a provider or helper.
             unsafe {
@@ -1392,6 +1517,8 @@ fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<(
                     finalized,
                     provider_fleet_proof,
                 } => {
+                    maybe_pause_at_cutover_test_boundary("after-finalize")?;
+                    let (finalized, ownership, readiness) = finalized.into_successor_parts();
                     println!(
                         "{}",
                         serde_json::to_string(&serde_json::json!({
@@ -1399,9 +1526,9 @@ fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<(
                             "outcome": "completed",
                             "catalog": catalog,
                             "host": host,
-                            "historyPath": finalized.finalized.history_path,
-                            "gateId": finalized.finalized.marker.gate_id,
-                            "requestSha256": finalized.finalized.marker.request_sha256,
+                            "historyPath": finalized.history_path,
+                            "gateId": finalized.marker.gate_id,
+                            "requestSha256": finalized.marker.request_sha256,
                             "providerFleetProof": provider_fleet_proof,
                         }))?
                     );
@@ -1410,10 +1537,19 @@ fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<(
                         catalog.display(),
                         host
                     );
-                    st2::run::up_loop_with_ownership(
-                        finalized.ownership,
+                    st2::run::up_loop_with_ownership_ready(
+                        ownership,
                         &runner,
                         Duration::from_secs(30),
+                        move || {
+                            st2::service::retire_ordinary_supervisor_for_cutover()?;
+                            match readiness {
+                                Some(readiness) => readiness
+                                    .supervisor_entered()
+                                    .map_err(|error| anyhow::anyhow!(error)),
+                                None => Ok(()),
+                            }
+                        },
                         |report| {
                             if report.is_noteworthy() {
                                 print_report(report);
@@ -1422,6 +1558,7 @@ fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<(
                     )
                 }
                 st2::cutover_driver::DriverRunOutcome::Finalized(finalized) => {
+                    let (finalized, ownership, readiness) = finalized.into_successor_parts();
                     println!(
                         "{}",
                         serde_json::to_string(&serde_json::json!({
@@ -1434,7 +1571,30 @@ fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<(
                             "requestSha256": finalized.marker.request_sha256,
                         }))?
                     );
-                    Ok(())
+                    eprintln!(
+                        "st2: exact finalized cutover replay; supervising {} on host '{}' with reacquired ownership",
+                        catalog.display(),
+                        host
+                    );
+                    st2::run::up_loop_with_ownership_ready(
+                        ownership,
+                        &runner,
+                        Duration::from_secs(30),
+                        move || {
+                            st2::service::retire_ordinary_supervisor_for_cutover()?;
+                            match readiness {
+                                Some(readiness) => readiness
+                                    .supervisor_entered()
+                                    .map_err(|error| anyhow::anyhow!(error)),
+                                None => Ok(()),
+                            }
+                        },
+                        |report| {
+                            if report.is_noteworthy() {
+                                print_report(report);
+                            }
+                        },
+                    )
                 }
                 st2::cutover_driver::DriverRunOutcome::Fenced(fence) => {
                     let detail = match fence {

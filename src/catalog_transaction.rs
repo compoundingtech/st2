@@ -115,6 +115,14 @@ pub(crate) struct PreparedCatalogApply {
     prepared_input: Option<(PathBuf, String, DeclarationProjection)>,
 }
 
+impl PreparedCatalogApply {
+    pub(crate) fn desired_root_sha256(&self) -> Option<&str> {
+        self.prepared_input
+            .as_ref()
+            .map(|(_, _, projection)| projection.root_sha256.as_str())
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyResult {

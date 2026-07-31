@@ -298,7 +298,16 @@ pub(crate) fn derive_and_validate_catalog(
     host: &str,
     action: &DingReconcileAction,
 ) -> AdmissionResult<()> {
-    let discovered = crate::discover(catalog);
+    validate_ding_action_preflight(catalog, catalog, host, action)
+}
+
+pub(crate) fn validate_ding_action_preflight(
+    declaration_root: &Path,
+    logical_catalog: &Path,
+    host: &str,
+    action: &DingReconcileAction,
+) -> AdmissionResult<()> {
+    let discovered = crate::discover(declaration_root);
     if !discovered.errors.is_empty() || !discovered.warnings.is_empty() {
         return Err(AdmissionError::Conflict(
             "Ding reconciliation requires warning-free catalog discovery".to_owned(),
@@ -321,13 +330,18 @@ pub(crate) fn derive_and_validate_catalog(
                 )));
             }
             let runtime_id = task.id.clone().unwrap_or_else(|| format!("{bus_id}.ding"));
-            let canonical_argv = canonical_ding_argv(task, &bus_id, catalog, &runtime_id)?;
-            let spec_dir = spec.path.parent().ok_or_else(|| {
-                AdmissionError::Invalid("Ding declaration path has no parent".to_owned())
+            let canonical_argv = canonical_ding_argv(task, &bus_id, logical_catalog, &runtime_id)?;
+            let relative_spec = spec.path.strip_prefix(declaration_root).map_err(|_| {
+                AdmissionError::Invalid("Ding declaration escaped its root".to_owned())
             })?;
+            let spec_dir = logical_catalog
+                .join(relative_spec)
+                .parent()
+                .unwrap_or(logical_catalog)
+                .to_path_buf();
             let cwd = match task.cwd.as_deref().or(spec.workspace.as_deref()) {
-                Some(value) => spec_dir.join(crate::expand::expand_catalog(value, catalog)),
-                None => spec_dir.to_path_buf(),
+                Some(value) => spec_dir.join(crate::expand::expand_catalog(value, logical_catalog)),
+                None => spec_dir,
             }
             .canonicalize()
             .map_err(|error| {
@@ -336,7 +350,12 @@ pub(crate) fn derive_and_validate_catalog(
             let mut env = task
                 .env
                 .iter()
-                .map(|(key, value)| (key.clone(), crate::expand::expand_catalog(value, catalog)))
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        crate::expand::expand_catalog(value, logical_catalog),
+                    )
+                })
                 .collect::<BTreeMap<_, _>>();
             if let Some(supervisor) = &spec.supervisor {
                 env.insert("ST_SUPERVISOR".to_owned(), supervisor.clone());
@@ -388,15 +407,7 @@ pub(crate) fn observe_successor_partition(
         .collect::<AdmissionResult<Vec<_>>>()?;
 
     let journal_dir =
-        match open_existing_journal_dir(cutover_dir, gate_id.as_str(), &action.generation_id) {
-            Ok(directory) => Some(directory),
-            Err(AdmissionError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                None
-            }
-            Err(error) => return Err(error),
-        };
+        open_existing_journal_dir(cutover_dir, gate_id.as_str(), &action.generation_id)?;
     if journal_dir.is_none() {
         if observed.iter().any(|(_, generation)| generation.is_some()) {
             return Err(AdmissionError::Conflict(
@@ -507,10 +518,41 @@ fn open_existing_journal_dir(
     cutover_dir: &File,
     gate_id: &str,
     generation_id: &str,
-) -> AdmissionResult<File> {
-    let ding = open_directory_at(cutover_dir, "ding")?;
-    let gate = open_directory_at(&ding, gate_id)?;
-    open_directory_at(&gate, generation_id)
+) -> AdmissionResult<Option<File>> {
+    let Some(ding) = open_optional_directory_at(cutover_dir, "ding")? else {
+        return Ok(None);
+    };
+    validate_optional_single_directory_name(&ding, gate_id, "Ding gate")?;
+    let Some(gate) = open_optional_directory_at(&ding, gate_id)? else {
+        return Ok(None);
+    };
+    validate_optional_single_directory_name(&gate, generation_id, "Ding generation")?;
+    open_optional_directory_at(&gate, generation_id)
+}
+
+fn open_optional_directory_at(parent: &File, name: &str) -> AdmissionResult<Option<File>> {
+    match open_directory_at(parent, name) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(AdmissionError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_optional_single_directory_name(
+    directory: &File,
+    expected: &str,
+    label: &str,
+) -> AdmissionResult<()> {
+    for name in directory_entry_names(directory)? {
+        if name != expected {
+            return Err(AdmissionError::Conflict(format!(
+                "unexpected {label} journal namespace {name:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn open_directory_at(parent: &File, name: &str) -> AdmissionResult<File> {
@@ -552,6 +594,25 @@ fn validate_exact_journal_names(
         }
     }
     Ok(())
+}
+
+fn validate_mutating_journal_namespace(
+    cutover_dir: &File,
+    gate_id: &str,
+    action: &DingReconcileAction,
+) -> AdmissionResult<()> {
+    let Some(ding) = open_optional_directory_at(cutover_dir, "ding")? else {
+        return Ok(());
+    };
+    validate_optional_single_directory_name(&ding, gate_id, "Ding gate")?;
+    let Some(gate) = open_optional_directory_at(&ding, gate_id)? else {
+        return Ok(());
+    };
+    validate_optional_single_directory_name(&gate, &action.generation_id, "Ding generation")?;
+    let Some(journal) = open_optional_directory_at(&gate, &action.generation_id)? else {
+        return Ok(());
+    };
+    validate_exact_journal_names(&journal, action)
 }
 
 fn directory_entry_names(directory: &File) -> AdmissionResult<Vec<String>> {
@@ -620,6 +681,7 @@ pub(crate) fn reconcile(
 ) -> AdmissionResult<DingReconcileReceipt> {
     validate_action(action)?;
     derive_and_validate_catalog(catalog, host, action)?;
+    validate_mutating_journal_namespace(cutover_dir, gate_id, action)?;
     let ding_dir = open_or_create_dir_at(cutover_dir, "ding")?;
     let gate_dir = open_or_create_dir_at(&ding_dir, gate_id)?;
     let journal_dir = open_or_create_dir_at(&gate_dir, &action.generation_id)?;
@@ -1436,6 +1498,98 @@ mod tests {
             .is_err()
         );
         assert_eq!(backend.spawns.get(), 0);
+    }
+
+    #[test]
+    fn read_only_partition_rejects_foreign_names_across_the_full_journal_census() {
+        for foreign_level in ["gate", "generation", "entry"] {
+            let (catalog, cutover, action) = fixture();
+            let canonical = CanonicalCatalog::open(catalog.path()).unwrap();
+            let backend = FakeBackend::new(Failure::None);
+            let ding = catalog.path().join(".st2/cutover/ding");
+            match foreign_level {
+                "gate" => {
+                    fs::create_dir_all(ding.join("foreign-gate")).unwrap();
+                }
+                "generation" => {
+                    fs::create_dir_all(ding.join("gate-1/foreign-generation")).unwrap();
+                }
+                "entry" => {
+                    reconcile(
+                        catalog.path(),
+                        &cutover,
+                        "host",
+                        "gate-1",
+                        3,
+                        &action,
+                        &backend,
+                    )
+                    .unwrap();
+                    fs::write(
+                        ding.join("gate-1")
+                            .join(&action.generation_id)
+                            .join("foreign.json"),
+                        b"{}\n",
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                observe_successor_partition(
+                    &canonical,
+                    &cutover,
+                    "host",
+                    &GateId::parse("gate-1").unwrap(),
+                    3,
+                    &action,
+                    &backend,
+                )
+                .is_err(),
+                "foreign {foreign_level} name was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_reconcile_rejects_foreign_namespace_before_journal_or_spawn_side_effects() {
+        for foreign_level in ["gate", "generation", "entry"] {
+            let (catalog, cutover, action) = fixture();
+            let backend = FakeBackend::new(Failure::None);
+            let ding = catalog.path().join(".st2/cutover/ding");
+            let target = ding.join("gate-1").join(&action.generation_id);
+            let foreign = match foreign_level {
+                "gate" => ding.join("foreign-gate"),
+                "generation" => ding.join("gate-1/foreign-generation"),
+                "entry" => target.join("foreign.json"),
+                _ => unreachable!(),
+            };
+            if foreign_level == "entry" {
+                fs::create_dir_all(&target).unwrap();
+                fs::write(&foreign, b"foreign\n").unwrap();
+            } else {
+                fs::create_dir_all(&foreign).unwrap();
+            }
+            assert!(
+                reconcile(
+                    catalog.path(),
+                    &cutover,
+                    "host",
+                    "gate-1",
+                    3,
+                    &action,
+                    &backend,
+                )
+                .is_err(),
+                "foreign {foreign_level} namespace was accepted"
+            );
+            assert_eq!(backend.spawns.get(), 0);
+            assert!(foreign.exists(), "foreign evidence was mutated");
+            assert!(
+                !target.join("journal.json").exists(),
+                "journal was created before namespace rejection"
+            );
+        }
     }
 
     #[test]

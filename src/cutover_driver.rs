@@ -1,11 +1,11 @@
 //! File-backed driver for one exact cutover transaction.
 //!
 //! The request file is an immutable authority manifest. Its canonical bytes bind the catalog,
-//! host, gate, source declaration digest, complete action program, and retirement selector before
-//! the durable fence is published. The retirement output, prepared catalog inputs, and checkpoint
-//! receipt output paths are canonical request data. Prepared content is precommitted by digest;
-//! checkpoint receipt facts are necessarily observed later, then schema-validated and hashed into
-//! the durable transaction marker before its cursor advances.
+//! host, gate, source declaration digest, complete action program, and completed predecessor
+//! retirement receipt before the durable fence is published. Prepared catalog inputs and
+//! checkpoint receipt output paths are canonical request data. Prepared content is precommitted by
+//! digest; checkpoint receipt facts are necessarily observed later, then schema-validated and
+//! hashed into the durable transaction marker before its cursor advances.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -16,26 +16,28 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::catalog_transaction::{ApplyMode, ApplyRequest, ApplyResult};
+use crate::catalog_transaction::{ApplyMode, ApplyRequest, ApplyResult, prepare_apply};
 use crate::cutover_admission::{
     AdmissionError, AdmissionResult, BeginCutover, BeginOutcome, CutoverAction, CutoverMarker,
-    CutoverTransaction, ExternalCheckpointKind, FinalizedCutover, FinalizedWithOwnership, GateId,
-    HostId, MutationAdmission, MutationBusy, PendingFence, ProviderFleetProofAction,
+    CutoverTransaction, ExternalCheckpointKind, FinalizedWithOwnership, GateId, HostId,
+    MutationAdmission, MutationBusy, PREDECESSOR_RETIREMENT_EVIDENCE_SCHEMA, PendingFence,
+    PredecessorRetiredDing, PredecessorRetirementEvidence, ProviderFleetProofAction,
     ProviderFleetProofEvidence, ResumeCutover, ResumeOutcome, probe_mutation_admission,
+    validate_predecessor_retirement_evidence,
 };
 use crate::ding_reconcile::{
     DingExecBackend, DingGenerationReader, DingReconcileAction, SystemDingExecBackend,
     SystemDingPartitionObserver,
 };
 use crate::exec_retirement::{
-    RetirementApplyReceipt, RetirementApplyRequest, RetirementPreparation,
-    RetirementPrepareRequest, RetirementSelector,
+    ExecRetirementReceipt, ExecRetirementStatus, RetirementAuthorityKind, SuccessorDesiredState,
 };
 use crate::run::{ProviderFleetRuntimeObserver, Runner};
 
-pub const CUTOVER_REQUEST_SCHEMA: &str = "st2.cutover-request.v1";
+pub const CUTOVER_REQUEST_SCHEMA: &str = "st2.cutover-request.v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CHECKPOINT_RECEIPT_BYTES: u64 = 64 * 1024;
+const MAX_PREDECESSOR_RETIREMENT_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -46,23 +48,16 @@ pub struct CutoverRequest {
     pub gate_id: GateId,
     pub source_catalog_sha256: String,
     pub program: Vec<CutoverAction>,
-    pub retirement: CutoverRetirement,
+    pub predecessor_retirement: CutoverPredecessorRetirementInput,
     pub catalog_inputs: Vec<CutoverCatalogInput>,
     pub checkpoint_inputs: Vec<CutoverCheckpointInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum CutoverRetirementSelector {
-    Id { runtime_id: String },
-    LegacySet,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CutoverRetirement {
-    pub selector: CutoverRetirementSelector,
-    pub plan_output: PathBuf,
+pub struct CutoverPredecessorRetirementInput {
+    pub receipt: PathBuf,
+    pub expect_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,15 +73,6 @@ pub struct CutoverCatalogInput {
 pub struct CutoverCheckpointInput {
     pub action_index: usize,
     pub receipt: PathBuf,
-}
-
-impl CutoverRetirementSelector {
-    fn to_retirement_selector(&self) -> RetirementSelector {
-        match self {
-            Self::Id { runtime_id } => RetirementSelector::Id(runtime_id.clone()),
-            Self::LegacySet => RetirementSelector::LegacySet,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +111,7 @@ impl LoadedCutoverRequest {
     }
 
     pub fn begin(&self) -> AdmissionResult<DriverBeginOutcome> {
+        let predecessor_retirement = self.preflight_evidence()?;
         let outcome = CutoverTransaction::begin(BeginCutover {
             catalog: crate::cutover_admission::CanonicalCatalog::open(
                 &self.request.canonical_catalog,
@@ -134,6 +121,7 @@ impl LoadedCutoverRequest {
             request_sha256: self.request_sha256.clone(),
             source_catalog_sha256: self.request.source_catalog_sha256.clone(),
             program: self.request.program.clone(),
+            predecessor_retirement,
         })?;
         match outcome {
             BeginOutcome::Claimed(transaction) => Ok(DriverBeginOutcome::Claimed(
@@ -157,7 +145,11 @@ impl LoadedCutoverRequest {
                 CutoverDriver::bind(self.clone(), transaction)?,
             )),
             ResumeOutcome::Finalized(finalized) => {
-                verify_authority(&self.request, &self.request_sha256, &finalized.marker)?;
+                verify_authority(
+                    &self.request,
+                    &self.request_sha256,
+                    &finalized.finalized.marker,
+                )?;
                 Ok(DriverResumeOutcome::Finalized(finalized))
             }
         }
@@ -168,18 +160,6 @@ impl LoadedCutoverRequest {
     /// The driver stops only at a durable external-evidence boundary. Reinvocation with the same
     /// request bytes and digest resumes from the marker cursor.
     pub fn run(&self, runner: &dyn Runner) -> AdmissionResult<DriverRunOutcome> {
-        let catalog =
-            crate::cutover_admission::CanonicalCatalog::open(&self.request.canonical_catalog)?;
-        let resume = ResumeCutover {
-            catalog: catalog.clone(),
-            host: self.request.host.clone(),
-            gate_id: self.request.gate_id.clone(),
-            request_sha256: self.request_sha256.clone(),
-        };
-        if let Some(finalized) = CutoverTransaction::inspect_finalized(resume.clone())? {
-            verify_authority(&self.request, &self.request_sha256, &finalized.marker)?;
-            return Ok(DriverRunOutcome::Finalized(finalized));
-        }
         let active = self
             .request
             .canonical_catalog
@@ -204,10 +184,28 @@ impl LoadedCutoverRequest {
                 }
             },
             Err(active_error) if active_error.kind() == std::io::ErrorKind::NotFound => {
+                let replay = ResumeCutover {
+                    catalog: crate::cutover_admission::CanonicalCatalog::open(
+                        &self.request.canonical_catalog,
+                    )?,
+                    host: self.request.host.clone(),
+                    gate_id: self.request.gate_id.clone(),
+                    request_sha256: self.request_sha256.clone(),
+                };
+                if let Some(finalized) = CutoverTransaction::reacquire_finalized_successor(replay)?
+                {
+                    verify_authority(
+                        &self.request,
+                        &self.request_sha256,
+                        &finalized.finalized.marker,
+                    )?;
+                    return Ok(DriverRunOutcome::Finalized(finalized));
+                }
                 match self.begin() {
                     Ok(DriverBeginOutcome::Claimed(driver)) => OpenedDriver::Active(driver),
                     Ok(DriverBeginOutcome::Fenced(fence)) => {
-                        return Ok(DriverRunOutcome::Fenced(DriverFence::Pending(fence)));
+                        let transaction = fence.wait_for_ownership()?;
+                        OpenedDriver::Active(CutoverDriver::bind(self.clone(), transaction)?)
                     }
                     Err(AdmissionError::Busy(busy)) => {
                         return Ok(DriverRunOutcome::Fenced(DriverFence::Active(busy)));
@@ -233,6 +231,14 @@ impl LoadedCutoverRequest {
             self.request.canonical_catalog.clone(),
         );
         driver.run_to_boundary(runner, &ding_backend, &ding_reader)
+    }
+
+    pub fn preflight(&self) -> AdmissionResult<()> {
+        self.preflight_evidence().map(drop)
+    }
+
+    fn preflight_evidence(&self) -> AdmissionResult<PredecessorRetirementEvidence> {
+        preflight_artifacts(&self.request)
     }
 
     fn from_canonical_bytes(
@@ -265,7 +271,7 @@ pub enum DriverBeginOutcome {
 
 pub enum DriverResumeOutcome {
     Active(CutoverDriver),
-    Finalized(FinalizedCutover),
+    Finalized(FinalizedWithOwnership),
 }
 
 enum OpenedDriver {
@@ -282,7 +288,7 @@ pub enum DriverRunOutcome {
         finalized: FinalizedWithOwnership,
         provider_fleet_proof: Option<ProviderFleetProofEvidence>,
     },
-    Finalized(FinalizedCutover),
+    Finalized(FinalizedWithOwnership),
     Fenced(DriverFence),
     NeedsCheckpoint {
         action_index: usize,
@@ -336,24 +342,6 @@ impl CutoverDriver {
         ding_backend: &dyn DingExecBackend,
         ding_reader: &dyn DingGenerationReader,
     ) -> AdmissionResult<DriverRunOutcome> {
-        if self.transaction.marker().retirement_receipt.is_none() {
-            if self.transaction.marker().retirement_plan.is_none() {
-                self.prepare_retirement(self.request.request.retirement.plan_output.clone())?;
-            }
-            let plan_sha256 = self
-                .transaction
-                .marker()
-                .retirement_plan
-                .as_ref()
-                .expect("preparation records retirement plan evidence")
-                .plan_sha256
-                .clone();
-            self.apply_retirement(
-                self.request.request.retirement.plan_output.clone(),
-                plan_sha256,
-            )?;
-        }
-
         let mut provider_fleet_proof = None;
         loop {
             let index = self.transaction.marker().cursor;
@@ -420,42 +408,6 @@ impl CutoverDriver {
             finalized,
             provider_fleet_proof,
         })
-    }
-
-    pub fn prepare_retirement(
-        &mut self,
-        output: impl Into<PathBuf>,
-    ) -> AdmissionResult<RetirementPreparation> {
-        self.verify()?;
-        self.transaction
-            .permission()
-            .prepare_retirement_once(RetirementPrepareRequest {
-                catalog: self.request.request.canonical_catalog.clone(),
-                host: self.request.request.host.as_str().to_owned(),
-                selector: self
-                    .request
-                    .request
-                    .retirement
-                    .selector
-                    .to_retirement_selector(),
-                expect_catalog_sha256: self.request.request.source_catalog_sha256.clone(),
-                output: output.into(),
-            })
-    }
-
-    pub fn apply_retirement(
-        &mut self,
-        plan: impl Into<PathBuf>,
-        expect_plan_sha256: impl Into<String>,
-    ) -> AdmissionResult<RetirementApplyReceipt> {
-        self.verify()?;
-        self.transaction
-            .permission()
-            .apply_retirement_once(RetirementApplyRequest {
-                catalog: self.request.request.canonical_catalog.clone(),
-                plan: plan.into(),
-                expect_plan_sha256: expect_plan_sha256.into(),
-            })
     }
 
     /// Apply the exact catalog transition at the durable cursor.
@@ -632,21 +584,365 @@ fn validate_request(request: &CutoverRequest) -> AdmissionResult<()> {
             request.canonical_catalog.display()
         )));
     }
-    if let CutoverRetirementSelector::Id { runtime_id } = &request.retirement.selector {
-        if runtime_id.is_empty()
-            || runtime_id.len() > 128
-            || !runtime_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-        {
+    validate_absolute_artifact_path(
+        "predecessor retirement receipt",
+        &request.predecessor_retirement.receipt,
+    )?;
+    validate_sha256(
+        "predecessor retirement receipt sha256",
+        &request.predecessor_retirement.expect_sha256,
+    )?;
+    validate_exact_inputs(request)?;
+    Ok(())
+}
+
+fn preflight_artifacts(request: &CutoverRequest) -> AdmissionResult<PredecessorRetirementEvidence> {
+    preflight_artifacts_with_state(request, &crate::run::exec_state_dir(request.host.as_str()))
+}
+
+fn preflight_artifacts_with_state(
+    request: &CutoverRequest,
+    state_dir: &Path,
+) -> AdmissionResult<PredecessorRetirementEvidence> {
+    validate_request(request)?;
+    let catalog = crate::cutover_admission::CanonicalCatalog::open(&request.canonical_catalog)?;
+    let receipt_path = canonical_artifact_path(
+        "predecessor retirement receipt",
+        &request.predecessor_retirement.receipt,
+    )?;
+    if receipt_path.starts_with(catalog.as_path()) || receipt_path.starts_with(state_dir) {
+        return Err(AdmissionError::Invalid(
+            "predecessor retirement receipt must be outside the catalog and exec state directory"
+                .to_owned(),
+        ));
+    }
+    let receipt_bytes = read_regular_nofollow(
+        &receipt_path,
+        MAX_PREDECESSOR_RETIREMENT_RECEIPT_BYTES,
+        "predecessor retirement receipt",
+    )?;
+    let predecessor_retirement = parse_predecessor_retirement_receipt(request, &receipt_bytes)?;
+    let mut outputs = std::collections::BTreeSet::new();
+    let mut prospective_catalog = None;
+    outputs.insert(receipt_path);
+    for input in &request.checkpoint_inputs {
+        let output = preflight_output(
+            "checkpoint receipt",
+            &input.receipt,
+            catalog.as_path(),
+            state_dir,
+        )?;
+        if !outputs.insert(output) {
             return Err(AdmissionError::Invalid(
-                "retirement runtime id must be one safe component of at most 128 bytes".to_owned(),
+                "cutover output artifact paths must be pairwise distinct".to_owned(),
             ));
         }
     }
-    validate_absolute_artifact_path("retirement plan output", &request.retirement.plan_output)?;
-    validate_exact_inputs(request)?;
-    Ok(())
+    for input in &request.catalog_inputs {
+        let transition = match request.program.get(input.action_index) {
+            Some(CutoverAction::CatalogTransition(transition)) => transition,
+            _ => {
+                return Err(AdmissionError::Invalid(format!(
+                    "catalog input {} does not map to a catalog transition",
+                    input.action_index
+                )));
+            }
+        };
+        if input.expect_sha256 != transition.before_sha256 {
+            return Err(AdmissionError::Invalid(format!(
+                "catalog input {} expectation does not match its transition before digest",
+                input.action_index
+            )));
+        }
+        let prepared = prepare_apply(ApplyRequest {
+            catalog: request.canonical_catalog.clone(),
+            mode: ApplyMode::Prepared {
+                prepared: input.prepared.clone(),
+                expect_sha256: input.expect_sha256.clone(),
+            },
+        })
+        .map_err(|error| {
+            AdmissionError::Invalid(format!(
+                "preflight prepared catalog input {}: {error:#}",
+                input.action_index
+            ))
+        })?;
+        if prepared.desired_root_sha256() != Some(transition.after_sha256.as_str()) {
+            return Err(AdmissionError::Invalid(format!(
+                "prepared catalog input {} does not produce its transition after digest",
+                input.action_index
+            )));
+        }
+        if prospective_catalog
+            .as_ref()
+            .is_none_or(|(index, _, _)| input.action_index > *index)
+        {
+            prospective_catalog = Some((
+                input.action_index,
+                input.prepared.canonicalize().map_err(|error| {
+                    AdmissionError::Invalid(format!(
+                        "canonicalize prepared prospective catalog {}: {error}",
+                        input.prepared.display()
+                    ))
+                })?,
+                transition.after_sha256.clone(),
+            ));
+        }
+    }
+    let (declaration_root, expected_sha256) = prospective_catalog
+        .as_ref()
+        .map(|(_, root, digest)| (root.as_path(), digest.as_str()))
+        .unwrap_or((catalog.as_path(), request.source_catalog_sha256.as_str()));
+    for action in &request.program {
+        match action {
+            CutoverAction::ProviderFleetProof(action) => {
+                crate::run::validate_provider_action_preflight(
+                    declaration_root,
+                    catalog.as_path(),
+                    &request.host,
+                    action,
+                    expected_sha256,
+                )?;
+            }
+            CutoverAction::DingReconcile(action) => {
+                crate::ding_reconcile::validate_ding_action_preflight(
+                    declaration_root,
+                    catalog.as_path(),
+                    request.host.as_str(),
+                    action,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(predecessor_retirement)
+}
+
+fn canonical_artifact_path(label: &str, path: &Path) -> AdmissionResult<PathBuf> {
+    validate_absolute_artifact_path(label, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AdmissionError::Invalid(format!("{label} has no parent")))?
+        .canonicalize()
+        .map_err(|error| {
+            AdmissionError::Invalid(format!(
+                "canonicalize {label} parent {}: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(parent.join(
+        path.file_name()
+            .ok_or_else(|| AdmissionError::Invalid(format!("{label} has no filename")))?,
+    ))
+}
+
+fn parse_predecessor_retirement_receipt(
+    request: &CutoverRequest,
+    bytes: &[u8],
+) -> AdmissionResult<PredecessorRetirementEvidence> {
+    let observed_sha256 = sha256(bytes);
+    if observed_sha256 != request.predecessor_retirement.expect_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "predecessor retirement receipt digest mismatch: expected {}, found {observed_sha256}",
+            request.predecessor_retirement.expect_sha256
+        )));
+    }
+    let receipt: ExecRetirementReceipt = serde_json::from_slice(bytes).map_err(|error| {
+        AdmissionError::Invalid(format!("parse predecessor retirement receipt: {error}"))
+    })?;
+    let mut canonical = serde_json::to_vec(&receipt).map_err(|error| {
+        AdmissionError::Invalid(format!("encode predecessor retirement receipt: {error}"))
+    })?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        return Err(AdmissionError::Invalid(
+            "predecessor retirement receipt is not byte-for-byte canonical JSON".to_owned(),
+        ));
+    }
+    if receipt.schema != "st2.exec-retirement.v1"
+        || receipt.status != ExecRetirementStatus::Completed
+        || receipt.journal_schema != "st2.exec-retirement-journal.v1"
+        || receipt.journal_status != "completed"
+        || !receipt.forward_only_started
+        || receipt.catalog != request.canonical_catalog
+        || receipt.host != request.host.as_str()
+        || receipt.catalog_sha256 != request.source_catalog_sha256
+    {
+        return Err(AdmissionError::Invalid(
+            "predecessor retirement receipt is not the exact completed source-catalog transaction"
+                .to_owned(),
+        ));
+    }
+    for (label, digest) in [
+        (
+            "predecessor retirement request sha256",
+            &receipt.request_sha256,
+        ),
+        ("predecessor retirement plan sha256", &receipt.plan_sha256),
+        (
+            "predecessor retirement catalog sha256",
+            &receipt.catalog_sha256,
+        ),
+        (
+            "predecessor retirement census sha256",
+            &receipt.census_sha256,
+        ),
+        (
+            "predecessor retirement journal sha256",
+            &receipt.journal_sha256,
+        ),
+        (
+            "predecessor retirement legacy partition sha256",
+            &receipt.legacy_partition_sha256,
+        ),
+    ] {
+        validate_sha256(label, digest)?;
+    }
+    let partition = receipt.legacy_partition.as_ref().ok_or_else(|| {
+        AdmissionError::Invalid(
+            "predecessor retirement receipt omits the complete legacy partition".to_owned(),
+        )
+    })?;
+    let mut partition_hash = Sha256::new();
+    partition_hash.update(b"st2.exec-retirement-legacy-partition.v1\0");
+    let mut partition_bytes = serde_json::to_vec(&receipt.legacy_partition).map_err(|error| {
+        AdmissionError::Invalid(format!("encode predecessor retirement partition: {error}"))
+    })?;
+    partition_bytes.push(b'\n');
+    partition_hash.update(partition_bytes);
+    let observed_partition_sha256 = format!("{:x}", partition_hash.finalize());
+    if observed_partition_sha256 != receipt.legacy_partition_sha256 {
+        return Err(AdmissionError::Invalid(
+            "predecessor retirement receipt has an invalid legacy partition digest".to_owned(),
+        ));
+    }
+
+    let mut projected = Vec::with_capacity(partition.len());
+    let mut partition_ids = std::collections::BTreeSet::new();
+    let mut previous_runtime_id = None;
+    for row in partition {
+        if row.task != "ding"
+            || row.desired_state != SuccessorDesiredState::AbsentRetired
+            || row.runtime_id != format!("{}.ding", row.agent)
+            || !row
+                .agent
+                .starts_with(&format!("{}.", request.host.as_str()))
+            || !partition_ids.insert(row.runtime_id.as_str())
+            || previous_runtime_id.is_some_and(|previous: &str| previous >= row.runtime_id.as_str())
+        {
+            return Err(AdmissionError::Invalid(
+                "predecessor retirement partition is not an exact all-retired local Ding set"
+                    .to_owned(),
+            ));
+        }
+        projected.push(PredecessorRetiredDing {
+            runtime_id: row.runtime_id.clone(),
+            agent: row.agent.clone(),
+        });
+        previous_runtime_id = Some(row.runtime_id.as_str());
+    }
+
+    let mut target_ids = std::collections::BTreeSet::new();
+    let mut previous_target_id = None;
+    for target in &receipt.targets {
+        if target.generation_id.is_some()
+            || !matches!(
+                target.authority_kind,
+                RetirementAuthorityKind::LegacyScopeV1 | RetirementAuthorityKind::StaleRecordOnly
+            )
+            || target.durable_phase != "record-retired"
+            || target.record_before.relative_path != format!("{}.pid", target.runtime_id)
+            || !target_ids.insert(target.runtime_id.as_str())
+            || previous_target_id
+                .is_some_and(|previous: &str| previous >= target.runtime_id.as_str())
+        {
+            return Err(AdmissionError::Invalid(
+                "predecessor retirement target is not exact completed legacy authority".to_owned(),
+            ));
+        }
+        previous_target_id = Some(target.runtime_id.as_str());
+    }
+    if target_ids != partition_ids || receipt.targets.len() != partition.len() {
+        return Err(AdmissionError::Invalid(
+            "predecessor retirement targets and all-retired Ding partition are not a bijection"
+                .to_owned(),
+        ));
+    }
+
+    let evidence = PredecessorRetirementEvidence {
+        schema: PREDECESSOR_RETIREMENT_EVIDENCE_SCHEMA.to_owned(),
+        receipt_sha256: observed_sha256,
+        plan_sha256: receipt.plan_sha256,
+        catalog_sha256: receipt.catalog_sha256,
+        host: request.host.clone(),
+        census_sha256: receipt.census_sha256,
+        journal_sha256: receipt.journal_sha256,
+        legacy_partition_sha256: receipt.legacy_partition_sha256,
+        legacy_partition: projected,
+    };
+    validate_predecessor_retirement_evidence(
+        &request.host,
+        &request.source_catalog_sha256,
+        &evidence,
+    )?;
+    Ok(evidence)
+}
+
+fn preflight_output(
+    label: &str,
+    path: &Path,
+    catalog: &Path,
+    state_dir: &Path,
+) -> AdmissionResult<PathBuf> {
+    validate_absolute_artifact_path(label, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AdmissionError::Invalid(format!("{label} has no parent")))?;
+    let parent = parent.canonicalize().map_err(|error| {
+        AdmissionError::Invalid(format!(
+            "canonicalize {label} parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let metadata = std::fs::symlink_metadata(&parent).map_err(|error| AdmissionError::Io {
+        context: format!("inspect {label} parent {}", parent.display()),
+        source: error,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AdmissionError::Invalid(format!(
+            "{label} parent is not a real directory: {}",
+            parent.display()
+        )));
+    }
+    let resolved = parent.join(
+        path.file_name()
+            .ok_or_else(|| AdmissionError::Invalid(format!("{label} has no filename")))?,
+    );
+    if resolved.starts_with(catalog) || resolved.starts_with(state_dir) {
+        return Err(AdmissionError::Invalid(format!(
+            "{label} must be outside the catalog and exec state directory"
+        )));
+    }
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.nlink() == 1 => {}
+        Ok(_) => {
+            return Err(AdmissionError::Invalid(format!(
+                "{label} is not a singly linked regular file: {}",
+                resolved.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(AdmissionError::Io {
+                context: format!("inspect {label} {}", resolved.display()),
+                source: error,
+            });
+        }
+    }
+    Ok(resolved)
 }
 
 fn validate_exact_inputs(request: &CutoverRequest) -> AdmissionResult<()> {
@@ -662,6 +958,15 @@ fn validate_exact_inputs(request: &CutoverRequest) -> AdmissionResult<()> {
         {
             return Err(AdmissionError::Invalid(format!(
                 "catalog input {} must map exactly once to a catalog-transition action",
+                input.action_index
+            )));
+        }
+        if let Some(CutoverAction::CatalogTransition(transition)) =
+            request.program.get(input.action_index)
+            && input.expect_sha256 != transition.before_sha256
+        {
+            return Err(AdmissionError::Invalid(format!(
+                "catalog input {} expectation must equal its transition before digest",
                 input.action_index
             )));
         }
@@ -732,6 +1037,8 @@ fn verify_authority(
         || marker.gate_id != request.gate_id
         || marker.source_catalog_sha256 != request.source_catalog_sha256
         || marker.program != request.program
+        || marker.predecessor_retirement.receipt_sha256
+            != request.predecessor_retirement.expect_sha256
     {
         return Err(AdmissionError::Conflict(
             "cutover transaction does not match the exact request authority".to_owned(),
@@ -825,6 +1132,78 @@ mod tests {
         format!("{byte:02x}").repeat(32)
     }
 
+    fn predecessor_receipt(catalog: &Path, host: &str, catalog_sha256: &str) -> Vec<u8> {
+        use crate::exec_retirement::{
+            ExecRetirementReceipt, ExecRetirementStatus, LegacySuccessorTask, RetiredDisposition,
+            RetiredRecordEvidence, RetiredTarget,
+        };
+
+        let partition = vec![LegacySuccessorTask {
+            runtime_id: format!("{host}.legacy.ding"),
+            agent: format!("{host}.legacy"),
+            task: "ding".to_owned(),
+            desired_state: SuccessorDesiredState::AbsentRetired,
+        }];
+        let legacy_partition = Some(partition);
+        let mut partition_bytes = serde_json::to_vec(&legacy_partition).unwrap();
+        partition_bytes.push(b'\n');
+        let mut partition_hash = Sha256::new();
+        partition_hash.update(b"st2.exec-retirement-legacy-partition.v1\0");
+        partition_hash.update(partition_bytes);
+        let record = RetiredRecordEvidence {
+            relative_path: format!("{host}.legacy.ding.pid"),
+            device: 1,
+            inode: 2,
+            length: 3,
+            modified_unix_ns: 4,
+            sha256: digest(4),
+        };
+        let receipt = ExecRetirementReceipt {
+            schema: "st2.exec-retirement.v1".to_owned(),
+            request_sha256: digest(1),
+            plan_sha256: digest(2),
+            catalog: catalog.to_path_buf(),
+            host: host.to_owned(),
+            catalog_sha256: catalog_sha256.to_owned(),
+            state_dir_device: 1,
+            state_dir_inode: 2,
+            journal_schema: "st2.exec-retirement-journal.v1".to_owned(),
+            journal_sha256: digest(3),
+            journal_status: "completed".to_owned(),
+            status: ExecRetirementStatus::Completed,
+            completed_at_unix_ms: 1,
+            census_sha256: digest(5),
+            forward_only_started: true,
+            legacy_partition_sha256: format!("{:x}", partition_hash.finalize()),
+            legacy_partition,
+            targets: vec![RetiredTarget {
+                runtime_id: format!("{host}.legacy.ding"),
+                generation_id: None,
+                authority_kind: RetirementAuthorityKind::StaleRecordOnly,
+                disposition: RetiredDisposition::StaleRecordOnly,
+                pid: 42,
+                start_time_ticks: None,
+                cgroup_path: None,
+                scope_unit: None,
+                cgroup_device: None,
+                cgroup_inode: None,
+                legacy_scope: None,
+                membership: Vec::new(),
+                freeze_observed: false,
+                cgroup_outcome: None,
+                durable_phase: "record-retired".to_owned(),
+                record_before: record.clone(),
+                record_after: RetiredRecordEvidence {
+                    relative_path: ".retirements/record".to_owned(),
+                    ..record
+                },
+            }],
+        };
+        let mut bytes = serde_json::to_vec(&receipt).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
     fn request(catalog: &Path) -> CutoverRequest {
         let argv = vec![
             "/nix/store/axe/bin/axe".to_owned(),
@@ -902,29 +1281,30 @@ mod tests {
                     desired: dings,
                 }),
                 CutoverAction::ExternalCheckpoint {
-                    kind: crate::cutover_admission::ExternalCheckpointKind::FinalProof,
-                    input_sha256: digest(4),
-                },
-                CutoverAction::ExternalCheckpoint {
                     kind: crate::cutover_admission::ExternalCheckpointKind::BusContinuity,
                     input_sha256: digest(5),
                 },
-            ],
-            retirement: CutoverRetirement {
-                selector: CutoverRetirementSelector::Id {
-                    runtime_id: "42".to_owned(),
+                CutoverAction::ExternalCheckpoint {
+                    kind: crate::cutover_admission::ExternalCheckpointKind::FinalProof,
+                    input_sha256: digest(4),
                 },
-                plan_output: catalog.join("retirement-plan.json"),
+            ],
+            predecessor_retirement: CutoverPredecessorRetirementInput {
+                receipt: catalog
+                    .parent()
+                    .unwrap_or(catalog)
+                    .join("predecessor-retirement.json"),
+                expect_sha256: digest(9),
             },
             catalog_inputs: Vec::new(),
             checkpoint_inputs: vec![
                 CutoverCheckpointInput {
                     action_index: 2,
-                    receipt: catalog.join("final-proof.json"),
+                    receipt: catalog.join("bus-continuity.json"),
                 },
                 CutoverCheckpointInput {
                     action_index: 3,
-                    receipt: catalog.join("bus-continuity.json"),
+                    receipt: catalog.join("final-proof.json"),
                 },
             ],
         }
@@ -943,9 +1323,20 @@ mod tests {
             source_catalog_sha256: request.source_catalog_sha256.clone(),
             program: request.program.clone(),
             cursor: 0,
-            retirement_plan: None,
-            forward_only_started: false,
-            retirement_receipt: None,
+            predecessor_retirement: PredecessorRetirementEvidence {
+                schema: PREDECESSOR_RETIREMENT_EVIDENCE_SCHEMA.to_owned(),
+                receipt_sha256: request.predecessor_retirement.expect_sha256.clone(),
+                plan_sha256: digest(8),
+                catalog_sha256: request.source_catalog_sha256.clone(),
+                host: request.host.clone(),
+                census_sha256: digest(7),
+                journal_sha256: digest(6),
+                legacy_partition_sha256: digest(5),
+                legacy_partition: vec![PredecessorRetiredDing {
+                    runtime_id: format!("{}.legacy.ding", request.host.as_str()),
+                    agent: format!("{}.legacy", request.host.as_str()),
+                }],
+            },
             completed_checkpoints: Vec::new(),
             completed_ding_reconciles: Vec::new(),
             provider_fleet_proof: None,
@@ -991,7 +1382,44 @@ mod tests {
     }
 
     #[test]
-    fn request_rejects_noncanonical_catalog_and_uncommitted_selector() {
+    fn predecessor_receipt_rejects_reordered_but_rehashed_partition() {
+        let temp = TempDir::new().unwrap();
+        let mut request = request(temp.path());
+        let bytes = predecessor_receipt(
+            temp.path(),
+            request.host.as_str(),
+            &request.source_catalog_sha256,
+        );
+        let mut receipt: ExecRetirementReceipt = serde_json::from_slice(&bytes).unwrap();
+        let partition = receipt.legacy_partition.as_mut().unwrap();
+        let mut earlier = partition[0].clone();
+        earlier.runtime_id = format!("{}.alpha.ding", request.host.as_str());
+        earlier.agent = format!("{}.alpha", request.host.as_str());
+        partition.push(earlier);
+        let mut target = receipt.targets[0].clone();
+        target.runtime_id = format!("{}.alpha.ding", request.host.as_str());
+        target.record_before.relative_path = format!("{}.pid", target.runtime_id);
+        receipt.targets.push(target);
+        let mut partition_bytes = serde_json::to_vec(&receipt.legacy_partition).unwrap();
+        partition_bytes.push(b'\n');
+        let mut partition_hash = Sha256::new();
+        partition_hash.update(b"st2.exec-retirement-legacy-partition.v1\0");
+        partition_hash.update(partition_bytes);
+        receipt.legacy_partition_sha256 = format!("{:x}", partition_hash.finalize());
+        let mut reordered = serde_json::to_vec(&receipt).unwrap();
+        reordered.push(b'\n');
+        request.predecessor_retirement.expect_sha256 = sha256(&reordered);
+
+        assert!(
+            parse_predecessor_retirement_receipt(&request, &reordered)
+                .unwrap_err()
+                .to_string()
+                .contains("all-retired local Ding set")
+        );
+    }
+
+    #[test]
+    fn request_rejects_noncanonical_catalog_and_uncommitted_receipt_digest() {
         let temp = TempDir::new().unwrap();
         let alias = temp.path().join("alias");
         symlink(temp.path(), &alias).unwrap();
@@ -1004,14 +1432,12 @@ mod tests {
         );
 
         request.canonical_catalog = temp.path().to_path_buf();
-        request.retirement.selector = CutoverRetirementSelector::Id {
-            runtime_id: "../42".to_owned(),
-        };
+        request.predecessor_retirement.expect_sha256 = "not-a-digest".to_owned();
         assert!(
             canonical_request_bytes(&request)
                 .unwrap_err()
                 .to_string()
-                .contains("safe component")
+                .contains("64 lowercase hexadecimal")
         );
     }
 
@@ -1062,7 +1488,7 @@ mod tests {
         request.catalog_inputs = vec![CutoverCatalogInput {
             action_index: 0,
             prepared: temp.path().join("prepared"),
-            expect_sha256: digest(6),
+            expect_sha256: digest(1),
         }];
         canonical_request_bytes(&request).unwrap();
 
@@ -1097,6 +1523,236 @@ mod tests {
     }
 
     #[test]
+    fn invalid_predecessor_receipts_fail_preflight_without_publishing_a_fence() {
+        let root = TempDir::new().unwrap();
+        let catalog = root.path().join("catalog");
+        let state = root.path().join("state/st2/host-a/exec");
+        fs::create_dir(&catalog).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let mut base = request(&catalog);
+        let receipt = predecessor_receipt(
+            &base.canonical_catalog,
+            base.host.as_str(),
+            &base.source_catalog_sha256,
+        );
+        let receipt_path = root.path().join("predecessor-retirement.json");
+        fs::write(&receipt_path, &receipt).unwrap();
+        base.predecessor_retirement.receipt = receipt_path;
+        base.predecessor_retirement.expect_sha256 = sha256(&receipt);
+        base.checkpoint_inputs[0].receipt = root.path().join("bus.json");
+        base.checkpoint_inputs[1].receipt = root.path().join("final.json");
+
+        for invalid in [
+            catalog.join("receipt.json"),
+            state.join("receipt.json"),
+            root.path().join("missing-parent/receipt.json"),
+        ] {
+            let mut request = base.clone();
+            request.predecessor_retirement.receipt = invalid;
+            assert!(preflight_artifacts_with_state(&request, &state).is_err());
+            assert!(
+                !catalog.join(".st2/cutover/active.json").exists(),
+                "preflight refusal must precede durable fence publication"
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_predecessor_receipt_refuses_before_fence_publication() {
+        let root = TempDir::new().unwrap();
+        let catalog = root.path().join("catalog");
+        fs::create_dir(&catalog).unwrap();
+        let mut request = request(&catalog);
+        request.source_catalog_sha256 =
+            crate::catalog_transaction::declaration_root_sha256_locked(&catalog).unwrap();
+        let receipt = predecessor_receipt(
+            &request.canonical_catalog,
+            request.host.as_str(),
+            &request.source_catalog_sha256,
+        );
+        let receipt_path = root.path().join("predecessor-retirement.json");
+        fs::write(&receipt_path, &receipt).unwrap();
+        request.predecessor_retirement = CutoverPredecessorRetirementInput {
+            receipt: receipt_path.clone(),
+            expect_sha256: sha256(&receipt),
+        };
+        let request_bytes = canonical_request_bytes(&request).unwrap();
+        let request_path = root.path().join("request.json");
+        fs::write(&request_path, &request_bytes).unwrap();
+        fs::write(&receipt_path, b"{}\n").unwrap();
+
+        let loaded = LoadedCutoverRequest::load(&request_path, &sha256(&request_bytes)).unwrap();
+        let error = match loaded.begin() {
+            Err(error) => error,
+            Ok(_) => panic!("tampered receipt must not publish a cutover fence"),
+        };
+        assert!(error.to_string().contains("receipt digest mismatch"));
+        assert!(!catalog.join(".st2/cutover/active.json").exists());
+    }
+
+    #[test]
+    fn deterministic_provider_and_ding_mismatches_refuse_before_fence_publication() {
+        for mismatch in ["provider", "ding", "prepared-final"] {
+            let root = TempDir::new().unwrap();
+            let catalog = root.path().join("catalog");
+            fs::create_dir(&catalog).unwrap();
+            let mut request = request(&catalog);
+            let workspace = root.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            let ding_workspace = root.path().join("ding-workspace");
+            fs::create_dir(&ding_workspace).unwrap();
+            let provider = request
+                .program
+                .iter_mut()
+                .find_map(|action| match action {
+                    CutoverAction::ProviderFleetProof(action) => Some(&mut action.providers[0]),
+                    _ => None,
+                })
+                .unwrap();
+            provider.workspace = workspace.clone();
+            provider.trajectory_sha256 =
+                crate::cutover_admission::provider_trajectory_sha256(provider).unwrap();
+            let CutoverAction::ProviderFleetProof(action) = &mut request.program[0] else {
+                unreachable!()
+            };
+            action.providers_sha256 =
+                crate::cutover_admission::provider_entries_sha256(&action.providers).unwrap();
+            let CutoverAction::DingReconcile(action) = &mut request.program[1] else {
+                unreachable!()
+            };
+            action.desired[0].canonical_cwd = ding_workspace.canonicalize().unwrap();
+            action.desired[0].launch_sha256 =
+                crate::ding_reconcile::launch_sha256(&action.desired[0]).unwrap();
+            action.desired_sha256 =
+                crate::ding_reconcile::desired_set_sha256(&action.desired).unwrap();
+            let provider_argv = match &request.program[0] {
+                CutoverAction::ProviderFleetProof(action) => {
+                    action.providers[0].canonical_argv.clone()
+                }
+                _ => unreachable!(),
+            };
+            let argv = provider_argv
+                .iter()
+                .map(|argument| format!("{argument:?}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let declaration = format!(
+                r#"agent "worker-a" {{
+  identity "worker-a"
+  host "host-a"
+  workspace {workspace:?}
+  pty "agent" {{
+    lifecycle "adopt-only"
+    argv {argv}
+    env {{
+      AGENT_PERSONA "worker"
+      AGENT_RUNTIME_PROFILE "/nix/store/profile.json"
+    }}
+  }}
+  exec "ding" {{
+    id "worker-a.ding"
+    argv "st2" "ding" "--identity" "host-a.worker-a" "--root" "$ST_ROOT"
+    cwd {ding_cwd:?}
+  }}
+}}
+"#,
+                workspace = workspace,
+                ding_cwd = ding_workspace,
+            );
+            let declaration_path = catalog.join("agents/host-a/worker-a/agent.kdl");
+            fs::create_dir_all(declaration_path.parent().unwrap()).unwrap();
+            fs::write(&declaration_path, &declaration).unwrap();
+            request.source_catalog_sha256 =
+                crate::catalog_transaction::declaration_root_sha256_locked(&catalog).unwrap();
+            let receipt = predecessor_receipt(
+                &request.canonical_catalog,
+                request.host.as_str(),
+                &request.source_catalog_sha256,
+            );
+            let receipt_path = root.path().join("predecessor-retirement.json");
+            fs::write(&receipt_path, &receipt).unwrap();
+            request.predecessor_retirement = CutoverPredecessorRetirementInput {
+                receipt: receipt_path,
+                expect_sha256: sha256(&receipt),
+            };
+            request.checkpoint_inputs[0].receipt = root.path().join("bus.json");
+            request.checkpoint_inputs[1].receipt = root.path().join("final.json");
+            if mismatch == "prepared-final" {
+                let prepared = root.path().join("prepared");
+                let prepared_declaration = prepared.join("agents/host-a/worker-a/agent.kdl");
+                fs::create_dir_all(prepared_declaration.parent().unwrap()).unwrap();
+                fs::write(
+                    prepared_declaration,
+                    declaration.replace("\"gpt-5\"", "\"opus\""),
+                )
+                .unwrap();
+                let after =
+                    crate::catalog_transaction::declaration_root_sha256_locked(&prepared).unwrap();
+                request.program.insert(
+                    0,
+                    CutoverAction::CatalogTransition(crate::cutover_admission::CatalogTransition {
+                        before_sha256: request.source_catalog_sha256.clone(),
+                        after_sha256: after,
+                    }),
+                );
+                for input in &mut request.checkpoint_inputs {
+                    input.action_index += 1;
+                }
+                request.catalog_inputs.push(CutoverCatalogInput {
+                    action_index: 0,
+                    prepared,
+                    expect_sha256: request.source_catalog_sha256.clone(),
+                });
+            }
+            if mismatch == "provider" {
+                let action = request
+                    .program
+                    .iter_mut()
+                    .find_map(|action| match action {
+                        CutoverAction::ProviderFleetProof(action) => Some(action),
+                        _ => None,
+                    })
+                    .unwrap();
+                action.providers[0].model = "foreign-model".to_owned();
+                action.providers[0].trajectory_sha256 =
+                    crate::cutover_admission::provider_trajectory_sha256(&action.providers[0])
+                        .unwrap();
+                action.providers_sha256 =
+                    crate::cutover_admission::provider_entries_sha256(&action.providers).unwrap();
+            }
+            if mismatch == "ding" {
+                let action = request
+                    .program
+                    .iter_mut()
+                    .find_map(|action| match action {
+                        CutoverAction::DingReconcile(action) => Some(action),
+                        _ => None,
+                    })
+                    .unwrap();
+                action.desired[0]
+                    .canonical_env
+                    .insert("FOREIGN".to_owned(), "1".to_owned());
+                action.desired[0].launch_sha256 =
+                    crate::ding_reconcile::launch_sha256(&action.desired[0]).unwrap();
+                action.desired_sha256 =
+                    crate::ding_reconcile::desired_set_sha256(&action.desired).unwrap();
+            }
+            let bytes = canonical_request_bytes(&request).unwrap();
+            let request_path = root.path().join("request.json");
+            fs::write(&request_path, &bytes).unwrap();
+            let loaded = LoadedCutoverRequest::load(&request_path, &sha256(&bytes)).unwrap();
+            assert!(
+                loaded.begin().is_err(),
+                "{mismatch} mismatch published a cutover"
+            );
+            assert!(
+                !catalog.join(".st2/cutover/active.json").exists(),
+                "{mismatch} mismatch published an active fence"
+            );
+        }
+    }
+
+    #[test]
     fn run_state_dispatches_adoption_ding_checkpoints_then_finalize() {
         let temp = TempDir::new().unwrap();
         let request = request(temp.path());
@@ -1116,7 +1772,7 @@ mod tests {
         assert!(matches!(
             classify_next(&request, &request_sha256, &marker).unwrap(),
             DriverStep::Checkpoint {
-                kind: ExternalCheckpointKind::FinalProof,
+                kind: ExternalCheckpointKind::BusContinuity,
                 ..
             }
         ));
@@ -1124,7 +1780,7 @@ mod tests {
         assert!(matches!(
             classify_next(&request, &request_sha256, &marker).unwrap(),
             DriverStep::Checkpoint {
-                kind: ExternalCheckpointKind::BusContinuity,
+                kind: ExternalCheckpointKind::FinalProof,
                 ..
             }
         ));

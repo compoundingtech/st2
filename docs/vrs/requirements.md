@@ -198,7 +198,11 @@ accepted.
   partition every numeric record exactly once as a desired-absent retired Ding.
   The successor st2 CLI has no legacy-set drain API, never parses predecessor
   numeric records, and consumes only the pinned typed receipt as a cutover
-  checkpoint. The caller never enumerates paths or derives generations.
+  checkpoint. Its request binds a mandatory receipt path and digest before
+  fence publication; the initial durable marker contains non-optional validated
+  receipt and exact all-retired Ding-partition evidence, so resume never needs
+  the predecessor artifact. The caller never enumerates paths or derives
+  generations.
   A live numeric record has no normal process-generation capability and wall
   clock or mtime reconstruction is never authority. It is retirable only as
   `legacy-scope-v1` when the dedicated systemd scope itself proves the complete
@@ -251,8 +255,15 @@ accepted.
   precommitted successor notification exec set. Its durable generation journal
   makes crash recovery idempotent and it cannot spawn, kill, reap, remove, or
   garbage-collect a provider.
-  Completion moves the exact active record without
-  replacement into durable history rather than unlinking it. Broad `st2 pty`
+  Completion first publishes and fsyncs the exact finalized bytes create-only
+  into durable history, then compare-and-swap persists those same bytes as the
+  finalized active record. A crash between those writes leaves unfinalized
+  active authority plus exact history and resumes idempotently; replay also
+  repairs the legacy inverse state only from an exact validated finalized
+  active record while retaining host ownership and catalog exclusion. The
+  finalized active name remains the admission gate until the successor has
+  entered its supervision loop, at which point readiness removes it and fsyncs
+  the control directory. Broad `st2 pty`
   and `st2 shell` lifecycle entry points and service install/change operations
   refuse while a gate is active. Message, context, Resource, status, and Ding
   delivery/file state remain available; starting or stopping the Ding process
@@ -266,10 +277,29 @@ accepted.
   independent copies cannot claim global exclusion and are unsupported for
   coordinated mutation.
 
+  `st2 cutover install` holds one systemd-user topology lock while it
+  atomically publishes at most one exact request-digest candidate unit in
+  persistent configuration, reloads the manager, persistently enables and
+  starts it, and revalidates both the exclusive durable topology and loaded
+  artifact before releasing the lock. Before cutover mutation, the
+  candidate self-admits only when one coherent loaded-unit snapshot binds its
+  current PID and invocation to the canonical durable `FragmentPath` whose
+  bytes equal the rendered request artifact, with no drop-ins,
+  `NeedDaemonReload=no`, `UnitFileState=enabled`, `Transient=no`,
+  `Restart=always`, and `RestartSec=2s`. Runtime/transient shadow units,
+  runtime-only enablement, stale manager state, or different fragments fail
+  closed. The ordinary supervisor remains until the admitted candidate has
+  completed the transaction and entered successor supervision; only that
+  readiness path retires the ordinary unit and archives the active gate.
+  Subsequent `Restart=always` starts use history-only successor replay.
+
   One bounded, canonical request drives the complete transaction through
   `st2 cutover run`. The request precommits checkpoint kinds, inputs, and
   canonical receipt paths, but not output receipt bytes that do not exist yet.
   The driver hashes and validates each produced typed receipt at its boundary.
-  Repeating `cutover run` after finalization verifies exact history without
-  first acquiring host ownership, so the retained successor lock does not make
-  finalized replay appear busy.
+  Repeating `cutover run` after readiness first verifies exact finalized
+  history without host ownership, then reacquires host ownership and rechecks
+  active absence plus the same exact history under catalog exclusion before
+  entering successor supervision. It never reopens transaction or predecessor
+  authority. A mismatched history fails closed rather than beginning a new
+  cutover.

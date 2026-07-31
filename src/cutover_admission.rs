@@ -21,17 +21,12 @@ use crate::catalog_transaction::{
     ApplyRequest, ApplyResult, apply_admitted, declaration_root_sha256_locked, prepare_apply,
 };
 use crate::ding_reconcile::{self, DingExecBackend, DingReconcileAction, DingReconcileReceipt};
-use crate::exec_retirement::{
-    RetirementApplyReceipt, RetirementApplyRequest, RetirementPreparation,
-    RetirementPrepareRequest, apply_admitted as apply_retirement_admitted,
-    prepare_admitted as prepare_retirement_admitted,
-};
 use crate::host_lock::HostOwnership;
 
-pub const CUTOVER_TRANSACTION_SCHEMA: &str = "st2.cutover-transaction.v3";
+pub const CUTOVER_TRANSACTION_SCHEMA: &str = "st2.cutover-transaction.v4";
 pub const MUTATION_BUSY_SCHEMA: &str = "st2.mutation-busy.v1";
-pub const RETIREMENT_RECEIPT_EVIDENCE_SCHEMA: &str = "st2.cutover-retirement-receipt-evidence.v1";
-pub const RETIREMENT_PLAN_EVIDENCE_SCHEMA: &str = "st2.cutover-retirement-plan-evidence.v1";
+pub const PREDECESSOR_RETIREMENT_EVIDENCE_SCHEMA: &str =
+    "st2.cutover-predecessor-retirement-evidence.v1";
 pub const EXTERNAL_CHECKPOINT_EVIDENCE_SCHEMA: &str = "st2.cutover-external-checkpoint-evidence.v1";
 pub const PROVIDER_FLEET_PROOF_EVIDENCE_SCHEMA: &str =
     "st2.cutover-provider-fleet-proof-evidence.v1";
@@ -45,6 +40,117 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_ARGV_ITEMS: usize = 256;
 const MAX_ARG_BYTES: usize = 16 * 1024;
 const MAX_ACTIONS: usize = 64;
+
+/// Debug-only live fault boundary shared with the cutover systemd E2E.
+///
+/// The sentinel contract intentionally matches the CLI boundary: both variables are required, the
+/// sentinel must already be a hardened file in a private `/tmp` child, and the process publishes
+/// its exact pid and boundary before stopping itself for an external SIGKILL.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn maybe_pause_at_cutover_test_boundary(boundary: &str) -> AdmissionResult<()> {
+    const BOUNDARY_ENV: &str = "ST2_TEST_CUTOVER_BOUNDARY";
+    const SENTINEL_ENV: &str = "ST2_TEST_CUTOVER_SENTINEL";
+    let (Some(requested_boundary), Some(sentinel)) = (
+        std::env::var_os(BOUNDARY_ENV),
+        std::env::var_os(SENTINEL_ENV),
+    ) else {
+        if std::env::var_os(BOUNDARY_ENV).is_some() || std::env::var_os(SENTINEL_ENV).is_some() {
+            return Err(AdmissionError::Invalid(format!(
+                "{BOUNDARY_ENV} and {SENTINEL_ENV} must be supplied together for a cutover test boundary"
+            )));
+        }
+        return Ok(());
+    };
+    if requested_boundary != boundary {
+        return Ok(());
+    }
+    let sentinel = PathBuf::from(sentinel);
+    if !sentinel.is_absolute() {
+        return Err(AdmissionError::Invalid(format!(
+            "{SENTINEL_ENV} must be absolute"
+        )));
+    }
+    let link_metadata = match fs::symlink_metadata(&sentinel) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AdmissionError::io(
+                format!("inspect cutover test sentinel {}", sentinel.display()),
+                error,
+            ));
+        }
+    };
+    let canonical = sentinel.canonicalize().map_err(|error| {
+        AdmissionError::io(
+            format!("canonicalize cutover test sentinel {}", sentinel.display()),
+            error,
+        )
+    })?;
+    if canonical != sentinel
+        || !link_metadata.is_file()
+        || link_metadata.file_type().is_symlink()
+        || link_metadata.nlink() != 1
+        || link_metadata.uid() != unsafe { libc::geteuid() }
+        || link_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(AdmissionError::Invalid(
+            "cutover test sentinel must be a canonical, singly linked, current-user regular file not writable by group or world".to_owned(),
+        ));
+    }
+    let parent = sentinel
+        .parent()
+        .ok_or_else(|| AdmissionError::Invalid("cutover test sentinel has no parent".to_owned()))?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+        AdmissionError::io(
+            format!("inspect cutover test directory {}", parent.display()),
+            error,
+        )
+    })?;
+    if parent.parent() != Some(Path::new("/tmp"))
+        || !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(AdmissionError::Invalid(
+            "cutover test sentinel must be inside a private current-user temporary directory directly under /tmp".to_owned(),
+        ));
+    }
+    let phase = sentinel.with_extension("phase");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&phase)
+        .map_err(|error| {
+            AdmissionError::io(
+                format!("create cutover test phase {}", phase.display()),
+                error,
+            )
+        })?;
+    writeln!(output, "{} {boundary}", std::process::id())
+        .map_err(|error| AdmissionError::io("write cutover test phase", error))?;
+    output
+        .sync_all()
+        .map_err(|error| AdmissionError::io("sync cutover test phase", error))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| AdmissionError::io("sync cutover test phase directory", error))?;
+    // SAFETY: this debug-only, explicitly armed boundary deliberately suspends the candidate so
+    // the live user-systemd test can SIGKILL this exact process.
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        return Err(AdmissionError::io(
+            "raise SIGSTOP at cutover test boundary",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(all(debug_assertions, target_os = "linux")))]
+fn maybe_pause_at_cutover_test_boundary(_boundary: &str) -> AdmissionResult<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -266,7 +372,6 @@ pub struct RuntimeMutate<'a> {
 
 enum RuntimeAuthoritySource {
     Ordinary,
-    Transaction,
 }
 
 impl RuntimeMutate<'_> {
@@ -315,6 +420,7 @@ pub struct BeginCutover {
     pub request_sha256: String,
     pub source_catalog_sha256: String,
     pub program: Vec<CutoverAction>,
+    pub predecessor_retirement: PredecessorRetirementEvidence,
 }
 
 #[derive(Debug, Clone)]
@@ -405,24 +511,23 @@ pub enum PromptInjectionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RetirementReceiptEvidence {
+pub struct PredecessorRetiredDing {
+    pub runtime_id: String,
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PredecessorRetirementEvidence {
     pub schema: String,
     pub receipt_sha256: String,
     pub plan_sha256: String,
     pub catalog_sha256: String,
     pub host: HostId,
+    pub census_sha256: String,
+    pub journal_sha256: String,
     pub legacy_partition_sha256: String,
-    pub forward_only: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RetirementPlanEvidence {
-    pub schema: String,
-    pub plan_sha256: String,
-    pub catalog_sha256: String,
-    pub host: HostId,
-    pub legacy_partition_sha256: String,
+    pub legacy_partition: Vec<PredecessorRetiredDing>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +567,10 @@ pub enum ExternalCheckpointPayload {
     },
     FinalProof {
         final_catalog_sha256: String,
+        providers_sha256: String,
+        launch_receipts_sha256: String,
+        ding_partition_sha256: String,
+        ding_reconcile_sha256: String,
         validation_sha256: String,
         runtime_inventory_sha256: String,
     },
@@ -529,6 +638,7 @@ pub trait ProviderFleetObserver {
 pub struct ProviderFleetProofEvidence {
     pub schema: String,
     pub providers_sha256: String,
+    pub launch_receipts_sha256: String,
     pub ding_partition_sha256: String,
     pub result_sha256: String,
 }
@@ -560,9 +670,7 @@ pub struct CutoverMarker {
     pub source_catalog_sha256: String,
     pub program: Vec<CutoverAction>,
     pub cursor: usize,
-    pub retirement_plan: Option<RetirementPlanEvidence>,
-    pub forward_only_started: bool,
-    pub retirement_receipt: Option<RetirementReceiptEvidence>,
+    pub predecessor_retirement: PredecessorRetirementEvidence,
     pub completed_checkpoints: Vec<CompletedCheckpoint>,
     pub completed_ding_reconciles: Vec<CompletedDingReconcile>,
     pub provider_fleet_proof: Option<ProviderFleetProofEvidence>,
@@ -571,7 +679,7 @@ pub struct CutoverMarker {
 
 pub enum ResumeOutcome {
     Active(CutoverTransaction),
-    Finalized(FinalizedCutover),
+    Finalized(FinalizedWithOwnership),
 }
 
 pub enum BeginOutcome {
@@ -588,6 +696,31 @@ pub struct PendingFence {
     pub active_path: PathBuf,
 }
 
+impl PendingFence {
+    /// Wait under the already durable fence until the retiring supervisor releases host ownership.
+    ///
+    /// This is an unbounded ownership wait by design. The candidate service remains alive (and is
+    /// restarted by systemd if it crashes) rather than publishing a fence and exiting idle.
+    pub fn wait_for_ownership(self) -> AdmissionResult<CutoverTransaction> {
+        loop {
+            match CutoverTransaction::claim_active(
+                self.catalog.clone(),
+                self.host.clone(),
+                self.gate_id.clone(),
+                self.request_sha256.clone(),
+            ) {
+                Ok(transaction) => return Ok(transaction),
+                Err(AdmissionError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizedCutover {
     pub history_path: PathBuf,
@@ -596,7 +729,51 @@ pub struct FinalizedCutover {
 
 pub struct FinalizedWithOwnership {
     pub finalized: FinalizedCutover,
-    pub ownership: HostOwnership,
+    ownership: HostOwnership,
+    readiness: Option<SuccessorReadiness>,
+}
+
+/// Final cutover authority retained until the successor supervisor has entered its loop.
+pub struct SuccessorReadiness {
+    catalog: CanonicalCatalog,
+    active_path: PathBuf,
+    marker: CutoverMarker,
+    marker_bytes: Vec<u8>,
+    _catalog_lock: CatalogLock,
+}
+
+impl FinalizedWithOwnership {
+    pub fn into_successor_parts(
+        self,
+    ) -> (FinalizedCutover, HostOwnership, Option<SuccessorReadiness>) {
+        (self.finalized, self.ownership, self.readiness)
+    }
+}
+
+impl SuccessorReadiness {
+    /// Archive the active fence only after the successor supervisor has entered its loop.
+    pub fn supervisor_entered(self) -> AdmissionResult<()> {
+        let (observed, bytes) = read_marker_with_bytes(&self.catalog, &self.active_path)?;
+        if observed != self.marker || bytes != self.marker_bytes || !observed.finalized {
+            return Err(AdmissionError::Conflict(
+                "finalized active fence changed before successor readiness".to_owned(),
+            ));
+        }
+        fs::remove_file(&self.active_path).map_err(|error| {
+            AdmissionError::io(
+                format!(
+                    "archive active cutover marker after successor readiness {}",
+                    self.active_path.display()
+                ),
+                error,
+            )
+        })?;
+        sync_dir(
+            self.active_path
+                .parent()
+                .ok_or_else(|| AdmissionError::Invalid("active fence has no parent".to_owned()))?,
+        )
+    }
 }
 
 pub struct CutoverTransaction {
@@ -822,9 +999,7 @@ impl CutoverTransaction {
             source_catalog_sha256: request.source_catalog_sha256,
             program: request.program,
             cursor: 0,
-            retirement_plan: None,
-            forward_only_started: false,
-            retirement_receipt: None,
+            predecessor_retirement: request.predecessor_retirement,
             completed_checkpoints: Vec::new(),
             completed_ding_reconciles: Vec::new(),
             provider_fleet_proof: None,
@@ -899,6 +1074,25 @@ impl CutoverTransaction {
                     read_marker_with_bytes(&request.catalog, &active_path)?;
                 verify_resume_authority(&request, &marker)?;
                 validate_resume_catalog_digest(&request.catalog, &marker)?;
+                if marker.finalized {
+                    let history_path =
+                        history_marker_path(&paths, &request.host, &request.gate_id)?;
+                    ensure_exact_finalized_history(&request.catalog, &history_path, &marker_bytes)?;
+                    return Ok(ResumeOutcome::Finalized(FinalizedWithOwnership {
+                        finalized: FinalizedCutover {
+                            history_path,
+                            marker: marker.clone(),
+                        },
+                        ownership: host_ownership,
+                        readiness: Some(SuccessorReadiness {
+                            catalog: request.catalog,
+                            active_path,
+                            marker,
+                            marker_bytes,
+                            _catalog_lock: catalog_lock,
+                        }),
+                    }));
+                }
                 let authority = CatalogAuthority::open(&request.catalog, &active_path, &marker)?;
                 Ok(ResumeOutcome::Active(Self {
                     catalog: request.catalog,
@@ -926,9 +1120,13 @@ impl CutoverTransaction {
                         "exact history record is not finalized".to_owned(),
                     ));
                 }
-                Ok(ResumeOutcome::Finalized(FinalizedCutover {
-                    history_path,
-                    marker,
+                Ok(ResumeOutcome::Finalized(FinalizedWithOwnership {
+                    finalized: FinalizedCutover {
+                        history_path,
+                        marker,
+                    },
+                    ownership: host_ownership,
+                    readiness: None,
                 }))
             }
             Err(error) => Err(AdmissionError::io(
@@ -998,6 +1196,68 @@ impl CutoverTransaction {
         }))
     }
 
+    /// Reacquire successor ownership from exact finalized history without reopening transaction
+    /// authority.
+    ///
+    /// `None` means no exact finalized history exists and the caller may attempt a fresh begin.
+    /// Once history is observed, this rechecks active absence and the same history bytes while
+    /// retaining host ownership plus catalog EX. A mismatched/corrupt history record is always an
+    /// error; it never falls through to begin.
+    pub fn reacquire_finalized_successor(
+        request: ResumeCutover,
+    ) -> AdmissionResult<Option<FinalizedWithOwnership>> {
+        let Some(_) = Self::inspect_finalized(request.clone())? else {
+            return Ok(None);
+        };
+        let host_ownership =
+            HostOwnership::acquire(request.catalog.as_path(), request.host.as_str()).map_err(
+                |error| {
+                    AdmissionError::io(
+                        format!(
+                            "reacquire finalized successor host lock for {}",
+                            request.host.as_str()
+                        ),
+                        error,
+                    )
+                },
+            )?;
+        let _catalog_lock = CatalogLock::exclusive(request.catalog.as_path()).map_err(|error| {
+            AdmissionError::Invalid(format!("acquire exclusive catalog lock: {error:#}"))
+        })?;
+        let paths = ensure_cutover_dirs(&request.catalog)?;
+        let active_path = active_marker_path(&paths);
+        match fs::symlink_metadata(&active_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(AdmissionError::Conflict(
+                    "active cutover appeared while reacquiring finalized successor".to_owned(),
+                ));
+            }
+            Err(error) => {
+                return Err(AdmissionError::io(
+                    format!("inspect active cutover marker {}", active_path.display()),
+                    error,
+                ));
+            }
+        }
+        let history_path = history_marker_path(&paths, &request.host, &request.gate_id)?;
+        let (marker, _) = read_marker_with_bytes(&request.catalog, &history_path)?;
+        verify_resume_authority(&request, &marker)?;
+        if !marker.finalized {
+            return Err(AdmissionError::Conflict(
+                "exact history record is not finalized".to_owned(),
+            ));
+        }
+        Ok(Some(FinalizedWithOwnership {
+            finalized: FinalizedCutover {
+                history_path,
+                marker,
+            },
+            ownership: host_ownership,
+            readiness: None,
+        }))
+    }
+
     fn claim_active(
         catalog: CanonicalCatalog,
         host: HostId,
@@ -1028,7 +1288,7 @@ impl CutoverTransaction {
         let authority = CatalogAuthority::open(&catalog, &active_path, &marker)?;
         Ok(Self {
             catalog,
-            host,
+            host: host.clone(),
             active_path,
             marker,
             marker_bytes,
@@ -1096,19 +1356,6 @@ impl Transaction<'_> {
         &self.transaction.marker
     }
 
-    fn runtime_authority(&self) -> AdmissionResult<RuntimeMutate<'_>> {
-        if self.transaction.host_ownership.is_none() || self.transaction.catalog_lock.is_none() {
-            return Err(AdmissionError::Conflict(
-                "cutover runtime authority was already released".to_owned(),
-            ));
-        }
-        Ok(RuntimeMutate {
-            catalog: &self.transaction.catalog,
-            host: &self.transaction.host,
-            _source: RuntimeAuthoritySource::Transaction,
-        })
-    }
-
     pub(crate) fn catalog_transition_authority(
         &self,
         expected_index: usize,
@@ -1128,130 +1375,6 @@ impl Transaction<'_> {
                 )
             })?,
         })
-    }
-
-    pub fn prepare_retirement_once(
-        &mut self,
-        request: RetirementPrepareRequest,
-    ) -> AdmissionResult<RetirementPreparation> {
-        let permission = self.runtime_authority()?;
-        let preparation = prepare_retirement_admitted(request, &permission)
-            .map_err(|error| AdmissionError::Conflict(format!("prepare retirement: {error:#}")))?;
-        drop(permission);
-        self.record_retirement_plan(RetirementPlanEvidence {
-            schema: RETIREMENT_PLAN_EVIDENCE_SCHEMA.to_owned(),
-            plan_sha256: preparation.plan_sha256().to_owned(),
-            catalog_sha256: preparation.catalog_sha256().to_owned(),
-            host: HostId::parse(preparation.host().to_owned())?,
-            legacy_partition_sha256: preparation.legacy_partition_sha256().to_owned(),
-        })?;
-        Ok(preparation)
-    }
-
-    fn record_retirement_plan(&mut self, evidence: RetirementPlanEvidence) -> AdmissionResult<()> {
-        validate_retirement_plan_evidence(
-            &self.transaction.catalog,
-            &self.transaction.host,
-            &evidence,
-        )?;
-        if self.transaction.marker.cursor != 0
-            || self.transaction.marker.retirement_plan.is_some()
-            || self.transaction.marker.forward_only_started
-            || self.transaction.marker.retirement_receipt.is_some()
-        {
-            return Err(AdmissionError::Conflict(
-                "retirement plan can only be recorded once before forward-only start".to_owned(),
-            ));
-        }
-        let mut next = self.transaction.marker.clone();
-        next.retirement_plan = Some(evidence);
-        self.transaction.persist(next)
-    }
-
-    fn start_forward_only(&mut self, expected_plan_sha256: &str) -> AdmissionResult<()> {
-        let plan = self
-            .transaction
-            .marker
-            .retirement_plan
-            .as_ref()
-            .ok_or_else(|| {
-                AdmissionError::Conflict("retirement plan is not recorded".to_owned())
-            })?;
-        if plan.plan_sha256 != expected_plan_sha256
-            || self.transaction.marker.forward_only_started
-            || self.transaction.marker.retirement_receipt.is_some()
-        {
-            return Err(AdmissionError::Conflict(
-                "forward-only start does not match the exact recorded plan".to_owned(),
-            ));
-        }
-        let mut next = self.transaction.marker.clone();
-        next.forward_only_started = true;
-        self.transaction.persist(next)
-    }
-
-    pub fn apply_retirement_once(
-        &mut self,
-        request: RetirementApplyRequest,
-    ) -> AdmissionResult<RetirementApplyReceipt> {
-        let plan_sha256 = request.expect_plan_sha256.clone();
-        if !self.transaction.marker.forward_only_started {
-            self.start_forward_only(&plan_sha256)?;
-        }
-        let permission = self.runtime_authority()?;
-        let receipt = apply_retirement_admitted(request, &permission)
-            .map_err(|error| AdmissionError::Conflict(format!("apply retirement: {error:#}")))?;
-        drop(permission);
-        let evidence = RetirementReceiptEvidence {
-            schema: RETIREMENT_RECEIPT_EVIDENCE_SCHEMA.to_owned(),
-            receipt_sha256: receipt
-                .canonical_sha256()
-                .map_err(|error| AdmissionError::Conflict(error.to_string()))?,
-            plan_sha256: receipt.plan_sha256().to_owned(),
-            catalog_sha256: receipt.catalog_sha256().to_owned(),
-            host: HostId::parse(receipt.host().to_owned())?,
-            legacy_partition_sha256: receipt.legacy_partition_sha256().to_owned(),
-            forward_only: receipt.forward_only_started(),
-        };
-        if let Some(existing) = &self.transaction.marker.retirement_receipt {
-            if existing != &evidence {
-                return Err(AdmissionError::Conflict(
-                    "replayed retirement receipt differs from durable evidence".to_owned(),
-                ));
-            }
-        } else {
-            self.record_retirement_receipt(evidence)?;
-        }
-        Ok(receipt)
-    }
-
-    fn record_retirement_receipt(
-        &mut self,
-        evidence: RetirementReceiptEvidence,
-    ) -> AdmissionResult<()> {
-        validate_retirement_evidence(&self.transaction.catalog, &self.transaction.host, &evidence)?;
-        let plan = self
-            .transaction
-            .marker
-            .retirement_plan
-            .as_ref()
-            .ok_or_else(|| {
-                AdmissionError::Conflict("retirement plan is not recorded".to_owned())
-            })?;
-        if self.transaction.marker.cursor != 0
-            || !self.transaction.marker.forward_only_started
-            || self.transaction.marker.retirement_receipt.is_some()
-            || evidence.plan_sha256 != plan.plan_sha256
-            || evidence.catalog_sha256 != plan.catalog_sha256
-            || evidence.legacy_partition_sha256 != plan.legacy_partition_sha256
-        {
-            return Err(AdmissionError::Conflict(
-                "retirement receipt must complete the exact forward-only recorded plan".to_owned(),
-            ));
-        }
-        let mut next = self.transaction.marker.clone();
-        next.retirement_receipt = Some(evidence);
-        self.transaction.persist(next)
     }
 
     pub fn apply_catalog_transition_once(
@@ -1281,7 +1404,6 @@ impl Transaction<'_> {
     where
         F: FnOnce(&TransactionCatalog<'_>) -> AdmissionResult<()>,
     {
-        self.require_retirement_evidence()?;
         self.expect_cursor(expected_index)?;
         let transition = match self.transaction.marker.program.get(expected_index) {
             Some(CutoverAction::CatalogTransition(transition)) => transition.clone(),
@@ -1324,7 +1446,6 @@ impl Transaction<'_> {
         expected_index: usize,
         receipt_bytes: &[u8],
     ) -> AdmissionResult<()> {
-        self.require_retirement_evidence()?;
         self.expect_cursor(expected_index)?;
         let (expected_kind, expected_input_sha256) =
             match self.transaction.marker.program.get(expected_index) {
@@ -1356,7 +1477,6 @@ impl Transaction<'_> {
         expected_index: usize,
         backend: &dyn DingExecBackend,
     ) -> AdmissionResult<DingReconcileReceipt> {
-        self.require_retirement_evidence()?;
         self.expect_cursor(expected_index)?;
         let action = match self.transaction.marker.program.get(expected_index) {
             Some(CutoverAction::DingReconcile(action)) => action.clone(),
@@ -1394,7 +1514,6 @@ impl Transaction<'_> {
         observer: &dyn ProviderFleetObserver,
         ding_reader: &dyn ding_reconcile::DingGenerationReader,
     ) -> AdmissionResult<ProviderFleetProofEvidence> {
-        self.require_retirement_evidence()?;
         self.expect_cursor(expected_index)?;
         let action = match self.transaction.marker.program.get(expected_index) {
             Some(CutoverAction::ProviderFleetProof(action)) => action.clone(),
@@ -1442,6 +1561,7 @@ impl Transaction<'_> {
         let completion = ProviderFleetProofEvidence {
             schema: PROVIDER_FLEET_PROOF_EVIDENCE_SCHEMA.to_owned(),
             providers_sha256: action.providers_sha256.clone(),
+            launch_receipts_sha256: provider_launch_receipts_sha256(&action.providers)?,
             ding_partition_sha256,
             result_sha256,
         };
@@ -1493,69 +1613,46 @@ impl Transaction<'_> {
 
         let mut finalized = marker.clone();
         finalized.finalized = true;
-        self.transaction.persist(finalized)?;
+        let finalized_bytes = canonical_json(&finalized)?;
         let paths = ensure_cutover_dirs(&self.transaction.catalog)?;
         let history_path = history_marker_path(
             &paths,
             &self.transaction.host,
             &self.transaction.marker.gate_id,
         )?;
-        match fs::symlink_metadata(&history_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                publish_bytes_create_only(
-                    history_path.parent().ok_or_else(|| {
-                        AdmissionError::Invalid("history path has no parent".to_owned())
-                    })?,
-                    &history_path,
-                    &self.transaction.marker_bytes,
-                )?;
-            }
-            Ok(_) => {
-                let (_, bytes) = read_marker_with_bytes(&self.transaction.catalog, &history_path)?;
-                if bytes != self.transaction.marker_bytes {
-                    return Err(AdmissionError::Conflict(format!(
-                        "cutover history collision at {}",
-                        history_path.display()
-                    )));
-                }
-            }
-            Err(error) => {
-                return Err(AdmissionError::io(
-                    format!("inspect cutover history {}", history_path.display()),
-                    error,
-                ));
-            }
+        // History becomes durable before active.json can claim finalization. A crash at the
+        // following exact boundary leaves an unfinalized active transaction plus byte-exact
+        // finalized history; replay republishes the same history and then performs the active CAS.
+        // The inverse state (finalized active without history) is therefore unreachable for new
+        // writers and repaired by `resume` for compatibility with an interrupted older writer.
+        ensure_exact_finalized_history(&self.transaction.catalog, &history_path, &finalized_bytes)?;
+        maybe_pause_at_cutover_test_boundary("after-finalized-history-before-active-finalized")?;
+        self.transaction.persist(finalized)?;
+        if self.transaction.marker_bytes != finalized_bytes {
+            return Err(AdmissionError::Conflict(
+                "finalized active marker differs from exact durable history".to_owned(),
+            ));
         }
-        fs::remove_file(&self.transaction.active_path).map_err(|error| {
-            AdmissionError::io(
-                format!(
-                    "retire active cutover marker {}",
-                    self.transaction.active_path.display()
-                ),
-                error,
-            )
-        })?;
-        sync_dir(&paths.cutover)?;
         let ownership = self.transaction.host_ownership.take().ok_or_else(|| {
             AdmissionError::Conflict("cutover host ownership was already transferred".to_owned())
         })?;
-        drop(self.transaction.catalog_lock.take());
+        let catalog_lock = self.transaction.catalog_lock.take().ok_or_else(|| {
+            AdmissionError::Conflict("cutover catalog authority was already transferred".to_owned())
+        })?;
         Ok(FinalizedWithOwnership {
             finalized: FinalizedCutover {
                 history_path,
                 marker: self.transaction.marker.clone(),
             },
             ownership,
+            readiness: Some(SuccessorReadiness {
+                catalog: self.transaction.catalog.clone(),
+                active_path: self.transaction.active_path.clone(),
+                marker: self.transaction.marker.clone(),
+                marker_bytes: self.transaction.marker_bytes.clone(),
+                _catalog_lock: catalog_lock,
+            }),
         })
-    }
-
-    fn require_retirement_evidence(&self) -> AdmissionResult<()> {
-        if self.transaction.marker.retirement_receipt.is_none() {
-            return Err(AdmissionError::Conflict(
-                "retirement receipt evidence must precede the action program".to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     fn expect_cursor(&self, expected: usize) -> AdmissionResult<()> {
@@ -1819,21 +1916,46 @@ pub(crate) fn validate_program(source: &str, program: &[CutoverAction]) -> Admis
                 .to_owned(),
         ));
     }
-    for kind in [
-        ExternalCheckpointKind::FinalProof,
-        ExternalCheckpointKind::BusContinuity,
-    ] {
-        let index = program
+    if program[..adoption_index]
+        .iter()
+        .filter(|action| matches!(action, CutoverAction::CatalogTransition(_)))
+        .count()
+        != program
             .iter()
-            .position(|action| {
-                matches!(action, CutoverAction::ExternalCheckpoint { kind: found, .. } if *found == kind)
-            })
-            .expect("checkpoint count checked");
-        if index <= ding_index {
-            return Err(AdmissionError::Invalid(
-                "final-proof and bus-continuity must follow Ding reconciliation".to_owned(),
-            ));
-        }
+            .filter(|action| matches!(action, CutoverAction::CatalogTransition(_)))
+            .count()
+    {
+        return Err(AdmissionError::Invalid(
+            "every catalog transition must precede provider fleet proof".to_owned(),
+        ));
+    }
+    let bus_index = program
+        .iter()
+        .position(|action| {
+            matches!(
+                action,
+                CutoverAction::ExternalCheckpoint {
+                    kind: ExternalCheckpointKind::BusContinuity,
+                    ..
+                }
+            )
+        })
+        .expect("bus count checked");
+    if bus_index <= ding_index {
+        return Err(AdmissionError::Invalid(
+            "bus-continuity must follow Ding reconciliation".to_owned(),
+        ));
+    }
+    if !matches!(
+        program.last(),
+        Some(CutoverAction::ExternalCheckpoint {
+            kind: ExternalCheckpointKind::FinalProof,
+            ..
+        })
+    ) {
+        return Err(AdmissionError::Invalid(
+            "final-proof must be the last cutover action".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1979,6 +2101,30 @@ pub fn provider_entries_sha256(entries: &[ProviderFleetEntry]) -> AdmissionResul
     let bytes = canonical_json(entries)?;
     let mut hash = Sha256::new();
     hash.update(b"st2.cutover-provider-fleet.v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub fn provider_launch_receipts_sha256(entries: &[ProviderFleetEntry]) -> AdmissionResult<String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LaunchReceiptBinding<'a> {
+        identity: &'a str,
+        path: &'a Path,
+        sha256: &'a str,
+    }
+    let bindings = entries
+        .iter()
+        .map(|entry| LaunchReceiptBinding {
+            identity: &entry.identity,
+            path: &entry.prompt.launch_receipt_path,
+            sha256: &entry.prompt.launch_receipt_sha256,
+        })
+        .collect::<Vec<_>>();
+    let bytes = canonical_json(&bindings)?;
+    let mut hash = Sha256::new();
+    hash.update(b"st2.cutover-provider-launch-receipts.v1\0");
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
     Ok(format!("{:x}", hash.finalize()))
@@ -2427,71 +2573,74 @@ fn successor_ding_id(observation: &SuccessorDingObservation) -> &str {
     }
 }
 
-fn validate_retirement_evidence(
-    catalog: &CanonicalCatalog,
+pub(crate) fn validate_predecessor_retirement_evidence(
     host: &HostId,
-    evidence: &RetirementReceiptEvidence,
+    source_catalog_sha256: &str,
+    evidence: &PredecessorRetirementEvidence,
 ) -> AdmissionResult<()> {
-    if evidence.schema != RETIREMENT_RECEIPT_EVIDENCE_SCHEMA
-        || &evidence.host != host
-        || !evidence.forward_only
-    {
+    if evidence.schema != PREDECESSOR_RETIREMENT_EVIDENCE_SCHEMA || &evidence.host != host {
         return Err(AdmissionError::Invalid(
-            "retirement receipt evidence has wrong schema, host, or forward-only authority"
-                .to_owned(),
+            "predecessor retirement evidence has wrong schema or host authority".to_owned(),
         ));
     }
     for (label, digest) in [
-        ("retirement receipt sha256", &evidence.receipt_sha256),
-        ("retirement plan sha256", &evidence.plan_sha256),
-        ("retirement catalog sha256", &evidence.catalog_sha256),
         (
-            "retirement legacy partition sha256",
+            "predecessor retirement receipt sha256",
+            &evidence.receipt_sha256,
+        ),
+        ("predecessor retirement plan sha256", &evidence.plan_sha256),
+        (
+            "predecessor retirement catalog sha256",
+            &evidence.catalog_sha256,
+        ),
+        (
+            "predecessor retirement census sha256",
+            &evidence.census_sha256,
+        ),
+        (
+            "predecessor retirement journal sha256",
+            &evidence.journal_sha256,
+        ),
+        (
+            "predecessor retirement legacy partition sha256",
             &evidence.legacy_partition_sha256,
         ),
     ] {
         validate_sha256(label, digest)?;
     }
-    if evidence.catalog_sha256
-        != declaration_root_sha256_locked(catalog.as_path()).map_err(|error| {
-            AdmissionError::Invalid(format!("compute retirement catalog digest: {error:#}"))
-        })?
-    {
+    if evidence.catalog_sha256 != source_catalog_sha256 {
         return Err(AdmissionError::Conflict(
-            "retirement receipt catalog digest does not bind the current catalog".to_owned(),
+            "predecessor retirement receipt does not bind the source catalog digest".to_owned(),
         ));
     }
-    Ok(())
-}
-
-fn validate_retirement_plan_evidence(
-    catalog: &CanonicalCatalog,
-    host: &HostId,
-    evidence: &RetirementPlanEvidence,
-) -> AdmissionResult<()> {
-    if evidence.schema != RETIREMENT_PLAN_EVIDENCE_SCHEMA || &evidence.host != host {
+    if evidence.legacy_partition.len() > 4096 {
         return Err(AdmissionError::Invalid(
-            "retirement plan evidence has wrong schema or host authority".to_owned(),
+            "predecessor retirement partition exceeds the marker bound".to_owned(),
         ));
     }
-    for (label, digest) in [
-        ("retirement plan sha256", &evidence.plan_sha256),
-        ("retirement plan catalog sha256", &evidence.catalog_sha256),
-        (
-            "retirement plan legacy partition sha256",
-            &evidence.legacy_partition_sha256,
-        ),
-    ] {
-        validate_sha256(label, digest)?;
-    }
-    let observed = declaration_root_sha256_locked(catalog.as_path()).map_err(|error| {
-        AdmissionError::Invalid(format!("compute retirement plan catalog digest: {error:#}"))
-    })?;
-    if evidence.catalog_sha256 != observed {
-        return Err(AdmissionError::Conflict(format!(
-            "retirement plan catalog digest compare-and-swap failed: expected {}, found {observed}",
-            evidence.catalog_sha256
-        )));
+    let mut previous = None;
+    for ding in &evidence.legacy_partition {
+        if ding.agent.is_empty()
+            || ding.agent.len() > MAX_ID_BYTES
+            || ding.runtime_id.len() > MAX_ID_BYTES
+            || ding.runtime_id != format!("{}.ding", ding.agent)
+            || !ding.agent.starts_with(&format!("{}.", host.as_str()))
+            || !ding
+                .agent
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        {
+            return Err(AdmissionError::Invalid(
+                "predecessor retirement partition contains a non-local or non-Ding identity"
+                    .to_owned(),
+            ));
+        }
+        if previous.is_some_and(|prior: &str| prior >= ding.runtime_id.as_str()) {
+            return Err(AdmissionError::Invalid(
+                "predecessor retirement partition must be strictly ordered and unique".to_owned(),
+            ));
+        }
+        previous = Some(ding.runtime_id.as_str());
     }
     Ok(())
 }
@@ -2579,16 +2728,64 @@ fn validate_external_receipt(
             ExternalCheckpointKind::FinalProof,
             ExternalCheckpointPayload::FinalProof {
                 final_catalog_sha256,
+                providers_sha256,
+                launch_receipts_sha256,
+                ding_partition_sha256,
+                ding_reconcile_sha256,
                 validation_sha256,
                 runtime_inventory_sha256,
             },
         ) => {
             validate_sha256("final proof catalog sha256", final_catalog_sha256)?;
+            validate_sha256("final proof provider fleet sha256", providers_sha256)?;
+            validate_sha256("final proof launch receipts sha256", launch_receipts_sha256)?;
+            validate_sha256("final proof Ding partition sha256", ding_partition_sha256)?;
+            validate_sha256("final proof Ding reconcile sha256", ding_reconcile_sha256)?;
             validate_sha256("final proof validation sha256", validation_sha256)?;
             validate_sha256(
                 "final proof runtime inventory sha256",
                 runtime_inventory_sha256,
-            )
+            )?;
+            let expected_catalog = catalog_digest_at_cursor(marker, expected_index);
+            let fleet = marker.provider_fleet_proof.as_ref().ok_or_else(|| {
+                AdmissionError::Conflict(
+                    "final proof requires durable provider fleet evidence".to_owned(),
+                )
+            })?;
+            let provider_action = marker
+                .program
+                .iter()
+                .find_map(|action| match action {
+                    CutoverAction::ProviderFleetProof(action) => Some(action),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    AdmissionError::Invalid(
+                        "final proof program has no provider fleet action".to_owned(),
+                    )
+                })?;
+            let expected_launch_receipts =
+                provider_launch_receipts_sha256(&provider_action.providers)?;
+            let [ding] = marker.completed_ding_reconciles.as_slice() else {
+                return Err(AdmissionError::Conflict(
+                    "final proof requires exactly one durable Ding reconciliation".to_owned(),
+                ));
+            };
+            let expected_ding_reconcile = sha256_bytes(&canonical_json(&ding.receipt)?);
+            if final_catalog_sha256 != &expected_catalog
+                || providers_sha256 != &fleet.providers_sha256
+                || launch_receipts_sha256 != &expected_launch_receipts
+                || launch_receipts_sha256 != &fleet.launch_receipts_sha256
+                || ding_partition_sha256 != &fleet.ding_partition_sha256
+                || ding_reconcile_sha256 != &expected_ding_reconcile
+                || runtime_inventory_sha256 != &fleet.result_sha256
+            {
+                return Err(AdmissionError::Conflict(
+                    "final proof does not bind the exact final catalog, full provider fleet, launch receipts, and Ding set"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
         }
         (
             ExternalCheckpointKind::BusContinuity,
@@ -2664,34 +2861,11 @@ fn validate_marker(
             "action cursor exceeds immutable program".to_owned(),
         ));
     }
-    if let Some(evidence) = &marker.retirement_plan {
-        validate_retirement_plan_evidence_shape(&marker.host, evidence)?;
-    }
-    if marker.forward_only_started && marker.retirement_plan.is_none() {
-        return Err(AdmissionError::Invalid(
-            "forward-only boundary exists without a retirement plan".to_owned(),
-        ));
-    }
-    if let Some(evidence) = &marker.retirement_receipt {
-        validate_retirement_evidence_shape(&marker.host, evidence)?;
-        let plan = marker.retirement_plan.as_ref().ok_or_else(|| {
-            AdmissionError::Invalid("retirement receipt exists without a plan".to_owned())
-        })?;
-        if !marker.forward_only_started
-            || evidence.plan_sha256 != plan.plan_sha256
-            || evidence.catalog_sha256 != plan.catalog_sha256
-            || evidence.legacy_partition_sha256 != plan.legacy_partition_sha256
-        {
-            return Err(AdmissionError::Invalid(
-                "retirement receipt does not complete the exact forward-only plan".to_owned(),
-            ));
-        }
-    }
-    if marker.cursor > 0 && marker.retirement_receipt.is_none() {
-        return Err(AdmissionError::Invalid(
-            "action cursor advanced without retirement receipt".to_owned(),
-        ));
-    }
+    validate_predecessor_retirement_evidence(
+        &marker.host,
+        &marker.source_catalog_sha256,
+        &marker.predecessor_retirement,
+    )?;
     for checkpoint in &marker.completed_checkpoints {
         if checkpoint.action_index >= marker.cursor {
             return Err(AdmissionError::Invalid(
@@ -2795,55 +2969,6 @@ fn validate_marker(
         return Err(AdmissionError::Invalid(
             "finalized marker is not completely successful".to_owned(),
         ));
-    }
-    Ok(())
-}
-
-fn validate_retirement_plan_evidence_shape(
-    host: &HostId,
-    evidence: &RetirementPlanEvidence,
-) -> AdmissionResult<()> {
-    if evidence.schema != RETIREMENT_PLAN_EVIDENCE_SCHEMA || &evidence.host != host {
-        return Err(AdmissionError::Invalid(
-            "retirement plan evidence has wrong schema or host authority".to_owned(),
-        ));
-    }
-    for (label, digest) in [
-        ("retirement plan sha256", &evidence.plan_sha256),
-        ("retirement plan catalog sha256", &evidence.catalog_sha256),
-        (
-            "retirement plan legacy partition sha256",
-            &evidence.legacy_partition_sha256,
-        ),
-    ] {
-        validate_sha256(label, digest)?;
-    }
-    Ok(())
-}
-
-fn validate_retirement_evidence_shape(
-    host: &HostId,
-    evidence: &RetirementReceiptEvidence,
-) -> AdmissionResult<()> {
-    if evidence.schema != RETIREMENT_RECEIPT_EVIDENCE_SCHEMA
-        || &evidence.host != host
-        || !evidence.forward_only
-    {
-        return Err(AdmissionError::Invalid(
-            "retirement receipt evidence has wrong schema, host, or forward-only authority"
-                .to_owned(),
-        ));
-    }
-    for (label, digest) in [
-        ("retirement receipt sha256", &evidence.receipt_sha256),
-        ("retirement plan sha256", &evidence.plan_sha256),
-        ("retirement catalog sha256", &evidence.catalog_sha256),
-        (
-            "retirement legacy partition sha256",
-            &evidence.legacy_partition_sha256,
-        ),
-    ] {
-        validate_sha256(label, digest)?;
     }
     Ok(())
 }
@@ -2953,6 +3078,40 @@ fn publish_create_only(
     let bytes = canonical_json(marker)?;
     publish_bytes_create_only(temp_parent, target, &bytes)?;
     Ok(bytes)
+}
+
+/// Publish or verify the immutable finalized record before active authority can be finalized.
+///
+/// Create-only publication makes concurrent or stale history fail closed. Existing history is
+/// accepted only when its validated marker bytes are exactly identical.
+fn ensure_exact_finalized_history(
+    catalog: &CanonicalCatalog,
+    history_path: &Path,
+    finalized_bytes: &[u8],
+) -> AdmissionResult<()> {
+    match fs::symlink_metadata(history_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => publish_bytes_create_only(
+            history_path
+                .parent()
+                .ok_or_else(|| AdmissionError::Invalid("history path has no parent".to_owned()))?,
+            history_path,
+            finalized_bytes,
+        ),
+        Ok(_) => {
+            let (marker, bytes) = read_marker_with_bytes(catalog, history_path)?;
+            if !marker.finalized || bytes != finalized_bytes {
+                return Err(AdmissionError::Conflict(format!(
+                    "cutover history collision at {}",
+                    history_path.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) => Err(AdmissionError::io(
+            format!("inspect cutover history {}", history_path.display()),
+            error,
+        )),
+    }
 }
 
 fn publish_bytes_create_only(
@@ -3156,12 +3315,12 @@ mod tests {
             CutoverAction::ProviderFleetProof(candidate()),
             CutoverAction::DingReconcile(ding_action()),
             CutoverAction::ExternalCheckpoint {
-                kind: ExternalCheckpointKind::FinalProof,
-                input_sha256: B.to_owned(),
-            },
-            CutoverAction::ExternalCheckpoint {
                 kind: ExternalCheckpointKind::BusContinuity,
                 input_sha256: C.to_owned(),
+            },
+            CutoverAction::ExternalCheckpoint {
+                kind: ExternalCheckpointKind::FinalProof,
+                input_sha256: B.to_owned(),
             },
         ]
     }
@@ -3179,11 +3338,12 @@ mod tests {
         let (source, after) = digests(&catalog);
         let outcome = CutoverTransaction::begin(BeginCutover {
             catalog,
-            host,
+            host: host.clone(),
             gate_id: GateId::parse("gate-1").unwrap(),
             request_sha256: A.to_owned(),
             source_catalog_sha256: source.clone(),
             program: program(&source, &after),
+            predecessor_retirement: predecessor_evidence(&source, &host),
         })
         .unwrap();
         let BeginOutcome::Claimed(transaction) = outcome else {
@@ -3192,37 +3352,21 @@ mod tests {
         (transaction, source, after)
     }
 
-    fn plan(catalog_digest: &str, host: &HostId) -> RetirementPlanEvidence {
-        RetirementPlanEvidence {
-            schema: RETIREMENT_PLAN_EVIDENCE_SCHEMA.to_owned(),
-            plan_sha256: B.to_owned(),
-            catalog_sha256: catalog_digest.to_owned(),
-            host: host.clone(),
-            legacy_partition_sha256: C.to_owned(),
-        }
-    }
-
-    fn receipt(catalog_digest: &str, host: &HostId) -> RetirementReceiptEvidence {
-        RetirementReceiptEvidence {
-            schema: RETIREMENT_RECEIPT_EVIDENCE_SCHEMA.to_owned(),
+    fn predecessor_evidence(catalog_digest: &str, host: &HostId) -> PredecessorRetirementEvidence {
+        PredecessorRetirementEvidence {
+            schema: PREDECESSOR_RETIREMENT_EVIDENCE_SCHEMA.to_owned(),
             receipt_sha256: A.to_owned(),
             plan_sha256: B.to_owned(),
             catalog_sha256: catalog_digest.to_owned(),
             host: host.clone(),
+            census_sha256: C.to_owned(),
+            journal_sha256: D.to_owned(),
             legacy_partition_sha256: C.to_owned(),
-            forward_only: true,
+            legacy_partition: vec![PredecessorRetiredDing {
+                runtime_id: format!("{}.legacy.ding", host.as_str()),
+                agent: format!("{}.legacy", host.as_str()),
+            }],
         }
-    }
-
-    fn record_retirement(cutover: &mut CutoverTransaction, catalog_digest: &str, host: &HostId) {
-        let mut transaction = cutover.permission();
-        transaction
-            .record_retirement_plan(plan(catalog_digest, host))
-            .unwrap();
-        transaction.start_forward_only(B).unwrap();
-        transaction
-            .record_retirement_receipt(receipt(catalog_digest, host))
-            .unwrap();
     }
 
     fn checkpoint(
@@ -3242,8 +3386,41 @@ mod tests {
             ExternalCheckpointKind::FinalProof => ExternalCheckpointPayload::FinalProof {
                 final_catalog_sha256: declaration_root_sha256_locked(cutover.catalog.as_path())
                     .unwrap(),
+                providers_sha256: cutover
+                    .marker
+                    .provider_fleet_proof
+                    .as_ref()
+                    .unwrap()
+                    .providers_sha256
+                    .clone(),
+                launch_receipts_sha256: cutover
+                    .marker
+                    .provider_fleet_proof
+                    .as_ref()
+                    .unwrap()
+                    .launch_receipts_sha256
+                    .clone(),
+                ding_partition_sha256: cutover
+                    .marker
+                    .provider_fleet_proof
+                    .as_ref()
+                    .unwrap()
+                    .ding_partition_sha256
+                    .clone(),
+                ding_reconcile_sha256: sha256_bytes(
+                    &canonical_json(
+                        &cutover.marker.completed_ding_reconciles.as_slice()[0].receipt,
+                    )
+                    .unwrap(),
+                ),
                 validation_sha256: C.to_owned(),
-                runtime_inventory_sha256: D.to_owned(),
+                runtime_inventory_sha256: cutover
+                    .marker
+                    .provider_fleet_proof
+                    .as_ref()
+                    .unwrap()
+                    .result_sha256
+                    .clone(),
             },
             ExternalCheckpointKind::BusContinuity => ExternalCheckpointPayload::BusContinuity {
                 bus_id: "catalog-bus".to_owned(),
@@ -3276,6 +3453,7 @@ mod tests {
         adopted.provider_fleet_proof = Some(ProviderFleetProofEvidence {
             schema: PROVIDER_FLEET_PROOF_EVIDENCE_SCHEMA.to_owned(),
             providers_sha256: adoption.providers_sha256.clone(),
+            launch_receipts_sha256: provider_launch_receipts_sha256(&adoption.providers).unwrap(),
             ding_partition_sha256: C.to_owned(),
             result_sha256: D.to_owned(),
         });
@@ -3343,14 +3521,17 @@ mod tests {
             host: host.clone(),
             gate_id: GateId::parse("gate-1").unwrap(),
             request_sha256: A.to_owned(),
-            source_catalog_sha256: source,
+            source_catalog_sha256: source.clone(),
             program: program(
                 &declaration_root_sha256_locked(catalog.as_path()).unwrap(),
                 &after,
             ),
+            predecessor_retirement: predecessor_evidence(&source, &host),
         })
         .unwrap();
-        assert!(matches!(outcome, BeginOutcome::Fenced(_)));
+        let BeginOutcome::Fenced(pending) = outcome else {
+            panic!("held host ownership must leave a durable pending fence");
+        };
         assert!(matches!(
             probe_mutation_admission(&catalog, Some(&host)).unwrap(),
             MutationAdmission::Busy(MutationBusy {
@@ -3358,16 +3539,12 @@ mod tests {
                 ..
             })
         ));
-        drop(ownership);
-        let ResumeOutcome::Active(_) = CutoverTransaction::resume(ResumeCutover {
-            catalog,
-            host,
-            gate_id: GateId::parse("gate-1").unwrap(),
-            request_sha256: A.to_owned(),
-        })
-        .unwrap() else {
-            panic!("fence should be claimable after prior owner releases");
-        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(ownership);
+        });
+        let claimed = pending.wait_for_ownership().unwrap();
+        assert_eq!(claimed.marker().cursor, 0);
     }
 
     #[test]
@@ -3395,6 +3572,28 @@ mod tests {
             .unwrap();
         actions.swap(adoption, ding);
         assert!(validate_program(A, &actions).is_err());
+    }
+
+    #[test]
+    fn program_refuses_every_catalog_transition_after_provider_fleet_proof() {
+        let mut actions = program(A, B);
+        let adoption = actions
+            .iter()
+            .position(|action| matches!(action, CutoverAction::ProviderFleetProof(_)))
+            .unwrap();
+        actions.insert(
+            adoption + 2,
+            CutoverAction::CatalogTransition(CatalogTransition {
+                before_sha256: B.to_owned(),
+                after_sha256: D.to_owned(),
+            }),
+        );
+        assert!(
+            validate_program(A, &actions)
+                .unwrap_err()
+                .to_string()
+                .contains("must precede provider fleet proof")
+        );
     }
 
     fn running_observation(entry: &ProviderFleetEntry) -> ProviderTaskObservation {
@@ -3566,8 +3765,7 @@ mod tests {
     #[test]
     fn action_program_enforces_exact_interleaving_and_typed_evidence() {
         let (_root, catalog, host) = fixture();
-        let (mut cutover, source, after) = begin(catalog.clone(), host.clone());
-        record_retirement(&mut cutover, &source, &host);
+        let (mut cutover, _source, after) = begin(catalog.clone(), host.clone());
         let premature = checkpoint(&cutover, 1, ExternalCheckpointKind::Cleanup);
         assert!(
             cutover
@@ -3608,8 +3806,27 @@ mod tests {
             sha256_bytes(&canonical_json(&stored.receipt).unwrap())
         );
         complete_adoption_and_ding(&mut cutover);
-        record_checkpoint(&mut cutover, 4, ExternalCheckpointKind::FinalProof);
-        record_checkpoint(&mut cutover, 5, ExternalCheckpointKind::BusContinuity);
+        record_checkpoint(&mut cutover, 4, ExternalCheckpointKind::BusContinuity);
+        let mut arbitrary: ExternalCheckpointReceipt =
+            serde_json::from_slice(&checkpoint(&cutover, 5, ExternalCheckpointKind::FinalProof))
+                .unwrap();
+        let ExternalCheckpointPayload::FinalProof {
+            final_catalog_sha256,
+            ..
+        } = &mut arbitrary.payload
+        else {
+            unreachable!()
+        };
+        *final_catalog_sha256 = A.to_owned();
+        assert!(
+            cutover
+                .permission()
+                .record_external_checkpoint(5, &canonical_json(&arbitrary).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("does not bind the exact final catalog")
+        );
+        record_checkpoint(&mut cutover, 5, ExternalCheckpointKind::FinalProof);
         let finalized = cutover.permission().finalize().unwrap();
         assert!(finalized.finalized.history_path.exists());
         assert!(finalized.finalized.marker.finalized);
@@ -3618,8 +3835,7 @@ mod tests {
     #[test]
     fn resume_accepts_exact_uncompleted_transition_after_digest_and_advances_without_reinvoke() {
         let (_root, catalog, host) = fixture();
-        let (mut cutover, source, _after) = begin(catalog.clone(), host.clone());
-        record_retirement(&mut cutover, &source, &host);
+        let (cutover, _source, _after) = begin(catalog.clone(), host.clone());
         fs::write(
             catalog.as_path().join(crate::catalog::CONFIG_FILE),
             b"candidate = true\n",
@@ -3650,8 +3866,7 @@ mod tests {
     #[test]
     fn finalized_history_has_unambiguous_nested_address_and_typed_recovery() {
         let (_root, catalog, host) = fixture();
-        let (mut cutover, source, _) = begin(catalog.clone(), host.clone());
-        record_retirement(&mut cutover, &source, &host);
+        let (mut cutover, _source, _) = begin(catalog.clone(), host.clone());
         cutover
             .permission()
             .catalog_transition_once(0, |_| {
@@ -3664,8 +3879,8 @@ mod tests {
             .unwrap();
         record_checkpoint(&mut cutover, 1, ExternalCheckpointKind::Cleanup);
         complete_adoption_and_ding(&mut cutover);
-        record_checkpoint(&mut cutover, 4, ExternalCheckpointKind::FinalProof);
-        record_checkpoint(&mut cutover, 5, ExternalCheckpointKind::BusContinuity);
+        record_checkpoint(&mut cutover, 4, ExternalCheckpointKind::BusContinuity);
+        record_checkpoint(&mut cutover, 5, ExternalCheckpointKind::FinalProof);
         let finalized = cutover.permission().finalize().unwrap();
         assert!(
             finalized
@@ -3674,6 +3889,29 @@ mod tests {
                 .ends_with(Path::new("test-host").join("gate-1.json"))
         );
         let finalized_path = finalized.finalized.history_path.clone();
+        assert!(
+            catalog
+                .as_path()
+                .join(CONTROL_DIR)
+                .join(CUTOVER_DIR)
+                .join(ACTIVE_MARKER)
+                .exists(),
+            "active gate stays present until successor loop readiness"
+        );
+        drop(finalized);
+        let ResumeOutcome::Finalized(recovered_before_readiness) =
+            CutoverTransaction::resume(ResumeCutover {
+                catalog: catalog.clone(),
+                host: host.clone(),
+                gate_id: GateId::parse("gate-1").unwrap(),
+                request_sha256: A.to_owned(),
+            })
+            .unwrap()
+        else {
+            panic!("restart before readiness must recover the finalized active fence");
+        };
+        let (_, ownership, readiness) = recovered_before_readiness.into_successor_parts();
+        readiness.unwrap().supervisor_entered().unwrap();
         let inspected = CutoverTransaction::inspect_finalized(ResumeCutover {
             catalog: catalog.clone(),
             host: host.clone(),
@@ -3683,17 +3921,140 @@ mod tests {
         .unwrap()
         .expect("finalized history must remain inspectable while successor owns the host");
         assert_eq!(inspected.history_path, finalized_path);
-        drop(finalized.ownership);
+        drop(ownership);
+        let recovered = CutoverTransaction::reacquire_finalized_successor(ResumeCutover {
+            catalog: catalog.clone(),
+            host: host.clone(),
+            gate_id: GateId::parse("gate-1").unwrap(),
+            request_sha256: A.to_owned(),
+        })
+        .unwrap()
+        .expect("expected history-only successor recovery");
+        assert_eq!(recovered.finalized.history_path, finalized_path);
+        assert!(
+            HostOwnership::acquire(catalog.as_path(), host.as_str()).is_err(),
+            "concurrent finalized replay cannot duplicate successor ownership"
+        );
+        let (_, recovered_ownership, readiness) = recovered.into_successor_parts();
+        assert!(readiness.is_none());
+        drop(recovered_ownership);
+
+        let mut mismatched = inspected.marker.clone();
+        mismatched.request_sha256 = D.to_owned();
+        fs::write(&finalized_path, canonical_json(&mismatched).unwrap()).unwrap();
+        let error = match CutoverTransaction::reacquire_finalized_successor(ResumeCutover {
+            catalog: catalog.clone(),
+            host: host.clone(),
+            gate_id: GateId::parse("gate-1").unwrap(),
+            request_sha256: A.to_owned(),
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched history must be rejected"),
+        };
+        assert!(
+            matches!(
+                error,
+                AdmissionError::Invalid(_) | AdmissionError::Conflict(_)
+            ),
+            "mismatched history must fail as typed validation/conflict"
+        );
+        assert!(
+            !catalog
+                .as_path()
+                .join(CONTROL_DIR)
+                .join(CUTOVER_DIR)
+                .join(ACTIVE_MARKER)
+                .exists(),
+            "mismatched history must never reopen predecessor authority"
+        );
+    }
+
+    #[test]
+    fn finalized_active_without_history_is_repaired_before_successor_recovery() {
+        let (_root, catalog, host) = fixture();
+        let (mut cutover, _source, _) = begin(catalog.clone(), host.clone());
+        cutover
+            .permission()
+            .catalog_transition_once(0, |_| {
+                fs::write(
+                    catalog.as_path().join(crate::catalog::CONFIG_FILE),
+                    b"candidate = true\n",
+                )
+                .map_err(|error| AdmissionError::io("write candidate catalog", error))
+            })
+            .unwrap();
+        record_checkpoint(&mut cutover, 1, ExternalCheckpointKind::Cleanup);
+        complete_adoption_and_ding(&mut cutover);
+        record_checkpoint(&mut cutover, 4, ExternalCheckpointKind::BusContinuity);
+        record_checkpoint(&mut cutover, 5, ExternalCheckpointKind::FinalProof);
+        let finalized = cutover.permission().finalize().unwrap();
+        let history_path = finalized.finalized.history_path.clone();
+        let expected_bytes = canonical_json(&finalized.finalized.marker).unwrap();
+
+        // Model the only legacy bad window: an older writer persisted finalized active authority
+        // and died before publishing history. New writers cannot create this state because they
+        // publish history first.
+        fs::remove_file(&history_path).unwrap();
+        sync_dir(history_path.parent().unwrap()).unwrap();
+        drop(finalized);
+
         let ResumeOutcome::Finalized(recovered) = CutoverTransaction::resume(ResumeCutover {
-            catalog,
+            catalog: catalog.clone(),
             host,
             gate_id: GateId::parse("gate-1").unwrap(),
             request_sha256: A.to_owned(),
         })
         .unwrap() else {
-            panic!("expected finalized recovery");
+            panic!("finalized active authority must repair its missing exact history");
         };
-        assert_eq!(recovered.history_path, finalized_path);
+        assert_eq!(fs::read(&history_path).unwrap(), expected_bytes);
+        assert!(recovered.finalized.marker.finalized);
+        assert!(recovered.readiness.is_some());
+    }
+
+    #[test]
+    fn history_collision_refuses_before_active_marker_can_be_finalized() {
+        let (_root, catalog, host) = fixture();
+        let (mut cutover, _source, _) = begin(catalog.clone(), host.clone());
+        cutover
+            .permission()
+            .catalog_transition_once(0, |_| {
+                fs::write(
+                    catalog.as_path().join(crate::catalog::CONFIG_FILE),
+                    b"candidate = true\n",
+                )
+                .map_err(|error| AdmissionError::io("write candidate catalog", error))
+            })
+            .unwrap();
+        record_checkpoint(&mut cutover, 1, ExternalCheckpointKind::Cleanup);
+        complete_adoption_and_ding(&mut cutover);
+        record_checkpoint(&mut cutover, 4, ExternalCheckpointKind::BusContinuity);
+        record_checkpoint(&mut cutover, 5, ExternalCheckpointKind::FinalProof);
+
+        let paths = ensure_cutover_dirs(&catalog).unwrap();
+        let history_path =
+            history_marker_path(&paths, &host, &GateId::parse("gate-1").unwrap()).unwrap();
+        let mut collision = cutover.marker().clone();
+        collision.finalized = true;
+        collision.request_sha256 = D.to_owned();
+        publish_bytes_create_only(
+            history_path.parent().unwrap(),
+            &history_path,
+            &canonical_json(&collision).unwrap(),
+        )
+        .unwrap();
+
+        let error = match cutover.permission().finalize() {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched history must refuse finalization"),
+        };
+        assert!(error.to_string().contains("history collision"));
+        let (active, _) =
+            read_marker_with_bytes(&catalog, &paths.cutover.join(ACTIVE_MARKER)).unwrap();
+        assert!(
+            !active.finalized,
+            "history must become exact before active authority can claim finalization"
+        );
     }
 
     #[test]

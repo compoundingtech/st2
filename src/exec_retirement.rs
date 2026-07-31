@@ -1,13 +1,10 @@
-//! Crash-recoverable retirement of historical numeric exec records.
+//! Crash-recoverable retirement of exact strict-v2 exec generations.
 //!
-//! This module is deliberately a closed transition consumer, not a compatibility implementation
-//! of `ExecBackend::remove`.  A preparation pass takes an exclusive state-namespace lock, captures
-//! every numeric generation record, and publishes an immutable plan.  Apply accepts only that
-//! plan, re-censuses the complete namespace, and either:
-//!
-//! - proves a recorded PID stale and retires only its exact record inode; or
-//! - pins a live leader with a pidfd, securely opens its dedicated leaf cgroup-v2 scope, freezes and
-//!   revalidates every member, uses `cgroup.kill`, proves the scope empty, and retires the record.
+//! This module is deliberately not a compatibility implementation of `ExecBackend::remove`.
+//! Preparation accepts one live strict-v2 generation, takes an exclusive state-namespace lock,
+//! and publishes an immutable plan. Apply accepts only that plan, re-censuses the namespace, pins
+//! the exact leader with a pidfd, securely opens its dedicated leaf cgroup-v2 scope, freezes and
+//! revalidates every member, uses `cgroup.kill`, proves the scope empty, and retires the record.
 //!
 //! A record is never unlinked.  It is moved with `renameat2(RENAME_NOREPLACE)` into a private slot,
 //! then the moved inode and bytes are verified.  A raced move is rolled back without replacement;
@@ -120,14 +117,10 @@ fn public_error(error: anyhow::Error) -> RetirementError {
     RetirementError { code, message }
 }
 
-/// A preparation either targets one historical numeric record or the complete numeric-record set.
-///
-/// `LegacySet` is intentionally all-or-nothing: callers cannot hand a partial list that silently
-/// leaves another historical record outside the one-shot transition.
+/// A preparation targets one exact strict-v2 runtime generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetirementSelector {
     Id(String),
-    LegacySet,
 }
 
 #[derive(Clone, Debug)]
@@ -201,7 +194,6 @@ struct RetirementPlan {
 #[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
 enum SelectionWire {
     Id { runtime_id: String },
-    LegacySet,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -251,10 +243,6 @@ pub struct LegacySuccessorTask {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "state", deny_unknown_fields)]
 enum PlannedClassification {
-    Stale {
-        pid: i32,
-        proof: StaleProof,
-    },
     Live {
         pid: i32,
         start_time_ticks: u64,
@@ -262,20 +250,6 @@ enum PlannedClassification {
         cgroup_path: String,
         cgroup_device: u64,
         cgroup_inode: u64,
-        legacy_scope: Option<LegacyScopeWitness>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
-enum StaleProof {
-    PidAbsent,
-    NumericPidOutsideRuntimeScope {
-        observed_start_time_ticks: u64,
-        observed_cgroup_path: String,
-    },
-    StrictGenerationNotLive {
-        expected_start_time_ticks: u64,
     },
 }
 
@@ -596,32 +570,9 @@ pub(crate) fn prepare_admitted(
     );
     let metadata = locked.state_dir.metadata()?;
     let census = census_state_namespace(&locked)?;
-    if matches!(&request.selector, RetirementSelector::LegacySet) {
-        anyhow::ensure!(
-            census.iter().all(|entry| entry.name.ends_with(".pid")),
-            "--legacy-set refuses foreign regular files in the exec state namespace"
-        );
-    }
     let census_sha256 = hash_census(&census);
-    let legacy_partition = if matches!(&request.selector, RetirementSelector::LegacySet) {
-        Some(derive_legacy_successor_partition(
-            &catalog,
-            &request.host,
-            &census,
-        )?)
-    } else {
-        None
-    };
+    let legacy_partition = None;
     let legacy_partition_sha256 = hash_legacy_partition(legacy_partition.as_deref())?;
-    let legacy_by_runtime = legacy_partition
-        .as_ref()
-        .map(|partition| {
-            partition
-                .iter()
-                .map(|task| (task.runtime_id.as_str(), task))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
     let mut targets = Vec::new();
     for entry in &census {
         let Some(runtime_id) = entry.name.strip_suffix(".pid") else {
@@ -630,115 +581,53 @@ pub(crate) fn prepare_admitted(
         if !safe_runtime_id(runtime_id) {
             anyhow::bail!("unsafe exec runtime id in state namespace: {runtime_id:?}");
         }
-        let selected = match &request.selector {
-            RetirementSelector::Id(selected) => selected == runtime_id,
-            RetirementSelector::LegacySet => true,
-        };
+        let RetirementSelector::Id(selected) = &request.selector;
+        let selected = selected == runtime_id;
         if !selected {
             continue;
         }
         let record = open_record(&locked, runtime_id)?;
         let raw = read_exact_record(&record.file)?;
-        let parsed = std::str::from_utf8(&raw)
-            .ok()
-            .map(str::trim)
-            .unwrap_or("")
-            .parse::<i32>();
-        let (generation_id, authority_kind, classification) = match parsed {
-            Ok(pid) => {
-                anyhow::ensure!(
-                    matches!(&request.selector, RetirementSelector::LegacySet),
-                    "historical numeric exec records are read-only outside --legacy-set"
-                );
-                anyhow::ensure!(
-                    pid > 0,
-                    "legacy exec record {runtime_id:?} has invalid pid {pid}"
-                );
-                (
-                    None,
-                    RetirementAuthorityKind::StaleRecordOnly,
-                    classify_numeric_pid(
-                        pid,
-                        runtime_id,
-                        legacy_by_runtime
-                            .get(runtime_id)
-                            .copied()
-                            .context("legacy successor partition omitted exec record")?,
-                        &catalog,
-                        &request.host,
-                    )?,
+        let generation: crate::exec_backend::ExecGeneration = serde_json::from_slice(&raw)
+            .map_err(|_| {
+                tagged(
+                    RetirementErrorCode::Unsupported,
+                    format!(
+                        "runtime {runtime_id:?} is not a strict-v2 generation; predecessor records \
+                         are read-only"
+                    ),
                 )
-            }
-            Err(_) if matches!(&request.selector, RetirementSelector::LegacySet) => {
-                anyhow::bail!(
-                    "--legacy-set requires the complete state namespace to contain only numeric \
-                     .pid records; foreign or strict record {:?} is present",
-                    entry.name
-                )
-            }
-            Err(_) => {
-                let generation: crate::exec_backend::ExecGeneration = serde_json::from_slice(&raw)
-                    .with_context(|| format!("decode strict exec generation for {runtime_id:?}"))?;
-                crate::exec_backend::validate_generation(runtime_id, &generation)
-                    .map_err(anyhow::Error::msg)?;
-                if generation.schema != crate::exec_backend::EXEC_GENERATION_SCHEMA_V2 {
-                    return Err(tagged(
-                        RetirementErrorCode::Unsupported,
-                        format!(
-                            "runtime {runtime_id:?} uses historical strict v1 and is read-only"
-                        ),
-                    ));
-                }
-                let classification = classify_strict_generation(&generation)?;
-                (
-                    Some(generation.generation_id),
-                    RetirementAuthorityKind::StrictGenerationV2,
-                    classification,
-                )
-            }
-        };
-        let authority_kind = if matches!(
-            classification,
-            PlannedClassification::Live {
-                legacy_scope: Some(_),
-                ..
-            }
-        ) {
-            RetirementAuthorityKind::LegacyScopeV1
-        } else {
-            authority_kind
-        };
+            })?;
+        crate::exec_backend::validate_generation(runtime_id, &generation)
+            .map_err(anyhow::Error::msg)?;
+        if generation.schema != crate::exec_backend::EXEC_GENERATION_SCHEMA_V2 {
+            return Err(tagged(
+                RetirementErrorCode::Unsupported,
+                format!("runtime {runtime_id:?} is not a strict-v2 generation and is read-only"),
+            ));
+        }
+        let classification = classify_strict_generation(&generation)?;
         targets.push(PlannedTarget {
             runtime_id: runtime_id.to_string(),
-            generation_id,
-            authority_kind,
+            generation_id: Some(generation.generation_id),
+            authority_kind: RetirementAuthorityKind::StrictGenerationV2,
             record: record.evidence,
             classification,
         });
     }
     targets.sort_by(|a, b| a.runtime_id.cmp(&b.runtime_id));
 
-    let selection = match request.selector {
-        RetirementSelector::Id(runtime_id) => {
-            anyhow::ensure!(
-                safe_runtime_id(&runtime_id),
-                "unsafe runtime id {runtime_id:?}"
-            );
-            targets.retain(|target| target.runtime_id == runtime_id);
-            anyhow::ensure!(
-                targets.len() == 1,
-                "runtime {runtime_id:?} is not exactly one historical numeric record"
-            );
-            SelectionWire::Id { runtime_id }
-        }
-        RetirementSelector::LegacySet => {
-            anyhow::ensure!(
-                !targets.is_empty(),
-                "exec state namespace contains no historical numeric records"
-            );
-            SelectionWire::LegacySet
-        }
-    };
+    let RetirementSelector::Id(runtime_id) = request.selector;
+    anyhow::ensure!(
+        safe_runtime_id(&runtime_id),
+        "unsafe runtime id {runtime_id:?}"
+    );
+    targets.retain(|target| target.runtime_id == runtime_id);
+    anyhow::ensure!(
+        targets.len() == 1,
+        "runtime {runtime_id:?} is not exactly one strict-v2 generation"
+    );
+    let selection = SelectionWire::Id { runtime_id };
     let request_sha256 = hash_request(
         &selection,
         &census_sha256,
@@ -1180,10 +1069,6 @@ fn apply_target(
     );
 
     match &target.classification {
-        PlannedClassification::Stale { pid, proof } => {
-            prove_stale_at_apply(*pid, proof, target.record.modified_unix_ns)?;
-            enter_forward_only(transaction, journal)?;
-        }
         PlannedClassification::Live {
             pid,
             start_time_ticks,
@@ -1191,7 +1076,7 @@ fn apply_target(
             cgroup_path,
             cgroup_device,
             cgroup_inode,
-            legacy_scope,
+            ..
         } if matches!(
             phase,
             ItemPhase::Prepared | ItemPhase::MutationAuthorized | ItemPhase::Frozen
@@ -1213,16 +1098,6 @@ fn apply_target(
                         );
                         let mut cgroup =
                             CgroupHandle::open(cgroup_path, *cgroup_device, *cgroup_inode)?;
-                        if let Some(legacy_scope) = legacy_scope {
-                            verify_legacy_scope_witness(
-                                &target.runtime_id,
-                                *pid,
-                                *start_time_ticks,
-                                scope_unit,
-                                cgroup_path,
-                                legacy_scope,
-                            )?;
-                        }
                         test_checkpoint("before-first-runtime-mutation");
                         verify_open_record_binding(locked, &record, &target.record)?;
                         verify_systemd_scope(scope_unit, cgroup_path)?;
@@ -1232,16 +1107,6 @@ fn apply_target(
                                 && cgroup.contains_pid(*pid)?,
                             "planned exec authority changed at the mutation boundary"
                         );
-                        if let Some(legacy_scope) = legacy_scope {
-                            verify_legacy_scope_witness(
-                                &target.runtime_id,
-                                *pid,
-                                *start_time_ticks,
-                                scope_unit,
-                                cgroup_path,
-                                legacy_scope,
-                            )?;
-                        }
                         enter_forward_only(transaction, journal)?;
                         journal
                             .items
@@ -1266,10 +1131,6 @@ fn apply_target(
                             recoverable(error, "persist frozen retirement phase")
                         })?;
                         let pinned = cgroup.revalidate_members(*pid, *start_time_ticks, leader)?;
-                        if let Some(legacy_scope) = legacy_scope {
-                            verify_frozen_legacy_membership(legacy_scope, &pinned.evidence)?;
-                            verify_legacy_process_witness(&legacy_scope.member, cgroup_path)?;
-                        }
                         membership = pinned.evidence.clone();
                         journal
                             .items
@@ -1300,13 +1161,6 @@ fn apply_target(
                             Ok(mut cgroup) => {
                                 verify_systemd_scope(scope_unit, cgroup_path)?;
                                 if !cgroup.is_empty()? {
-                                    if let Some(legacy_scope) = legacy_scope {
-                                        verify_legacy_systemd_scope(
-                                            scope_unit,
-                                            cgroup_path,
-                                            legacy_scope,
-                                        )?;
-                                    }
                                     let frozen = read_event(&cgroup.events_file, "frozen")?;
                                     match leaderless_freeze_action(phase, frozen.as_deref())? {
                                         LeaderlessFreezeAction::Freeze => {
@@ -1359,12 +1213,6 @@ fn apply_target(
                                         }
                                     }
                                     let pinned = cgroup.revalidate_all_members()?;
-                                    if let Some(legacy_scope) = legacy_scope {
-                                        verify_frozen_legacy_membership(
-                                            legacy_scope,
-                                            &pinned.evidence,
-                                        )?;
-                                    }
                                     if membership.is_empty() {
                                         membership = pinned.evidence.clone();
                                         journal
@@ -1516,25 +1364,6 @@ fn retired_target(
         sha256: after.sha256,
     };
     match &target.classification {
-        PlannedClassification::Stale { pid, .. } => RetiredTarget {
-            runtime_id: target.runtime_id.clone(),
-            generation_id: target.generation_id.clone(),
-            authority_kind: target.authority_kind,
-            disposition: RetiredDisposition::StaleRecordOnly,
-            pid: *pid,
-            start_time_ticks: None,
-            scope_unit: None,
-            cgroup_path: None,
-            cgroup_device: None,
-            cgroup_inode: None,
-            legacy_scope: None,
-            membership: item.membership.clone(),
-            freeze_observed: item.freeze_observed,
-            cgroup_outcome: item.cgroup_outcome,
-            durable_phase: "record-retired".to_string(),
-            record_before: before,
-            record_after: after,
-        },
         PlannedClassification::Live {
             pid,
             start_time_ticks,
@@ -1542,7 +1371,7 @@ fn retired_target(
             cgroup_path,
             cgroup_device,
             cgroup_inode,
-            legacy_scope,
+            ..
         } => RetiredTarget {
             runtime_id: target.runtime_id.clone(),
             generation_id: target.generation_id.clone(),
@@ -1554,7 +1383,7 @@ fn retired_target(
             cgroup_path: Some(cgroup_path.clone()),
             cgroup_device: Some(*cgroup_device),
             cgroup_inode: Some(*cgroup_inode),
-            legacy_scope: legacy_scope.clone(),
+            legacy_scope: None,
             membership: item.membership.clone(),
             freeze_observed: item.freeze_observed,
             cgroup_outcome: item.cgroup_outcome,
@@ -1579,153 +1408,6 @@ fn public_record(record: &RecordEvidence) -> RetiredRecordEvidence {
 struct OpenRecord {
     file: File,
     evidence: RecordEvidence,
-}
-
-fn derive_legacy_successor_partition(
-    catalog: &Path,
-    host: &str,
-    census: &[CensusEntry],
-) -> Result<Vec<LegacySuccessorTask>> {
-    let discovered = crate::discover(catalog);
-    anyhow::ensure!(
-        discovered.errors.is_empty() && discovered.warnings.is_empty(),
-        "legacy retirement requires warning-free catalog discovery: errors={:?}, warnings={:?}",
-        discovered
-            .errors
-            .iter()
-            .map(|error| format!("{}: {}", error.path.display(), error.message))
-            .collect::<Vec<_>>(),
-        discovered.warnings
-    );
-    let record_ids = census
-        .iter()
-        .map(|entry| {
-            entry
-                .name
-                .strip_suffix(".pid")
-                .map(str::to_string)
-                .context("legacy exec census contains a non-record entry")
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
-    let mut partition = Vec::new();
-    let mut declared_ids = BTreeSet::new();
-    for spec in &discovered.specs {
-        if spec.resolved_host(host) != host {
-            continue;
-        }
-        let bus_id = spec.bus_id(host);
-        for task in &spec.tasks {
-            if task.kind != agent_spec::spec::TaskKind::Exec {
-                continue;
-            }
-            let runtime_id = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
-            anyhow::ensure!(
-                declared_ids.insert(runtime_id.clone()),
-                "duplicate local exec runtime id {runtime_id:?}"
-            );
-            validate_canonical_ding_declaration(spec, task, &runtime_id, catalog, host)?;
-            partition.push(LegacySuccessorTask {
-                runtime_id,
-                agent: bus_id.clone(),
-                task: task.name.clone(),
-                desired_state: if spec.retired {
-                    SuccessorDesiredState::AbsentRetired
-                } else {
-                    SuccessorDesiredState::RunningDing
-                },
-            });
-        }
-    }
-    anyhow::ensure!(
-        declared_ids == record_ids,
-        "legacy exec namespace and successor catalog partition differ: records={record_ids:?}, \
-         declarations={declared_ids:?}"
-    );
-    partition.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
-    Ok(partition)
-}
-
-struct ExpectedDing {
-    argv: Vec<String>,
-    cwd: PathBuf,
-}
-
-fn validate_canonical_ding_declaration(
-    spec: &agent_spec::spec::AgentSpec,
-    task: &agent_spec::spec::Task,
-    runtime_id: &str,
-    catalog: &Path,
-    host: &str,
-) -> Result<ExpectedDing> {
-    anyhow::ensure!(
-        task.kind == agent_spec::spec::TaskKind::Exec && task.name == "ding",
-        "legacy exec runtime {runtime_id:?} is not the canonical Ding task"
-    );
-    let bus_id = spec.bus_id(host);
-    let expected_shell = format!("st2 ding --identity {bus_id} --root $ST_ROOT");
-    let argv = match (&task.command, &task.argv) {
-        (Some(command), None) if command == &expected_shell => vec![
-            "st2".to_string(),
-            "ding".to_string(),
-            "--identity".to_string(),
-            bus_id,
-            "--root".to_string(),
-            catalog.display().to_string(),
-        ],
-        (None, Some(argv))
-            if argv
-                == &vec![
-                    "st2".to_string(),
-                    "ding".to_string(),
-                    "--identity".to_string(),
-                    bus_id.clone(),
-                    "--root".to_string(),
-                    "$ST_ROOT".to_string(),
-                ] =>
-        {
-            argv.iter()
-                .map(|argument| {
-                    if argument == "$ST_ROOT" {
-                        catalog.display().to_string()
-                    } else {
-                        crate::expand::expand_catalog(argument, catalog)
-                    }
-                })
-                .collect()
-        }
-        _ => anyhow::bail!(
-            "legacy exec runtime {runtime_id:?} is not a closed canonical Ding launch"
-        ),
-    };
-    let spec_dir = spec
-        .path
-        .parent()
-        .context("agent declaration path has no parent")?;
-    let cwd = match task.cwd.as_deref().or(spec.workspace.as_deref()) {
-        Some(value) => spec_dir.join(crate::expand::expand_catalog(value, catalog)),
-        None => spec_dir.to_path_buf(),
-    }
-    .canonicalize()
-    .with_context(|| format!("canonicalize expected Ding cwd for {runtime_id:?}"))?;
-    Ok(ExpectedDing { argv, cwd })
-}
-
-fn expected_ding_for_runtime(catalog: &Path, host: &str, runtime_id: &str) -> Result<ExpectedDing> {
-    let discovered = crate::discover(catalog);
-    anyhow::ensure!(
-        discovered.errors.is_empty() && discovered.warnings.is_empty(),
-        "catalog discovery changed while deriving Ding witness"
-    );
-    let (spec, task, resolved) =
-        crate::reconcile::resolve_task(&discovered.specs, runtime_id, host)?;
-    anyhow::ensure!(
-        resolved == runtime_id,
-        "catalog resolved a different Ding runtime id"
-    );
-    validate_canonical_ding_declaration(spec, task, runtime_id, catalog, host)
 }
 
 fn open_record(locked: &StateLock, runtime_id: &str) -> Result<OpenRecord> {
@@ -1766,417 +1448,6 @@ fn verify_open_record_binding(
         "exact exec record changed at the retirement mutation boundary"
     );
     Ok(())
-}
-
-fn classify_numeric_pid(
-    pid: i32,
-    runtime_id: &str,
-    successor: &LegacySuccessorTask,
-    catalog: &Path,
-    host: &str,
-) -> Result<PlannedClassification> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, runtime_id, successor, catalog, host);
-        return Err(tagged(
-            RetirementErrorCode::Unsupported,
-            "historical exec retirement preparation requires Linux",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        match pidfd_open(pid) {
-            Ok(leader) => {
-                classify_live_legacy_scope(pid, runtime_id, successor, catalog, host, leader)
-            }
-            Err(error)
-                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
-            {
-                Ok(PlannedClassification::Stale {
-                    pid,
-                    proof: StaleProof::PidAbsent,
-                })
-            }
-            Err(error) => Err(error).context("open pidfd while classifying legacy exec record"),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn classify_live_legacy_scope(
-    pid: i32,
-    runtime_id: &str,
-    successor: &LegacySuccessorTask,
-    catalog: &Path,
-    host: &str,
-    leader: File,
-) -> Result<PlannedClassification> {
-    anyhow::ensure!(
-        successor.runtime_id == runtime_id,
-        "legacy successor row does not bind its record"
-    );
-    let start_time_ticks = process_start_time_ticks(pid)?;
-    ensure_pidfd_live(&leader)?;
-    let cgroup_path = process_cgroup_path(pid)?;
-    let unit = Path::new(&cgroup_path)
-        .file_name()
-        .and_then(OsStr::to_str)
-        .context("legacy process cgroup has no UTF-8 unit leaf")?
-        .to_string();
-    if !crate::isolate::scope_unit_matches(runtime_id, &unit) {
-        return Ok(PlannedClassification::Stale {
-            pid,
-            proof: StaleProof::NumericPidOutsideRuntimeScope {
-                observed_start_time_ticks: start_time_ticks,
-                observed_cgroup_path: cgroup_path,
-            },
-        });
-    }
-
-    let expected = expected_ding_for_runtime(catalog, host, runtime_id)?;
-    let systemd = systemd_scope_witness(&unit)?;
-    anyhow::ensure!(
-        systemd.control_group == cgroup_path,
-        "legacy scope ControlGroup differs from the record PID cgroup"
-    );
-    let cgroup = CgroupHandle::open_inner(&cgroup_path, None)?;
-    let cgroup_metadata = cgroup.dir.metadata()?;
-    let members = read_pids(&cgroup.procs_file)?;
-    anyhow::ensure!(
-        members == vec![pid] && read_pids(&cgroup.procs_file)? == members,
-        "legacy scope is shared, provider-owned, or changed membership"
-    );
-    let member = capture_legacy_process_witness(pid, start_time_ticks, &expected, &cgroup_path)?;
-    ensure_pidfd_live(&leader)?;
-    anyhow::ensure!(
-        process_start_time_ticks(pid)? == start_time_ticks
-            && read_pids(&cgroup.procs_file)? == vec![pid],
-        "legacy Ding generation changed during preparation"
-    );
-    Ok(PlannedClassification::Live {
-        pid,
-        start_time_ticks,
-        scope_unit: unit,
-        cgroup_path,
-        cgroup_device: cgroup_metadata.dev(),
-        cgroup_inode: cgroup_metadata.ino(),
-        legacy_scope: Some(LegacyScopeWitness {
-            scope_id: systemd.id,
-            control_group: systemd.control_group,
-            invocation_id: systemd.invocation_id,
-            active_enter_timestamp_monotonic: systemd.active_enter_timestamp_monotonic,
-            slice: systemd.slice,
-            member,
-        }),
-    })
-}
-
-#[cfg(target_os = "linux")]
-struct SystemdScopeWitness {
-    id: String,
-    control_group: String,
-    invocation_id: String,
-    active_enter_timestamp_monotonic: u64,
-    slice: String,
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_scope_witness(unit: &str) -> Result<SystemdScopeWitness> {
-    const PROPERTIES: [&str; 10] = [
-        "Id",
-        "Names",
-        "ControlGroup",
-        "InvocationID",
-        "ActiveEnterTimestampMonotonic",
-        "Transient",
-        "LoadState",
-        "ActiveState",
-        "SubState",
-        "Slice",
-    ];
-    let mut command = Command::new("systemctl");
-    command.args(["--user", "show", unit]);
-    for property in PROPERTIES {
-        command.arg(format!("--property={property}"));
-    }
-    let output = command
-        .output()
-        .with_context(|| format!("query complete systemd authority for {unit}"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "systemd did not acknowledge exact legacy scope {unit}: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    parse_systemd_scope_witness(unit, &output.stdout)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_systemd_scope_witness(unit: &str, stdout: &[u8]) -> Result<SystemdScopeWitness> {
-    const PROPERTIES: [&str; 10] = [
-        "Id",
-        "Names",
-        "ControlGroup",
-        "InvocationID",
-        "ActiveEnterTimestampMonotonic",
-        "Transient",
-        "LoadState",
-        "ActiveState",
-        "SubState",
-        "Slice",
-    ];
-    let mut values = BTreeMap::new();
-    for line in String::from_utf8(stdout.to_vec())
-        .context("systemd scope properties are not UTF-8")?
-        .lines()
-    {
-        let (key, value) = line
-            .split_once('=')
-            .context("systemd emitted an unkeyed scope property")?;
-        anyhow::ensure!(
-            PROPERTIES.contains(&key)
-                && values.insert(key.to_string(), value.to_string()).is_none(),
-            "systemd emitted an unknown or duplicate scope property {key:?}"
-        );
-    }
-    anyhow::ensure!(
-        values.len() == PROPERTIES.len(),
-        "systemd omitted required legacy scope authority"
-    );
-    let value = |key: &str| -> Result<&str> {
-        values
-            .get(key)
-            .map(String::as_str)
-            .with_context(|| format!("systemd omitted {key}"))
-    };
-    anyhow::ensure!(
-        value("Id")? == unit
-            && value("Names")? == unit
-            && value("Transient")? == "yes"
-            && value("LoadState")? == "loaded"
-            && value("ActiveState")? == "active"
-            && value("SubState")? == "running"
-            && value("Slice")? == "app.slice",
-        "legacy scope is not one active transient st2 task in app.slice"
-    );
-    let invocation_id = value("InvocationID")?;
-    anyhow::ensure!(
-        invocation_id.len() == 32
-            && invocation_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && invocation_id.bytes().any(|byte| byte != b'0'),
-        "legacy scope InvocationID is missing or invalid"
-    );
-    let active_enter_timestamp_monotonic =
-        value("ActiveEnterTimestampMonotonic")?
-            .parse::<u64>()
-            .context("parse legacy scope monotonic activation identity")?;
-    anyhow::ensure!(
-        active_enter_timestamp_monotonic > 0,
-        "legacy scope monotonic activation identity is absent"
-    );
-    Ok(SystemdScopeWitness {
-        id: unit.to_string(),
-        control_group: value("ControlGroup")?.to_string(),
-        invocation_id: invocation_id.to_string(),
-        active_enter_timestamp_monotonic,
-        slice: value("Slice")?.to_string(),
-    })
-}
-
-fn verify_frozen_legacy_membership(
-    expected: &LegacyScopeWitness,
-    actual: &[MemberEvidence],
-) -> Result<()> {
-    anyhow::ensure!(
-        actual
-            == [MemberEvidence {
-                pid: expected.member.pid,
-                start_time_ticks: expected.member.start_time_ticks,
-            }],
-        "frozen legacy Ding membership differs from preparation"
-    );
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn capture_legacy_process_witness(
-    pid: i32,
-    start_time_ticks: u64,
-    expected: &ExpectedDing,
-    cgroup_path: &str,
-) -> Result<LegacyProcessWitness> {
-    let uid = process_uid(pid)?;
-    let current_uid = unsafe { libc::geteuid() };
-    anyhow::ensure!(
-        uid.iter().all(|value| *value == current_uid),
-        "legacy Ding uid authority differs from the st2 user"
-    );
-    let executable = fs::read_link(format!("/proc/{pid}/exe"))
-        .with_context(|| format!("read legacy Ding executable for pid {pid}"))?;
-    let executable = executable
-        .canonicalize()
-        .context("canonicalize legacy Ding executable")?;
-    let executable_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(format!("/proc/{pid}/exe"))
-        .with_context(|| format!("open retained legacy Ding executable for pid {pid}"))?;
-    let executable_metadata = executable_file.metadata()?;
-    anyhow::ensure!(
-        executable_metadata.is_file()
-            && fs::read_link(format!("/proc/{pid}/exe"))?.canonicalize()? == executable
-            && executable.file_name().and_then(OsStr::to_str) == Some("st2"),
-        "legacy Ding executable is not one exact regular st2 binary"
-    );
-    let argv = process_argv(pid)?;
-    anyhow::ensure!(
-        argv == expected.argv,
-        "legacy Ding argv differs from its canonical catalog declaration"
-    );
-    let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
-        .with_context(|| format!("read legacy Ding cwd for pid {pid}"))?
-        .canonicalize()
-        .context("canonicalize legacy Ding cwd")?;
-    let cwd_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
-        .open(format!("/proc/{pid}/cwd"))?;
-    let cwd_metadata = cwd_file.metadata()?;
-    anyhow::ensure!(
-        cwd == expected.cwd,
-        "legacy Ding cwd differs from its catalog declaration"
-    );
-    anyhow::ensure!(
-        process_cgroup_path(pid)? == cgroup_path
-            && process_start_time_ticks(pid)? == start_time_ticks,
-        "legacy Ding process authority changed during capture"
-    );
-    Ok(LegacyProcessWitness {
-        pid,
-        start_time_ticks,
-        uid: current_uid,
-        executable,
-        executable_device: executable_metadata.dev(),
-        executable_inode: executable_metadata.ino(),
-        argv,
-        cwd,
-        cwd_device: cwd_metadata.dev(),
-        cwd_inode: cwd_metadata.ino(),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn verify_legacy_scope_witness(
-    runtime_id: &str,
-    pid: i32,
-    start_time_ticks: u64,
-    unit: &str,
-    cgroup_path: &str,
-    expected: &LegacyScopeWitness,
-) -> Result<()> {
-    anyhow::ensure!(
-        crate::isolate::scope_unit_matches(runtime_id, unit)
-            && expected.scope_id == unit
-            && expected.control_group == cgroup_path
-            && expected.member.pid == pid
-            && expected.member.start_time_ticks == start_time_ticks,
-        "legacy-scope-v1 plan does not bind the exact runtime boundary"
-    );
-    verify_legacy_systemd_scope(unit, cgroup_path, expected)?;
-    verify_legacy_process_witness(&expected.member, cgroup_path)
-}
-
-#[cfg(target_os = "linux")]
-fn verify_legacy_systemd_scope(
-    unit: &str,
-    cgroup_path: &str,
-    expected: &LegacyScopeWitness,
-) -> Result<()> {
-    anyhow::ensure!(
-        expected.scope_id == unit && expected.control_group == cgroup_path,
-        "legacy systemd witness does not bind the selected scope"
-    );
-    let current = systemd_scope_witness(unit)?;
-    anyhow::ensure!(
-        current.id == expected.scope_id
-            && current.control_group == expected.control_group
-            && current.invocation_id == expected.invocation_id
-            && current.active_enter_timestamp_monotonic
-                == expected.active_enter_timestamp_monotonic
-            && current.slice == expected.slice,
-        "legacy systemd scope identity changed since preparation"
-    );
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn verify_legacy_process_witness(expected: &LegacyProcessWitness, cgroup_path: &str) -> Result<()> {
-    anyhow::ensure!(
-        process_start_time_ticks(expected.pid)? == expected.start_time_ticks
-            && process_cgroup_path(expected.pid)? == cgroup_path,
-        "legacy Ding process generation changed"
-    );
-    let uid = process_uid(expected.pid)?;
-    anyhow::ensure!(
-        uid.iter().all(|value| *value == expected.uid),
-        "legacy Ding uid changed"
-    );
-    let executable = fs::read_link(format!("/proc/{}/exe", expected.pid))?
-        .canonicalize()
-        .context("canonicalize retained legacy Ding executable")?;
-    let executable_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(format!("/proc/{}/exe", expected.pid))
-        .context("open retained legacy Ding executable")?;
-    let executable_metadata = executable_file.metadata()?;
-    let cwd = fs::read_link(format!("/proc/{}/cwd", expected.pid))?.canonicalize()?;
-    let cwd_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
-        .open(format!("/proc/{}/cwd", expected.pid))?;
-    let cwd_metadata = cwd_file.metadata()?;
-    anyhow::ensure!(
-        executable == expected.executable
-            && fs::read_link(format!("/proc/{}/exe", expected.pid))?.canonicalize()? == executable
-            && executable_metadata.dev() == expected.executable_device
-            && executable_metadata.ino() == expected.executable_inode
-            && process_argv(expected.pid)? == expected.argv
-            && cwd == expected.cwd
-            && cwd_metadata.dev() == expected.cwd_device
-            && cwd_metadata.ino() == expected.cwd_inode,
-        "legacy Ding executable, argv, or cwd changed"
-    );
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn process_uid(pid: i32) -> Result<[u32; 4]> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
-    let values = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .context("process status omitted Uid")?
-        .split_whitespace()
-        .map(str::parse::<u32>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    values
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("process status Uid did not contain four values"))
-}
-
-#[cfg(target_os = "linux")]
-fn process_argv(pid: i32) -> Result<Vec<String>> {
-    let bytes = fs::read(format!("/proc/{pid}/cmdline"))?;
-    anyhow::ensure!(
-        !bytes.is_empty() && bytes.len() <= 1024 * 1024 && bytes.last() == Some(&0),
-        "legacy Ding argv is empty, unterminated, or oversized"
-    );
-    bytes[..bytes.len() - 1]
-        .split(|byte| *byte == 0)
-        .map(|argument| {
-            String::from_utf8(argument.to_vec()).context("legacy Ding argv is not UTF-8")
-        })
-        .collect()
 }
 
 fn classify_strict_generation(
@@ -2225,7 +1496,6 @@ fn classify_strict_generation(
                     cgroup_path: isolation.cgroup_path.clone(),
                     cgroup_device: isolation.cgroup_device,
                     cgroup_inode: isolation.cgroup_inode,
-                    legacy_scope: None,
                 })
             }
             Err(error)
@@ -2239,52 +1509,6 @@ fn classify_strict_generation(
             Err(error) => Err(error).context("open pidfd for strict exec generation"),
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn prove_stale_at_apply(pid: i32, proof: &StaleProof, _record_mtime_ns: i128) -> Result<()> {
-    match proof {
-        // Preparation observed the immutable numeric record while this PID was absent. Any process
-        // that later acquires the number is necessarily unrelated and is never signalled.
-        StaleProof::PidAbsent => Ok(()),
-        // Preparation positively proved that the live PID was outside the exact runtime-named
-        // scope. The unchanged record is therefore stale; later PID reuse cannot revive it.
-        StaleProof::NumericPidOutsideRuntimeScope {
-            observed_start_time_ticks,
-            observed_cgroup_path,
-        } => {
-            anyhow::ensure!(
-                *observed_start_time_ticks > 0 && observed_cgroup_path.starts_with('/'),
-                "legacy stale proof is malformed"
-            );
-            Ok(())
-        }
-        StaleProof::StrictGenerationNotLive {
-            expected_start_time_ticks,
-        } => match pidfd_open(pid) {
-            Err(error)
-                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error).context("revalidate stale exec pid with pidfd"),
-            Ok(_pidfd) => {
-                anyhow::ensure!(
-                    process_start_time_ticks(pid)? != *expected_start_time_ticks,
-                    "the strict generation planned as stale is live again"
-                );
-                Ok(())
-            }
-        },
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn prove_stale_at_apply(_pid: i32, _proof: &StaleProof, _record_mtime_ns: i128) -> Result<()> {
-    Err(tagged(
-        RetirementErrorCode::Unsupported,
-        "exec retirement requires Linux",
-    ))
 }
 
 struct CgroupHandle {
@@ -2708,67 +1932,19 @@ fn validate_plan(locked: &StateLock, plan: &RetirementPlan, plan_sha256: &str) -
             target.record.relative_path == format!("{}.pid", target.runtime_id),
             "retirement record path does not match runtime id"
         );
-        match (&plan.selection, &target.classification) {
-            (
-                SelectionWire::Id { runtime_id },
-                PlannedClassification::Live {
-                    legacy_scope: None, ..
-                },
-            ) => {
-                anyhow::ensure!(
-                    runtime_id == &target.runtime_id
-                        && target.generation_id.is_some()
-                        && target.authority_kind == RetirementAuthorityKind::StrictGenerationV2,
-                    "general retirement plan does not bind one strict generation"
-                );
-            }
-            (SelectionWire::LegacySet, PlannedClassification::Stale { .. }) => {
-                anyhow::ensure!(
-                    target.generation_id.is_none()
-                        && target.authority_kind == RetirementAuthorityKind::StaleRecordOnly,
-                    "legacy-set stale target unexpectedly carries a strict generation"
-                );
-            }
-            (
-                SelectionWire::LegacySet,
-                PlannedClassification::Live {
-                    legacy_scope: Some(_),
-                    ..
-                },
-            ) => {
-                anyhow::ensure!(
-                    target.generation_id.is_none()
-                        && target.authority_kind == RetirementAuthorityKind::LegacyScopeV1,
-                    "legacy-set live target omitted legacy-scope-v1 authority"
-                );
-            }
-            (SelectionWire::Id { .. }, _) => {
-                anyhow::bail!("general retirement plan is not one live strict-v2 generation");
-            }
-            (SelectionWire::LegacySet, _) => {
-                anyhow::bail!("legacy-set plan contains unsupported live or PID-reuse authority");
-            }
-        }
+        let SelectionWire::Id { runtime_id } = &plan.selection;
+        anyhow::ensure!(
+            matches!(target.classification, PlannedClassification::Live { .. })
+                && runtime_id == &target.runtime_id
+                && target.generation_id.is_some()
+                && target.authority_kind == RetirementAuthorityKind::StrictGenerationV2,
+            "general retirement plan does not bind one live strict-v2 generation"
+        );
     }
-    match (&plan.selection, &plan.legacy_partition) {
-        (SelectionWire::LegacySet, Some(partition)) => {
-            let partition_ids = partition
-                .iter()
-                .map(|task| task.runtime_id.as_str())
-                .collect::<BTreeSet<_>>();
-            let target_ids = plan
-                .targets
-                .iter()
-                .map(|target| target.runtime_id.as_str())
-                .collect::<BTreeSet<_>>();
-            anyhow::ensure!(
-                partition.len() == partition_ids.len() && partition_ids == target_ids,
-                "legacy successor partition is incomplete, duplicate, or contains extras"
-            );
-        }
-        (SelectionWire::Id { .. }, None) => {}
-        _ => anyhow::bail!("retirement plan has an invalid successor partition shape"),
-    }
+    anyhow::ensure!(
+        plan.legacy_partition.is_none(),
+        "successor retirement plans cannot carry predecessor partition authority"
+    );
     Ok(())
 }
 
@@ -2799,32 +1975,20 @@ fn validate_journal(
             .items
             .get(&target.runtime_id)
             .context("retirement journal omitted target state")?;
-        match &target.classification {
-            PlannedClassification::Live { .. } => {
-                if matches!(
-                    item.phase,
-                    ItemPhase::Frozen | ItemPhase::Killed | ItemPhase::RecordRetired
-                ) {
-                    anyhow::ensure!(
-                        item.freeze_observed,
-                        "live retirement phase omitted its freeze observation"
-                    );
-                }
-                if matches!(item.phase, ItemPhase::Killed | ItemPhase::RecordRetired) {
-                    anyhow::ensure!(
-                        item.cgroup_outcome.is_some(),
-                        "live killed phase omitted its cgroup outcome"
-                    );
-                }
-            }
-            PlannedClassification::Stale { .. } => {
-                anyhow::ensure!(
-                    !item.freeze_observed
-                        && item.cgroup_outcome.is_none()
-                        && item.membership.is_empty(),
-                    "stale record-only journal contains cgroup mutation evidence"
-                );
-            }
+        if matches!(
+            item.phase,
+            ItemPhase::Frozen | ItemPhase::Killed | ItemPhase::RecordRetired
+        ) {
+            anyhow::ensure!(
+                item.freeze_observed,
+                "live retirement phase omitted its freeze observation"
+            );
+        }
+        if matches!(item.phase, ItemPhase::Killed | ItemPhase::RecordRetired) {
+            anyhow::ensure!(
+                item.cgroup_outcome.is_some(),
+                "live killed phase omitted its cgroup outcome"
+            );
         }
     }
     let advanced = journal
@@ -3631,138 +2795,6 @@ mod tests {
         assert_ne!(
             hash_legacy_partition(None).unwrap(),
             hash_legacy_partition(Some(&partition)).unwrap()
-        );
-    }
-
-    #[test]
-    fn legacy_partition_accepts_only_exact_declared_ding_namespace() {
-        let catalog = tempfile::tempdir().unwrap();
-        let agent = catalog.path().join("agents/dev3/demo");
-        fs::create_dir_all(&agent).unwrap();
-        fs::write(
-            agent.join("agent.kdl"),
-            "agent \"demo\" { host \"dev3\"; ding #true; argv \"agent-bin\" }\n",
-        )
-        .unwrap();
-        let census = [CensusEntry {
-            name: "dev3.demo.ding.pid".to_string(),
-            device: 1,
-            inode: 2,
-            length: 3,
-            sha256: "00".repeat(32),
-        }];
-        let partition = derive_legacy_successor_partition(catalog.path(), "dev3", &census).unwrap();
-        assert_eq!(
-            partition,
-            [LegacySuccessorTask {
-                runtime_id: "dev3.demo.ding".to_string(),
-                agent: "dev3.demo".to_string(),
-                task: "ding".to_string(),
-                desired_state: SuccessorDesiredState::RunningDing,
-            }]
-        );
-
-        let foreign = [CensusEntry {
-            name: "dev3.demo.provider.pid".to_string(),
-            ..census[0].clone()
-        }];
-        assert!(
-            derive_legacy_successor_partition(catalog.path(), "dev3", &foreign)
-                .unwrap_err()
-                .to_string()
-                .contains("partition differ")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn legacy_systemd_witness_accepts_only_complete_exact_scope_identity() {
-        let unit = "st2-dev3.demo.ding-4242-7.scope";
-        let valid = format!(
-            "Id={unit}\n\
-             Names={unit}\n\
-             ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}\n\
-             InvocationID=0123456789abcdef0123456789abcdef\n\
-             ActiveEnterTimestampMonotonic=987654321\n\
-             Transient=yes\n\
-             LoadState=loaded\n\
-             ActiveState=active\n\
-             SubState=running\n\
-             Slice=app.slice\n"
-        );
-        let witness = parse_systemd_scope_witness(unit, valid.as_bytes()).unwrap();
-        assert_eq!(witness.id, unit);
-        assert_eq!(witness.invocation_id, "0123456789abcdef0123456789abcdef");
-        assert_eq!(witness.active_enter_timestamp_monotonic, 987654321);
-
-        for invalid in [
-            valid.replace(
-                "InvocationID=0123456789abcdef0123456789abcdef",
-                "InvocationID=",
-            ),
-            valid.replace(
-                "ActiveEnterTimestampMonotonic=987654321",
-                "ActiveEnterTimestampMonotonic=0",
-            ),
-            valid.replace("Slice=app.slice", "Slice=provider.slice"),
-            valid.replace("SubState=running", "SubState=dead"),
-            format!("{valid}ControlGroup=/duplicate\n"),
-        ] {
-            assert!(
-                parse_systemd_scope_witness(unit, invalid.as_bytes()).is_err(),
-                "accepted invalid systemd witness: {invalid}"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_frozen_membership_rejects_shared_or_changed_generation() {
-        let expected = LegacyScopeWitness {
-            scope_id: "st2-dev3.demo.ding-4242-7.scope".to_string(),
-            control_group: "/app.slice/st2-dev3.demo.ding-4242-7.scope".to_string(),
-            invocation_id: "0123456789abcdef0123456789abcdef".to_string(),
-            active_enter_timestamp_monotonic: 987654321,
-            slice: "app.slice".to_string(),
-            member: LegacyProcessWitness {
-                pid: 4242,
-                start_time_ticks: 12345,
-                uid: 1000,
-                executable: PathBuf::from("/nix/store/exact/bin/st2"),
-                executable_device: 1,
-                executable_inode: 2,
-                argv: vec!["st2".to_string(), "ding".to_string()],
-                cwd: PathBuf::from("/catalog/dev3/demo"),
-                cwd_device: 3,
-                cwd_inode: 4,
-            },
-        };
-        let exact = [MemberEvidence {
-            pid: 4242,
-            start_time_ticks: 12345,
-        }];
-        verify_frozen_legacy_membership(&expected, &exact).unwrap();
-        assert!(
-            verify_frozen_legacy_membership(
-                &expected,
-                &[
-                    exact[0].clone(),
-                    MemberEvidence {
-                        pid: 5000,
-                        start_time_ticks: 888,
-                    },
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            verify_frozen_legacy_membership(
-                &expected,
-                &[MemberEvidence {
-                    pid: 4242,
-                    start_time_ticks: 12346,
-                }],
-            )
-            .is_err()
         );
     }
 

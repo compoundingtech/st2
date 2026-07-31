@@ -540,6 +540,18 @@ Successor st2 consumes only that pinned typed receipt as a cutover checkpoint;
 it has no legacy-set drain API and never parses or mutates predecessor numeric
 records.
 
+`st2.cutover-request.v2` carries the receipt as the mandatory pre-fence input
+`predecessorRetirement = { receipt, expectSha256 }`; it carries no retirement
+selector or plan output. Before publishing the fence, the driver reads one
+bounded singly-linked regular file without following symlinks, requires
+byte-for-byte canonical `st2.exec-retirement.v1` JSON and the exact caller-held
+digest, and validates a completed forward-only journal whose host, canonical
+catalog, source digest, targets, and strictly ordered all-retired Ding partition
+form one exact bijection. `st2.cutover-transaction.v4` is born with the validated
+receipt digest and typed partition as non-optional evidence. Resume therefore
+does not reread the predecessor artifact. The successor action program starts
+only after this proof and has no predecessor runtime-mutation capability.
+
 The host exclusion path is
 `<canonical-catalog>/.st2.<host>.lock`. It is a persistent inode with a retained
 kernel `flock`; the PID text is diagnostic only. The old supervisor is stopped
@@ -607,9 +619,16 @@ program/cursor, typed external checkpoints, and deterministic candidate
 invocation/result. It is
 create-only, fsynced, survives process death, and has no time- or PID-based
 reclaim. Unknown or malformed active state is busy, not absent. Finalization
-publishes the exact record bytes create-only into durable history, fsyncs that
-destination, then removes the active name and fsyncs the control directory.
-Recovery accepts only byte-identical pre-published history.
+first publishes the exact finalized record bytes create-only into durable
+history and fsyncs that destination, then compare-and-swap persists the same
+bytes as finalized active authority. A crash at that boundary therefore leaves
+an unfinalized active record plus exact history and resumes idempotently; the
+inverse finalized-active/missing-history state is unreachable for new writers
+and is repaired for an interrupted older writer only from the exact validated
+active record under retained host ownership and catalog exclusion. The
+finalized active name remains the gate until the successor has entered its
+supervision loop; only that readiness callback removes it and fsyncs the
+control directory. Recovery accepts only byte-identical pre-published history.
 
 This is a singleton per canonical writable catalog authority, not distributed
 consensus. The writable catalog and its locks live in one authoritative POSIX
@@ -678,15 +697,35 @@ Status/preflight can report either state without mutating it, allowing systemd
 reports available or the typed `st2.mutation-busy.v1` record and never recovers
 or rewrites an active gate.
 
+`st2 cutover install` is the only candidate-service bootstrap. One retained
+systemd-user topology lock spans create-only publication or byte-verification
+of the request-digest unit, exclusion of every different candidate, daemon
+reload, persistent `enable --now`, and post-enable revalidation of the durable
+topology and loaded artifact. It does not retire the ordinary supervisor. On
+every start the candidate validates its
+current invocation and PID against one coherent loaded-unit snapshot. The
+loaded unit must have a canonical `FragmentPath` equal to that durable config
+file, exact rendered bytes, no `DropInPaths`, `NeedDaemonReload=no`,
+`UnitFileState=enabled`, `Transient=no`, `Restart=always`, and
+`RestartUSec=2s`. A same-named transient/runtime fragment, runtime-only
+enablement, stale daemon cache, or drop-in therefore cannot acquire cutover
+authority. The candidate enters successor supervision before its readiness
+callback retires the ordinary unit and archives the active gate. A later
+`Restart=always` start reacquires successor ownership from exact history rather
+than reopening the transaction.
+
 `st2 cutover run --request FILE --expect-request-sha256 HEX` is the sole normal
 mutation driver. It no-follow reads one bounded canonical
-`st2.cutover-request.v1`, verifies the caller-held digest, and resumes the exact
+`st2.cutover-request.v2`, verifies the caller-held digest, and resumes the exact
 next action. External-checkpoint request entries commit the typed input digest
 and canonical receipt path, not a future output digest. At the boundary the
 driver no-follow reads, hashes, and validates the produced receipt before
-recording it. Before acquiring `HostOwnership`, a repeated run checks exact
-finalized history read-only; therefore the final supervisor can retain the host
-lock continuously while replay still reports finalized.
+recording it. After readiness archived the active gate, a repeated run first
+checks exact finalized history read-only, then reacquires `HostOwnership` and
+rechecks active absence plus that same exact history under catalog exclusion
+before entering successor supervision. It never reopens transaction or
+predecessor authority, and mismatched history never falls through to a fresh
+begin.
 
 The gate covers resident and one-shot reconciliation, selected tasks,
 materialization, teardown, retirement, Ding process lifecycle, broad `st2 pty`

@@ -1,6 +1,7 @@
 //! CLI-level proofs for the sole durable cutover mutation driver.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
@@ -9,10 +10,14 @@ use st2::cutover_admission::{
     ProviderFleetEntry, ProviderFleetProofAction,
 };
 use st2::cutover_driver::{
-    CUTOVER_REQUEST_SCHEMA, CutoverCheckpointInput, CutoverRequest, CutoverRetirement,
-    CutoverRetirementSelector, canonical_request_bytes,
+    CUTOVER_REQUEST_SCHEMA, CutoverCheckpointInput, CutoverPredecessorRetirementInput,
+    CutoverRequest, canonical_request_bytes,
 };
 use st2::ding_reconcile::{DingDesiredExec, DingReconcileAction};
+use st2::exec_retirement::{
+    ExecRetirementReceipt, ExecRetirementStatus, LegacySuccessorTask, RetiredDisposition,
+    RetiredRecordEvidence, RetiredTarget, RetirementAuthorityKind, SuccessorDesiredState,
+};
 
 fn st2() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -24,6 +29,72 @@ fn digest(byte: u8) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn predecessor_receipt(catalog: &Path, host: &str, catalog_sha256: &str) -> Vec<u8> {
+    let legacy_partition = Some(vec![LegacySuccessorTask {
+        runtime_id: format!("{host}.legacy.ding"),
+        agent: format!("{host}.legacy"),
+        task: "ding".to_owned(),
+        desired_state: SuccessorDesiredState::AbsentRetired,
+    }]);
+    let mut partition_bytes = serde_json::to_vec(&legacy_partition).unwrap();
+    partition_bytes.push(b'\n');
+    let mut partition_hash = Sha256::new();
+    partition_hash.update(b"st2.exec-retirement-legacy-partition.v1\0");
+    partition_hash.update(partition_bytes);
+    let record = RetiredRecordEvidence {
+        relative_path: format!("{host}.legacy.ding.pid"),
+        device: 1,
+        inode: 2,
+        length: 3,
+        modified_unix_ns: 4,
+        sha256: digest(4),
+    };
+    let receipt = ExecRetirementReceipt {
+        schema: "st2.exec-retirement.v1".to_owned(),
+        request_sha256: digest(1),
+        plan_sha256: digest(2),
+        catalog: catalog.to_path_buf(),
+        host: host.to_owned(),
+        catalog_sha256: catalog_sha256.to_owned(),
+        state_dir_device: 1,
+        state_dir_inode: 2,
+        journal_schema: "st2.exec-retirement-journal.v1".to_owned(),
+        journal_sha256: digest(3),
+        journal_status: "completed".to_owned(),
+        status: ExecRetirementStatus::Completed,
+        completed_at_unix_ms: 1,
+        census_sha256: digest(5),
+        forward_only_started: true,
+        legacy_partition_sha256: format!("{:x}", partition_hash.finalize()),
+        legacy_partition,
+        targets: vec![RetiredTarget {
+            runtime_id: format!("{host}.legacy.ding"),
+            generation_id: None,
+            authority_kind: RetirementAuthorityKind::StaleRecordOnly,
+            disposition: RetiredDisposition::StaleRecordOnly,
+            pid: 42,
+            start_time_ticks: None,
+            cgroup_path: None,
+            scope_unit: None,
+            cgroup_device: None,
+            cgroup_inode: None,
+            legacy_scope: None,
+            membership: Vec::new(),
+            freeze_observed: false,
+            cgroup_outcome: None,
+            durable_phase: "record-retired".to_owned(),
+            record_before: record.clone(),
+            record_after: RetiredRecordEvidence {
+                relative_path: ".retirements/record".to_owned(),
+                ..record
+            },
+        }],
+    };
+    let mut bytes = serde_json::to_vec(&receipt).unwrap();
+    bytes.push(b'\n');
+    bytes
 }
 
 fn checkpoint_request(catalog: &Path, root: &Path) -> CutoverRequest {
@@ -44,13 +115,46 @@ fn checkpoint_request(catalog: &Path, root: &Path) -> CutoverRequest {
         "--boot".to_owned(),
         "managed-v1".to_owned(),
     ];
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let provider_argv = argv
+        .iter()
+        .map(|argument| format!("{argument:?}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let provider_declaration = catalog.join("agents/testhost/worker-a/agent.kdl");
+    fs::create_dir_all(provider_declaration.parent().unwrap()).unwrap();
+    fs::write(
+        provider_declaration,
+        format!(
+            r#"agent "worker-a" {{
+  identity "worker-a"
+  host "testhost"
+  workspace {workspace:?}
+  pty "agent" {{
+    lifecycle "adopt-only"
+    argv {provider_argv}
+    env {{
+      AGENT_PERSONA "worker"
+      AGENT_RUNTIME_PROFILE "/nix/store/profile.json"
+    }}
+  }}
+  exec "ding" {{
+    argv "st2" "ding" "--identity" "testhost.worker-a" "--root" "$ST_ROOT"
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
     let mut provider = ProviderFleetEntry {
         identity: "worker-a".to_owned(),
         host: HostId::parse("testhost").unwrap(),
         provider: "codex".to_owned(),
         account: "account-a".to_owned(),
         persona: "worker".to_owned(),
-        workspace: root.join("workspace"),
+        workspace: workspace.clone(),
         prompt: LaunchPromptAuthority {
             runtime_profile_path: PathBuf::from("/nix/store/profile.json"),
             runtime_profile_sha256: digest(3),
@@ -77,8 +181,15 @@ fn checkpoint_request(catalog: &Path, root: &Path) -> CutoverRequest {
     let providers = vec![provider];
     let mut ding = DingDesiredExec {
         runtime_id: "testhost.worker-a.ding".to_owned(),
-        canonical_argv: vec!["/nix/store/st2/bin/st2".to_owned(), "ding".to_owned()],
-        canonical_cwd: root.join("workspace"),
+        canonical_argv: vec![
+            "st2".to_owned(),
+            "ding".to_owned(),
+            "--identity".to_owned(),
+            "testhost.worker-a".to_owned(),
+            "--root".to_owned(),
+            catalog.canonicalize().unwrap().display().to_string(),
+        ],
+        canonical_cwd: workspace,
         canonical_env: Default::default(),
         launch_sha256: String::new(),
     };
@@ -86,6 +197,13 @@ fn checkpoint_request(catalog: &Path, root: &Path) -> CutoverRequest {
     let desired = vec![ding];
     let source_catalog_sha256 =
         st2::catalog_transaction::declaration_root_sha256_locked(catalog).unwrap();
+    let retirement_receipt = predecessor_receipt(
+        &catalog.canonicalize().unwrap(),
+        "testhost",
+        &source_catalog_sha256,
+    );
+    let retirement_receipt_path = root.join("predecessor-retirement.json");
+    fs::write(&retirement_receipt_path, &retirement_receipt).unwrap();
     CutoverRequest {
         schema: CUTOVER_REQUEST_SCHEMA.to_owned(),
         canonical_catalog: catalog.canonicalize().unwrap(),
@@ -108,17 +226,17 @@ fn checkpoint_request(catalog: &Path, root: &Path) -> CutoverRequest {
                 desired,
             }),
             CutoverAction::ExternalCheckpoint {
-                kind: ExternalCheckpointKind::FinalProof,
-                input_sha256: digest(8),
-            },
-            CutoverAction::ExternalCheckpoint {
                 kind: ExternalCheckpointKind::BusContinuity,
                 input_sha256: digest(9),
             },
+            CutoverAction::ExternalCheckpoint {
+                kind: ExternalCheckpointKind::FinalProof,
+                input_sha256: digest(8),
+            },
         ],
-        retirement: CutoverRetirement {
-            selector: CutoverRetirementSelector::LegacySet,
-            plan_output: root.join("retirement-plan.json"),
+        predecessor_retirement: CutoverPredecessorRetirementInput {
+            receipt: retirement_receipt_path,
+            expect_sha256: sha256(&retirement_receipt),
         },
         catalog_inputs: Vec::new(),
         checkpoint_inputs: vec![
@@ -128,11 +246,11 @@ fn checkpoint_request(catalog: &Path, root: &Path) -> CutoverRequest {
             },
             CutoverCheckpointInput {
                 action_index: 3,
-                receipt: root.join("final.json"),
+                receipt: root.join("bus.json"),
             },
             CutoverCheckpointInput {
                 action_index: 4,
-                receipt: root.join("bus.json"),
+                receipt: root.join("final.json"),
             },
         ],
     }
@@ -195,6 +313,112 @@ fn wrong_request_digest_refuses_before_any_catalog_or_runtime_state_mutation() {
 }
 
 #[test]
+fn candidate_start_failure_preserves_the_ordinary_supervisor_and_no_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let catalog = root.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let legacy = catalog.join("agents/testhost/legacy/agent.kdl");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(
+        legacy,
+        "agent \"legacy\" {\n  host \"testhost\"\n  retired #true\n  exec \"ding\" {\n    command \"st2 ding --identity testhost.legacy --root $ST_ROOT\"\n  }\n}\n",
+    )
+    .unwrap();
+    let request = checkpoint_request(&catalog, root.path());
+    let bytes = canonical_request_bytes(&request).unwrap();
+    let request_sha256 = sha256(&bytes);
+    let request_path = root.path().join("request.json");
+    fs::write(&request_path, bytes).unwrap();
+
+    let config = root.path().join("config");
+    let unit_dir = config.join("systemd/user");
+    fs::create_dir_all(&unit_dir).unwrap();
+    let ordinary = unit_dir.join("st2.service");
+    fs::write(&ordinary, b"ordinary-supervisor\n").unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+if [ "$2" = enable ]; then exit 23; fi
+if [ "$2" = show ]; then
+  printf '%s\n' \
+    'MainPID=1' \
+    'ActiveState=active' \
+    'LoadState=loaded' \
+    'Restart=always' \
+    'RestartUSec=2s' \
+    "FragmentPath=$XDG_CONFIG_HOME/systemd/user/$3" \
+    'DropInPaths=' \
+    'NeedDaemonReload=no' \
+    'UnitFileState=enabled' \
+    'Transient=no'
+fi
+exit 0
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = st2()
+        .args([
+            "cutover",
+            "install",
+            "--request",
+            request_path.to_str().unwrap(),
+            "--expect-request-sha256",
+            &request_sha256,
+        ])
+        .env("XDG_CONFIG_HOME", &config)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&ordinary).unwrap(), b"ordinary-supervisor\n");
+    assert!(!catalog.join(".st2/cutover/active.json").exists());
+
+    let candidate = st2::service::CutoverCandidateServiceSpec::new(
+        PathBuf::from(env!("CARGO_BIN_EXE_st2"))
+            .canonicalize()
+            .unwrap(),
+        catalog.canonicalize().unwrap(),
+        request_path.canonicalize().unwrap(),
+        request_sha256.clone(),
+        "testhost".to_owned(),
+        "gate-a".to_owned(),
+    )
+    .unwrap();
+    let forged = st2()
+        .args([
+            "cutover",
+            "run",
+            "--request",
+            request_path.to_str().unwrap(),
+            "--expect-request-sha256",
+            &request_sha256,
+        ])
+        .env("XDG_CONFIG_HOME", &config)
+        .env("PATH", format!("{}:", bin.display()))
+        .env(st2::service::CUTOVER_CANDIDATE_ENV, candidate.unit_name)
+        .env("INVOCATION_ID", "forged")
+        .output()
+        .unwrap();
+    assert!(!forged.status.success());
+    assert!(
+        String::from_utf8_lossy(&forged.stderr).contains("MainPID mismatch"),
+        "{}",
+        String::from_utf8_lossy(&forged.stderr)
+    );
+    assert!(!catalog.join(".st2/cutover/active.json").exists());
+}
+
+#[test]
 fn missing_checkpoint_boundary_is_durable_and_idempotent() {
     let root = tempfile::tempdir().unwrap();
     let catalog = root.path().join("catalog");
@@ -208,7 +432,7 @@ fn missing_checkpoint_boundary_is_durable_and_idempotent() {
     fs::create_dir_all(legacy.parent().unwrap()).unwrap();
     fs::write(
         legacy,
-        "agent \"legacy\" {\n  host \"testhost\"\n  retired #true\n  command \"true\"\n  ding\n}\n",
+        "agent \"legacy\" {\n  host \"testhost\"\n  retired #true\n  exec \"ding\" {\n    command \"st2 ding --identity testhost.legacy --root $ST_ROOT\"\n  }\n}\n",
     )
     .unwrap();
     let request = checkpoint_request(&catalog, root.path());
@@ -216,6 +440,52 @@ fn missing_checkpoint_boundary_is_durable_and_idempotent() {
     let request_sha256 = sha256(&bytes);
     let request_path = root.path().join("request.json");
     fs::write(&request_path, bytes).unwrap();
+    let candidate = st2::service::CutoverCandidateServiceSpec::new(
+        PathBuf::from(env!("CARGO_BIN_EXE_st2"))
+            .canonicalize()
+            .unwrap(),
+        catalog.canonicalize().unwrap(),
+        request_path.canonicalize().unwrap(),
+        request_sha256.clone(),
+        "testhost".to_owned(),
+        "gate-a".to_owned(),
+    )
+    .unwrap();
+    let config = root.path().join("config");
+    let unit_dir = config.join("systemd/user");
+    fs::create_dir_all(&unit_dir).unwrap();
+    fs::write(
+        unit_dir.join(&candidate.unit_name),
+        st2::service::render_cutover_candidate_unit(&candidate),
+    )
+    .unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+if [ "$2" != show ]; then exit 1; fi
+printf '%s\n' \
+  "MainPID=$PPID" \
+  'ActiveState=active' \
+  'LoadState=loaded' \
+  'Restart=always' \
+  'RestartUSec=2s' \
+  "FragmentPath=$XDG_CONFIG_HOME/systemd/user/$3" \
+  'DropInPaths=' \
+  'NeedDaemonReload=no' \
+  'UnitFileState=enabled' \
+  'Transient=no'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     let invoke = || {
         st2()
@@ -228,6 +498,10 @@ fn missing_checkpoint_boundary_is_durable_and_idempotent() {
                 &request_sha256,
             ])
             .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &config)
+            .env(st2::service::CUTOVER_CANDIDATE_ENV, &candidate.unit_name)
+            .env("INVOCATION_ID", "test-invocation")
+            .env("PATH", &path)
             .output()
             .unwrap()
     };
@@ -249,14 +523,12 @@ fn missing_checkpoint_boundary_is_durable_and_idempotent() {
     );
     let marker = catalog.join(".st2/cutover/active.json");
     let marker_before = fs::read(&marker).unwrap();
-    let plan_before = fs::read(root.path().join("retirement-plan.json")).unwrap();
+    let receipt_path = root.path().join("predecessor-retirement.json");
+    fs::remove_file(&receipt_path).unwrap();
 
     let second = invoke();
     assert!(!second.status.success());
     assert_eq!(second.stdout, first.stdout);
     assert_eq!(fs::read(marker).unwrap(), marker_before);
-    assert_eq!(
-        fs::read(root.path().join("retirement-plan.json")).unwrap(),
-        plan_before
-    );
+    assert!(!receipt_path.exists());
 }
