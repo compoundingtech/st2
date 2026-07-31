@@ -122,3 +122,17 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+- **R23 Fail-closed task inventory:** One read-only machine command exposes
+  every desired local PTY and exec task by agent identity, task name, runtime
+  id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
+  time, and opaque runtime-generation id. Unknown, duplicate, malformed,
+  unreadable, timed-out, PID-reused, or otherwise unprovable evidence is
+  indeterminate and makes the versioned envelope incomplete and the command
+  unsuccessful; it is never reported as absence. Observation detects semantic
+  declaration drift across its runtime probe, does not invoke a backend for a
+  root positively absent at admission, and performs no reconciliation, cleanup,
+  lifecycle change, or state rewrite. An admitted PTY root that changes
+  filesystem identity during the backend probe makes the observation
+  incomplete; the external backend may already have recreated a concurrently
+  removed registry. This diagnostic boundary is not transactionally serialized
+  with catalog or runtime writers and is not control-plane cutover authority.

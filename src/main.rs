@@ -269,6 +269,16 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Emit one fail-closed desired-task/runtime diagnostic snapshot. This is
+    /// read-only observation, not reconciliation or cutover authority.
+    Tasks {
+        /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
@@ -571,6 +581,13 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
+        Command::Tasks { host, json } => {
+            if !json {
+                anyhow::bail!("`st2 tasks` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            tasks_cmd(&catalog, host)
+        }
         Command::CompileAgent {
             catalog,
             identity,
@@ -1109,6 +1126,33 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         Ok(())
     } else {
         anyhow::bail!("{problems} problem(s) found")
+    }
+}
+
+fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = match root.canonicalize() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let detail = format!("canonicalize catalog {}: {error}", root.display());
+            let inventory =
+                st2::task_inventory::TaskInventory::incomplete(root.to_path_buf(), host, detail);
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let found = discover(&catalog);
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    let after = discover(&catalog);
+    if !st2::task_inventory::same_discovery(&found, &after) {
+        inventory.mark_incomplete("catalog declarations changed during task observation");
+    }
+    println!("{}", inventory.to_json());
+    if inventory.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("task inventory incomplete")
     }
 }
 

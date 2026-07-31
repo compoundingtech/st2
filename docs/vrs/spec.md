@@ -167,6 +167,32 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   lifecycle is the explicit authority to resume ordinary replacement.
   `retired #true` remains the separate explicit teardown path.
 
+- **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
+  `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
+  agent, task, and runtime id and cover both PTY and terminal-free exec tasks.
+  `complete=false` plus a non-zero exit is a closed result: a consumer must not
+  turn a missing row into absence. A running row always carries a PID, creation
+  time, and opaque generation id derived from stable backend evidence.
+
+  Discovery runs before and after runtime observation. A semantic declaration
+  change across those passes makes the result incomplete. This detects
+  observed drift but does not serialize catalog writers or claim a
+  transactional snapshot. A runtime root positively absent at admission is
+  empty and is not passed to its backend. An admitted PTY root that is removed
+  or replaced during `pty list` is indeterminate; because the external backend
+  creates an absent registry, concurrent root deletion is not a zero-write
+  boundary. Malformed state, PID reuse, timeouts, duplicate ids, and observer
+  failures are likewise indeterminate. Existing plain-PID exec records are
+  opened read-only without following symlinks and verified by retained file
+  identity, unchanged content and metadata, the final path identity, process
+  start token, and record mtime without rewriting them. If that proof is
+  unavailable on a supported OS, the generation remains indeterminate.
+
+  Inventory performs no reconciliation, launch, teardown, cleanup, lifecycle
+  edit, state migration, or catalog write. It does not authorize a staged
+  supervisor replacement; any cutover requiring transactional declaration
+  authority needs a separate protocol.
+
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
   can share a single registry across catalogs. Resolution is an exported
