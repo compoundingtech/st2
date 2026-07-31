@@ -585,33 +585,79 @@ lock domains:
 
 | Permission | Ordinary authority | Active-gate result |
 | --- | --- | --- |
-| `runtime-mutate` | `HostMutationLease(canonical catalog, host)` | typed busy |
+| `runtime-mutate` | retained `HostOwnership` plus short per-pass admission | typed busy |
 | `catalog-publish` | exclusive catalog lock plus digest CAS | typed busy |
 | `transaction` | exact active cutover record and phase CAS | only recorded next phase |
 
-The active record lives under the catalog control plane and binds its schema,
-canonical catalog, validated host, gate/request identity, source declaration
-digest, closed phase, forward-only state, retirement plan/receipt digests,
-ordered declaration transitions, and candidate invocation/result. It is
+The singleton active record lives at `.st2/cutover/active.json` under the
+catalog control plane and binds its schema,
+canonical catalog incarnation, validated host, gate/request identity, source
+declaration digest, forward-only retirement evidence, immutable ordered action
+program/cursor, typed external checkpoints, and deterministic candidate
+invocation/result. It is
 create-only, fsynced, survives process death, and has no time- or PID-based
 reclaim. Unknown or malformed active state is busy, not absent. Finalization
-moves the exact record with no replacement into durable history and fsyncs both
-directories.
+publishes the exact record bytes create-only into durable history, fsyncs that
+destination, then removes the active name and fsyncs the control directory.
+Recovery accepts only byte-identical pre-published history.
 
-Ordinary host mutation acquires the persistent host flock first, then observes
-the gate under the shared catalog lock, and retains the host lease through the
-operation. Gate creation uses the same host-first order and the exclusive
-catalog lock. Ordinary agent publication and catalog apply remain declaration
+This is a singleton per canonical writable catalog authority, not distributed
+consensus. The writable catalog and its locks live in one authoritative POSIX
+filesystem/kernel lock domain. Replicas remain read-only during the
+transaction; eventually synchronized independent writable copies are outside
+the v1 coordination model.
+
+Fence publication is the authorized stop signal: a resident supervisor observes
+the gate on its next pass, exits without mutating, and releases
+`HostOwnership`. Claim/resume then acquires that ownership under the already
+durable fence. Successful finalization returns the same retained ownership to
+`up_once_with_ownership` or `up_loop_with_ownership`; the successor never drops
+and reacquires the host lock.
+
+Ordinary host mutation retains `HostOwnership` across the supervisor lifetime.
+Each reconcile, materialize, teardown, or retirement pass then observes the
+global gate while briefly retaining the shared catalog lock. The shared lock is
+released between resident passes so ordinary declaration publishers are not
+starved. Fence creation briefly takes only the exclusive catalog lock, publishes
+the durable gate, and releases it before waiting for the prior supervisor to
+observe the fence and release host ownership. Transaction claim then uses
+host-first order and reacquires the exclusive catalog lock. Ordinary agent
+publication and catalog apply remain declaration
 transactions: while already holding the exclusive catalog lock they prove that
 no active gate exists. The exact cutover transaction may instead perform only
 its pre-recorded catalog CAS sequence. There is no generic force flag or
 untyped bypass token.
 
-Candidate reconciliation is an in-process, one-use capability. The transaction
-persists `candidate-started` before invoking it and persists its result after
-return. A crash after the first write is indeterminate and cannot invoke the
-candidate again automatically. Status/preflight can report that state without
-mutating it, allowing systemd `ExecStartPre` and publishers to refuse.
+The provider handoff is two different program actions rather than one generic
+candidate reconcile:
+
+1. `AdoptionProofAction` validates the precommitted provider generation,
+   declaration, identity, workspace, argv, profile, prompt, harness, model,
+   effort, and complete runtime inventory. It is read-only apart from advancing
+   the transaction marker after an exact proof. It has no workspace
+   materialization or provider spawn/kill/reap/remove/GC capability. A mismatch
+   leaves the cursor unchanged and is safe to inspect again.
+2. `DingReconcileAction` runs only after legacy Ding retirement and adoption
+   proof. It owns one precommitted successor notification exec set and a durable
+   per-Ding generation journal. Recovery accepts only an exact already-published
+   generation from that journal, so a crash cannot duplicate a sidecar. Its API
+   cannot address provider tasks or generic runtime teardown/GC.
+
+Status/preflight can report either state without mutating it, allowing systemd
+`ExecStartPre` and publishers to refuse.
+`st2 cutover status --json` is the stable read-only preflight surface; it
+reports available or the typed `st2.mutation-busy.v1` record and never recovers
+or rewrites an active gate.
+
+`st2 cutover run --request FILE --expect-request-sha256 HEX` is the sole normal
+mutation driver. It no-follow reads one bounded canonical
+`st2.cutover-request.v1`, verifies the caller-held digest, and resumes the exact
+next action. External-checkpoint request entries commit the typed input digest
+and canonical receipt path, not a future output digest. At the boundary the
+driver no-follow reads, hashes, and validates the produced receipt before
+recording it. Before acquiring `HostOwnership`, a repeated run checks exact
+finalized history read-only; therefore the final supervisor can retain the host
+lock continuously while replay still reports finalized.
 
 The gate covers resident and one-shot reconciliation, selected tasks,
 materialization, teardown, retirement, Ding process lifecycle, broad `st2 pty`

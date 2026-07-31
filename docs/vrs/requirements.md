@@ -212,17 +212,27 @@ accepted.
 - **R25 Durable cutover admission:** Runtime/workspace mutation and declaration
   publication remain separate capability domains. Every supervisor, one-shot
   reconcile, materializer, teardown, and retirement operation requires a
-  non-forgeable `HostMutationLease` for one validated `(canonical catalog,
-  host)`. Agent publication and whole-catalog apply retain their exclusive
+  non-forgeable `HostOwnership` for one validated `(canonical catalog, host)`
+  plus a short-lived `RuntimeMutationAdmission` for each mutation pass. Agent
+  publication and whole-catalog apply retain their exclusive
   catalog lock plus digest CAS. One durable active cutover gate admits neither
   ordinary runtime leases nor ordinary catalog publishers, even after its
   creating process dies; only its exact typed transaction may advance the
-  recorded retirement, ordered catalog CAS, and single candidate-once phases.
+  recorded retirement and immutable ordered action program. The program
+  interleaves declaration CAS, typed cleanup/final/bus checkpoints, a pure
+  adoption proof, and a separately restricted successor Ding reconciliation.
 
   The gate has no PID, TTL, mtime, or wall-clock stale recovery. Missing,
   malformed, unknown-schema, or unknown-phase active state fails closed.
-  Candidate invocation is recorded before execution and is never automatically
-  repeated after a crash. Completion moves the exact active record without
+  Provider generation, argv, profile, harness, model, and effort are committed
+  before the adoption proof. That proof reads the complete desired and actual
+  provider inventory and has no provider lifecycle or workspace-write
+  capability. It advances only when the inventory and trajectory are exact.
+  The following Ding action can reconcile only the precommitted successor
+  notification exec set. Its durable generation journal makes crash recovery
+  idempotent and it cannot spawn, kill, reap, remove, or garbage-collect a
+  provider.
+  Completion moves the exact active record without
   replacement into durable history rather than unlinking it. Broad `st2 pty`
   and `st2 shell` lifecycle entry points and service install/change operations
   refuse while a gate is active. Message, context, Resource, status, and Ding
@@ -230,3 +240,17 @@ accepted.
   is runtime mutation and remains leased. Direct same-UID writes outside st2
   are outside the cooperative threat model and are detected by repeated
   dirfd/inode/hash CAS, never claimed to be kernel-excluded.
+
+  The v1 authority domain is one canonical writable catalog on one
+  authoritative POSIX filesystem/kernel lock domain. Replicas are
+  read-only/non-authoritative during the transaction. Eventually synchronized
+  independent copies cannot claim global exclusion and are unsupported for
+  coordinated mutation.
+
+  One bounded, canonical request drives the complete transaction through
+  `st2 cutover run`. The request precommits checkpoint kinds, inputs, and
+  canonical receipt paths, but not output receipt bytes that do not exist yet.
+  The driver hashes and validates each produced typed receipt at its boundary.
+  Repeating `cutover run` after finalization verifies exact history without
+  first acquiring host ownership, so the retained successor lock does not make
+  finalized replay appear busy.
