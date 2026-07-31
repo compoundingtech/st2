@@ -293,6 +293,29 @@ first reconcile proves all of the following:
 - only genuinely missing declared work is launched;
 - explicit teardown remains the only path that stops an agent.
 
+Use the typed inventory rather than parsing `doctor` output:
+
+```sh
+st2 tasks --catalog "$CATALOG" --host <host> --json
+```
+
+The `st2.task-inventory.v1` envelope covers every desired local PTY and exec task. A complete
+observation exits zero. Unknown runtime evidence emits `complete: false`, preserves affected rows as
+`indeterminate` rather than `absent`, and exits non-zero.
+
+For the first replacement, apply `lifecycle "adopt-only"` to every active task before starting the
+new supervisor. The replacement can then adopt live generations but structurally cannot launch a
+missing one. After applying that fence, record the complete baseline inventory; after replacement,
+require every active desired row to be running at the exact baseline generation. Only then should a
+separate catalog CAS restore the ordinary `service` lifecycle. If proof fails, leave the adoption
+fence in place.
+
+Legacy exec PID records are read without rewriting them. If their PID-file time cannot prove the
+live process generation, inventory is deliberately indeterminate. There is currently no safe
+per-task rollover command for that ambiguous evidence: the cutover remains blocked until the
+sidecar exits naturally or a separate, explicitly authorized rollover seam is implemented and
+proved. Never work around this by rewriting the record or restarting PTY-backed agent sessions.
+
 The executable gate drives the real st2 binary and both PTY and exec backends through normal stop,
 forced kill, atomic binary replacement, adoption, a live-task heartbeat, and a duplicate-boot
 receipt:

@@ -241,6 +241,16 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Emit one complete-or-indeterminate desired-task/runtime snapshot for an adoption-only
+    /// supervisor cutover. This is a read-only typed boundary; it never reconciles.
+    Tasks {
+        /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
@@ -757,6 +767,13 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
+        Command::Tasks { host, json } => {
+            if !json {
+                anyhow::bail!("`st2 tasks` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            tasks_cmd(&catalog, host)
+        }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
                 anyhow::bail!(
@@ -1244,6 +1261,41 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         Ok(())
     } else {
         anyhow::bail!("{problems} problem(s) found")
+    }
+}
+
+fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = match root.canonicalize() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let detail = format!("canonicalize catalog {}: {error}", root.display());
+            let inventory = st2::task_inventory::TaskInventory::incomplete(
+                root.to_path_buf(),
+                host,
+                detail,
+            );
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let _catalog_lock = match st2::CatalogLock::shared(&catalog) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let detail = format!("acquire shared catalog-authoring lock: {error:#}");
+            let inventory = st2::task_inventory::TaskInventory::incomplete(catalog, host, detail);
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let found = discover(&catalog);
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+    let inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    println!("{}", inventory.to_json());
+    if inventory.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("task inventory incomplete")
     }
 }
 

@@ -14,15 +14,51 @@
 //! same host adopts the exec processes it left running.
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
+
+const EXEC_GENERATION_SCHEMA: &str = "st2.exec-generation.v1";
+
+/// The immutable identity of one exec process generation.
+///
+/// `start_time_ticks` is the kernel's process-start token: Linux clock ticks since boot, or the
+/// macOS process start timestamp in microseconds. It is deliberately paired with the pid: a reused
+/// pid can never make a different generation read as running.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecGeneration {
+    pub schema: String,
+    pub pid: u32,
+    pub created_at: String,
+    pub start_time_ticks: u64,
+    pub generation_id: String,
+}
+
+/// A generation observation is explicitly indeterminate when legacy evidence cannot safely identify
+/// a process. Callers must not collapse that case into "running".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecGenerationObservation {
+    Known {
+        generation: ExecGeneration,
+        alive: bool,
+    },
+    Indeterminate {
+        pid: Option<i32>,
+        reason: String,
+        /// Conservative compatibility projection for the old boolean `Session` API.
+        alive_for_reconcile: bool,
+    },
+}
 
 /// Supervises `exec` tasks as terminal-free processes.
 pub struct ExecBackend {
@@ -131,7 +167,38 @@ impl ExecBackend {
         }
 
         let child = cmd.spawn()?;
-        fs::write(self.pid_path(&target.pty_id), child.id().to_string())?;
+        let pid = child.id();
+        let start_time_ticks = match process_start_time_ticks(pid as i32) {
+            Ok(value) => value,
+            Err(error) => {
+                // Never leave a live process behind without its generation record.
+                terminate_unpublished(pid);
+                return Err(error).with_context(|| {
+                    format!("identifying spawned exec generation '{}'", target.pty_id)
+                });
+            }
+        };
+        let created_at = match rfc3339_utc(SystemTime::now()) {
+            Ok(created_at) => created_at,
+            Err(error) => {
+                terminate_unpublished(pid);
+                return Err(error)
+                    .with_context(|| format!("timestamping exec generation '{}'", target.pty_id));
+            }
+        };
+        let generation = ExecGeneration {
+            schema: EXEC_GENERATION_SCHEMA.to_string(),
+            pid,
+            generation_id: generation_id(&target.pty_id, pid, &created_at, start_time_ticks),
+            created_at,
+            start_time_ticks,
+        };
+        if let Err(error) = self.publish_generation(&target.pty_id, &generation) {
+            // Publication is the ownership boundary. If it fails, tear down the otherwise-untracked
+            // process group before returning the error.
+            terminate_unpublished(pid);
+            return Err(error);
+        }
         // Detach: dropping Child neither waits nor kills; `list` reaps exited children.
         drop(child);
         Ok(())
@@ -154,20 +221,28 @@ impl ExecBackend {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("reading exec pid record {}", path.display()))?;
-            let pid = raw
-                .trim()
-                .parse::<i32>()
-                .with_context(|| format!("parsing exec pid record {}", path.display()))?;
-            // Reap if it's our exited child (ECHILD after an st2 restart is fine — it's now init's).
-            unsafe {
-                let mut status = 0;
-                libc::waitpid(pid, &mut status, libc::WNOHANG);
-            }
+            let observation = self.observe_generation_path(id, &path);
+            let alive = match observation {
+                ExecGenerationObservation::Known {
+                    generation,
+                    alive: _,
+                } => {
+                    // Reap if it's our exited child (ECHILD after an st2 restart is fine — it's now
+                    // init's). Re-observe afterwards so a reaped zombie does not read as alive.
+                    unsafe {
+                        let mut status = 0;
+                        libc::waitpid(generation.pid as i32, &mut status, libc::WNOHANG);
+                    }
+                    observation_alive_for_reconcile(self.observe_generation_path(id, &path))
+                }
+                ExecGenerationObservation::Indeterminate {
+                    alive_for_reconcile,
+                    ..
+                } => alive_for_reconcile,
+            };
             out.push(Session {
                 pty_id: id.to_string(),
-                alive: process_alive(pid),
+                alive,
                 exit_code: None,
             });
         }
@@ -183,7 +258,16 @@ impl ExecBackend {
     /// succeeds for a freshly-forked child (never itself a group leader), so the group is the task's
     /// own, never st2's.
     pub fn kill(&self, id: &str) -> anyhow::Result<()> {
-        let pid = self.read_pid(id)?;
+        let pid = match self.observe_generation(id)? {
+            ExecGenerationObservation::Known {
+                generation,
+                alive: true,
+            } => generation.pid as i32,
+            ExecGenerationObservation::Known { alive: false, .. } => return Ok(()),
+            ExecGenerationObservation::Indeterminate { reason, .. } => {
+                anyhow::bail!("exec generation for '{id}' is indeterminate: {reason}")
+            }
+        };
         // Negative target = the process group led by `pid`.
         let ret = unsafe { libc::kill(-pid, libc::SIGTERM) };
         if ret != 0 {
@@ -222,11 +306,615 @@ impl ExecBackend {
         Ok(())
     }
 
-    fn read_pid(&self, id: &str) -> anyhow::Result<i32> {
-        let raw = fs::read_to_string(self.pid_path(id))
-            .map_err(|e| anyhow::anyhow!("reading pid for exec '{id}': {e}"))?;
-        raw.trim()
-            .parse::<i32>()
-            .map_err(|_| anyhow::anyhow!("bad pid file for exec '{id}'"))
+    /// Observe one exec without ever treating a reused pid as the recorded generation.
+    pub fn observe_generation(&self, id: &str) -> anyhow::Result<ExecGenerationObservation> {
+        self.observe_generation_optional(id)?
+            .ok_or_else(|| anyhow::anyhow!("reading pid for exec '{id}': no generation record"))
+    }
+
+    /// Observe exactly one desired exec id. `None` means only that its state record is absent.
+    pub fn observe_generation_optional(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<ExecGenerationObservation>> {
+        let path = self.pid_path(id);
+        match path.try_exists() {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("checking exec generation {}", path.display()));
+            }
+        }
+        Ok(Some(self.observe_generation_path(id, &path)))
+    }
+
+    fn observe_generation_path(&self, id: &str, path: &Path) -> ExecGenerationObservation {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return indeterminate(None, format!("reading {}: {error}", path.display()), true);
+            }
+        };
+        if let Ok(pid) = raw.trim().parse::<i32>() {
+            return self.observe_legacy_generation(id, path, pid);
+        }
+        let generation: ExecGeneration = match serde_json::from_str(&raw) {
+            Ok(record) => record,
+            Err(error) => {
+                return indeterminate(None, format!("strict JSON parse failed: {error}"), true);
+            }
+        };
+        if let Err(reason) = validate_generation(id, &generation) {
+            return indeterminate(Some(generation.pid as i32), reason, true);
+        }
+        match generation_process_state(&generation) {
+            GenerationProcessState::Running => ExecGenerationObservation::Known {
+                generation,
+                alive: true,
+            },
+            GenerationProcessState::Exited => ExecGenerationObservation::Known {
+                generation,
+                alive: false,
+            },
+            GenerationProcessState::Mismatch => indeterminate(
+                Some(generation.pid as i32),
+                "recorded startTimeTicks does not match the live pid",
+                true,
+            ),
+        }
+    }
+
+    fn observe_legacy_generation(
+        &self,
+        id: &str,
+        path: &Path,
+        pid: i32,
+    ) -> ExecGenerationObservation {
+        if pid <= 0 || !process_alive(pid) {
+            return indeterminate(
+                Some(pid),
+                "legacy pid is not a live process",
+                process_alive(pid),
+            );
+        }
+        let start_time_ticks = match process_start_time_ticks(pid) {
+            Ok(value) => value,
+            Err(error) => {
+                return indeterminate(
+                    Some(pid),
+                    format!("cannot read legacy process start token: {error:#}"),
+                    true,
+                );
+            }
+        };
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return indeterminate(
+                    Some(pid),
+                    format!("cannot stat legacy pid file: {error}"),
+                    true,
+                );
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(error) => {
+                return indeterminate(
+                    Some(pid),
+                    format!("legacy pid file has no usable mtime: {error}"),
+                    true,
+                );
+            }
+        };
+        match legacy_pid_predates_record(pid, start_time_ticks, modified) {
+            Ok(true) => {}
+            Ok(false) => {
+                return indeterminate(
+                    Some(pid),
+                    "legacy pid file predates the current process generation",
+                    true,
+                );
+            }
+            Err(error) => {
+                return indeterminate(
+                    Some(pid),
+                    format!("cannot order legacy pid file and process start: {error:#}"),
+                    true,
+                );
+            }
+        }
+        // Read the start token again after all legacy evidence. A process that changed under us is
+        // never promoted to a strict record.
+        if process_start_time_ticks(pid).ok() != Some(start_time_ticks) {
+            return indeterminate(
+                Some(pid),
+                "legacy process generation changed while observed",
+                true,
+            );
+        }
+        let created_at = match rfc3339_utc(modified) {
+            Ok(value) => value,
+            Err(error) => {
+                return indeterminate(
+                    Some(pid),
+                    format!("cannot encode legacy pid-file mtime: {error:#}"),
+                    true,
+                );
+            }
+        };
+        let generation = ExecGeneration {
+            schema: EXEC_GENERATION_SCHEMA.to_string(),
+            pid: pid as u32,
+            generation_id: generation_id(id, pid as u32, &created_at, start_time_ticks),
+            created_at,
+            start_time_ticks,
+        };
+        // Observation is read-only. Existing legacy files remain unchanged until normal lifecycle
+        // replacement; only future spawns publish strict JSON.
+        ExecGenerationObservation::Known {
+            generation,
+            alive: true,
+        }
+    }
+
+    fn publish_generation(&self, id: &str, generation: &ExecGeneration) -> anyhow::Result<()> {
+        let path = self.pid_path(id);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("exec generation path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let mut bytes = serde_json::to_vec(generation)?;
+        bytes.push(b'\n');
+        let mut temp = tempfile::Builder::new()
+            .prefix(".exec-generation.")
+            .tempfile_in(parent)?;
+        temp.write_all(&bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("publishing exec generation {}", path.display()))?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
+fn terminate_unpublished(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+        libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+    }
+}
+
+fn indeterminate(
+    pid: Option<i32>,
+    reason: impl Into<String>,
+    alive_for_reconcile: bool,
+) -> ExecGenerationObservation {
+    ExecGenerationObservation::Indeterminate {
+        pid,
+        reason: reason.into(),
+        alive_for_reconcile,
+    }
+}
+
+fn observation_alive_for_reconcile(observation: ExecGenerationObservation) -> bool {
+    match observation {
+        ExecGenerationObservation::Known { alive, .. } => alive,
+        ExecGenerationObservation::Indeterminate {
+            alive_for_reconcile,
+            ..
+        } => alive_for_reconcile,
+    }
+}
+
+fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), String> {
+    if generation.schema != EXEC_GENERATION_SCHEMA {
+        return Err(format!("unsupported schema {:?}", generation.schema));
+    }
+    if generation.pid == 0 || generation.pid > i32::MAX as u32 {
+        return Err("pid must be positive".to_string());
+    }
+    if !crate::task_inventory::is_rfc3339_utc_millis(&generation.created_at) {
+        return Err("createdAt must be an RFC3339 UTC timestamp with milliseconds".to_string());
+    }
+    let expected = generation_id(
+        id,
+        generation.pid,
+        &generation.created_at,
+        generation.start_time_ticks,
+    );
+    if generation.generation_id != expected {
+        return Err("generationId does not match the generation fields".to_string());
+    }
+    Ok(())
+}
+
+enum GenerationProcessState {
+    Running,
+    Exited,
+    Mismatch,
+}
+
+fn generation_process_state(generation: &ExecGeneration) -> GenerationProcessState {
+    let pid = generation.pid as i32;
+    if !process_alive(pid) {
+        return GenerationProcessState::Exited;
+    }
+    let first = process_start_time_ticks(pid).ok();
+    if first != Some(generation.start_time_ticks) {
+        return if process_alive(pid) {
+            GenerationProcessState::Mismatch
+        } else {
+            GenerationProcessState::Exited
+        };
+    }
+    // The second read closes the check/use window enough for an observation: a generation change at
+    // either edge makes the result non-running.
+    if !process_alive(pid) {
+        GenerationProcessState::Exited
+    } else if process_start_time_ticks(pid).ok() == Some(generation.start_time_ticks) {
+        GenerationProcessState::Running
+    } else {
+        GenerationProcessState::Mismatch
+    }
+}
+
+fn generation_id(runtime_id: &str, pid: u32, created_at: &str, start_time_ticks: u64) -> String {
+    crate::task_inventory::generation_id(
+        "exec",
+        runtime_id,
+        pid,
+        created_at,
+        Some(start_time_ticks),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after_comm = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| anyhow::anyhow!("malformed /proc/{pid}/stat"))?
+        .1;
+    // Fields after comm begin at field 3 (state); starttime is field 22, therefore index 19.
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("missing starttime in /proc/{pid}/stat"))?
+        .parse()
+        .with_context(|| format!("parsing starttime in /proc/{pid}/stat"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskallinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKALLINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    if read != expected {
+        anyhow::bail!("proc_pidinfo({pid}) returned {read}, expected {expected}");
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(info
+        .pbsd
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbsd.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_pid_predates_record(
+    _pid: i32,
+    start_time_ticks: u64,
+    modified: SystemTime,
+) -> anyhow::Result<bool> {
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        anyhow::bail!("sysconf(_SC_CLK_TCK) failed");
+    }
+    let uptime: f64 = fs::read_to_string("/proc/uptime")?
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing /proc/uptime value"))?
+        .parse()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let modified = modified.duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let tick = 1.0 / ticks_per_second as f64;
+    // A start token denotes a clock-tick bucket. Requiring the pid-file mtime to follow the *end* of
+    // that bucket means a process created after the legacy record (pid reuse) cannot be accepted.
+    let latest_start = now - uptime + start_time_ticks as f64 * tick + tick;
+    Ok(modified >= latest_start)
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_pid_predates_record(
+    _pid: i32,
+    start_time_ticks: u64,
+    modified: SystemTime,
+) -> anyhow::Result<bool> {
+    let modified_micros = modified.duration_since(UNIX_EPOCH)?.as_micros();
+    Ok(u128::from(start_time_ticks) <= modified_micros)
+}
+
+fn rfc3339_utc(time: SystemTime) -> anyhow::Result<String> {
+    let duration = time.duration_since(UNIX_EPOCH)?;
+    let seconds = duration.as_secs() as libc::time_t;
+    let millis = duration.subsec_millis();
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    if unsafe { libc::gmtime_r(&seconds, tm.as_mut_ptr()) }.is_null() {
+        anyhow::bail!("gmtime_r failed");
+    }
+    let tm = unsafe { tm.assume_init() };
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        millis
+    ))
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    fn target(id: &str) -> TaskTarget {
+        TaskTarget {
+            kind: crate::spec::TaskKind::Exec,
+            pty_id: id.to_string(),
+            bus_id: "host.test".to_string(),
+            name: "probe".to_string(),
+            launch: TaskLaunch::Shell("sleep 30".to_string()),
+            cwd: None,
+            workspace: None,
+            tags: BTreeMap::new(),
+            env: BTreeMap::new(),
+            keep: false,
+        }
+    }
+
+    #[test]
+    fn spawn_atomically_publishes_strict_generation_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        fs::create_dir_all(&catalog).unwrap();
+        let backend = ExecBackend::new(temp.path().join("state"), catalog);
+        let id = "host.test.probe";
+
+        backend.spawn(&target(id), temp.path()).unwrap();
+        let raw = fs::read_to_string(backend.pid_path(id)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "createdAt",
+                "generationId",
+                "pid",
+                "schema",
+                "startTimeTicks"
+            ]
+        );
+        let generation: ExecGeneration = serde_json::from_value(value).unwrap();
+        assert_eq!(generation.schema, EXEC_GENERATION_SCHEMA);
+        assert!(crate::task_inventory::is_rfc3339_utc_millis(
+            &generation.created_at
+        ));
+        assert_eq!(
+            generation.generation_id,
+            generation_id(
+                id,
+                generation.pid,
+                &generation.created_at,
+                generation.start_time_ticks
+            )
+        );
+        assert!(matches!(
+            backend.observe_generation(id).unwrap(),
+            ExecGenerationObservation::Known { alive: true, .. }
+        ));
+
+        backend.kill(id).unwrap();
+        backend.remove(id).unwrap();
+    }
+
+    #[test]
+    fn replacement_exec_process_gets_a_new_generation_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        fs::create_dir_all(&catalog).unwrap();
+        let backend = ExecBackend::new(temp.path().join("state"), catalog);
+        let id = "host.test.replacement";
+
+        backend.spawn(&target(id), temp.path()).unwrap();
+        let first = match backend.observe_generation(id).unwrap() {
+            ExecGenerationObservation::Known { generation, .. } => generation.generation_id,
+            observation => panic!("unexpected first generation: {observation:?}"),
+        };
+        backend.kill(id).unwrap();
+        let mut exited = false;
+        for _ in 0..50 {
+            if backend
+                .list()
+                .unwrap()
+                .iter()
+                .any(|session| session.pty_id == id && !session.alive)
+            {
+                exited = true;
+                break;
+            }
+            sleep(Duration::from_millis(20));
+        }
+        assert!(exited, "first exec generation did not exit");
+        backend.reap_for_restart(id).unwrap();
+        backend.spawn(&target(id), temp.path()).unwrap();
+        let second = match backend.observe_generation(id).unwrap() {
+            ExecGenerationObservation::Known { generation, .. } => generation.generation_id,
+            observation => panic!("unexpected replacement generation: {observation:?}"),
+        };
+        assert_ne!(second, first);
+
+        backend.kill(id).unwrap();
+        backend.remove(id).unwrap();
+    }
+
+    #[test]
+    fn strict_json_rejects_unknown_fields_as_indeterminate() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let backend = ExecBackend::new(state, temp.path().join("catalog"));
+        let id = "host.test.unknown";
+        fs::write(
+            backend.pid_path(id),
+            format!(
+                "{{\"schema\":\"{EXEC_GENERATION_SCHEMA}\",\"pid\":{},\
+                 \"createdAt\":\"2026-07-31T00:00:00.000Z\",\"startTimeTicks\":1,\
+                 \"generationId\":\"sha256:nope\",\"extra\":true}}",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.observe_generation(id).unwrap(),
+            ExecGenerationObservation::Indeterminate { reason, .. }
+                if reason.contains("unknown field")
+        ));
+        assert!(
+            backend.list().unwrap()[0].alive,
+            "malformed evidence must not trigger a duplicate relaunch"
+        );
+    }
+
+    #[test]
+    fn start_token_mismatch_cannot_report_running_or_signal_reused_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        fs::create_dir_all(&catalog).unwrap();
+        let backend = ExecBackend::new(temp.path().join("state"), catalog);
+        let id = "host.test.reused";
+        backend.spawn(&target(id), temp.path()).unwrap();
+
+        let path = backend.pid_path(id);
+        let mut generation: ExecGeneration =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let actual_pid = generation.pid;
+        generation.start_time_ticks = generation.start_time_ticks.saturating_add(1);
+        generation.generation_id = generation_id(
+            id,
+            generation.pid,
+            &generation.created_at,
+            generation.start_time_ticks,
+        );
+        backend.publish_generation(id, &generation).unwrap();
+
+        assert!(matches!(
+            backend.observe_generation(id).unwrap(),
+            ExecGenerationObservation::Indeterminate {
+                alive_for_reconcile: true,
+                ..
+            }
+        ));
+        assert!(
+            backend
+                .kill(id)
+                .unwrap_err()
+                .to_string()
+                .contains("indeterminate"),
+            "kill must refuse a generation mismatch"
+        );
+        assert!(
+            backend.list().unwrap()[0].alive,
+            "a live reused pid must not trigger a duplicate relaunch"
+        );
+        assert!(
+            process_alive(actual_pid as i32),
+            "a start-token mismatch must not signal the current pid"
+        );
+
+        unsafe {
+            libc::kill(-(actual_pid as i32), libc::SIGTERM);
+        }
+        backend.remove(id).unwrap();
+    }
+
+    #[test]
+    fn legacy_plain_pid_is_observed_read_only_with_trustworthy_mtime_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let backend = ExecBackend::new(state, temp.path().join("catalog"));
+        let id = "host.test.legacy";
+        let pid = std::process::id() as i32;
+        // This process predates the pid-file by far more than one kernel tick, making the legacy
+        // ordering proof unambiguous.
+        sleep(Duration::from_millis(20));
+        let legacy = pid.to_string();
+        fs::write(backend.pid_path(id), &legacy).unwrap();
+
+        assert!(matches!(
+            backend.observe_generation(id).unwrap(),
+            ExecGenerationObservation::Known {
+                generation,
+                alive: true
+            } if generation.pid == pid as u32
+                && generation.schema == EXEC_GENERATION_SCHEMA
+                && crate::task_inventory::is_rfc3339_utc_millis(&generation.created_at)
+        ));
+        assert_eq!(
+            fs::read_to_string(backend.pid_path(id)).unwrap(),
+            legacy,
+            "observation must not migrate or rewrite legacy state"
+        );
+        backend.remove(id).unwrap();
+    }
+
+    #[test]
+    fn unavailable_legacy_process_is_indeterminate_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let backend = ExecBackend::new(state, temp.path().join("catalog"));
+        let id = "host.test.dead-legacy";
+        fs::write(backend.pid_path(id), "2000000000").unwrap();
+
+        assert!(matches!(
+            backend.observe_generation(id).unwrap(),
+            ExecGenerationObservation::Indeterminate { pid, .. }
+                if pid == Some(2_000_000_000)
+        ));
+        assert!(!backend.list().unwrap()[0].alive);
+    }
+
+    #[test]
+    fn optional_observation_distinguishes_absence_from_indeterminate_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = ExecBackend::new(temp.path().join("state"), temp.path().join("catalog"));
+        assert_eq!(
+            backend
+                .observe_generation_optional("host.test.absent")
+                .unwrap(),
+            None
+        );
     }
 }
