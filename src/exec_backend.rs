@@ -937,6 +937,8 @@ mod generation_observation_tests {
             workspace: None,
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
+            restart: Default::default(),
+            lifecycle: crate::spec::TaskLifecycle::Service,
             keep: false,
         }
     }

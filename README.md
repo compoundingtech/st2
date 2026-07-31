@@ -265,6 +265,25 @@ otherwise unprovable generations emit `complete: false` and exit non-zero. Missi
 become `absent` only when the corresponding backend observation is complete; uncertainty remains
 `indeterminate`.
 
+Each row separates the semantic `declarationRevision` from the effective process and supervision
+contract in `desiredLaunchGeneration`. Resource-only declaration edits change the former without
+marking a healthy process as stale. Launch, environment, working-directory, lifecycle, or restart
+changes produce `launchGenerationState: "drifted"` while leaving that process running. A runtime
+that predates binding evidence remains `unknown`; inventory does not infer convergence from presence.
+
+Replacing a healthy drifted task is a separate, explicit operation. Stop the resident supervisor,
+then name the exact runtime generation previously returned by inventory:
+
+```sh
+st2 task replace <task> --expected-running-generation <generationId> \
+  --catalog "$CATALOG" --host <host> --json
+```
+
+The command rechecks the declaration and exact runtime generation immediately before disruption.
+A stale expectation refuses without signalling the task. Success returns a
+`st2.task-replacement.v1` receipt linking the previous runtime generation to the new, converged
+runtime and launch generations.
+
 A PTY root positively absent at admission is not passed to `pty` and remains absent; an absent exec
 state root likewise remains absent. If an admitted PTY root is concurrently removed, the result is
 incomplete because its filesystem identity changed, but the external `pty list` implementation may

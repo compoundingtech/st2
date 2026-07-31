@@ -10,7 +10,7 @@ use std::time::Duration;
 use st2::exec_backend::ExecBackend;
 use st2::host_lock::process_alive;
 use st2::reconcile::{TaskLaunch, TaskTarget};
-use st2::spec::TaskKind;
+use st2::spec::{TaskKind, TaskLifecycle};
 
 fn exec_target(id: &str, command: &str) -> TaskTarget {
     TaskTarget {
@@ -23,6 +23,8 @@ fn exec_target(id: &str, command: &str) -> TaskTarget {
         workspace: None,
         tags: BTreeMap::new(),
         env: BTreeMap::new(),
+        restart: Default::default(),
+        lifecycle: TaskLifecycle::Service,
         keep: false,
     }
 }

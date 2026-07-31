@@ -30,8 +30,8 @@ use crate::flapping::FlappingCap;
 use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use crate::task_inventory::{
-    DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
-    RuntimeObserver, generation_id,
+    DesiredRuntime, LaunchBindingStore, ObservationBatch, ObservedState, RuntimeGeneration,
+    RuntimeObservation, RuntimeObserver, generation_id, launch_generation_for_target,
 };
 use agent_spec::spec::TaskKind;
 
@@ -158,6 +158,9 @@ struct PtyListEntry {
     /// PTY-owned generation creation time.
     #[serde(rename = "createdAt", default)]
     created_at: Option<String>,
+    /// Persisted session tags. st2 reserves one tag for the launch contract it created.
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -424,9 +427,22 @@ impl PtyCli {
                     ObservedState::Indeterminate(message)
                 }
             };
+            let running_launch_generation = entry
+                .tags
+                .get(crate::task_inventory::LAUNCH_GENERATION_TAG)
+                .cloned();
+            if let Some(generation) = &running_launch_generation
+                && !crate::task_inventory::valid_launch_generation(generation)
+            {
+                errors.push(format!(
+                    "PTY task {:?} has a malformed launch-generation tag",
+                    entry.name
+                ));
+            }
             observations.push(RuntimeObservation {
                 runtime_id: entry.name,
                 state,
+                running_launch_generation,
             });
         }
         ObservationBatch {
@@ -596,6 +612,7 @@ impl Runner for PtyCli {
 pub struct SystemRunner {
     pty: PtyCli,
     exec: ExecBackend,
+    launch_bindings: LaunchBindingStore,
     /// id → kind, refreshed each `list_sessions`, so kill/remove hit the right backend.
     index: RefCell<HashMap<String, TaskKind>>,
 }
@@ -603,9 +620,14 @@ pub struct SystemRunner {
 impl SystemRunner {
     /// `catalog_root` roots `$CATALOG`; `exec_state_dir` is where exec pids/logs live (machine-local).
     pub fn new(catalog_root: PathBuf, exec_state_dir: PathBuf) -> Self {
+        let launch_state_dir = exec_state_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("launch-generations");
         Self {
             pty: PtyCli::new(catalog_root.clone()),
             exec: ExecBackend::new(exec_state_dir, catalog_root),
+            launch_bindings: LaunchBindingStore::new(launch_state_dir),
             index: RefCell::new(HashMap::new()),
         }
     }
@@ -613,6 +635,12 @@ impl SystemRunner {
 
 impl RuntimeObserver for SystemRunner {
     fn observe(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        {
+            let mut index = self.index.borrow_mut();
+            for runtime in desired {
+                index.insert(runtime.runtime_id.clone(), runtime.kind);
+            }
+        }
         let pty_ids = desired
             .iter()
             .filter(|runtime| runtime.kind == TaskKind::Pty)
@@ -647,12 +675,14 @@ impl RuntimeObserver for SystemRunner {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state,
+                        running_launch_generation: None,
                     });
                 }
                 Ok(Some(crate::exec_backend::ExecGenerationObservation::Exited { .. })) => {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state: ObservedState::Exited,
+                        running_launch_generation: None,
                     });
                 }
                 Ok(Some(crate::exec_backend::ExecGenerationObservation::Indeterminate {
@@ -667,6 +697,7 @@ impl RuntimeObserver for SystemRunner {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state: ObservedState::Indeterminate(message),
+                        running_launch_generation: None,
                     });
                 }
                 Err(error) => {
@@ -675,8 +706,29 @@ impl RuntimeObserver for SystemRunner {
                     batch.observations.push(RuntimeObservation {
                         runtime_id: runtime.runtime_id.clone(),
                         state: ObservedState::Indeterminate(message),
+                        running_launch_generation: None,
                     });
                 }
+            }
+        }
+        for observation in &mut batch.observations {
+            if observation.running_launch_generation.is_some() {
+                continue;
+            }
+            let ObservedState::Running(generation) = &observation.state else {
+                continue;
+            };
+            match self
+                .launch_bindings
+                .read(&observation.runtime_id, generation.generation_id())
+            {
+                Ok(running_launch_generation) => {
+                    observation.running_launch_generation = running_launch_generation;
+                }
+                Err(error) => batch.errors.push(format!(
+                    "read launch binding for {:?}: {error:#}",
+                    observation.runtime_id
+                )),
             }
         }
         batch.complete &= batch.errors.is_empty();
@@ -701,10 +753,52 @@ impl Runner for SystemRunner {
     }
 
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()> {
+        let launch_generation =
+            launch_generation_for_target(target, spec_dir, &self.pty.catalog_root);
         match target.kind {
-            TaskKind::Pty => self.pty.spawn(target, spec_dir),
-            TaskKind::Exec => self.exec.spawn(target, spec_dir),
+            TaskKind::Pty => {
+                if target
+                    .tags
+                    .contains_key(crate::task_inventory::LAUNCH_GENERATION_TAG)
+                {
+                    anyhow::bail!(
+                        "task {:?} declares reserved tag {:?}",
+                        target.pty_id,
+                        crate::task_inventory::LAUNCH_GENERATION_TAG
+                    );
+                }
+                let mut tagged = target.clone();
+                tagged.tags.insert(
+                    crate::task_inventory::LAUNCH_GENERATION_TAG.to_owned(),
+                    launch_generation,
+                );
+                return self.pty.spawn(&tagged, spec_dir);
+            }
+            TaskKind::Exec => self.exec.spawn(target, spec_dir)?,
         }
+        let observed = self.observe(&[DesiredRuntime {
+            runtime_id: target.pty_id.clone(),
+            kind: target.kind,
+        }]);
+        let runtime_generation = observed
+            .observations
+            .into_iter()
+            .find_map(|observation| match observation.state {
+                ObservedState::Running(generation) => Some(generation),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "spawned task {:?} has no exact runtime generation: {}",
+                    target.pty_id,
+                    observed.errors.join("; ")
+                )
+            })?;
+        self.launch_bindings.write(
+            &target.pty_id,
+            runtime_generation.generation_id(),
+            &launch_generation,
+        )
     }
 
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -735,7 +829,8 @@ impl Runner for SystemRunner {
                 let _ = self.exec.remove(pty_id);
                 Ok(())
             }
-        }
+        }?;
+        self.launch_bindings.remove(pty_id)
     }
 }
 
@@ -1595,6 +1690,8 @@ mod tests {
             workspace: None,
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
+            restart: Default::default(),
+            lifecycle: TaskLifecycle::Service,
             keep: false,
         }
     }
@@ -2401,7 +2498,7 @@ mod tests {
         std::fs::write(
             &fake,
             r#"#!/bin/sh
-printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","tags":{"st2.launch_generation":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
 "#,
         )
         .unwrap();
@@ -2424,6 +2521,10 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         assert_eq!(generation.pid(), 41);
         assert_eq!(generation.created_at(), "2026-07-31T10:00:00.000Z");
         assert!(generation.generation_id().starts_with("sha256:"));
+        assert_eq!(
+            first.observations[0].running_launch_generation.as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(first.observations[1].state, ObservedState::Exited);
         assert_eq!(first.observations[2].state, ObservedState::Vanished);
     }
