@@ -90,13 +90,19 @@ st2 neither reads, writes, migrates, nor interprets it.
 
 1. acquires the persistent exclusive
    `<catalog>/.st2/presentation-authoring.lock` before discovery;
-2. resolves exactly one declaration and checks the caller's `ST_AGENT`
-   self/descendant relationship when present;
-3. refuses `meta { managed-by "nix" }`, unsupported formats, malformed catalogs,
-   and ambiguous targets;
+2. resolves exactly one declaration and applies the caller-supplied `ST_AGENT`
+   self/descendant guardrail when present;
+3. refuses declarations explicitly marked `meta { managed-by "nix" }`,
+   unsupported formats, malformed catalogs, and ambiguous targets;
 4. applies one span-bounded edit, reparses and validates the candidate;
 5. fsyncs a same-directory temporary, rechecks the original inode/version and
    bytes, atomically renames it, then fsyncs the declaration directory.
+
+`ST_AGENT` is a runner-provided convention in this trusted single-operator fleet,
+not an authenticated capability: a same-UID caller can alter or remove it, and
+its absence selects the operator path. Nix generators must emit the ownership
+marker before activating a binary with authoring commands; st2 cannot infer an
+unmarked generator from KDL bytes.
 
 The lock file is a persistent real inode and is never removed or stale-recovered.
 It serializes cooperating st2 presentation writers in one local POSIX

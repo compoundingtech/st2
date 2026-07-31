@@ -166,10 +166,13 @@ accepted.
   replacement, fsync the result, and return classified receipts. The lock inode
   is never removed or stale-recovered and defines one local POSIX
   filesystem/kernel exclusion domain; it is not cross-host coordination or OS
-  isolation from direct external writers. TOML, JSON, Nix-owned declarations,
-  stable-ID changes, and malformed or ambiguous targets fail closed. A catalog
-  agent may edit itself or a descendant reached through declared supervisor
-  edges; an operator outside a managed agent context may use the same operation.
+  isolation from direct external writers. TOML, JSON, declarations explicitly
+  marked Nix-owned, stable-ID changes, and malformed or ambiguous targets fail
+  closed. Nix emitters must publish that marker before authoring is activated.
+  In the trusted-fleet model, caller-supplied `ST_AGENT` provides a guardrail,
+  not authentication: a catalog agent may edit itself or a descendant reached
+  through declared supervisor edges, while its absence selects the operator
+  path.
 - **R26 Live PTY presentation projection:** For every healthy managed PTY, st2
   reconciles a versioned owned tag snapshot containing the stable actor identity
   plus optional description through one exact task-ID metadata patch. The

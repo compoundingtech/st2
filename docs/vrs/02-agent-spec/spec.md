@@ -279,10 +279,10 @@ replacement of drifted work.
   and [runner](../../../src/run.rs).
 - **G08, moved intent:** parser, status, and executor support are absent; syntax
   is unspecified. [Parser](../../../crates/agent-spec/src/kdl_format.rs)
-- **G09, F17 activation:** st2's exact-ID presentation interface and tests are
-  prepared, but the current pinned PTY does not yet provide the required atomic
-  metadata-patch API. Keep the dependency pin unchanged until that exact PTY
-  implementation is finalized and verified.
+- **G09, F17 release ordering:** source authoring requires Nix emitters to mark
+  generated declarations before the compatible st2 binary is activated. The
+  pinned PTY dependency provides the exact-ID atomic metadata-patch API, but
+  remains a draft merge dependency.
 
 ## Acceptance cases
 

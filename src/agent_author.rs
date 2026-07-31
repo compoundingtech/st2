@@ -2,8 +2,9 @@
 //!
 //! Presentation is declaration state, not runtime identity. Every edit holds a private persistent
 //! catalog-wide presentation lock, rechecks the original bytes, and atomically replaces exactly one
-//! canonical KDL declaration. TOML, JSON, Nix-owned declarations, and unauthorized callers fail
-//! closed. The lock serializes cooperating local st2 writers; it is not a cross-host lock service.
+//! canonical KDL declaration. TOML, JSON, declarations marked Nix-owned, and callers outside the
+//! supplied actor relationship fail closed. `ST_AGENT` is a trusted-fleet guardrail rather than
+//! authentication. The lock serializes cooperating local st2 writers; it is not a cross-host lock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,9 +31,9 @@ struct PresentationAuthorLock {
 
 impl PresentationAuthorLock {
     fn exclusive(catalog_root: &Path) -> anyhow::Result<Self> {
-        let catalog = catalog_root
-            .canonicalize()
-            .map_err(|error| anyhow::anyhow!("canonicalize catalog {}: {error}", catalog_root.display()))?;
+        let catalog = catalog_root.canonicalize().map_err(|error| {
+            anyhow::anyhow!("canonicalize catalog {}: {error}", catalog_root.display())
+        })?;
         let metadata = fs::symlink_metadata(&catalog)
             .map_err(|error| anyhow::anyhow!("read catalog {}: {error}", catalog.display()))?;
         anyhow::ensure!(
@@ -53,7 +54,10 @@ impl PresentationAuthorLock {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         let metadata = fs::symlink_metadata(&control).map_err(|error| {
-                            anyhow::anyhow!("re-read catalog control path {}: {error}", control.display())
+                            anyhow::anyhow!(
+                                "re-read catalog control path {}: {error}",
+                                control.display()
+                            )
                         })?;
                         anyhow::ensure!(
                             metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -91,10 +95,12 @@ impl PresentationAuthorLock {
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|error| anyhow::anyhow!("open presentation lock {}: {error}", path.display()))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| anyhow::anyhow!("inspect presentation lock {}: {error}", path.display()))?;
+            .map_err(|error| {
+                anyhow::anyhow!("open presentation lock {}: {error}", path.display())
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            anyhow::anyhow!("inspect presentation lock {}: {error}", path.display())
+        })?;
         anyhow::ensure!(
             metadata.is_file(),
             "presentation lock is not a regular file: {}",
@@ -224,9 +230,9 @@ struct AgentTarget {
 
 /// Set or clear one presentation field for one stable Agent Spec identity.
 ///
-/// `actor` is the caller's `ST_AGENT` identity. An absent actor is the explicit operator path. A
-/// catalog-managed caller may edit itself or a descendant reached through declared supervisor
-/// edges; no presentation field expands that authority.
+/// `actor` is the caller-supplied `ST_AGENT` identity. An absent actor is the explicit operator
+/// path. Within the trusted-fleet model, the guardrail limits a catalog-managed caller to itself or
+/// a descendant reached through declared supervisor edges; no presentation field expands it.
 pub fn set_presentation(
     catalog_root: &Path,
     selector: &str,

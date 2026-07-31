@@ -31,9 +31,12 @@ Spec declaration is their sole source of truth; a sibling `name` file is neither
 read nor written.
 
 Constrained KDL-only commands may mutate one presentation field without
-publishing a second representation. Catalog agents may edit themselves or
-declared descendants; operators may use the same constrained path. Nix-owned
-declarations remain writable only at their Nix source. st2 serializes these
+publishing a second representation. Within the trusted-fleet model,
+caller-supplied `ST_AGENT` limits an invocation to itself or declared
+descendants; this is an operational guardrail, not an authenticated capability,
+and absence selects the operator path. Declarations explicitly marked Nix-owned
+remain writable only at their Nix source, and Nix emitters must publish that
+marker before authoring is activated. st2 serializes these
 edits with the private persistent `.st2/presentation-authoring.lock`, preserves
 unrelated source bytes, detects stale source, and atomically replaces the
 declaration. The lock covers cooperating local st2 writers in one POSIX
@@ -55,9 +58,10 @@ retries without restart or lifecycle accounting.
   disambiguation and automation.
 - The old equality between stable identity and every presentation surface is
   superseded, but stable routing semantics are preserved.
-- Existing declarations require no compatibility marker because the new fields
-  are optional and additive. Adoption begins only after compatible PTY and st2
-  binaries are deployed.
+- Existing declarations require no presentation compatibility marker because
+  the new fields are optional and additive. Adoption begins only after
+  compatible PTY and st2 binaries are deployed; Nix-generated declarations
+  first add their ownership marker.
 - This decision remains draft and is not accepted or mergeable until Nathan
   approves it.
 

@@ -300,9 +300,8 @@ enum Command {
 /// running agent needs no flags.
 #[derive(Args)]
 struct MsgCtx {
-    /// Low-level bus root override. Declared identities use native resource boxes; any absent
-    /// identity is treated as an exact flat mailbox id. Prefer global `--catalog` for strict Agent
-    /// Spec routing.
+    /// Legacy catalog/bus root override. Prefer global `--catalog`; defaults to `$CATALOG`, then the
+    /// default st2 catalog.
     #[arg(long, conflicts_with = "catalog_path")]
     root: Option<PathBuf>,
     /// The acting identity — who the message is `from` / whose inbox is "mine". Defaults to
@@ -1360,11 +1359,11 @@ fn ding_cmd(
     // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
     // optional). An explicit positional still overrides for the rare non-agent case.
     let session = session.unwrap_or_else(|| id.clone());
-    // Explicit-root transport still resolves a declared agent to its native resource inbox; only
-    // an absent identity uses the exact flat <root>/<id> mailbox. Status lives beside it either way.
+    // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
+    // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
         .unwrap_or_else(|| catalog_root.join(&id));
-    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host, routing_mode(&ctx))?;
+    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
@@ -1386,14 +1385,6 @@ fn resolve_ctx(ctx: &MsgCtx) -> Result<(PathBuf, String)> {
     };
     let host = ctx.host.clone().unwrap_or_else(detect_host);
     Ok((root, host))
-}
-
-fn routing_mode(ctx: &MsgCtx) -> message::RoutingMode {
-    if ctx.root.is_some() {
-        message::RoutingMode::ExplicitRoot
-    } else {
-        message::RoutingMode::Catalog
-    }
 }
 
 /// The acting identity (`from` / whose inbox is "mine"): `--as`, else `$ST_AGENT`.
@@ -1446,10 +1437,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let mode = routing_mode(&ctx);
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host, mode)?;
+            let dir = message::resolve_inbox(&root, &to, &host);
             let filename = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1468,9 +1458,8 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let mode = routing_mode(&ctx);
             let from = acting_id(&ctx)?;
-            let my_inbox = message::resolve_inbox(&root, &from, &host, mode)?;
+            let my_inbox = message::resolve_inbox(&root, &from, &host);
             let original = message::read_msg(&my_inbox, &filename)
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
@@ -1479,7 +1468,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host, mode)?;
+            let dir = message::resolve_inbox(&root, &to, &host);
             let sent = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1503,12 +1492,11 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let mode = routing_mode(&ctx);
             let id = match identity {
                 Some(id) => id,
                 None => acting_id(&ctx)?,
             };
-            let dir = message::resolve_list_box(&root, &id, &host, archive, orphan, mode)?;
+            let dir = message::resolve_list_box(&root, &id, &host, archive, orphan)?;
             let mut msgs = if archive {
                 message::list_dir(&dir)?
             } else {
@@ -1554,13 +1542,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let mode = routing_mode(&ctx);
             let (id, filename) = box_target(first, second, &ctx)?;
             let dir = if archive {
-                message::resolve_archive(&root, &id, &host, mode)
+                message::resolve_archive(&root, &id, &host)
             } else {
-                message::resolve_inbox(&root, &id, &host, mode)
-            }?;
+                message::resolve_inbox(&root, &id, &host)
+            };
             if raw {
                 print!("{}", std::fs::read_to_string(dir.join(&filename))?);
                 return Ok(());
@@ -1586,11 +1573,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         }
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let mode = routing_mode(&ctx);
             let (id, filename) = box_target(first, second, &ctx)?;
-            let inbox = message::resolve_inbox(&root, &id, &host, mode)?;
-            let archive = message::resolve_archive(&root, &id, &host, mode)?;
-            message::archive_msg(&inbox, &archive, &filename)?;
+            message::archive_msg(
+                &message::resolve_inbox(&root, &id, &host),
+                &message::resolve_archive(&root, &id, &host),
+                &filename,
+            )?;
             println!("archived");
             Ok(())
         }

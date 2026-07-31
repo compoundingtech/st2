@@ -177,9 +177,11 @@ st2 rename <stable-id> --clear
 
 These commands preserve unrelated KDL bytes and serialize local writers through the persistent
 private `.st2/presentation-authoring.lock`. They refuse TOML, JSON, and
-`meta { managed-by "nix" }` targets. `ST_AGENT` callers may edit themselves or declared
-descendants; an operator without `ST_AGENT` may use the same bounded authoring path. The sibling
-`<agent-dir>/name` convention is hard-retired and ignored.
+explicitly `meta { managed-by "nix" }` targets. Nix generators must emit that marker before the
+compatible st2 binary is activated. In the trusted single-operator fleet, caller-supplied
+`ST_AGENT` limits an invocation to itself or declared descendants; it is a guardrail rather than
+authentication, and absence selects the operator path. The sibling `<agent-dir>/name` convention
+is hard-retired and ignored.
 
 `argv` launches its first value directly with the remaining values as arguments. It resolves a bare
 program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
