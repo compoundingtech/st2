@@ -75,7 +75,7 @@ fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
 fn output_with_input_timeout(
     command: &mut Command,
     timeout: Duration,
-    input: Option<&[u8]>,
+    input: Option<Vec<u8>>,
 ) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
@@ -100,18 +100,31 @@ fn output_with_input_timeout(
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
     if let Some(input) = input {
-        let write = child
-            .stdin
-            .take()
-            .context("metadata patch child has no piped stdin")
-            .and_then(|mut stdin| {
-                stdin
-                    .write_all(input)
-                    .context("write metadata patch payload")
-            });
-        if let Err(error) = write {
+        let Some(mut stdin) = child.stdin.take() else {
             terminate_and_reap_before(child, pid, deadline);
-            return Err(error);
+            anyhow::bail!("metadata patch child has no piped stdin");
+        };
+        let (write_tx, write_rx) = channel();
+        std::thread::spawn(move || {
+            let result = stdin
+                .write_all(&input)
+                .context("write metadata patch payload");
+            let _ = write_tx.send(result);
+        });
+        match write_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                terminate_and_reap_before(child, pid, deadline);
+                return Err(error);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                terminate_and_reap_before(child, pid, deadline);
+                anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                terminate_and_reap_before(child, pid, deadline);
+                anyhow::bail!("metadata patch stdin writer stopped before reporting its result");
+            }
         }
     }
     let status = loop {
@@ -532,7 +545,7 @@ impl PtyCli {
                 .args(["metadata", "patch", "--id", &presentation.pty_id])
                 .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
             PTY_LIST_TIMEOUT,
-            Some(&payload),
+            Some(payload),
         )
         .map_err(|error| anyhow::anyhow!("`pty metadata patch --id` failed: {error}"))?;
         if !out.status.success() {
@@ -2241,7 +2254,7 @@ mod tests {
         let error = output_with_input_timeout(
             Command::new(&executable).env("PIDFILE", &pidfile),
             Duration::from_secs(1),
-            Some(&input),
+            Some(input),
         )
         .unwrap_err();
         let pid = std::fs::read_to_string(pidfile)
@@ -2257,6 +2270,47 @@ mod tests {
             !crate::host_lock::process_alive(pid),
             "failed metadata child {pid} was not terminated and reaped"
         );
+    }
+
+    #[test]
+    fn input_write_obeys_the_child_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("ignore-stdin");
+        let pidfile = temporary.path().join("child.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let error = output_with_input_timeout(
+            Command::new(&executable).env("PIDFILE", &pidfile),
+            Duration::from_millis(100),
+            Some(input),
+        )
+        .unwrap_err();
+        let pid = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected write error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked stdin write ignored the child deadline"
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::host_lock::process_alive(pid));
     }
 
     #[test]
