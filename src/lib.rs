@@ -14,6 +14,7 @@ pub mod ding;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod exec_backend;
+pub mod exec_retirement;
 pub mod expand;
 pub mod flapping;
 pub mod hooks;

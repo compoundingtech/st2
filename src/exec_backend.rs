@@ -33,8 +33,8 @@ use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
 
-const EXEC_GENERATION_SCHEMA_V1: &str = "st2.exec-generation.v1";
-const EXEC_GENERATION_SCHEMA_V2: &str = "st2.exec-generation.v2";
+pub(crate) const EXEC_GENERATION_SCHEMA_V1: &str = "st2.exec-generation.v1";
+pub(crate) const EXEC_GENERATION_SCHEMA_V2: &str = "st2.exec-generation.v2";
 
 /// Exact Linux cgroup-v2 capability published with a generation. Path names
 /// alone are never authority: retirement must reopen the path without
@@ -664,7 +664,7 @@ fn observation_alive_for_reconcile(observation: ExecGenerationObservation) -> bo
     }
 }
 
-fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), String> {
+pub(crate) fn validate_generation(id: &str, generation: &ExecGeneration) -> Result<(), String> {
     if !matches!(
         generation.schema.as_str(),
         EXEC_GENERATION_SCHEMA_V1 | EXEC_GENERATION_SCHEMA_V2

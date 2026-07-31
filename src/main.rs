@@ -123,6 +123,9 @@ enum Command {
     /// Transactionally publish one canonical Agent Spec into the live catalog.
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// Exact, crash-recoverable lifecycle transactions for terminal-free exec tasks.
+    #[command(subcommand)]
+    Exec(ExecCmd),
     /// Canonical declaration snapshots and crash-recoverable whole-catalog application.
     #[command(subcommand)]
     Catalog(CatalogCmd),
@@ -323,6 +326,54 @@ enum AgentCmd {
         #[arg(long, value_name = "HEX")]
         input_sha256: String,
         /// Emit the typed publication result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExecCmd {
+    /// Prepare or apply an immutable exact-retirement capability.
+    #[command(subcommand)]
+    Retirement(ExecRetirementCmd),
+}
+
+#[derive(Subcommand)]
+enum ExecRetirementCmd {
+    /// Read runtime authority and write one create-only immutable retirement plan.
+    Prepare {
+        /// Exact host-local exec namespace. Never inferred from a runtime id.
+        #[arg(long)]
+        host: String,
+        /// Prepare one exact runtime id.
+        #[arg(
+            long,
+            required_unless_present = "legacy_set",
+            conflicts_with = "legacy_set"
+        )]
+        id: Option<String>,
+        /// Temporary migration seam: prepare the complete numeric-record namespace.
+        #[arg(long, required_unless_present = "id", conflicts_with = "id")]
+        legacy_set: bool,
+        /// Caller-held canonical declaration-root digest.
+        #[arg(long, value_name = "HEX")]
+        expect_catalog_sha256: String,
+        /// Create-only immutable plan path outside the live catalog and exec state.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+        /// Emit `st2.exec-retirement-preparation.v1`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply or resume one immutable retirement plan.
+    Apply {
+        /// Create-only plan emitted by `exec retirement prepare`.
+        #[arg(long, value_name = "FILE")]
+        plan: PathBuf,
+        /// Caller-held SHA-256 of the exact plan bytes.
+        #[arg(long, value_name = "HEX")]
+        expect_plan_sha256: String,
+        /// Emit the typed completed receipt.
         #[arg(long)]
         json: bool,
     },
@@ -721,6 +772,70 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Exec(ExecCmd::Retirement(ExecRetirementCmd::Prepare {
+            host,
+            id,
+            legacy_set,
+            expect_catalog_sha256,
+            output,
+            json,
+        })) => {
+            let catalog = require_exec_retirement_catalog(
+                catalog_path.clone(),
+                json,
+                "`exec retirement prepare` requires explicit --catalog <path>",
+            )?;
+            let selector = match (id, legacy_set) {
+                (Some(id), false) => st2::exec_retirement::RetirementSelector::Id(id),
+                (None, true) => st2::exec_retirement::RetirementSelector::LegacySet,
+                _ => unreachable!("clap enforces exactly one retirement selector"),
+            };
+            let result = exec_retirement_result(
+                st2::exec_retirement::prepare(st2::exec_retirement::RetirementPrepareRequest {
+                    catalog,
+                    host,
+                    selector,
+                    expect_catalog_sha256,
+                    output,
+                }),
+                json,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "prepared {} {}",
+                    result.plan_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Exec(ExecCmd::Retirement(ExecRetirementCmd::Apply {
+            plan,
+            expect_plan_sha256,
+            json,
+        })) => {
+            let catalog = require_exec_retirement_catalog(
+                catalog_path.clone(),
+                json,
+                "`exec retirement apply` requires explicit --catalog <path>",
+            )?;
+            let result = exec_retirement_result(
+                st2::exec_retirement::apply(st2::exec_retirement::RetirementApplyRequest {
+                    catalog,
+                    plan,
+                    expect_plan_sha256,
+                }),
+                json,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("completed {}", result.request_sha256);
+            }
+            Ok(())
+        }
         Command::Catalog(CatalogCmd::Snapshot { output, json }) => {
             let result =
                 st2::catalog_transaction::snapshot(st2::catalog_transaction::SnapshotRequest {
@@ -902,6 +1017,39 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn require_exec_retirement_catalog(
+    catalog: Option<PathBuf>,
+    json: bool,
+    message: &str,
+) -> Result<PathBuf> {
+    match catalog {
+        Some(catalog) => Ok(catalog),
+        None if json => exec_retirement_error_exit("authority", message),
+        None => anyhow::bail!("{message}"),
+    }
+}
+
+fn exec_retirement_result<T>(
+    result: st2::exec_retirement::RetirementResult<T>,
+    json: bool,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if json => exec_retirement_error_exit(error.code.as_str(), &error.message),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn exec_retirement_error_exit<T>(code: &str, message: &str) -> Result<T> {
+    let envelope = serde_json::json!({
+        "schema": "st2.exec-retirement-error.v1",
+        "code": code,
+        "message": message,
+    });
+    eprintln!("{}", serde_json::to_string(&envelope)?);
+    std::process::exit(1);
 }
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
@@ -1997,6 +2145,8 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         eprintln!("st2: {}", lock.busy_warning(owner));
         std::process::exit(1);
     }
+    let stale = lock.has_stale_lock();
+    lock.acquire().context("acquiring host lock")?;
 
     if once {
         let report = st2::up_once_specs(&specs, &this_host, &runner);
@@ -2011,10 +2161,9 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         return Ok(());
     }
 
-    if lock.has_stale_lock() {
+    if stale {
         eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
     }
-    lock.acquire().context("acquiring host lock")?;
     eprintln!(
         "st2: supervising spec {} on host '{this_host}' ({} agents; reconcile every {interval}s; Ctrl-C to stop)",
         spec_file.display(),
@@ -2061,6 +2210,15 @@ fn up(
     let this_host = host.unwrap_or_else(detect_host);
     // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // Every workspace/runtime mutation shares one persistent kernel lock with
+    // the resident supervisor and exact-retirement transactions.
+    let lock = HostLock::new(&catalog_root, &this_host);
+    if let Some(owner) = lock.live_owner() {
+        eprintln!("st2: {}", lock.busy_warning(owner));
+        std::process::exit(1);
+    }
+    let stale = lock.has_stale_lock();
+    lock.acquire().context("acquiring host lock")?;
 
     if materialize_only {
         let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
@@ -2121,15 +2279,6 @@ fn up(
 
     let runner = SystemRunner::new(catalog_root.clone(), exec_state_dir(&this_host));
 
-    // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
-    // the lock (it would double-spawn) — but it does NOT take the lock itself (that would clobber the
-    // loop's pid file); only the loop acquires + holds it.
-    let lock = HostLock::new(root, &this_host);
-    if let Some(owner) = lock.live_owner() {
-        eprintln!("st2: {}", lock.busy_warning(owner));
-        std::process::exit(1);
-    }
-
     if once {
         let targeted = task.is_some();
         let report = match task.as_deref() {
@@ -2149,10 +2298,9 @@ fn up(
         return Ok(());
     }
 
-    if lock.has_stale_lock() {
+    if stale {
         eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
     }
-    lock.acquire().context("acquiring host lock")?;
 
     eprintln!(
         "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",

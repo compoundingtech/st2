@@ -95,10 +95,46 @@ static SCOPE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub fn scope_unit(task_id: &str) -> String {
     let safe: String = task_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let seq = SCOPE_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("st2-{safe}-{}-{seq}.scope", std::process::id())
+}
+
+/// Prove that `unit` is one of the unique transient scope names minted for exactly `task_id`.
+///
+/// The nonce remains opaque authority: consumers validate its closed numeric grammar but never
+/// derive or predict it.
+pub(crate) fn scope_unit_matches(task_id: &str, unit: &str) -> bool {
+    let safe: String = task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let Some(nonce) = unit
+        .strip_prefix(&format!("st2-{safe}-"))
+        .and_then(|rest| rest.strip_suffix(".scope"))
+    else {
+        return false;
+    };
+    let Some((pid, sequence)) = nonce.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Build the OUTER launch [`Command`] for the inner `program` + `args`, isolated under `unit`.
@@ -135,20 +171,36 @@ mod tests {
     fn scope_unit_is_unique_and_systemd_safe() {
         // Keeps the (dotted) id for greppability, gains the st2- prefix, a nonce, and the .scope suffix.
         let u = scope_unit("hetz.demo.agent");
-        assert!(u.starts_with("st2-hetz.demo.agent-"), "unexpected unit name {u}");
+        assert!(
+            u.starts_with("st2-hetz.demo.agent-"),
+            "unexpected unit name {u}"
+        );
         assert!(u.ends_with(".scope"), "unexpected unit name {u}");
         // Unsafe bytes (space, slash) are replaced so systemd never rejects the unit name.
         assert!(scope_unit("a b/c").starts_with("st2-a_b_c-"));
         // UNIQUE, not deterministic — two spawns of the same id never collide on the scope name.
         assert_ne!(scope_unit("x"), scope_unit("x"));
+        assert!(scope_unit_matches("hetz.demo.agent", &u));
+        assert!(!scope_unit_matches("hetz.other.agent", &u));
+        assert!(!scope_unit_matches(
+            "hetz.demo.agent",
+            "st2-hetz.demo.agent-provider.scope"
+        ));
     }
 
     #[test]
     fn wrap_scope_prefixes_systemd_run_but_passthrough_does_not() {
         // We can't force `mode()` per-test (it's process-cached), so assert the shape that matches the
         // detected mode: on a systemd Linux CI box it's Scope; otherwise pass-through.
-        let cmd = wrap("st2-x.scope", OsStr::new("sh"), &[OsStr::new("-c"), OsStr::new("true")]);
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let cmd = wrap(
+            "st2-x.scope",
+            OsStr::new("sh"),
+            &[OsStr::new("-c"), OsStr::new("true")],
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         match mode() {
             Isolation::Scope => {
                 assert_eq!(cmd.get_program(), OsStr::new("systemd-run"));

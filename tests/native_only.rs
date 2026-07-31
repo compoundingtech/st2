@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -340,12 +341,18 @@ fn clean_path_supports_help_validate_env_and_doctor() {
     let doctor_agent = doctor_catalog.join("agents/h/missing/agent.kdl");
     fs::create_dir_all(doctor_agent.parent().unwrap()).unwrap();
     fs::write(&doctor_agent, "agent \"missing\" { host \"h\" }\n").unwrap();
-    let mut owner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-    fs::write(
-        doctor_catalog.join(".st2.h.lock"),
-        format!("{}\n", owner.id()),
-    )
-    .unwrap();
+    let mut owner = Command::new("sleep").arg("30").spawn().unwrap();
+    let doctor_lock_path = doctor_catalog.join(".st2.h.lock");
+    fs::write(&doctor_lock_path, format!("{}\n", owner.id())).unwrap();
+    let _doctor_lock = File::options()
+        .read(true)
+        .write(true)
+        .open(&doctor_lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(_doctor_lock.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
     let missing = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
