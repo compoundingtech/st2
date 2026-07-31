@@ -15,10 +15,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
@@ -72,6 +73,43 @@ fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
     }
 }
 
+fn write_all_before(
+    mut stdin: ChildStdin,
+    mut input: &[u8],
+    deadline: Instant,
+) -> anyhow::Result<bool> {
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error()).context("read metadata stdin flags");
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("make metadata stdin nonblocking");
+    }
+    while !input.is_empty() {
+        match stdin.write(input) {
+            Ok(0) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                    .context("write metadata patch payload");
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Err(error) => return Err(error).context("write metadata patch payload"),
+        }
+    }
+    Ok(true)
+}
+
 fn output_with_input_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -100,30 +138,19 @@ fn output_with_input_timeout(
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
     if let Some(input) = input {
-        let Some(mut stdin) = child.stdin.take() else {
+        let Some(stdin) = child.stdin.take() else {
             terminate_and_reap_before(child, pid, deadline);
             anyhow::bail!("metadata patch child has no piped stdin");
         };
-        let (write_tx, write_rx) = channel();
-        std::thread::spawn(move || {
-            let result = stdin
-                .write_all(&input)
-                .context("write metadata patch payload");
-            let _ = write_tx.send(result);
-        });
-        match write_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                terminate_and_reap_before(child, pid, deadline);
-                return Err(error);
-            }
-            Err(RecvTimeoutError::Timeout) => {
+        match write_all_before(stdin, &input, deadline) {
+            Ok(true) => {}
+            Ok(false) => {
                 terminate_and_reap_before(child, pid, deadline);
                 anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
             }
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(error) => {
                 terminate_and_reap_before(child, pid, deadline);
-                anyhow::bail!("metadata patch stdin writer stopped before reporting its result");
+                return Err(error);
             }
         }
     }
@@ -2311,6 +2338,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!crate::host_lock::process_alive(pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_stdin_reader_does_not_retain_a_writer_thread() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("escape-with-stdin");
+        let escaped_pidfile = temporary.path().join("escaped.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nexec 3<&0\nsetsid sh -c 'printf %s \"$$\" > \"$ESCAPED_PIDFILE\"; sleep 60' <&3 &\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        output_with_input_timeout(
+            Command::new(&executable).env("ESCAPED_PIDFILE", &escaped_pidfile),
+            Duration::from_millis(100),
+            Some(vec![b'x'; 1024 * 1024]),
+        )
+        .unwrap_err();
+        let escaped_pid = std::fs::read_to_string(&escaped_pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let pipe = std::fs::read_link(format!("/proc/{escaped_pid}/fd/0")).unwrap();
+        let retained_writers = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target == &pipe)
+            .count();
+        unsafe {
+            libc::kill(-escaped_pid, libc::SIGKILL);
+        }
+
+        assert_eq!(
+            retained_writers, 0,
+            "escaped stdin reader retained a metadata writer file descriptor"
+        );
     }
 
     #[test]
