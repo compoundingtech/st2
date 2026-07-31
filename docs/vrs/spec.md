@@ -165,7 +165,8 @@ DIR/
   adopt-only/        exact declarations; every PTY lifecycle is adopt-only
   provider-witness/  all Agent identities and Resources; active PTYs only,
                      all exec/Ding and retired desired-absent PTYs suppressed
-  receipt.json       source/child roots, identity sets, active/retired partition
+  receipt.json       source/child roots, typed predecessors, identity sets,
+                     active/retired partition
   bundle.sha256      domain hash of receipt bytes and the three child roots
 ```
 
@@ -203,14 +204,30 @@ requires the exact five-entry outer shape, then captures the complete public
 bundle once through retained no-follow descriptors with explicit depth,
 filesystem-entry-count, per-file, and total-byte bounds. It reparses the private typed
 receipt, verifies the exact receipt bytes and outer bundle digest, requires
-`expect-sha256` to equal the receipt source root and the receipt's canonical
-`logicalCatalog` to equal `ROOT`, and reprojects all three materialized private
-children against their receipt roots, entry counts, identity sets, and
-projection admission. Only then does the selected child enter the same ordinary
-full-admission/CAS transaction without reopening the public bundle.
-`provider-witness` is
+`expect-sha256` to equal the selected child's receipt-bound predecessor and the
+receipt's canonical `logicalCatalog` to equal `ROOT`, and reprojects all three
+materialized private children against their receipt roots, entry counts,
+identity sets, and projection admission. Only then does the selected child
+enter the same ordinary full-admission/CAS transaction without reopening the
+public bundle. `provider-witness` is
 deliberately not apply authority. A child root digest alone cannot authorize
 reuse at another catalog address.
+
+The receipt's closed transition graph is:
+
+```text
+service/source root --apply adopt-only--> adopt-only root
+adopt-only root     --apply service-----> service/source root
+provider-witness                         no apply predecessor
+```
+
+Each edge names exactly one predecessor digest; arbitrary child transitions
+are rejected before ordinary apply. A completed-edge retry remains idempotent
+because ordinary apply returns `unchanged` when the current root already equals
+the selected target before evaluating the predecessor CAS. Once a durable apply
+marker exists, generic `catalog apply --resume` uses only its captured
+content-addressed stage and predecessor record; replaying the bundle is rejected
+until recovery completes.
 
 `st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
 rejects any prepared state/control path, symlink, special node, unprojected

@@ -423,7 +423,7 @@ fn typed_projection_apply_verifies_target_receipt_digest_and_materialized_child(
         .output()
         .unwrap();
     assert!(!wrong_lineage.status.success());
-    assert!(String::from_utf8_lossy(&wrong_lineage.stderr).contains("source root"));
+    assert!(String::from_utf8_lossy(&wrong_lineage.stderr).contains("requires predecessor"));
 
     let wrong_bundle_capability = st2()
         .args(["catalog", "apply", "--catalog"])
@@ -636,7 +636,40 @@ fn typed_projection_apply_verifies_target_receipt_digest_and_materialized_child(
             .as_str()
             .unwrap()
             .to_owned();
-    let applied = st2()
+    let clean_receipt: Value =
+        serde_json::from_slice(&fs::read(clean_bundle.join("receipt.json")).unwrap()).unwrap();
+    let adopt_hash = clean_receipt["adoptOnly"]["rootSha256"].as_str().unwrap();
+    assert_eq!(clean_receipt["service"]["rootSha256"], source_hash);
+    assert_eq!(clean_receipt["service"]["applyFromRootSha256"], adopt_hash);
+    assert_eq!(
+        clean_receipt["adoptOnly"]["applyFromRootSha256"],
+        source_hash
+    );
+    assert!(clean_receipt["providerWitness"]["applyFromRootSha256"].is_null());
+
+    // A target cannot be selected from an arbitrary sibling/source state.
+    let wrong_service_predecessor = st2()
+        .args(["catalog", "apply", "--catalog"])
+        .arg(&catalog)
+        .args(["--projection-bundle"])
+        .arg(&clean_bundle)
+        .args([
+            "--projection-child",
+            "service",
+            "--expect-bundle-sha256",
+            &clean_bundle_hash,
+            "--expect-sha256",
+            source_hash,
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_service_predecessor.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_service_predecessor.stderr).contains("requires predecessor")
+    );
+
+    // Crash after the durable marker: replay is fenced and generic resume needs no public bundle.
+    let crashed = st2()
         .args(["catalog", "apply", "--catalog"])
         .arg(&catalog)
         .args(["--projection-bundle"])
@@ -648,20 +681,115 @@ fn typed_projection_apply_verifies_target_receipt_digest_and_materialized_child(
             &clean_bundle_hash,
             "--expect-sha256",
             source_hash,
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_CRASH_AT", "marker-created")
+        .output()
+        .unwrap();
+    assert!(!crashed.status.success());
+    assert!(catalog.join(".st2/catalog-apply-incomplete").is_file());
+    let replay_while_incomplete = st2()
+        .args(["catalog", "apply", "--catalog"])
+        .arg(&catalog)
+        .args(["--projection-bundle"])
+        .arg(&clean_bundle)
+        .args([
+            "--projection-child",
+            "adopt-only",
+            "--expect-bundle-sha256",
+            &clean_bundle_hash,
+            "--expect-sha256",
+            source_hash,
+        ])
+        .output()
+        .unwrap();
+    assert!(!replay_while_incomplete.status.success());
+    assert!(
+        String::from_utf8_lossy(&replay_while_incomplete.stderr)
+            .contains("recover only with `catalog apply --resume`")
+    );
+    let recovered = st2()
+        .args(["catalog", "apply", "--catalog"])
+        .arg(&catalog)
+        .args(["--resume", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["afterSha256"], adopt_hash);
+    assert_eq!(recovered["recovered"], true);
+
+    let wrong_adopt_predecessor = st2()
+        .args(["catalog", "apply", "--catalog"])
+        .arg(&catalog)
+        .args(["--projection-bundle"])
+        .arg(&clean_bundle)
+        .args([
+            "--projection-child",
+            "adopt-only",
+            "--expect-bundle-sha256",
+            &clean_bundle_hash,
+            "--expect-sha256",
+            adopt_hash,
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_adopt_predecessor.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_adopt_predecessor.stderr).contains("requires predecessor")
+    );
+
+    let restored = st2()
+        .args(["catalog", "apply", "--catalog"])
+        .arg(&catalog)
+        .args(["--projection-bundle"])
+        .arg(&clean_bundle)
+        .args([
+            "--projection-child",
+            "service",
+            "--expect-bundle-sha256",
+            &clean_bundle_hash,
+            "--expect-sha256",
+            adopt_hash,
             "--json",
         ])
         .output()
         .unwrap();
     assert!(
-        applied.status.success(),
+        restored.status.success(),
         "{}",
-        String::from_utf8_lossy(&applied.stderr)
+        String::from_utf8_lossy(&restored.stderr)
     );
-    let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    let restored: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(restored["afterSha256"], source_hash);
+    assert_eq!(restored["status"], "applied");
+
+    // Retrying the completed edge with the same predecessor capability is a typed no-op.
+    let retry = st2()
+        .args(["catalog", "apply", "--catalog"])
+        .arg(&catalog)
+        .args(["--projection-bundle"])
+        .arg(&clean_bundle)
+        .args([
+            "--projection-child",
+            "service",
+            "--expect-bundle-sha256",
+            &clean_bundle_hash,
+            "--expect-sha256",
+            adopt_hash,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(retry.status.success());
+    let retry: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry["status"], "unchanged");
     assert_eq!(
-        applied["afterSha256"],
-        serde_json::from_slice::<Value>(&fs::read(clean_bundle.join("receipt.json")).unwrap())
-            .unwrap()["adoptOnly"]["rootSha256"]
+        snapshot(&catalog, &temp.path().join("restored-snapshot"))["rootSha256"],
+        source_hash
     );
 }
 

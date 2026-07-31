@@ -92,6 +92,9 @@ pub struct CatalogProjectionArtifact {
     /// Path relative to the atomic projection bundle.
     pub path: String,
     pub root_sha256: String,
+    /// Exact current declaration root from which this child may be applied. `None` means evidence
+    /// only and grants no apply authority.
+    pub apply_from_root_sha256: Option<String>,
     pub entries: usize,
     /// Every Agent identity, including agents without a provider PTY.
     pub agent_ids: Vec<String>,
@@ -261,10 +264,12 @@ pub fn project_catalog(request: CatalogProjectionRequest) -> Result<CatalogProje
     validate_projectable_catalog(&witness_path, true)
         .context("validate materialized provider-only witness projection")?;
 
-    let service_artifact = projection_artifact(&service_path, "service", &service)?;
-    let adopt_artifact = projection_artifact(&adopt_path, "adopt-only", &adopt_only)?;
+    let mut service_artifact = projection_artifact(&service_path, "service", &service)?;
+    let mut adopt_artifact = projection_artifact(&adopt_path, "adopt-only", &adopt_only)?;
     let witness_artifact =
         projection_artifact(&witness_path, "provider-witness", &provider_witness)?;
+    service_artifact.apply_from_root_sha256 = Some(adopt_artifact.root_sha256.clone());
+    adopt_artifact.apply_from_root_sha256 = Some(service_artifact.root_sha256.clone());
     let equality = CatalogProjectionEquality {
         service_to_adopt_agent_ids: service_artifact.agent_ids == adopt_artifact.agent_ids,
         service_to_witness_agent_ids: service_artifact.agent_ids == witness_artifact.agent_ids,
@@ -390,12 +395,6 @@ pub fn apply_projection_bundle(
     );
     validate_sha256(&receipt.source_root_sha256)
         .context("validate projection receipt source root sha256")?;
-    anyhow::ensure!(
-        receipt.source_root_sha256 == request.expect_sha256,
-        "projection receipt source root {} does not match expected live root {}",
-        receipt.source_root_sha256,
-        request.expect_sha256
-    );
     let recorded_bundle_hash = String::from_utf8(read_real_file(
         &bundle.join("bundle.sha256"),
         "projection bundle digest",
@@ -417,6 +416,26 @@ pub fn apply_projection_bundle(
         receipt.service.root_sha256 == receipt.source_root_sha256,
         "projection service root does not match receipt source root"
     );
+    for (name, artifact) in [
+        ("service", &receipt.service),
+        ("adopt-only", &receipt.adopt_only),
+        ("provider-witness", &receipt.provider_witness),
+    ] {
+        validate_sha256(&artifact.root_sha256)
+            .with_context(|| format!("validate projection {name} root sha256"))?;
+        if let Some(predecessor) = &artifact.apply_from_root_sha256 {
+            validate_sha256(predecessor)
+                .with_context(|| format!("validate projection {name} predecessor sha256"))?;
+        }
+    }
+    anyhow::ensure!(
+        receipt.service.apply_from_root_sha256.as_deref()
+            == Some(receipt.adopt_only.root_sha256.as_str())
+            && receipt.adopt_only.apply_from_root_sha256.as_deref()
+                == Some(receipt.service.root_sha256.as_str())
+            && receipt.provider_witness.apply_from_root_sha256.is_none(),
+        "projection receipt apply transition graph is invalid"
+    );
 
     let (relative, artifact) = match request.child {
         CatalogProjectionChild::Service => ("service", &receipt.service),
@@ -426,6 +445,15 @@ pub fn apply_projection_bundle(
         artifact.path == relative,
         "projection receipt child path mismatch: expected {relative}, found {}",
         artifact.path
+    );
+    let predecessor = artifact
+        .apply_from_root_sha256
+        .as_deref()
+        .context("projection child grants no apply authority")?;
+    anyhow::ensure!(
+        request.expect_sha256 == predecessor,
+        "projection child {relative} requires predecessor sha256 {predecessor}, found {}",
+        request.expect_sha256
     );
     verify_projection_child(
         &bundle.join("service"),
@@ -757,6 +785,7 @@ fn projection_artifact(
     Ok(CatalogProjectionArtifact {
         path: relative_path.to_owned(),
         root_sha256: projection.root_sha256.clone(),
+        apply_from_root_sha256: None,
         entries: projection.entries(),
         agent_ids,
         provider_agent_ids: provider_agent_ids.into_iter().collect(),
