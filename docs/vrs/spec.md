@@ -180,30 +180,32 @@ positive declaration/template wakes, negative runtime/bus events, bounded
 discovery/materialization/PTY queries and writes, continuous-event starvation,
 and no-op desired-equals-actual behavior.
 
-## Quiet, evented coordination (R22)
+## Quiet coordination after events (R22)
 
-Useful work is silent by default. Presence, status, and durable plan state are
-inspectable facts, not invitations to send status messages or poll peers.
-Coordination begins only at an understandable event boundary:
+Useful work is quiet by default. Presence, status, and durable plan data are
+facts. They do not cause a status message or a peer poll.
 
-| Admitted event | Coordination obligation |
-| --- | --- |
-| unread inbox message | DING the recipient; process or hand off the request |
-| durable failure or true blocker | notify the responsible supervisor; diagnose, recover, or escalate until cleared |
-| completion or decision | hand the outcome to the agent or principal that needs it, then become quiet |
-| explicitly declared named schedule | perform that named coordination; do not emulate it with an ambient chat or polling loop |
+Coordination starts only after one of these events:
 
-The inbox path follows the source contract in
-[DING requirements](./01-ding/requirements.md). A normal supervisor is an
-exception handler for failure and truly blocked work, not a continuous manager
-of healthy agents. An intentionally extended supervisor persona may declare a
-higher coordination cadence. CoS is one non-normative example only: st2 does not
-require or type that role, and R22 grants it no standardized authority.
+- An unread inbox message. DING the recipient. Process or hand off the request.
+- A durable failure or real blocker. Tell the responsible supervisor. Find the cause.
+  Repair the failure or escalate it.
+- A completion or decision. Give the result to the agent or principal that needs it.
+- A declared schedule with a name. Do that work. Do not replace the schedule
+  with repeated messages or polls.
 
-This boundary does not define the still-open schedule grammar in DQ1; it only
-requires a named declared event rather than an implicit loop. A transport
-partition may delay coordination, but it does not stop independent host-local
-work or create a global availability dependency.
+After an event, continue until you resolve the need or hand it off. Then become quiet.
+
+The inbox uses the source contract in
+[DING requirements](./01-ding/requirements.md). A normal supervisor handles
+failures and blocked work. It does not continuously manage healthy agents. A
+custom supervisor persona can ask for more frequent coordination. CoS is only
+an example. st2 does not require or define that role, and R22 gives it no
+standard authority.
+
+R22 does not define the schedule grammar in DQ1. A schedule must have a declared
+name. Transport loss can delay coordination. It does not stop independent
+host-local work. Local work does not depend on a global service.
 
 ## Targeted reconciliation (R19)
 
