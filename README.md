@@ -98,7 +98,11 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 ```
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`.
+`copy` under `$CATALOG/_templates`. The maintained declaration does not add workspace trust.
+`compile-agent` also omits trust by default. Pass `--harness codex --trust-workspace` to opt in to an
+argv-local Codex `projects` trust override. The generator serializes the declared workspace as the
+exact decoded key; other harnesses reject the flag. This is a launch convention inside opaque argv,
+not agent-spec grammar enforced by st2.
 
 The compact declaration shape is:
 

@@ -14,6 +14,7 @@ pub struct AgentInput {
     pub host: String,
     pub role: String,
     pub harness: String,
+    pub trust_workspace: bool,
     pub model: Option<String>,
     pub workspace: String,
     pub supervisor: Option<String>,
@@ -37,11 +38,17 @@ impl AgentInput {
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
             ],
-            "codex" => vec![
-                "codex".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--dangerously-bypass-hook-trust".to_string(),
-            ],
+            "codex" => {
+                let mut argv = vec!["codex".to_string()];
+                if self.trust_workspace {
+                    argv.extend(["-c".to_string(), codex_project_trust(&self.workspace)]);
+                }
+                argv.extend([
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--dangerously-bypass-hook-trust".to_string(),
+                ]);
+                argv
+            }
             other => anyhow::bail!(
                 "compile-agent: harness '{other}' is not supported (expected claude or codex)"
             ),
@@ -53,6 +60,20 @@ impl AgentInput {
         argv.push(boot.to_string());
         Ok(argv)
     }
+}
+
+/// One generator-owned, argv-local Codex config override. TOML's table serializer owns key
+/// escaping so the decoded key is byte-identical to the declared workspace even when it contains
+/// quotes or slashes. Generic catalog validation continues to treat the resulting argv as opaque.
+fn codex_project_trust(workspace: &str) -> String {
+    let mut project = toml::Table::new();
+    project.insert(
+        "trust_level".to_string(),
+        toml::Value::String("trusted".to_string()),
+    );
+    let mut projects = toml::Table::new();
+    projects.insert(workspace.to_string(), toml::Value::Table(project));
+    format!("projects={}", toml::Value::Table(projects))
 }
 
 fn kdl_str(value: &str) -> String {
@@ -132,6 +153,9 @@ pub fn compile_agent(
             "compile-agent: harness '{}' is not supported (expected claude or codex)",
             input.harness
         );
+    }
+    if input.trust_workspace && input.harness != "codex" {
+        anyhow::bail!("compile-agent: --trust-workspace requires --harness codex");
     }
     let persona = fs::read_to_string(persona_file).map_err(|error| {
         anyhow::anyhow!(
