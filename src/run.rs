@@ -87,6 +87,9 @@ fn write_all_before(
         return Err(std::io::Error::last_os_error()).context("make metadata stdin nonblocking");
     }
     while !input.is_empty() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
         match stdin.write(input) {
             Ok(0) => {
                 return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
@@ -2371,6 +2374,22 @@ mod tests {
         assert_eq!(
             retained_writers, 1,
             "the undrained pipe retained a writer after the deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_write_deadline_prevents_further_progress() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let _reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        assert!(
+            !write_all_before(ChildStdin::from(writer), b"x", Instant::now()).unwrap(),
+            "an expired child deadline still allowed stdin progress"
         );
     }
 
