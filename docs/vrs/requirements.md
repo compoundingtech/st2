@@ -233,8 +233,13 @@ accepted.
   every provider task is running at the exact committed generation and
   trajectory, with no missing, extra, non-running, or mismatched row. For every
   provider workspace it also proves the retired `.st2/PERSONA.md` prompt and
-  loader absent; prompt authority comes only from the immutable runtime-profile
-  persona entry and exact harness-injection/launch receipt.
+  loader absent. Prompt authority comes only from the immutable runtime-profile
+  persona entry and a bounded canonical Axe launch receipt tagged onto that
+  exact PTY generation. The receipt binds runtime identity, workspace,
+  provider/account/persona/harness/model/effort axes, canonical provider argv,
+  runtime-profile and persona-prompt paths/digests, a closed harness-injection
+  kind, and the complete trajectory digest. Unlinked files or tags are not
+  proof.
 
   Successor Ding execs are a separate exact partition: before the following
   Ding action each is either positively absent or exact journal-bound, and none

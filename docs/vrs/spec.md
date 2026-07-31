@@ -641,9 +641,17 @@ candidate reconcile:
    launch-scoped immutable prompt authority, harness, model, effort, and a
    trajectory digest. Under one coherent declaration snapshot, the proof
    requires a bijection with the complete runtime provider inventory and
-   requires every row to be running and exact. The launch prompt is verified
-   through the runtime-profile persona entry and harness injection/launch
-   receipt; `.st2/PERSONA.md` and its loader must be absent in every workspace.
+   requires every row to be running and exact. Each PTY generation carries the
+   exact path and digest of one bounded canonical
+   `axe.agent-launch-receipt.v1`; the receipt binds its PTY runtime id,
+   identity, workspace, provider/account/persona/harness/model/effort,
+   canonical provider argv and digest, runtime-profile path/digest, selected
+   persona-prompt path/digest, closed harness-injection kind, and trajectory
+   digest. The proof verifies that the profile maps the persona to that prompt
+   and that the receipt path/digest is attached to the same observed PTY
+   generation. Four unrelated files, mutable ambient state, or an unlinked
+   receipt cannot satisfy the proof. `.st2/PERSONA.md` and its loader must be
+   absent in every workspace.
    It is read-only apart from advancing the transaction marker after the whole
    fleet passes. It has no workspace materialization or provider
    spawn/kill/reap/remove/GC capability. Any missing, extra, non-running,
