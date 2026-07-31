@@ -217,13 +217,13 @@ impl ExecBackend {
     }
 
     /// SIGTERM the whole task — the process GROUP, not just the recorded pid. `spawn` puts each exec
-    /// task in its own session via `setsid`, so the recorded pid is the group leader (pgid == pid) and
-    /// `kill(-pid)` reaps the leader AND anything it forked: a `sh -c` wrapper's grandchild (dash forks
-    /// rather than exec-replacing a bare command), a compound command's pipeline, a daemon's workers.
-    /// Killing only the leader would leave the real workload orphaned — an incomplete teardown, which
-    /// is precisely the guarantee st2 must not break. Targeting the group is safe: setsid always
-    /// succeeds for a freshly-forked child (never itself a group leader), so the group is the task's
-    /// own, never st2's.
+    /// task in its own session via `setsid`, so the recorded pid begins as the group leader
+    /// (pgid == pid), and `kill(-pid)` reaches the leader and anything it forked. Killing only the
+    /// leader could leave the real workload orphaned.
+    ///
+    /// This is legacy lifecycle behavior, not race-free retirement: generation observation and
+    /// numeric process-group signaling are separate operations, so a PID/PGID can be reused between
+    /// them. Issue #121 owns capability-pinned signaling and exact record retirement.
     pub fn kill(&self, id: &str) -> anyhow::Result<()> {
         let pid = match self.observe_generation(id)? {
             ExecGenerationObservation::Running { pid, .. } => pid as i32,
