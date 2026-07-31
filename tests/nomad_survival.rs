@@ -440,6 +440,22 @@ fn pty_gate(test: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+fn scope_gate(test: &str) -> bool {
+    let runtime_dir_valid = std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|path| Path::new(&path).is_dir());
+    if runtime_dir_valid && st2::isolate::mode() == st2::isolate::Isolation::Scope {
+        return true;
+    }
+    assert!(
+        std::env::var_os("ST2_ALLOW_ISOLATION_SKIP").is_some(),
+        "{test}: a valid XDG_RUNTIME_DIR and systemd user scope are required. Set \
+         ST2_ALLOW_ISOLATION_SKIP=1 to skip on a host without them."
+    );
+    eprintln!("SKIP {test}: systemd user scope unavailable (ST2_ALLOW_ISOLATION_SKIP set)");
+    false
+}
+
 #[test]
 fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle() {
     if !pty_gate("pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle") {
@@ -522,20 +538,28 @@ fn managed_agents_do_not_inherit_launcher_no_color_unless_declared() {
     if !pty_gate("managed_agents_do_not_inherit_launcher_no_color_unless_declared") {
         return;
     }
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .expect("this scope-path test requires XDG_RUNTIME_DIR for the systemd user manager");
-    assert!(
-        Path::new(&runtime_dir).is_dir(),
-        "XDG_RUNTIME_DIR must name an existing directory"
-    );
+    assert_managed_agent_color_contract("portable");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_agent_color_contract_crosses_systemd_scope() {
+    let test = "managed_agent_color_contract_crosses_systemd_scope";
+    if !pty_gate(test) || !scope_gate(test) {
+        return;
+    }
     assert_eq!(
         st2::isolate::mode(),
         st2::isolate::Isolation::Scope,
         "the NO_COLOR integration must exercise systemd-run, not degraded pass-through"
     );
+    assert_managed_agent_color_contract("scope");
+}
+
+fn assert_managed_agent_color_contract(suffix: &str) {
     let fx = Fixture::new();
-    let ambient_snapshot = fx.write_color_env_agent("ambient-color", false);
-    let explicit_snapshot = fx.write_color_env_agent("explicit-color", true);
+    let ambient_snapshot = fx.write_color_env_agent(&format!("ambient-color-{suffix}"), false);
+    let explicit_snapshot = fx.write_color_env_agent(&format!("explicit-color-{suffix}"), true);
 
     let out = fx
         .st2()
