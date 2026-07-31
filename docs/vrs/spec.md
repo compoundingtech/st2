@@ -497,20 +497,39 @@ the resident supervisor continues to reconcile the complete local catalog.
 
 ## Exact exec retirement (R24)
 
-The closed operator entry point is:
+The general closed operator entry point is prepare/apply:
 
 ```text
-st2 --catalog <catalog> exec retire \
+st2 --catalog <catalog> exec retirement prepare \
+  --host <host> \
   --id <runtime-id> \
-  --expect-generation-id <sha256:...> \
   --expect-catalog-sha256 <lowercase-hex> \
+  --output <create-only-plan> \
+  --json
+
+st2 --catalog <catalog> exec retirement apply \
+  --plan <plan> \
+  --expect-plan-sha256 <lowercase-hex> \
   --json
 ```
 
 `--catalog` identifies the logical declaration plane. The expected catalog
 digest is caller-held authority produced from a coherent canonical snapshot;
-the expected generation id is caller-held authority produced by the typed task
-inventory. Neither is inferred by this command.
+the create-only plan externalizes the exact runtime authority derived by st2.
+Apply accepts only the caller-held plan digest. Repeating the same apply resumes
+or returns the byte-identical completed receipt; there is no separate resume
+verb.
+
+The temporary legacy migration replaces `--id` with `--legacy-set`. It
+enumerates the complete host-local exec state namespace under the host lock and
+emits one exact-set digest plus one capability for every numeric record.
+Preparation fails without an artifact if any record is ambiguous, foreign, or
+otherwise unplanned. Live records carry exact process and dedicated-scope
+authority; positively stale/reused records carry exact record authority and a
+proof that signaling is unnecessary. Apply checks that the namespace is still
+exactly the original set minus durably completed entries. This is the only
+legacy-classification authority; consumers do not list files, parse PIDs, or
+derive generation ids.
 
 The operation writes a durable per-request journal under the host-local exec
 state directory and returns `st2.exec-retirement.v1`. Repeating the same request
@@ -526,10 +545,12 @@ trusting path names. The generation record moves to a create-only private slot;
 it is never unlinked. Logs are diagnostics, not generation authority, and are
 not part of exact retirement.
 
-Only a Linux generation published with a dedicated cgroup-v2 systemd scope is
-retirable. Other platforms and degraded isolation remain observable but return
-a typed unsupported error. PTY tasks continue to use the PTY backend and never
-enter this transaction.
+Only a Linux live generation with a dedicated cgroup-v2 systemd scope is
+retirable. The legacy-set seam additionally permits record-only retirement
+after a positive stale/reused proof and performs no signal or cgroup write for
+that entry. Other platforms and degraded isolation remain observable but
+return a typed unsupported error. PTY tasks continue to use the PTY backend and
+never enter this transaction.
 
 ## Open design questions
 

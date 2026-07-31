@@ -182,5 +182,12 @@ accepted.
   exact evidence, or supported generation schema fails closed. There is no
   numeric PID/process-group, path-unlink, PTY, whole-state-directory, or
   best-effort fallback. Historical exec records remain read-only and cannot be
-  retired by this seam. Whole-state-directory rotation is a one-shot consumer
-  operation, not general task removal.
+  retired by the general seam. A removable, explicitly typed legacy migration
+  seam may prepare a complete host-local exec-state census under the host lock,
+  classify every numeric record as exact-live or positively stale, reject the
+  entire set on ambiguity or foreign entries, and externalize a create-only
+  plan whose digest is the sole apply authority. Apply rechecks the catalog
+  root and complete remaining namespace before each resumable per-entry
+  transition. The caller never enumerates paths or derives generations.
+  Whole-state-directory rotation is a one-shot consumer operation, not general
+  task removal.
