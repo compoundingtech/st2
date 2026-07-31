@@ -495,6 +495,42 @@ owner/task path.
 selector. Targeted task reconciliation is intentionally bounded to `--once`;
 the resident supervisor continues to reconcile the complete local catalog.
 
+## Exact exec retirement (R24)
+
+The closed operator entry point is:
+
+```text
+st2 --catalog <catalog> exec retire \
+  --id <runtime-id> \
+  --expect-generation-id <sha256:...> \
+  --expect-catalog-sha256 <lowercase-hex> \
+  --json
+```
+
+`--catalog` identifies the logical declaration plane. The expected catalog
+digest is caller-held authority produced from a coherent canonical snapshot;
+the expected generation id is caller-held authority produced by the typed task
+inventory. Neither is inferred by this command.
+
+The operation writes a durable per-request journal under the host-local exec
+state directory and returns `st2.exec-retirement.v1`. Repeating the same request
+resumes or returns the completed receipt. A different request for the same
+runtime id conflicts while a journal is incomplete. The state transition is:
+
+```text
+prepared -> frozen -> killed -> record-retired -> completed
+```
+
+At every arrow, recovery reopens and revalidates capabilities rather than
+trusting path names. The generation record moves to a create-only private slot;
+it is never unlinked. Logs are diagnostics, not generation authority, and are
+not part of exact retirement.
+
+Only a Linux generation published with a dedicated cgroup-v2 systemd scope is
+retirable. Other platforms and degraded isolation remain observable but return
+a typed unsupported error. PTY tasks continue to use the PTY backend and never
+enter this transaction.
+
 ## Open design questions
 
 - **DQ1 Scheduled work:** The vision includes per-machine schedulers that form a

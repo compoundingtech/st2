@@ -163,3 +163,24 @@ accepted.
   only the old supervisor and start the replacement, prove every desired task
   running at its baseline generation through a second complete inventory, and
   only then separately compare-and-swap the ordinary `service` lifecycle.
+- **R24 Exact exec retirement:** A caller may retire one exact `exec`
+  generation only while holding both its opaque runtime-generation capability
+  and the exact canonical declaration-root digest. On Linux, retirement is one
+  durable, restartable transaction over a dedicated cgroup-v2 systemd scope:
+  it pins the leader with a pidfd, opens the recorded cgroup without symlink or
+  mount traversal, freezes it, revalidates the generation, record inode, scope,
+  and complete membership, uses `cgroup.kill`, proves the cgroup empty, then
+  moves the exact generation record with `renameat2(RENAME_NOREPLACE)` into a
+  private retirement slot and verifies the moved inode and bytes. A raced
+  replacement is restored without replacement; if restoration conflicts, both
+  objects are preserved and the transaction reports conflict. Every durable
+  phase is recoverable and the typed receipt binds the request digest,
+  declaration root, record before/after evidence, process generation, cgroup
+  authority, membership, freeze, kill, and journal.
+
+  Missing pidfd, cgroup-v2, dedicated scope authority, writable controls,
+  exact evidence, or supported generation schema fails closed. There is no
+  numeric PID/process-group, path-unlink, PTY, whole-state-directory, or
+  best-effort fallback. Historical exec records remain read-only and cannot be
+  retired by this seam. Whole-state-directory rotation is a one-shot consumer
+  operation, not general task removal.
