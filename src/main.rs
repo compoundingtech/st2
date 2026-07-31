@@ -141,6 +141,10 @@ enum Command {
         persona: PathBuf,
         #[arg(long, default_value = "claude")]
         harness: String,
+        /// Add an argv-local Codex project trust override for the exact workspace. This is opt-in
+        /// and requires `--harness codex`.
+        #[arg(long)]
+        trust_workspace: bool,
         /// Host (defaults to the local hostname).
         #[arg(long)]
         host: Option<String>,
@@ -595,6 +599,7 @@ fn main() -> Result<()> {
             dir,
             persona,
             harness,
+            trust_workspace,
             host,
             model,
             supervisor,
@@ -602,7 +607,16 @@ fn main() -> Result<()> {
         } => {
             let catalog = catalog_arg(catalog)?;
             compile_agent_cmd(
-                &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
+                &catalog,
+                &identity,
+                &role,
+                &dir,
+                &persona,
+                &harness,
+                trust_workspace,
+                host,
+                model,
+                supervisor,
                 extra_arg,
             )
         }
@@ -663,6 +677,7 @@ fn compile_agent_cmd(
     dir: &str,
     persona: &Path,
     harness: &str,
+    trust_workspace: bool,
     host: Option<String>,
     model: Option<String>,
     supervisor: Option<String>,
@@ -674,6 +689,7 @@ fn compile_agent_cmd(
         host: host.clone(),
         role: role.to_string(),
         harness: harness.to_string(),
+        trust_workspace,
         model,
         workspace: dir.to_string(),
         supervisor,

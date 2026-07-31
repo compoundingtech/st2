@@ -14,9 +14,10 @@ machine-specific install paths. Copy the appropriate file into
 `<catalog>/agents/<host>/<identity>/agent.kdl`, replace every placeholder, and add the referenced
 catalog-owned templates. `role` is optional metadata; `supervisor` is optional runtime routing.
 Uncomment them when the agent has an assigned role or reports to another bus identity. In the Codex
-declaration, replacing `<workspace>` in both places keeps its argv-local project trust key
-byte-identical to the declared workspace. st2 treats that argv as opaque; the trust flag is a
-Codex launch convention, not part of generic catalog validation.
+declaration, workspace trust is absent by default. The experimental generator adds an argv-local
+Codex project trust override only with `compile-agent --harness codex --trust-workspace`. It preserves
+the exact decoded workspace bytes as the key. st2 treats that argv as opaque; the trust flag is not
+part of generic catalog validation.
 
 ## Lifecycle
 

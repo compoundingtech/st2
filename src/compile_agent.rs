@@ -14,6 +14,7 @@ pub struct AgentInput {
     pub host: String,
     pub role: String,
     pub harness: String,
+    pub trust_workspace: bool,
     pub model: Option<String>,
     pub workspace: String,
     pub supervisor: Option<String>,
@@ -37,13 +38,17 @@ impl AgentInput {
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
             ],
-            "codex" => vec![
-                "codex".to_string(),
-                "-c".to_string(),
-                codex_project_trust(&self.workspace),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--dangerously-bypass-hook-trust".to_string(),
-            ],
+            "codex" => {
+                let mut argv = vec!["codex".to_string()];
+                if self.trust_workspace {
+                    argv.extend(["-c".to_string(), codex_project_trust(&self.workspace)]);
+                }
+                argv.extend([
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--dangerously-bypass-hook-trust".to_string(),
+                ]);
+                argv
+            }
             other => anyhow::bail!(
                 "compile-agent: harness '{other}' is not supported (expected claude or codex)"
             ),
@@ -148,6 +153,9 @@ pub fn compile_agent(
             "compile-agent: harness '{}' is not supported (expected claude or codex)",
             input.harness
         );
+    }
+    if input.trust_workspace && input.harness != "codex" {
+        anyhow::bail!("compile-agent: --trust-workspace requires --harness codex");
     }
     let persona = fs::read_to_string(persona_file).map_err(|error| {
         anyhow::anyhow!(

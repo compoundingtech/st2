@@ -98,9 +98,11 @@ ${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
 ```
 
 Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`. The Codex declaration repeats the exact decoded `<workspace>`
-bytes in its argv-local `projects` trust table; keep both values byte-identical. This is a harness
-launch convention inside opaque argv, not agent-spec grammar enforced by st2.
+`copy` under `$CATALOG/_templates`. The maintained declaration does not add workspace trust.
+`compile-agent` also omits trust by default. Pass `--harness codex --trust-workspace` to opt in to an
+argv-local Codex `projects` trust override. The generator serializes the declared workspace as the
+exact decoded key; other harnesses reject the flag. This is a launch convention inside opaque argv,
+not agent-spec grammar enforced by st2.
 
 The compact declaration shape is:
 
@@ -113,7 +115,7 @@ agent "<identity>" {
   // role "worker"
   // supervisor "<supervisor-bus-id>"
   env { ST_AGENT "<host>.<identity>" }
-  argv "codex" "-c" "projects={\"<workspace>\"={trust_level=\"trusted\"}}" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
+  argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {
