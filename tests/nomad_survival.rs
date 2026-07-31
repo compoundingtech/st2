@@ -135,6 +135,29 @@ impl Fixture {
         std::fs::write(path, kdl).unwrap();
     }
 
+    fn write_color_env_agent(&self, identity: &str, explicit_no_color: bool) -> PathBuf {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}"));
+        let snapshot = self.catalog.join(format!("{identity}.color-env"));
+        let explicit_env = explicit_no_color
+            .then_some("  env { NO_COLOR \"1\" }\n")
+            .unwrap_or_default();
+        let kdl = format!(
+            r##"agent "{identity}" {{
+  identity "{identity}"
+  host "{HOST}"
+  type "service"
+{explicit_env}  command #"printf '%s\n' "${{NO_COLOR-unset}}" > "$CATALOG/{identity}.color-env"; exec sleep 120"#
+}}
+"##
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+        snapshot
+    }
+
     /// Write a PTY task that records every st2-managed environment value and its cwd on each boot.
     /// The append-only snapshot lets a test compare the initial launch with a manual `pty restart`.
     fn write_restart_env_agent(&self, identity: &str) -> PathBuf {
@@ -492,6 +515,45 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
             "down did not stop {session_id}"
         );
     }
+}
+
+#[test]
+fn managed_agents_do_not_inherit_launcher_no_color_unless_declared() {
+    if !pty_gate("managed_agents_do_not_inherit_launcher_no_color_unless_declared") {
+        return;
+    }
+    let fx = Fixture::new();
+    let ambient_snapshot = fx.write_color_env_agent("ambient-color", false);
+    let explicit_snapshot = fx.write_color_env_agent("explicit-color", true);
+
+    let out = fx
+        .st2()
+        .env("NO_COLOR", "1")
+        .arg("up")
+        .arg(&fx.catalog)
+        .args(["--host", HOST, "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "st2 up --once failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(poll_until(SPAWN_TIMEOUT, || {
+        ambient_snapshot.exists() && explicit_snapshot.exists()
+    }));
+
+    assert_eq!(
+        std::fs::read_to_string(ambient_snapshot).unwrap(),
+        "unset\n",
+        "the reconciler's capture-only NO_COLOR must not disable agent color"
+    );
+    assert_eq!(
+        std::fs::read_to_string(explicit_snapshot).unwrap(),
+        "1\n",
+        "an explicit Agent Spec NO_COLOR must still reach the agent"
+    );
 }
 
 #[test]
