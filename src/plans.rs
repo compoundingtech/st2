@@ -1,6 +1,6 @@
 //! Experimental, read-only plan discovery and inspection.
 //!
-//! Plans remain ordinary KDL and referenced files. This module parses intent, validates immutable
+//! Plans remain ordinary KDL and referenced files. This module parses intent, validates declared
 //! version links, and derives the frontier; it never executes, schedules, reconciles, or writes.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,7 +38,7 @@ pub enum PlanSourceKind {
     Inline,
 }
 
-/// One immutable intent revision.
+/// One declared intent revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanVersion {

@@ -216,9 +216,11 @@ agent "app-web" {
 
 An agent links an external declaration with `plan-ref "file:relative/plan.kdl"`. Plan identity is
 the explicit KDL value, never the directory. Inline ownership comes from the containing agent;
-external plans require one `owner`. Every version has one relative `file:` resource. Revisions have
-one or more immutable `parent` links and a non-empty `why`; root versions have no parent. The
-frontier is derived as every version with no child, so concurrent siblings remain visible.
+external plans require one `owner`. Every version has one relative `file:` resource. Revisions
+declare one or more `parent` links and a non-empty `why`; root versions have no parent. The frontier
+is derived as every version with no child, so concurrent siblings remain visible. The experiment
+stores no content digest or history. It cannot prove that an earlier declaration or resource file
+stayed unchanged.
 References resolve from the KDL file that declares them and must stay inside the selected catalog.
 
 ```sh
