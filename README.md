@@ -165,6 +165,39 @@ does not introduce a shell. Use `command #"..."#` instead when the task intentio
 syntax such as pipelines, redirects, or variable expansion; `command` continues to run under
 `sh -c`. A runnable task must declare exactly one of `argv` or `command`.
 
+An experimental rich DING path can be selected by giving compact `ding` one generic activity
+adapter. The adapter is also structured argv: core introduces no shell, provider selector, arguments, or
+environment.
+
+```kdl
+env { ADAPTER_ROOT "/opt/agent-adapters" }
+ding {
+  adapter {
+    argv "$ADAPTER_ROOT/bin/activity" "--format" "jsonl"
+  }
+}
+```
+
+The adapter must publish the matching harness-neutral PTY activity lease and emit the generic
+JSONL input-buffer/freshness evidence described in
+[`docs/vrs/01-ding/spec.md`](docs/vrs/01-ding/spec.md). Only a fresh exact `idle` + `empty` tuple can
+reach PTY's generation/revision-guarded write. Every mismatch, stale event, adapter failure, or
+nonempty/unknown input buffer holds the durable FIFO and writes zero bytes. Omitted/bare `ding`
+preserves the existing delivery path exactly; configured rich DING never falls back to it.
+st2 records exact PTY attempt ownership before the guarded packet, so a transport error or sidecar
+restart cannot replay possibly-written bytes; only a proven zero-byte conflict clears that attempt.
+
+A provider-rendered turn-boundary hook that already injected exact unread files into the next
+context records that fact separately:
+
+```sh
+st2 ding-control --identity <host.identity> hook-owned \
+  --message <exact-unread-filename.md>
+```
+
+The control ingress does not install hooks, parse provider JSON, trigger a model call, or send PTY
+input. It verifies exact unread filenames and keeps ownership durable until archive.
+
 ### Scheduled work is coming soon, not implemented
 
 st2 does not parse or run scheduled entries today. The intended direction starts with a declarative
@@ -357,7 +390,7 @@ st2 service uninstall
 
 ```text
 ls, up, down, validate, doctor
-message, ding, agents, status, context, resource
+message, ding, ding-control, agents, status, context, resource
 env, pty, shell, pretrust
 hooks, service, eval
 compile-agent (experimental)

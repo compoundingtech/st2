@@ -10,6 +10,10 @@ specified in [`01-claude/spec.md`](./01-claude/spec.md) and
 Active. A map to the implementation and its evidence, not a replacement for the
 tests.
 
+Bare `ding` is the active compatibility path described first below. The
+adapter-selected path later in this document is experimental and depends on
+PTY's generic activity and guarded-send protocols.
+
 ## Composer states
 
 One inspection of a rendered screen, evaluated against one exact expected
@@ -135,6 +139,92 @@ indefinitely occupied composer cannot spawn a terminal probe per inbox poll
 (`DING-R08`). Archive receipts remove pending notices without another attempt.
 Declared `busy` never suppresses delivery; only fresh `dnd` defers it
 (`DING-R09`).
+
+## Experimental adapter-selected delivery
+
+The sole rich policy is selected by adapter presence; no provider or delivery
+enum is built into core:
+
+```kdl
+ding {
+  adapter {
+    argv "$ADAPTER_ROOT/bin/activity" "--format" "jsonl"
+  }
+}
+```
+
+The argv values follow normal task launch semantics. The first value is the
+executable, remaining values are exact arguments, and declared task/agent
+environment is inherited. st2 neither runs a shell nor adds arguments or
+environment. Bare `ding` continues to lower to
+`st2 ding --identity <id> --root $ST_ROOT` exactly.
+
+The long-running adapter owns provider-native interpretation and publishes
+PTY's harness-neutral activity lease. Its bounded stdout is newline-delimited
+JSON. Core accepts only this strict v1 event:
+
+```json
+{"v":1,"kind":"activity","session":"host.identity","incarnation":"opaque-epoch","generation":"opaque-pty-generation","sequence":7,"state":"idle","inputBuffer":"empty","validForMs":250,"reason":"opaque"}
+```
+
+- Required common fields are `v`, `kind`, `session`, `incarnation`,
+  `generation`, and a nonzero strictly increasing `sequence`.
+- `state` is `idle`, `active`, `child`, or `unknown`.
+- `inputBuffer` is `empty`, `nonempty`, or `unknown`. This is deliberately not
+  named composer state; adapters translate their own UI facts.
+- `validForMs` is anchored when st2 receives the line and capped at two seconds.
+  A newer event invalidates the prior lease.
+- Unknown fields, versions, or kinds; malformed/oversized/non-UTF-8 lines;
+  identity or sequence mismatch; adapter EOF/error; and tuple changes fail
+  closed. Opaque `reason` is not interpreted.
+
+Only fresh `idle` + `empty` proceeds. st2 reads one PTY STATUS packet and
+requires exact equality across:
+
+```text
+event.session     = PTY session
+event.incarnation = activity.producerEpoch
+event.generation  = STATUS generation = activity.generation
+event.sequence    = activity.sequence
+event.state       = activity.state = idle
+```
+
+It then records exact durable attempt ownership and sends the existing
+normalized bracketed-paste DING notice plus Return as opaque bytes in PTY's
+generation/I/O-revision guarded packet. PTY compares both tokens and writes once
+in the same event-loop turn. A successful guard creates PTY ownership, not a
+positive harness receipt, and the notice is not written again while unread,
+including after a sidecar restart. A proven conflict writes zero guarded bytes
+and clears attempt ownership. A transport error is ambiguous after packet write,
+so ownership remains fail-closed. Both outcomes invalidate the lease and require
+a newer qualifying event before any unowned work can proceed.
+
+The PTY contract is defined by the stacked experimental
+[activity PR](https://github.com/compoundingtech/pty/pull/131) and
+[guarded-send PR](https://github.com/compoundingtech/pty/pull/133). Rich DING
+must remain opt-in until that substrate and external acceptance are available.
+
+## Turn-boundary hook ownership
+
+Hook delivery is separate from the activity adapter. A rendered provider hook
+first injects exact unread filenames into an already-occurring next context,
+then calls:
+
+```text
+st2 ding-control --identity <host.identity> hook-owned \
+  --message <exact-unread-filename.md> [--message ...]
+```
+
+The ingress resolves the durable inbox, rejects invalid, duplicate, archived,
+or missing filenames, and atomically records ownership beside the inbox. The
+sidecar rechecks receipts on every wake/restart. Hook-owned filenames are
+removed from rich PTY work while unread; archive removes their durable
+ownership. The command does not read provider hook JSON, install hooks, trigger
+a model call, press Return, or provide mid-turn interruption.
+
+Rich logs emit typed JSON receipts for `held`, staged `error`, `hook-owned`,
+`guard-conflict`, and `pty-owned`. The legacy path emits one `fallback` receipt
+only to make its unchanged selection explicit.
 
 ## Known limits
 

@@ -108,6 +108,29 @@ enum Command {
         /// Poll/liveness cadence in milliseconds (folder changes poke immediately regardless).
         #[arg(long, default_value_t = 1000)]
         interval: u64,
+        /// Opt into fail-closed rich DING with this long-running generic activity-adapter
+        /// executable. Omission preserves the existing aggressive behavior exactly.
+        #[arg(long)]
+        adapter: Option<String>,
+        /// One argument passed directly to `--adapter` (repeatable; no shell parsing).
+        #[arg(long, requires = "adapter", allow_hyphen_values = true)]
+        adapter_arg: Vec<String>,
+    },
+    /// EXPERIMENTAL generic local ingress for provider-rendered DING hooks. This records only that
+    /// an already-running lifecycle hook injected exact unread filenames into the next context.
+    #[command(name = "ding-control")]
+    DingControl {
+        #[command(subcommand)]
+        operation: DingControlCmd,
+        /// Whose unread inbox the hook injected. Defaults to `$ST_AGENT`.
+        #[arg(long)]
+        identity: Option<String>,
+        /// Catalog root. Defaults to `$CATALOG`.
+        #[arg(long, conflicts_with = "catalog_path")]
+        root: Option<PathBuf>,
+        /// Host used to resolve `<host>.<identity>` bus ids.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Get or set an agent's presence status. No `--set` prints the status; no identity means yours
     /// (`$ST_AGENT`). Settable: offline | available | busy | away | dnd (`unknown` is derived).
@@ -340,6 +363,15 @@ enum HooksCmd {
 }
 
 #[derive(Subcommand)]
+enum DingControlCmd {
+    /// Record exact currently unread filenames already injected by a lifecycle hook.
+    HookOwned {
+        #[arg(long = "message", required = true)]
+        messages: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ResourceCmd {
     /// Link a resource (a URL you produced or reference) into your resource list.
     Add {
@@ -562,7 +594,23 @@ fn main() -> Result<()> {
             root,
             host,
             interval,
-        } => ding_cmd(session, identity, root, host, interval),
+            adapter,
+            adapter_arg,
+        } => ding_cmd(
+            session,
+            identity,
+            root,
+            host,
+            interval,
+            adapter,
+            adapter_arg,
+        ),
+        Command::DingControl {
+            operation,
+            identity,
+            root,
+            host,
+        } => ding_control_cmd(operation, identity, root, host),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Agents {
             catalog,
@@ -1193,6 +1241,8 @@ fn ding_cmd(
     root: Option<PathBuf>,
     host: Option<String>,
     interval: u64,
+    adapter: Option<String>,
+    adapter_args: Vec<String>,
 ) -> Result<()> {
     let ctx = MsgCtx {
         root,
@@ -1220,7 +1270,41 @@ fn ding_cmd(
         poll: Duration::from_millis(interval),
         ..Default::default()
     };
-    ding::serve(&inbox, &status_path, &session, &config)
+    let adapter_argv = adapter.map(|program| {
+        std::iter::once(program)
+            .chain(adapter_args)
+            .collect::<Vec<_>>()
+    });
+    ding::serve(
+        &inbox,
+        &status_path,
+        &session,
+        adapter_argv.as_deref(),
+        &config,
+    )
+}
+
+fn ding_control_cmd(
+    operation: DingControlCmd,
+    identity: Option<String>,
+    root: Option<PathBuf>,
+    host: Option<String>,
+) -> Result<()> {
+    let ctx = MsgCtx {
+        root,
+        as_id: identity,
+        host,
+    };
+    let (catalog_root, this_host) = resolve_ctx(&ctx)?;
+    let id = acting_id(&ctx)?;
+    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
+    match operation {
+        DingControlCmd::HookOwned { messages } => {
+            let receipt = ding::record_hook_owned(&inbox, &messages)?;
+            println!("{}", receipt.display());
+            Ok(())
+        }
+    }
 }
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.
