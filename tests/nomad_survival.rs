@@ -592,18 +592,27 @@ fn assert_managed_agent_color_contract(suffix: &str) {
         "an explicit Agent Spec NO_COLOR must still reach the agent"
     );
 
-    for identity in [&ambient_identity, &explicit_identity] {
-        let restarted = Command::new("pty")
+    for (identity, snapshot) in [
+        (&ambient_identity, &ambient_snapshot),
+        (&explicit_identity, &explicit_snapshot),
+    ] {
+        let mut restarted = Command::new("pty")
             .env("NO_COLOR", "1")
             .env("PTY_ROOT", &fx.pty_root)
             .args(["restart", "-y", "--force", &format!("{HOST}.{identity}")])
-            .output()
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        let observed = poll_until(SPAWN_TIMEOUT, || {
+            std::fs::read_to_string(snapshot).is_ok_and(|contents| contents.lines().count() == 2)
+        });
+        let _ = restarted.kill();
+        let output = restarted.wait_with_output().unwrap();
         assert!(
-            restarted.status.success(),
-            "`pty restart -y` failed for {identity}:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&restarted.stdout),
-            String::from_utf8_lossy(&restarted.stderr)
+            observed,
+            "`pty restart -y` did not produce a second snapshot for {identity}:\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
     assert!(
