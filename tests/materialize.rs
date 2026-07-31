@@ -2,12 +2,330 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use st2::materialize::{materialize_catalog, parse_plan};
+use st2::materialize::{materialize_catalog, materialize_catalog_against, parse_plan};
 use st2::{AgentSpec, discover};
 
 fn write(path: &Path, contents: impl AsRef<[u8]>) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
+}
+
+#[test]
+fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let before = fs::read_dir(tmp.path()).unwrap().count();
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["up", "--catalog"])
+        .arg(tmp.path())
+        .args([
+            "--host",
+            "host",
+            "--materialize-only",
+            "--task",
+            "host.missing.task",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), before);
+}
+
+#[test]
+fn task_selector_materializes_only_owning_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let owner = tmp.path().join("owner");
+    let sibling = tmp.path().join("sibling");
+    fs::create_dir_all(&owner).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(&owner, r#"    copy "_templates/owner" "OWNER.txt""#),
+    );
+    write(
+        &catalog.join("agents/Silber/pty/agent.kdl"),
+        agent_kdl(&sibling, r#"    copy "_templates/sibling" "SIBLING.txt""#)
+            .replace("agent \"cos\"", "agent \"pty\"")
+            .replace("Silber.cos", "Silber.pty"),
+    );
+    write(&catalog.join("_templates/owner"), "owner");
+    write(&catalog.join("_templates/sibling"), "sibling");
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["up", "--catalog"])
+        .arg(&catalog)
+        .args([
+            "--host",
+            "Silber",
+            "--materialize-only",
+            "--task",
+            "Silber.cos.agent",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(owner.join("OWNER.txt")).unwrap(),
+        "owner"
+    );
+    assert!(!sibling.join("SIBLING.txt").exists());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("materialized 1 operation"));
+}
+
+#[test]
+fn shared_workspace_conflicting_copy_targets_fail_before_any_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &catalog.join("agents/Silber/worker/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/worker.md" ".st2/PERSONA.md""#,
+        ),
+    );
+    write(
+        &catalog.join("agents/Silber/orchestrator/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/orchestrator.md" ".st2/PERSONA.md""#,
+        )
+        .replace("agent \"cos\"", "agent \"orchestrator\"")
+        .replace("Silber.cos", "Silber.orchestrator"),
+    );
+    write(&catalog.join("_templates/worker.md"), "worker\n");
+    write(
+        &catalog.join("_templates/orchestrator.md"),
+        "orchestrator\n",
+    );
+
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("conflicting render ownership"),
+        "{:?}",
+        report.errors
+    );
+    assert_eq!(report.failed_agents.len(), 2);
+    assert!(
+        !workspace.join(".st2/PERSONA.md").exists(),
+        "a conflicting fleet must be rejected before either owner writes"
+    );
+}
+
+#[test]
+fn selected_owner_cannot_bypass_a_shared_workspace_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &catalog.join("agents/Silber/worker/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/worker.md" ".st2/PERSONA.md""#,
+        ),
+    );
+    write(
+        &catalog.join("agents/Silber/orchestrator/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/orchestrator.md" ".st2/PERSONA.md""#,
+        )
+        .replace("agent \"cos\"", "agent \"orchestrator\"")
+        .replace("Silber.cos", "Silber.orchestrator"),
+    );
+    write(&catalog.join("_templates/worker.md"), "worker\n");
+    write(
+        &catalog.join("_templates/orchestrator.md"),
+        "orchestrator\n",
+    );
+    let found = discover(&catalog);
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "cos")
+        .unwrap();
+
+    let report = materialize_catalog_against(
+        &catalog,
+        std::slice::from_ref(worker),
+        &found.specs,
+        "Silber",
+    );
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.failed_agents.contains("Silber.cos"));
+    assert!(!workspace.join(".st2/PERSONA.md").exists());
+}
+
+#[test]
+fn shared_workspace_byte_identical_claims_are_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let render = r#"    copy "_templates/shared.md" ".st2/bus.md""#;
+    write(
+        &catalog.join("agents/Silber/a/agent.kdl"),
+        agent_kdl(&workspace, render),
+    );
+    write(
+        &catalog.join("agents/Silber/b/agent.kdl"),
+        agent_kdl(&workspace, render)
+            .replace("agent \"cos\"", "agent \"b\"")
+            .replace("Silber.cos", "Silber.b"),
+    );
+    write(&catalog.join("_templates/shared.md"), "shared\n");
+    let found = discover(&catalog);
+
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.failed_agents.is_empty());
+    assert_eq!(
+        fs::read_to_string(workspace.join(".st2/bus.md")).unwrap(),
+        "shared\n"
+    );
+}
+
+#[test]
+fn task_selector_ambiguous_refuses_without_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    let kdl = |id: &str, ws: &Path, marker: &str| {
+        format!(
+            "agent \"{id}\" {{\n host \"Silber\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{\n  id \"dup\"\n  command \"true\"\n }}\n render {{ file \"MARKER.txt\" \"{marker}\" }}\n}}\n",
+            ws.display()
+        )
+    };
+    write(
+        &catalog.join("agents/Silber/a/agent.kdl"),
+        kdl("a", &a, "a"),
+    );
+    write(
+        &catalog.join("agents/Silber/b/agent.kdl"),
+        kdl("b", &b, "b"),
+    );
+    let found = st2::discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs.len(), 2);
+    assert!(
+        found
+            .specs
+            .iter()
+            .all(|s| s.tasks.len() == 1 && s.tasks[0].id.as_deref() == Some("dup"))
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["up", "--catalog"])
+        .arg(&catalog)
+        .args(["--host", "Silber", "--materialize-only", "--task", "dup"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous"));
+    assert!(!a.join("MARKER.txt").exists() && !b.join("MARKER.txt").exists());
+}
+
+#[test]
+fn task_selector_wrong_host_refuses_without_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let target = tmp.path().join("hetz-target");
+    fs::create_dir_all(&target).unwrap();
+    let text = format!(
+        "agent \"remote\" {{\n host \"Hetz\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{ id \"hetz.task\" command \"true\" }}\n render {{ file \"MARKER.txt\" \"remote\" }}\n}}\n",
+        target.display()
+    );
+    write(&catalog.join("agents/Hetz/remote/agent.kdl"), text);
+    let found = st2::discover(&catalog);
+    assert!(found.errors.is_empty());
+    assert_eq!(found.specs[0].tasks[0].id.as_deref(), Some("hetz.task"));
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["up", "--catalog"])
+        .arg(&catalog)
+        .args([
+            "--host",
+            "Silber",
+            "--materialize-only",
+            "--task",
+            "hetz.task",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("did not resolve"));
+    assert!(!target.join("MARKER.txt").exists());
+}
+
+#[test]
+fn task_selector_cli_modes_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        vec![
+            "up",
+            "--catalog",
+            tmp.path().to_str().unwrap(),
+            "--task",
+            "host.a.x",
+        ],
+        vec![
+            "up",
+            "--catalog",
+            tmp.path().to_str().unwrap(),
+            "--materialize-only",
+            "--task",
+            "host.a.x",
+            "--agent",
+            "a",
+        ],
+        vec![
+            "up",
+            "--catalog",
+            tmp.path().to_str().unwrap(),
+            "--agent",
+            "a",
+        ],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).trim().is_empty());
+    }
+}
+
+#[test]
+fn task_selector_single_file_modes_refuse_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = tmp.path().join("spec.kdl");
+    fs::write(&spec, "agent \"a\" { host \"Silber\" command \"true\" }\n").unwrap();
+    let before = fs::read_to_string(&spec).unwrap();
+    for extra in [
+        ["--materialize-only", "--task", "Silber.a.agent"],
+        ["--once", "--task", "Silber.a.agent"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["up", spec.to_str().unwrap()])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+    }
+    assert_eq!(fs::read_to_string(&spec).unwrap(), before);
 }
 
 fn spec(catalog: &Path, identity: &str) -> AgentSpec {

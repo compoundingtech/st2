@@ -2,10 +2,10 @@
 //! plus the supervisor loop that reconciles on a folder-watch + timer.
 //!
 //! Everything st2 does to the world goes through the [`Runner`] trait: list sessions, spawn a pty
-//! from its explicit command, kill a session, remove a dead one. The production [`PtyCli`] shells out
+//! from its explicit launch, kill a session, remove a dead one. The production [`PtyCli`] shells out
 //! to the `pty` CLI; tests swap in a fake, so plan execution is verified without spawning a single
-//! real process. st2 stays harness-agnostic here too — it runs the spec's `command` verbatim under
-//! `sh -c` and never inspects it.
+//! real process. st2 stays harness-agnostic here too — it either runs shell source verbatim under
+//! `sh -c` or passes a structured argv directly.
 //!
 //! The loop is decoupled Nomad-style: stopping st2 never tears down its agents — they are detached
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
@@ -13,7 +13,9 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::{Read as _, Seek as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -26,9 +28,14 @@ use serde::Deserialize;
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{ReconcilePlan, Session, TaskTarget};
+use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::task_inventory::{
+    DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
+    RuntimeObserver, generation_id,
+};
 use agent_spec::spec::TaskKind;
 
+// This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 
@@ -104,7 +111,7 @@ pub(crate) fn resolve_task_cwd(
 pub trait Runner {
     /// ACTUAL state: every task session the runner can see (unioned across backends).
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>>;
-    /// Spawn `target` in the background from its explicit command. `spec_dir` is the spec file's
+    /// Spawn `target` in the background from its explicit launch. `spec_dir` is the spec file's
     /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
     /// SIGTERM a running session.
@@ -145,6 +152,12 @@ struct PtyListEntry {
     /// The process exit code once `exited` (absent while running or `vanished`).
     #[serde(rename = "exitCode", default)]
     exit_code: Option<i64>,
+    /// PTY daemon PID. Together with `createdAt`, this identifies one generation.
+    #[serde(default)]
+    pid: Option<u32>,
+    /// PTY-owned generation creation time.
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -221,8 +234,8 @@ impl PtyCli {
     /// env can be unit-tested without spawning anything.
     ///
     /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, and `cwd` — because `pty` passes the child env through verbatim. The `command` is left
-    /// unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
+    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -260,18 +273,178 @@ impl PtyCli {
             assignment.push(value);
             cmd.arg("--env").arg(assignment);
         }
-        // Run the command verbatim under a shell — st2 never parses or splits it.
-        cmd.arg("--").arg("sh").arg("-c").arg(&target.command);
+        cmd.arg("--");
+        match &target.launch {
+            // Run shell source verbatim — st2 never parses or splits it.
+            TaskLaunch::Shell(command) => {
+                cmd.arg("sh").arg("-c").arg(command);
+            }
+            // Direct mode preserves argument boundaries and introduces no shell process.
+            TaskLaunch::Argv(argv) => {
+                debug_assert!(!argv.is_empty());
+                cmd.args(argv.iter().map(|arg| self.expand(arg)));
+            }
+        }
         cmd
     }
-}
 
-impl Runner for PtyCli {
-    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+    /// Pure, typed PTY observation. A missing root is known empty and is not
+    /// passed to `pty`, because observation must not create it.
+    fn task_observations(&self, desired_ids: &HashSet<&str>) -> ObservationBatch {
+        let root = effective_pty_root(&self.catalog_root);
+        self.task_observations_at_root(desired_ids, &root)
+    }
+
+    fn task_observations_at_root(
+        &self,
+        desired_ids: &HashSet<&str>,
+        root: &Path,
+    ) -> ObservationBatch {
+        if desired_ids.is_empty() {
+            return ObservationBatch {
+                complete: true,
+                ..ObservationBatch::default()
+            };
+        }
+        // Retain the admitted directory inode across the external probe. `pty
+        // list` creates PTY_ROOT when absent, so a path removed and recreated
+        // during the call must never be confused with the admitted registry.
+        let root_handle = match File::open(root) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ObservationBatch {
+                    complete: true,
+                    ..ObservationBatch::default()
+                };
+            }
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "cannot inspect PTY root {}: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        let metadata = match root_handle.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "cannot inspect admitted PTY root {}: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        if !metadata.is_dir() {
+            return ObservationBatch {
+                complete: false,
+                observations: Vec::new(),
+                errors: vec![format!("PTY root {} is not a directory", root.display())],
+            };
+        }
+        let entries = match self.list_entries_at(root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![error.to_string()],
+                };
+            }
+        };
+        let final_metadata = match std::fs::metadata(root) {
+            Ok(final_metadata) => final_metadata,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "PTY root {} disappeared during observation: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        if !final_metadata.is_dir()
+            || final_metadata.dev() != metadata.dev()
+            || final_metadata.ino() != metadata.ino()
+        {
+            return ObservationBatch {
+                complete: false,
+                observations: Vec::new(),
+                errors: vec![format!(
+                    "PTY root {} changed identity during observation",
+                    root.display()
+                )],
+            };
+        }
+        let mut observations = Vec::with_capacity(entries.len());
+        let mut errors = Vec::new();
+        for entry in entries {
+            if !desired_ids.contains(entry.name.as_str()) {
+                continue;
+            }
+            let state = match entry.status.as_str() {
+                "running" => match (entry.pid, entry.created_at.as_deref()) {
+                    (Some(pid), Some(created_at)) => {
+                        let generation_id =
+                            generation_id("pty", &entry.name, pid, created_at, None);
+                        match RuntimeGeneration::new(pid, created_at.to_owned(), generation_id) {
+                            Ok(generation) => ObservedState::Running(generation),
+                            Err(error) => {
+                                let message = format!(
+                                    "invalid PTY task {:?} generation: {error}",
+                                    entry.name
+                                );
+                                errors.push(message.clone());
+                                ObservedState::Indeterminate(message)
+                            }
+                        }
+                    }
+                    _ => {
+                        let message = format!(
+                            "running PTY task {:?} lacks pid or createdAt generation evidence",
+                            entry.name
+                        );
+                        errors.push(message.clone());
+                        ObservedState::Indeterminate(message)
+                    }
+                },
+                "exited" => ObservedState::Exited,
+                "vanished" => ObservedState::Vanished,
+                other => {
+                    let message = format!("PTY task {:?} has unknown status {other:?}", entry.name);
+                    errors.push(message.clone());
+                    ObservedState::Indeterminate(message)
+                }
+            };
+            observations.push(RuntimeObservation {
+                runtime_id: entry.name,
+                state,
+            });
+        }
+        ObservationBatch {
+            complete: errors.is_empty(),
+            observations,
+            errors,
+        }
+    }
+
+    fn list_entries(&self) -> anyhow::Result<Vec<PtyListEntry>> {
+        self.list_entries_at(&effective_pty_root(&self.catalog_root))
+    }
+
+    fn list_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyListEntry>> {
         let out = output_with_timeout(
             Command::new(&self.bin)
                 .args(["list", "--json"])
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+                .env("PTY_ROOT", root),
             PTY_LIST_TIMEOUT,
         )
         .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
@@ -281,9 +454,15 @@ impl Runner for PtyCli {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("parsing `pty list --json`: {e}"))?;
-        Ok(entries
+        serde_json::from_slice(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty list --json`: {error}"))
+    }
+}
+
+impl Runner for PtyCli {
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        Ok(self
+            .list_entries()?
             .into_iter()
             .map(|e| Session {
                 pty_id: e.name,
@@ -432,6 +611,79 @@ impl SystemRunner {
     }
 }
 
+impl RuntimeObserver for SystemRunner {
+    fn observe(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        let pty_ids = desired
+            .iter()
+            .filter(|runtime| runtime.kind == TaskKind::Pty)
+            .map(|runtime| runtime.runtime_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut batch = self.pty.task_observations(&pty_ids);
+
+        for runtime in desired
+            .iter()
+            .filter(|runtime| runtime.kind == TaskKind::Exec)
+        {
+            match self.exec.observe_generation_optional(&runtime.runtime_id) {
+                Ok(None) => {
+                    // Positive absence is filled by the declaration/runtime join.
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Running {
+                    pid,
+                    created_at,
+                    generation_id,
+                })) => {
+                    let state = match RuntimeGeneration::new(pid, created_at, generation_id) {
+                        Ok(generation) => ObservedState::Running(generation),
+                        Err(error) => {
+                            let message = format!(
+                                "invalid exec task {:?} generation: {error}",
+                                runtime.runtime_id
+                            );
+                            batch.errors.push(message.clone());
+                            ObservedState::Indeterminate(message)
+                        }
+                    };
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state,
+                    });
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Exited { .. })) => {
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Exited,
+                    });
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Indeterminate {
+                    reason,
+                    ..
+                })) => {
+                    let message = format!(
+                        "exec task {:?} is indeterminate: {reason}",
+                        runtime.runtime_id
+                    );
+                    batch.errors.push(message.clone());
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Indeterminate(message),
+                    });
+                }
+                Err(error) => {
+                    let message = format!("observe exec task {:?}: {error:#}", runtime.runtime_id);
+                    batch.errors.push(message.clone());
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Indeterminate(message),
+                    });
+                }
+            }
+        }
+        batch.complete &= batch.errors.is_empty();
+        batch
+    }
+}
+
 impl Runner for SystemRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let mut idx = self.index.borrow_mut();
@@ -540,6 +792,8 @@ pub struct UpReport {
     /// not-alive but was alive within the grace window, i.e. a transient `pty list` flicker under load,
     /// left alone rather than destructively reaped (R21c). Not "noteworthy" (it's a no-op by design).
     pub deferred: Vec<String>,
+    /// dead or absent adopt-only task ids held without reap or launch.
+    pub held: Vec<String>,
     /// pty ids the flapping-cap refused to (re)launch this pass (parked / crash-looping).
     pub flapping: Vec<String>,
     /// Rich crash-loop records (a superset of `flapping`) — the source for supervisor surfacing.
@@ -557,6 +811,21 @@ pub struct UpReport {
 }
 
 impl UpReport {
+    fn absorb(&mut self, mut other: UpReport) {
+        self.skipped |= other.skipped;
+        self.launched.append(&mut other.launched);
+        self.torn_down.append(&mut other.torn_down);
+        self.gc.append(&mut other.gc);
+        self.deferred.append(&mut other.deferred);
+        self.held.append(&mut other.held);
+        self.flapping.append(&mut other.flapping);
+        self.crash_loops.append(&mut other.crash_loops);
+        self.adopted.append(&mut other.adopted);
+        self.other_host.append(&mut other.other_host);
+        self.unrunnable.append(&mut other.unrunnable);
+        self.warnings.append(&mut other.warnings);
+        self.errors.append(&mut other.errors);
+    }
     /// True when the pass actually changed something (or hit an error) — used to keep the loop's log
     /// quiet on no-op ticks.
     pub fn is_noteworthy(&self) -> bool {
@@ -663,6 +932,7 @@ pub fn execute(
     report
         .adopted
         .extend(plan.adopt.iter().map(|s| s.identity.clone()));
+    report.held.extend(plan.held.iter().cloned());
     report
         .other_host
         .extend(plan.other_host.iter().map(|s| s.identity.clone()));
@@ -768,7 +1038,7 @@ fn reconcile_pass(
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
-    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host)
+    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host, root)
         .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
@@ -782,15 +1052,21 @@ fn reconcile_pass(
         .specs
         .iter()
         .filter(|spec| {
-            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host)
+            hook_error.is_none() || !crate::hooks::required_by_codex_agent(spec, this_host, root)
         })
         .cloned()
         .collect::<Vec<_>>();
 
-    // Ordered, idempotent pre-boot materialization. A gating render failure removes only that agent
-    // from this pass; advisory git-exclude failures remain warnings and never block a launch.
-    let materialized =
-        crate::materialize::materialize_catalog(root, &materializable_specs, this_host);
+    // Ordered, idempotent pre-boot materialization, with ownership checked against the complete
+    // active fleet even when another gate defers one owner's writes. A gating render failure removes
+    // only that agent from this pass; advisory git-exclude failures remain warnings and never block
+    // a launch.
+    let materialized = crate::materialize::materialize_catalog_against(
+        root,
+        &materializable_specs,
+        &found.specs,
+        this_host,
+    );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
     let eligible_specs: Vec<_> = found
@@ -814,7 +1090,7 @@ fn reconcile_pass(
     debounce.observe(&sessions, now);
     let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches_on_hooks(&mut plan, &mut report, || match &hook_error {
+    gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
@@ -831,6 +1107,7 @@ fn reconcile_pass(
 /// the wrong state and could not satisfy the launched seat's trust gate.
 fn gate_codex_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
+    catalog_root: &Path,
     report: &mut UpReport,
     verify_hooks: V,
 ) where
@@ -839,7 +1116,8 @@ fn gate_codex_launches_on_hooks<'a, V>(
     let mut gated_agents = Vec::new();
     for launch in &plan.launch {
         let Some(_) = launch.tasks.iter().find(|target| {
-            target.name == "agent" && crate::hooks::command_invokes_codex(&target.command)
+            target.name == "agent"
+                && crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
         }) else {
             continue;
         };
@@ -938,6 +1216,92 @@ pub fn up_once_specs(
         &mut FlappingCap::default(),
         &mut debounce,
     )
+}
+
+/// One bounded task-scoped pass over already-discovered specs. Selector resolution precedes any runner call.
+pub fn up_once_selected_specs(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
+        crate::hooks::verify_installed().map(|_| ())
+    })
+}
+
+/// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
+/// materialize only that owner and execute the selected plan.
+pub fn up_once_selected(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
+    let found = crate::discovery::discover(catalog_root);
+    let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+    let mut report = UpReport::default();
+    report.warnings.extend(found.warnings);
+    report.errors.extend(
+        found
+            .errors
+            .into_iter()
+            .map(|e| format!("{}: {}", e.path.display(), e.message)),
+    );
+    let owner = owner.clone();
+    if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
+        && let Err(error) = crate::hooks::verify_installed()
+    {
+        report
+            .errors
+            .push(format!("verify lifecycle hooks: {error}"));
+        return Ok(report);
+    }
+    let materialized = crate::materialize::materialize_catalog_against(
+        catalog_root,
+        std::slice::from_ref(&owner),
+        &found.specs,
+        this_host,
+    );
+    report.warnings.extend(materialized.warnings);
+    let owner_materialization_failed = !materialized.failed_agents.is_empty();
+    report.errors.extend(materialized.errors);
+    if owner_materialization_failed {
+        return Ok(report);
+    }
+    let execution = up_once_selected_specs_with_gates(
+        catalog_root,
+        &found.specs,
+        selector,
+        this_host,
+        runner,
+        || Ok(()),
+    )?;
+    report.absorb(execution);
+    Ok(report)
+}
+
+fn up_once_selected_specs_with_gates<V>(
+    catalog_root: &Path,
+    specs: &[crate::spec::AgentSpec],
+    selector: &str,
+    this_host: &str,
+    runner: &dyn Runner,
+    verify_hooks: V,
+) -> anyhow::Result<UpReport>
+where
+    V: FnOnce() -> anyhow::Result<()>,
+{
+    crate::reconcile::resolve_task(specs, selector, this_host)?;
+    let sessions = runner
+        .list_sessions()
+        .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
+    let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
+    let mut report = UpReport::default();
+    gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
+    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    Ok(report)
 }
 
 /// Supervise an in-memory spec team: keep-alive + respawn on a timer, behaving exactly like
@@ -1224,7 +1588,8 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::TaskKind;
+    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
@@ -1234,7 +1599,7 @@ mod tests {
             pty_id: id.to_string(),
             bus_id: "hetz.demo".to_string(),
             name: "agent".to_string(),
-            command: cmd.to_string(),
+            launch: TaskLaunch::Shell(cmd.to_string()),
             cwd: None,
             workspace: None,
             tags: BTreeMap::new(),
@@ -1243,26 +1608,74 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    struct EmptyRunner;
+    struct GateRunner {
+        list_calls: Cell<usize>,
+    }
 
-    #[cfg(target_os = "linux")]
-    impl Runner for EmptyRunner {
+    impl Runner for GateRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            self.list_calls.set(self.list_calls.get() + 1);
             Ok(Vec::new())
         }
 
         fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot launch")
+            panic!("gate runner must not spawn")
         }
 
         fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot kill")
+            panic!("gate runner must not kill")
         }
 
         fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
-            unreachable!("an empty catalog cannot remove")
+            panic!("gate runner must not remove")
         }
+    }
+
+    #[test]
+    fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
+        let spec = AgentSpec {
+            identity: "codex".into(),
+            host: None,
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            retired: false,
+            keep: false,
+            restart: None,
+            resources: vec![],
+            tasks: vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: Some("test.codex.agent".into()),
+                command: None,
+                argv: Some(vec!["$CATALOG/bin/codex".into(), "--version".into()]),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            }],
+            path: "/tmp/spec.kdl".into(),
+        };
+        let runner = GateRunner {
+            list_calls: Cell::new(0),
+        };
+        let report = up_once_selected_specs_with_gates(
+            Path::new("/tmp"),
+            &[spec],
+            "test.codex.agent",
+            "test",
+            &runner,
+            || anyhow::bail!("stale receipt"),
+        )
+        .unwrap();
+        assert_eq!(runner.list_calls.get(), 1);
+        assert!(report.launched.is_empty());
+        assert!(report.errors.iter().any(|error| {
+            error.contains("stale receipt") && error.contains("launch suppressed")
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -1280,7 +1693,9 @@ mod tests {
             up_loop_until(
                 catalog.path(),
                 "test-host",
-                &EmptyRunner,
+                &GateRunner {
+                    list_calls: Cell::new(0),
+                },
                 Duration::from_secs(60),
                 &stop,
                 |_| passes += 1,
@@ -1298,8 +1713,6 @@ mod tests {
     //    destructively GC/relaunch a HEALTHY agent; a stable death must still be reaped ──────────────
 
     use crate::reconcile::Launch;
-    use agent_spec::spec::{AgentSpec, JobType};
-
     fn sess(id: &str, alive: bool) -> Session {
         Session {
             pty_id: id.to_string(),
@@ -1319,6 +1732,7 @@ mod tests {
             retired: false,
             keep: false,
             restart: None,
+            resources: vec![],
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }
@@ -1458,7 +1872,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || Ok(()));
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || Ok(()),
+        );
 
         assert_eq!(
             plan.launch
@@ -1488,6 +1907,7 @@ mod tests {
 
         gate_codex_launches_on_hooks(
             &mut plan,
+            Path::new("/catalog"),
             &mut report,
             || panic!("an already-live Codex agent must not enter the hook gate"),
         );
@@ -1520,9 +1940,12 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(&mut plan, &mut report, || {
-            anyhow::bail!("stale receipt")
-        });
+        gate_codex_launches_on_hooks(
+            &mut plan,
+            Path::new("/catalog"),
+            &mut report,
+            || anyhow::bail!("stale receipt"),
+        );
 
         assert_eq!(
             plan.launch
@@ -1560,7 +1983,49 @@ mod tests {
         let name_pos = args.iter().position(|a| a == "--name").unwrap();
         assert_eq!(args[name_pos + 1], "hetz.demo");
         let sep = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&args[sep + 1..], &["sh", "-c", &t.command]);
+        assert_eq!(
+            &args[sep + 1..],
+            &[
+                "sh",
+                "-c",
+                "exec claude --permission-mode bypassPermissions 'boot'"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_run_command_passes_direct_argv_without_a_shell() {
+        let cli = PtyCli::new(PathBuf::from("/my/catalog"));
+        let mut t = target("hetz.demo.agent", "unused");
+        t.launch = TaskLaunch::Argv(vec![
+            "axe".into(),
+            "agent".into(),
+            "exec".into(),
+            "--".into(),
+            "claude".into(),
+            "--resume".into(),
+            "$CATALOG/session id".into(),
+        ]);
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let sep = args.iter().position(|arg| arg == "--").unwrap();
+
+        assert_eq!(
+            &args[sep + 1..],
+            [
+                "axe",
+                "agent",
+                "exec",
+                "--",
+                "claude",
+                "--resume",
+                "/my/catalog/session id"
+            ]
+        );
+        assert!(!args[sep + 1..].iter().any(|arg| arg == "sh"));
     }
 
     #[test]
@@ -1844,5 +2309,169 @@ mod tests {
         let h = detect_host();
         assert!(!h.is_empty());
         assert!(!h.contains('.'), "short name only, got {h}");
+    }
+
+    #[test]
+    fn task_observation_of_missing_pty_root_is_complete_and_does_not_create_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir(&catalog).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                tmp.path().join("missing-pty").display().to_string()
+            ),
+        )
+        .unwrap();
+        let root = effective_pty_root_from(&catalog, None);
+        assert!(!root.exists());
+        let batch = PtyCli::new(catalog).task_observations(&HashSet::from(["h.worker"]));
+        assert!(batch.complete, "{:?}", batch.errors);
+        assert!(batch.observations.is_empty());
+        assert!(!root.exists(), "read-only observation created the PTY root");
+    }
+
+    #[test]
+    fn unreadable_pty_root_evidence_is_indeterminate_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let loop_path = tmp.path().join("pty-loop");
+        std::fs::create_dir(&catalog).unwrap();
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                loop_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let batch = PtyCli::new(catalog)
+            .task_observations_at_root(&HashSet::from(["h.worker"]), &loop_path);
+        assert!(!batch.complete);
+        assert!(batch.observations.is_empty());
+        assert!(
+            batch.errors[0].contains("cannot inspect PTY root"),
+            "{:?}",
+            batch.errors
+        );
+    }
+
+    #[test]
+    fn removed_and_recreated_pty_root_is_indeterminate_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pty");
+        std::fs::create_dir(&root).unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nrmdir \"$PTY_ROOT\"\nmkdir \"$PTY_ROOT\"\nprintf '%s\\n' '[]'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let batch = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: tmp.path().join("catalog"),
+        }
+        .task_observations_at_root(&HashSet::from(["h.worker"]), &root);
+        assert!(!batch.complete);
+        assert!(batch.observations.is_empty());
+        assert!(
+            batch.errors[0].contains("changed identity during observation"),
+            "{:?}",
+            batch.errors
+        );
+    }
+
+    #[test]
+    fn pty_task_observation_preserves_exact_generation_and_closed_states() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let pty_root = tmp.path().join("pty");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::create_dir(&pty_root).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                pty_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let cli = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: catalog,
+        };
+        let desired = HashSet::from(["h.live", "h.exit", "h.gone"]);
+        let first = cli.task_observations(&desired);
+        let second = cli.task_observations(&desired);
+        assert!(first.complete, "{:?}", first.errors);
+        assert_eq!(first, second, "same PTY evidence changed generation");
+        let ObservedState::Running(generation) = &first.observations[0].state else {
+            panic!("running PTY lost generation: {:?}", first.observations[0]);
+        };
+        assert_eq!(generation.pid(), 41);
+        assert_eq!(generation.created_at(), "2026-07-31T10:00:00.000Z");
+        assert!(generation.generation_id().starts_with("sha256:"));
+        assert_eq!(first.observations[1].state, ObservedState::Exited);
+        assert_eq!(first.observations[2].state, ObservedState::Vanished);
+    }
+
+    #[test]
+    fn running_pty_without_complete_generation_is_indeterminate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let pty_root = tmp.path().join("pty");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::create_dir(&pty_root).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                pty_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"h.live\",\"status\":\"running\"}]'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let batch = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: catalog,
+        }
+        .task_observations(&HashSet::from(["h.live"]));
+        assert!(!batch.complete);
+        assert!(matches!(
+            batch.observations[0].state,
+            ObservedState::Indeterminate(_)
+        ));
     }
 }

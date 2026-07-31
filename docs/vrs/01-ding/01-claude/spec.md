@@ -59,6 +59,15 @@ differently from typed input, so recognizing it relies on a text grammar a human
 could in principle type; an empty composer cannot be confused with a human
 draft, because a draft is not empty.
 
+## Post-submit receipt
+
+The exact notice as the complete lowest live composer is `RetainedSafe` only
+with the ordinary idle proof and no blocking state; otherwise it is
+`RetainedBlocked`. `Accepted` requires both an empty or recognized placeholder
+in the lowest live composer and the expected notice text in the adapter's
+submitted-prompt or queued-message pattern. A placeholder alone, disappearance,
+a different live draft, and unrecognized pixels are `Unproven`.
+
 ## Blocked states
 
 Return is withheld while the screen shows an active turn or a modal. Two

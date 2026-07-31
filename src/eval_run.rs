@@ -1,8 +1,8 @@
 //! Runtime for the st2 spec (P2+): boot a spec's team, and (P3/P4) run its `eval` + judges. The
-//! team-boot REUSES the existing reconcile/execute machinery — a parsed [`Spec`] is mapped to in-memory
-//! [`AgentSpec`]s (each agent → a pty task for its command + an exec task per `exec` block), then
-//! `reconcile` + `execute` spawn them (isolated, teardown-clean) exactly as `st2 up <catalog>` does.
-//! No catalog discovery: the one spec file IS the source.
+//! team-boot REUSES the existing reconcile/execute machinery. Compact `team` declarations map to
+//! in-memory [`AgentSpec`]s; an explicit `canonical-agents` eval instead discovers the post-run
+//! hermetic catalog. Either way one [`AgentSpec`] vector flows through reconcile, execution,
+//! supervision, and teardown exactly as `st2 up <catalog>` does.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
 use crate::reconcile::reconcile;
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
-use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind};
+use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 macro_rules! eval_log {
     ($($arg:tt)*) => {
@@ -66,10 +66,12 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 name: "agent".to_string(),
                 id: Some(a.id.clone()), // explicit id → the session is exactly the agent id (mix.sup)
                 command: Some(a.command.clone()),
+                argv: None,
                 cwd: None, // → the agent's workspace (resolved relative to `root`)
                 tags: ptags,
                 env: a.env.clone(),
                 keep: false,
+                lifecycle: TaskLifecycle::Service,
             });
             for ex in &a.execs {
                 tasks.push(Task {
@@ -78,10 +80,12 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                     name: ex.id.clone(),
                     id: Some(ex.id.clone()),
                     command: Some(ex.command.clone()),
+                    argv: None,
                     cwd: None,
                     tags: BTreeMap::new(),
                     env: ex.env.clone(),
                     keep: false,
+                    lifecycle: TaskLifecycle::Service,
                 });
             }
             AgentSpec {
@@ -94,11 +98,188 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 retired: false,
                 keep: false,
                 restart: None,
+                resources: Vec::new(),
                 tasks,
                 path: path.clone(),
             }
         })
         .collect()
+}
+
+#[derive(Debug)]
+struct CanonicalEvalTeam {
+    specs: Vec<AgentSpec>,
+    runtime_tasks: Vec<EvalRuntimeTask>,
+    routes: BTreeMap<String, CanonicalRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvalRuntimeTask {
+    agent_id: String,
+    runtime_id: String,
+    is_pty: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalRoute {
+    inbox: PathBuf,
+    archive: PathBuf,
+}
+
+fn admitted_route<'a>(
+    routes: &'a BTreeMap<String, CanonicalRoute>,
+    id: &str,
+) -> &'a CanonicalRoute {
+    routes
+        .get(id)
+        .unwrap_or_else(|| panic!("strict canonical admission did not freeze route for `{id}`"))
+}
+
+fn task_runtime_id(spec: &AgentSpec, task: &Task, host: &str) -> String {
+    task.id
+        .clone()
+        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(host), task.name))
+}
+
+fn task_is_launchable(task: &Task) -> bool {
+    task.command.is_some() || task.argv.is_some()
+}
+
+/// Discover the sole declaration authority for a `canonical-agents` eval after its fixture and run
+/// steps have populated the hermetic catalog. This deliberately consumes the shared Agent Spec
+/// parser instead of projecting the compact eval grammar into a second, partial declaration.
+fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalTeam> {
+    let validation = crate::validate::validate_for_host(catalog, host);
+    if !validation.issues.is_empty() {
+        let issues = validation
+            .issues
+            .iter()
+            .map(|issue| {
+                format!(
+                    "{} {} {}: {}",
+                    issue.severity.tag(),
+                    issue.code,
+                    issue.path,
+                    issue.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("canonical eval Agent Specs failed strict validation: {issues}");
+    }
+    let found = crate::discover(catalog);
+    if !found.errors.is_empty() {
+        let errors = found
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path.display(), error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("canonical eval Agent Spec discovery failed: {errors}");
+    }
+    if !found.warnings.is_empty() {
+        anyhow::bail!(
+            "canonical eval Agent Specs must discover without warnings: {}",
+            found.warnings.join("; ")
+        );
+    }
+    if crate::catalog::pty_root(catalog) != catalog.join("pty") {
+        anyhow::bail!(
+            "canonical-agents requires the hermetic PTY root `{}`",
+            catalog.join("pty").display()
+        );
+    }
+
+    let local_specs = found
+        .specs
+        .iter()
+        .filter(|spec| spec.resolved_host(host) == host)
+        .cloned()
+        .collect::<Vec<_>>();
+    if local_specs.is_empty() {
+        anyhow::bail!(
+            "canonical-agents found no local canonical Agent Specs for host `{host}` in {}",
+            catalog.display()
+        );
+    }
+
+    let mut bus_ids = HashSet::new();
+    let mut runtime_ids = BTreeMap::<String, String>::new();
+    let mut runtime_tasks = Vec::new();
+    let mut routes = BTreeMap::new();
+    for spec in &local_specs {
+        let bus_id = spec.bus_id(host);
+        if !bus_ids.insert(bus_id.clone()) {
+            anyhow::bail!("canonical-agents found duplicate Agent Spec bus identity `{bus_id}`");
+        }
+        if spec.retired {
+            anyhow::bail!("canonical-agents refuses retired Agent Spec `{bus_id}`");
+        }
+        if !spec.is_runnable() {
+            anyhow::bail!("canonical-agents Agent Spec `{bus_id}` is not runnable");
+        }
+        for task in &spec.tasks {
+            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT"] {
+                if task.env.contains_key(root) {
+                    anyhow::bail!(
+                        "canonical-agents Agent Spec `{bus_id}` must not override eval-owned `{root}`"
+                    );
+                }
+            }
+        }
+        for task in &spec.tasks {
+            let runtime_id = task_runtime_id(spec, task, host);
+            if runtime_id.trim().is_empty() {
+                anyhow::bail!(
+                    "canonical-agents Agent Spec `{bus_id}` task `{}` runtime task id must be nonempty",
+                    task.name
+                );
+            }
+            if let Some(previous) = runtime_ids.insert(runtime_id.clone(), bus_id.clone()) {
+                anyhow::bail!(
+                    "canonical-agents found duplicate runtime task id `{runtime_id}` in `{previous}` and `{bus_id}`"
+                );
+            }
+            if task_is_launchable(task) {
+                runtime_tasks.push(EvalRuntimeTask {
+                    agent_id: bus_id.clone(),
+                    runtime_id,
+                    is_pty: task.kind == TaskKind::Pty,
+                });
+            }
+        }
+        let agent_dir = spec
+            .path
+            .parent()
+            .expect("canonical Agent Spec path has an agent directory");
+        let route = CanonicalRoute {
+            inbox: crate::message::inbox_dir(agent_dir),
+            archive: crate::message::archive_dir(agent_dir),
+        };
+        routes.insert(bus_id, route.clone());
+        routes.insert(spec.identity.clone(), route);
+    }
+    runtime_tasks.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
+
+    let materialized =
+        crate::materialize::materialize_catalog(catalog, &local_specs, host);
+    if !materialized.errors.is_empty() {
+        anyhow::bail!(
+            "canonical eval Agent Spec materialization failed: {}",
+            materialized.errors.join("; ")
+        );
+    }
+    if !materialized.warnings.is_empty() {
+        anyhow::bail!(
+            "canonical eval Agent Spec materialization warnings are fatal: {}",
+            materialized.warnings.join("; ")
+        );
+    }
+    Ok(CanonicalEvalTeam {
+        specs: local_specs,
+        runtime_tasks,
+        routes,
+    })
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -242,8 +423,8 @@ pub fn prepare_spawn_env() {
 // ── P3: the `st2 eval` flow ───────────────────────────────────────────────────────────────────────
 
 /// The outcome of an eval run: whether the team reached "done", plus every judge's result. The
-/// verdict is all-must-pass over the judges (done is informational — the judges are the truth, so a
-/// timeout still grades the final state and simply fails the judges it should).
+/// verdict is all-must-pass over the judges. Compact-team `done` remains informational; a canonical
+/// team adds its completion result as a gating judge while still grading the final state.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EvalReport {
     /// The team reached the done signal (a sup→requester confirmation post-dating a worker report).
@@ -320,26 +501,41 @@ fn from_is(from: Option<&str>, id: &str) -> bool {
     from.is_some_and(|f| f == id || f.ends_with(&format!(".{id}")))
 }
 
-/// Wait for the DONE signal, message-driven (not grade-poll): a `sup → requester` confirmation whose
-/// timestamp POST-DATES a `worker → sup` report (Q1(b) — the same discriminator the graders use, so an
-/// early "on it" ack from the sup can't fire it). Bounded by `timeout`. Returns whether done fired.
+/// Wait for the DONE signal, message-driven (not grade-poll). Multi-agent teams require a
+/// `sup → requester` confirmation whose timestamp follows a `worker → sup` report. A canonical
+/// singleton instead requires a causally new requester-inbox entry at-or-after the exact kickoff
+/// receipt. Compact singleton semantics remain unchanged. Bounded by `timeout`. Returns whether done
+/// fired.
 fn wait_done(
     bus: &Path,
+    canonical_routes: Option<&BTreeMap<String, CanonicalRoute>>,
     sup: &str,
     requester: &str,
     workers: &[String],
+    kickoff_ts: Option<u64>,
+    requester_before_kickoff: Option<&HashSet<String>>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(),
 ) -> bool {
-    let sup_inbox = bus.join(sup).join("inbox");
-    let sup_archive = bus.join(sup).join("archive");
+    let (sup_inbox, sup_archive) = match canonical_routes {
+        Some(routes) => {
+            let route = admitted_route(routes, sup);
+            (route.inbox.clone(), route.archive.clone())
+        }
+        None => (
+            bus.join(sup).join("inbox"),
+            bus.join(sup).join("archive"),
+        ),
+    };
+    // The requester is eval-owned, not an admitted Agent Spec, and deliberately keeps one explicit
+    // flat mailbox. Every canonical agent route above comes from the frozen admitted vector.
     let req_inbox = bus.join(requester).join("inbox");
     let deadline = Instant::now() + timeout;
     loop {
         if EVAL_INTERRUPTED.load(Ordering::SeqCst) {
             return false;
         }
-        // Earliest worker→sup report (a message from a worker seat). Scan the sup's inbox AND archive:
+        // Earliest worker→sup report (a message from a worker agent). Scan inbox AND archive:
         // DING-BUS mandates "archive a message the moment you act on it", so a well-behaved sup MOVES the
         // report inbox→archive the instant it acts. Scanning inbox-only makes the done-signal a race
         // against the sup's archiving — a fully-closed loop hangs to max-timeout because the report left
@@ -347,6 +543,22 @@ fn wait_done(
         // a passive eval-runner seed that never archives.)
         let sup_msgs = crate::message::list_dir(&sup_inbox).unwrap_or_default();
         let sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
+        if workers.is_empty()
+            && let Some(kickoff_ts) = kickoff_ts
+            && let Some(before) = requester_before_kickoff
+        {
+            let confirmed = crate::message::list_dir(&req_inbox)
+                .unwrap_or_default()
+                .iter()
+                .any(|m| {
+                    !before.contains(&m.filename)
+                        && from_is(m.from.as_deref(), sup)
+                        && m.ts_ms >= kickoff_ts
+                });
+            if confirmed {
+                return true;
+            }
+        }
         let report_ts = sup_msgs
             .iter()
             .chain(sup_archived.iter())
@@ -366,20 +578,20 @@ fn wait_done(
         if Instant::now() > deadline {
             return false;
         }
-        // A per-tick hook: under `supervise`, this respawns any dead team seat FROM SPEC (full env) so a
-        // fault-injected restart/crash recovers mid-run. A no-op for a boot-once (unsupervised) eval.
+        // A per-tick hook: under `supervise`, this respawns any dead team task FROM SPEC (full env) so
+        // a fault-injected restart/crash recovers mid-run. A no-op for boot-once (unsupervised).
         on_tick();
         std::thread::sleep(Duration::from_millis(300));
     }
 }
 
-/// Fail-fast boot gate: a seat whose command exits immediately (127 harness-not-on-PATH, or a crash at
+/// Fail-fast boot gate: a task whose command exits immediately (127 harness-not-on-PATH, or a crash at
 /// startup) must fail the eval LOUDLY now, not leave it hanging until `max-timeout` waiting for a
-/// confirmation that can never come. Poll briefly for all seats to be live — a real seat is up within
+/// confirmation that can never come. Poll briefly for all tasks to be live — a real task is up within
 /// ~1s; a dead-at-boot one never is (tolerant of a slow start + a transient pty-list flicker).
-fn boot_gate(agents: &[SpecAgent], specs: &[AgentSpec], host: &str, catalog: &Path) -> Result<()> {
+fn boot_gate(task_ids: &[String], specs: &[AgentSpec], host: &str, catalog: &Path) -> Result<()> {
     let runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
-    let want: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+    let want: Vec<&str> = task_ids.iter().map(String::as_str).collect();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let sessions = runner.list_sessions().unwrap_or_default();
@@ -389,9 +601,9 @@ fn boot_gate(agents: &[SpecAgent], specs: &[AgentSpec], host: &str, catalog: &Pa
             return Ok(());
         }
         if Instant::now() > deadline {
-            teardown_team(specs, host, catalog, false); // boot failure → no runtime seats yet
+            teardown_team(specs, host, catalog, false); // boot failure → no runtime tasks yet
             anyhow::bail!(
-                "seat(s) {dead:?} exited at boot — the command didn't stay running (harness not on PATH, \
+                "task(s) {dead:?} exited at boot — the command didn't stay running (harness not on PATH, \
                  e.g. claude/codex not installed, or a crash at startup). Failing fast instead of hanging \
                  until the eval's max-timeout."
             );
@@ -400,15 +612,53 @@ fn boot_gate(agents: &[SpecAgent], specs: &[AgentSpec], host: &str, catalog: &Pa
     }
 }
 
+fn require_canonical_boot(report: &UpReport, task_ids: &[String]) -> Result<()> {
+    let missing = task_ids
+        .iter()
+        .filter(|id| !report.launched.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if report.skipped
+        || !report.errors.is_empty()
+        || !report.flapping.is_empty()
+        || !report.held.is_empty()
+        || !report.unrunnable.is_empty()
+        || !missing.is_empty()
+    {
+        anyhow::bail!(
+            "canonical Agent Spec boot did not launch every admitted task: missing={missing:?}; \
+             skipped={}; held={:?}; unrunnable={:?}; flapping={:?}; errors={:?}",
+            report.skipped,
+            report.held,
+            report.unrunnable,
+            report.flapping,
+            report.errors
+        );
+    }
+    Ok(())
+}
+
+fn message_timestamp(filename: &str) -> Result<u64> {
+    filename
+        .split_once('-')
+        .and_then(|(timestamp, _)| timestamp.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("message receipt `{filename}` has no timestamp"))
+}
+
 /// Tear down the team (nomad-safe): mark the specs retired and reconcile → the runner kills the live
-/// sessions (process-group kill). Best-effort — an eval always tears down, no zombie seats.
+/// sessions (process-group kill). Best-effort — an eval always tears down, with no zombie tasks.
 ///
 /// `reap_all` (set under `supervise`): after the declared teardown, ALSO reap every remaining session
-/// in the eval's hermetic PTY_ROOT — the RUNTIME-spawned seats that are NOT in the spec (e.g. a
-/// team-standup specialist the CoS spun up mid-run). `teardown_team` alone only reaps DECLARED seats, so
-/// a runtime seat would leak as an orphan; since the PTY_ROOT is hermetic to this eval, anything still
+/// in the eval's hermetic PTY_ROOT — runtime-spawned tasks that are NOT in the spec (e.g. a
+/// team-standup specialist the CoS spun up mid-run). Declared teardown only reaps declared tasks, so
+/// a runtime task would leak as an orphan; since the PTY_ROOT is hermetic to this eval, anything still
 /// alive is ours to clean. Killing an already-dead declared session is a harmless no-op.
-fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
+fn teardown_team_with_runner(
+    specs: &[AgentSpec],
+    host: &str,
+    runner: &dyn Runner,
+    reap_all: bool,
+) {
     let retired: Vec<AgentSpec> = specs
         .iter()
         .cloned()
@@ -417,12 +667,11 @@ fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
             s
         })
         .collect();
-    let runner = SystemRunner::new(root.to_path_buf(), root.join("exec"));
     if let Ok(sessions) = runner.list_sessions() {
         let plan = reconcile(&retired, &sessions, host);
         let mut report = UpReport::default();
         let mut cap = FlappingCap::default();
-        execute(&plan, &runner, &mut cap, &mut report);
+        execute(&plan, runner, &mut cap, &mut report);
     }
     if reap_all
         && let Ok(remaining) = runner.list_sessions()
@@ -432,6 +681,11 @@ fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
             let _ = runner.remove(&s.pty_id);
         }
     }
+}
+
+fn teardown_team(specs: &[AgentSpec], host: &str, root: &Path, reap_all: bool) {
+    let runner = SystemRunner::new(root.to_path_buf(), root.join("exec"));
+    teardown_team_with_runner(specs, host, &runner, reap_all);
 }
 
 /// `st2 eval <folder>` — run the eval end to end: mint a hermetic temp catalog, copy the fixture
@@ -629,27 +883,27 @@ fn run_steps(
     (results, judge_env)
 }
 
-/// Snapshot each agent's terminal output to `<catalog>/logs/<id>.log` (plain-text full scrollback via
+/// Snapshot each PTY task's terminal output to `<catalog>/logs/<id>.log` (plain-text full scrollback via
 /// `pty peek`), so judges can review/assert an agent's output by log. Best-effort: `pty` has no
 /// continuous plain-text log, so this is the scrollback captured at judge time — enough to inspect a
 /// wedged/finished agent's history. A truly continuous agent log would need a `pty` feature.
-fn dump_agent_logs(agents: &[SpecAgent], catalog: &Path) {
-    if agents.is_empty() {
+fn dump_agent_logs(pty_task_ids: &[String], catalog: &Path) {
+    if pty_task_ids.is_empty() {
         return;
     }
     let logs_dir = catalog.join("logs");
     let _ = std::fs::create_dir_all(&logs_dir);
     let pty_root = crate::run::effective_pty_root(catalog);
-    for a in agents {
+    for task_id in pty_task_ids {
         let out = std::process::Command::new("pty")
-            .args(["peek", "--full", "--plain", &a.id])
+            .args(["peek", "--full", "--plain", task_id])
             .env("PTY_ROOT", &pty_root)
             .output();
         if let Ok(o) = out
             && o.status.success()
             && !o.stdout.is_empty()
         {
-            let _ = std::fs::write(logs_dir.join(format!("{}.log", a.id)), &o.stdout);
+            let _ = std::fs::write(logs_dir.join(format!("{task_id}.log")), &o.stdout);
         }
     }
 }
@@ -659,41 +913,54 @@ fn env_key(id: &str) -> String {
     id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
 }
 
-/// The supervisor chain of `seat_id`, walked transitively via each agent's `supervisor` field to the
+/// The supervisor chain of `agent_id`, walked transitively via each agent's `supervisor` field to the
 /// root (whose supervisor is `None` — the cos). Returns the ancestor ids, nearest first. A cycle or a
 /// supervisor that names no declared agent terminates the walk (the named id is still included — we ding
-/// its inbox regardless of whether it is a booted seat).
-fn supervisor_chain(seat_id: &str, specs: &[AgentSpec]) -> Vec<String> {
+/// its inbox regardless of whether it has a running task).
+fn supervisor_chain(agent_id: &str, specs: &[AgentSpec], host: &str) -> Vec<String> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut current = specs.iter().find(|s| s.identity == seat_id).and_then(|s| s.supervisor.clone());
+    let find = |identity: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.identity == identity || spec.bus_id(host) == identity)
+    };
+    let mut current = find(agent_id).and_then(|s| s.supervisor.clone());
     while let Some(sup) = current {
         if !seen.insert(sup.clone()) {
             break; // cycle guard
         }
         chain.push(sup.clone());
-        current = specs.iter().find(|s| s.identity == sup).and_then(|s| s.supervisor.clone());
+        current = find(&sup).and_then(|s| s.supervisor.clone());
     }
     chain
 }
 
-/// Emit a crash-ding for a crashed seat: a `worker crash: <id>` bus message to EVERY ancestor in its
-/// supervisor chain (the direct supervisor up to the cos root) — so the whole supervision chain learns
-/// the worker died without polling. A seat with no supervisor has nothing to notify.
-fn crash_ding(seat_id: &str, specs: &[AgentSpec], bus: &Path) {
-    let chain = supervisor_chain(seat_id, specs);
+/// Emit a crash-ding for a crashed task to every ancestor in its owning agent's supervisor chain.
+fn crash_ding(
+    agent_id: &str,
+    task_id: &str,
+    specs: &[AgentSpec],
+    bus: &Path,
+    host: &str,
+    canonical_routes: Option<&BTreeMap<String, CanonicalRoute>>,
+) {
+    let chain = supervisor_chain(agent_id, specs, host);
     if chain.is_empty() {
         return;
     }
-    let subject = format!("worker crash: {seat_id}");
+    let subject = format!("worker crash: {task_id}");
     let body = format!(
-        "Worker '{seat_id}' crashed — its pty session died non-cleanly (non-zero exit / killed / vanished). \
+        "Agent task '{task_id}' crashed — its session died non-cleanly (non-zero exit / killed / vanished). \
          st2 respawned it from spec; surfacing the crash up the supervision chain."
     );
     for ancestor in &chain {
-        let inbox = bus.join(ancestor).join("inbox");
+        let inbox = match canonical_routes {
+            Some(routes) => admitted_route(routes, ancestor).inbox.clone(),
+            None => bus.join(ancestor).join("inbox"),
+        };
         let _ = crate::message::send_to_inbox(&inbox, "st2", Some(&subject), None, &[], &body);
-        eval_log!("== crash-ding: {seat_id} → {ancestor} ==");
+        eval_log!("== crash-ding: {task_id} → {ancestor} ==");
     }
 }
 
@@ -712,50 +979,144 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
     // the verdict); `run_env` ($RUNS_DIR + each $RUN_<id>_EXIT) is handed to the judges to read captures.
     let (mut judges, run_env) = run_steps(&eval.run_steps, catalog, &spec.env);
 
-    // The base team + eval-only agents. An eval with NONE is TEAM-LESS: the jobs are the work.
-    let mut agents = spec.agents.clone();
-    agents.extend(eval.agents.clone());
+    // The base team + eval-only compact agents. `canonical-agents` is a mutually exclusive authority:
+    // it discovers the post-run hermetic catalog rather than projecting this compact grammar.
+    let mut compact_agents = spec.agents.clone();
+    compact_agents.extend(eval.agents.clone());
 
-    let (done, specs) = if agents.is_empty() {
+    let (done, specs, pty_task_ids) = if compact_agents.is_empty() && !eval.canonical_agents {
         // TEAM-LESS: nothing to boot, kick off, or wait on — the run steps did the work → straight to judging.
         if !eval.run_steps.is_empty() {
             eval_log!("== team-less eval: {} run step(s) ran → judging ==", eval.run_steps.len());
         }
-        (true, Vec::new())
+        (true, Vec::new(), Vec::new())
     } else {
-        let mut specs = spec_to_agent_specs(&agents, host, catalog);
-        if eval.supervise {
+        let (mut specs, runtime_tasks, participant_ids, canonical_routes) = if eval.canonical_agents {
+            if bus != catalog {
+                anyhow::bail!(
+                    "canonical-agents requires the native flat ST_ROOT `{}`, got `{}`",
+                    catalog.display(),
+                    bus.display()
+                );
+            }
+            let team = load_canonical_eval_team(catalog, host)?;
+            let participants = team
+                .specs
+                .iter()
+                .map(|spec| spec.bus_id(host))
+                .collect::<Vec<_>>();
+            (
+                team.specs,
+                team.runtime_tasks,
+                participants,
+                Some(team.routes),
+            )
+        } else {
+            let specs = spec_to_agent_specs(&compact_agents, host, catalog);
+            let runtime_tasks = compact_agents
+                .iter()
+                .map(|agent| EvalRuntimeTask {
+                    agent_id: agent.id.clone(),
+                    runtime_id: agent.id.clone(),
+                    is_pty: true,
+                })
+                .collect::<Vec<_>>();
+            let participants = compact_agents
+                .iter()
+                .map(|agent| agent.id.clone())
+                .collect::<Vec<_>>();
+            (specs, runtime_tasks, participants, None)
+        };
+        let task_ids = runtime_tasks
+            .iter()
+            .map(|task| task.runtime_id.clone())
+            .collect::<Vec<_>>();
+        let pty_task_ids = runtime_tasks
+            .iter()
+            .filter(|task| task.is_pty)
+            .map(|task| task.runtime_id.clone())
+            .collect::<Vec<_>>();
+        if eval.supervise && !eval.canonical_agents {
             add_eval_exit_markers(&mut specs, catalog);
         }
-        // Pre-trust each agent's workspace so a real claude seat never hangs on the trust dialog.
-        let dirs: Vec<PathBuf> =
-            agents.iter().filter_map(|a| a.workspace.as_deref()).map(|w| catalog.join(w)).collect();
-        if !dirs.is_empty() {
-            let _ = crate::pretrust::pretrust(&dirs);
+        if !eval.canonical_agents {
+            // Compact legacy agents intentionally retain their historical ambient trust behavior.
+            // Canonical managed Agent Specs own trust inside their declared adapter trajectory.
+            let dirs: Vec<PathBuf> = compact_agents
+                .iter()
+                .filter_map(|a| a.workspace.as_deref())
+                .map(|w| catalog.join(w))
+                .collect();
+            if !dirs.is_empty() {
+                let _ = crate::pretrust::pretrust(&dirs);
+            }
         }
+        let canonical_sup = if eval.canonical_agents {
+            let msg = eval.message.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a canonical-agents eval needs a message{{}} kickoff before any agent can launch"
+                )
+            })?;
+            let matches = specs
+                .iter()
+                .filter(|agent| agent.identity == msg.to || agent.bus_id(host) == msg.to)
+                .map(|agent| agent.bus_id(host))
+                .collect::<Vec<_>>();
+            let [target] = matches.as_slice() else {
+                anyhow::bail!(
+                    "canonical-agents kickoff target `{}` must resolve to exactly one Agent Spec, found {}",
+                    msg.to,
+                    matches.len()
+                );
+            };
+            Some(target.clone())
+        } else {
+            None
+        };
 
         eval_log!("== boot team ({} agents) ==", specs.len());
-        boot_team(&specs, host, catalog)?;
-        boot_gate(&agents, &specs, host, catalog)?;
+        let boot = boot_team(&specs, host, catalog)?;
+        if eval.canonical_agents {
+            require_canonical_boot(&boot, &task_ids)?;
+        }
+        boot_gate(&task_ids, &specs, host, catalog)?;
 
-        // Deliver the kickoff onto the bus the seats' dings watch (ST_ROOT), from the requester.
+        // Deliver the kickoff onto the bus the agents' DING tasks watch (ST_ROOT), from the requester.
         let msg = eval.message.as_ref().ok_or_else(|| {
             anyhow::anyhow!("a team eval needs a message{{}} kickoff (only a team-less eval may omit it)")
         })?;
         let body = resolve_content(&msg.content, spec_dir)?;
-        let to_inbox = bus.join(&msg.to).join("inbox");
-        crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
+        let sup = canonical_sup.unwrap_or_else(|| msg.to.clone());
+        let to_inbox = match canonical_routes.as_ref() {
+            Some(routes) => admitted_route(routes, &sup).inbox.clone(),
+            None => bus.join(&sup).join("inbox"),
+        };
+        let requester_before_kickoff = eval.canonical_agents.then(|| {
+            crate::message::list_dir(&bus.join(&msg.from).join("inbox"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|message| message.filename)
+                .collect::<HashSet<_>>()
+        });
+        let kickoff_receipt =
+            crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
             .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
-        eval_log!("== kickoff → {} (from {}) ==", msg.to, msg.from);
+        let kickoff_ts = eval
+            .canonical_agents
+            .then(|| message_timestamp(&kickoff_receipt))
+            .transpose()?;
+        eval_log!("== kickoff → {sup} (from {}) ==", msg.from);
 
-        let sup = msg.to.clone();
-        let workers: Vec<String> = spec.agents.iter().map(|a| a.id.clone()).filter(|id| *id != sup).collect();
+        let workers: Vec<String> = participant_ids
+            .into_iter()
+            .filter(|id| *id != sup)
+            .collect();
         eval_log!(
             "== waiting for {sup}→{} confirmation post-dating a worker report (≤{:?}) ==",
             msg.from, eval.max_timeout
         );
 
-        // `supervise`: each wait tick, respawn any dead seat FROM SPEC (full env → rejoins cold). Carry a
+        // `supervise`: each wait tick, respawn any dead task FROM SPEC (full env → rejoins cold). Carry a
         // FlappingCap + LivenessDebounce ACROSS ticks so a fault-injected kill is respawned exactly ONCE
         // (cap rate-limits; debounce absorbs a transient `pty list` misread). Scoped so the tick's borrow
         // of `specs` ends before we hand `specs` to teardown.
@@ -763,17 +1124,17 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             let supervise_runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
             let mut sup_cap = crate::flapping::FlappingCap::default();
             let mut sup_debounce = crate::run::LivenessDebounce::new(Duration::from_secs(2));
-            // Crash-ding state: the boot gate immediately above proved every declared seat alive, so
+            // Crash-ding state: the boot gate immediately above proved every declared task alive, so
             // carry that proof into supervision. PTY may self-reap a fast exit before the first
-            // post-kickoff list snapshot; starting empty would then misclassify the proven-live seat
+            // post-kickoff list snapshot; starting empty would then misclassify the proven-live task
             // as never booted and suppress its crash ding. `dinged` dedups so one crash = one ding
-            // until the seat is alive again.
+            // until the task is alive again.
             let mut ever_alive: std::collections::HashSet<String> =
-                specs.iter().map(|seat| seat.identity.clone()).collect();
+                task_ids.iter().cloned().collect();
             let mut dinged: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut tick = || {
                 if eval.supervise {
-                    // Detect crashes BEFORE respawn (reconcile reaps the dead session): a declared seat
+                    // Detect crashes BEFORE respawn (reconcile reaps the dead session): a declared task
                     // that was alive and is now dead non-cleanly (non-zero/killed/vanished) → crash-ding
                     // its supervisor chain. A clean exit (code 0) stays SILENT (a false ding on a routine
                     // finish is as bad as a missed crash).
@@ -783,8 +1144,8 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                                 &str,
                                 &crate::reconcile::Session,
                             > = sessions.iter().map(|s| (s.pty_id.as_str(), s)).collect();
-                            for seat in &specs {
-                                let id = seat.identity.as_str(); // the seat's main pty session id == its identity
+                            for task in &runtime_tasks {
+                                let id = task.runtime_id.as_str();
                                 match by_id.get(id) {
                                     Some(s) if s.alive => {
                                         ever_alive.insert(id.to_string());
@@ -798,7 +1159,14 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                                             && !clean
                                             && !dinged.contains(id)
                                         {
-                                            crash_ding(&seat.identity, &specs, &bus);
+                                            crash_ding(
+                                                &task.agent_id,
+                                                id,
+                                                &specs,
+                                                &bus,
+                                                host,
+                                                canonical_routes.as_ref(),
+                                            );
                                             dinged.insert(id.to_string());
                                         }
                                     }
@@ -831,7 +1199,17 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                     }
                 }
             };
-            wait_done(&bus, &sup, &msg.from, &workers, eval.max_timeout, &mut tick)
+            wait_done(
+                &bus,
+                canonical_routes.as_ref(),
+                &sup,
+                &msg.from,
+                &workers,
+                kickoff_ts,
+                requester_before_kickoff.as_ref(),
+                eval.max_timeout,
+                &mut tick,
+            )
         };
 
         if EVAL_INTERRUPTED.load(Ordering::SeqCst) {
@@ -843,18 +1221,31 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
         } else {
             eval_log!("== max-timeout: no confirmation within {:?} — judging the final state ==", eval.max_timeout);
         }
-        (done, specs)
+        (done, specs, pty_task_ids)
     };
+
+    if eval.canonical_agents {
+        judges.push(JudgeResult {
+            name: "canonical team completion".to_string(),
+            passed: done,
+            detail: if done {
+                "post-kickoff completion received".to_string()
+            } else {
+                "no post-kickoff completion before max-timeout".to_string()
+            },
+            signal: false,
+        });
+    }
 
     // Snapshot each agent's terminal output to logs/<id>.log so judges can review/assert an agent's
     // output by log (alongside the run-step + exec sidecar logs already there). Done BEFORE teardown so
     // the sessions are still peekable.
-    dump_agent_logs(&agents, catalog);
+    dump_agent_logs(&pty_task_ids, catalog);
 
     // Judges: the run-step gate results first, then the declared judges (all must pass). Judge BEFORE
     // teardown — an ask-agent judge needs its judge agent still alive to answer.
     judges.extend(run_judges(&eval.judges, spec_dir, catalog, &bus, &requester, &run_env));
-    // Under `supervise`, reap runtime-spawned seats too (team-standup) — not just the declared team.
+    // Under `supervise`, reap runtime-spawned tasks too (team-standup), not just the declared team.
     teardown_team(&specs, host, catalog, eval.supervise);
     Ok(EvalReport { done, judges, timeout: eval.max_timeout })
 }
@@ -1046,6 +1437,276 @@ mod tests {
     use crate::reconcile::{Session, TaskTarget};
     use std::cell::RefCell;
 
+    fn write_eval_agent(catalog: &Path, relative: &str, body: &str) {
+        let path = catalog.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn canonical_eval_team_uses_exact_catalog_declarations_and_runtime_ids() {
+        let catalog = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(catalog.path().join("sup")).unwrap();
+        std::fs::create_dir_all(catalog.path().join("worker")).unwrap();
+        write_eval_agent(
+            catalog.path(),
+            "agents/evalhost/sup/agent.kdl",
+            r#"agent "sup" {
+  identity "sup"
+  host "evalhost"
+  workspace "$CATALOG/sup"
+  argv "sh" "-c" "sleep 60"
+}
+"#,
+        );
+        write_eval_agent(
+            catalog.path(),
+            "agents/evalhost/worker/agent.kdl",
+            r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  workspace "$CATALOG/worker"
+  argv "sh" "-c" "sleep 60"
+}
+"#,
+        );
+
+        let team = load_canonical_eval_team(catalog.path(), "evalhost").unwrap();
+        assert_eq!(team.specs.len(), 2);
+        assert_eq!(
+            team.runtime_tasks
+                .iter()
+                .map(|task| task.runtime_id.as_str())
+                .collect::<Vec<_>>(),
+            ["evalhost.sup", "evalhost.worker"]
+        );
+        assert!(team.specs.iter().all(|spec| spec.path.ends_with("agent.kdl")));
+    }
+
+    #[test]
+    fn canonical_eval_team_projects_local_path_independent_agents_and_tears_down_every_task() {
+        let catalog = tempfile::tempdir().unwrap();
+        write_eval_agent(
+            catalog.path(),
+            "organization/.managed/arbitrary/declaration/agent.kdl",
+            r#"agent "local" {
+  identity "local"
+  host "evalhost"
+  pty "work" { id "local-work"; command "sleep 60" }
+  exec "watch" { id "local-watch"; command "sleep 60" }
+}"#,
+        );
+        write_eval_agent(
+            catalog.path(),
+            "fleet/remote/declaration/agent.kdl",
+            r#"agent "remote" {
+  identity "remote"
+  host "other"
+  pty "remote-work" { id "remote-work"; command "sleep 60" }
+}"#,
+        );
+
+        let team = load_canonical_eval_team(catalog.path(), "evalhost").unwrap();
+        assert_eq!(
+            team.specs
+                .iter()
+                .map(|spec| spec.bus_id("evalhost"))
+                .collect::<Vec<_>>(),
+            ["evalhost.local"]
+        );
+        assert_eq!(
+            team.runtime_tasks,
+            [
+                EvalRuntimeTask {
+                    agent_id: "evalhost.local".into(),
+                    runtime_id: "local-watch".into(),
+                    is_pty: false,
+                },
+                EvalRuntimeTask {
+                    agent_id: "evalhost.local".into(),
+                    runtime_id: "local-work".into(),
+                    is_pty: true,
+                },
+            ]
+        );
+        assert_eq!(
+            admitted_route(&team.routes, "evalhost.local").inbox,
+            catalog
+                .path()
+                .join("organization/.managed/arbitrary/declaration/resources/inbox")
+        );
+
+        struct RecordingRunner {
+            sessions: Vec<Session>,
+            killed: RefCell<Vec<String>>,
+        }
+        impl Runner for RecordingRunner {
+            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+                Ok(self.sessions.clone())
+            }
+            fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> {
+                unreachable!("teardown must not spawn")
+            }
+            fn kill(&self, id: &str) -> anyhow::Result<()> {
+                self.killed.borrow_mut().push(id.to_string());
+                Ok(())
+            }
+            fn remove(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let runner = RecordingRunner {
+            sessions: ["local-work", "local-watch", "remote-work"]
+                .into_iter()
+                .map(|id| Session {
+                    pty_id: id.into(),
+                    alive: true,
+                    exit_code: None,
+                })
+                .collect(),
+            killed: RefCell::new(Vec::new()),
+        };
+        teardown_team_with_runner(&team.specs, "evalhost", &runner, false);
+        let mut killed = runner.killed.into_inner();
+        killed.sort();
+        assert_eq!(killed, ["local-watch", "local-work"]);
+    }
+
+    #[test]
+    fn canonical_eval_team_fails_closed_before_launch_on_zero_or_duplicate_specs() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            load_canonical_eval_team(empty.path(), "evalhost")
+                .unwrap_err()
+                .to_string()
+                .contains("no local canonical Agent Specs")
+        );
+
+        let duplicate = tempfile::tempdir().unwrap();
+        write_eval_agent(
+            duplicate.path(),
+            "agents/evalhost/worker/agent.kdl",
+            r#"
+agent "worker" { identity "worker"; host "evalhost"; argv "true" }
+agent "worker" { identity "worker"; host "evalhost"; argv "true" }
+"#,
+        );
+        let error = load_canonical_eval_team(duplicate.path(), "evalhost")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn canonical_eval_team_applies_strict_validation_and_task_invariants() {
+        let cases = [
+            (
+                "unknown-type",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  type "srvice"
+  argv "true"
+}"#,
+                )],
+            ),
+            (
+                "unknown-task-kind",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  argv "true"
+  pty { command "true" }
+}"#,
+                )],
+            ),
+            (
+                "dangling-supervisor",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  supervisor "missing"
+  argv "true"
+}"#,
+                )],
+            ),
+            (
+                "bad-path",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  workspace "$CATALOG/missing"
+  argv "true"
+}"#,
+                )],
+            ),
+            (
+                "duplicate runtime task id",
+                vec![
+                    (
+                        "agents/evalhost/one/agent.kdl",
+                        r#"agent "one" {
+  identity "one"
+  host "evalhost"
+  pty "agent" { id "shared"; command "sleep 60" }
+}"#,
+                    ),
+                    (
+                        "agents/evalhost/two/agent.kdl",
+                        r#"agent "two" {
+  identity "two"
+  host "evalhost"
+  pty "agent" { id "two-main"; command "sleep 60" }
+  exec "poison" { id "shared"; command "true" }
+}"#,
+                    ),
+                ],
+            ),
+        ];
+        for (expected, specs) in cases {
+            let catalog = tempfile::tempdir().unwrap();
+            for (path, body) in specs {
+                write_eval_agent(catalog.path(), path, body);
+            }
+            let error = load_canonical_eval_team(catalog.path(), "evalhost")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` refusal, got: {error}"
+            );
+        }
+
+        let warning = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(warning.path().join("workspace")).unwrap();
+        write_eval_agent(
+            warning.path(),
+            "agents/evalhost/worker/agent.kdl",
+            r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  workspace "$CATALOG/workspace"
+  argv "true"
+  render { git-exclude ".st2/" }
+}"#,
+        );
+        let error = load_canonical_eval_team(warning.path(), "evalhost")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("materialization") && error.contains("git-exclude"),
+            "materialization warning was not a pre-spawn failure: {error}"
+        );
+    }
+
     struct RaceRunner { lists: RefCell<Vec<Vec<Session>>>, ops: RefCell<Vec<String>> }
     impl Runner for RaceRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { Ok(self.lists.borrow_mut().remove(0)) }
@@ -1204,15 +1865,45 @@ mod tests {
         let workers = vec!["mix.worker".to_string()];
         let noop = &mut (|| {}) as &mut dyn FnMut();
         // No worker report → never fires (bounded timeout).
-        assert!(!wait_done(root, sup, req, &workers, Duration::from_millis(100), noop));
+        assert!(!wait_done(
+            root,
+            None,
+            sup,
+            req,
+            &workers,
+            None,
+            None,
+            Duration::from_millis(100),
+            noop,
+        ));
         // A worker→sup report at t=2000 + a sup→requester confirm that PRE-dates it (t=1000) → false
         // (the early "on it" ack the discriminator exists to reject).
         seed_msg(&root.join(sup).join("inbox"), 1_700_000_002_000, "aaaaaa", "mix.worker");
         seed_msg(&root.join(req).join("inbox"), 1_700_000_001_000, "bbbbbb", "mix.sup");
-        assert!(!wait_done(root, sup, req, &workers, Duration::from_millis(100), noop));
+        assert!(!wait_done(
+            root,
+            None,
+            sup,
+            req,
+            &workers,
+            None,
+            None,
+            Duration::from_millis(100),
+            noop,
+        ));
         // A confirm that POST-dates the report (t=3000) → done.
         seed_msg(&root.join(req).join("inbox"), 1_700_000_003_000, "cccccc", "mix.sup");
-        assert!(wait_done(root, sup, req, &workers, Duration::from_millis(2000), noop));
+        assert!(wait_done(
+            root,
+            None,
+            sup,
+            req,
+            &workers,
+            None,
+            None,
+            Duration::from_millis(2000),
+            noop,
+        ));
     }
 
     #[test]
@@ -1230,7 +1921,17 @@ mod tests {
         seed_msg(&root.join(sup).join("archive"), 1_700_000_002_000, "aaaaaa", "mix.worker");
         seed_msg(&root.join(req).join("inbox"), 1_700_000_003_000, "cccccc", "mix.sup");
         assert!(
-            wait_done(root, sup, req, &workers, Duration::from_millis(2000), noop),
+            wait_done(
+                root,
+                None,
+                sup,
+                req,
+                &workers,
+                None,
+                None,
+                Duration::from_millis(2000),
+                noop,
+            ),
             "an archived worker report must still be seen (else archive-on-act hygiene hangs the eval)"
         );
     }
@@ -1243,9 +1944,106 @@ mod tests {
         let bus = tempfile::tempdir().unwrap();
         let ticks = std::cell::Cell::new(0u32);
         let mut tick = || ticks.set(ticks.get() + 1);
-        let fired = wait_done(bus.path(), "sup", "req", &["w".to_string()], Duration::from_millis(400), &mut tick);
+        let fired = wait_done(
+            bus.path(),
+            None,
+            "sup",
+            "req",
+            &["w".to_string()],
+            None,
+            None,
+            Duration::from_millis(400),
+            &mut tick,
+        );
         assert!(!fired, "no confirmation was seeded → must time out");
         assert!(ticks.get() >= 1, "the supervise tick must run during the wait");
+    }
+
+    #[test]
+    fn canonical_singleton_done_is_new_after_kickoff_and_allows_the_same_millisecond() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/h/interviewer");
+        let routes = BTreeMap::from([(
+            "h.interviewer".to_string(),
+            CanonicalRoute {
+                inbox: crate::message::inbox_dir(&agent_dir),
+                archive: crate::message::archive_dir(&agent_dir),
+            },
+        )]);
+        let requester = root.path().join("requester/inbox");
+        let kickoff_ts = 1_700_000_002_000;
+        // An already-present message may even claim a FUTURE timestamp. Causality comes from the
+        // pre-kickoff filename snapshot, not wall-clock trust.
+        seed_msg(&requester, kickoff_ts + 1_000, "aaaaaa", "h.interviewer");
+        let before = crate::message::list_dir(&requester)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.filename)
+            .collect::<HashSet<_>>();
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        assert!(
+            !wait_done(
+                root.path(),
+                Some(&routes),
+                "h.interviewer",
+                "requester",
+                &[],
+                Some(kickoff_ts),
+                Some(&before),
+                Duration::from_millis(100),
+                noop,
+            ),
+            "a future-dated pre-kickoff acknowledgement must not complete a singleton"
+        );
+        // Filename novelty establishes after-kickoff causality; `>=` keeps a valid same-ms reply.
+        seed_msg(&requester, kickoff_ts, "bbbbbb", "h.interviewer");
+        assert!(
+            wait_done(
+                root.path(),
+                Some(&routes),
+                "h.interviewer",
+                "requester",
+                &[],
+                Some(kickoff_ts),
+                Some(&before),
+                Duration::from_secs(1),
+                noop,
+            ),
+            "a newly appearing same-ms singleton confirmation should complete promptly"
+        );
+    }
+
+    #[test]
+    fn canonical_boot_report_requires_every_admitted_task_and_propagates_backend_errors() {
+        let ids = vec!["task-a".to_string(), "task-b".to_string()];
+        let clean = UpReport {
+            launched: ids.clone(),
+            ..UpReport::default()
+        };
+        require_canonical_boot(&clean, &ids).unwrap();
+
+        let missing = UpReport {
+            launched: vec!["task-a".to_string()],
+            ..UpReport::default()
+        };
+        assert!(
+            require_canonical_boot(&missing, &ids)
+                .unwrap_err()
+                .to_string()
+                .contains("task-b")
+        );
+
+        let backend_error = UpReport {
+            launched: ids.clone(),
+            errors: vec!["spawn task-b: backend refused".to_string()],
+            ..UpReport::default()
+        };
+        assert!(
+            require_canonical_boot(&backend_error, &ids)
+                .unwrap_err()
+                .to_string()
+                .contains("backend refused")
+        );
     }
 
     #[test]

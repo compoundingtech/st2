@@ -75,7 +75,9 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     let kdl = fs::read_to_string(&declaration).unwrap();
     assert!(kdl.starts_with("// Experimental output from `st2 compile-agent`."));
     assert!(kdl.contains("supervisor \"lead\""));
-    assert!(kdl.contains("'--verbose'"));
+    assert!(kdl.contains("\"--verbose\""));
+    assert!(kdl.contains("argv \"claude\""));
+    assert!(!kdl.contains("command #\"exec claude"));
     assert!(kdl.contains("set status busy"));
     assert!(!kdl.contains("ST_SUPERVISOR"));
     assert!(!workspace.join(".st2/PERSONA.md").exists());
@@ -90,6 +92,16 @@ fn compile_agent_generates_claude_then_materializes_verbatim_persona() {
     assert_eq!(spec.host.as_deref(), Some("h"));
     assert_eq!(spec.role.as_deref(), Some("supervisor"));
     assert_eq!(spec.supervisor.as_deref(), Some("lead"));
+    assert_eq!(
+        spec.tasks
+            .iter()
+            .find(|task| task.name == "agent")
+            .unwrap()
+            .argv
+            .as_ref()
+            .unwrap()[0],
+        "claude"
+    );
 
     let validate = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("validate")
@@ -237,7 +249,8 @@ fn compile_agent_generates_codex_then_materializes_composed_agents_md() {
     );
 
     let kdl = fs::read_to_string(catalog.join("agents/h/worker/agent.kdl")).unwrap();
-    assert!(kdl.contains("exec codex"));
+    assert!(kdl.contains("argv \"codex\""));
+    assert!(!kdl.contains("exec codex"));
     assert!(kdl.contains("set status busy"));
     assert!(kdl.contains("--dangerously-bypass-hook-trust"));
     assert!(kdl.contains("json-upsert \".codex/hooks.json\""));

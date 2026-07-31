@@ -29,24 +29,49 @@ notice, yields exactly one state:
 ## Delivery
 
 ```text
-peek ─► classify ─┬─ ExactSafe ────► final observation ─► Return ─► Delivered
-                  ├─ ExactBlocked ─────────────────────────────────► Staged
-                  ├─ Changed / Ambiguous ──────────────────────────► Deferred
-                  └─ EmptySafe ─► paste ─► observe until deadline ─┬► Delivered
-                                                                   ├► Staged
-                                                                   └► Deferred
+record ownership ─► combined transport (paste ─► 0.5s ─► Return) ─► receipt
+                         │ command failure or ambiguity                 │
+                         └──────────────────────────────────────────────► Staged
+
+receipt ─┬─ Accepted ──────────────────────────────────────────────► Delivered
+         └─ RetainedSafe / RetainedBlocked / Unproven ────────────► Staged
+
+staged retry ─► receipt ─┬─ Accepted ──────────────────────────────► Delivered
+                         ├─ RetainedSafe ─► final receipt ─┬─ Accepted ─► Delivered
+                         │                                 ├─ RetainedSafe ─► Return ─► receipt
+                         │                                 └─ other ────────► Staged
+                         └─ RetainedBlocked / Unproven ─────────────► Staged
 ```
 
-Delivery is two-phase: a bracketed paste that carries no Return, then a separate
-bare Return gated on a second exact observation (`DING-R02`). The observation
-loop after paste runs to a bounded deadline; expiry yields `Staged`, never a
-Return.
+Fresh delivery preserves the production transport: one bounded PTY transaction
+contains a bracketed paste, a 0.5 second delay, and Return (`DING-R01`).
+Ownership is recorded immediately before that transaction. The production path
+does not inspect the composer first and does not use the separate staging
+helper.
 
-Every failure of a terminal command after paste has begun resolves to `Staged`
-rather than `Deferred` (`DING-R07`): the paste may already have reached the
-harness, so ownership is retained and retry re-inspects instead of re-pasting. A
-retry of a staged payload is inspect-only — it may submit or defer, but it never
-pastes.
+Every failure of that terminal command or of the following receipt observation
+resolves to `Staged` (`DING-R07`): the paste and Return may already have reached
+the harness, so ownership is retained and retry re-inspects instead of
+re-pasting. A staged retry is inspect-only unless two adjacent `RetainedSafe`
+observations authorize one bare Return (`DING-R02`).
+
+Return is transport, not a delivery receipt. After any submission attempt, a
+bounded observation loop asks the selected harness adapter for one of four
+states:
+
+| Receipt state | Meaning |
+| --- | --- |
+| `Accepted` | The expected notice text is visible in an adapter-recognized submitted-prompt or queued-message pattern while the lowest live composer is empty or an accepted idle placeholder |
+| `RetainedSafe` | The exact notice remains the complete live composer and Return is currently safe |
+| `RetainedBlocked` | The exact notice remains the complete live composer but the harness is active or blocked |
+| `Unproven` | No positive acceptance or exact retained-composer state was proven |
+
+Only `Accepted` becomes `Delivered` (`DING-R10`). PTY command success, generic
+screen change, disappearance alone, a changed composer, unreadable output, and
+observation timeout retain `Staged` ownership. A staged retry completes without
+input when it observes `Accepted`; it may send one bare Return only after two
+adjacent `RetainedSafe` observations, then must obtain the same positive
+receipt. `RetainedBlocked` and `Unproven` send no input. No retry re-pastes.
 
 ## Harness dispatch
 
@@ -65,6 +90,11 @@ resolves harness-shaped transcript text — a captured screen from another harne
 pasted into a pane — without a per-pair special case. When exactly one harness
 locates a composer, that one is classified; when none do, the screen is
 `Ambiguous`.
+
+Post-submit receipt classification uses that same positional dispatch and a
+shared `ReceiptState` type. Each adapter owns the renderer-specific proof that
+the exact notice is retained or accepted; shared delivery code never matches
+Codex or Claude pixels directly (`DING-R06`, `DING-R10`).
 
 Positions are compared in one unit. Harnesses do not agree on what they match
 against: some locate against the raw screen including escape sequences, others

@@ -49,6 +49,64 @@ fn compact_agent_catalog_is_clean() {
     assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
 }
 
+#[test]
+fn opaque_resource_bindings_are_structurally_valid() {
+    let c = catalog(&[(
+        "Silber/cos/agent.kdl",
+        r#"agent "cos" {
+  host "Silber"
+  resource "work" _tag="vendor-specific-type" uri="vendor+thing://authority/exact%20identity"
+  command "codex"
+}"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+}
+
+#[test]
+fn an_invalid_resource_binding_is_a_parse_error() {
+    let c = catalog(&[(
+        "Silber/cos/agent.kdl",
+        r#"agent "cos" {
+  host "Silber"
+  resource "work" _tag="github-issue" uri="not-an-absolute-uri"
+  command "codex"
+}"#,
+    )]);
+    assert!(has(&validate(c.path()), "parse-error", Severity::Error));
+}
+
+#[test]
+fn shared_workspace_render_conflict_is_an_error() {
+    let c = tempfile::tempdir().unwrap();
+    let workspace = c.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(c.path().join("_templates")).unwrap();
+    std::fs::write(c.path().join("_templates/a"), "a\n").unwrap();
+    std::fs::write(c.path().join("_templates/b"), "b\n").unwrap();
+    for (identity, template) in [("a", "a"), ("b", "b")] {
+        let path = c.path().join(format!("h/{identity}/agent.kdl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "agent \"{identity}\" {{ host \"h\"; workspace \"{}\"; command \"true\"; render {{ copy \"_templates/{template}\" \".st2/PERSONA.md\" }} }}",
+                workspace.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    let r = validate_for_host(c.path(), "h");
+
+    assert!(
+        has(&r, "render-owner-conflict", Severity::Error),
+        "{:?}",
+        r.issues
+    );
+}
+
 // ---- errors ----------------------------------------------------------------------------------
 
 #[test]
@@ -175,6 +233,18 @@ fn a_duplicate_bus_id_is_an_error() {
 }
 
 #[test]
+fn explicit_identity_and_host_are_path_independent_but_still_unique() {
+    let c = catalog(&[(
+        "organization/.managed/archive/arbitrary/declaration/agent.kdl",
+        r#"agent "stable" { host "pinned"; command "x" }"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+    assert_eq!(r.agents, 1);
+}
+
+#[test]
 fn an_unrendered_service_is_not_runnable() {
     let c = catalog(&[(
         "hetz/w/agent.kdl",
@@ -200,7 +270,7 @@ fn ls_marks_a_generated_ding_only_agent_as_unrendered() {
         .unwrap();
     assert!(output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("[UNRENDERED: no task command]"),
+        String::from_utf8_lossy(&output.stdout).contains("[UNRENDERED: no task launch]"),
         "stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -300,7 +370,7 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
 fn an_identity_folder_mismatch_is_a_warning() {
     let c = catalog(&[(
         "hetz/folder-name/agent.kdl",
-        r#"agent "content-name" { host "hetz"; type "service"; pty "agent" { command "x" } }"#,
+        r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(&validate(c.path()), "id-path-mismatch", Severity::Warn));
 }
@@ -309,7 +379,7 @@ fn an_identity_folder_mismatch_is_a_warning() {
 fn a_host_folder_mismatch_is_a_warning() {
     let c = catalog(&[(
         "folderhost/w/agent.kdl",
-        r#"agent "w" { host "confighost"; type "service"; pty "agent" { command "x" } }"#,
+        r#"agent { host "confighost"; type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(
         &validate(c.path()),
