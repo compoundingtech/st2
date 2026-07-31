@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-#[cfg(target_os = "macos")]
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
@@ -166,6 +166,146 @@ fn exec_launches_direct_argv_with_literal_boundaries_and_catalog_expansion() {
         fs::read_to_string(&log).ok()
     );
     backend.remove(id).unwrap();
+}
+
+#[test]
+fn generated_rich_ding_uses_task_only_roots_without_shell_expansion() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "generated_rich_ding_task_env_helper",
+            "--nocapture",
+        ])
+        .env("ST2_RICH_DING_TASK_ENV_HELPER", "1")
+        .env_remove("ST_ROOT")
+        .env_remove("ADAPTER_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn generated_rich_ding_task_env_helper() {
+    if std::env::var_os("ST2_RICH_DING_TASK_ENV_HELPER").is_none() {
+        return;
+    }
+    assert!(std::env::var_os("ST_ROOT").is_none());
+    assert!(std::env::var_os("ADAPTER_ROOT").is_none());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    let bin = tmp.path().join("bin");
+    let adapter_root = tmp.path().join("adapters");
+    let record = tmp.path().join("adapter-record.txt");
+    fs::create_dir_all(catalog.join("agents/testhost/worker")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&adapter_root).unwrap();
+    symlink(env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
+
+    let adapter = adapter_root.join("activity");
+    fs::write(
+        &adapter,
+        r#"#!/bin/sh
+{
+  printf 'root=%s\n' "$ST_ROOT"
+  for argument in "$@"; do
+    printf 'arg=%s\n' "$argument"
+  done
+} > "$ADAPTER_RECORD"
+exec /bin/sleep 30
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&adapter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&adapter, permissions).unwrap();
+
+    let task_path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("test helper PATH")
+    );
+    let declaration = format!(
+        r#"
+agent "worker" {{
+  host "testhost"
+  command "/bin/true"
+  env {{
+    PATH "{}"
+    ADAPTER_ROOT "{}"
+    ADAPTER_RECORD "{}"
+  }}
+  ding {{
+    adapter {{
+      argv "$ADAPTER_ROOT/activity" "--format" "jsonl" "space arg" "; touch forbidden"
+    }}
+  }}
+}}
+"#,
+        task_path,
+        adapter_root.display(),
+        record.display()
+    );
+    fs::write(
+        catalog.join("agents/testhost/worker/agent.kdl"),
+        declaration,
+    )
+    .unwrap();
+
+    let found = st2::discover(&catalog);
+    assert!(
+        found.errors.is_empty(),
+        "generated declaration did not parse: {:?}",
+        found.errors
+    );
+    let plan = st2::reconcile::reconcile(&found.specs, &[], "testhost");
+    let target = plan
+        .launch
+        .iter()
+        .flat_map(|launch| &launch.tasks)
+        .find(|target| target.name == "ding")
+        .expect("generated rich DING task")
+        .clone();
+    assert!(matches!(target.launch, TaskLaunch::Argv(_)));
+
+    let backend = ExecBackend::new(state, catalog.clone());
+    let spec_dir = found.specs[0].path.parent().unwrap();
+    backend.spawn(&target, spec_dir).unwrap();
+    assert!(
+        wait_until(|| record.is_file()),
+        "generated sidecar did not start its task-env adapter; log: {:?}",
+        fs::read_to_string(catalog.join("logs").join(format!("{}.log", target.pty_id))).ok()
+    );
+    assert_eq!(
+        fs::read_to_string(&record).unwrap(),
+        format!(
+            "root={}\narg=--format\narg=jsonl\narg=space arg\narg=; touch forbidden\n",
+            catalog.display()
+        )
+    );
+    assert!(!spec_dir.join("forbidden").exists());
+
+    let log = catalog.join("logs").join(format!("{}.log", target.pty_id));
+    let expected_inbox = catalog.join("agents/testhost/worker/resources/inbox");
+    assert!(
+        wait_until(|| fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(&expected_inbox.display().to_string())),
+        "generated `--root $ST_ROOT` did not resolve the catalog inbox: {:?}",
+        fs::read_to_string(&log).ok()
+    );
+
+    backend.kill(&target.pty_id).unwrap();
+    assert!(wait_until(|| backend.list().unwrap().iter().any(
+        |session| session.pty_id == target.pty_id && !session.alive
+    )));
+    backend.remove(&target.pty_id).unwrap();
 }
 
 /// Auto-log observability: a detached exec's stdout AND stderr must be captured to a discoverable

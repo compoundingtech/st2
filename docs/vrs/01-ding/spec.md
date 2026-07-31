@@ -154,9 +154,12 @@ ding {
 ```
 
 The argv values follow normal task launch semantics. The first value is the
-executable, remaining values are exact arguments, and declared task/agent
-environment is inherited. st2 neither runs a shell nor adds arguments or
-environment. Bare `ding` continues to lower to
+executable and remaining values are exact arguments. st2 first resolves the
+generated sidecar's complete managed environment, including `CATALOG`,
+`ST_ROOT`, and declared task/agent `env`, and then expands each argv token
+against that final map without changing argument boundaries. It neither runs a
+shell nor adds adapter arguments or adapter-specific environment. Bare `ding`
+continues to lower to
 `st2 ding --identity <id> --root $ST_ROOT` exactly.
 
 The long-running adapter owns provider-native interpretation and publishes

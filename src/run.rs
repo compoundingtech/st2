@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -99,6 +99,66 @@ pub(crate) fn resolve_task_cwd(
         Some(c) => spec_dir.join(crate::expand::expand_catalog(c, catalog_root)),
         None => spec_dir.to_path_buf(),
     }
+}
+
+/// Resolve the st2-owned launch environment before expanding any structured argv token.
+///
+/// Declared values retain their existing `$CATALOG` plus ambient expansion semantics. The returned
+/// map is then authoritative for direct argv expansion, so task-only values such as `ST_ROOT` and a
+/// declared adapter root do not depend on the supervisor's ambient environment.
+pub(crate) fn managed_task_env(
+    target: &TaskTarget,
+    catalog_root: &Path,
+    default_term: Option<&str>,
+) -> BTreeMap<OsString, OsString> {
+    let mut env = BTreeMap::from([
+        (
+            OsString::from("CATALOG"),
+            catalog_root.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("ST_ROOT"),
+            catalog_root.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("PTY_ROOT"),
+            effective_pty_root(catalog_root).into_os_string(),
+        ),
+    ]);
+    if let Some(term) = default_term {
+        env.insert(OsString::from("TERM"), OsString::from(term));
+    }
+    if let Ok(path) = crate::hooks::hooks_root() {
+        env.insert(OsString::from("ST_HOOKS"), path.into_os_string());
+    }
+    for (key, value) in &target.env {
+        let value = if key == "PTY_ROOT" {
+            effective_pty_root(catalog_root).into_os_string()
+        } else {
+            OsString::from(crate::expand::expand_catalog(value, catalog_root))
+        };
+        env.insert(OsString::from(key), value);
+    }
+    env
+}
+
+/// Expand one structured argv against the complete resolved task environment while preserving
+/// every argument boundary and introducing no shell. Managed/declared values outrank ambient ones;
+/// the ambient fallback preserves the existing direct-argv contract for undeclared variables.
+pub(crate) fn expand_task_argv(
+    argv: &[String],
+    task_env: &BTreeMap<OsString, OsString>,
+) -> Vec<OsString> {
+    argv.iter()
+        .map(|argument| {
+            OsString::from(crate::expand::expand_vars(argument, |key| {
+                task_env
+                    .get(OsStr::new(key))
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .or_else(|| std::env::var(key).ok())
+            }))
+        })
+        .collect()
 }
 
 /// The set of task operations st2 needs. Abstracted so execution is testable against a fake.
@@ -189,41 +249,16 @@ impl PtyCli {
     /// initial `pty run` process and persisted through repeatable `--env KEY=VALUE` arguments, so a
     /// manual `pty restart` recreates the task without snapshotting unrelated ambient OS variables.
     fn managed_task_env(&self, target: &TaskTarget) -> BTreeMap<OsString, OsString> {
-        let mut env = BTreeMap::from([
-            (
-                OsString::from("CATALOG"),
-                self.catalog_root.as_os_str().to_os_string(),
-            ),
-            (
-                OsString::from("ST_ROOT"),
-                self.catalog_root.as_os_str().to_os_string(),
-            ),
-            (
-                OsString::from("PTY_ROOT"),
-                effective_pty_root(&self.catalog_root).into_os_string(),
-            ),
-            (OsString::from("TERM"), OsString::from("xterm-256color")),
-        ]);
-        if let Ok(path) = crate::hooks::hooks_root() {
-            env.insert(OsString::from("ST_HOOKS"), path.into_os_string());
-        }
-        for (key, value) in &target.env {
-            let value = if key == "PTY_ROOT" {
-                effective_pty_root(&self.catalog_root).into_os_string()
-            } else {
-                OsString::from(self.expand(value))
-            };
-            env.insert(OsString::from(key), value);
-        }
-        env
+        managed_task_env(target, &self.catalog_root, Some("xterm-256color"))
     }
 
     /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
     /// env can be unit-tested without spawning anything.
     ///
     /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
-    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Direct argv uses
+    /// the complete resolved managed task environment. Shell source is left unexpanded: `sh -c`
+    /// expands it at spawn from the same env (which includes `$CATALOG`).
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -270,7 +305,7 @@ impl PtyCli {
             // Direct mode preserves argument boundaries and introduces no shell process.
             TaskLaunch::Argv(argv) => {
                 debug_assert!(!argv.is_empty());
-                cmd.args(argv.iter().map(|arg| self.expand(arg)));
+                cmd.args(expand_task_argv(argv, &managed_env));
             }
         }
         cmd
@@ -1748,14 +1783,15 @@ mod tests {
         let cli = PtyCli::new(PathBuf::from("/my/catalog"));
         let mut t = target("hetz.demo.agent", "unused");
         t.launch = TaskLaunch::Argv(vec![
-            "axe".into(),
+            "$TOOL_ROOT/axe".into(),
             "agent".into(),
             "exec".into(),
             "--".into(),
             "claude".into(),
             "--resume".into(),
-            "$CATALOG/session id".into(),
+            "$ST_ROOT/session id".into(),
         ]);
+        t.env.insert("TOOL_ROOT".into(), "/opt/task tools".into());
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
         let args = cmd
             .get_args()
@@ -1766,7 +1802,7 @@ mod tests {
         assert_eq!(
             &args[sep + 1..],
             [
-                "axe",
+                "/opt/task tools/axe",
                 "agent",
                 "exec",
                 "--",

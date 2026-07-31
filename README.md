@@ -161,13 +161,16 @@ opaque to st2; catalog readers use the public `agent-spec` crate to inspect the 
 
 `argv` launches its first value directly with the remaining values as arguments. It resolves a bare
 program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
-does not introduce a shell. Use `command #"..."#` instead when the task intentionally needs shell
-syntax such as pipelines, redirects, or variable expansion; `command` continues to run under
-`sh -c`. A runnable task must declare exactly one of `argv` or `command`.
+does not introduce a shell. `$VAR` tokens are expanded only after st2 has resolved the complete
+managed task environment, so st2-owned `CATALOG`/`ST_ROOT` and declared `env` values are available
+to both PTY and exec argv. Use `command #"..."#` instead when the task intentionally needs shell
+syntax such as pipelines or redirects; `command` continues to run under `sh -c`. A runnable task
+must declare exactly one of `argv` or `command`.
 
 An experimental rich DING path can be selected by giving compact `ding` one generic activity
 adapter. The adapter is also structured argv: core introduces no shell, provider selector, arguments, or
-environment.
+adapter-specific environment. Its tokens resolve against the generated DING task's final managed
+environment, including the agent's declared `env`.
 
 ```kdl
 env { ADAPTER_ROOT "/opt/agent-adapters" }

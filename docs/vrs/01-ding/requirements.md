@@ -97,9 +97,10 @@ is in [`spec.md`](./spec.md).
 ### Optional rich delivery must remain generic and fail closed
 
 - **DING-R11 Structured adapter launch:** An adapter declaration is one
-  explicit executable plus argument vector. Core introduces no shell, provider
-  selector, inferred arguments, or environment. Adapter argv participates in
-  the DING sidecar launch fingerprint.
+  executable plus argument vector, expanded against the complete resolved DING
+  task environment before direct launch. Core introduces no shell, provider
+  selector, inferred arguments, or adapter-specific environment. Adapter argv
+  participates in the DING sidecar launch fingerprint.
 - **DING-R12 Exact generic activity tuple:** Rich PTY input requires one
   receipt-anchored, unexpired `idle` event with `inputBuffer=empty`. Its exact
   session, incarnation, PTY generation, and strictly increasing sequence must
