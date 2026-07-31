@@ -224,6 +224,8 @@ impl std::error::Error for AuthorError {}
 #[derive(Debug)]
 struct AgentTarget {
     identity: String,
+    source_host: String,
+    source_identity: String,
     declaration: PathBuf,
     retired: bool,
 }
@@ -270,6 +272,8 @@ pub fn set_presentation(
     let result = edit_declaration(
         &target.declaration,
         &target.identity,
+        &target.source_host,
+        &target.source_identity,
         field,
         requested.as_deref(),
         || {},
@@ -307,6 +311,8 @@ fn resolve_target(
         )),
         [spec] => Ok(AgentTarget {
             identity: spec.bus_id(this_host),
+            source_host: spec.resolved_host(this_host).to_owned(),
+            source_identity: spec.identity.clone(),
             declaration: spec.path.clone(),
             retired: spec.retired,
         }),
@@ -378,16 +384,28 @@ fn authorize_actor(
 fn edit_declaration_for_test(
     path: &Path,
     expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
     field: PresentationField,
     requested: Option<&str>,
     before_commit: impl FnOnce(),
 ) -> Result<AuthorOutcome, AuthorError> {
-    edit_declaration(path, expected_identity, field, requested, before_commit)
+    edit_declaration(
+        path,
+        expected_identity,
+        expected_host,
+        expected_agent,
+        field,
+        requested,
+        before_commit,
+    )
 }
 
 fn edit_declaration(
     path: &Path,
     expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
     field: PresentationField,
     requested: Option<&str>,
     before_commit: impl FnOnce(),
@@ -432,7 +450,7 @@ fn edit_declaration(
             format!("parsing declaration {}: {error}", path.display()),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity)?;
+    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
     if is_nix_managed(target) {
         return Err(AuthorError::new(
             "nix-managed-declaration",
@@ -445,7 +463,14 @@ fn edit_declaration(
     let Some(replacement) = presentation_edit(text, target, field, requested)? else {
         return Ok(AuthorOutcome::Unchanged);
     };
-    verify_candidate(&replacement, expected_identity, field, requested)?;
+    verify_candidate(
+        &replacement,
+        expected_identity,
+        expected_host,
+        expected_agent,
+        field,
+        requested,
+    )?;
     atomic_replace_checked(
         path,
         &original,
@@ -460,13 +485,9 @@ fn edit_declaration(
 fn exact_agent_node<'a>(
     document: &'a KdlDocument,
     expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
 ) -> Result<&'a KdlNode, AuthorError> {
-    let (expected_host, expected_agent) = expected_identity.split_once('.').ok_or_else(|| {
-        AuthorError::new(
-            "invalid-target",
-            format!("expected host-qualified agent identity, found {expected_identity:?}"),
-        )
-    })?;
     let matches = document
         .nodes()
         .iter()
@@ -749,6 +770,8 @@ fn line_indent(text: &str, offset: usize) -> Option<String> {
 fn verify_candidate(
     candidate: &str,
     expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
     field: PresentationField,
     expected: Option<&str>,
 ) -> Result<(), AuthorError> {
@@ -758,7 +781,7 @@ fn verify_candidate(
             format!("presentation edit did not produce valid KDL: {error}"),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity)?;
+    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
     let fields = target
         .children()
         .into_iter()
@@ -951,6 +974,34 @@ mod tests {
     }
 
     #[test]
+    fn source_preserving_edit_accepts_a_dotted_host_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = write(
+            root,
+            "us.east/worker/agent.kdl",
+            &declaration("worker", "us.east", None, "catalog"),
+        );
+
+        let receipt = set_presentation(
+            root,
+            "us.east.worker",
+            "elsewhere",
+            None,
+            PresentationField::Name,
+            Some("Build owner"),
+        )
+        .unwrap();
+
+        assert_eq!(receipt.identity, "us.east.worker");
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("name \"Build owner\"")
+        );
+    }
+
+    #[test]
     fn self_and_supervisor_can_edit_but_sibling_and_nix_owner_cannot() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
@@ -1033,6 +1084,8 @@ mod tests {
         let error = edit_declaration_for_test(
             &path,
             "h.worker",
+            "h",
+            "worker",
             PresentationField::Name,
             Some("Owner"),
             || fs::write(&path, &changed).unwrap(),
@@ -1050,6 +1103,8 @@ mod tests {
         let error = edit_declaration_for_test(
             &path,
             "h.worker",
+            "h",
+            "worker",
             PresentationField::Name,
             Some("Owner"),
             || {
