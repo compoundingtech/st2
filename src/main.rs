@@ -247,6 +247,9 @@ enum Command {
         /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
         #[arg(long)]
         host: Option<String>,
+        /// Observe only tasks with this desired state. Omit for both running and absent.
+        #[arg(long, value_enum)]
+        desired_state: Option<st2::task_inventory::DesiredStateSelection>,
         /// Emit the versioned machine-readable envelope. Required in v1.
         #[arg(long)]
         json: bool,
@@ -336,26 +339,40 @@ enum CatalogCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Derive one atomic service/adopt-only/provider-witness bundle from a retained snapshot.
+    Project {
+        /// Retained canonical snapshot produced by `catalog snapshot`.
+        #[arg(long, value_name = "DIR")]
+        snapshot: PathBuf,
+        /// Exact declaration-root SHA-256 returned by `catalog snapshot`.
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: String,
+        /// Create-only atomic output bundle.
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+        /// Emit the typed projection result and receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Apply a complete canonical declaration directory under declaration-root CAS.
     Apply {
         /// Complete prepared declaration directory. Runtime state and control paths are rejected.
-        #[arg(
-            long,
-            value_name = "DIR",
-            required_unless_present = "resume",
-            conflicts_with = "resume"
-        )]
+        #[arg(long, value_name = "DIR")]
         prepared: Option<PathBuf>,
+        /// Atomic projection bundle whose typed receipt must name the apply target.
+        #[arg(long, value_name = "DIR")]
+        projection_bundle: Option<PathBuf>,
+        /// Apply-capable child selected from the verified projection bundle.
+        #[arg(long, value_enum)]
+        projection_child: Option<st2::catalog_transaction::CatalogProjectionChild>,
+        /// Caller-held SHA-256 returned by `catalog project`; never read from the bundle itself.
+        #[arg(long, value_name = "HEX")]
+        expect_bundle_sha256: Option<String>,
         /// Expected canonical declaration-root SHA-256 of the live catalog.
-        #[arg(
-            long,
-            value_name = "HEX",
-            required_unless_present = "resume",
-            conflicts_with = "resume"
-        )]
+        #[arg(long, value_name = "HEX")]
         expect_sha256: Option<String>,
         /// Resume the durable incomplete marker and internal stage without the original source.
-        #[arg(long, conflicts_with_all = ["prepared", "expect_sha256"])]
+        #[arg(long)]
         resume: bool,
         /// Emit the typed application receipt as JSON.
         #[arg(long)]
@@ -725,27 +742,87 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Catalog(CatalogCmd::Project {
+            snapshot,
+            expect_sha256,
+            output,
+            json,
+        }) => {
+            let result = st2::catalog_transaction::project_catalog(
+                st2::catalog_transaction::CatalogProjectionRequest {
+                    catalog: catalog_arg(None)?,
+                    snapshot,
+                    expect_sha256,
+                    output,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "created {} {}",
+                    result.bundle_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
         Command::Catalog(CatalogCmd::Apply {
             prepared,
+            projection_bundle,
+            projection_child,
+            expect_bundle_sha256,
             expect_sha256,
             resume,
             json,
         }) => {
-            let mode = if resume {
-                st2::catalog_transaction::ApplyMode::Resume
-            } else {
-                let prepared = prepared.context("clap requires --prepared unless --resume")?;
-                let expect_sha256 =
-                    expect_sha256.context("clap requires --expect-sha256 unless --resume")?;
-                st2::catalog_transaction::ApplyMode::Prepared {
-                    prepared,
-                    expect_sha256,
+            let catalog = catalog_arg(None)?;
+            let result = match (
+                prepared,
+                projection_bundle,
+                projection_child,
+                expect_bundle_sha256,
+                expect_sha256,
+                resume,
+            ) {
+                (Some(prepared), None, None, None, Some(expect_sha256), false) => {
+                    st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
+                        catalog,
+                        mode: st2::catalog_transaction::ApplyMode::Prepared {
+                            prepared,
+                            expect_sha256,
+                        },
+                    })?
                 }
+                (
+                    None,
+                    Some(bundle),
+                    Some(child),
+                    Some(expect_bundle_sha256),
+                    Some(expect_sha256),
+                    false,
+                ) => st2::catalog_transaction::apply_projection_bundle(
+                    st2::catalog_transaction::CatalogProjectionApplyRequest {
+                        catalog,
+                        bundle,
+                        child,
+                        expect_bundle_sha256,
+                        expect_sha256,
+                    },
+                )?,
+                (None, None, None, None, None, true) => {
+                    st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
+                        catalog,
+                        mode: st2::catalog_transaction::ApplyMode::Resume,
+                    })?
+                }
+                _ => anyhow::bail!(
+                    "catalog apply requires exactly one complete mode: \
+                     --prepared DIR --expect-sha256 HEX; \
+                     --projection-bundle DIR --projection-child service|adopt-only \
+                     --expect-bundle-sha256 HEX --expect-sha256 HEX; or --resume"
+                ),
             };
-            let result = st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
-                catalog: catalog_arg(None)?,
-                mode,
-            })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -767,12 +844,16 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
-        Command::Tasks { host, json } => {
+        Command::Tasks {
+            host,
+            desired_state,
+            json,
+        } => {
             if !json {
                 anyhow::bail!("`st2 tasks` v1 requires --json");
             }
             let catalog = catalog_arg(None)?;
-            tasks_cmd(&catalog, host)
+            tasks_cmd(&catalog, host, desired_state)
         }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
@@ -1264,7 +1345,11 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
     }
 }
 
-fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
+fn tasks_cmd(
+    root: &Path,
+    host: Option<String>,
+    selection: Option<st2::task_inventory::DesiredStateSelection>,
+) -> Result<()> {
     let host = host.unwrap_or_else(detect_host);
     let catalog = match root.canonicalize() {
         Ok(catalog) => catalog,
@@ -1274,6 +1359,7 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
                 root.to_path_buf(),
                 host,
                 detail,
+                selection,
             );
             println!("{}", inventory.to_json());
             anyhow::bail!("task inventory incomplete")
@@ -1283,14 +1369,15 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
         Ok(lock) => lock,
         Err(error) => {
             let detail = format!("acquire shared catalog-authoring lock: {error:#}");
-            let inventory = st2::task_inventory::TaskInventory::incomplete(catalog, host, detail);
+            let inventory =
+                st2::task_inventory::TaskInventory::incomplete(catalog, host, detail, selection);
             println!("{}", inventory.to_json());
             anyhow::bail!("task inventory incomplete")
         }
     };
     let found = discover(&catalog);
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
-    let inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    let inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner, selection);
     println!("{}", inventory.to_json());
     if inventory.complete() {
         Ok(())

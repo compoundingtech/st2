@@ -102,11 +102,19 @@ fn resume(catalog: &Path) -> Output {
 }
 
 #[test]
-fn catalog_apply_cli_exposes_exactly_the_two_closed_modes() {
+fn catalog_apply_cli_exposes_exactly_the_three_closed_modes() {
     let help = st2().args(["catalog", "apply", "--help"]).output().unwrap();
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    for flag in ["--prepared", "--expect-sha256", "--resume", "--json"] {
+    for flag in [
+        "--prepared",
+        "--projection-bundle",
+        "--projection-child",
+        "--expect-bundle-sha256",
+        "--expect-sha256",
+        "--resume",
+        "--json",
+    ] {
         assert!(help.contains(flag), "catalog apply help omitted {flag}");
     }
     assert!(!help.contains("--expect-absent"));
@@ -125,6 +133,18 @@ fn catalog_apply_cli_exposes_exactly_the_two_closed_modes() {
             "catalog",
             "apply",
             "--resume",
+            "--expect-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+        vec![
+            "catalog",
+            "apply",
+            "--projection-bundle",
+            "/tmp/bundle",
+            "--projection-child",
+            "provider-witness",
+            "--expect-bundle-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
             "--expect-sha256",
             "0000000000000000000000000000000000000000000000000000000000000000",
         ],
