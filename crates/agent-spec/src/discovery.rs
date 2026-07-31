@@ -3,9 +3,9 @@
 //! The folder is *both* the catalog and the inboxes: one directory per agent holding its spec plus
 //! its `inbox/`/`archive/`. Discovery walks `<root>` recursively, parses every `*.{toml,json,kdl}`
 //! that looks like a spec, and resolves each spec's `identity`/`host` with the gist's precedence:
-//! **content wins, the path supplies defaults, a mismatch is a warning** (a convention, not a
-//! constraint). Malformed files are collected as errors rather than halting the walk — one bad edit
-//! must not wedge the whole reconcile.
+//! an explicit identity+host pair is path-independent; otherwise **content wins, the path supplies
+//! defaults, and a mismatch is a warning**. Malformed files are collected as errors rather than
+//! halting the walk — one bad edit must not wedge the whole reconcile.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -54,10 +54,76 @@ pub fn discover(root: &Path) -> Discovered {
     out
 }
 
-/// Recursively gather candidate spec files, skipping dotfiles/dotdirs (`.git`, hidden config), the
-/// top-level `pty/` runtime registry, and anything that isn't one of [`SPEC_EXTS`]. `pty` session
-/// metadata includes JSON that can resemble an agent spec; it is runner state, never catalog input.
-/// Unreadable directories are skipped, not fatal.
+/// Whether `path` is in catalog declaration space rather than a known control/runtime namespace.
+///
+/// A leading dot has no generic meaning: organizational directories such as `.managed` and
+/// `.retired` remain visible. `.git` and `.st2` control directories at any depth, the catalog root's
+/// `pty` child, and an actual declaration parent's `resources`, `archive`, and `inbox` children have
+/// explicit non-catalog meaning.
+pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components: Vec<_> = rel
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+
+    if components
+        .iter()
+        .any(|name| matches!(name.to_str(), Some(".git" | ".st2")))
+        || components.first().and_then(|name| name.to_str()) == Some("pty")
+    {
+        return false;
+    }
+
+    let mut parent = root.to_path_buf();
+    for name in components {
+        if matches!(name.to_str(), Some("resources" | "archive" | "inbox"))
+            && is_declaration_parent(&parent)
+        {
+            return false;
+        }
+        parent.push(name);
+    }
+    true
+}
+
+/// Whether `dir` anchors at least one declaration whose adjacent state directories are not
+/// recursively discoverable catalog input.
+///
+/// Generic `agent.*` filenames reserve the namespace even while malformed so a broken declaration
+/// cannot suddenly expose its inbox as candidate specs. Named declaration files are recognized
+/// only when they parse as an agent spec, which keeps ordinary project JSON/TOML/KDL from claiming
+/// an unrelated `resources` directory.
+fn is_declaration_parent(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| SPEC_EXTS.contains(&extension))
+        {
+            return false;
+        }
+        if path.file_stem().and_then(|stem| stem.to_str()) == Some("agent") {
+            return true;
+        }
+        parse_raw_file(&path).is_ok_and(|raws| raws.iter().any(RawSpec::looks_like_spec))
+    })
+}
+
+/// Recursively gather candidate spec files, skipping only explicit control/runtime namespaces and
+/// anything that isn't one of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble
+/// an agent spec; it is runner state, never catalog input. Unreadable directories are skipped, not
+/// fatal.
 fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -65,23 +131,14 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue; // skip hidden files and directories
+        if !is_catalog_path(root, &path) {
+            continue;
         }
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
         };
         if ft.is_dir() {
-            if path == root.join("pty")
-                || name == "resources"
-                || name == "archive"
-                || name == "inbox"
-            {
-                continue;
-            }
             collect_spec_files(root, &path, acc);
         } else if ft.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
@@ -103,6 +160,8 @@ fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
 pub struct Declared {
     /// `identity` as written in the file. `None` when the file relies on [`path_defaults`].
     pub identity: Option<String>,
+    /// `host` as written in the file. `None` when the file relies on [`path_defaults`].
+    pub host: Option<String>,
     /// `type` as written, before it is normalized to `JobType::Service`. `None` when unset.
     pub job_type: Option<String>,
 }
@@ -117,6 +176,7 @@ pub fn parse_declared(path: &Path) -> anyhow::Result<Vec<Declared>> {
         .into_iter()
         .map(|raw| Declared {
             identity: raw.identity,
+            host: raw.host,
             job_type: raw.job_type,
         })
         .collect())
@@ -156,7 +216,8 @@ fn load_specs(root: &Path, path: &Path) -> anyhow::Result<(Vec<AgentSpec>, Vec<S
     Ok((specs, warnings))
 }
 
-/// Apply the gist's identity/host precedence to one raw spec: content wins, path supplies defaults, a
+/// Apply identity/host precedence to one raw spec. An explicit pair is authoritative and
+/// path-independent. When either is omitted, content still wins over path-derived defaults and a
 /// mismatch warns. Returns `None` for a non-spec (no agent signal); `Err` when it looks like a spec
 /// but no identity can be resolved from content or path.
 fn resolve_spec(
@@ -169,10 +230,11 @@ fn resolve_spec(
     }
 
     let (path_identity, path_host) = path_defaults(root, path);
+    let explicit_placement = raw.identity.is_some() && raw.host.is_some();
     let mut warnings = Vec::new();
 
     let identity = match (raw.identity.clone(), path_identity) {
-        (Some(c), Some(p)) if c != p => {
+        (Some(c), Some(p)) if c != p && !explicit_placement => {
             warnings.push(format!(
                 "{}: identity mismatch — content '{c}' vs path '{p}'; using content",
                 path.display()
@@ -190,7 +252,7 @@ fn resolve_spec(
     };
 
     let host = match (raw.host.clone(), path_host) {
-        (Some(c), Some(p)) if c != p => {
+        (Some(c), Some(p)) if c != p && !explicit_placement => {
             warnings.push(format!(
                 "{}: host mismatch — content '{c}' vs path '{p}'; using content",
                 path.display()
@@ -202,7 +264,7 @@ fn resolve_spec(
         (None, None) => None,
     };
 
-    let spec = raw.into_agent_spec(identity, host, path.to_path_buf());
+    let spec = raw.into_agent_spec(identity, host, path.to_path_buf())?;
     Ok(Some((spec, warnings)))
 }
 

@@ -25,6 +25,7 @@ pub mod resource;
 pub mod run;
 pub mod service;
 pub mod status;
+pub mod task_inventory;
 pub mod validate;
 pub mod version;
 mod watch;
@@ -36,14 +37,15 @@ pub use agent_spec::{discovery, spec};
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover};
 pub use agent_spec::spec::{
-    AgentSpec, JobType, Restart, RestartMode, Task, TaskKind, parse_duration,
+    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
+    parse_duration,
 };
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
 pub use host_lock::HostLock;
-pub use reconcile::{Launch, ReconcilePlan, Session, TaskTarget, Teardown, reconcile};
+pub use reconcile::{Launch, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
-    up_loop, up_loop_specs, up_once, up_once_specs,
+    up_loop, up_loop_specs, up_once, up_once_selected, up_once_selected_specs, up_once_specs,
 };

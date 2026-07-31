@@ -5,11 +5,12 @@
 //! - **ERROR** — the agent will fail to run, or run and silently do the wrong thing (parse failure,
 //!   no identity, unknown `type`, a task silently dropped, an unrendered service, a duplicate id, a
 //!   relative path, or a missing **catalog-rooted** path — the renderer's own output). Exits non-zero.
-//! - **WARN** — advisory; the run still works (identity/host path↔content mismatch — the spec says a
-//!   mismatch is a warning; a dangling supervisor — crash-dings just route nowhere; a missing
-//!   **external** path for an agent assigned to the selected validation host; an overlay `@import`
-//!   that does not resolve — a *render* concern, not st2 law, since a valid spec may carry no
-//!   persona). `--strict` promotes every WARN to a failure so a renderer's CI can demand spotless.
+//! - **WARN** — advisory; the run still works (a partially explicit identity/host placement that
+//!   mismatches its path-derived default; a dangling supervisor — crash-dings just route nowhere; a
+//!   missing **external** path for an agent assigned to the selected validation host; an overlay
+//!   `@import` that does not resolve — a *render* concern, not st2 law, since a valid spec may carry
+//!   no persona). `--strict` promotes every WARN to a failure so a renderer's CI can demand
+//!   spotless.
 //!
 //! st2 stays render-agnostic: render-only fields (`harness`, `model`, `persona`,
 //! `permissions`, …) are never required — their absence is never an issue.
@@ -151,9 +152,13 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
     let mut files: Vec<&PathBuf> = d.specs.iter().map(|s| &s.path).collect();
     files.sort();
     files.dedup();
+    let mut explicit_placements: HashSet<(PathBuf, String, String)> = HashSet::new();
     for f in files {
         if let Ok(raws) = parse_declared(f) {
             for raw in raws {
+                if let (Some(identity), Some(host)) = (&raw.identity, &raw.host) {
+                    explicit_placements.insert((f.clone(), identity.clone(), host.clone()));
+                }
                 if let Some(t) = &raw.job_type
                     && t != "service"
                 {
@@ -214,10 +219,15 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             ));
         }
 
-        // identity / host path↔content mismatch (content wins; advisory) — re-derived structurally.
+        // An explicit identity+host pair is authoritative regardless of folder names. When either
+        // field is omitted, path defaults remain part of placement and mismatches stay advisory.
+        let explicit_placement = s.host.as_ref().is_some_and(|host| {
+            explicit_placements.contains(&(s.path.clone(), s.identity.clone(), host.clone()))
+        });
         let (path_id, path_host) = path_defaults(root, &s.path);
         if let Some(pid) = &path_id
             && pid != &s.identity
+            && !explicit_placement
         {
             issues.push(Issue::warn(
                 "id-path-mismatch",
@@ -231,6 +241,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
         }
         if let (Some(h), Some(ph)) = (&s.host, &path_host)
             && h != ph
+            && !explicit_placement
         {
             issues.push(Issue::warn(
                 "host-path-mismatch",
@@ -247,7 +258,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
                 "not-runnable",
                 rp.clone(),
                 ag.clone(),
-                "service agent has no task with a command (unrendered, or the renderer emitted none)"
+                "service agent has no task with `command` or `argv` (unrendered, or the renderer emitted none)"
                     .to_string(),
             ));
         }
@@ -284,6 +295,21 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             crate::materialize::validate_agent(root, s, s.host.as_deref().unwrap_or(""))
         {
             issues.push(Issue::error("render-error", rp, ag, format!("{error:#}")));
+        }
+    }
+
+    if let Some(host) = this_host {
+        for conflict in crate::materialize::render_ownership_conflicts(root, &d.specs, host) {
+            issues.push(Issue::error(
+                "render-owner-conflict",
+                ".".to_string(),
+                None,
+                format!(
+                    "conflicting render ownership for '{}': active agents {} declare incompatible content for one shared workspace target",
+                    conflict.destination.display(),
+                    conflict.owners.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            ));
         }
     }
 

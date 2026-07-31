@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use agent_spec::spec::{AgentSpec, TaskKind};
+use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
 
 /// ACTUAL state: one running/known task as st2 observes it (unioned across backends).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub struct Session {
 }
 
 /// A concrete task st2 should spawn — everything a backend needs, resolved from the spec. Produced
-/// only for tasks that carry an explicit `command`.
+/// only for tasks that carry an explicit `command` or `argv`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTarget {
     /// `pty` (terminal) or `exec` (terminal-free) — selects the backend.
@@ -37,8 +37,8 @@ pub struct TaskTarget {
     pub bus_id: String,
     /// The task name (`agent`, `ding`, …).
     pub name: String,
-    /// The exact command line to exec, run verbatim under `sh -c`.
-    pub command: String,
+    /// How to launch the task: shell source or a direct program argument vector.
+    pub launch: TaskLaunch,
     /// Declared working dir; `None` → default to `workspace`, else the spec dir (resolved at spawn).
     pub cwd: Option<String>,
     /// The agent's workspace — the cwd default when `cwd` is unset.
@@ -47,6 +47,15 @@ pub struct TaskTarget {
     pub env: BTreeMap<String, String>,
     /// GC pin (task-level `keep`, or the agent-level `keep`).
     pub keep: bool,
+}
+
+/// A resolved task launch accepted by the execution backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskLaunch {
+    /// Shell source, preserved verbatim and passed to `sh -c`.
+    Shell(String),
+    /// A non-empty vector whose first element is the program.
+    Argv(Vec<String>),
 }
 
 /// An agent to launch, with the specific tasks that are missing (not already live).
@@ -74,10 +83,113 @@ pub struct ReconcilePlan<'a> {
     pub adopt: Vec<&'a AgentSpec>,
     /// host != this machine → skipped; another machine's st2 owns it.
     pub other_host: Vec<&'a AgentSpec>,
-    /// This host, active service, but no task carries a command (unrendered) → nothing to run.
+    /// This host, active service, but no task carries a launch (unrendered) → nothing to run.
     pub unrunnable: Vec<&'a AgentSpec>,
     /// Dead, non-`keep` sessions of declared tasks → reap (`rm`).
     pub gc: Vec<String>,
+    /// Dead or absent `adopt-only` task ids held without reap or launch.
+    pub held: Vec<String>,
+}
+
+/// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
+pub fn resolve_task<'a>(
+    specs: &'a [AgentSpec],
+    selector: &str,
+    this_host: &str,
+) -> anyhow::Result<(&'a AgentSpec, &'a crate::spec::Task, String)> {
+    let mut matches = Vec::new();
+    for spec in specs {
+        if spec.resolved_host(this_host) != this_host {
+            continue;
+        }
+        for task in &spec.tasks {
+            let runtime = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+            let qualified = format!("{}.{}", spec.bus_id(this_host), task.name);
+            if selector == runtime || selector == qualified {
+                matches.push((spec, task, runtime));
+            }
+        }
+    }
+    match matches.as_slice() {
+        [(spec, task, runtime)] => Ok((*spec, *task, runtime.clone())),
+        [] => anyhow::bail!("task selector {selector:?} did not resolve to one local task"),
+        _ => anyhow::bail!("task selector {selector:?} is ambiguous"),
+    }
+}
+
+/// Pure task-scoped plan: resolve first, then retain only the selected runtime target.
+pub fn reconcile_selected<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+    selector: &str,
+) -> anyhow::Result<ReconcilePlan<'a>> {
+    let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
+    let mut plan = ReconcilePlan::default();
+    let actual = sessions.iter().find(|s| s.pty_id == runtime);
+    if owner.retired {
+        if let Some(s) = actual {
+            if s.alive {
+                plan.teardown.push(Teardown {
+                    spec: owner,
+                    pty_ids: vec![runtime],
+                });
+            } else if !(task.keep || owner.keep) {
+                plan.gc.push(runtime);
+            }
+        }
+        return Ok(plan);
+    }
+    let launch = match (&task.command, &task.argv) {
+        (Some(command), None) => TaskLaunch::Shell(command.clone()),
+        (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
+        (None, None) => {
+            plan.unrunnable.push(owner);
+            return Ok(plan);
+        }
+        (Some(_), Some(_)) => {
+            unreachable!("discovery rejects tasks carrying both command and argv")
+        }
+    };
+    let bus_id = owner.bus_id(this_host);
+    let mut env = task.env.clone();
+    if let Some(supervisor) = &owner.supervisor {
+        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
+    } else {
+        env.remove("ST_SUPERVISOR");
+    }
+    let target = TaskTarget {
+        kind: task.kind,
+        pty_id: runtime.clone(),
+        bus_id,
+        name: task.name.clone(),
+        launch,
+        cwd: task.cwd.clone(),
+        workspace: owner.workspace.clone(),
+        tags: task.tags.clone(),
+        env,
+        keep: task.keep || owner.keep,
+    };
+    match actual {
+        Some(s) if s.alive => plan.adopt.push(owner),
+        _ if task.lifecycle == TaskLifecycle::AdoptOnly => plan.held.push(runtime),
+        Some(_) if target.keep => plan.adopt.push(owner),
+        Some(_) => {
+            plan.gc.push(runtime);
+            plan.launch.push(Launch {
+                spec: owner,
+                tasks: vec![target],
+            });
+        }
+        _ => plan.launch.push(Launch {
+            spec: owner,
+            tasks: vec![target],
+        }),
+    }
+    Ok(plan)
 }
 
 /// The state of a declared task's session in the ACTUAL world.
@@ -104,9 +216,15 @@ fn resolve_task_id(bus_id: &str, name: &str, explicit: Option<&str>) -> String {
 }
 
 /// Compute the reconcile plan for `specs` given observed `sessions`, filtering to `this_host`.
-pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &str) -> ReconcilePlan<'a> {
-    let by_id: HashMap<&str, bool> =
-        sessions.iter().map(|s| (s.pty_id.as_str(), s.alive)).collect();
+pub fn reconcile<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+) -> ReconcilePlan<'a> {
+    let by_id: HashMap<&str, bool> = sessions
+        .iter()
+        .map(|s| (s.pty_id.as_str(), s.alive))
+        .collect();
 
     let mut plan = ReconcilePlan::default();
     for spec in specs {
@@ -128,7 +246,10 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
                 }
             }
             if !teardown_ids.is_empty() {
-                plan.teardown.push(Teardown { spec, pty_ids: teardown_ids });
+                plan.teardown.push(Teardown {
+                    spec,
+                    pty_ids: teardown_ids,
+                });
             }
             continue;
         }
@@ -138,11 +259,18 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
             continue;
         }
 
-        let targets: Vec<TaskTarget> = spec
+        let targets: Vec<(TaskTarget, TaskLifecycle)> = spec
             .tasks
             .iter()
             .filter_map(|t| {
-                let command = t.command.clone()?;
+                let launch = match (&t.command, &t.argv) {
+                    (Some(command), None) => TaskLaunch::Shell(command.clone()),
+                    (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),
+                    (None, None) => return None,
+                    (Some(_), Some(_)) => {
+                        unreachable!("discovery rejects tasks carrying both command and argv")
+                    }
+                };
                 // `supervisor` is the single source of truth. Hooks and harnesses consume the
                 // derived environment variable, but catalog authors/renderers never need to
                 // duplicate the relationship in env{} (and cannot accidentally make it disagree).
@@ -152,27 +280,36 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
                 } else {
                     env.remove("ST_SUPERVISOR");
                 }
-                Some(TaskTarget {
-                    kind: t.kind,
-                    pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
-                    bus_id: bus_id.clone(),
-                    name: t.name.clone(),
-                    command,
-                    cwd: t.cwd.clone(),
-                    workspace: spec.workspace.clone(),
-                    tags: t.tags.clone(),
-                    env,
-                    keep: t.keep || spec.keep,
-                })
+                Some((
+                    TaskTarget {
+                        kind: t.kind,
+                        pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
+                        bus_id: bus_id.clone(),
+                        name: t.name.clone(),
+                        launch,
+                        cwd: t.cwd.clone(),
+                        workspace: spec.workspace.clone(),
+                        tags: t.tags.clone(),
+                        env,
+                        keep: t.keep || spec.keep,
+                    },
+                    t.lifecycle,
+                ))
             })
             .collect();
 
         debug_assert!(!targets.is_empty());
 
         let mut to_launch = Vec::new();
-        for target in targets {
+        let held_before = plan.held.len();
+        for (target, lifecycle) in targets {
             match session_state(&by_id, &target.pty_id) {
                 SessionState::Alive => {}
+                SessionState::Dead | SessionState::Absent
+                    if lifecycle == TaskLifecycle::AdoptOnly =>
+                {
+                    plan.held.push(target.pty_id.clone());
+                }
                 SessionState::Dead if target.keep => {}
                 SessionState::Dead => {
                     plan.gc.push(target.pty_id.clone());
@@ -182,10 +319,13 @@ pub fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], this_host: &s
             }
         }
 
-        if to_launch.is_empty() {
+        if to_launch.is_empty() && plan.held.len() == held_before {
             plan.adopt.push(spec);
-        } else {
-            plan.launch.push(Launch { spec, tasks: to_launch });
+        } else if !to_launch.is_empty() {
+            plan.launch.push(Launch {
+                spec,
+                tasks: to_launch,
+            });
         }
     }
     plan
