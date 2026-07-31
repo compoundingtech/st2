@@ -169,13 +169,13 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
 - **Catalog liveness:** The
   [Host-local supervision contract](03-host-local/requirements.md) separates
-  continuing canonical-agent liveness from resident-supervisor state. A
-  running canonical agent keeps its catalog live across supervisor downtime;
-  DING/sidecar-only survival does not. Incomplete observation cannot prove a
-  catalog globally not live. While the catalog is live, or its supervisor is
-  running, the resolved catalog root and PTY root remain stable paths; ordinary
-  catalog edit/sync remains allowed, while relocation requires the coordinated
-  operation in
+  continuing canonical-agent liveness from resident st2 control-plane instance
+  state. A running canonical agent keeps its catalog live across instance
+  downtime; DING/sidecar-only survival does not. Incomplete observation cannot
+  prove a catalog globally not live. While the catalog is live, or its resident
+  st2 control-plane instance is running, the resolved catalog root and PTY root
+  remain stable paths; ordinary catalog edit/sync remains allowed, while
+  relocation requires the coordinated operation in
   [issue #85](https://github.com/compoundingtech/st2/issues/85).
 
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
@@ -208,13 +208,19 @@ existing resident writer for the same local subject
 plane loss and adoption
 ([evidence](../../tests/nomad_survival.rs#L592-L701)).
 
-The durable catalog-activation half of R18/R22 is not implemented. Each pass
-currently discovers the live catalog directory directly
+A plain synced catalog folder and direct KDL remain a complete operating path
+for R18/R22. Last-known-good host operation does not require catalog
+publication, compare-and-swap, durable staging, or a content-addressed store.
+An optional transactional authoring path may be added, but it cannot become a
+prerequisite for direct-KDL operation.
+
+The complete-version and durable last-known-good half of R18/R22 is not
+implemented. Each pass currently discovers the live catalog directory directly
 ([source](../../src/run.rs#L737-L758)); `st2 validate` is separate and
-read-only. There is no staged candidate boundary, catalog version ordering,
-atomic validated activation, or durable last-known-good receipt. The exact
-candidate-completeness, version, and activation-recovery contracts remain open
-design work.
+read-only. There is no identified and ordered complete candidate version or
+durable last-known-good receipt. The exact completeness, version, and recovery
+contracts remain open design work; that gap does not prescribe CAS or a
+content-addressed activation mechanism.
 
 ## Message lifecycle
 
