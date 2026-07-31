@@ -2342,51 +2342,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn escaped_stdin_reader_does_not_retain_a_writer_thread() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn undrained_reader_does_not_retain_the_nonblocking_writer() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
 
-        let temporary = tempfile::tempdir().unwrap();
-        let executable = temporary.path().join("escape-with-stdin");
-        let escaped_pidfile = temporary.path().join("escaped.pid");
-        let pipefile = temporary.path().join("escaped.pipe");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nexec 3<&0\nsetsid sh -c 'printf %s \"$$\" > \"$ESCAPED_PIDFILE\"; readlink /proc/self/fd/0 > \"$PIPEFILE\"; sleep 60' <&3 &\nsleep 60\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        output_with_input_timeout(
-            Command::new(&executable)
-                .env("ESCAPED_PIDFILE", &escaped_pidfile)
-                .env("PIPEFILE", &pipefile),
-            Duration::from_millis(100),
-            Some(vec![b'x'; 1024 * 1024]),
-        )
-        .unwrap_err();
-        let escaped_ready_deadline = Instant::now() + Duration::from_secs(2);
-        while (!escaped_pidfile.exists() || !pipefile.exists())
-            && Instant::now() < escaped_ready_deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let escaped_pid = std::fs::read_to_string(&escaped_pidfile)
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let pipe = std::fs::read_link(format!("/proc/self/fd/{}", reader.as_raw_fd())).unwrap();
+        let started = Instant::now();
+
+        assert!(
+            !write_all_before(
+                ChildStdin::from(writer),
+                &vec![b'x'; 1024 * 1024],
+                Instant::now() + Duration::from_millis(100),
+            )
             .unwrap()
-            .parse::<i32>()
-            .unwrap();
-        let pipe = std::fs::read_to_string(&pipefile).unwrap();
+        );
         let retained_writers = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(Result::ok)
             .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-            .filter(|target| target.to_string_lossy() == pipe.trim())
+            .filter(|target| target == &pipe)
             .count();
-        unsafe {
-            libc::kill(-escaped_pid, libc::SIGKILL);
-        }
 
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
-            retained_writers, 0,
-            "escaped stdin reader retained a metadata writer file descriptor"
+            retained_writers, 1,
+            "the undrained pipe retained a writer after the deadline"
         );
     }
 
