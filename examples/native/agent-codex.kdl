@@ -18,7 +18,7 @@ agent "<identity>" {
   ding
 
   render {
-    copy "assets/AGENTS.md" "AGENTS.md"
+    copy "_templates/<host>.<identity>.AGENTS.md" "AGENTS.md"
     json-upsert ".codex/hooks.json" #"""
 {
   "hooks": {

@@ -11,8 +11,9 @@ fn write(path: &Path, contents: impl AsRef<[u8]>) {
 }
 
 #[test]
-fn task_selector_refusal_initializes_only_the_persistent_coordination_lock() {
+fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
     let tmp = tempfile::tempdir().unwrap();
+    let before = fs::read_dir(tmp.path()).unwrap().count();
     let out = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(tmp.path())
@@ -26,29 +27,7 @@ fn task_selector_refusal_initializes_only_the_persistent_coordination_lock() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let root_entries = fs::read_dir(tmp.path())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(root_entries.len(), 2);
-    let host_lock = root_entries
-        .iter()
-        .find(|entry| entry.file_name() == ".st2.host.lock")
-        .unwrap();
-    let host_lock = fs::symlink_metadata(host_lock.path()).unwrap();
-    assert!(host_lock.is_file() && !host_lock.file_type().is_symlink());
-    let control = root_entries
-        .iter()
-        .find(|entry| entry.file_name() == ".st2")
-        .unwrap();
-    let control_entries = fs::read_dir(control.path())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(control_entries.len(), 1);
-    assert_eq!(control_entries[0].file_name(), "catalog-authoring.lock");
-    let lock = fs::symlink_metadata(control_entries[0].path()).unwrap();
-    assert!(lock.is_file() && !lock.file_type().is_symlink());
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), before);
 }
 
 #[test]
@@ -174,6 +153,7 @@ fn selected_owner_cannot_bypass_a_shared_workspace_conflict() {
         .iter()
         .find(|spec| spec.identity == "cos")
         .unwrap();
+
     let report = materialize_catalog_against(
         &catalog,
         std::slice::from_ref(worker),
@@ -602,6 +582,7 @@ fn missing_git_executable_fails_closed_before_workspace_write() {
         &catalog.join("agents/Silber/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
     );
+
     let output = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("up")
         .arg(&catalog)
@@ -694,13 +675,6 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
         &catalog.join("agents/Silber/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/brief.md" "AGENTS.md""#),
     );
-    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|entry| entry.join("git"))
-        .find(|candidate| candidate.is_file())
-        .unwrap();
-    let tools = tmp.path().join("tools");
-    fs::create_dir(&tools).unwrap();
-    std::os::unix::fs::symlink(git, tools.join("git")).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up"])
@@ -708,7 +682,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
         .args(["--host", "Silber", "--materialize-only"])
         // Proves this path never tries the runtime's external pty backend.
         .env("ST_HOOKS", &hooks_root)
-        .env("PATH", &tools)
+        .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
     assert!(

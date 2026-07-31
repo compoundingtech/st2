@@ -54,12 +54,6 @@ fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
     cond()
 }
 
-fn recorded_pid(path: &std::path::Path) -> i32 {
-    serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap()["pid"]
-        .as_i64()
-        .unwrap() as i32
-}
-
 #[test]
 fn exec_spawns_terminal_free_process_tracks_liveness_kills_and_cleans_up() {
     let tmp = tempfile::tempdir().unwrap();
@@ -75,7 +69,11 @@ fn exec_spawns_terminal_free_process_tracks_liveness_kills_and_cleans_up() {
     // pid file recorded
     let pid_path = state.join(format!("{id}.pid"));
     assert!(pid_path.exists(), "pid file written");
-    let pid = recorded_pid(&pid_path);
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
     // liveness: alive
     let sessions = backend.list().unwrap();
@@ -331,7 +329,11 @@ fn exec_kill_reaps_the_whole_process_group_not_just_the_leader() {
     backend
         .spawn(&exec_target(id, "sleep 45 & sleep 45"), tmp.path())
         .unwrap();
-    let leader = recorded_pid(&state.join(format!("{id}.pid")));
+    let leader: i32 = fs::read_to_string(state.join(format!("{id}.pid")))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
     assert!(
         wait_until(|| group_members(leader).len() >= 2),

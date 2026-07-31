@@ -10,24 +10,22 @@ These maintained, hand-authored declarations are the canonical starting points:
 
 The examples use `<host>`, `<identity>`, and `<workspace>` placeholders. st2 provides `CATALOG`,
 `ST_ROOT`, `PTY_ROOT`, and `ST_HOOKS` when it starts a task, so hook declarations contain no
-machine-specific install paths. Copy the appropriate file outside the catalog, replace every
-placeholder, assemble it and the referenced files under the publication bundle's `assets/`
-directory, then publish the bundle. `role` is optional metadata; `supervisor` is optional runtime routing.
+machine-specific install paths. Copy the appropriate file into
+`<catalog>/agents/<host>/<identity>/agent.kdl`, replace every placeholder, and add the referenced
+catalog-owned templates. `role` is optional metadata; `supervisor` is optional runtime routing.
 Uncomment them when the seat has an assigned role or reports to another bus identity.
 
 ## Lifecycle
 
-st2 accepts exact canonical KDL or a create-only bundle; it does not compile human intent. Inspect
-all KDL and workspace targets before publication.
+`compile-agent` is an experimental generation aid. It writes one declaration, catalog-owned
+templates, and the agent's `resources/{inbox,archive,context,links}` directories without changing
+the workspace. Inspect all generated KDL and workspace targets before use.
 
-Use this sequence:
+Use this sequence for hand-authored or generated declarations:
 
 ```sh
 st2 hooks install
 st2 hooks verify
-input_sha256="$(st2 agent digest --bundle <bundle>)"
-st2 agent publish --catalog <catalog> --bundle <bundle> \
-  --input-sha256 "$input_sha256" --expect-absent --json
 st2 validate <catalog>
 st2 up <catalog> --host <host> --materialize-only
 st2 up <catalog> --host <host> --once

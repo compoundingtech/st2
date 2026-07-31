@@ -1,5 +1,4 @@
-use std::fs::{self, File};
-use std::os::fd::AsRawFd as _;
+use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,13 +59,11 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
     let state = tmp.path().join("state");
     let hooks = tmp.path().join("hooks");
     let catalog = tmp.path().join("catalog");
-    let codex_bundle = tmp.path().join("codex-bundle");
-    let claude_bundle = tmp.path().join("claude-bundle");
     let codex_workspace = tmp.path().join("codex-workspace");
     let claude_workspace = tmp.path().join("claude-workspace");
-    fs::create_dir_all(&catalog).unwrap();
-    fs::create_dir_all(codex_bundle.join("assets")).unwrap();
-    fs::create_dir_all(claude_bundle.join("assets")).unwrap();
+    fs::create_dir_all(catalog.join("agents/clean/codex")).unwrap();
+    fs::create_dir_all(catalog.join("agents/clean/claude")).unwrap();
+    fs::create_dir_all(catalog.join("_templates")).unwrap();
     fs::create_dir_all(&codex_workspace).unwrap();
     fs::create_dir_all(&claude_workspace).unwrap();
 
@@ -83,20 +80,31 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
         .replace("<host>", "clean")
         .replace("<workspace>", &claude_workspace.display().to_string())
         .replace("<boot prompt>", "boot");
-    let bus = fs::read_to_string(manifest.join("templates/bus.st2.md")).unwrap();
-    fs::write(codex_bundle.join("agent.kdl"), codex.as_bytes()).unwrap();
-    fs::write(claude_bundle.join("agent.kdl"), claude.as_bytes()).unwrap();
     fs::write(
-        codex_bundle.join("assets/AGENTS.md"),
-        format!("# Clean Codex agent\n\n---\n\n{bus}"),
+        catalog.join("agents/clean/codex/agent.kdl"),
+        codex.as_bytes(),
     )
     .unwrap();
     fs::write(
-        claude_bundle.join("assets/PERSONA.md"),
+        catalog.join("agents/clean/claude/agent.kdl"),
+        claude.as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("_templates/clean.codex.AGENTS.md"),
+        "# Clean Codex agent\n",
+    )
+    .unwrap();
+    fs::write(
+        catalog.join("_templates/clean.claude.persona.md"),
         "# Clean Claude persona\n",
     )
     .unwrap();
-    fs::write(claude_bundle.join("assets/bus.st2.md"), &bus).unwrap();
+    fs::copy(
+        manifest.join("templates/bus.st2.md"),
+        catalog.join("_templates/bus.st2.md"),
+    )
+    .unwrap();
 
     for workspace in [&codex_workspace, &claude_workspace] {
         let git = Command::new(bin.path().join("git"))
@@ -106,38 +114,6 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
             .status()
             .unwrap();
         assert!(git.success());
-    }
-
-    for bundle in [&codex_bundle, &claude_bundle] {
-        let digest = clean_st2(bin.path(), &state, &hooks)
-            .args(["agent", "digest", "--bundle"])
-            .arg(bundle)
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert!(
-            digest.status.success(),
-            "stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&digest.stdout),
-            String::from_utf8_lossy(&digest.stderr)
-        );
-        let digest: serde_json::Value = serde_json::from_slice(&digest.stdout).unwrap();
-        let publish = clean_st2(bin.path(), &state, &hooks)
-            .args(["agent", "publish", "--catalog"])
-            .arg(&catalog)
-            .arg("--bundle")
-            .arg(bundle)
-            .arg("--input-sha256")
-            .arg(digest["sha256"].as_str().unwrap())
-            .args(["--expect-absent", "--json"])
-            .output()
-            .unwrap();
-        assert!(
-            publish.status.success(),
-            "stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&publish.stdout),
-            String::from_utf8_lossy(&publish.stderr)
-        );
     }
 
     let install = clean_st2(bin.path(), &state, &hooks)
@@ -237,15 +213,14 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
         }
     }
 
-    let codex_agents = fs::read_to_string(codex_workspace.join("AGENTS.md")).unwrap();
-    assert!(codex_agents.starts_with("# Clean Codex agent\n\n---\n\n"));
-    assert!(codex_agents.contains("Set `busy` immediately before actively executing"));
+    assert_eq!(
+        fs::read_to_string(codex_workspace.join("AGENTS.md")).unwrap(),
+        "# Clean Codex agent\n"
+    );
     assert_eq!(
         fs::read_to_string(claude_workspace.join(".st2/PERSONA.md")).unwrap(),
         "# Clean Claude persona\n"
     );
-    let claude_bus = fs::read_to_string(claude_workspace.join(".st2/bus.md")).unwrap();
-    assert!(claude_bus.contains("Set `busy` immediately before actively executing"));
     for workspace in [&codex_workspace, &claude_workspace] {
         let status = Command::new(bin.path().join("git"))
             .arg("-C")
@@ -289,7 +264,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         "message",
         "ding",
         "hooks",
-        "agent",
+        "compile-agent",
         "completions",
     ] {
         assert!(help.contains(command), "missing {command} in help:\n{help}");
@@ -341,18 +316,12 @@ fn clean_path_supports_help_validate_env_and_doctor() {
     let doctor_agent = doctor_catalog.join("agents/h/missing/agent.kdl");
     fs::create_dir_all(doctor_agent.parent().unwrap()).unwrap();
     fs::write(&doctor_agent, "agent \"missing\" { host \"h\" }\n").unwrap();
-    let mut owner = Command::new("sleep").arg("30").spawn().unwrap();
-    let doctor_lock_path = doctor_catalog.join(".st2.h.lock");
-    fs::write(&doctor_lock_path, format!("{}\n", owner.id())).unwrap();
-    let _doctor_lock = File::options()
-        .read(true)
-        .write(true)
-        .open(&doctor_lock_path)
-        .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(_doctor_lock.as_raw_fd(), libc::LOCK_EX) },
-        0
-    );
+    let mut owner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    fs::write(
+        doctor_catalog.join(".st2.h.lock"),
+        format!("{}\n", owner.id()),
+    )
+    .unwrap();
     let missing = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
