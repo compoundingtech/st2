@@ -35,10 +35,11 @@ st2 hooks verify
 ```
 
 When upgrading, deploy and activate the compatible `pty` before this version of
-`st2`. An older `pty` rejects `--unset-env`, so a canonical agent launch fails
-before the agent starts. The Nix input and development shell pin the compatible
-artifact; Cargo installs rely on the operator to satisfy this runtime
-prerequisite.
+`st2`. An older `pty` may silently ignore the unknown `--unset-env` option and
+still launch the agent without persisting the removal. The initial environment
+can therefore look correct while a later restart reintroduces the caller's
+ambient value. The Nix input and development shell pin the compatible artifact;
+Cargo installs rely on the operator to satisfy this runtime prerequisite.
 
 The standard catalog is:
 
