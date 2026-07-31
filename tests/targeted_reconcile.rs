@@ -90,15 +90,7 @@ fn assert_success(output: &Output, context: &str) {
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
-    let raw = fs::read_to_string(path).ok()?;
-    raw.trim().parse().ok().or_else(|| {
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()?
-            .get("pid")?
-            .as_i64()?
-            .try_into()
-            .ok()
-    })
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn kill_process_group(pid: i32) {
