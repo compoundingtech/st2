@@ -1,6 +1,6 @@
 //! M2.3 integration: presence status + the agent roster over a discovered catalog. Unit mechanics
 //! (state parse, staleness, atomic set/refresh) live in `src/status.rs`; this covers the composition
-//! `st2 agents` relies on — enumerate specs, read each agent's `status`/`name`/inbox, project the
+//! `st2 agents` relies on — enumerate specs, read each agent's status/presentation/inbox, project the
 //! roster, and derive `unknown` from staleness.
 
 use std::fs;
@@ -26,6 +26,13 @@ fn agent_kdl(identity: &str, host: &str) -> String {
     )
 }
 
+fn presented_agent_kdl(identity: &str, host: &str) -> String {
+    agent_kdl(identity, host).replace(
+        "  type \"service\"\n",
+        "  type \"service\"\n  name \"st2 owner\"\n  description \"Own st2 delivery\"\n",
+    )
+}
+
 fn retired_agent_kdl(identity: &str, host: &str) -> String {
     agent_kdl(identity, host).replace(
         "  type \"service\"\n",
@@ -42,7 +49,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
     write(
         root,
         "hetz/st2-claude/agent.kdl",
-        &agent_kdl("st2-claude", "hetz"),
+        &presented_agent_kdl("st2-claude", "hetz"),
     );
     write(
         root,
@@ -55,15 +62,14 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
         &agent_kdl("fabric-claude", "silber"),
     );
 
-    // Presence: st2-claude busy, cos-claude available, fabric-claude unset (→ offline). A display name
-    // and an inbox message for st2-claude.
+    // Presence: st2-claude busy, cos-claude available, fabric-claude unset (→ offline). Presentation
+    // metadata and an inbox message belong to st2-claude's declaration.
     set_state(&status_path(&root.join("hetz/st2-claude")), State::Busy).unwrap();
     set_state(
         &status_path(&root.join("hetz/cos-claude")),
         State::Available,
     )
     .unwrap();
-    write(root, "hetz/st2-claude/name", "st2 owner\n");
     send_to_inbox(
         &st2::message::inbox_dir(&root.join("hetz/st2-claude")),
         "hetz.cos-claude",
@@ -104,6 +110,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
         .unwrap();
     assert_eq!(st2c.status, State::Busy);
     assert_eq!(st2c.name.as_deref(), Some("st2 owner"));
+    assert_eq!(st2c.description.as_deref(), Some("Own st2 delivery"));
     assert!(!st2c.retired);
     assert_eq!(
         st2c.inbox, 1,
@@ -201,7 +208,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     );
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "h.live\tavailable\t\nh.retired\tbusy\t\t[retired]\n"
+        "h.live\tavailable\t\t\nh.retired\tbusy\t\t\t[retired]\n"
     );
 }
 

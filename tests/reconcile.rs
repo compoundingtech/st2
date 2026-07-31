@@ -368,6 +368,8 @@ fn spec(
 ) -> AgentSpec {
     AgentSpec {
         identity: identity.to_string(),
+        name: None,
+        description: None,
         host: host.map(String::from),
         role: None,
         job_type,
@@ -448,6 +450,65 @@ fn all_tasks_live_is_adopted() {
     let plan = reconcile(&specs, &sessions, HOST);
     assert!(plan.launch.is_empty());
     assert_eq!(plan.adopt.len(), 1);
+}
+
+#[test]
+fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
+    let mut owner = svc(
+        "worker",
+        Some(HOST),
+        vec![
+            task(
+                TaskKind::Pty,
+                "agent",
+                Some("hetz.worker"),
+                Some("codex"),
+            ),
+            task(
+                TaskKind::Pty,
+                "shell",
+                Some("hetz.worker.shell"),
+                Some("sh"),
+            ),
+        ],
+    );
+    owner.name = Some("Build owner".to_owned());
+    owner.description = Some("Owns build delivery".to_owned());
+    let specs = [owner];
+    let plan = reconcile(
+        &specs,
+        &[live("hetz.worker"), live("hetz.worker.shell")],
+        HOST,
+    );
+
+    assert!(plan.launch.is_empty());
+    assert!(plan.teardown.is_empty());
+    assert!(plan.gc.is_empty());
+    assert_eq!(plan.presentation.len(), 2);
+    let primary = plan
+        .presentation
+        .iter()
+        .find(|item| item.pty_id == "hetz.worker")
+        .unwrap();
+    assert_eq!(primary.display_name, Some(Some("Build owner".to_owned())));
+    assert_eq!(
+        primary.tags,
+        BTreeMap::from([
+            ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
+            ("agent.actor.path".to_owned(), Some("hetz.worker".to_owned())),
+            (
+                "agent.presentation.description".to_owned(),
+                Some("Owns build delivery".to_owned()),
+            ),
+        ])
+    );
+    let secondary = plan
+        .presentation
+        .iter()
+        .find(|item| item.pty_id == "hetz.worker.shell")
+        .unwrap();
+    assert_eq!(secondary.display_name, None);
+    assert_eq!(secondary.tags, primary.tags);
 }
 
 #[test]

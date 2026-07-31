@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
-use agent_spec::spec::{Restart, RestartMode, parse_duration};
+use agent_spec::spec::{
+    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, Restart, RestartMode, parse_duration,
+    validate_presentation,
+};
 
 /// A parsed st2 spec: a base team (`st2 up` boots this) plus an optional `eval` (`st2 eval` runs it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,8 @@ pub struct Spec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecAgent {
     pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
     pub workspace: Option<String>,
     /// This agent's supervisor (the id its crash escalates to). The chain of `supervisor` fields is
     /// walked to the root (the root's is `None` — that is the cos) for crash-ding escalation.
@@ -389,6 +394,8 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
     let name = arg(node).ok_or_else(|| anyhow::anyhow!("agent needs an id"))?;
     let id = if prefix.is_empty() { name } else { format!("{prefix}.{name}") };
 
+    let mut display_name = None;
+    let mut description = None;
     let mut workspace = None;
     let mut supervisor = None;
     let mut agent_env = BTreeMap::new();
@@ -406,6 +413,8 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
         for c in ch.nodes() {
             match c.name().value() {
                 "env" => {}
+                "name" => display_name = arg(c),
+                "description" => description = arg(c),
                 "workspace" => workspace = arg(c),
                 "supervisor" => supervisor = arg(c),
                 "command" => command = arg(c),
@@ -456,13 +465,21 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
                     });
                 }
                 other => anyhow::bail!(
-                    "agent '{id}': unexpected node '{other}' (expected workspace|supervisor|env|command|ding|exec)"
+                    "agent '{id}': unexpected node '{other}' (expected name|description|workspace|supervisor|env|command|ding|exec)"
                 ),
             }
         }
+        validate_presentation("name", display_name.as_deref(), AGENT_NAME_MAX_CHARS)?;
+        validate_presentation(
+            "description",
+            description.as_deref(),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )?;
         let env = cascade(parent_env, &agent_env);
         return Ok(SpecAgent {
             id: id.clone(),
+            name: display_name,
+            description,
             workspace,
             supervisor,
             env,

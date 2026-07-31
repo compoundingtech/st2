@@ -490,7 +490,7 @@ fn up_once_never_mutates_the_ambient_codex_config_before_account_selection() {
 }
 
 #[test]
-fn missing_hooks_do_not_rewrite_or_stop_an_already_live_codex_agent() {
+fn missing_hooks_defer_workspace_but_reconcile_live_presentation_without_lifecycle_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
     let workspace = tmp.path().join("workspace");
@@ -542,8 +542,8 @@ fn missing_hooks_do_not_rewrite_or_stop_an_already_live_codex_agent() {
     let pty_actions = fs::read_to_string(&pty_log).unwrap_or_default();
     assert_eq!(
         pty_actions.lines().collect::<Vec<_>>(),
-        ["list --json"],
-        "the existing Codex session must be adopted without run, kill, or remove"
+        ["list --json", "metadata patch --id h.worker"],
+        "the existing Codex session may receive exact-ID metadata but no run, kill, or remove"
     );
     assert!(!hooks_root.exists());
 }

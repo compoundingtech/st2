@@ -1274,6 +1274,7 @@ mod generation_tests {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            presentation: None,
         }
     }
 

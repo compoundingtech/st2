@@ -212,6 +212,7 @@ impl DingExecBackend for SystemDingExecBackend {
             tags: BTreeMap::new(),
             env: desired.canonical_env.clone(),
             keep: false,
+            presentation: None,
         };
         let generation = self
             .inner

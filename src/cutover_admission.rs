@@ -3689,6 +3689,8 @@ mod tests {
         };
         let spec = agent_spec::spec::AgentSpec {
             identity: "worker".to_owned(),
+            name: None,
+            description: None,
             host: Some("test-host".to_owned()),
             role: None,
             job_type: agent_spec::spec::JobType::Service,

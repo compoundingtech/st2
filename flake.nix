@@ -4,9 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Packaged PTY fleet-observation gate: the exact `pty list --json` producer revision with
-    # ambiguity-safe PID reads, EPERM handling, and one fleet-wide socket fallback budget.
-    pty.url = "github:compoundingtech/pty/afeb3b6234b7010b7db802fd029766ad17c14219";
+    # Exact PTY producer revision for ambiguity-safe lookup and atomic exact-ID metadata patches.
+    pty.url = "github:compoundingtech/pty/4c67fb51a161b66e949b5be905ca9164f7a04c99";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 

@@ -206,6 +206,10 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Set or clear an agent's human-facing name without changing stable identity.
+    Rename(PresentationArgs),
+    /// Set or clear an agent's enduring responsibility description.
+    Describe(PresentationArgs),
     /// Transactionally publish one canonical Agent Spec into the live catalog.
     #[command(subcommand)]
     Agent(AgentCmd),
@@ -418,6 +422,28 @@ enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Args)]
+struct PresentationArgs {
+    /// Exact bus identity, or a bare stable identity only when unique in the selected catalog.
+    identity: String,
+    /// Presentation text. Use --clear to remove the field.
+    #[arg(
+        value_name = "TEXT",
+        required_unless_present = "clear",
+        conflicts_with = "clear"
+    )]
+    value: Option<String>,
+    /// Remove the optional field.
+    #[arg(long)]
+    clear: bool,
+    /// Emit a stable JSON receipt or classified refusal.
+    #[arg(long)]
+    json: bool,
+    /// Host used only to resolve declarations whose host is omitted.
+    #[arg(long)]
+    host: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -835,6 +861,10 @@ fn main() -> Result<()> {
             interval,
         } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
+        Command::Describe(args) => {
+            presentation_cmd(st2::agent_author::PresentationField::Description, args)
+        }
         Command::Cutover(cmd) => cutover_cmd(cmd, catalog_path.as_deref()),
         Command::Agent(AgentCmd::Publish {
             spec,
@@ -1127,6 +1157,69 @@ fn main() -> Result<()> {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "st2", &mut std::io::stdout());
             Ok(())
+        }
+    }
+}
+
+fn presentation_cmd(
+    field: st2::agent_author::PresentationField,
+    args: PresentationArgs,
+) -> Result<()> {
+    let PresentationArgs {
+        identity,
+        value,
+        clear,
+        json,
+        host,
+    } = args;
+    let root = catalog_arg(None)?;
+    let host = host.unwrap_or_else(detect_host);
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let requested = if clear { None } else { value.as_deref() };
+    match st2::agent_author::set_presentation(
+        &root,
+        &identity,
+        &host,
+        actor.as_deref(),
+        field,
+        requested,
+    ) {
+        Ok(receipt) => {
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                let state = match (receipt.result, receipt.value.as_deref()) {
+                    (st2::agent_author::AuthorOutcome::Changed, Some(value)) => {
+                        format!("set to {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Changed, None) => "cleared".to_owned(),
+                    (st2::agent_author::AuthorOutcome::Unchanged, Some(value)) => {
+                        format!("already {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Unchanged, None) => {
+                        "already clear".to_owned()
+                    }
+                };
+                println!("{} {}: {state}", receipt.identity, field.as_str());
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "error",
+                        "code": error.code(),
+                        "identity": identity,
+                        "field": field,
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(error.into())
         }
     }
 }
@@ -1992,10 +2085,11 @@ fn agents_cmd(
         for r in &rows {
             let retired = if r.retired { "\t[retired]" } else { "" };
             println!(
-                "{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 r.name.as_deref().unwrap_or(""),
+                r.description.as_deref().unwrap_or(""),
                 retired,
             );
         }

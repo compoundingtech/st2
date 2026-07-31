@@ -43,6 +43,9 @@ accepted.
   lifecycle meaning; discovery excludes `.git` and `.st2` control directories
   at any depth, the catalog-root `pty` runtime directory, and state namespaces
   directly owned by a declaration.
+  The positional agent identity remains the stable automation ID. Optional
+  `name` and `description` fields are presentation only, may be
+  absent or non-unique, and never become routing aliases.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
 
@@ -79,6 +82,9 @@ accepted.
   control plane adopts those existing processes by stable identity and starts
   only genuinely missing work. Stopping an agent is a separate, explicit
   lifecycle action.
+  Changing or clearing presentation metadata is not a lifecycle action and
+  must preserve the PTY, PID, task generation, inbox, context, Resources, and
+  supervisor binding.
 
 ### Must externalize agent state and scope
 
@@ -86,6 +92,8 @@ accepted.
   presence, declared activity status, current plan, and current plan step
   without PTY or transcript inspection. Presence and activity status are
   distinct, and stale state is identifiable.
+  Machine and human rosters expose stable identity separately from optional
+  presentation metadata and never read a sibling display-name file.
 - **R09 State continuity:** An agent's current work and durable decisions
   can survive process replacement without depending on its transcript.
 - **R10 Agent-only identity:** st2 models agents. Non-agent identities are
@@ -94,6 +102,8 @@ accepted.
 - **R13 Shortest-path reconciliation:** An event is evidence, not permission
   to run the world. st2 classifies source, path, kind, and affected identity,
   then takes the shortest correct path from observed state to desired state.
+  Presentation-only declaration changes take a metadata-reconciliation path
+  outside launch, replacement, garbage collection, and flapping accounting.
 - **R14 Explicit filesystem-event contracts:** Every watcher is deny-by-default
   with exact roots, paths, mutation kinds, semantic meaning, debounce policy,
   and consumer. Reads, opens, unknown paths, and runtime output never trigger
@@ -114,6 +124,8 @@ accepted.
   gates, PTY inspection, and plan execution are limited to the selected
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
+  Stable IDs alone select and authorize automation; presentation values never
+  resolve a message, Resource, status, lifecycle, or authoring target.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
   order-independent Resource bindings. Each binding has a non-empty, agent-local
   unique name and preserves a non-empty, opaque type discriminator and an RFC
@@ -303,3 +315,28 @@ accepted.
   entering successor supervision. It never reopens transaction or predecessor
   authority. A mismatched history fails closed rather than beginning a new
   cutover.
+
+- **R26 Bounded presentation contract:** Agent Specs may declare optional,
+  non-empty, bounded `name` and `description` strings in canonical KDL and the
+  readable TOML/JSON forms. `name` is a mutable human label and `description`
+  is an enduring responsibility boundary. Omission means absence; there is no
+  fallback or second source of truth.
+- **R27 Constrained presentation authoring:** `st2 rename` and `st2 describe`
+  set or clear only their corresponding direct field in one
+  canonical KDL declaration. The commands preserve unrelated source bytes,
+  serialize through the catalog authoring lock, reject a stale source before
+  atomic replacement, and return classified receipts. TOML, JSON, Nix-owned
+  declarations, stable-ID changes, and malformed or ambiguous targets fail
+  closed. A catalog agent may edit itself or a descendant reached through
+  declared supervisor edges; an operator outside a managed agent context may
+  use the same constrained operation. This is an operational admission
+  boundary inside the trusted private fleet, not OS security isolation.
+- **R28 Live PTY presentation projection:** For a healthy exact stable task,
+  st2 reconciles the owning agent's optional name to native PTY display
+  metadata and publishes a versioned st2-owned tag snapshot containing stable
+  actor identity plus optional description. It preserves unrelated
+  tags, removes absent owned values, retries visible partial failure, and is
+  idempotent. Projection uses exact PTY task IDs only; it never falls back to a
+  human display-name resolver and never restarts the task. Secondary tasks
+  preserve their task-specific identity and presentation unless an explicit
+  deterministic projection says otherwise.

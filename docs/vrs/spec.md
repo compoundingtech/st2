@@ -60,6 +60,54 @@ materialization, frozen routing after declaration removal, singleton
 completion, custom task-ID supervision/logging/teardown, and the no-opt-in
 legacy control in `tests/eval_run_e2e.rs`.
 
+## Stable identity and mutable presentation (R02, R08, R11, R13, R19, R26-R28)
+
+The positional value in `agent "<identity>"` remains the stable Agent Spec ID.
+The supported child/TOML/JSON `identity` spelling and the roster JSON
+`identity` field remain unchanged. Host qualification produces the existing
+`<host>.<identity>` bus ID. Only that stable identity controls routing,
+selectors, supervisor edges, task IDs, durable paths, Resources,
+authorization, and lifecycle reconciliation.
+
+An Agent Spec may additionally carry two direct optional strings:
+
+```kdl
+agent "worker" {
+  host "host"
+  name "Release worker"
+  description "Owns release preparation and verification."
+}
+```
+
+`name` is a non-unique human label and `description` is the enduring
+responsibility boundary. Omission is the only cleared representation. Name is
+limited to 160 Unicode scalars and description to 1,000. Explicit empty,
+surrounding-whitespace, multiline, control-character, or over-limit values are
+invalid. The declaration is the
+sole source of truth; `<agent-dir>/name` is not read, projected, or maintained.
+
+`st2 rename` and `st2 describe` accept one stable selector
+and either a value or `--clear`. They edit canonical KDL only. Under the
+persistent exclusive catalog-authoring lock, st2 resolves one declaration,
+checks the caller's `ST_AGENT` self/descendant relationship when present,
+refuses `meta { managed-by "nix" }`, applies one span-bounded edit, reparses the
+candidate, rechecks the original source bytes, and atomically replaces and
+fsyncs the declaration. TOML/JSON authoring and stable-ID rename do not exist.
+The classified refusal codes are an operational trusted-fleet boundary; they
+do not claim adversarial OS isolation from another process that can write the
+catalog directly.
+
+For each healthy managed primary agent PTY, presentation reconciliation uses
+the exact stable PTY task ID. `name` maps only to native `displayName`; it is
+not duplicated into a tag. st2 owns a versioned tag snapshot containing
+`agent.actor.path=<host>.<identity>` plus optional description,
+while every unrelated tag is preserved. Clearing a field clears only its
+native or owned projection. Repeated reconciliation is a no-op. A failed
+metadata projection is reported as degraded and retried by the ordinary loop;
+it never enters launch, teardown, garbage collection, or flapping accounting.
+Secondary PTYs retain their task-specific display identity unless a separate
+deterministic task convention explicitly defines a presentation.
+
 ## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:
