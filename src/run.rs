@@ -332,9 +332,10 @@ impl PtyCli {
     /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
     /// env can be unit-tested without spawning anything.
     ///
-    /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
-    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// `$VAR`s are expanded here for task-authored values that do NOT pass through a shell — env,
+    /// tags, `cwd`, and direct argv — because `pty` passes them through verbatim. The st2-owned
+    /// presentation snapshot remains literal so initial spawn and later metadata patches agree.
+    /// Shell source is left unexpanded: `sh -c` expands it at spawn from the same env.
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -362,7 +363,11 @@ impl PtyCli {
             }
         }
         cmd.arg("--cwd").arg(&cwd);
-        let mut tags = target.tags.clone();
+        let mut tags = target
+            .tags
+            .iter()
+            .map(|(key, value)| (key.clone(), self.expand(value)))
+            .collect::<BTreeMap<_, _>>();
         if let Some(presentation) = &target.presentation {
             for (key, value) in &presentation.tags {
                 match value {
@@ -376,7 +381,7 @@ impl PtyCli {
             }
         }
         for (k, v) in &tags {
-            cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
+            cmd.arg("--tag").arg(format!("{k}={v}"));
         }
         // Managed agent and DING sessions retain PTY exit evidence until the lifecycle owner records
         // the receipt and explicitly removes the generation. This prevents face607 clean-exit reaping
@@ -2179,6 +2184,9 @@ mod tests {
 
     #[test]
     fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
+        let key = "ST2_TEST_PRESENTATION_LITERAL_71c";
+        unsafe { std::env::set_var(key, "expanded") }
+
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "codex");
         t.bus_id = "hetz.demo".to_owned();
@@ -2195,7 +2203,10 @@ mod tests {
                     "agent.actor.path".to_owned(),
                     Some("hetz.demo".to_owned()),
                 ),
-                ("agent.presentation.description".to_owned(), None),
+                (
+                    "agent.presentation.description".to_owned(),
+                    Some(format!("${key}")),
+                ),
             ]),
         });
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
@@ -2214,11 +2225,7 @@ mod tests {
         assert!(tags.contains("unrelated=preserved"));
         assert!(tags.contains("agent.presentation.schema=1"));
         assert!(tags.contains("agent.actor.path=hetz.demo"));
-        assert!(
-            !tags
-                .iter()
-                .any(|tag| tag.starts_with("agent.presentation.description="))
-        );
+        assert!(tags.contains("agent.presentation.description=$ST2_TEST_PRESENTATION_LITERAL_71c"));
     }
 
     #[test]
