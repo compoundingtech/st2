@@ -27,9 +27,10 @@ PR base.
 <h3 id="f01">F01 Source form or path</h3>
 
 Formatting, comments, order, and a source path change are `no-op` only when all
-normalized fields, render plans, task IDs, fallback `cwd`, state anchors, and
-Resource anchors match. Otherwise, classify the changed effect. A `no-op`
-writes and notifies nothing but does not block healing of absent or dead work.
+normalized fields, render plans, task IDs, fallback `cwd`, exact resolved paths,
+and Resource references match. Otherwise, classify the changed effect. A
+`no-op` writes and notifies nothing but does not block healing of absent or dead
+work.
 
 Authoring: [pinned discovery, identity, and host][evals-discovery]. st2 source:
 [KDL parser](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
@@ -159,7 +160,8 @@ Evidence: [policy planning](../../../src/reconcile.rs).
 <h3 id="f13">F13 <code>retired #true</code></h3>
 
 Fence, stop, and clean every declared ID with exact ownership proof, and prevent
-relaunch. A child removed in the same change still uses F02, F09, or F10 proof.
+relaunch. An agent identity removal in the same change uses F02. A child removal
+uses F09 or F10 proof.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::retired`](../../../crates/agent-spec/src/spec.rs). Evidence:
@@ -167,9 +169,9 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 
 <h3 id="f14">F14 Compact agent fields</h3>
 
-Compact `command`, `argv`, `env`, `lifecycle`, and `ding` lower to the generated
-agent PTY and sidecar. The tasks use F09, F11, and F12. Compact syntax adds no
-other behavior.
+Compact `command`, `argv`, `env`, `lifecycle`, and `ding` convert to the
+generated agent PTY and sidecar. The tasks use F09, F11, and F12. Compact syntax
+adds no other behavior.
 
 Authoring: [pinned compact tasks][evals-tasks]. That document and st2 `9887b28`
 predate compact `argv` and `lifecycle`. Current st2 source:
@@ -180,8 +182,8 @@ predate compact `argv` and `lifecycle`. Current st2 source:
 
 Core st2 ignores `harness`, `model`, `persona`, `permissions`, `transport`,
 `strategy`, `meta`, and provider extensions. They do not change core equality,
-wake behavior, or actions. Providers may lower them into F05 through F14; core
-acts only on that concrete output.
+wake behavior, or actions. Providers may convert them into F05 through F14;
+core acts only on that concrete output.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [KDL field boundary](../../../crates/agent-spec/src/kdl_format.rs). Evidence:

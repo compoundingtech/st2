@@ -38,14 +38,15 @@ Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
   source path change are `no-op` only when every normalized effect is equal.
   A source-only `no-op` authorizes no write or notification. It does not block
   healing of independently absent or dead work. A provider field has no core
-  effect until a provider lowers it into core fields.
+  effect until a provider converts it into core fields.
 
 - **SPEC-R02 Do not change work whose proof is incomplete.** Before a change,
   validate all input that can affect the related agents, tasks, and files.
-  Prove the current owner of each affected process and file. Partial, unreadable,
-  ambiguous, or conflicting input retains the latest locally proved ownership.
-  It never proves removal. Destructive action requires proof that binds the
-  exact catalog, host, owner, task ID, and live incarnation (one task generation).
+  Prove the current owner of each affected process and file. When input is
+  partial, unreadable, ambiguous, or conflicting, st2 retains the latest locally
+  proved ownership. Such input never proves removal. Destructive action requires
+  proof that binds the exact catalog, host, owner, task ID, and live incarnation
+  (one task generation).
   Work without this proof stays in `hold`. Independent agents, tasks, and files
   can proceed when their input and ownership proof are complete. No prior
   synchronized snapshot, deletion record, or CAS is required.
