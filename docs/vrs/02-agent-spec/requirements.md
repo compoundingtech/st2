@@ -42,8 +42,11 @@
 - **Replacement authority** is explicit permission to replace one exact
   incarnation.
 - A **destructive action** removes a file or stops, retires, or replaces work.
-- **DING** is a terminal notice that tells an agent to read its inbox.
-  st2 tries to send DING but does not guarantee delivery.
+- **DING** is a best-effort delivery attempt.
+  It tells an agent to read its inbox.
+  st2 does not guarantee delivery.
+  A configured adapter can use terminal input or a post-turn hook.
+  This contract does not require terminal input or harness-specific behavior.
 - A **PTY task** is an interactive terminal task.
 - An **exec task** is a non-interactive task.
 - The **CLI** is the st2 command-line interface.
