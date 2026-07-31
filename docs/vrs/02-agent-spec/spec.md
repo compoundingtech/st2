@@ -281,8 +281,8 @@ replacement of drifted work.
   is unspecified. [Parser](../../../crates/agent-spec/src/kdl_format.rs)
 - **G09, F17 release ordering:** source authoring requires Nix emitters to mark
   generated declarations before the compatible st2 binary is activated. The
-  pinned PTY dependency provides the exact-ID atomic metadata-patch API, but
-  remains a draft merge dependency.
+  pinned merged PTY dependency provides the exact-ID atomic metadata-patch API;
+  compatible st2 and Nix provenance adoption must still deploy as one gated cohort.
 
 ## Acceptance cases
 

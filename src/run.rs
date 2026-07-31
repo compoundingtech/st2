@@ -322,6 +322,13 @@ impl PtyCli {
         // last-wins, then forcibly injects the new session's own PTY_SESSION identity.
         let managed_env = self.managed_task_env(target);
         cmd.envs(&managed_env);
+        // Coding-agent command runners commonly set NO_COLOR for their own captured output. That
+        // ambient preference belongs to the launcher, not to the interactive agent it happens to
+        // reconcile. Agent Spec env remains authoritative when an agent deliberately opts out.
+        if target.name == "agent" && !target.env.contains_key("NO_COLOR") {
+            cmd.env_remove("NO_COLOR");
+            cmd.arg("--unset-env").arg("NO_COLOR");
+        }
         for (key, value) in &managed_env {
             let mut assignment = key.clone();
             assignment.push("=");
@@ -537,6 +544,20 @@ impl PtyCli {
     }
 }
 
+/// Apply both assignments and removals from an inner command to its isolation wrapper.
+fn apply_command_env(source: &Command, target: &mut Command) {
+    for (key, value) in source.get_envs() {
+        match value {
+            Some(value) => {
+                target.env(key, value);
+            }
+            None => {
+                target.env_remove(key);
+            }
+        }
+    }
+}
+
 impl Runner for PtyCli {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         Ok(self
@@ -562,10 +583,6 @@ impl Runner for PtyCli {
         let args: Vec<OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
         let arg_refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
         let unit = crate::isolate::scope_unit(&target.pty_id);
-        let envs: Vec<(OsString, OsString)> = inner
-            .get_envs()
-            .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
-            .collect();
 
         // Atomic reap-then-respawn: a session id JUST reaped in this same pass (execute's
         // reap-then-respawn after a hard-kill) can linger microseconds in the per-session pty daemon —
@@ -578,9 +595,7 @@ impl Runner for PtyCli {
         let mut last_err = String::new();
         for attempt in 0..SPAWN_ATTEMPTS {
             let mut cmd = crate::isolate::wrap(&unit, program.as_os_str(), &arg_refs);
-            for (k, v) in &envs {
-                cmd.env(k, v);
-            }
+            apply_command_env(&inner, &mut cmd);
             let out = cmd.output()?;
             if out.status.success() {
                 return Ok(());
@@ -2255,11 +2270,13 @@ mod tests {
         }
         let inherited = cmd
             .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.unwrap().to_string_lossy().into_owned(),
-                )
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
@@ -2366,6 +2383,96 @@ mod tests {
                 .is_some_and(|path| !path.contains("/sets/sha256-")),
             "managed tasks keep ST_HOOKS at the receipt-bearing root; only rendered hook commands use a versioned set"
         );
+    }
+
+    #[test]
+    fn managed_agent_scrubs_ambient_no_color_unless_explicitly_declared() {
+        let cli = PtyCli::default();
+        let agent = target("hetz.demo.agent", "exec claude 'boot'");
+        let command = cli.build_run_command(&agent, Path::new("/cat/hetz/demo"));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("NO_COLOR"))
+                .map(|(_, value)| value),
+            Some(None),
+            "ambient NO_COLOR must not silently disable an interactive agent's color"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "the removal must be persisted for PTY restart"
+        );
+
+        let mut explicit = target("hetz.explicit.agent", "exec claude 'boot'");
+        explicit.env.insert("NO_COLOR".into(), "1".into());
+        let command = cli.build_run_command(&explicit, Path::new("/cat/hetz/explicit"));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("NO_COLOR"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("1")),
+            "an explicit Agent Spec NO_COLOR remains authoritative"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "an explicit assignment must not also persist a removal"
+        );
+    }
+
+    #[test]
+    fn non_agent_task_does_not_claim_no_color_policy() {
+        let cli = PtyCli::default();
+        let mut task = target("hetz.demo.sidecar", "exec sleep 1");
+        task.name = "sidecar".into();
+        let command = cli.build_run_command(&task, Path::new("/cat/hetz/demo"));
+
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != OsStr::new("NO_COLOR")),
+            "non-agent services keep the caller's ambient NO_COLOR semantics"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "non-agent services must not persist an st2-owned removal"
+        );
+    }
+
+    #[test]
+    fn isolation_wrapper_preserves_environment_removals() {
+        let mut inner = Command::new("pty");
+        inner.env("TERM", "xterm-256color").env_remove("NO_COLOR");
+        let mut outer = Command::new("systemd-run");
+
+        apply_command_env(&inner, &mut outer);
+
+        let env = outer
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(OsStr::new("TERM")).and_then(Option::as_deref),
+            Some(OsStr::new("xterm-256color"))
+        );
+        assert_eq!(env.get(OsStr::new("NO_COLOR")), Some(&None));
     }
 
     #[test]

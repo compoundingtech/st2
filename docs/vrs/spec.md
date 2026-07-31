@@ -200,6 +200,15 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   before launch: the command may select an account-specific `CODEX_HOME` only
   after st2 starts it. `st2 pretrust` remains an explicit operator utility for
   commands that intentionally use the ambient Claude and Codex configs.
+
+  The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
+  launcher preference rather than agent policy. Unless the Agent Spec declares
+  `NO_COLOR`, st2 removes it from the launch environment and records the removal
+  in the PTY launch definition. An explicit Agent Spec assignment takes
+  precedence. Isolation wrappers preserve both assignments and removals, so a
+  manual PTY restart under a different ambient environment reconstructs the
+  same effective color policy. Adoption of an already-live task remains
+  non-mutating: this policy is applied only when st2 creates a generation.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both

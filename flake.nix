@@ -4,9 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Packaged PTY dependency: the exact reviewed revision with atomic metadata patching and the
+    # Packaged PTY dependency: the merged revision with atomic metadata patching and the
     # fleet-observation guarantees required by st2 reconciliation.
-    pty.url = "github:compoundingtech/pty/0deb3f0ad6eb07f30ad9dea6392b843d4495ad5f";
+    pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -314,6 +314,7 @@
             pkgs.rustfmt
             pkgs.rust-analyzer
             pkgs.git
+            pty.packages.${system}.default
           ];
         };
       }
