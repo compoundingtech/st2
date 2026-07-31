@@ -4,9 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Packaged PTY fleet-observation gate: the exact `pty list --json` producer revision with
-    # ambiguity-safe PID reads, EPERM handling, and one fleet-wide socket fallback budget.
-    pty.url = "github:compoundingtech/pty/afeb3b6234b7010b7db802fd029766ad17c14219";
+    # Packaged PTY contract: the exact fleet-observation producer revision, including persisted
+    # environment removals used by managed agent restarts.
+    pty.url = "github:compoundingtech/pty/d5fabc3917407aeb937a012bd97679c303e18033";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -314,6 +314,7 @@
             pkgs.rustfmt
             pkgs.rust-analyzer
             pkgs.git
+            pty.packages.${system}.default
           ];
         };
       }

@@ -19,7 +19,7 @@ implementation changes. Nathan must approve changes to `docs/vrs/vision.md` or
 Prerequisites:
 
 - Rust and Cargo;
-- `pty` on `PATH`;
+- `pty` on `PATH` with `pty run --unset-env` support;
 - at least one supported harness on `PATH`: `codex` or `claude`;
 - Git when a declaration materializes workspace files;
 - Bash and `jq` on `PATH` when lifecycle hooks are enabled.
@@ -33,6 +33,13 @@ pty --help
 st2 hooks install
 st2 hooks verify
 ```
+
+When upgrading, deploy and activate the compatible `pty` before this version of
+`st2`. An older `pty` may silently ignore the unknown `--unset-env` option and
+still launch the agent without persisting the removal. The initial environment
+can therefore look correct while a later restart reintroduces the caller's
+ambient value. The Nix input and development shell pin the compatible artifact;
+Cargo installs rely on the operator to satisfy this runtime prerequisite.
 
 The standard catalog is:
 
