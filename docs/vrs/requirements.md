@@ -51,7 +51,10 @@ accepted.
 - **R04 Root supervision:** Every machine has exactly one root agent. The
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
-  recovery, and escalates what it cannot resolve.
+  recovery, and escalates what it cannot resolve. Every supervisor, one-shot
+  reconcile, workspace materializer, and exact-retirement transaction for one
+  `(canonical catalog, host)` retains the same persistent kernel `flock`;
+  diagnostic PID text is never ownership and the lock inode is never removed.
 
 ### Must preserve delivery and launch behavior
 
@@ -188,6 +191,42 @@ accepted.
   entire set on ambiguity or foreign entries, and externalize a create-only
   plan whose digest is the sole apply authority. Apply rechecks the catalog
   root and complete remaining namespace before each resumable per-entry
-  transition. The caller never enumerates paths or derives generations.
+  transition. The immutable plan and completed receipt partition every numeric
+  record exactly once into a successor desired-running canonical Ding or a
+  desired-absent retired Ding, with neither undeclared records nor declaration
+  extras. The caller never enumerates paths or derives generations.
+  A live numeric record has no normal process-generation capability and wall
+  clock or mtime reconstruction is never authority. It is retirable only as
+  `legacy-scope-v1` when the dedicated systemd scope itself proves the complete
+  task boundary: exact runtime-id unit naming, ControlGroup, InvocationID and
+  nonzero monotonic activation identity, pinned cgroup inode, record PID
+  membership, frozen exact members, retained Ding executable/argv/cwd/uid, and
+  no provider/shared scope. Missing or ambiguous evidence remains blocked for
+  natural exit. A positively absent or reused numeric PID is record-only and is
+  never signalled.
+  The journal durably enters a forward-only state before the first cgroup or
+  record mutation. From that point a crash may only resume or complete the
+  exact transaction; it cannot restore the old supervisor trajectory.
   Whole-state-directory rotation is a one-shot consumer operation, not general
   task removal.
+- **R25 Durable cutover admission:** Runtime/workspace mutation and declaration
+  publication remain separate capability domains. Every supervisor, one-shot
+  reconcile, materializer, teardown, and retirement operation requires a
+  non-forgeable `HostMutationLease` for one validated `(canonical catalog,
+  host)`. Agent publication and whole-catalog apply retain their exclusive
+  catalog lock plus digest CAS. One durable active cutover gate admits neither
+  ordinary runtime leases nor ordinary catalog publishers, even after its
+  creating process dies; only its exact typed transaction may advance the
+  recorded retirement, ordered catalog CAS, and single candidate-once phases.
+
+  The gate has no PID, TTL, mtime, or wall-clock stale recovery. Missing,
+  malformed, unknown-schema, or unknown-phase active state fails closed.
+  Candidate invocation is recorded before execution and is never automatically
+  repeated after a crash. Completion moves the exact active record without
+  replacement into durable history rather than unlinking it. Broad `st2 pty`
+  and `st2 shell` lifecycle entry points and service install/change operations
+  refuse while a gate is active. Message, context, Resource, status, and Ding
+  delivery/file state remain available; starting or stopping the Ding process
+  is runtime mutation and remains leased. Direct same-UID writes outside st2
+  are outside the cooperative threat model and are detected by repeated
+  dirfd/inode/hash CAS, never claimed to be kernel-excluded.

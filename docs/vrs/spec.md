@@ -529,7 +529,30 @@ authority; positively stale/reused records carry exact record authority and a
 proof that signaling is unnecessary. Apply checks that the namespace is still
 exactly the original set minus durably completed entries. This is the only
 legacy-classification authority; consumers do not list files, parse PIDs, or
-derive generation ids.
+derive generation ids. The plan and receipt also carry the complete typed
+`legacyPartition`: every numeric record appears exactly once as either a
+successor desired-running canonical Ding or a desired-absent retired Ding, and
+the declared local exec set has no extra row.
+
+The host exclusion path is
+`<canonical-catalog>/.st2.<host>.lock`. It is a persistent inode with a retained
+kernel `flock`; the PID text is diagnostic only. The old supervisor is stopped
+and proven absent before preparation. Preparation and apply each acquire the
+same lock and both run against the same pre-cutover declaration root. The
+durable cutover admission record covers gaps and process crashes; an ordinary
+service restart, reconcile, teardown, materializer, or publisher refuses while
+it is active. Apply still rechecks the exact catalog and remaining state
+namespace. Catalog CAS begins only after the completed retirement receipt.
+
+For a live numeric record, neither PID-file mtime nor reconstructed wall time is
+generation authority. Preparation may issue only `legacy-scope-v1`, never a
+normal generation id, and only after the dedicated scope proves: its exact
+runtime-id unit name; matching systemd ControlGroup, InvocationID, and nonzero
+monotonic activation identity; a pinned cgroup inode; the
+recorded PID as a member; frozen exact membership; retained Ding
+executable/argv/cwd/uid; and no provider/shared scope. Any missing or ambiguous
+witness blocks. A positively dead/reused numeric record is record-only and
+apply performs no signal or cgroup control write.
 
 The operation writes a durable per-request journal under the host-local exec
 state directory and returns `st2.exec-retirement.v1`. Repeating the same request
@@ -543,7 +566,10 @@ prepared -> frozen -> killed -> record-retired -> completed
 At every arrow, recovery reopens and revalidates capabilities rather than
 trusting path names. The generation record moves to a create-only private slot;
 it is never unlinked. Logs are diagnostics, not generation authority, and are
-not part of exact retirement.
+not part of exact retirement. Before the first cgroup-control or record move,
+the journal durably records `forwardOnlyStarted=true`. After that boundary the
+old trajectory cannot be restored; every recovery continues forward or
+preserves a typed conflict.
 
 Only a Linux live generation with a dedicated cgroup-v2 systemd scope is
 retirable. The legacy-set seam additionally permits record-only retirement
@@ -551,6 +577,50 @@ after a positive stale/reused proof and performs no signal or cgroup write for
 that entry. Other platforms and degraded isolation remain observable but
 return a typed unsupported error. PTY tasks continue to use the PTY backend and
 never enter this transaction.
+
+### Durable cutover admission
+
+Admission distinguishes three closed permissions rather than conflating two
+lock domains:
+
+| Permission | Ordinary authority | Active-gate result |
+| --- | --- | --- |
+| `runtime-mutate` | `HostMutationLease(canonical catalog, host)` | typed busy |
+| `catalog-publish` | exclusive catalog lock plus digest CAS | typed busy |
+| `transaction` | exact active cutover record and phase CAS | only recorded next phase |
+
+The active record lives under the catalog control plane and binds its schema,
+canonical catalog, validated host, gate/request identity, source declaration
+digest, closed phase, forward-only state, retirement plan/receipt digests,
+ordered declaration transitions, and candidate invocation/result. It is
+create-only, fsynced, survives process death, and has no time- or PID-based
+reclaim. Unknown or malformed active state is busy, not absent. Finalization
+moves the exact record with no replacement into durable history and fsyncs both
+directories.
+
+Ordinary host mutation acquires the persistent host flock first, then observes
+the gate under the shared catalog lock, and retains the host lease through the
+operation. Gate creation uses the same host-first order and the exclusive
+catalog lock. Ordinary agent publication and catalog apply remain declaration
+transactions: while already holding the exclusive catalog lock they prove that
+no active gate exists. The exact cutover transaction may instead perform only
+its pre-recorded catalog CAS sequence. There is no generic force flag or
+untyped bypass token.
+
+Candidate reconciliation is an in-process, one-use capability. The transaction
+persists `candidate-started` before invoking it and persists its result after
+return. A crash after the first write is indeterminate and cannot invoke the
+candidate again automatically. Status/preflight can report that state without
+mutating it, allowing systemd `ExecStartPre` and publishers to refuse.
+
+The gate covers resident and one-shot reconciliation, selected tasks,
+materialization, teardown, retirement, Ding process lifecycle, broad `st2 pty`
+and `st2 shell` lifecycle passthrough, and service install/change. It does not
+cover message delivery/archive, context, Resource, status, or Ding delivery
+state, which remain usable throughout the cutover. Direct external same-UID
+filesystem or `pty` mutation is outside st2's cooperative writer boundary;
+repeated declaration, inode, membership, and record CAS detects conflicts
+without claiming to prevent them.
 
 ## Open design questions
 
