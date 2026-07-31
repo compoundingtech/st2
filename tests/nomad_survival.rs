@@ -148,7 +148,7 @@ impl Fixture {
   identity "{identity}"
   host "{HOST}"
   type "service"
-{explicit_env}  command #"printf '%s\n' "${{NO_COLOR-unset}}" > "$CATALOG/{identity}.color-env"; exec sleep 120"#
+{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') > "$CATALOG/{identity}.color-env"; exec sleep 120"#
 }}
 "##
         );
@@ -522,6 +522,17 @@ fn managed_agents_do_not_inherit_launcher_no_color_unless_declared() {
     if !pty_gate("managed_agents_do_not_inherit_launcher_no_color_unless_declared") {
         return;
     }
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .expect("this scope-path test requires XDG_RUNTIME_DIR for the systemd user manager");
+    assert!(
+        Path::new(&runtime_dir).is_dir(),
+        "XDG_RUNTIME_DIR must name an existing directory"
+    );
+    assert_eq!(
+        st2::isolate::mode(),
+        st2::isolate::Isolation::Scope,
+        "the NO_COLOR integration must exercise systemd-run, not degraded pass-through"
+    );
     let fx = Fixture::new();
     let ambient_snapshot = fx.write_color_env_agent("ambient-color", false);
     let explicit_snapshot = fx.write_color_env_agent("explicit-color", true);
