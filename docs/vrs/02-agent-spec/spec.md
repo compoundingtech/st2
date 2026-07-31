@@ -11,13 +11,13 @@ before destructive action. Each host acts only on its local projection. Fence
 and remove before a conflicting add. Notify surviving agents only after commit.
 
 A dry-run makes no writes. Dry-run and quiet status name only affected IDs,
-with the change, action or refusal, and proof scope. They include desired and
-observed fingerprints and the exact incarnation when relevant. `hold` waits
-without the requested lifecycle change. `refuse` makes no change because
-validation or proof failed.
+with the change, action or refusal, and what the proof covers. They include
+desired and observed fingerprints and the exact incarnation when relevant.
+`hold` waits without the requested lifecycle change. `refuse` makes no change
+because validation or proof failed.
 
 Each **Authoring** link points to the canonical evals Agent Spec at exact commit
-`b3cd5fbd98c11179a4555d0f9bbccfe98351a734`, which is pinned to st2
+`e9b53e79b05b1c0e1d7eea02db2eaba47376fe05`, which is pinned to st2
 `9887b28`. It is the authoring authority, not proof of current st2 runtime
 behavior. **st2 source** and **Evidence** links show this implementation on the
 PR base.
@@ -59,7 +59,7 @@ Authoring: [pinned discovery and host][evals-discovery]. st2 source:
 <h3 id="f04">F04 <code>type</code></h3>
 
 An omitted value and `service` have the same effect. Any other value refuses
-the owner component before launch, write, or teardown.
+changes to the related agent, tasks, and files before launch, write, or teardown.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`JobType` and `RawSpec::job_type`](../../../crates/agent-spec/src/spec.rs).
@@ -135,7 +135,7 @@ fingerprint. Absent or dead work boots with the latest inputs.
 
 A healthy mismatch stays alive as `drifted` or `unknown`; report both
 fingerprints. Command drift stays visible and does not restart automatically.
-Replacement needs task-scoped authority and a fresh exact-incarnation check.
+Replacement needs authority for that task and a fresh exact-incarnation check.
 An `env` key named `PTY_ROOT` is only a task launch input.
 
 Authoring: [pinned tasks][evals-tasks] and [environment][evals-environment]. The
@@ -147,7 +147,8 @@ Evidence: [spawn construction](../../../src/run.rs).
 
 Agent or task `keep`, restart `attempts`, `interval`, `delay`, and `mode`, and
 task `lifecycle` are future policy. Adopt healthy work. `adopt-only` holds absent
-or dead work; `service` reconciles it normally. Invalid policy refuses the owner.
+or dead work; `service` reconciles it normally. Invalid policy refuses changes
+to the related agent and tasks.
 
 Authoring: [pinned complete declaration][evals-fields]. The
 [pinned explicit-task list][evals-task-fields] and st2 `9887b28` predate task
@@ -188,9 +189,10 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 
 <h3 id="f16">F16 Invalid or incomplete state</h3>
 
-Refuse the smallest affected local component when desired or actual state is
+Refuse changes to an agent, task, or file when its desired or actual state is
 unreadable, invalid, ambiguous, or conflicting. Keep last-known-good ownership
-and perform no destructive action there. Independent proved work can continue.
+and perform no destructive action to that work. Independent agents, tasks, and
+files can continue when their input and ownership proof are complete.
 
 Authoring: [pinned validation, health, and lifecycle][evals-lifecycle]. st2
 source: [`RawSpec` and `AgentSpec`](../../../crates/agent-spec/src/spec.rs).
@@ -227,8 +229,9 @@ from this fixed order:
 6. **VERIFY/REPORT:** verify exact results; roll back only when proved,
    otherwise hold or refuse.
 
-Independent proved components progress separately. The order does not
-coordinate hosts or authorize replacement of drifted work.
+Independent agents, tasks, and files progress separately when their input and
+ownership proof are complete. The order does not coordinate hosts or authorize
+replacement of drifted work.
 
 ## Current implementation gaps
 
@@ -248,7 +251,8 @@ coordinate hosts or authorize replacement of drifted work.
 - **G06, notifications:** inbox and DING exist, but reconciliation writes no
   stable change event. [Message](../../../src/message.rs) and
   [DING](../../../src/ding/mod.rs)
-- **G07, planning/reporting:** st2 has no component transaction or true dry-run;
+- **G07, planning/reporting:** st2 cannot plan and commit all related agent,
+  task, and file changes as one operation, and it has no true dry-run;
   `materialize-only` writes. See [#53](https://github.com/compoundingtech/st2/issues/53)
   and [runner](../../../src/run.rs).
 - **G08, moved intent:** parser, status, and executor support are absent; syntax
@@ -272,14 +276,15 @@ coordinate hosts or authorize replacement of drifted work.
   shared receipt.
 - Moved intent rejects cycles, conflicts, and host changes. It removes before
   add unless a future atomic address change can preserve the process.
-- A refused component does not block independent work. Every result names the
-  affected IDs, action, and proof scope.
+- A refusal for one related set of agents, tasks, or files does not block
+  independent work whose input and ownership proof are complete. Every result
+  names the affected IDs, action, and what the proof covers.
 
-[evals-discovery]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#discovery-identity-and-host
-[evals-fields]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#complete-declaration-shape
-[evals-supported-fields]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#L73-L95
-[evals-tasks]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#compact-and-explicit-tasks
-[evals-task-fields]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#L147-L151
-[evals-environment]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#environment-and-expansion
-[evals-render]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#render-contract
-[evals-lifecycle]: https://github.com/compoundingtech/evals/blob/b3cd5fbd98c11179a4555d0f9bbccfe98351a734/AGENT-SPEC.md#validation-health-and-lifecycle
+[evals-discovery]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#discovery-identity-and-host
+[evals-fields]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#complete-declaration-shape
+[evals-supported-fields]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#L79-L101
+[evals-tasks]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#compact-and-explicit-tasks
+[evals-task-fields]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#L153-L157
+[evals-environment]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#environment-and-expansion
+[evals-render]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#render-contract
+[evals-lifecycle]: https://github.com/compoundingtech/evals/blob/e9b53e79b05b1c0e1d7eea02db2eaba47376fe05/AGENT-SPEC.md#validation-health-and-lifecycle
