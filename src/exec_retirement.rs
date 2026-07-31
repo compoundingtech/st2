@@ -1135,11 +1135,9 @@ fn apply_target(
                             recoverable(error, "persist pinned cgroup membership")
                         })?;
                         test_checkpoint("after-membership-journal");
-                        cgroup
-                            .kill_all(&pinned)
-                            .map_err(|error| {
-                                recoverable(format!("{error:#}"), "kill exact exec cgroup")
-                            })?;
+                        cgroup.kill_all(&pinned).map_err(|error| {
+                            recoverable(format!("{error:#}"), "kill exact exec cgroup")
+                        })?;
                         test_checkpoint("after-cgroup-kill");
                         journal
                             .items

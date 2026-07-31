@@ -594,10 +594,7 @@ agent "freeze" {
         .arg(&catalog)
         .args(apply_args)
         .env("XDG_STATE_HOME", &xdg)
-        .env(
-            "ST2_TEST_EXEC_RETIREMENT_CRASH_AT",
-            "after-cgroup-freeze",
-        )
+        .env("ST2_TEST_EXEC_RETIREMENT_CRASH_AT", "after-cgroup-freeze")
         .output()
         .unwrap();
     assert!(!crashed.status.success());
