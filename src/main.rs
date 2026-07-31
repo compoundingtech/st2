@@ -449,6 +449,15 @@ enum MessageCmd {
         /// Comma-separated tags.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Stable external producer identity. Requires `--event-id` and enables local idempotency.
+        #[arg(long, requires = "event_id")]
+        source: Option<String>,
+        /// Stable producer event identity. Requires `--source` and enables local idempotency.
+        #[arg(long = "event-id", requires = "source")]
+        event_id: Option<String>,
+        /// Print a stable machine-readable send receipt.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -1340,21 +1349,60 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             subject,
             in_reply_to,
             tags,
+            source,
+            event_id,
+            json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
             let dir = message::resolve_inbox(&root, &to, &host);
-            let filename = message::send_to_inbox(
-                &dir,
-                &from,
-                subject.as_deref(),
-                in_reply_to.as_deref(),
-                &tags,
-                &body,
-            )?;
-            println!("{filename}");
+            let (filename, outcome) = match (source.as_deref(), event_id.as_deref()) {
+                (Some(source), Some(event_id)) => {
+                    let receipt = message::send_idempotent_to_inbox(
+                        &dir,
+                        &from,
+                        subject.as_deref(),
+                        in_reply_to.as_deref(),
+                        &tags,
+                        &body,
+                        source,
+                        event_id,
+                    )?;
+                    let outcome = if receipt.created {
+                        "created"
+                    } else {
+                        "deduplicated"
+                    };
+                    (receipt.filename, outcome)
+                }
+                (None, None) => (
+                    message::send_to_inbox(
+                        &dir,
+                        &from,
+                        subject.as_deref(),
+                        in_reply_to.as_deref(),
+                        &tags,
+                        &body,
+                    )?,
+                    "created",
+                ),
+                _ => unreachable!("clap requires --source and --event-id together"),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&SendReceiptJson {
+                        recipient: &to,
+                        filename: &filename,
+                        receipt_id: &filename,
+                        outcome,
+                    })?
+                );
+            } else {
+                println!("{filename}");
+            }
             Ok(())
         }
         MessageCmd::Reply {
@@ -1473,6 +1521,15 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             if !m.tags.is_empty() {
                 println!("tags:        {}", m.tags.join(", "));
             }
+            if let Some(source) = &m.source {
+                println!("source:      {source}");
+            }
+            if let Some(event_id) = &m.event_id {
+                println!("event-id:    {event_id}");
+            }
+            if let Some(receipt_id) = &m.receipt_id {
+                println!("receipt-id:  {receipt_id}");
+            }
             println!();
             print!("{}", m.body);
             Ok(())
@@ -1522,6 +1579,16 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     }
 }
 
+/// `st2 message send --json` — the stable result of a normal or idempotent send.
+#[derive(serde::Serialize)]
+struct SendReceiptJson<'a> {
+    recipient: &'a str,
+    filename: &'a str,
+    #[serde(rename = "receiptId")]
+    receipt_id: &'a str,
+    outcome: &'a str,
+}
+
 /// `st2 message ls --json` row (stable st2 wire contract).
 #[derive(serde::Serialize)]
 struct LsItemJson<'a> {
@@ -1533,6 +1600,12 @@ struct LsItemJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(rename = "receiptId", skip_serializing_if = "Option::is_none")]
+    receipt_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
 }
@@ -1547,6 +1620,9 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            source: m.source.as_deref(),
+            event_id: m.event_id.as_deref(),
+            receipt_id: m.receipt_id.as_deref(),
             body: None,
         }
     }
@@ -1573,6 +1649,12 @@ struct MessageJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(rename = "receiptId", skip_serializing_if = "Option::is_none")]
+    receipt_id: Option<&'a str>,
     body: &'a str,
 }
 
@@ -1586,6 +1668,9 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            source: m.source.as_deref(),
+            event_id: m.event_id.as_deref(),
+            receipt_id: m.receipt_id.as_deref(),
             body: &m.body,
         }
     }

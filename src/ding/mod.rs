@@ -995,6 +995,9 @@ mod tests {
             in_reply_to: None,
             tags: vec![],
             priority: None,
+            source: None,
+            event_id: None,
+            receipt_id: None,
             body: String::new(),
         }
     }

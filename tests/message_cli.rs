@@ -39,6 +39,136 @@ fn list(root: &Path, extra: &[&str]) -> std::process::Output {
     list_identity(root, "bob", extra)
 }
 
+fn send(root: &Path, body: &str, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "bob", "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", "alice", "--message", body])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn archive(root: &Path, filename: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "archive", "bob", filename, "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", "alice"])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn ordinary_send_keeps_its_bytes_output_and_storage_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = send(
+        temporary.path(),
+        "ordinary body",
+        &["--subject", "ordinary"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let filename = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert!(st2::message::is_message_filename(&filename));
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("bob/inbox").join(filename)).unwrap(),
+        "---\nfrom: alice\nsubject: ordinary\n---\nordinary body\n"
+    );
+    assert!(!temporary.path().join("bob/message-receipts").exists());
+}
+
+#[test]
+fn idempotent_send_returns_stable_json_across_inbox_and_archive_retries() {
+    let temporary = tempfile::tempdir().unwrap();
+    let flags = [
+        "--subject",
+        "daily check",
+        "--source",
+        "systemd:daily",
+        "--event-id",
+        "2026-07-31",
+        "--json",
+    ];
+    let first = send(temporary.path(), "first body", &flags);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["recipient"], "bob");
+    assert_eq!(first["outcome"], "created");
+    assert_eq!(first["receiptId"], first["filename"]);
+    let filename = first["filename"].as_str().unwrap();
+
+    let retry = send(temporary.path(), "changed body must not win", &flags);
+    let retry: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry["outcome"], "deduplicated");
+    assert_eq!(retry["filename"], first["filename"]);
+    let message = st2::message::read_msg(&temporary.path().join("bob/inbox"), filename).unwrap();
+    assert_eq!(message.body.trim_end(), "first body");
+    assert_eq!(message.source.as_deref(), Some("systemd:daily"));
+    assert_eq!(message.event_id.as_deref(), Some("2026-07-31"));
+    let listed = list(temporary.path(), &["--count"]);
+    assert!(listed.status.success());
+    assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "1");
+
+    let archived = archive(temporary.path(), filename);
+    assert!(
+        archived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&archived.stderr)
+    );
+    let retry = send(temporary.path(), "another changed body", &flags);
+    let retry: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry["outcome"], "deduplicated");
+    assert_eq!(retry["filename"], first["filename"]);
+    assert!(
+        st2::message::list_dir(&temporary.path().join("bob/inbox"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        st2::message::list_dir(&temporary.path().join("bob/archive"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn idempotency_flags_are_paired_and_different_keys_do_not_deduplicate() {
+    let temporary = tempfile::tempdir().unwrap();
+    let incomplete = send(temporary.path(), "body", &["--source", "producer"]);
+    assert!(!incomplete.status.success());
+    assert!(!temporary.path().join("bob/inbox").exists());
+
+    let first = send(
+        temporary.path(),
+        "one",
+        &["--source", "producer", "--event-id", "one", "--json"],
+    );
+    let second = send(
+        temporary.path(),
+        "two",
+        &["--source", "producer", "--event-id", "two", "--json"],
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(first["outcome"], "created");
+    assert_eq!(second["outcome"], "created");
+    assert_ne!(first["filename"], second["filename"]);
+    assert_eq!(
+        st2::message::list_dir(&temporary.path().join("bob/inbox"))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn since_is_strict_and_composes_with_other_list_filters() {
     let tmp = tempfile::tempdir().unwrap();

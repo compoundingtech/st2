@@ -316,6 +316,30 @@ st2 agents --json --enrich
 st2 context read --full
 ```
 
+Use optional idempotency for a shell producer that can retry one external event:
+
+```sh
+check_status | st2 message send <recipient> \
+  --source systemd:daily-check \
+  --event-id 2026-07-31 \
+  --subject "Daily check" \
+  --json
+```
+
+Pass `--source` and `--event-id` together. st2 stores both values in the message frontmatter. The
+first send returns `outcome: "created"`. A retry for the same resolved recipient and the same pair
+returns the first filename with `outcome: "deduplicated"`. The retry does not create another inbox
+file. It does not cause another DING. The message body is not a deduplication key.
+
+This guarantee applies to one resolved recipient on one local catalog filesystem. It is not a
+global exactly-once guarantee across catalog replicas during a partition. st2 stores claims in the
+agent `resources/message-receipts` directory. Normal message list, read, archive, and thread commands
+ignore that directory. A claim remains after message archive so a later retry returns the first
+receipt. This release does not delete claims automatically. Claim retention is a later policy.
+
+Without the two idempotency flags, `message send` keeps its existing message bytes, filename output,
+and inbox behavior. `--json` is optional for both normal and idempotent sends.
+
 The roster includes retired declarations instead of silently conflating them with runtime
 presence. Both JSON shapes contain `retired` and the declaration's ordered `resources` descriptors;
 `--enrich` additionally supplies `lastActivity` and `inbox`. Human output leaves active rows

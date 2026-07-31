@@ -12,11 +12,14 @@
 //! the catalog for VRS-native, or `$ST_ROOT` for a compat shim).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
 /// a strict subset of what the reader accepts: the frozen bus grammar is `[0-9a-z]{6}`, so a peer
@@ -41,8 +44,30 @@ pub struct Message {
     pub tags: Vec<String>,
     /// `priority:` — `low` | `normal` | `high`, if set.
     pub priority: Option<String>,
+    /// `source:` — the optional external producer identity for idempotent ingress.
+    pub source: Option<String>,
+    /// `event-id:` — the producer's optional stable event identity.
+    pub event_id: Option<String>,
+    /// `receipt-id:` — the stable message filename for idempotent ingress.
+    pub receipt_id: Option<String>,
     /// The markdown body.
     pub body: String,
+}
+
+/// The stable result of one idempotent message ingress attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReceipt {
+    /// The first message filename allocated for this recipient and event key.
+    pub filename: String,
+    /// True only for the attempt that published the durable event claim.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressSeam {
+    BeforeClaimPublication,
+    AfterClaimPublication,
+    BeforeInboxLink,
 }
 
 /// Current unix time in milliseconds.
@@ -106,8 +131,45 @@ pub fn render_message(
     tags: &[String],
     body: &str,
 ) -> String {
+    render_message_fields(
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_message_fields(
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    source: Option<&str>,
+    event_id: Option<&str>,
+    receipt_id: Option<&str>,
+    claim_digest: Option<&str>,
+) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("from: {from}\n"));
+    if let Some(source) = source {
+        s.push_str(&format!("source: {source}\n"));
+    }
+    if let Some(event_id) = event_id {
+        s.push_str(&format!("event-id: {event_id}\n"));
+    }
+    if let Some(receipt_id) = receipt_id {
+        s.push_str(&format!("receipt-id: {receipt_id}\n"));
+    }
+    if let Some(claim_digest) = claim_digest {
+        s.push_str(&format!("claim-digest: {claim_digest}\n"));
+    }
     if let Some(subj) = subject {
         s.push_str(&format!("subject: {subj}\n"));
     }
@@ -140,6 +202,9 @@ fn parse_message(filename: &str, contents: &str) -> Message {
         in_reply_to: None,
         tags: Vec::new(),
         priority: None,
+        source: None,
+        event_id: None,
+        receipt_id: None,
         body: String::new(),
     };
 
@@ -171,6 +236,9 @@ fn parse_message(filename: &str, contents: &str) -> Message {
                         .collect()
                 }
                 "priority" => msg.priority = Some(v.to_string()),
+                "source" => msg.source = Some(v.to_string()),
+                "event-id" => msg.event_id = Some(v.to_string()),
+                "receipt-id" => msg.receipt_id = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -220,6 +288,297 @@ pub fn send_to_inbox(
         "could not allocate a unique message filename in {}",
         inbox_dir.display()
     )
+}
+
+/// Send one external event to an inbox exactly once on this local recipient filesystem.
+///
+/// The durable claim is scoped to `inbox_dir` and `(source, event_id)`. It is not a global
+/// exactly-once claim across replicated catalogs. The first complete claim owns the message bytes
+/// and filename. A retry repairs a missing inbox link from that claim, or returns the same filename
+/// when the message is already in the inbox or archive.
+#[allow(clippy::too_many_arguments)]
+pub fn send_idempotent_to_inbox(
+    inbox_dir: &Path,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    source: &str,
+    event_id: &str,
+) -> anyhow::Result<SendReceipt> {
+    send_idempotent_to_inbox_with_seam(
+        inbox_dir,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        source,
+        event_id,
+        |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_idempotent_to_inbox_with_seam(
+    inbox_dir: &Path,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    source: &str,
+    event_id: &str,
+    mut seam: impl FnMut(IngressSeam) -> anyhow::Result<()>,
+) -> anyhow::Result<SendReceipt> {
+    validate_ingress_value("source", source)?;
+    validate_ingress_value("event-id", event_id)?;
+
+    fs::create_dir_all(inbox_dir)?;
+    let receipts_dir = message_receipts_dir(inbox_dir);
+    ensure_plain_directory(&receipts_dir)?;
+    let claim_path = receipts_dir.join(format!("{}.receipt", ingress_key(source, event_id)));
+
+    if claim_path.exists() {
+        let filename = validate_claim(&claim_path, source, event_id)?;
+        seam(IngressSeam::BeforeInboxLink)?;
+        ensure_inbox_link(inbox_dir, &claim_path, &filename)?;
+        return Ok(SendReceipt {
+            filename,
+            created: false,
+        });
+    }
+
+    let filename = allocate_receipt_filename(inbox_dir)?;
+    let unsigned = render_message_fields(
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        Some(source),
+        Some(event_id),
+        Some(&filename),
+        None,
+    );
+    let claim_digest = sha256_hex(unsigned.as_bytes());
+    let contents = render_message_fields(
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        Some(source),
+        Some(event_id),
+        Some(&filename),
+        Some(&claim_digest),
+    );
+    let temporary = receipts_dir.join(claim_tmp_name());
+    write_synced_new(&temporary, &contents)?;
+    seam(IngressSeam::BeforeClaimPublication)?;
+
+    let created = match fs::hard_link(&temporary, &claim_path) {
+        Ok(()) => {
+            sync_directory(&receipts_dir)?;
+            true
+        }
+        Err(_) if claim_path.exists() => false,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(anyhow::anyhow!(
+                "publishing message ingress claim {}: {error}",
+                claim_path.display()
+            ));
+        }
+    };
+    seam(IngressSeam::AfterClaimPublication)?;
+    remove_temporary(&temporary)?;
+
+    let filename = validate_claim(&claim_path, source, event_id)?;
+    seam(IngressSeam::BeforeInboxLink)?;
+    ensure_inbox_link(inbox_dir, &claim_path, &filename)?;
+    Ok(SendReceipt { filename, created })
+}
+
+fn validate_ingress_value(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        anyhow::bail!("message ingress {field} must be non-empty single-line text");
+    }
+    Ok(())
+}
+
+fn message_receipts_dir(inbox_dir: &Path) -> PathBuf {
+    inbox_dir
+        .parent()
+        .unwrap_or(inbox_dir)
+        .join("message-receipts")
+}
+
+fn ensure_plain_directory(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "message receipt path is not a plain directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ingress_key(source: &str, event_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [source, event_id] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hex_digest(hasher.finalize())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+fn allocate_receipt_filename(inbox_dir: &Path) -> anyhow::Result<String> {
+    let archive_dir = sibling_archive_dir(inbox_dir);
+    for _ in 0..8 {
+        let filename = new_filename();
+        if !inbox_dir.join(&filename).exists() && !archive_dir.join(&filename).exists() {
+            return Ok(filename);
+        }
+    }
+    anyhow::bail!(
+        "could not allocate a unique message receipt in {}",
+        inbox_dir.display()
+    )
+}
+
+fn claim_tmp_name() -> String {
+    format!(
+        ".claim.tmp-{}-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        rand6()
+    )
+}
+
+fn write_synced_new(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn remove_temporary(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_claim(claim_path: &Path, source: &str, event_id: &str) -> anyhow::Result<String> {
+    let metadata = fs::symlink_metadata(claim_path).map_err(|error| {
+        anyhow::anyhow!(
+            "reading message ingress claim {}: {error}",
+            claim_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "message ingress claim is not a plain file: {}",
+            claim_path.display()
+        );
+    }
+    let contents = fs::read_to_string(claim_path)?;
+    verify_claim_digest(&contents)?;
+    let parsed = parse_message("0000000000000-000000.md", &contents);
+    if parsed.source.as_deref() != Some(source) || parsed.event_id.as_deref() != Some(event_id) {
+        anyhow::bail!("message ingress claim provenance does not match its key");
+    }
+    let filename = parsed
+        .receipt_id
+        .filter(|value| is_message_filename(value))
+        .ok_or_else(|| anyhow::anyhow!("message ingress claim has an unsafe receipt-id"))?;
+    Ok(filename)
+}
+
+fn verify_claim_digest(contents: &str) -> anyhow::Result<()> {
+    let mut digest = None;
+    let mut unsigned = String::with_capacity(contents.len());
+    for line in contents.split_inclusive('\n') {
+        if let Some(value) = line.strip_prefix("claim-digest: ") {
+            if digest.is_some() {
+                anyhow::bail!("message ingress claim has duplicate claim-digest fields");
+            }
+            digest = Some(value.trim_end_matches(['\r', '\n']).to_string());
+        } else {
+            unsigned.push_str(line);
+        }
+    }
+    let digest = digest.ok_or_else(|| anyhow::anyhow!("message ingress claim has no digest"))?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("message ingress claim has an invalid digest");
+    }
+    if sha256_hex(unsigned.as_bytes()) != digest {
+        anyhow::bail!("message ingress claim digest does not match its contents");
+    }
+    Ok(())
+}
+
+fn ensure_inbox_link(inbox_dir: &Path, claim_path: &Path, filename: &str) -> anyhow::Result<()> {
+    let inbox_path = inbox_dir.join(filename);
+    let archive_path = sibling_archive_dir(inbox_dir).join(filename);
+    if archive_path.exists() {
+        return verify_existing_receipt(&archive_path, claim_path);
+    }
+    if inbox_path.exists() {
+        return verify_existing_receipt(&inbox_path, claim_path);
+    }
+
+    match fs::hard_link(claim_path, &inbox_path) {
+        Ok(()) => sync_directory(inbox_dir),
+        Err(_) if archive_path.exists() => verify_existing_receipt(&archive_path, claim_path),
+        Err(_) if inbox_path.exists() => verify_existing_receipt(&inbox_path, claim_path),
+        Err(error) => Err(anyhow::anyhow!(
+            "publishing message receipt {filename} to {}: {error}",
+            inbox_dir.display()
+        )),
+    }
+}
+
+fn verify_existing_receipt(existing: &Path, claim: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(existing)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "message receipt path is not a plain file: {}",
+            existing.display()
+        );
+    }
+    if fs::read(existing)? != fs::read(claim)? {
+        anyhow::bail!(
+            "message receipt collides with different bytes: {}",
+            existing.display()
+        );
+    }
+    Ok(())
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -646,6 +1005,183 @@ mod tests {
         // Source already absent + receipt present is idempotent success too.
         archive_msg(&inbox, &archive, &filename).unwrap();
         assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);
+    }
+
+    fn send_event(inbox: &Path, source: &str, event_id: &str, body: &str) -> SendReceipt {
+        send_idempotent_to_inbox(
+            inbox,
+            "producer",
+            Some("external event"),
+            None,
+            &[],
+            body,
+            source,
+            event_id,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn idempotent_send_keeps_the_first_message_in_inbox_and_archive() {
+        let temporary = tempfile::tempdir().unwrap();
+        let inbox = temporary.path().join("inbox");
+        let archive = temporary.path().join("archive");
+
+        let first = send_event(&inbox, "systemd:daily", "2026-07-31", "first body");
+        assert!(first.created);
+        let first_bytes = fs::read(inbox.join(&first.filename)).unwrap();
+        let first_modified = fs::metadata(inbox.join(&first.filename))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let parsed = read_msg(&inbox, &first.filename).unwrap();
+        assert_eq!(parsed.source.as_deref(), Some("systemd:daily"));
+        assert_eq!(parsed.event_id.as_deref(), Some("2026-07-31"));
+        assert_eq!(parsed.receipt_id.as_deref(), Some(first.filename.as_str()));
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let inbox_retry = send_event(&inbox, "systemd:daily", "2026-07-31", "changed body");
+        assert!(!inbox_retry.created);
+        assert_eq!(inbox_retry.filename, first.filename);
+        assert_eq!(list_dir(&inbox).unwrap().len(), 1);
+        assert_eq!(fs::read(inbox.join(&first.filename)).unwrap(), first_bytes);
+        assert_eq!(
+            fs::metadata(inbox.join(&first.filename))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            first_modified,
+            "a retry must not rewrite the DING-triggering inbox file"
+        );
+
+        archive_msg(&inbox, &archive, &first.filename).unwrap();
+        let archived_retry = send_event(&inbox, "systemd:daily", "2026-07-31", "third body");
+        assert!(!archived_retry.created);
+        assert_eq!(archived_retry.filename, first.filename);
+        assert!(list_dir(&inbox).unwrap().is_empty());
+        assert_eq!(list_dir(&archive).unwrap().len(), 1);
+        assert!(message_receipts_dir(&inbox).is_dir());
+    }
+
+    #[test]
+    fn concurrent_retries_create_one_claim_and_different_keys_create_different_messages() {
+        use std::sync::{Arc, Barrier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let inbox = Arc::new(temporary.path().join("inbox"));
+        let workers = 12;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut threads = Vec::new();
+        for index in 0..workers {
+            let inbox = Arc::clone(&inbox);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                send_event(
+                    &inbox,
+                    "github:webhook",
+                    "delivery-42",
+                    &format!("body {index}"),
+                )
+            }));
+        }
+        let receipts: Vec<SendReceipt> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(receipts.iter().filter(|receipt| receipt.created).count(), 1);
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.filename == receipts[0].filename)
+        );
+        assert_eq!(list_dir(&inbox).unwrap().len(), 1);
+
+        let other = send_event(&inbox, "github:webhook", "delivery-43", "other");
+        assert!(other.created);
+        assert_ne!(other.filename, receipts[0].filename);
+        assert_eq!(list_dir(&inbox).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retries_recover_at_each_claim_to_inbox_crash_seam() {
+        for (crash, retry_created) in [
+            (IngressSeam::BeforeClaimPublication, true),
+            (IngressSeam::AfterClaimPublication, false),
+            (IngressSeam::BeforeInboxLink, false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let inbox = temporary.path().join("inbox");
+            let failed = send_idempotent_to_inbox_with_seam(
+                &inbox,
+                "producer",
+                Some("crash seam"),
+                None,
+                &[],
+                "first body",
+                "monitor",
+                "alert-1",
+                |seam| {
+                    if seam == crash {
+                        anyhow::bail!("injected crash at {seam:?}");
+                    }
+                    Ok(())
+                },
+            );
+            assert!(failed.is_err(), "{crash:?}");
+
+            let retry = send_event(&inbox, "monitor", "alert-1", "retry body");
+            assert_eq!(retry.created, retry_created, "{crash:?}");
+            assert_eq!(list_dir(&inbox).unwrap().len(), 1, "{crash:?}");
+            let message = read_msg(&inbox, &retry.filename).unwrap();
+            let expected_body = if retry_created {
+                "retry body"
+            } else {
+                "first body"
+            };
+            assert_eq!(message.body.trim_end(), expected_body, "{crash:?}");
+        }
+    }
+
+    #[test]
+    fn corrupt_or_unsafe_claims_fail_closed() {
+        let corrupt = tempfile::tempdir().unwrap();
+        let inbox = corrupt.path().join("inbox");
+        send_event(&inbox, "source", "event", "body");
+        let claim = message_receipts_dir(&inbox)
+            .join(format!("{}.receipt", ingress_key("source", "event")));
+        fs::write(&claim, "corrupt").unwrap();
+        let error = send_idempotent_to_inbox(
+            &inbox,
+            "producer",
+            None,
+            None,
+            &[],
+            "retry",
+            "source",
+            "event",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("claim has no digest"));
+
+        let unsafe_shape = tempfile::tempdir().unwrap();
+        let inbox = unsafe_shape.path().join("inbox");
+        let receipts = message_receipts_dir(&inbox);
+        fs::create_dir_all(&receipts).unwrap();
+        fs::create_dir(receipts.join(format!("{}.receipt", ingress_key("source", "event"))))
+            .unwrap();
+        let error = send_idempotent_to_inbox(
+            &inbox,
+            "producer",
+            None,
+            None,
+            &[],
+            "retry",
+            "source",
+            "event",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not a plain file"));
     }
 
     #[test]
