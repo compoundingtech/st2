@@ -73,11 +73,24 @@ fn output_with_input_timeout(
     }
     let mut child = command.spawn()?;
     if let Some(input) = input {
-        child
+        let write = child
             .stdin
             .take()
-            .context("metadata patch child has no piped stdin")?
-            .write_all(input)?;
+            .context("metadata patch child has no piped stdin")
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(input)
+                    .context("write metadata patch payload")
+            });
+        if let Err(error) = write {
+            let pid = child.id() as i32;
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
     }
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
@@ -2197,6 +2210,41 @@ mod tests {
         assert_eq!(
             payload["tags"]["agent.presentation.description"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn input_write_failure_terminates_and_reaps_the_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("close-stdin");
+        let pidfile = temporary.path().join("child.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nexec 0<&-\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1024 * 1024];
+        let error = output_with_input_timeout(
+            Command::new(&executable).env("PIDFILE", &pidfile),
+            Duration::from_secs(1),
+            Some(&input),
+        )
+        .unwrap_err();
+        let pid = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("Broken pipe"),
+            "unexpected write error: {error:#}"
+        );
+        assert!(
+            !crate::host_lock::process_alive(pid),
+            "failed metadata child {pid} was not terminated and reaped"
         );
     }
 
