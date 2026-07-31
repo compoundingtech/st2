@@ -2348,14 +2348,17 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("escape-with-stdin");
         let escaped_pidfile = temporary.path().join("escaped.pid");
+        let pipefile = temporary.path().join("escaped.pipe");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nexec 3<&0\nsetsid sh -c 'printf %s \"$$\" > \"$ESCAPED_PIDFILE\"; sleep 60' <&3 &\nsleep 60\n",
+            "#!/bin/sh\nexec 3<&0\nsetsid sh -c 'printf %s \"$$\" > \"$ESCAPED_PIDFILE\"; readlink /proc/self/fd/0 > \"$PIPEFILE\"; sleep 60' <&3 &\nsleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         output_with_input_timeout(
-            Command::new(&executable).env("ESCAPED_PIDFILE", &escaped_pidfile),
+            Command::new(&executable)
+                .env("ESCAPED_PIDFILE", &escaped_pidfile)
+                .env("PIPEFILE", &pipefile),
             Duration::from_millis(100),
             Some(vec![b'x'; 1024 * 1024]),
         )
@@ -2364,12 +2367,12 @@ mod tests {
             .unwrap()
             .parse::<i32>()
             .unwrap();
-        let pipe = std::fs::read_link(format!("/proc/{escaped_pid}/fd/0")).unwrap();
+        let pipe = std::fs::read_to_string(&pipefile).unwrap();
         let retained_writers = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(Result::ok)
             .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-            .filter(|target| target == &pipe)
+            .filter(|target| target.to_string_lossy() == pipe.trim())
             .count();
         unsafe {
             libc::kill(-escaped_pid, libc::SIGKILL);
