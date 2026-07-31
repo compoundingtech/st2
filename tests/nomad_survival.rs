@@ -148,7 +148,7 @@ impl Fixture {
   identity "{identity}"
   host "{HOST}"
   type "service"
-{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') > "$CATALOG/{identity}.color-env"; exec sleep 120"#
+{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') >> "$CATALOG/{identity}.color-env""#
 }}
 "##
         );
@@ -442,8 +442,8 @@ fn pty_gate(test: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn scope_gate(test: &str) -> bool {
-    let runtime_dir_valid = std::env::var_os("XDG_RUNTIME_DIR")
-        .is_some_and(|path| Path::new(&path).is_dir());
+    let runtime_dir_valid =
+        std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|path| Path::new(&path).is_dir());
     if runtime_dir_valid && st2::isolate::mode() == st2::isolate::Isolation::Scope {
         return true;
     }
@@ -558,8 +558,10 @@ fn managed_agent_color_contract_crosses_systemd_scope() {
 
 fn assert_managed_agent_color_contract(suffix: &str) {
     let fx = Fixture::new();
-    let ambient_snapshot = fx.write_color_env_agent(&format!("ambient-color-{suffix}"), false);
-    let explicit_snapshot = fx.write_color_env_agent(&format!("explicit-color-{suffix}"), true);
+    let ambient_identity = format!("ambient-color-{suffix}");
+    let explicit_identity = format!("explicit-color-{suffix}");
+    let ambient_snapshot = fx.write_color_env_agent(&ambient_identity, false);
+    let explicit_snapshot = fx.write_color_env_agent(&explicit_identity, true);
 
     let out = fx
         .st2()
@@ -580,14 +582,50 @@ fn assert_managed_agent_color_contract(suffix: &str) {
     }));
 
     assert_eq!(
-        std::fs::read_to_string(ambient_snapshot).unwrap(),
+        std::fs::read_to_string(&ambient_snapshot).unwrap(),
         "unset\n",
         "the reconciler's capture-only NO_COLOR must not disable agent color"
     );
     assert_eq!(
-        std::fs::read_to_string(explicit_snapshot).unwrap(),
+        std::fs::read_to_string(&explicit_snapshot).unwrap(),
         "1\n",
         "an explicit Agent Spec NO_COLOR must still reach the agent"
+    );
+
+    for identity in [&ambient_identity, &explicit_identity] {
+        let restarted = Command::new("pty")
+            .env("NO_COLOR", "1")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["restart", "-y", "--force", &format!("{HOST}.{identity}")])
+            .output()
+            .unwrap();
+        assert!(
+            restarted.status.success(),
+            "`pty restart -y` failed for {identity}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&restarted.stdout),
+            String::from_utf8_lossy(&restarted.stderr)
+        );
+    }
+    assert!(
+        poll_until(SPAWN_TIMEOUT, || {
+            [&ambient_snapshot, &explicit_snapshot]
+                .iter()
+                .all(|snapshot| {
+                    std::fs::read_to_string(snapshot)
+                        .is_ok_and(|contents| contents.lines().count() == 2)
+                })
+        }),
+        "restarted agents did not record their second environment snapshot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ambient_snapshot).unwrap(),
+        "unset\nunset\n",
+        "the persisted removal must win over a restart caller's ambient NO_COLOR"
+    );
+    assert_eq!(
+        std::fs::read_to_string(explicit_snapshot).unwrap(),
+        "1\n1\n",
+        "the explicit Agent Spec assignment must win on restart"
     );
 }
 

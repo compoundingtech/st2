@@ -272,6 +272,7 @@ impl PtyCli {
         // reconcile. Agent Spec env remains authoritative when an agent deliberately opts out.
         if target.name == "agent" && !target.env.contains_key("NO_COLOR") {
             cmd.env_remove("NO_COLOR");
+            cmd.arg("--unset-env").arg("NO_COLOR");
         }
         for (key, value) in &managed_env {
             let mut assignment = key.clone();
@@ -2207,6 +2208,15 @@ mod tests {
             Some(None),
             "ambient NO_COLOR must not silently disable an interactive agent's color"
         );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "the removal must be persisted for PTY restart"
+        );
 
         let mut explicit = target("hetz.explicit.agent", "exec claude 'boot'");
         explicit.env.insert("NO_COLOR".into(), "1".into());
@@ -2218,6 +2228,16 @@ mod tests {
                 .and_then(|(_, value)| value),
             Some(OsStr::new("1")),
             "an explicit Agent Spec NO_COLOR remains authoritative"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "an explicit assignment must not also persist a removal"
         );
     }
 
@@ -2233,6 +2253,16 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != OsStr::new("NO_COLOR")),
             "non-agent services keep the caller's ambient NO_COLOR semantics"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "non-agent services must not persist an st2-owned removal"
         );
     }
 
