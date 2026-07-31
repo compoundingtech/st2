@@ -8,9 +8,95 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn maybe_pause_at_cutover_test_boundary(boundary: &str) -> Result<()> {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    const BOUNDARY_ENV: &str = "ST2_TEST_CUTOVER_BOUNDARY";
+    const SENTINEL_ENV: &str = "ST2_TEST_CUTOVER_SENTINEL";
+    let (Some(requested_boundary), Some(sentinel)) = (
+        std::env::var_os(BOUNDARY_ENV),
+        std::env::var_os(SENTINEL_ENV),
+    ) else {
+        if std::env::var_os(BOUNDARY_ENV).is_some() || std::env::var_os(SENTINEL_ENV).is_some() {
+            anyhow::bail!(
+                "{BOUNDARY_ENV} and {SENTINEL_ENV} must be supplied together for a cutover test boundary"
+            );
+        }
+        return Ok(());
+    };
+    if requested_boundary != boundary {
+        return Ok(());
+    }
+    let sentinel = PathBuf::from(sentinel);
+    if !sentinel.is_absolute() {
+        anyhow::bail!("{SENTINEL_ENV} must be absolute");
+    }
+    let link_metadata = match std::fs::symlink_metadata(&sentinel) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect cutover test sentinel {}", sentinel.display()));
+        }
+    };
+    let canonical = sentinel
+        .canonicalize()
+        .with_context(|| format!("canonicalize cutover test sentinel {}", sentinel.display()))?;
+    if canonical != sentinel
+        || !link_metadata.is_file()
+        || link_metadata.file_type().is_symlink()
+        || link_metadata.nlink() != 1
+        || link_metadata.uid() != unsafe { libc::geteuid() }
+        || link_metadata.permissions().mode() & 0o022 != 0
+    {
+        anyhow::bail!(
+            "cutover test sentinel must be a canonical, singly linked, current-user regular file not writable by group or world"
+        );
+    }
+    let parent = sentinel
+        .parent()
+        .context("cutover test sentinel has no parent")?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect cutover test directory {}", parent.display()))?;
+    if parent.parent() != Some(Path::new("/tmp"))
+        || !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        anyhow::bail!(
+            "cutover test sentinel must be inside a private current-user temporary directory directly under /tmp"
+        );
+    }
+    let phase = sentinel.with_extension("phase");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&phase)
+        .with_context(|| format!("create cutover test phase {}", phase.display()))?;
+    writeln!(output, "{} {boundary}", std::process::id())?;
+    output.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    // SAFETY: this debug-only, explicitly armed boundary deliberately suspends the candidate so
+    // the live user-systemd test can SIGKILL this exact process.
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        anyhow::bail!("raise SIGSTOP at cutover test boundary");
+    }
+    Ok(())
+}
+
+#[cfg(not(all(debug_assertions, target_os = "linux")))]
+fn maybe_pause_at_cutover_test_boundary(_boundary: &str) -> Result<()> {
+    Ok(())
+}
+
 use st2::{
-    HostLock, Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message,
-    up_loop, up_once,
+    Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message, up_loop,
+    up_once,
 };
 
 #[derive(Parser)]
@@ -120,40 +206,18 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// EXPERIMENTAL: generate one compact agent declaration plus catalog-owned templates. Hand-authored
-    /// KDL is canonical. Inspect the full generated KDL and every workspace `render {}` target before
-    /// materialization. The workspace remains untouched until `st2 up --materialize-only` or `st2 up`.
-    #[command(name = "compile-agent")]
-    CompileAgent {
-        /// Optional positional catalog folder. Prefer --catalog; defaults to $CATALOG, then the
-        /// standard st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog: Option<PathBuf>,
-        #[arg(long)]
-        identity: String,
-        #[arg(long, default_value = "worker")]
-        role: String,
-        /// The agent's workspace directory (its cwd).
-        #[arg(long)]
-        dir: String,
-        /// Persona source file to vendor into the catalog-owned overlay.
-        #[arg(long)]
-        persona: PathBuf,
-        #[arg(long, default_value = "claude")]
-        harness: String,
-        /// Host (defaults to the local hostname).
-        #[arg(long)]
-        host: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        supervisor: Option<String>,
-        /// Extra harness arg spliced into the seat's `exec claude/codex …` command before the boot
-        /// prompt (repeatable, hyphen values allowed) — e.g. `--extra-arg=--plugin-dir
-        /// --extra-arg=/path`. The st2 analog of a per-seat command edit; omit for a normal seat.
-        #[arg(long = "extra-arg", allow_hyphen_values = true)]
-        extra_arg: Vec<String>,
-    },
+    /// Transactionally publish one canonical Agent Spec into the live catalog.
+    #[command(subcommand)]
+    Agent(AgentCmd),
+    /// Exact, crash-recoverable lifecycle transactions for terminal-free exec tasks.
+    #[command(subcommand)]
+    Exec(ExecCmd),
+    /// Read-only admission state for catalog cutover coordination.
+    #[command(subcommand)]
+    Cutover(CutoverCmd),
+    /// Canonical declaration snapshots and crash-recoverable whole-catalog application.
+    #[command(subcommand)]
+    Catalog(CatalogCmd),
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
     /// tasks (stopping/crashing st2 never does). Idempotent.
     Down {
@@ -269,11 +333,183 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Emit one complete-or-indeterminate desired-task/runtime snapshot for an adoption-only
+    /// supervisor cutover. This is a read-only typed boundary; it never reconciles.
+    Tasks {
+        /// Host whose desired tasks and runtime generations to inspect. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Observe only tasks with this desired state. Omit for both running and absent.
+        #[arg(long, value_enum)]
+        desired_state: Option<st2::task_inventory::DesiredStateSelection>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Compute the authoritative digest bound by `agent publish --input-sha256`.
+    Digest {
+        /// A canonical KDL file containing exactly one top-level `agent` node.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        spec: Option<PathBuf>,
+        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "spec",
+            conflicts_with = "spec"
+        )]
+        bundle: Option<PathBuf>,
+        /// Emit the typed source-digest receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish exactly one explicit-host, explicit-identity agent under a catalog-wide CAS lock.
+    Publish {
+        /// A canonical KDL file containing exactly one top-level `agent` node.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        spec: Option<PathBuf>,
+        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "spec",
+            conflicts_with = "spec"
+        )]
+        bundle: Option<PathBuf>,
+        /// Create only. An identical existing agent.kdl is reported as `unchanged`.
+        #[arg(
+            long,
+            required_unless_present = "expect_sha256",
+            conflicts_with = "expect_sha256"
+        )]
+        expect_absent: bool,
+        /// Replace only when the current agent.kdl has this lowercase SHA-256.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required_unless_present = "expect_absent",
+            conflicts_with = "expect_absent"
+        )]
+        expect_sha256: Option<String>,
+        /// SHA-256 returned by `st2 agent digest` for the exact source capability.
+        #[arg(long, value_name = "HEX")]
+        input_sha256: String,
+        /// Emit the typed publication result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExecCmd {
+    /// Prepare or apply an immutable exact-retirement capability.
+    #[command(subcommand)]
+    Retirement(ExecRetirementCmd),
+}
+
+#[derive(Subcommand)]
+enum ExecRetirementCmd {
+    /// Read runtime authority and write one create-only immutable retirement plan.
+    Prepare {
+        /// Exact host-local exec namespace. Never inferred from a runtime id.
+        #[arg(long)]
+        host: String,
+        /// Prepare one exact runtime id.
+        #[arg(long)]
+        id: String,
+        /// Caller-held canonical declaration-root digest.
+        #[arg(long, value_name = "HEX")]
+        expect_catalog_sha256: String,
+        /// Create-only immutable plan path outside the live catalog and exec state.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+        /// Emit `st2.exec-retirement-preparation.v1`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply or resume one immutable retirement plan.
+    Apply {
+        /// Create-only plan emitted by `exec retirement prepare`.
+        #[arg(long, value_name = "FILE")]
+        plan: PathBuf,
+        /// Caller-held SHA-256 of the exact plan bytes.
+        #[arg(long, value_name = "HEX")]
+        expect_plan_sha256: String,
+        /// Emit the typed completed receipt.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCmd {
+    /// Capture the coherent declaration plane into a create-only canonical directory.
+    Snapshot {
+        /// Destination directory. It must be outside the live catalog.
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+        /// Emit the typed snapshot receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Derive one atomic service/adopt-only/provider-witness bundle from a retained snapshot.
+    Project {
+        /// Retained canonical snapshot produced by `catalog snapshot`.
+        #[arg(long, value_name = "DIR")]
+        snapshot: PathBuf,
+        /// Exact declaration-root SHA-256 returned by `catalog snapshot`.
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: String,
+        /// Create-only atomic output bundle.
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+        /// Emit the typed projection result and receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a complete canonical declaration directory under declaration-root CAS.
+    Apply {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(long, value_name = "DIR")]
+        prepared: Option<PathBuf>,
+        /// Atomic projection bundle whose typed receipt must name the apply target.
+        #[arg(long, value_name = "DIR")]
+        projection_bundle: Option<PathBuf>,
+        /// Apply-capable child selected from the verified projection bundle.
+        #[arg(long, value_enum)]
+        projection_child: Option<st2::catalog_transaction::CatalogProjectionChild>,
+        /// Caller-held SHA-256 returned by `catalog project`; never read from the bundle itself.
+        #[arg(long, value_name = "HEX")]
+        expect_bundle_sha256: Option<String>,
+        /// Expected canonical declaration-root SHA-256 of the live catalog.
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: Option<String>,
+        /// Resume the durable incomplete marker and internal stage without the original source.
+        #[arg(long)]
+        resume: bool,
+        /// Emit the typed application receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -320,6 +556,41 @@ enum ServiceCmd {
     Status,
     /// Stop, disable, and remove the `st2.service` unit. Idempotent.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum CutoverCmd {
+    /// Install and start the exact restart-always candidate service for one cutover request.
+    Install {
+        /// Canonical bounded st2.cutover-request.v2 file.
+        #[arg(long, value_name = "FILE")]
+        request: PathBuf,
+        /// Caller-held SHA-256 of the exact request bytes.
+        #[arg(long, value_name = "HEX")]
+        expect_request_sha256: String,
+    },
+    /// Run or resume one exact durable cutover request, then retain host ownership as the successor
+    /// supervisor after successful finalization.
+    Run {
+        /// Canonical bounded st2.cutover-request.v2 file.
+        #[arg(long, value_name = "FILE")]
+        request: PathBuf,
+        /// Caller-held SHA-256 of the exact request bytes.
+        #[arg(long, value_name = "HEX")]
+        expect_request_sha256: String,
+    },
+    /// Report whether ordinary runtime mutation is currently admitted.
+    ///
+    /// Exits non-zero while a durable cutover gate is active or malformed, making this suitable
+    /// for systemd ExecStartPre and other cooperative writers.
+    Status {
+        /// Host requesting runtime-mutation admission. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the stable machine-readable admission record.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -564,6 +835,235 @@ fn main() -> Result<()> {
             interval,
         } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Cutover(cmd) => cutover_cmd(cmd, catalog_path.as_deref()),
+        Command::Agent(AgentCmd::Publish {
+            spec,
+            bundle,
+            expect_absent,
+            expect_sha256,
+            input_sha256,
+            json,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let source = match (spec, bundle) {
+                (Some(path), None) => st2::agent_publish::PublishSource::Spec(path),
+                (None, Some(path)) => st2::agent_publish::PublishSource::Bundle(path),
+                _ => unreachable!("clap enforces one publication source"),
+            };
+            let expectation = match (expect_absent, expect_sha256) {
+                (true, None) => st2::agent_publish::PublishExpectation::Absent,
+                (false, Some(hash)) => st2::agent_publish::PublishExpectation::Sha256(hash),
+                _ => unreachable!("clap enforces one publication expectation"),
+            };
+            let result = st2::agent_publish::publish(st2::agent_publish::PublishRequest {
+                catalog,
+                source,
+                expectation,
+                input_sha256,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {} {}",
+                    match result.status {
+                        st2::agent_publish::PublishStatus::Published => "published",
+                        st2::agent_publish::PublishStatus::Unchanged => "unchanged",
+                    },
+                    result.bus_id,
+                    result.path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Agent(AgentCmd::Digest { spec, bundle, json }) => {
+            let source = match (spec, bundle) {
+                (Some(path), None) => st2::agent_publish::PublishSource::Spec(path),
+                (None, Some(path)) => st2::agent_publish::PublishSource::Bundle(path),
+                _ => unreachable!("clap enforces one source"),
+            };
+            let digest = st2::agent_publish::digest_source(source)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&digest)?);
+            } else {
+                println!("{}", digest.sha256);
+            }
+            Ok(())
+        }
+        Command::Exec(ExecCmd::Retirement(ExecRetirementCmd::Prepare {
+            host,
+            id,
+            expect_catalog_sha256,
+            output,
+            json,
+        })) => {
+            let catalog = require_exec_retirement_catalog(
+                catalog_path.clone(),
+                json,
+                "`exec retirement prepare` requires explicit --catalog <path>",
+            )?;
+            let result = exec_retirement_result(
+                st2::exec_retirement::prepare(st2::exec_retirement::RetirementPrepareRequest {
+                    catalog,
+                    host,
+                    selector: st2::exec_retirement::RetirementSelector::Id(id),
+                    expect_catalog_sha256,
+                    output,
+                }),
+                json,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "prepared {} {}",
+                    result.plan_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Exec(ExecCmd::Retirement(ExecRetirementCmd::Apply {
+            plan,
+            expect_plan_sha256,
+            json,
+        })) => {
+            let catalog = require_exec_retirement_catalog(
+                catalog_path.clone(),
+                json,
+                "`exec retirement apply` requires explicit --catalog <path>",
+            )?;
+            let result = exec_retirement_result(
+                st2::exec_retirement::apply(st2::exec_retirement::RetirementApplyRequest {
+                    catalog,
+                    plan,
+                    expect_plan_sha256,
+                }),
+                json,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("completed {}", result.request_sha256);
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Snapshot { output, json }) => {
+            let result =
+                st2::catalog_transaction::snapshot(st2::catalog_transaction::SnapshotRequest {
+                    catalog: catalog_arg(None)?,
+                    output,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {} {}",
+                    match result.status {
+                        st2::catalog_transaction::SnapshotStatus::Created => "created",
+                        st2::catalog_transaction::SnapshotStatus::Unchanged => "unchanged",
+                    },
+                    result.root_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Project {
+            snapshot,
+            expect_sha256,
+            output,
+            json,
+        }) => {
+            let result = st2::catalog_transaction::project_catalog(
+                st2::catalog_transaction::CatalogProjectionRequest {
+                    catalog: catalog_arg(None)?,
+                    snapshot,
+                    expect_sha256,
+                    output,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "created {} {}",
+                    result.bundle_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Apply {
+            prepared,
+            projection_bundle,
+            projection_child,
+            expect_bundle_sha256,
+            expect_sha256,
+            resume,
+            json,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let result = match (
+                prepared,
+                projection_bundle,
+                projection_child,
+                expect_bundle_sha256,
+                expect_sha256,
+                resume,
+            ) {
+                (Some(prepared), None, None, None, Some(expect_sha256), false) => {
+                    st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
+                        catalog,
+                        mode: st2::catalog_transaction::ApplyMode::Prepared {
+                            prepared,
+                            expect_sha256,
+                        },
+                    })?
+                }
+                (
+                    None,
+                    Some(bundle),
+                    Some(child),
+                    Some(expect_bundle_sha256),
+                    Some(expect_sha256),
+                    false,
+                ) => st2::catalog_transaction::apply_projection_bundle(
+                    st2::catalog_transaction::CatalogProjectionApplyRequest {
+                        catalog,
+                        bundle,
+                        child,
+                        expect_bundle_sha256,
+                        expect_sha256,
+                    },
+                )?,
+                (None, None, None, None, None, true) => {
+                    st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
+                        catalog,
+                        mode: st2::catalog_transaction::ApplyMode::Resume,
+                    })?
+                }
+                _ => anyhow::bail!(
+                    "catalog apply requires exactly one complete mode: \
+                     --prepared DIR --expect-sha256 HEX; \
+                     --projection-bundle DIR --projection-child service|adopt-only \
+                     --expect-bundle-sha256 HEX --expect-sha256 HEX; or --resume"
+                ),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {}",
+                    match result.status {
+                        st2::catalog_transaction::ApplyStatus::Applied => "applied",
+                        st2::catalog_transaction::ApplyStatus::Unchanged => "unchanged",
+                    },
+                    result.after_sha256
+                );
+            }
+            Ok(())
+        }
         Command::Agents {
             catalog,
             status,
@@ -571,23 +1071,16 @@ fn main() -> Result<()> {
             enrich,
             ctx,
         } => agents_cmd(catalog, status, json, enrich, ctx),
-        Command::CompileAgent {
-            catalog,
-            identity,
-            role,
-            dir,
-            persona,
-            harness,
+        Command::Tasks {
             host,
-            model,
-            supervisor,
-            extra_arg,
+            desired_state,
+            json,
         } => {
-            let catalog = catalog_arg(catalog)?;
-            compile_agent_cmd(
-                &catalog, &identity, &role, &dir, &persona, &harness, host, model, supervisor,
-                extra_arg,
-            )
+            if !json {
+                anyhow::bail!("`st2 tasks` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            tasks_cmd(&catalog, host, desired_state)
         }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
@@ -638,41 +1131,37 @@ fn main() -> Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compile_agent_cmd(
-    catalog: &Path,
-    identity: &str,
-    role: &str,
-    dir: &str,
-    persona: &Path,
-    harness: &str,
-    host: Option<String>,
-    model: Option<String>,
-    supervisor: Option<String>,
-    extra_arg: Vec<String>,
-) -> Result<()> {
-    let host = host.unwrap_or_else(detect_host);
-    let input = st2::compile_agent::AgentInput {
-        identity: identity.to_string(),
-        host: host.clone(),
-        role: role.to_string(),
-        harness: harness.to_string(),
-        model,
-        workspace: dir.to_string(),
-        supervisor,
-        extra_args: extra_arg,
-    };
-    let agent_dir = st2::compile_agent::compile_agent(&input, catalog, persona)
-        .with_context(|| format!("compiling agent '{identity}'"))?;
-    println!(
-        "compiled {host}.{identity} → {}  \
-         (next: st2 hooks install; st2 validate --catalog {}; st2 up --catalog {} --host {host} --materialize-only; then st2 up --catalog {} --host {host} --once)",
-        agent_dir.display(),
-        catalog.display(),
-        catalog.display(),
-        catalog.display()
-    );
-    Ok(())
+fn require_exec_retirement_catalog(
+    catalog: Option<PathBuf>,
+    json: bool,
+    message: &str,
+) -> Result<PathBuf> {
+    match catalog {
+        Some(catalog) => Ok(catalog),
+        None if json => exec_retirement_error_exit("authority", message),
+        None => anyhow::bail!("{message}"),
+    }
+}
+
+fn exec_retirement_result<T>(
+    result: st2::exec_retirement::RetirementResult<T>,
+    json: bool,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if json => exec_retirement_error_exit(error.code.as_str(), &error.message),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn exec_retirement_error_exit<T>(code: &str, message: &str) -> Result<T> {
+    let envelope = serde_json::json!({
+        "schema": "st2.exec-retirement-error.v1",
+        "code": code,
+        "message": message,
+    });
+    eprintln!("{}", serde_json::to_string(&envelope)?);
+    std::process::exit(1);
 }
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
@@ -681,6 +1170,12 @@ fn hooks_cmd(command: HooksCmd) -> Result<()> {
             replace,
             allow_downgrade,
         } => {
+            let catalog = catalog_root_for_env()?;
+            // Hook publication may bootstrap before the default catalog exists. In that case no
+            // durable gate can exist yet; an existing selected catalog must pass admission.
+            if catalog.exists() {
+                require_runtime_mutation_admission(&catalog, None)?;
+            }
             let dir = st2::hooks::install(replace || allow_downgrade)?;
             let root = st2::hooks::hooks_root()?;
             println!(
@@ -720,8 +1215,8 @@ fn down_cmd(root: &Path, host: Option<String>) -> Result<()> {
             .or_else(|| spec.host.clone())
             .unwrap_or_else(detect_host);
         let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &spec_root);
-        let runner = SystemRunner::new(spec_root, exec_state_dir(&this_host));
-        let report = st2::down_specs(&specs, &this_host, &runner)?;
+        let runner = SystemRunner::new(spec_root.clone(), exec_state_dir(&this_host));
+        let report = st2::down_specs(&specs, &spec_root, &this_host, &runner)?;
         println!(
             "teardown of spec {} on host '{this_host}':",
             spec_file.display()
@@ -802,6 +1297,8 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
 fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let host = host.unwrap_or_else(detect_host);
+    let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+        .context("acquire shared catalog-authoring lock for validation")?;
     let report = st2::validate::validate_for_host(&catalog_root, &host);
     let (errors, warnings) = (report.errors(), report.warnings());
 
@@ -917,6 +1414,278 @@ fn with_bus_env(cmd: &mut std::process::Command, root: &Path) {
         .env("PTY_ROOT", st2::catalog::pty_root(root));
 }
 
+fn mutation_admission(
+    root: &Path,
+    host: Option<String>,
+) -> Result<(
+    st2::cutover_admission::CanonicalCatalog,
+    st2::cutover_admission::HostId,
+    st2::cutover_admission::MutationAdmission,
+)> {
+    let catalog = st2::cutover_admission::CanonicalCatalog::open(root)?;
+    let host = st2::cutover_admission::HostId::parse(host.unwrap_or_else(detect_host))?;
+    let admission = st2::cutover_admission::probe_mutation_admission(&catalog, Some(&host))?;
+    Ok((catalog, host, admission))
+}
+
+fn require_runtime_mutation_admission(root: &Path, host: Option<String>) -> Result<()> {
+    let (_, _, admission) = mutation_admission(root, host)?;
+    match admission {
+        st2::cutover_admission::MutationAdmission::Available => Ok(()),
+        st2::cutover_admission::MutationAdmission::Busy(busy) => {
+            anyhow::bail!(
+                "runtime mutation refused: {}",
+                serde_json::to_string(&busy)?
+            )
+        }
+    }
+}
+
+fn cutover_cmd(command: CutoverCmd, explicit_catalog: Option<&Path>) -> Result<()> {
+    match command {
+        CutoverCmd::Install {
+            request,
+            expect_request_sha256,
+        } => {
+            let loaded =
+                st2::cutover_driver::LoadedCutoverRequest::load(&request, &expect_request_sha256)?;
+            loaded.preflight()?;
+            let request = request
+                .canonicalize()
+                .with_context(|| format!("canonicalize cutover request {}", request.display()))?;
+            let spec = st2::service::CutoverCandidateServiceSpec::new(
+                std::env::current_exe()?.canonicalize()?,
+                loaded.request().canonical_catalog.clone(),
+                request,
+                expect_request_sha256,
+                loaded.request().host.as_str().to_owned(),
+                loaded.request().gate_id.as_str().to_owned(),
+            )?;
+            let unit = st2::service::install_cutover_candidate(&spec)?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema": "st2.cutover-candidate-service.v1",
+                    "unit": spec.unit_name,
+                    "unitPath": unit,
+                    "restart": "always",
+                    "restartSec": st2::service::CUTOVER_RESTART_SEC,
+                }))?
+            );
+            Ok(())
+        }
+        CutoverCmd::Run {
+            request,
+            expect_request_sha256,
+        } => {
+            let loaded =
+                st2::cutover_driver::LoadedCutoverRequest::load(&request, &expect_request_sha256)?;
+            let catalog = loaded.request().canonical_catalog.clone();
+            let host = loaded.request().host.as_str().to_owned();
+            if let Some(explicit) = explicit_catalog {
+                let explicit = absolute_catalog_path(explicit)?;
+                if explicit != catalog {
+                    anyhow::bail!(
+                        "cutover request catalog {} conflicts with explicit --catalog {}",
+                        catalog.display(),
+                        explicit.display()
+                    );
+                }
+            }
+            let candidate = st2::service::CutoverCandidateServiceSpec::new(
+                std::env::current_exe()?.canonicalize()?,
+                catalog.clone(),
+                request.canonicalize().with_context(|| {
+                    format!("canonicalize cutover request {}", request.display())
+                })?,
+                expect_request_sha256,
+                host.clone(),
+                loaded.request().gate_id.as_str().to_owned(),
+            )?;
+            st2::service::validate_cutover_candidate_process(&candidate)?;
+            maybe_pause_at_cutover_test_boundary("before-run")?;
+            // SAFETY: CLI dispatch remains single-threaded here. The request is the sole cutover
+            // authority; inherited ambient selection must not leak into a provider or helper.
+            unsafe {
+                std::env::set_var("CATALOG", &catalog);
+                std::env::set_var("ST_ROOT", &catalog);
+                std::env::set_var("PTY_ROOT", st2::catalog::pty_root(&catalog));
+            }
+            let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+            match loaded.run(&runner)? {
+                st2::cutover_driver::DriverRunOutcome::Completed {
+                    finalized,
+                    provider_fleet_proof,
+                } => {
+                    maybe_pause_at_cutover_test_boundary("after-finalize")?;
+                    let (finalized, ownership, readiness) = finalized.into_successor_parts();
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "completed",
+                            "catalog": catalog,
+                            "host": host,
+                            "historyPath": finalized.history_path,
+                            "gateId": finalized.marker.gate_id,
+                            "requestSha256": finalized.marker.request_sha256,
+                            "providerFleetProof": provider_fleet_proof,
+                        }))?
+                    );
+                    eprintln!(
+                        "st2: cutover finalized; supervising {} on host '{}' with retained ownership",
+                        catalog.display(),
+                        host
+                    );
+                    st2::run::up_loop_with_ownership_ready(
+                        ownership,
+                        &runner,
+                        Duration::from_secs(30),
+                        move || {
+                            st2::service::retire_ordinary_supervisor_for_cutover()?;
+                            match readiness {
+                                Some(readiness) => readiness
+                                    .supervisor_entered()
+                                    .map_err(|error| anyhow::anyhow!(error)),
+                                None => Ok(()),
+                            }
+                        },
+                        |report| {
+                            if report.is_noteworthy() {
+                                print_report(report);
+                            }
+                        },
+                    )
+                }
+                st2::cutover_driver::DriverRunOutcome::Finalized(finalized) => {
+                    let (finalized, ownership, readiness) = finalized.into_successor_parts();
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "finalized",
+                            "catalog": catalog,
+                            "host": host,
+                            "historyPath": finalized.history_path,
+                            "gateId": finalized.marker.gate_id,
+                            "requestSha256": finalized.marker.request_sha256,
+                        }))?
+                    );
+                    eprintln!(
+                        "st2: exact finalized cutover replay; supervising {} on host '{}' with reacquired ownership",
+                        catalog.display(),
+                        host
+                    );
+                    st2::run::up_loop_with_ownership_ready(
+                        ownership,
+                        &runner,
+                        Duration::from_secs(30),
+                        move || {
+                            st2::service::retire_ordinary_supervisor_for_cutover()?;
+                            match readiness {
+                                Some(readiness) => readiness
+                                    .supervisor_entered()
+                                    .map_err(|error| anyhow::anyhow!(error)),
+                                None => Ok(()),
+                            }
+                        },
+                        |report| {
+                            if report.is_noteworthy() {
+                                print_report(report);
+                            }
+                        },
+                    )
+                }
+                st2::cutover_driver::DriverRunOutcome::Fenced(fence) => {
+                    let detail = match fence {
+                        st2::cutover_driver::DriverFence::Active(busy) => serde_json::json!({
+                            "kind": "active",
+                            "busy": busy,
+                        }),
+                        st2::cutover_driver::DriverFence::Pending(pending) => serde_json::json!({
+                            "kind": "pending",
+                            "catalog": pending.catalog.as_path(),
+                            "host": pending.host,
+                            "gateId": pending.gate_id,
+                            "requestSha256": pending.request_sha256,
+                            "activePath": pending.active_path,
+                        }),
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "fenced",
+                            "detail": detail,
+                        }))?
+                    );
+                    anyhow::bail!("cutover is fenced by another active authority")
+                }
+                st2::cutover_driver::DriverRunOutcome::NeedsCheckpoint {
+                    action_index,
+                    kind,
+                    input_sha256,
+                    receipt,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "schema": "st2.cutover-run.v1",
+                            "outcome": "needs-checkpoint",
+                            "actionIndex": action_index,
+                            "kind": kind,
+                            "inputSha256": input_sha256,
+                            "receipt": receipt,
+                        }))?
+                    );
+                    anyhow::bail!(
+                        "cutover requires external checkpoint evidence at action {action_index}"
+                    )
+                }
+            }
+        }
+        CutoverCmd::Status { host, json } => {
+            let root = catalog_root_for_env()?;
+            let (catalog, host, admission) = mutation_admission(&root, host)?;
+            match admission {
+                st2::cutover_admission::MutationAdmission::Available => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "schema": "st2.mutation-available.v1",
+                                "catalog": catalog.as_path(),
+                                "requestedHost": host,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "available\tcatalog={}\thost={}",
+                            catalog.as_path().display(),
+                            host.as_str()
+                        );
+                    }
+                    Ok(())
+                }
+                st2::cutover_admission::MutationAdmission::Busy(busy) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&busy)?);
+                    } else {
+                        println!(
+                            "busy\treason={:?}\tcatalog={}\thost={}",
+                            busy.reason,
+                            busy.catalog.display(),
+                            host.as_str()
+                        );
+                        println!("active-marker\t{}", busy.active_marker.display());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 /// `st2 pty [<pty-args>…]` — a thin pass-through to `pty` with the catalog's bus env pre-set, so
 /// the maintainer never has to `eval "$(st2 env …)"` first. **Replaces** this process with `pty` (via exec)
 /// so the interactive UI keeps the tty, signals, and exit code.
@@ -924,6 +1693,7 @@ fn pty_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    require_runtime_mutation_admission(&root, None)?;
     let mut cmd = std::process::Command::new("pty");
     cmd.args(args);
     with_bus_env(&mut cmd, &root);
@@ -938,6 +1708,7 @@ fn shell_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    require_runtime_mutation_admission(&root, None)?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let mut cmd = std::process::Command::new(&shell);
     cmd.args(args);
@@ -1012,6 +1783,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
 
     // 3) Per this-host declaration: active tasks must be alive with fresh presence; retired tasks
     // must all be absent and need no presence file.
+    let _catalog_lock = st2::CatalogLock::shared(&catalog)
+        .context("acquire shared catalog-authoring lock for doctor snapshot")?;
     let found = discover(&catalog);
     for e in &found.errors {
         report_check(
@@ -1112,6 +1885,47 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
     }
 }
 
+fn tasks_cmd(
+    root: &Path,
+    host: Option<String>,
+    selection: Option<st2::task_inventory::DesiredStateSelection>,
+) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = match root.canonicalize() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let detail = format!("canonicalize catalog {}: {error}", root.display());
+            let inventory = st2::task_inventory::TaskInventory::incomplete(
+                root.to_path_buf(),
+                host,
+                detail,
+                selection,
+            );
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let _catalog_lock = match st2::CatalogLock::shared(&catalog) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let detail = format!("acquire shared catalog-authoring lock: {error:#}");
+            let inventory =
+                st2::task_inventory::TaskInventory::incomplete(catalog, host, detail, selection);
+            println!("{}", inventory.to_json());
+            anyhow::bail!("task inventory incomplete")
+        }
+    };
+    let found = discover(&catalog);
+    let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
+    let inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner, selection);
+    println!("{}", inventory.to_json());
+    if inventory.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("task inventory incomplete")
+    }
+}
+
 fn tool_on_path(tool: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
@@ -1166,6 +1980,8 @@ fn agents_cmd(
         ctx.root = catalog;
     }
     let (root, host) = resolve_ctx(&ctx)?;
+    let _catalog_lock = st2::CatalogLock::shared(&root)
+        .context("acquire shared catalog-authoring lock for agent roster")?;
     let mut rows = st2::agents::roster(&root, &host);
     if let Some(f) = &status_filter {
         rows.retain(|r| r.status.as_str() == f);
@@ -1209,7 +2025,7 @@ fn ding_cmd(
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
         .unwrap_or_else(|| catalog_root.join(&id));
-    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
+    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
@@ -1285,7 +2101,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
+            let dir = message::resolve_inbox(&root, &to, &host)?;
             let filename = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1305,7 +2121,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
-            let my_inbox = message::resolve_inbox(&root, &from, &host);
+            let my_inbox = message::resolve_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
@@ -1314,7 +2130,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
+            let dir = message::resolve_inbox(&root, &to, &host)?;
             let sent = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1393,7 +2209,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 message::resolve_archive(&root, &id, &host)
             } else {
                 message::resolve_inbox(&root, &id, &host)
-            };
+            }?;
             if raw {
                 print!("{}", std::fs::read_to_string(dir.join(&filename))?);
                 return Ok(());
@@ -1420,11 +2236,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            message::archive_msg(
-                &message::resolve_inbox(&root, &id, &host),
-                &message::resolve_archive(&root, &id, &host),
-                &filename,
-            )?;
+            let inbox = message::resolve_inbox(&root, &id, &host)?;
+            let archive = message::resolve_archive(&root, &id, &host)?;
+            message::archive_msg(&inbox, &archive, &filename)?;
             println!("archived");
             Ok(())
         }
@@ -1596,7 +2410,10 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
             st2::service::install(&catalog, host, pty_root, memory_max_mb)
         }
         ServiceCmd::Status => st2::service::status(),
-        ServiceCmd::Uninstall => st2::service::uninstall(),
+        ServiceCmd::Uninstall => {
+            let catalog = catalog_root_for_env()?;
+            st2::service::uninstall(&catalog)
+        }
     }
 }
 
@@ -1717,15 +2534,8 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
-    // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
-    let lock = HostLock::new(&root, &this_host);
-    if let Some(owner) = lock.live_owner() {
-        eprintln!("st2: {}", lock.busy_warning(owner));
-        std::process::exit(1);
-    }
-
     if once {
-        let report = st2::up_once_specs(&specs, &this_host, &runner);
+        let report = st2::up_once_specs(&specs, &root, &this_host, &runner);
         println!(
             "booted team from spec {} on host '{this_host}' (once):",
             spec_file.display()
@@ -1737,16 +2547,12 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         return Ok(());
     }
 
-    if lock.has_stale_lock() {
-        eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
-    }
-    lock.acquire().context("acquiring host lock")?;
     eprintln!(
         "st2: supervising spec {} on host '{this_host}' ({} agents; reconcile every {interval}s; Ctrl-C to stop)",
         spec_file.display(),
         specs.len()
     );
-    let result = st2::up_loop_specs(
+    st2::up_loop_specs(
         &specs,
         &root,
         &this_host,
@@ -1757,9 +2563,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
                 print_report(report);
             }
         },
-    );
-    lock.release();
-    result
+    )
 }
 
 fn up(
@@ -1787,8 +2591,10 @@ fn up(
     let this_host = host.unwrap_or_else(detect_host);
     // Canonicalize the catalog root so `$CATALOG` expands to an absolute path (T01/R11).
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-
     if materialize_only {
+        let ownership = st2::host_lock::HostOwnership::acquire(&catalog_root, &this_host)
+            .context("acquire runtime host ownership for materialization")?;
+        let admission = st2::cutover_admission::RuntimeMutationAdmission::ordinary(&ownership)?;
         let mut found = discover(&catalog_root);
         let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
@@ -1815,7 +2621,8 @@ fn up(
                 "verifying explicitly installed lifecycle hooks before Codex materialization",
             )?;
         }
-        let report = st2::materialize::materialize_catalog_against(
+        let report = st2::materialize::materialize_catalog_against_admitted(
+            &admission.permission(),
             &catalog_root,
             &found.specs,
             &ownership_specs,
@@ -1845,15 +2652,6 @@ fn up(
 
     let runner = SystemRunner::new(catalog_root.clone(), exec_state_dir(&this_host));
 
-    // One supervisor per (folder, host). A single `--once` pass must also refuse while a loop owns
-    // the lock (it would double-spawn) — but it does NOT take the lock itself (that would clobber the
-    // loop's pid file); only the loop acquires + holds it.
-    let lock = HostLock::new(root, &this_host);
-    if let Some(owner) = lock.live_owner() {
-        eprintln!("st2: {}", lock.busy_warning(owner));
-        std::process::exit(1);
-    }
-
     if once {
         let targeted = task.is_some();
         let report = match task.as_deref() {
@@ -1873,16 +2671,11 @@ fn up(
         return Ok(());
     }
 
-    if lock.has_stale_lock() {
-        eprintln!("st2: reclaiming a stale lock left by a crashed st2.");
-    }
-    lock.acquire().context("acquiring host lock")?;
-
     eprintln!(
         "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",
         root.display()
     );
-    let result = up_loop(
+    up_loop(
         root,
         &this_host,
         &runner,
@@ -1892,9 +2685,7 @@ fn up(
                 print_report(report);
             }
         },
-    );
-    lock.release();
-    result
+    )
 }
 
 fn print_report(report: &UpReport) {
@@ -1956,6 +2747,8 @@ fn ls(root: &Path) -> Result<()> {
         }
         return Ok(());
     }
+    let _catalog_lock = st2::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for catalog listing")?;
     let found = discover(root);
 
     if found.specs.is_empty() {

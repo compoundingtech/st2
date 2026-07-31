@@ -4,8 +4,8 @@ st2 runs a declarative network of Codex and Claude agents from one catalog. It o
 reconciliation, native messages, normalized terminal DING delivery, presence, durable context,
 workspace materialization, and explicit teardown.
 
-Hand-authored KDL is the canonical interface. `st2 compile-agent` is experimental and must be
-reviewed before its output is materialized.
+Canonical KDL is the authoring interface. Publish one explicit Agent Spec transactionally with
+`st2 agent publish`; st2 does not compile human intent into declarations.
 
 ## Product intent and implementation contract
 
@@ -92,13 +92,40 @@ Start from the maintained [Codex](examples/native/agent-codex.kdl) or
 
 ```sh
 export CATALOG="${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog"
-mkdir -p "$CATALOG/agents/<host>/<identity>" "$CATALOG/_templates"
-cp examples/native/agent-codex.kdl "$CATALOG/agents/<host>/<identity>/agent.kdl"
-${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
+bundle="$(mktemp -d)"
+mkdir -p "$bundle/assets"
+cp examples/native/agent-codex.kdl "$bundle/agent.kdl"
+cp ./composed-AGENTS.md "$bundle/assets/AGENTS.md"
+${EDITOR:-vi} "$bundle/agent.kdl"
+input_sha256="$(st2 agent digest --bundle "$bundle")"
+st2 agent publish --catalog "$CATALOG" --bundle "$bundle" \
+  --input-sha256 "$input_sha256" --expect-absent --json
 ```
 
-Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`.
+Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Include every file referenced by
+`copy` in the bundle. For a later declaration-only update, publish `agent.kdl` with the current
+declaration's SHA-256 via `--spec ... --expect-sha256 HEX`; sibling assets and state are preserved.
+Bind either operation to the exact captured source with the SHA-256 returned by
+`st2 agent digest`.
+
+To prepare and apply a complete declaration-plane replacement without copying
+runtime state or workspaces:
+
+```sh
+st2 catalog snapshot --catalog "$CATALOG" --output ./prepared --json
+# Edit/render ./prepared, then retain the rootSha256 from the snapshot receipt.
+st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
+  --expect-sha256 <rootSha256> --json
+```
+
+`catalog apply` is policy-free. It rejects state/control content, symlinks,
+unprojected workspace facts, catalog-local/default PTY roots, and effective
+PTY-root changes. Fresh bootstrap is a separate st2+pty transaction, not an
+apply mode. A crash leaves a durable marker and content-addressed stage;
+`st2 catalog apply --catalog "$CATALOG" --resume --json` resumes without the
+original prepared source. Snapshots own the complete bounded `_templates`
+library and empty canonical per-agent `.workspace` directory facts, but never
+traverse, hash, copy, or delete workspace content.
 
 The compact declaration shape is:
 
@@ -115,7 +142,7 @@ agent "<identity>" {
   ding
 
   render {
-    copy "_templates/<host>.<identity>.AGENTS.md" "AGENTS.md"
+    copy "assets/AGENTS.md" "AGENTS.md"
     json-upsert ".codex/hooks.json" #"""
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ST_HOOKS/codex-session-start.sh","timeout":5}]}]}}
 """#
@@ -266,6 +293,29 @@ first reconcile proves all of the following:
 - only genuinely missing declared work is launched;
 - explicit teardown remains the only path that stops an agent.
 
+Use the typed inventory rather than parsing `doctor` output:
+
+```sh
+st2 tasks --catalog "$CATALOG" --host <host> --json
+```
+
+The `st2.task-inventory.v1` envelope covers every desired local PTY and exec task. A complete
+observation exits zero. Unknown runtime evidence emits `complete: false`, preserves affected rows as
+`indeterminate` rather than `absent`, and exits non-zero.
+
+For the first replacement, apply `lifecycle "adopt-only"` to every active task before starting the
+new supervisor. The replacement can then adopt live generations but structurally cannot launch a
+missing one. After applying that fence, record the complete baseline inventory; after replacement,
+require every active desired row to be running at the exact baseline generation. Only then should a
+separate catalog CAS restore the ordinary `service` lifecycle. If proof fails, leave the adoption
+fence in place.
+
+Legacy exec PID records are read without rewriting them. If their PID-file time cannot prove the
+live process generation, inventory is deliberately indeterminate. There is currently no safe
+per-task rollover command for that ambiguous evidence: the cutover remains blocked until the
+sidecar exits naturally or a separate, explicitly authorized rollover seam is implemented and
+proved. Never work around this by rewriting the record or restarting PTY-backed agent sessions.
+
 The executable gate drives the real st2 binary and both PTY and exec backends through normal stop,
 forced kill, atomic binary replacement, adoption, a live-task heartbeat, and a duplicate-boot
 receipt:
@@ -360,7 +410,8 @@ ls, up, down, validate, doctor
 message, ding, agents, status, context, resource
 env, pty, shell, pretrust
 hooks, service, eval
-compile-agent (experimental)
+agent digest, agent publish
+catalog snapshot, catalog apply
 completions
 ```
 
@@ -420,5 +471,9 @@ interviewer reply at-or-after the exact kickoff receipt completes it. Canonical 
 verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
 evals retain their flat bus and completion semantics.
 
-`st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
-interface, and generated output must be reviewed before materialization.
+`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) --input-sha256 HEX
+(--expect-absent | --expect-sha256 HEX)` is the single-agent declaration writer.
+`st2 catalog apply --catalog ROOT
+(--prepared DIR --expect-sha256 ROOT_HEX | --resume)` is the complete
+declaration-plane writer. Each admits the complete prospective catalog under a
+compare-and-swap lock before making one atomic change.

@@ -1,58 +1,157 @@
 //! The single-owner guard (post-v0 item b) — one supervising st2 per **(folder, host)**.
 //!
 //! Two st2 loops reconciling the same folder for the same host would double-spawn every agent and
-//! fight over liveness. A pid-file lock prevents it and is scoped by host
+//! fight over liveness. A persistent kernel `flock` prevents it and is scoped by host
 //! (`<root>/.st2.<host>.lock`), because the folder is a *synced* catalog: host A's lock file
 //! syncs to host B, and B must ignore it (B only reads `.st2.<B>.lock`). The lock is dot-prefixed so
-//! discovery skips it. A crashed owner leaves a stale lock (dead pid) which the next start reclaims.
+//! discovery skips it. The file's pid text is diagnostic only; ownership is the retained kernel
+//! lock, which the kernel releases on process exit. The inode is never removed.
 
-use std::fs;
+use std::cell::RefCell;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek as _, SeekFrom, Write as _};
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+
+/// Retained, non-forgeable ownership of one canonical `(catalog, host)` runtime domain.
+///
+/// Runtime mutators accept this capability instead of accepting a path plus an independently
+/// constructed [`HostLock`]. The lock remains held until this value is dropped.
+pub struct HostOwnership {
+    catalog: PathBuf,
+    host: String,
+    _lock: HostLock,
+}
+
+impl HostOwnership {
+    pub fn acquire(catalog: &Path, host: &str) -> std::io::Result<Self> {
+        let catalog = catalog.canonicalize()?;
+        let metadata = fs::symlink_metadata(&catalog)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("catalog is not a real directory: {}", catalog.display()),
+            ));
+        }
+        if host.is_empty()
+            || host == "."
+            || host == ".."
+            || host.starts_with('.')
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "host must be one safe path component",
+            ));
+        }
+        let lock = HostLock::new(&catalog, host);
+        lock.acquire()?;
+        Ok(Self {
+            catalog,
+            host: host.to_owned(),
+            _lock: lock,
+        })
+    }
+
+    pub fn catalog(&self) -> &Path {
+        &self.catalog
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+}
 
 /// A pid-file lock for one host's supervision of one folder.
 pub struct HostLock {
     path: PathBuf,
+    held: RefCell<Option<File>>,
 }
 
 impl HostLock {
     pub fn new(root: &Path, host: &str) -> Self {
-        Self { path: root.join(format!(".st2.{host}.lock")) }
+        Self {
+            path: root.join(format!(".st2.{host}.lock")),
+            held: RefCell::new(None),
+        }
     }
 
     pub fn pid_path(&self) -> &Path {
         &self.path
     }
 
-    /// The pid of a *live, foreign* st2 already supervising this (folder, host), or `None` (no lock,
-    /// a stale lock from a dead pid, or the lock is ours).
+    /// The diagnostic pid written by a foreign holder, if the kernel lock is
+    /// currently held. The kernel `flock`, not this text, is ownership.
     pub fn live_owner(&self) -> Option<i32> {
-        let raw = fs::read_to_string(&self.path).ok()?;
-        let pid: i32 = raw.trim().parse().ok()?;
-        if pid == std::process::id() as i32 {
-            return None; // us
+        if self.held.borrow().is_some() {
+            return None;
         }
-        process_alive(pid).then_some(pid)
+        let file = OpenOptions::new().read(true).open(&self.path).ok()?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+            return None;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            return None;
+        }
+        fs::read_to_string(&self.path)
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
     }
 
-    /// True if a lock file exists but its owner is dead (a crashed st2 left it behind).
+    /// The lock inode is persistent and must never be removed. A free inode
+    /// with old diagnostic text is harmless and reclaimable.
     pub fn has_stale_lock(&self) -> bool {
-        self.path.exists() && self.live_owner().is_none()
+        self.path.exists()
+            && self.live_owner().is_none()
+            && fs::read_to_string(&self.path)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<i32>().ok())
+                .is_some_and(|pid| !process_alive(pid))
     }
 
-    /// Write our pid as the owner. Call only after [`live_owner`](Self::live_owner) is `None`.
+    /// Atomically claim and retain the kernel lock until [`release`](Self::release).
     pub fn acquire(&self) -> std::io::Result<()> {
+        if self.held.borrow().is_some() {
+            return Ok(());
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.path, std::process::id().to_string())
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        write!(file, "{}", std::process::id())?;
+        file.sync_all()?;
+        *self.held.borrow_mut() = Some(file);
+        Ok(())
     }
 
-    /// Remove the lock — but only if it is still ours (never clobber a live successor's lock).
+    /// Release ownership while preserving the inode as the one lock domain.
     pub fn release(&self) {
-        if let Ok(raw) = fs::read_to_string(&self.path)
-            && raw.trim().parse::<u32>().ok() == Some(std::process::id())
-        {
-            let _ = fs::remove_file(&self.path);
+        if let Some(file) = self.held.borrow_mut().take() {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 
@@ -61,9 +160,18 @@ impl HostLock {
         format!(
             "another st2 is already supervising this folder for this host (pid {owner_pid}) — refusing to start.\n\
              Two supervisors on one (folder, host) double-spawn every agent. Stop the other one first.\n\
-             If it is already gone, clear the stale lock:  rm {}",
-            self.path.display()
+             The persistent lock inode is reclaimed automatically when that process exits."
         )
+    }
+}
+
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.held.get_mut().take() {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
     }
 }
 
@@ -93,10 +201,14 @@ mod tests {
 
         lock.acquire().unwrap();
         assert!(lock.pid_path().exists());
-        assert!(lock.live_owner().is_none(), "our own lock is not a foreign owner");
+        assert!(
+            lock.live_owner().is_none(),
+            "our own lock is not a foreign owner"
+        );
 
         lock.release();
-        assert!(!lock.pid_path().exists());
+        assert!(lock.pid_path().exists(), "kernel lock inode is persistent");
+        assert!(lock.live_owner().is_none());
     }
 
     #[test]
@@ -105,11 +217,18 @@ mod tests {
         let a = HostLock::new(tmp.path(), "hetz");
         let b = HostLock::new(tmp.path(), "silber");
         assert_ne!(a.pid_path(), b.pid_path(), "per-host lock files");
-        assert!(a.pid_path().file_name().unwrap().to_str().unwrap().starts_with('.'));
+        assert!(
+            a.pid_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with('.')
+        );
     }
 
     #[test]
-    fn stale_lock_from_dead_pid_is_detected_and_not_an_owner() {
+    fn free_persistent_lock_with_old_pid_text_is_reclaimable() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = HostLock::new(tmp.path(), "hetz");
         fs::write(lock.pid_path(), "2000000000").unwrap(); // almost certainly dead
@@ -118,20 +237,44 @@ mod tests {
     }
 
     #[test]
-    fn a_live_foreign_pid_is_reported_as_owner() {
+    fn live_pid_text_without_a_kernel_lock_is_not_an_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = HostLock::new(tmp.path(), "hetz");
         fs::write(lock.pid_path(), "1").unwrap(); // init — always alive, not us
-        assert_eq!(lock.live_owner(), Some(1));
+        assert_eq!(lock.live_owner(), None);
     }
 
     #[test]
-    fn release_does_not_clobber_a_foreign_lock() {
+    fn a_second_claim_refuses_while_the_first_kernel_lock_is_held() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = HostLock::new(tmp.path(), "hetz");
-        fs::write(lock.pid_path(), "1").unwrap(); // not ours
-        lock.release();
-        assert!(lock.pid_path().exists(), "must not remove a foreign lock");
+        let first = HostLock::new(tmp.path(), "hetz");
+        let second = HostLock::new(tmp.path(), "hetz");
+        first.acquire().unwrap();
+        assert_eq!(second.live_owner(), Some(std::process::id() as i32));
+        assert_eq!(
+            second.acquire().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        first.release();
+        second.acquire().unwrap();
+    }
+
+    #[test]
+    fn ownership_is_canonical_validated_and_retains_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ownership = HostOwnership::acquire(tmp.path(), "hetz").unwrap();
+        assert_eq!(ownership.catalog(), tmp.path().canonicalize().unwrap());
+        assert_eq!(ownership.host(), "hetz");
+        assert_eq!(
+            HostOwnership::acquire(tmp.path(), "hetz")
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(HostOwnership::acquire(tmp.path(), "../hetz").is_err());
+        drop(ownership);
+        HostOwnership::acquire(tmp.path(), "hetz").unwrap();
     }
 
     #[test]

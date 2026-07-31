@@ -11,9 +11,10 @@
 //! pty sessions and keep running; only a `retired` spec tears an agent down.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Seek as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -21,17 +22,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
+use crate::cutover_admission::{RuntimeMutate, RuntimeMutationAdmission};
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
+use crate::host_lock::HostOwnership;
 use crate::message;
 use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
-use agent_spec::spec::TaskKind;
+use crate::task_inventory::{
+    DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
+    RuntimeObserver, generation_id,
+};
+use agent_spec::spec::{TaskKind, TaskLifecycle};
 
 // This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+const OBSERVED_PROCESS_PID_TAG: &str = "st2.observation.process.pid";
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
@@ -116,6 +126,27 @@ pub trait Runner {
     }
     /// Finally remove an exited session's files (retirement/final garbage collection).
     fn remove(&self, pty_id: &str) -> anyhow::Result<()>;
+
+    /// Read-only, generation-bearing observation used by exact cutover adoption. Ordinary fake
+    /// runners need not implement this; refusing an incomplete observation is safer than inferring
+    /// an adoptable generation from the lossy [`Session`] view.
+    fn observe_runtime(&self, _desired: &[DesiredRuntime]) -> ObservationBatch {
+        ObservationBatch {
+            complete: false,
+            errors: vec!["runner does not provide generation-bearing runtime observation".into()],
+            ..ObservationBatch::default()
+        }
+    }
+
+    /// Complete read-only census of the effective PTY root. Provider cutover proof uses this
+    /// instead of a requested-id projection so an undeclared competing provider cannot hide.
+    fn observe_pty_root(&self) -> ObservationBatch {
+        ObservationBatch {
+            complete: false,
+            errors: vec!["runner does not provide a complete PTY-root census".into()],
+            ..ObservationBatch::default()
+        }
+    }
 }
 
 /// Production [`Runner`]. Shells out to the `pty` CLI for tasks. (M1a routes both `pty` and `exec`
@@ -146,6 +177,35 @@ struct PtyListEntry {
     /// The process exit code once `exited` (absent while running or `vanished`).
     #[serde(rename = "exitCode", default)]
     exit_code: Option<i64>,
+    /// PTY daemon PID. Together with `createdAt`, this is pty's stable generation tuple.
+    #[serde(default)]
+    pid: Option<u32>,
+    /// PTY-owned generation creation time.
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+    /// Immutable-at-proof launch metadata published by Axe onto this exact PTY.
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsEntry {
+    name: String,
+    process: PtyStatsProcess,
+    daemon: PtyStatsDaemon,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsProcess {
+    alive: bool,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsDaemon {
+    pid: u32,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -275,14 +335,139 @@ impl PtyCli {
         }
         cmd
     }
-}
 
-impl Runner for PtyCli {
-    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+    /// Pure, typed PTY observation for task inventory. A missing root is known
+    /// empty and is not passed to `pty`, because observation must not create it.
+    fn task_observations(&self, desired_ids: &HashSet<&str>) -> ObservationBatch {
+        let root = effective_pty_root(&self.catalog_root);
+        self.task_observations_at_root(Some(desired_ids), &root)
+    }
+
+    fn all_task_observations(&self) -> ObservationBatch {
+        let root = effective_pty_root(&self.catalog_root);
+        let mut batch = self.task_observations_at_root(None, &root);
+        if batch.complete
+            && batch
+                .observations
+                .iter()
+                .any(|observed| matches!(observed.state, ObservedState::Running(_)))
+            && let Err(error) = self.enrich_running_process_pids(&root, &mut batch)
+        {
+            batch.complete = false;
+            batch.errors.push(error.to_string());
+        }
+        batch
+    }
+
+    fn task_observations_at_root(
+        &self,
+        desired_ids: Option<&HashSet<&str>>,
+        root: &Path,
+    ) -> ObservationBatch {
+        if desired_ids.is_some_and(HashSet::is_empty) {
+            return ObservationBatch {
+                complete: true,
+                ..ObservationBatch::default()
+            };
+        }
+        let metadata = match std::fs::metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ObservationBatch {
+                    complete: true,
+                    ..ObservationBatch::default()
+                };
+            }
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "cannot inspect PTY root {}: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        if !metadata.is_dir() {
+            return ObservationBatch {
+                complete: false,
+                observations: Vec::new(),
+                errors: vec![format!("PTY root {} is not a directory", root.display())],
+            };
+        }
+        let entries = match self.list_entries_at(root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![error.to_string()],
+                };
+            }
+        };
+        let mut observations = Vec::with_capacity(entries.len());
+        let mut errors = Vec::new();
+        for entry in entries {
+            if desired_ids.is_some_and(|ids| !ids.contains(entry.name.as_str())) {
+                continue;
+            }
+            let state = match entry.status.as_str() {
+                "running" => match (entry.pid, entry.created_at.as_deref()) {
+                    (Some(pid), Some(created_at)) => {
+                        let generation_id =
+                            generation_id("pty", &entry.name, pid, created_at, None);
+                        match RuntimeGeneration::new(pid, created_at.to_owned(), generation_id) {
+                            Ok(generation) => ObservedState::Running(generation),
+                            Err(error) => {
+                                let message = format!(
+                                    "invalid PTY task {:?} generation: {error}",
+                                    entry.name
+                                );
+                                errors.push(message.clone());
+                                ObservedState::Indeterminate(message)
+                            }
+                        }
+                    }
+                    _ => {
+                        let message = format!(
+                            "running PTY task {:?} lacks pid or createdAt generation evidence",
+                            entry.name
+                        );
+                        errors.push(message.clone());
+                        ObservedState::Indeterminate(message)
+                    }
+                },
+                "exited" => ObservedState::Exited,
+                "vanished" => ObservedState::Vanished,
+                other => {
+                    let message = format!("PTY task {:?} has unknown status {other:?}", entry.name);
+                    errors.push(message.clone());
+                    ObservedState::Indeterminate(message)
+                }
+            };
+            observations.push(RuntimeObservation {
+                runtime_id: entry.name,
+                state,
+                tags: entry.tags,
+            });
+        }
+        ObservationBatch {
+            complete: errors.is_empty(),
+            observations,
+            errors,
+        }
+    }
+
+    fn list_entries(&self) -> anyhow::Result<Vec<PtyListEntry>> {
+        self.list_entries_at(&effective_pty_root(&self.catalog_root))
+    }
+
+    fn list_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyListEntry>> {
         let out = output_with_timeout(
             Command::new(&self.bin)
                 .args(["list", "--json"])
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+                .env("PTY_ROOT", root),
             PTY_LIST_TIMEOUT,
         )
         .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
@@ -292,9 +477,77 @@ impl Runner for PtyCli {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("parsing `pty list --json`: {e}"))?;
-        Ok(entries
+        serde_json::from_slice(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty list --json`: {error}"))
+    }
+
+    fn enrich_running_process_pids(
+        &self,
+        root: &Path,
+        batch: &mut ObservationBatch,
+    ) -> anyhow::Result<()> {
+        let out = output_with_timeout(
+            Command::new(&self.bin)
+                .args(["stats", "--json"])
+                .env("PTY_ROOT", root),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty stats --json` failed: {error}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "`pty stats --json` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stats = serde_json::from_slice::<Vec<PtyStatsEntry>>(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty stats --json`: {error}"))?;
+        let mut by_name = BTreeMap::new();
+        for entry in &stats {
+            anyhow::ensure!(
+                by_name.insert(entry.name.as_str(), entry).is_none(),
+                "`pty stats --json` contains duplicate session {:?}",
+                entry.name
+            );
+        }
+        for observed in &mut batch.observations {
+            let ObservedState::Running(generation) = &observed.state else {
+                continue;
+            };
+            let entry = by_name.get(observed.runtime_id.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`pty stats --json` is missing running session {:?}",
+                    observed.runtime_id
+                )
+            })?;
+            anyhow::ensure!(
+                entry.daemon.pid == generation.pid()
+                    && entry.created_at == generation.created_at()
+                    && entry.process.alive,
+                "`pty stats --json` generation differs for running session {:?}",
+                observed.runtime_id
+            );
+            let pid = entry.process.pid.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`pty stats --json` lacks child pid for running session {:?}",
+                    observed.runtime_id
+                )
+            })?;
+            anyhow::ensure!(
+                pid > 0,
+                "`pty stats --json` has invalid child pid for running session {:?}",
+                observed.runtime_id
+            );
+            observed
+                .tags
+                .insert(OBSERVED_PROCESS_PID_TAG.to_owned(), pid.to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Runner for PtyCli {
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        Ok(self
+            .list_entries()?
             .into_iter()
             .map(|e| Session {
                 pty_id: e.name,
@@ -443,6 +696,83 @@ impl SystemRunner {
     }
 }
 
+impl RuntimeObserver for SystemRunner {
+    fn observe(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        let pty_ids = desired
+            .iter()
+            .filter(|runtime| runtime.kind == TaskKind::Pty)
+            .map(|runtime| runtime.runtime_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut batch = self.pty.task_observations(&pty_ids);
+
+        for runtime in desired
+            .iter()
+            .filter(|runtime| runtime.kind == TaskKind::Exec)
+        {
+            match self.exec.observe_generation_optional(&runtime.runtime_id) {
+                Ok(None) => {
+                    // Positive absence is filled by the declaration/runtime join.
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Known {
+                    generation,
+                    alive,
+                })) => {
+                    let state = if alive {
+                        match RuntimeGeneration::new(
+                            generation.pid,
+                            generation.created_at,
+                            generation.generation_id,
+                        ) {
+                            Ok(generation) => ObservedState::Running(generation),
+                            Err(error) => {
+                                let message = format!(
+                                    "invalid exec task {:?} generation: {error}",
+                                    runtime.runtime_id
+                                );
+                                batch.errors.push(message.clone());
+                                ObservedState::Indeterminate(message)
+                            }
+                        }
+                    } else {
+                        ObservedState::Exited
+                    };
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state,
+                        tags: BTreeMap::new(),
+                    });
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Indeterminate {
+                    reason,
+                    ..
+                })) => {
+                    let message = format!(
+                        "exec task {:?} is indeterminate: {reason}",
+                        runtime.runtime_id
+                    );
+                    batch.errors.push(message.clone());
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Indeterminate(message),
+                        tags: BTreeMap::new(),
+                    });
+                }
+                Err(error) => {
+                    let message = format!("observe exec task {:?}: {error:#}", runtime.runtime_id);
+                    batch.errors.push(message.clone());
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Indeterminate(message),
+                        tags: BTreeMap::new(),
+                    });
+                }
+            }
+        }
+        batch.complete &= batch.errors.is_empty();
+        batch
+    }
+}
+
 impl Runner for SystemRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let mut idx = self.index.borrow_mut();
@@ -496,6 +826,14 @@ impl Runner for SystemRunner {
             }
         }
     }
+
+    fn observe_runtime(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        RuntimeObserver::observe(self, desired)
+    }
+
+    fn observe_pty_root(&self) -> ObservationBatch {
+        self.pty.all_task_observations()
+    }
 }
 
 /// The machine-local runner-state dir for a host's exec tasks: `$XDG_STATE_HOME/st2/<host>/exec`
@@ -510,7 +848,8 @@ pub fn exec_state_dir(host: &str) -> PathBuf {
 
 /// A task st2 gave up restarting (crash-looped past its `restart{}` policy, mode=fail) — carries what
 /// the supervisor loop needs to SURFACE it: the parked task, its agent, and who to notify (M2.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CrashLoop {
     /// The parked task's pty id.
     pub pty_id: String,
@@ -533,7 +872,8 @@ impl CrashLoop {
 }
 
 /// Owned, human-readable summary of one reconcile+execute pass (no borrows of the plan/specs).
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpReport {
     /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
     /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
@@ -598,11 +938,30 @@ impl UpReport {
 /// flapping-cap. Order matters: reap standalone corpses, then (cap-gated) reap-and-respawn each
 /// launch target, then kill teardowns. Per-op errors are collected, never fatal.
 pub fn execute(
+    permission: &RuntimeMutate<'_>,
+    catalog_root: &Path,
+    this_host: &str,
     plan: &ReconcilePlan,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     report: &mut UpReport,
 ) {
+    let Ok(canonical_root) = catalog_root.canonicalize() else {
+        report.errors.push(format!(
+            "canonicalize runtime mutation catalog {}",
+            catalog_root.display()
+        ));
+        return;
+    };
+    if permission.catalog().as_path() != canonical_root || permission.host().as_str() != this_host {
+        report.errors.push(format!(
+            "runtime mutation permission is for ({}, {}), not ({}, {this_host})",
+            permission.catalog().as_path().display(),
+            permission.host().as_str(),
+            canonical_root.display(),
+        ));
+        return;
+    }
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -768,6 +1127,37 @@ impl LivenessDebounce {
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
 /// `debounce` carries per-id liveness so a transient not-alive flicker isn't destructively reaped.
 fn reconcile_pass(
+    ownership: &HostOwnership,
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
+    let admission = match RuntimeMutationAdmission::ordinary(ownership) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "runtime mutation admission denied (pass skipped): {error}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
+    reconcile_pass_admitted(
+        &admission.permission(),
+        root,
+        this_host,
+        runner,
+        cap,
+        debounce,
+    )
+}
+
+pub(crate) fn reconcile_pass_admitted(
+    permission: &RuntimeMutate<'_>,
     root: &Path,
     this_host: &str,
     runner: &dyn Runner,
@@ -811,7 +1201,8 @@ fn reconcile_pass(
     // active fleet even when another gate defers one owner's writes. A gating render failure removes
     // only that agent from this pass; advisory git-exclude failures remain warnings and never block
     // a launch.
-    let materialized = crate::materialize::materialize_catalog_against(
+    let materialized = crate::materialize::materialize_catalog_against_admitted(
+        permission,
         root,
         &materializable_specs,
         &found.specs,
@@ -844,7 +1235,7 @@ fn reconcile_pass(
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute(&plan, runner, cap, &mut report);
+    execute(permission, root, this_host, &plan, runner, cap, &mut report);
     report
 }
 
@@ -891,14 +1282,1163 @@ fn gate_codex_launches_on_hooks<'a, V>(
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for one-shot reconcile")?;
+    up_once_with_ownership(&ownership, runner)
+}
+
+/// Reconcile once while retaining caller-owned host authority.
+///
+/// Cutover finalization uses this seam to continue into the successor without a
+/// drop-and-reacquire window.
+pub fn up_once_with_ownership(
+    ownership: &HostOwnership,
+    runner: &dyn Runner,
+) -> anyhow::Result<UpReport> {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     Ok(reconcile_pass(
-        root,
-        this_host,
+        &ownership,
+        ownership.catalog(),
+        ownership.host(),
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
     ))
+}
+
+pub(crate) trait RuntimeObservationSource {
+    fn observe_complete_pty_root(&self) -> ObservationBatch;
+}
+
+impl<T: Runner + ?Sized> RuntimeObservationSource for T {
+    fn observe_complete_pty_root(&self) -> ObservationBatch {
+        Runner::observe_pty_root(self)
+    }
+}
+
+pub(crate) struct ProviderFleetRuntimeObserver<'a, O: RuntimeObservationSource + ?Sized> {
+    action: &'a crate::cutover_admission::ProviderFleetProofAction,
+    observer: &'a O,
+}
+
+impl<'a, O: RuntimeObservationSource + ?Sized> ProviderFleetRuntimeObserver<'a, O> {
+    pub(crate) fn new(
+        action: &'a crate::cutover_admission::ProviderFleetProofAction,
+        observer: &'a O,
+    ) -> Self {
+        Self { action, observer }
+    }
+}
+
+impl<O: RuntimeObservationSource + ?Sized> crate::cutover_admission::ProviderFleetObserver
+    for ProviderFleetRuntimeObserver<'_, O>
+{
+    fn observe_provider_rows(
+        &self,
+        catalog: &crate::cutover_admission::CanonicalCatalog,
+        host: &crate::cutover_admission::HostId,
+    ) -> crate::cutover_admission::AdmissionResult<
+        Vec<crate::cutover_admission::ProviderTaskObservation>,
+    > {
+        use crate::cutover_admission::{
+            AdmissionError, ProviderTaskObservation, ProviderTaskStatus,
+        };
+
+        let found = crate::discover(catalog.as_path());
+        if !found.errors.is_empty() {
+            return Err(AdmissionError::Invalid(
+                "provider runtime observation requires exact catalog discovery".to_owned(),
+            ));
+        }
+        let mut provider_runtime_ids = Vec::with_capacity(self.action.providers.len());
+        let mut catalog_provider_ids = BTreeSet::new();
+        for spec in found
+            .specs
+            .iter()
+            .filter(|spec| spec.resolved_host(host.as_str()) == host.as_str() && !spec.retired)
+        {
+            for task in spec
+                .tasks
+                .iter()
+                .filter(|task| task.name == "agent" && !task.derived && task.kind == TaskKind::Pty)
+            {
+                let runtime_id = task.id.clone().unwrap_or_else(|| {
+                    format!("{}.{}.{}", host.as_str(), spec.identity, task.name)
+                });
+                if task.lifecycle != TaskLifecycle::AdoptOnly {
+                    return Err(AdmissionError::Conflict(format!(
+                        "local provider PTY {runtime_id:?} is not adopt-only"
+                    )));
+                }
+                if !catalog_provider_ids.insert(runtime_id.clone()) {
+                    return Err(AdmissionError::Conflict(format!(
+                        "local provider PTY id {runtime_id:?} is declared more than once"
+                    )));
+                }
+            }
+        }
+        for entry in &self.action.providers {
+            let mut matches = found
+                .specs
+                .iter()
+                .filter(|spec| {
+                    spec.identity == entry.identity
+                        && spec.resolved_host(host.as_str()) == host.as_str()
+                })
+                .flat_map(|spec| {
+                    spec.tasks
+                        .iter()
+                        .filter(|task| task.name == "agent" && !task.derived)
+                        .map(move |task| (spec, task))
+                });
+            let Some((spec, task)) = matches.next() else {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} has no exact authored runtime",
+                    entry.identity
+                )));
+            };
+            if matches.next().is_some() {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} has multiple authored runtimes",
+                    entry.identity
+                )));
+            }
+            provider_runtime_ids.push((
+                entry,
+                task.id.clone().unwrap_or_else(|| {
+                    format!("{}.{}.{}", host.as_str(), spec.identity, task.name)
+                }),
+            ));
+        }
+        let expected_ids = provider_runtime_ids
+            .iter()
+            .map(|(_, runtime_id)| runtime_id.clone())
+            .collect::<BTreeSet<_>>();
+        if expected_ids.len() != provider_runtime_ids.len() || catalog_provider_ids != expected_ids
+        {
+            return Err(AdmissionError::Conflict(
+                "provider action is not an exact projection of all local adopt-only provider PTYs"
+                    .to_owned(),
+            ));
+        }
+
+        let batch = self.observer.observe_complete_pty_root();
+        if !batch.complete || !batch.errors.is_empty() {
+            return Err(AdmissionError::Invalid(format!(
+                "complete PTY-root observation is incomplete: {}",
+                batch.errors.join("; ")
+            )));
+        }
+        validate_complete_provider_pty_census(&expected_ids, &batch)?;
+        let mut observed_by_id = BTreeMap::new();
+        for observed in &batch.observations {
+            observed_by_id.insert(observed.runtime_id.as_str(), observed);
+        }
+
+        let mut authored_providers = Vec::with_capacity(provider_runtime_ids.len());
+        for (entry, runtime_id) in provider_runtime_ids {
+            let observed = observed_by_id
+                .get(runtime_id.as_str())
+                .expect("declared provider presence checked");
+            let receipt = observe_prompt_authority(entry, host, &runtime_id, &observed.tags)?;
+            let (status, runtime_generation_id) = match &observed.state {
+                ObservedState::Running(generation) => {
+                    let process_pid = observed
+                        .tags
+                        .get(OBSERVED_PROCESS_PID_TAG)
+                        .ok_or_else(|| {
+                            AdmissionError::Invalid(format!(
+                                "provider {runtime_id:?} lacks exact PTY child-process evidence"
+                            ))
+                        })?
+                        .parse::<u32>()
+                        .map_err(|error| {
+                            AdmissionError::Invalid(format!(
+                                "provider {runtime_id:?} child-process pid is invalid: {error}"
+                            ))
+                        })?;
+                    observe_effective_prompt_injection(entry, &receipt, process_pid)?;
+                    (
+                        ProviderTaskStatus::Running,
+                        Some(generation.generation_id().to_owned()),
+                    )
+                }
+                ObservedState::Exited | ObservedState::Vanished => {
+                    (ProviderTaskStatus::Stopped, None)
+                }
+                ObservedState::Indeterminate(reason) => {
+                    return Err(AdmissionError::Invalid(format!(
+                        "provider {runtime_id:?} is indeterminate: {reason}"
+                    )));
+                }
+                ObservedState::Absent => (ProviderTaskStatus::Absent, None),
+            };
+            authored_providers.push(ProviderTaskObservation {
+                identity: entry.identity.clone(),
+                status,
+                runtime_generation_id,
+                prompt: Some(entry.prompt.clone()),
+            });
+        }
+
+        let recheck = self.observer.observe_complete_pty_root();
+        validate_complete_provider_pty_census(&expected_ids, &recheck)?;
+        validate_provider_carriers_unchanged(&expected_ids, &batch, &recheck)?;
+
+        Ok(authored_providers)
+    }
+}
+
+pub(crate) fn validate_provider_action_preflight(
+    declaration_root: &Path,
+    logical_catalog: &Path,
+    host: &crate::cutover_admission::HostId,
+    action: &crate::cutover_admission::ProviderFleetProofAction,
+    expected_catalog_sha256: &str,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    let observed_sha256 = crate::catalog_transaction::declaration_root_sha256_locked(
+        declaration_root,
+    )
+    .map_err(|error| {
+        AdmissionError::Invalid(format!(
+            "compute prospective provider catalog digest: {error:#}"
+        ))
+    })?;
+    if observed_sha256 != expected_catalog_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "prospective provider catalog digest mismatch: expected {expected_catalog_sha256}, found {observed_sha256}"
+        )));
+    }
+    let found = crate::discover(declaration_root);
+    if !found.errors.is_empty() || !found.warnings.is_empty() {
+        return Err(AdmissionError::Invalid(
+            "provider preflight requires warning-free exact prospective catalog discovery"
+                .to_owned(),
+        ));
+    }
+    let authored = found
+        .specs
+        .iter()
+        .filter(|spec| spec.resolved_host(host.as_str()) == host.as_str() && !spec.retired)
+        .flat_map(|spec| {
+            spec.tasks
+                .iter()
+                .filter(|task| task.name == "agent" && !task.derived && task.kind == TaskKind::Pty)
+                .map(move |task| (spec, task))
+        })
+        .collect::<Vec<_>>();
+    if authored.len() != action.providers.len()
+        || authored
+            .iter()
+            .any(|(_, task)| task.lifecycle != TaskLifecycle::AdoptOnly)
+    {
+        return Err(AdmissionError::Conflict(
+            "prospective catalog provider inventory is not the exact adopt-only action fleet"
+                .to_owned(),
+        ));
+    }
+    for entry in &action.providers {
+        let matches = authored
+            .iter()
+            .filter(|(spec, _)| spec.identity == entry.identity)
+            .collect::<Vec<_>>();
+        let [(spec, task)] = matches.as_slice() else {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} is missing or non-unique in prospective catalog",
+                entry.identity
+            )));
+        };
+        if entry.host != *host {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} host differs from preflight host",
+                entry.identity
+            )));
+        }
+        let relative_spec = spec.path.strip_prefix(declaration_root).map_err(|_| {
+            AdmissionError::Invalid("prospective provider declaration escaped its root".to_owned())
+        })?;
+        let logical_spec_dir = logical_catalog
+            .join(relative_spec)
+            .parent()
+            .unwrap_or(logical_catalog)
+            .to_path_buf();
+        let workspace = spec
+            .workspace
+            .as_deref()
+            .map(|value| {
+                logical_spec_dir.join(crate::expand::expand_catalog(value, logical_catalog))
+            })
+            .ok_or_else(|| {
+                AdmissionError::Conflict(format!(
+                    "provider {:?} has no authored workspace",
+                    entry.identity
+                ))
+            })?;
+        if workspace != entry.workspace {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} workspace differs from prospective catalog",
+                entry.identity
+            )));
+        }
+        let argv = match (&task.command, &task.argv) {
+            (None, Some(argv)) => argv
+                .iter()
+                .map(|argument| crate::expand::expand_catalog(argument, logical_catalog))
+                .collect::<Vec<_>>(),
+            _ => {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} does not have one structured argv",
+                    entry.identity
+                )));
+            }
+        };
+        if argv != entry.canonical_argv {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} argv differs from prospective catalog",
+                entry.identity
+            )));
+        }
+        for (flag, expected) in [
+            ("--persona", entry.persona.as_str()),
+            ("--harness", entry.harness.as_str()),
+            ("--model", entry.model.as_str()),
+            ("--effort", entry.effort.as_str()),
+            ("--mode", entry.mode.as_str()),
+            ("--boot", entry.boot_contract.as_str()),
+        ] {
+            if exact_provider_argv_axis(&argv, flag)? != expected {
+                return Err(AdmissionError::Conflict(format!(
+                    "provider {:?} {flag} differs from prospective catalog",
+                    entry.identity
+                )));
+            }
+        }
+        let persona = task
+            .env
+            .get("AGENT_PERSONA")
+            .map(|value| crate::expand::expand_catalog(value, logical_catalog));
+        if persona.as_deref() != Some(entry.persona.as_str()) {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} AGENT_PERSONA differs from prospective catalog",
+                entry.identity
+            )));
+        }
+        let profile = task
+            .env
+            .get("AGENT_RUNTIME_PROFILE")
+            .map(|value| PathBuf::from(crate::expand::expand_catalog(value, logical_catalog)));
+        if profile.as_deref() != Some(entry.prompt.runtime_profile_path.as_path()) {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} runtime profile differs from prospective catalog",
+                entry.identity
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn exact_provider_argv_axis<'a>(
+    argv: &'a [String],
+    flag: &str,
+) -> crate::cutover_admission::AdmissionResult<&'a str> {
+    use crate::cutover_admission::AdmissionError;
+
+    let inline = format!("{flag}=");
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        if argv[index] == flag {
+            let value = argv.get(index + 1).ok_or_else(|| {
+                AdmissionError::Invalid(format!("provider argv {flag} has no value"))
+            })?;
+            values.push(value.as_str());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argv[index].strip_prefix(&inline) {
+            values.push(value);
+        }
+        index += 1;
+    }
+    match values.as_slice() {
+        [value] if !value.is_empty() && !value.starts_with("--") => Ok(*value),
+        [] => Err(AdmissionError::Invalid(format!(
+            "provider argv omits {flag}"
+        ))),
+        _ => Err(AdmissionError::Invalid(format!(
+            "provider argv has invalid or repeated {flag}"
+        ))),
+    }
+}
+
+fn validate_complete_provider_pty_census(
+    expected_ids: &BTreeSet<String>,
+    batch: &ObservationBatch,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    if !batch.complete || !batch.errors.is_empty() {
+        return Err(AdmissionError::Invalid(
+            "provider proof requires one complete PTY-root census".to_owned(),
+        ));
+    }
+    let mut observed_ids = BTreeSet::new();
+    for observed in &batch.observations {
+        if !observed_ids.insert(observed.runtime_id.as_str()) {
+            return Err(AdmissionError::Conflict(format!(
+                "complete PTY-root census contains duplicate runtime id {:?}",
+                observed.runtime_id
+            )));
+        }
+        if !expected_ids.contains(&observed.runtime_id)
+            && (observed.runtime_id.ends_with(".agent")
+                || observed.tags.get("role").map(String::as_str) == Some("agent")
+                || observed.tags.get("run.role").map(String::as_str) == Some("coding-agent")
+                || observed.tags.contains_key("agent.provider")
+                || observed.tags.contains_key("agent.harness")
+                || observed.tags.contains_key("agent.tool")
+                || observed.tags.keys().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "agent.launch.receipt.schema"
+                            | "agent.launch.receipt.path"
+                            | "agent.launch.receipt.sha256"
+                            | "agent.generation.id"
+                    )
+                }))
+        {
+            return Err(AdmissionError::Conflict(format!(
+                "complete PTY-root census contains undeclared provider PTY {:?}",
+                observed.runtime_id
+            )));
+        }
+    }
+    if expected_ids
+        .iter()
+        .any(|runtime_id| !observed_ids.contains(runtime_id.as_str()))
+    {
+        return Err(AdmissionError::Conflict(
+            "complete PTY-root census is missing a declared provider PTY".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_carriers_unchanged(
+    expected_ids: &BTreeSet<String>,
+    before: &ObservationBatch,
+    after: &ObservationBatch,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    fn rows<'a>(
+        expected_ids: &BTreeSet<String>,
+        batch: &'a ObservationBatch,
+    ) -> BTreeMap<&'a str, &'a RuntimeObservation> {
+        batch
+            .observations
+            .iter()
+            .filter(|row| expected_ids.contains(&row.runtime_id))
+            .map(|row| (row.runtime_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>()
+    }
+    let before = rows(expected_ids, before);
+    let after = rows(expected_ids, after);
+    if before.len() != expected_ids.len()
+        || after.len() != expected_ids.len()
+        || before
+            .iter()
+            .any(|(runtime_id, row)| after.get(runtime_id).copied() != Some(*row))
+    {
+        return Err(AdmissionError::Conflict(
+            "provider carrier changed after live prompt-injection inspection".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchReceiptPathDigest {
+    path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchReceiptInjection {
+    kind: crate::cutover_admission::PromptInjectionKind,
+    seam: String,
+    prompt_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AxeLaunchReceipt {
+    schema: String,
+    phase: String,
+    runtime_id: String,
+    generation_id: String,
+    identity: String,
+    workspace: PathBuf,
+    provider: String,
+    account: String,
+    persona: String,
+    harness: String,
+    model: String,
+    effort: String,
+    mode: String,
+    boot_contract: String,
+    runtime_profile: LaunchReceiptPathDigest,
+    persona_prompt: LaunchReceiptPathDigest,
+    injection: LaunchReceiptInjection,
+    canonical_provider_argv: Vec<String>,
+    provider_argv_sha256: String,
+    trajectory_sha256: String,
+}
+
+struct ObservedPromptAuthority {
+    receipt: AxeLaunchReceipt,
+    account_executable: PathBuf,
+    account_environment: BTreeMap<String, String>,
+    all_account_environment_keys: BTreeSet<String>,
+}
+
+fn observe_prompt_authority(
+    entry: &crate::cutover_admission::ProviderFleetEntry,
+    host: &crate::cutover_admission::HostId,
+    runtime_id: &str,
+    tags: &BTreeMap<String, String>,
+) -> crate::cutover_admission::AdmissionResult<ObservedPromptAuthority> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+
+    let prompt = &entry.prompt;
+    let required_tags = [
+        ("agent.launch.receipt.schema", "axe.agent-launch-receipt.v1"),
+        (
+            "agent.launch.receipt.path",
+            prompt.launch_receipt_path.to_str().ok_or_else(|| {
+                AdmissionError::Invalid("launch receipt path is not UTF-8".to_owned())
+            })?,
+        ),
+        (
+            "agent.launch.receipt.sha256",
+            prompt.launch_receipt_sha256.as_str(),
+        ),
+        ("agent.generation.id", entry.launch_generation_id.as_str()),
+    ];
+    for (name, expected) in required_tags {
+        if tags.get(name).map(String::as_str) != Some(expected) {
+            return Err(AdmissionError::Conflict(format!(
+                "provider {:?} PTY tag {name:?} does not bind the exact launch receipt",
+                entry.identity
+            )));
+        }
+    }
+
+    let profile_bytes = read_bounded_regular(&prompt.runtime_profile_path, "runtime profile")
+        .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+    let observed_profile = format!("{:x}", Sha256::digest(&profile_bytes));
+    if observed_profile != prompt.runtime_profile_sha256 || observed_profile != entry.profile_sha256
+    {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} runtime profile digest mismatch",
+            entry.identity
+        )));
+    }
+    let profile: serde_json::Value = serde_json::from_slice(&profile_bytes).map_err(|error| {
+        AdmissionError::Invalid(format!("parse provider runtime profile: {error}"))
+    })?;
+    if profile
+        .pointer(&format!(
+            "/personas/prompts/{}",
+            entry.persona.replace('~', "~0").replace('/', "~1")
+        ))
+        .and_then(serde_json::Value::as_str)
+        != prompt.persona_prompt_path.to_str()
+    {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} runtime profile does not map its persona to the exact prompt",
+            entry.identity
+        )));
+    }
+    let (account_executable, account_environment, all_account_environment_keys) =
+        profile_account_binding(&profile, entry)?;
+    let persona_prompt_bytes = read_bounded_regular(&prompt.persona_prompt_path, "persona prompt")
+        .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+    let observed_prompt = format!("{:x}", Sha256::digest(&persona_prompt_bytes));
+    if observed_prompt != prompt.persona_prompt_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} persona prompt digest mismatch",
+            entry.identity
+        )));
+    }
+
+    let receipt_bytes = read_bounded_regular(&prompt.launch_receipt_path, "Axe launch receipt")
+        .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+    let observed_receipt = format!("{:x}", Sha256::digest(&receipt_bytes));
+    if observed_receipt != prompt.launch_receipt_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} launch receipt digest mismatch",
+            entry.identity
+        )));
+    }
+    let receipt: AxeLaunchReceipt = serde_json::from_slice(&receipt_bytes)
+        .map_err(|error| AdmissionError::Invalid(format!("parse Axe launch receipt: {error}")))?;
+    let canonical = serde_json::to_vec(&receipt).map_err(|error| {
+        AdmissionError::Invalid(format!("canonicalize Axe launch receipt: {error}"))
+    })?;
+    if canonical != receipt_bytes {
+        return Err(AdmissionError::Invalid(
+            "Axe launch receipt is not byte-for-byte canonical JSON".to_owned(),
+        ));
+    }
+    let expected_identity = format!("{}.{}", host.as_str(), entry.identity);
+    if receipt.schema != "axe.agent-launch-receipt.v1"
+        || receipt.phase != "prepared"
+        || receipt.runtime_id != runtime_id
+        || receipt.generation_id != entry.launch_generation_id
+        || receipt.identity != expected_identity
+        || receipt.workspace != entry.workspace
+        || receipt.provider != entry.provider
+        || receipt.account != entry.account
+        || receipt.persona != entry.persona
+        || receipt.harness != entry.harness
+        || receipt.model != entry.model
+        || receipt.effort != entry.effort
+        || receipt.mode != entry.mode
+        || receipt.boot_contract != entry.boot_contract
+        || receipt.runtime_profile.path != prompt.runtime_profile_path
+        || receipt.runtime_profile.sha256 != prompt.runtime_profile_sha256
+        || receipt.persona_prompt.path != prompt.persona_prompt_path
+        || receipt.persona_prompt.sha256 != prompt.persona_prompt_sha256
+        || receipt.injection.kind != prompt.injection_kind
+        || receipt.injection.seam
+            != match prompt.injection_kind {
+                PromptInjectionKind::ClaudeAppendSystemPromptFile => {
+                    "argv:--append-system-prompt-file"
+                }
+                PromptInjectionKind::CodexDeveloperInstructions => "argv:-c:developer_instructions",
+                PromptInjectionKind::OpencodeSystemPromptFile => "env:AGENT_SYSTEM_PROMPT_FILE",
+                PromptInjectionKind::PiAppendSystemPromptFile => "argv:--append-system-prompt",
+            }
+        || receipt.injection.prompt_sha256 != prompt.persona_prompt_sha256
+        || receipt.trajectory_sha256 != entry.trajectory_sha256
+        || receipt.canonical_provider_argv.is_empty()
+    {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} Axe launch receipt does not bind the exact trajectory",
+            entry.identity
+        )));
+    }
+    let provider_argv_sha256 = provider_argv_sha256(
+        &receipt.canonical_provider_argv,
+        prompt.injection_kind,
+        &prompt.persona_prompt_sha256,
+        &persona_prompt_bytes,
+    )?;
+    if provider_argv_sha256 != receipt.provider_argv_sha256 {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} canonical provider argv digest mismatch",
+            entry.identity
+        )));
+    }
+    Ok(ObservedPromptAuthority {
+        receipt,
+        account_executable,
+        account_environment,
+        all_account_environment_keys,
+    })
+}
+
+fn profile_account_binding(
+    profile: &serde_json::Value,
+    entry: &crate::cutover_admission::ProviderFleetEntry,
+) -> crate::cutover_admission::AdmissionResult<(PathBuf, BTreeMap<String, String>, BTreeSet<String>)>
+{
+    use crate::cutover_admission::AdmissionError;
+
+    let accounts = profile
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            AdmissionError::Invalid("runtime profile has no accounts array".to_owned())
+        })?;
+    let mut all_keys = BTreeSet::new();
+    let mut selected = Vec::new();
+    for account in accounts {
+        let env = account
+            .pointer("/execution/env")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                AdmissionError::Invalid("runtime profile account has no execution.env".to_owned())
+            })?;
+        for (key, value) in env {
+            if !value.is_string() {
+                return Err(AdmissionError::Invalid(format!(
+                    "runtime profile account env {key:?} is not a string"
+                )));
+            }
+            all_keys.insert(key.clone());
+        }
+        if account.get("accountId").and_then(serde_json::Value::as_str)
+            == Some(entry.account.as_str())
+        {
+            selected.push((account, env));
+        }
+    }
+    let [(account, env)] = selected.as_slice() else {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} account is missing or non-unique in runtime profile",
+            entry.identity
+        )));
+    };
+    if account.get("harness").and_then(serde_json::Value::as_str) != Some(entry.harness.as_str()) {
+        return Err(AdmissionError::Conflict(format!(
+            "provider {:?} account harness differs from runtime profile",
+            entry.identity
+        )));
+    }
+    let executable = account
+        .pointer("/execution/binPath")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            AdmissionError::Invalid("runtime profile account has no execution.binPath".to_owned())
+        })?;
+    let environment = env
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value.as_str().expect("validated string").to_owned(),
+            )
+        })
+        .collect();
+    Ok((executable, environment, all_keys))
+}
+
+fn provider_argv_sha256(
+    projected: &[String],
+    injection_kind: crate::cutover_admission::PromptInjectionKind,
+    prompt_sha256: &str,
+    prompt_bytes: &[u8],
+) -> crate::cutover_admission::AdmissionResult<String> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+    let mut argv = projected.to_vec();
+    if injection_kind == PromptInjectionKind::CodexDeveloperInstructions {
+        let placeholder = format!("developer_instructions=<prompt-sha256:{prompt_sha256}>");
+        let indexes = argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == &placeholder).then_some(index))
+            .collect::<Vec<_>>();
+        let [index] = indexes.as_slice() else {
+            return Err(AdmissionError::Conflict(
+                "Codex provider argv must contain one exact redacted prompt placeholder".to_owned(),
+            ));
+        };
+        let prompt = std::str::from_utf8(prompt_bytes).map_err(|error| {
+            AdmissionError::Invalid(format!("Codex persona prompt is not UTF-8: {error}"))
+        })?;
+        let encoded = serde_json::to_string(prompt).map_err(|error| {
+            AdmissionError::Invalid(format!("encode Codex developer instructions: {error}"))
+        })?;
+        argv[*index] = format!("developer_instructions={encoded}");
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"axe.agent-launch-provider-argv.v1\0");
+    for argument in argv {
+        hash.update((argument.len() as u64).to_be_bytes());
+        hash.update(argument.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn observe_effective_prompt_injection(
+    entry: &crate::cutover_admission::ProviderFleetEntry,
+    authority: &ObservedPromptAuthority,
+    pid: u32,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (entry, authority, pid);
+        return Err(AdmissionError::Invalid(
+            "live provider injection observation is unsupported on this platform".to_owned(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let snapshot = read_stable_proc_snapshot(pid).map_err(|error| {
+            AdmissionError::Invalid(format!(
+                "read stable live provider {:?} process snapshot: {error:#}",
+                entry.identity
+            ))
+        })?;
+        let prompt_bytes =
+            read_bounded_regular(&entry.prompt.persona_prompt_path, "persona prompt")
+                .map_err(|error| AdmissionError::Invalid(error.to_string()))?;
+        validate_effective_prompt_injection(
+            entry.prompt.injection_kind,
+            &entry.prompt.persona_prompt_path,
+            &prompt_bytes,
+            &snapshot.argv,
+            &snapshot.env,
+        )?;
+        validate_live_provider_argv(
+            &authority.receipt.canonical_provider_argv,
+            &authority.receipt.provider_argv_sha256,
+            entry.prompt.injection_kind,
+            &entry.prompt.persona_prompt_sha256,
+            &prompt_bytes,
+            &snapshot.argv,
+            &authority.account_executable,
+            &snapshot.identity,
+        )?;
+        validate_live_account_environment(
+            &authority.account_environment,
+            &authority.all_account_environment_keys,
+            &snapshot.env,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcIdentity {
+    start_time_ticks: u64,
+    executable: PathBuf,
+    executable_device: u64,
+    executable_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcSnapshot {
+    identity: ProcIdentity,
+    argv: Vec<String>,
+    env: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_stable_proc_snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
+    let first = read_proc_snapshot_once(pid)?;
+    let second = read_proc_snapshot_once(pid)?;
+    validate_stable_proc_snapshots(&first, &second)?;
+    Ok(second)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_snapshot_once(pid: u32) -> anyhow::Result<ProcSnapshot> {
+    let before = read_proc_identity(pid)?;
+    let argv = read_proc_nul_list(pid, "cmdline")?;
+    let env = read_proc_nul_list(pid, "environ")?;
+    let after = read_proc_identity(pid)?;
+    anyhow::ensure!(
+        before == after,
+        "provider process identity changed while cmdline/environment were read"
+    );
+    Ok(ProcSnapshot {
+        identity: after,
+        argv,
+        env,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_stable_proc_snapshots(
+    first: &ProcSnapshot,
+    second: &ProcSnapshot,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        first == second,
+        "provider cmdline/environment changed between complete process snapshots"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_identity(pid: u32) -> anyhow::Result<ProcIdentity> {
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let stat = std::fs::read_to_string(root.join("stat"))
+        .with_context(|| format!("read {}/stat", root.display()))?;
+    let suffix = stat
+        .rsplit_once(") ")
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| anyhow::anyhow!("{}/stat has no process-name terminator", root.display()))?;
+    let start_time_ticks = suffix
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("{}/stat lacks starttime", root.display()))?
+        .parse::<u64>()
+        .with_context(|| format!("parse {}/stat starttime", root.display()))?;
+    let executable = std::fs::read_link(root.join("exe"))
+        .with_context(|| format!("read {}/exe", root.display()))?;
+    let executable_metadata = std::fs::metadata(root.join("exe"))
+        .with_context(|| format!("inspect {}/exe", root.display()))?;
+    Ok(ProcIdentity {
+        start_time_ticks,
+        executable,
+        executable_device: executable_metadata.dev(),
+        executable_inode: executable_metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_nul_list(pid: u32, name: &str) -> anyhow::Result<Vec<String>> {
+    const MAX_PROC_BYTES: u64 = 4 * 1024 * 1024;
+    let path = PathBuf::from(format!("/proc/{pid}/{name}"));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROC_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PROC_BYTES,
+        "{} exceeds {MAX_PROC_BYTES} bytes",
+        path.display()
+    );
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .map(|value| {
+            String::from_utf8(value.to_vec())
+                .with_context(|| format!("{} contains non-UTF-8 data", path.display()))
+        })
+        .collect()
+}
+
+fn validate_effective_prompt_injection(
+    kind: crate::cutover_admission::PromptInjectionKind,
+    prompt_path: &Path,
+    prompt_bytes: &[u8],
+    argv: &[String],
+    env: &[String],
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+
+    let prompt_path = prompt_path
+        .to_str()
+        .ok_or_else(|| AdmissionError::Invalid("persona prompt path is not UTF-8".to_owned()))?;
+    let prompt = std::str::from_utf8(prompt_bytes).map_err(|error| {
+        AdmissionError::Invalid(format!("persona prompt is not UTF-8: {error}"))
+    })?;
+    let encoded_prompt = serde_json::to_string(prompt).map_err(|error| {
+        AdmissionError::Invalid(format!("encode Codex developer instructions: {error}"))
+    })?;
+    let codex_value = format!("developer_instructions={encoded_prompt}");
+
+    let flag_values = |flag: &str| {
+        argv.iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_str() == flag)
+            .map(|(index, _)| argv.get(index + 1).map(String::as_str))
+            .collect::<Vec<_>>()
+    };
+    let claude = flag_values("--append-system-prompt-file");
+    let pi = flag_values("--append-system-prompt");
+    let codex = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == "-c")
+        .filter_map(|(index, _)| argv.get(index + 1).map(String::as_str))
+        .filter(|value| value.starts_with("developer_instructions="))
+        .collect::<Vec<_>>();
+    let opencode = env
+        .iter()
+        .filter_map(|value| value.strip_prefix("AGENT_SYSTEM_PROMPT_FILE="))
+        .collect::<Vec<_>>();
+
+    let exact = match kind {
+        PromptInjectionKind::ClaudeAppendSystemPromptFile => {
+            claude == [Some(prompt_path)]
+                && pi.is_empty()
+                && codex.is_empty()
+                && opencode.is_empty()
+        }
+        PromptInjectionKind::CodexDeveloperInstructions => {
+            codex == [codex_value.as_str()]
+                && claude.is_empty()
+                && pi.is_empty()
+                && opencode.is_empty()
+        }
+        PromptInjectionKind::OpencodeSystemPromptFile => {
+            opencode == [prompt_path] && claude.is_empty() && pi.is_empty() && codex.is_empty()
+        }
+        PromptInjectionKind::PiAppendSystemPromptFile => {
+            pi == [Some(prompt_path)]
+                && claude.is_empty()
+                && codex.is_empty()
+                && opencode.is_empty()
+        }
+    };
+    if !exact {
+        return Err(AdmissionError::Conflict(
+            "live provider process does not contain one exact harness-specific prompt injection"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_provider_argv(
+    projected: &[String],
+    expected_sha256: &str,
+    injection_kind: crate::cutover_admission::PromptInjectionKind,
+    prompt_sha256: &str,
+    prompt_bytes: &[u8],
+    actual: &[String],
+    account_executable: &Path,
+    process_identity: &ProcIdentity,
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::{AdmissionError, PromptInjectionKind};
+
+    let projected_executable = projected.first().ok_or_else(|| {
+        AdmissionError::Invalid("canonical provider argv has no executable".to_owned())
+    })?;
+    if Path::new(projected_executable) != account_executable {
+        return Err(AdmissionError::Conflict(
+            "canonical provider executable differs from selected account binding".to_owned(),
+        ));
+    }
+    let executable = account_executable.canonicalize().map_err(|error| {
+        AdmissionError::Invalid(format!(
+            "canonicalize selected account executable {}: {error}",
+            account_executable.display()
+        ))
+    })?;
+    let metadata = std::fs::metadata(&executable).map_err(|error| {
+        AdmissionError::io(
+            format!(
+                "inspect selected account executable {}",
+                executable.display()
+            ),
+            error,
+        )
+    })?;
+    if executable != process_identity.executable
+        || metadata.dev() != process_identity.executable_device
+        || metadata.ino() != process_identity.executable_inode
+    {
+        return Err(AdmissionError::Conflict(
+            "live provider executable identity differs from selected account executable".to_owned(),
+        ));
+    }
+
+    let mut normalized = actual.to_vec();
+    if injection_kind == PromptInjectionKind::CodexDeveloperInstructions {
+        let prompt = std::str::from_utf8(prompt_bytes).map_err(|error| {
+            AdmissionError::Invalid(format!("Codex persona prompt is not UTF-8: {error}"))
+        })?;
+        let encoded = serde_json::to_string(prompt).map_err(|error| {
+            AdmissionError::Invalid(format!("encode Codex developer instructions: {error}"))
+        })?;
+        let exact = format!("developer_instructions={encoded}");
+        let indexes = normalized
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == &exact).then_some(index))
+            .collect::<Vec<_>>();
+        let [index] = indexes.as_slice() else {
+            return Err(AdmissionError::Conflict(
+                "live Codex argv does not contain one exact developer-instructions value"
+                    .to_owned(),
+            ));
+        };
+        normalized[*index] = format!("developer_instructions=<prompt-sha256:{prompt_sha256}>");
+    }
+    if normalized != projected {
+        return Err(AdmissionError::Conflict(
+            "live provider argv differs from the canonical Axe projection".to_owned(),
+        ));
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"axe.agent-launch-provider-argv.v1\0");
+    for argument in actual {
+        hash.update((argument.len() as u64).to_be_bytes());
+        hash.update(argument.as_bytes());
+    }
+    if format!("{:x}", hash.finalize()) != expected_sha256 {
+        return Err(AdmissionError::Conflict(
+            "live provider argv differs from the receipt provider argv digest".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_account_environment(
+    selected: &BTreeMap<String, String>,
+    all_account_keys: &BTreeSet<String>,
+    live: &[String],
+) -> crate::cutover_admission::AdmissionResult<()> {
+    use crate::cutover_admission::AdmissionError;
+
+    let mut environment = BTreeMap::new();
+    for assignment in live {
+        let Some((key, value)) = assignment.split_once('=') else {
+            return Err(AdmissionError::Invalid(
+                "live provider environment contains an assignment without `=`".to_owned(),
+            ));
+        };
+        if environment.insert(key, value).is_some() {
+            return Err(AdmissionError::Conflict(format!(
+                "live provider environment repeats {key:?}"
+            )));
+        }
+    }
+    for key in all_account_keys {
+        match selected.get(key) {
+            Some(expected) if environment.get(key.as_str()).copied() == Some(expected.as_str()) => {
+            }
+            None if !environment.contains_key(key.as_str()) => {}
+            _ => {
+                return Err(AdmissionError::Conflict(format!(
+                    "live provider account environment key {key:?} differs from selected runtime-profile account"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_bounded_regular(path: &Path, label: &str) -> anyhow::Result<Vec<u8>> {
+    const MAX_CANDIDATE_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_CANDIDATE_ARTIFACT_BYTES,
+        "{label} {} must be a regular file of at most {MAX_CANDIDATE_ARTIFACT_BYTES} bytes",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read {label} {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 == metadata.len(),
+        "{label} {} changed size while read",
+        path.display()
+    );
+    Ok(bytes)
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -911,6 +2451,51 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
 /// transient `pty list` misread of a healthy seat).
 pub fn reconcile_pass_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+) -> UpReport {
+    let ownership = match HostOwnership::acquire(root, this_host) {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "acquire runtime host ownership (pass skipped): {error}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
+    let admission = match RuntimeMutationAdmission::ordinary(&ownership) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "runtime mutation admission denied (pass skipped): {error}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
+    reconcile_pass_specs_admitted(
+        &admission.permission(),
+        specs,
+        root,
+        this_host,
+        runner,
+        cap,
+        debounce,
+    )
+}
+
+fn reconcile_pass_specs_admitted(
+    permission: &RuntimeMutate<'_>,
+    specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
@@ -927,7 +2512,9 @@ pub fn reconcile_pass_specs(
             return report;
         }
     };
-    reconcile_pass_specs_with_sessions(specs, &sessions, this_host, runner, cap, debounce)
+    reconcile_pass_specs_with_sessions(
+        permission, specs, root, &sessions, this_host, runner, cap, debounce,
+    )
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
@@ -935,7 +2522,9 @@ pub fn reconcile_pass_specs(
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
 /// vanished crash on the next tick.
 pub(crate) fn reconcile_pass_specs_with_sessions(
+    permission: &RuntimeMutate<'_>,
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     sessions: &[Session],
     this_host: &str,
     runner: &dyn Runner,
@@ -947,7 +2536,7 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     debounce.observe(sessions, now);
     let mut plan = crate::reconcile(specs, sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    execute(&plan, runner, cap, &mut report);
+    execute(permission, root, this_host, &plan, runner, cap, &mut report);
     report
 }
 
@@ -955,12 +2544,14 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
 /// (a single pass has no flicker history); never `Err` — failures collect in `report.errors`.
 pub fn up_once_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
 ) -> UpReport {
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     reconcile_pass_specs(
         specs,
+        root,
         this_host,
         runner,
         &mut FlappingCap::default(),
@@ -976,9 +2567,19 @@ pub fn up_once_selected_specs(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
-        crate::hooks::verify_installed().map(|_| ())
-    })
+    crate::reconcile::resolve_task(specs, selector, this_host)?;
+    let ownership = HostOwnership::acquire(catalog_root, this_host)
+        .context("acquire runtime host ownership for selected reconcile")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
+    up_once_selected_specs_with_gates(
+        &admission.permission(),
+        catalog_root,
+        specs,
+        selector,
+        this_host,
+        runner,
+        || crate::hooks::verify_installed().map(|_| ()),
+    )
 }
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
@@ -989,6 +2590,9 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    let ownership = HostOwnership::acquire(catalog_root, this_host)
+        .context("acquire runtime host ownership for selected reconcile")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
     let found = crate::discovery::discover(catalog_root);
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
     let mut report = UpReport::default();
@@ -1008,7 +2612,8 @@ pub fn up_once_selected(
             .push(format!("verify lifecycle hooks: {error}"));
         return Ok(report);
     }
-    let materialized = crate::materialize::materialize_catalog_against(
+    let materialized = crate::materialize::materialize_catalog_against_admitted(
+        &admission.permission(),
         catalog_root,
         std::slice::from_ref(&owner),
         &found.specs,
@@ -1021,6 +2626,7 @@ pub fn up_once_selected(
         return Ok(report);
     }
     let execution = up_once_selected_specs_with_gates(
+        &admission.permission(),
         catalog_root,
         &found.specs,
         selector,
@@ -1033,6 +2639,7 @@ pub fn up_once_selected(
 }
 
 fn up_once_selected_specs_with_gates<V>(
+    permission: &RuntimeMutate<'_>,
     catalog_root: &Path,
     specs: &[crate::spec::AgentSpec],
     selector: &str,
@@ -1050,7 +2657,15 @@ where
     let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
     gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
-    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    execute(
+        permission,
+        catalog_root,
+        this_host,
+        &plan,
+        runner,
+        &mut FlappingCap::default(),
+        &mut report,
+    );
     Ok(report)
 }
 
@@ -1067,12 +2682,31 @@ pub fn up_loop_specs(
     interval: Duration,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for spec supervisor")?;
     install_signal_handler();
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut reported_flapping: HashSet<String> = HashSet::new();
     loop {
-        let report = reconcile_pass_specs(specs, this_host, runner, &mut cap, &mut debounce);
+        let report = match RuntimeMutationAdmission::ordinary(&ownership) {
+            Ok(admission) => reconcile_pass_specs_admitted(
+                &admission.permission(),
+                specs,
+                root,
+                this_host,
+                runner,
+                &mut cap,
+                &mut debounce,
+            ),
+            Err(error) => UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "runtime mutation admission denied (pass skipped): {error}"
+                )],
+                ..Default::default()
+            },
+        };
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1108,6 +2742,9 @@ pub fn up_loop_specs(
 /// one operation that ends tasks (the Nomad model: stopping the supervisor never does). Idempotent:
 /// tasks already gone are simply not in the live set. Per-kill errors are collected, never fatal.
 pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for teardown")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -1118,7 +2755,14 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
             .collect(),
         ..Default::default()
     };
-    teardown_specs(&found.specs, this_host, runner, &mut report)?;
+    teardown_specs(
+        &admission.permission(),
+        root,
+        &found.specs,
+        this_host,
+        runner,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -1128,11 +2772,22 @@ pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result
 /// stop them. `specs` are the already-resolved [`AgentSpec`]s (from `spec_to_agent_specs`).
 pub fn down_specs(
     specs: &[agent_spec::spec::AgentSpec],
+    root: &Path,
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for spec teardown")?;
+    let admission = RuntimeMutationAdmission::ordinary(&ownership)?;
     let mut report = UpReport::default();
-    teardown_specs(specs, this_host, runner, &mut report)?;
+    teardown_specs(
+        &admission.permission(),
+        root,
+        specs,
+        this_host,
+        runner,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -1140,11 +2795,24 @@ pub fn down_specs(
 /// derived identically to how reconcile spawns them (explicit `task.id`, else `<bus_id>.<task>`), so
 /// the catalog `down` and the spec `down_specs` tear down exactly what `up`/`up_*_specs` launched.
 fn teardown_specs(
+    permission: &RuntimeMutate<'_>,
+    root: &Path,
     specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
     runner: &dyn Runner,
     report: &mut UpReport,
 ) -> anyhow::Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize runtime mutation catalog {}", root.display()))?;
+    if permission.catalog().as_path() != canonical_root || permission.host().as_str() != this_host {
+        anyhow::bail!(
+            "runtime mutation permission is for ({}, {}), not ({}, {this_host})",
+            permission.catalog().as_path().display(),
+            permission.host().as_str(),
+            canonical_root.display(),
+        );
+    }
     let live: HashSet<String> = runner
         .list_sessions()?
         .into_iter()
@@ -1206,11 +2874,43 @@ pub fn up_loop(
     interval: Duration,
     on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    let ownership = HostOwnership::acquire(root, this_host)
+        .context("acquire runtime host ownership for supervisor")?;
+    up_loop_with_ownership(ownership, runner, interval, on_report)
+}
+
+/// Enter the resident supervisor while consuming already-retained host authority.
+///
+/// This is the no-gap successor handoff from a finalized cutover.
+pub fn up_loop_with_ownership(
+    ownership: HostOwnership,
+    runner: &dyn Runner,
+    interval: Duration,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    up_loop_with_ownership_ready(ownership, runner, interval, || Ok(()), on_report)
+}
+
+/// Enter the resident supervisor and invoke `on_ready` exactly once while the caller's host
+/// authority is still retained and immediately before the first reconcile pass can begin.
+pub fn up_loop_with_ownership_ready(
+    ownership: HostOwnership,
+    runner: &dyn Runner,
+    interval: Duration,
+    on_ready: impl FnOnce() -> anyhow::Result<()>,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    let root = ownership.catalog().to_path_buf();
+    let this_host = ownership.host().to_owned();
     install_signal_handler();
-    up_loop_until(root, this_host, runner, interval, &STOP, on_report)
+    on_ready().context("publish retained-ownership supervisor readiness")?;
+    up_loop_until(
+        &ownership, &root, &this_host, runner, interval, &STOP, on_report,
+    )
 }
 
 fn up_loop_until(
+    ownership: &HostOwnership,
     root: &Path,
     this_host: &str,
     runner: &dyn Runner,
@@ -1231,7 +2931,7 @@ fn up_loop_until(
     let mut reported_flapping: HashSet<String> = HashSet::new();
 
     loop {
-        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass(ownership, root, this_host, runner, &mut cap, &mut debounce);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1343,6 +3043,642 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 
+    #[test]
+    fn axe_launch_receipt_links_all_four_harnesses_to_the_exact_pty_generation() {
+        use crate::cutover_admission::{
+            HostId, LaunchPromptAuthority, PromptInjectionKind, ProviderFleetEntry,
+        };
+
+        for (provider, harness, kind, seam) in [
+            (
+                "claude-code",
+                "claude",
+                PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                "argv:--append-system-prompt-file",
+            ),
+            (
+                "codex",
+                "codex",
+                PromptInjectionKind::CodexDeveloperInstructions,
+                "argv:-c:developer_instructions",
+            ),
+            (
+                "opencode",
+                "opencode",
+                PromptInjectionKind::OpencodeSystemPromptFile,
+                "env:AGENT_SYSTEM_PROMPT_FILE",
+            ),
+            (
+                "pi-mono",
+                "pi",
+                PromptInjectionKind::PiAppendSystemPromptFile,
+                "argv:--append-system-prompt",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            let prompt_path = temp.path().join("worker-prompt.md");
+            let prompt_bytes = b"exact worker prompt\n";
+            std::fs::write(&prompt_path, prompt_bytes).unwrap();
+            let prompt_sha256 = format!("{:x}", Sha256::digest(prompt_bytes));
+            let profile_path = temp.path().join("profile.json");
+            let profile_bytes = serde_json::to_vec(&serde_json::json!({
+                "personas": {"prompts": {"worker": prompt_path}},
+                "accounts": [{
+                    "accountId": "account-a",
+                    "harness": harness,
+                    "execution": {
+                        "binPath": format!("/nix/store/{harness}/bin/{harness}"),
+                        "env": {},
+                    },
+                }],
+            }))
+            .unwrap();
+            std::fs::write(&profile_path, &profile_bytes).unwrap();
+            let profile_sha256 = format!("{:x}", Sha256::digest(&profile_bytes));
+            let receipt_path = temp.path().join("receipt.json");
+            let adapter_argv = vec![
+                "/nix/store/axe/bin/axe".to_owned(),
+                "agent".to_owned(),
+                "launch".to_owned(),
+                "--harness".to_owned(),
+                harness.to_owned(),
+                "--persona".to_owned(),
+                "worker".to_owned(),
+                "--model".to_owned(),
+                "model-a".to_owned(),
+                "--effort".to_owned(),
+                "high".to_owned(),
+                "--mode".to_owned(),
+                "managed-unattended".to_owned(),
+                "--boot".to_owned(),
+                "managed-v1".to_owned(),
+            ];
+            let mut entry = ProviderFleetEntry {
+                identity: "worker-a".to_owned(),
+                host: HostId::parse("testhost").unwrap(),
+                provider: provider.to_owned(),
+                account: "account-a".to_owned(),
+                persona: "worker".to_owned(),
+                workspace: workspace.clone(),
+                prompt: LaunchPromptAuthority {
+                    runtime_profile_path: profile_path.clone(),
+                    runtime_profile_sha256: profile_sha256.clone(),
+                    persona_prompt_path: prompt_path.clone(),
+                    persona_prompt_sha256: prompt_sha256.clone(),
+                    launch_receipt_path: receipt_path.clone(),
+                    launch_receipt_sha256: String::new(),
+                    injection_kind: kind,
+                },
+                argv_sha256: crate::cutover_admission::candidate_argv_sha256(&adapter_argv),
+                canonical_argv: adapter_argv,
+                profile_sha256: profile_sha256.clone(),
+                harness: harness.to_owned(),
+                model: "model-a".to_owned(),
+                effort: "high".to_owned(),
+                mode: "managed-unattended".to_owned(),
+                boot_contract: "managed-v1".to_owned(),
+                launch_generation_id: "axe-generation-a".to_owned(),
+                runtime_generation_id: "pty-generation-a".to_owned(),
+                trajectory_sha256: String::new(),
+            };
+            entry.trajectory_sha256 =
+                crate::cutover_admission::provider_trajectory_sha256(&entry).unwrap();
+            let projected_argv = if kind == PromptInjectionKind::CodexDeveloperInstructions {
+                vec![
+                    "codex".to_owned(),
+                    "-c".to_owned(),
+                    format!("developer_instructions=<prompt-sha256:{prompt_sha256}>"),
+                ]
+            } else {
+                vec![
+                    harness.to_owned(),
+                    "--model".to_owned(),
+                    "model-a".to_owned(),
+                ]
+            };
+            let provider_argv_sha256 =
+                provider_argv_sha256(&projected_argv, kind, &prompt_sha256, prompt_bytes).unwrap();
+            let receipt = AxeLaunchReceipt {
+                schema: "axe.agent-launch-receipt.v1".to_owned(),
+                phase: "prepared".to_owned(),
+                runtime_id: "testhost.worker-a.agent".to_owned(),
+                generation_id: entry.launch_generation_id.clone(),
+                identity: "testhost.worker-a".to_owned(),
+                workspace: workspace.clone(),
+                provider: provider.to_owned(),
+                account: "account-a".to_owned(),
+                persona: "worker".to_owned(),
+                harness: harness.to_owned(),
+                model: "model-a".to_owned(),
+                effort: "high".to_owned(),
+                mode: "managed-unattended".to_owned(),
+                boot_contract: "managed-v1".to_owned(),
+                runtime_profile: LaunchReceiptPathDigest {
+                    path: profile_path,
+                    sha256: profile_sha256,
+                },
+                persona_prompt: LaunchReceiptPathDigest {
+                    path: prompt_path,
+                    sha256: prompt_sha256.clone(),
+                },
+                injection: LaunchReceiptInjection {
+                    kind,
+                    seam: seam.to_owned(),
+                    prompt_sha256,
+                },
+                canonical_provider_argv: projected_argv,
+                provider_argv_sha256,
+                trajectory_sha256: entry.trajectory_sha256.clone(),
+            };
+            let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+            std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+            entry.prompt.launch_receipt_sha256 = format!("{:x}", Sha256::digest(&receipt_bytes));
+            let mut tags = BTreeMap::from([
+                (
+                    "agent.launch.receipt.schema".to_owned(),
+                    "axe.agent-launch-receipt.v1".to_owned(),
+                ),
+                (
+                    "agent.launch.receipt.path".to_owned(),
+                    receipt_path.display().to_string(),
+                ),
+                (
+                    "agent.launch.receipt.sha256".to_owned(),
+                    entry.prompt.launch_receipt_sha256.clone(),
+                ),
+                (
+                    "agent.generation.id".to_owned(),
+                    entry.launch_generation_id.clone(),
+                ),
+            ]);
+            observe_prompt_authority(
+                &entry,
+                &HostId::parse("testhost").unwrap(),
+                "testhost.worker-a.agent",
+                &tags,
+            )
+            .unwrap();
+            tags.insert(
+                "agent.generation.id".to_owned(),
+                "foreign-generation".to_owned(),
+            );
+            assert!(
+                observe_prompt_authority(
+                    &entry,
+                    &HostId::parse("testhost").unwrap(),
+                    "testhost.worker-a.agent",
+                    &tags,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn live_prompt_injection_requires_one_exact_harness_specific_seam() {
+        use crate::cutover_admission::PromptInjectionKind;
+
+        let prompt_path = Path::new("/nix/store/persona/prompt.md");
+        let prompt_bytes = b"exact persona prompt\n";
+        let encoded = serde_json::to_string("exact persona prompt\n").unwrap();
+        let cases = [
+            (
+                PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                vec![
+                    "claude".to_owned(),
+                    "--append-system-prompt-file".to_owned(),
+                    prompt_path.display().to_string(),
+                ],
+                Vec::new(),
+            ),
+            (
+                PromptInjectionKind::CodexDeveloperInstructions,
+                vec![
+                    "codex".to_owned(),
+                    "-c".to_owned(),
+                    format!("developer_instructions={encoded}"),
+                ],
+                Vec::new(),
+            ),
+            (
+                PromptInjectionKind::OpencodeSystemPromptFile,
+                vec!["opencode".to_owned()],
+                vec![format!(
+                    "AGENT_SYSTEM_PROMPT_FILE={}",
+                    prompt_path.display()
+                )],
+            ),
+            (
+                PromptInjectionKind::PiAppendSystemPromptFile,
+                vec![
+                    "pi".to_owned(),
+                    "--append-system-prompt".to_owned(),
+                    prompt_path.display().to_string(),
+                ],
+                Vec::new(),
+            ),
+        ];
+        for (kind, argv, env) in cases {
+            validate_effective_prompt_injection(kind, prompt_path, prompt_bytes, &argv, &env)
+                .unwrap();
+
+            let mut duplicate = argv.clone();
+            match kind {
+                PromptInjectionKind::ClaudeAppendSystemPromptFile => duplicate.extend([
+                    "--append-system-prompt-file".to_owned(),
+                    prompt_path.display().to_string(),
+                ]),
+                PromptInjectionKind::CodexDeveloperInstructions => {
+                    duplicate.extend(["-c".to_owned(), format!("developer_instructions={encoded}")])
+                }
+                PromptInjectionKind::OpencodeSystemPromptFile => {}
+                PromptInjectionKind::PiAppendSystemPromptFile => duplicate.extend([
+                    "--append-system-prompt".to_owned(),
+                    prompt_path.display().to_string(),
+                ]),
+            }
+            let mut duplicate_env = env.clone();
+            if kind == PromptInjectionKind::OpencodeSystemPromptFile {
+                duplicate_env.push(format!(
+                    "AGENT_SYSTEM_PROMPT_FILE={}",
+                    prompt_path.display()
+                ));
+            }
+            assert!(
+                validate_effective_prompt_injection(
+                    kind,
+                    prompt_path,
+                    prompt_bytes,
+                    &duplicate,
+                    &duplicate_env,
+                )
+                .is_err(),
+                "duplicate {kind:?} injection was accepted"
+            );
+
+            let mut competing_env = env.clone();
+            competing_env.push(format!(
+                "AGENT_SYSTEM_PROMPT_FILE={}",
+                prompt_path.display()
+            ));
+            if kind != PromptInjectionKind::OpencodeSystemPromptFile {
+                assert!(
+                    validate_effective_prompt_injection(
+                        kind,
+                        prompt_path,
+                        prompt_bytes,
+                        &argv,
+                        &competing_env,
+                    )
+                    .is_err(),
+                    "competing {kind:?} injection was accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_provider_argv_rejects_binary_model_or_effort_drift_with_exact_prompt_seam() {
+        use crate::cutover_admission::PromptInjectionKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("claude");
+        std::fs::write(&executable, b"provider\n").unwrap();
+        let executable = executable.canonicalize().unwrap();
+        let executable_metadata = std::fs::metadata(&executable).unwrap();
+        let process_identity = ProcIdentity {
+            start_time_ticks: 42,
+            executable: executable.clone(),
+            executable_device: executable_metadata.dev(),
+            executable_inode: executable_metadata.ino(),
+        };
+        let prompt = b"exact persona prompt\n";
+        let prompt_sha256 = format!("{:x}", Sha256::digest(prompt));
+        let projected = vec![
+            executable.display().to_string(),
+            "--model".to_owned(),
+            "sonnet".to_owned(),
+            "--effort".to_owned(),
+            "high".to_owned(),
+            "--append-system-prompt-file".to_owned(),
+            "/nix/store/persona/prompt.md".to_owned(),
+        ];
+        let expected_sha256 = provider_argv_sha256(
+            &projected,
+            PromptInjectionKind::ClaudeAppendSystemPromptFile,
+            &prompt_sha256,
+            prompt,
+        )
+        .unwrap();
+        validate_live_provider_argv(
+            &projected,
+            &expected_sha256,
+            PromptInjectionKind::ClaudeAppendSystemPromptFile,
+            &prompt_sha256,
+            prompt,
+            &projected,
+            &executable,
+            &process_identity,
+        )
+        .unwrap();
+
+        for (index, replacement) in [(0, "/foreign/bin/claude"), (2, "opus"), (4, "low")] {
+            let mut changed = projected.clone();
+            changed[index] = replacement.to_owned();
+            assert!(
+                validate_live_provider_argv(
+                    &projected,
+                    &expected_sha256,
+                    PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                    &prompt_sha256,
+                    prompt,
+                    &changed,
+                    &executable,
+                    &process_identity,
+                )
+                .is_err()
+            );
+        }
+
+        let foreign_executable = temp.path().join("foreign-claude");
+        std::fs::write(&foreign_executable, b"foreign\n").unwrap();
+        let foreign_executable = foreign_executable.canonicalize().unwrap();
+        let foreign_metadata = std::fs::metadata(&foreign_executable).unwrap();
+        let foreign_identity = ProcIdentity {
+            start_time_ticks: process_identity.start_time_ticks,
+            executable: foreign_executable,
+            executable_device: foreign_metadata.dev(),
+            executable_inode: foreign_metadata.ino(),
+        };
+        assert!(
+            validate_live_provider_argv(
+                &projected,
+                &expected_sha256,
+                PromptInjectionKind::ClaudeAppendSystemPromptFile,
+                &prompt_sha256,
+                prompt,
+                &projected,
+                &executable,
+                &foreign_identity,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_proc_snapshot_rejects_argv_or_environment_drift_with_same_carrier() {
+        let stable = ProcSnapshot {
+            identity: ProcIdentity {
+                start_time_ticks: 42,
+                executable: PathBuf::from("/nix/store/provider/bin/provider"),
+                executable_device: 7,
+                executable_inode: 8,
+            },
+            argv: vec!["provider".to_owned(), "--model=sonnet".to_owned()],
+            env: vec!["AGENT_SYSTEM_PROMPT_FILE=/nix/store/prompt".to_owned()],
+        };
+        validate_stable_proc_snapshots(&stable, &stable).unwrap();
+
+        let mut argv_drift = stable.clone();
+        argv_drift.argv[1] = "--model=opus".to_owned();
+        assert!(validate_stable_proc_snapshots(&stable, &argv_drift).is_err());
+
+        let mut env_drift = stable.clone();
+        env_drift.env[0] = "AGENT_SYSTEM_PROMPT_FILE=/foreign/prompt".to_owned();
+        assert!(validate_stable_proc_snapshots(&stable, &env_drift).is_err());
+    }
+
+    #[test]
+    fn live_account_environment_requires_selected_values_and_scrubs_unselected_keys() {
+        let selected = BTreeMap::from([("CODEX_HOME".to_owned(), "/accounts/codex-a".to_owned())]);
+        let all_keys = BTreeSet::from(["CODEX_HOME".to_owned(), "CLAUDE_CONFIG_DIR".to_owned()]);
+        validate_live_account_environment(
+            &selected,
+            &all_keys,
+            &[
+                "PATH=/bin".to_owned(),
+                "CODEX_HOME=/accounts/codex-a".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            validate_live_account_environment(
+                &selected,
+                &all_keys,
+                &["CODEX_HOME=/accounts/codex-b".to_owned()],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_live_account_environment(
+                &selected,
+                &all_keys,
+                &[
+                    "CODEX_HOME=/accounts/codex-a".to_owned(),
+                    "CLAUDE_CONFIG_DIR=/accounts/claude-b".to_owned(),
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_census_allows_unrelated_pty_but_rejects_undeclared_provider_and_duplicates() {
+        let expected = BTreeSet::from(["custom-provider-runtime".to_owned()]);
+        let provider = RuntimeObservation {
+            runtime_id: "custom-provider-runtime".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([(
+                "agent.launch.receipt.schema".to_owned(),
+                "axe.agent-launch-receipt.v1".to_owned(),
+            )]),
+        };
+        let unrelated = RuntimeObservation {
+            runtime_id: "host.shell".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([("run.role".to_owned(), "dev-server".to_owned())]),
+        };
+        let clean = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), unrelated],
+            errors: Vec::new(),
+        };
+        validate_complete_provider_pty_census(&expected, &clean).unwrap();
+        validate_provider_carriers_unchanged(&expected, &clean, &clean).unwrap();
+
+        let mut changed_carrier = clean.clone();
+        changed_carrier.observations[0].tags.insert(
+            OBSERVED_PROCESS_PID_TAG.to_owned(),
+            "different-child".to_owned(),
+        );
+        assert!(validate_provider_carriers_unchanged(&expected, &clean, &changed_carrier).is_err());
+
+        let foreign = RuntimeObservation {
+            runtime_id: "arbitrary-provider-id".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([("role".to_owned(), "agent".to_owned())]),
+        };
+        let foreign_batch = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), foreign],
+            errors: Vec::new(),
+        };
+        assert!(validate_complete_provider_pty_census(&expected, &foreign_batch).is_err());
+
+        let legacy = RuntimeObservation {
+            runtime_id: "co2-bear-a078".to_owned(),
+            state: ObservedState::Absent,
+            tags: BTreeMap::from([("run.role".to_owned(), "coding-agent".to_owned())]),
+        };
+        let legacy_batch = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), legacy],
+            errors: Vec::new(),
+        };
+        assert!(validate_complete_provider_pty_census(&expected, &legacy_batch).is_err());
+
+        let duplicate_batch = ObservationBatch {
+            complete: true,
+            observations: vec![provider.clone(), provider],
+            errors: Vec::new(),
+        };
+        assert!(validate_complete_provider_pty_census(&expected, &duplicate_batch).is_err());
+    }
+
+    #[test]
+    fn complete_pty_census_binds_daemon_generation_to_live_child_process_pid() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pty = temp.path().join("pty");
+        std::fs::write(
+            &pty,
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"custom-provider-runtime","process":{"alive":true,"pid":99},"daemon":{"pid":41},"createdAt":"2026-07-31T10:00:00.000Z"}]'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let observer = PtyCli {
+            bin: pty.display().to_string(),
+            catalog_root: temp.path().to_path_buf(),
+        };
+        let mut batch = ObservationBatch {
+            complete: true,
+            observations: vec![RuntimeObservation {
+                runtime_id: "custom-provider-runtime".to_owned(),
+                state: ObservedState::Running(
+                    RuntimeGeneration::new(
+                        41,
+                        "2026-07-31T10:00:00.000Z".to_owned(),
+                        "generation-a".to_owned(),
+                    )
+                    .unwrap(),
+                ),
+                tags: BTreeMap::new(),
+            }],
+            errors: Vec::new(),
+        };
+        observer
+            .enrich_running_process_pids(temp.path(), &mut batch)
+            .unwrap();
+        assert_eq!(
+            batch.observations[0]
+                .tags
+                .get(OBSERVED_PROCESS_PID_TAG)
+                .map(String::as_str),
+            Some("99")
+        );
+
+        if let ObservedState::Running(generation) = &mut batch.observations[0].state {
+            *generation = RuntimeGeneration::new(
+                42,
+                "2026-07-31T10:00:00.000Z".to_owned(),
+                "generation-b".to_owned(),
+            )
+            .unwrap();
+        }
+        assert!(
+            observer
+                .enrich_running_process_pids(temp.path(), &mut batch)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_observer_rejects_catalog_agent_pty_that_is_not_adopt_only_before_observation() {
+        use crate::cutover_admission::{
+            CanonicalCatalog, HostId, LaunchPromptAuthority, PromptInjectionKind,
+            ProviderFleetEntry, ProviderFleetObserver, ProviderFleetProofAction,
+        };
+
+        struct NeverObserve;
+        impl RuntimeObservationSource for NeverObserve {
+            fn observe_complete_pty_root(&self) -> ObservationBatch {
+                panic!("non-adopt-only catalog must fail before runtime observation")
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            temp.path().join("agent.kdl"),
+            format!(
+                r#"agent "worker" {{
+  identity "worker"
+  host "testhost"
+  workspace {:?}
+  pty "agent" {{
+    id "custom-provider-runtime"
+    argv "true"
+  }}
+}}
+"#,
+                workspace
+            ),
+        )
+        .unwrap();
+        let host = HostId::parse("testhost").unwrap();
+        let action = ProviderFleetProofAction {
+            providers: vec![ProviderFleetEntry {
+                identity: "worker".to_owned(),
+                host: host.clone(),
+                provider: "codex".to_owned(),
+                account: "account-a".to_owned(),
+                persona: "worker".to_owned(),
+                workspace: workspace.clone(),
+                prompt: LaunchPromptAuthority {
+                    runtime_profile_path: workspace.join("profile.json"),
+                    runtime_profile_sha256: "0".repeat(64),
+                    persona_prompt_path: workspace.join("prompt.md"),
+                    persona_prompt_sha256: "1".repeat(64),
+                    launch_receipt_path: workspace.join("receipt.json"),
+                    launch_receipt_sha256: "2".repeat(64),
+                    injection_kind: PromptInjectionKind::CodexDeveloperInstructions,
+                },
+                canonical_argv: vec!["axe".to_owned()],
+                argv_sha256: "3".repeat(64),
+                profile_sha256: "0".repeat(64),
+                harness: "codex".to_owned(),
+                model: "model-a".to_owned(),
+                effort: "high".to_owned(),
+                mode: "managed-unattended".to_owned(),
+                boot_contract: "managed-v1".to_owned(),
+                launch_generation_id: "launch-a".to_owned(),
+                runtime_generation_id: "runtime-a".to_owned(),
+                trajectory_sha256: "4".repeat(64),
+            }],
+            providers_sha256: "5".repeat(64),
+        };
+        let catalog = CanonicalCatalog::open(temp.path()).unwrap();
+        let runtime = ProviderFleetRuntimeObserver::new(&action, &NeverObserve);
+        assert!(runtime.observe_provider_rows(&catalog, &host).is_err());
+    }
+
     fn target(id: &str, cmd: &str) -> TaskTarget {
         TaskTarget {
             kind: TaskKind::Pty,
@@ -1383,6 +3719,9 @@ mod tests {
 
     #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
+        let catalog = tempfile::tempdir().unwrap();
+        let ownership = HostOwnership::acquire(catalog.path(), "test").unwrap();
+        let admission = RuntimeMutationAdmission::ordinary(&ownership).unwrap();
         let spec = AgentSpec {
             identity: "codex".into(),
             host: None,
@@ -1407,13 +3746,14 @@ mod tests {
                 keep: false,
                 lifecycle: TaskLifecycle::Service,
             }],
-            path: "/tmp/spec.kdl".into(),
+            path: catalog.path().join("spec.kdl"),
         };
         let runner = GateRunner {
             list_calls: Cell::new(0),
         };
         let report = up_once_selected_specs_with_gates(
-            Path::new("/tmp"),
+            &admission.permission(),
+            catalog.path(),
             &[spec],
             "test.codex.agent",
             "test",
@@ -1434,6 +3774,7 @@ mod tests {
         let catalog = tempfile::tempdir().unwrap();
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
+        let ownership = HostOwnership::acquire(catalog.path(), "test-host").unwrap();
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -1441,6 +3782,7 @@ mod tests {
                 stop.store(true, Ordering::SeqCst);
             });
             up_loop_until(
+                &ownership,
                 catalog.path(),
                 "test-host",
                 &GateRunner {
@@ -1622,12 +3964,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || Ok(()),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || Ok(()));
 
         assert_eq!(
             plan.launch
@@ -1655,12 +3992,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || panic!("an already-live Codex agent must not enter the hook gate"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            panic!("an already-live Codex agent must not enter the hook gate")
+        });
 
         assert_eq!(plan.adopt, [&spec]);
         assert_eq!(plan.launch.len(), 1);
@@ -1690,12 +4024,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || anyhow::bail!("stale receipt"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            anyhow::bail!("stale receipt")
+        });
 
         assert_eq!(
             plan.launch
@@ -2059,5 +4390,138 @@ mod tests {
         let h = detect_host();
         assert!(!h.is_empty());
         assert!(!h.contains('.'), "short name only, got {h}");
+    }
+
+    #[test]
+    fn task_observation_of_missing_pty_root_is_complete_and_does_not_create_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir(&catalog).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                tmp.path().join("missing-pty").display().to_string()
+            ),
+        )
+        .unwrap();
+        let root = effective_pty_root_from(&catalog, None);
+        assert!(!root.exists());
+        let batch = PtyCli::new(catalog).task_observations(&HashSet::new());
+        assert!(batch.complete, "{:?}", batch.errors);
+        assert!(batch.observations.is_empty());
+        assert!(!root.exists(), "read-only observation created the PTY root");
+    }
+
+    #[test]
+    fn unreadable_pty_root_evidence_is_indeterminate_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let loop_path = tmp.path().join("pty-loop");
+        std::fs::create_dir(&catalog).unwrap();
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                loop_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let batch = PtyCli::new(catalog)
+            .task_observations_at_root(Some(&HashSet::from(["h.worker.agent"])), &loop_path);
+        assert!(!batch.complete);
+        assert!(batch.observations.is_empty());
+        assert!(
+            batch.errors[0].contains("cannot inspect PTY root"),
+            "{:?}",
+            batch.errors
+        );
+    }
+
+    #[test]
+    fn pty_task_observation_preserves_exact_generation_and_closed_states() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let pty_root = tmp.path().join("pty");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::create_dir(&pty_root).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                pty_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let cli = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: catalog,
+        };
+        let desired = HashSet::from(["h.live", "h.exit", "h.gone"]);
+        let first = cli.task_observations(&desired);
+        let second = cli.task_observations(&desired);
+        assert!(first.complete, "{:?}", first.errors);
+        assert_eq!(first, second, "same PTY evidence changed generation");
+        let ObservedState::Running(generation) = &first.observations[0].state else {
+            panic!("running PTY lost generation: {:?}", first.observations[0]);
+        };
+        assert_eq!(generation.pid(), 41);
+        assert_eq!(generation.created_at(), "2026-07-31T10:00:00.000Z");
+        assert!(generation.generation_id().starts_with("sha256:"));
+        assert_eq!(first.observations[1].state, ObservedState::Exited);
+        assert_eq!(first.observations[2].state, ObservedState::Vanished);
+    }
+
+    #[test]
+    fn running_pty_without_complete_generation_is_indeterminate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let pty_root = tmp.path().join("pty");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::create_dir(&pty_root).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                pty_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"h.live\",\"status\":\"running\"}]'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let batch = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: catalog,
+        }
+        .task_observations(&HashSet::from(["h.live"]));
+        assert!(!batch.complete);
+        assert!(matches!(
+            batch.observations[0].state,
+            ObservedState::Indeterminate(_)
+        ));
     }
 }

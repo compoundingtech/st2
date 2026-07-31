@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::fs::File;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -11,7 +13,7 @@ fn executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn retired_catalog(root: &Path) -> Child {
+fn retired_catalog(root: &Path) -> (Child, File) {
     let declaration = root.join("agents/h/gone/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
     fs::write(
@@ -20,8 +22,15 @@ fn retired_catalog(root: &Path) -> Child {
     )
     .unwrap();
     let owner = Command::new("sleep").arg("30").spawn().unwrap();
-    fs::write(root.join(".st2.h.lock"), format!("{}\n", owner.id())).unwrap();
-    owner
+    let lock_path = root.join(".st2.h.lock");
+    fs::write(&lock_path, format!("{}\n", owner.id())).unwrap();
+    let lock = File::options()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    (owner, lock)
 }
 
 fn doctor(catalog: &Path, bin: &Path, state: &Path) -> std::process::Output {
@@ -203,7 +212,7 @@ fn retired_declaration_is_healthy_when_tasks_and_presence_are_absent() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let (mut owner, _lock) = retired_catalog(&catalog);
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -235,7 +244,7 @@ fn retired_declaration_is_unhealthy_while_a_declared_task_is_alive() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.gone\",\"status\":\"running\"}]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let (mut owner, _lock) = retired_catalog(&catalog);
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -273,7 +282,7 @@ fn retired_declaration_is_unhealthy_while_a_dead_task_record_remains() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.gone\",\"status\":\"exited\"}]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let (mut owner, _lock) = retired_catalog(&catalog);
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
