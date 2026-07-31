@@ -1,8 +1,9 @@
 //! CLI coverage for message-list filters and output modes.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn write_message(inbox: &Path, ts_ms: u64, suffix: &str, from: &str) {
     fs::create_dir_all(inbox).unwrap();
@@ -25,14 +26,23 @@ fn write_agent(root: &Path, identity: &str) {
     .unwrap();
 }
 
-fn list_identity(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
+fn list_identity_with_flag(
+    root: &Path,
+    identity: &str,
+    root_flag: &str,
+    extra: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_st2"))
-        .args(["message", "ls", identity, "--root"])
+        .args(["message", "ls", identity, root_flag])
         .arg(root)
         .args(["--host", "h"])
         .args(extra)
         .output()
         .unwrap()
+}
+
+fn list_identity(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
+    list_identity_with_flag(root, identity, "--root", extra)
 }
 
 fn list(root: &Path, extra: &[&str]) -> std::process::Output {
@@ -147,7 +157,7 @@ fn an_unknown_catalog_identity_fails_before_every_output_mode_reads_a_box() {
         vec!["--archive", "--json"],
         vec!["--archive", "--count"],
     ] {
-        let out = list_identity(tmp.path(), "missing", &extra);
+        let out = list_identity_with_flag(tmp.path(), "missing", "--catalog", &extra);
         assert!(!out.status.success(), "mode {extra:?} must fail");
         assert!(
             out.stdout.is_empty(),
@@ -191,6 +201,50 @@ fn known_empty_native_and_catalog_less_flat_boxes_remain_valid() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
+fn routing_mode_separates_catalog_identities_from_explicit_root_transport() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path();
+    write_agent(catalog, "worker");
+    let declaration = catalog.join("h/worker/agent.kdl");
+    fs::write(
+        &declaration,
+        fs::read_to_string(&declaration)
+            .unwrap()
+            .replace("  type \"service\"\n", "  type \"service\"\n  name \"Shared Worker\"\n"),
+    )
+    .unwrap();
+
+    let send = |recipient: &str, root_flag: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["message", "send", recipient, root_flag])
+            .arg(catalog)
+            .args(["--host", "h", "--as", "h.sender"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"work\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let refused = send("Shared Worker", "--catalog");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no agent 'Shared Worker' found"));
+    assert!(!catalog.join("Shared Worker").exists());
+
+    let declared = send("h.worker", "--root");
+    assert!(declared.status.success(), "{}", String::from_utf8_lossy(&declared.stderr));
+    let listed = list_identity(catalog, "h.worker", &["--count"]);
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "1");
+
+    let flat = send("requester", "--root");
+    assert!(flat.status.success(), "{}", String::from_utf8_lossy(&flat.stderr));
+    assert_eq!(fs::read_dir(catalog.join("requester/inbox")).unwrap().count(), 1);
 }
 
 #[test]
@@ -255,7 +309,7 @@ fn malformed_catalog_declarations_disable_implicit_flat_fallback() {
         vec!["--archive", "--json"],
         vec!["--archive", "--count"],
     ] {
-        let out = list_identity(tmp.path(), "missing", &extra);
+        let out = list_identity_with_flag(tmp.path(), "missing", "--catalog", &extra);
         assert!(!out.status.success(), "mode {extra:?} must fail");
         assert!(
             out.stdout.is_empty(),

@@ -316,44 +316,49 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join("archive")
 }
 
-/// The inbox dir for `id` under `root`: the NATIVE catalog inbox (`<agent_dir>/resources/inbox`) if a
-/// catalog agent is discoverable, else the flat bus inbox (`<root>/<id>/inbox`). The
-/// flat fallback lets `st2 ding`/`st2 message` operate on a catalog-LESS bus — e.g. an eval's ST_ROOT,
-/// where agents are booted from a single spec (no on-disk `agent.kdl` to discover). `root` is whatever
-/// `--root`/ST_ROOT names, so the layout follows the spec, never a hardcoded path.
-pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
-    match resolve_agent_dir(root, id, host) {
-        Some(dir) => Ok(inbox_dir(&dir)),
-        None if apply_incomplete(root) => {
-            anyhow::bail!("agent '{id}' is not addressable while catalog apply is incomplete")
-        }
-        None => Ok(root.join(id).join("inbox")),
-    }
+/// How a message command selected its bus root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingMode {
+    /// Catalog-derived routing accepts only declared Agent Spec identities.
+    Catalog,
+    /// Explicit `--root` is the low-level transport boundary: declared identities still use their
+    /// native resource boxes, while an absent identity names an exact flat mailbox.
+    ExplicitRoot,
 }
 
-/// The archive dir for `id` under `root` — native catalog archive if discoverable, else the flat
-/// `<root>/<id>/archive` (companion to [`resolve_inbox`]).
-pub fn resolve_archive(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
-    match resolve_agent_dir(root, id, host) {
-        Some(dir) => Ok(archive_dir(&dir)),
-        None if apply_incomplete(root) => {
-            anyhow::bail!("agent '{id}' is not addressable while catalog apply is incomplete")
-        }
-        None => Ok(root.join(id).join("archive")),
-    }
+/// Resolve the inbox for `id` under `root` according to the caller's routing boundary.
+pub fn resolve_inbox(
+    root: &Path,
+    id: &str,
+    host: &str,
+    mode: RoutingMode,
+) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, id, host, false, false, mode)
+}
+
+/// The archive companion to [`resolve_inbox`], with the same catalog-backed strictness and
+/// explicit-root flat transport.
+pub fn resolve_archive(
+    root: &Path,
+    id: &str,
+    host: &str,
+    mode: RoutingMode,
+) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, id, host, true, false, mode)
 }
 
 /// Resolve one box for `message ls`.
 ///
-/// The permissive flat layout is automatic only when discovery proves that `root` is catalog-less.
-/// Once any valid or malformed declaration makes it a catalog, an absent identity is an error.
-/// `orphan` is the explicit recovery path for inspecting a raw flat box inside such a root.
+/// Catalog-derived routing rejects absent identities. Explicit `--root` routing treats an absent
+/// identity as an exact flat mailbox id; it never resolves presentation names. `orphan` is the
+/// explicit recovery path for inspecting a raw flat box regardless of routing mode.
 pub fn resolve_list_box(
     root: &Path,
     id: &str,
     host: &str,
     archive: bool,
     orphan: bool,
+    mode: RoutingMode,
 ) -> anyhow::Result<PathBuf> {
     let flat = || {
         root.join(id)
@@ -389,7 +394,7 @@ pub fn resolve_list_box(
         });
     }
 
-    if discovered.specs.is_empty() && discovered.errors.is_empty() {
+    if mode == RoutingMode::ExplicitRoot {
         return Ok(flat());
     }
     anyhow::bail!("no agent '{id}' found in catalog {}", root.display())
@@ -739,16 +744,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_inbox_falls_back_to_the_flat_bus_when_catalog_less() {
+    fn explicit_root_resolves_declared_agents_then_falls_back_to_exact_flat_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // No catalog under root → the flat bus (<root>/<id>/inbox|archive).
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h").unwrap(),
+            resolve_inbox(root, "mix.sup", "h", RoutingMode::ExplicitRoot).unwrap(),
             root.join("mix.sup").join("inbox")
         );
         assert_eq!(
-            resolve_archive(root, "mix.sup", "h").unwrap(),
+            resolve_archive(root, "mix.sup", "h", RoutingMode::ExplicitRoot).unwrap(),
             root.join("mix.sup").join("archive")
         );
         // A discoverable native catalog agent → its resources/inbox.
@@ -760,8 +765,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h").unwrap(),
+            resolve_inbox(root, "mix.sup", "h", RoutingMode::ExplicitRoot).unwrap(),
             ad.join("resources").join("inbox")
         );
+        assert_eq!(
+            resolve_inbox(root, "requester", "h", RoutingMode::ExplicitRoot).unwrap(),
+            root.join("requester").join("inbox")
+        );
+        assert!(resolve_inbox(root, "requester", "h", RoutingMode::Catalog).is_err());
     }
 }
