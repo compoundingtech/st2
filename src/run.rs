@@ -2363,6 +2363,12 @@ mod tests {
             Some(vec![b'x'; 1024 * 1024]),
         )
         .unwrap_err();
+        let escaped_ready_deadline = Instant::now() + Duration::from_secs(2);
+        while (!escaped_pidfile.exists() || !pipefile.exists())
+            && Instant::now() < escaped_ready_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let escaped_pid = std::fs::read_to_string(&escaped_pidfile)
             .unwrap()
             .parse::<i32>()
