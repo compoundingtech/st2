@@ -91,7 +91,16 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
             }
             "command" => raw.command = arg_string(child),
             "argv" => raw.argv = Some(argv(child)?),
-            "ding" => raw.ding = true,
+            "ding" => {
+                if raw.ding {
+                    anyhow::bail!(
+                        "agent '{}' declares compact `ding` more than once",
+                        raw.identity.as_deref().unwrap_or("<unnamed>")
+                    );
+                }
+                raw.ding = true;
+                raw.ding_adapter_argv = ding_adapter_argv(child)?;
+            }
             "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {
@@ -114,6 +123,58 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
         );
     }
     Ok(raw)
+}
+
+fn ding_adapter_argv(node: &KdlNode) -> anyhow::Result<Option<Vec<String>>> {
+    if !node.entries().is_empty() {
+        anyhow::bail!("compact `ding` accepts no arguments or properties");
+    }
+    let Some(children) = node.children() else {
+        return Ok(None);
+    };
+    let mut adapter = None;
+    for child in children.nodes() {
+        if child.name().value() != "adapter" {
+            anyhow::bail!(
+                "compact `ding` has unsupported child `{}`",
+                child.name().value()
+            );
+        }
+        if adapter.is_some() {
+            anyhow::bail!("compact `ding` declares `adapter` more than once");
+        }
+        if !child.entries().is_empty() {
+            anyhow::bail!("compact `ding` `adapter` accepts no arguments or properties");
+        }
+        let Some(adapter_children) = child.children() else {
+            anyhow::bail!("compact `ding` `adapter` requires non-empty `argv`");
+        };
+        let mut parsed_argv = None;
+        for adapter_child in adapter_children.nodes() {
+            if adapter_child.name().value() != "argv" {
+                anyhow::bail!(
+                    "compact `ding` `adapter` has unsupported child `{}`",
+                    adapter_child.name().value()
+                );
+            }
+            if adapter_child.children().is_some() {
+                anyhow::bail!("compact `ding` adapter `argv` cannot have children");
+            }
+            if parsed_argv.is_some() {
+                anyhow::bail!("compact `ding` adapter declares `argv` more than once");
+            }
+            let values = argv(adapter_child)?;
+            if values.is_empty() || values[0].is_empty() {
+                anyhow::bail!("compact `ding` `adapter` requires non-empty `argv`");
+            }
+            parsed_argv = Some(values);
+        }
+        adapter = Some(
+            parsed_argv
+                .ok_or_else(|| anyhow::anyhow!("compact `ding` `adapter` requires `argv`"))?,
+        );
+    }
+    Ok(adapter)
 }
 
 fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)> {

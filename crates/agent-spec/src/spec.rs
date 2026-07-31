@@ -289,6 +289,10 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: include the built-in `st2 ding` sidecar.
     #[serde(default)]
     pub ding: bool,
+    /// Canonical KDL only: an explicit executable plus arguments for the optional generic DING
+    /// activity adapter. Presence selects the fail-closed rich delivery path.
+    #[serde(skip)]
+    pub ding_adapter_argv: Option<Vec<String>>,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
     pub lifecycle: Option<String>,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
@@ -642,13 +646,36 @@ impl RawSpec {
             });
         }
         if self.ding {
+            let (command, argv) = match self.ding_adapter_argv {
+                None => (
+                    Some(format!("st2 ding --identity {bus_id} --root $ST_ROOT")),
+                    None,
+                ),
+                Some(adapter) => {
+                    let mut argv = vec![
+                        "st2".to_string(),
+                        "ding".to_string(),
+                        "--identity".to_string(),
+                        bus_id.clone(),
+                        "--root".to_string(),
+                        "$ST_ROOT".to_string(),
+                        "--adapter".to_string(),
+                        adapter[0].clone(),
+                    ];
+                    for argument in &adapter[1..] {
+                        argv.push("--adapter-arg".to_string());
+                        argv.push(argument.clone());
+                    }
+                    (None, Some(argv))
+                }
+            };
             tasks.push(Task {
                 kind: TaskKind::Exec,
                 derived: true,
                 name: "ding".to_string(),
                 id: Some(format!("{bus_id}.ding")),
-                command: Some(format!("st2 ding --identity {bus_id} --root $ST_ROOT")),
-                argv: None,
+                command,
+                argv,
                 cwd: None,
                 tags: BTreeMap::new(),
                 env: self.env,

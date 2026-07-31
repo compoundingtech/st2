@@ -23,13 +23,19 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod adapter;
 mod composer;
+mod guarded_pty;
 mod harness;
+mod hook_control;
 
 use crate::message::{self, Message};
 use crate::status;
+use adapter::{AdapterSignal, AdapterState, ExternalAdapter, HoldReason, IdleLease};
 use composer::{ComposerState, classify_composer, classify_receipt};
+use guarded_pty::{GuardedPty, GuardedSend, PtySnapshot, SocketPty};
 use harness::ReceiptState;
+pub use hook_control::record_hook_owned;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
@@ -153,6 +159,52 @@ pub enum PokeOutcome {
     Delivered,
     Staged,
     Deferred,
+}
+
+/// Observable decisions from the opt-in rich path. These are transport/ownership receipts, not
+/// claims that a harness accepted a prompt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "result", rename_all = "kebab-case")]
+enum DeliveryReceipt {
+    Fallback {
+        reason: &'static str,
+    },
+    Held {
+        reason: String,
+    },
+    Error {
+        stage: &'static str,
+        error: String,
+    },
+    HookOwned {
+        messages: Vec<String>,
+    },
+    GuardConflict {
+        generation: String,
+        revision: u64,
+        error: String,
+    },
+    PtyOwned {
+        generation: String,
+        revision: u64,
+        sequence: u64,
+    },
+}
+
+#[derive(Default)]
+struct ReceiptLog {
+    last: Option<String>,
+}
+
+impl ReceiptLog {
+    fn emit(&mut self, receipt: DeliveryReceipt) {
+        let serialized =
+            serde_json::to_string(&receipt).expect("DING delivery receipts are serializable");
+        if self.last.as_deref() != Some(&serialized) {
+            eprintln!("st2 ding receipt: {serialized}");
+            self.last = Some(serialized);
+        }
+    }
 }
 
 /// How DING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
@@ -939,6 +991,356 @@ fn flush_pending(
     }
 }
 
+#[derive(Debug)]
+struct RichNotice {
+    filenames: HashSet<String>,
+    text: String,
+    pty_owned: bool,
+}
+
+impl RichNotice {
+    fn recovery(messages: &[Message]) -> Self {
+        Self {
+            filenames: messages
+                .iter()
+                .map(|message| message.filename.clone())
+                .collect(),
+            text: RECOVERY_POKE.to_string(),
+            pty_owned: false,
+        }
+    }
+
+    fn message(message: Message) -> Self {
+        Self {
+            filenames: HashSet::from([message.filename.clone()]),
+            text: poke_text(&message),
+            pty_owned: false,
+        }
+    }
+}
+
+fn refresh_rich_pending(
+    inbox_dir: &Path,
+    seen: &mut HashSet<String>,
+    pending: &mut VecDeque<RichNotice>,
+) -> anyhow::Result<Vec<String>> {
+    pending.extend(
+        new_arrivals(inbox_dir, seen)
+            .into_iter()
+            .map(RichNotice::message),
+    );
+    let unread: HashSet<String> = message::list_inbox(inbox_dir)?
+        .into_iter()
+        .map(|message| message.filename)
+        .collect();
+    let hook_owned = hook_control::load_hook_owned(inbox_dir)?;
+    let pty_owned = hook_control::load_pty_owned(inbox_dir)?;
+    let mut applied_hook_ownership = HashSet::new();
+    for notice in pending.iter_mut() {
+        notice.filenames.retain(|filename| {
+            if !unread.contains(filename) {
+                return false;
+            }
+            if hook_owned.contains(filename) {
+                applied_hook_ownership.insert(filename.clone());
+                return false;
+            }
+            true
+        });
+        if notice
+            .filenames
+            .iter()
+            .any(|filename| pty_owned.contains(filename))
+        {
+            notice.pty_owned = true;
+        }
+    }
+    pending.retain(|notice| !notice.filenames.is_empty());
+    let mut applied = applied_hook_ownership.into_iter().collect::<Vec<_>>();
+    applied.sort();
+    Ok(applied)
+}
+
+fn guarded_delivery_bytes(text: &str) -> String {
+    // This is the existing DING terminal transaction carried as one opaque guarded write:
+    // normalized bracketed paste followed by Return. Core assigns no provider meaning to it.
+    format!("{}\r", bracketed_paste(text))
+}
+
+fn snapshot_matches_lease(snapshot: &PtySnapshot, lease: &IdleLease) -> bool {
+    snapshot.name == lease.session
+        && snapshot.generation == lease.generation
+        && snapshot.activity.generation == lease.generation
+        && snapshot.activity.producer_epoch.as_deref() == Some(lease.incarnation.as_str())
+        && snapshot.activity.sequence == lease.sequence
+        && snapshot.activity.state == lease.state.pty_name()
+}
+
+fn attempt_rich_delivery(
+    inbox_dir: &Path,
+    pending: &mut VecDeque<RichNotice>,
+    state: &mut AdapterState,
+    pty: &dyn GuardedPty,
+    last_attempted: &mut Option<(String, String, u64)>,
+    receipts: &mut ReceiptLog,
+) {
+    let Some(notice) = pending.front_mut() else {
+        return;
+    };
+    if notice.pty_owned {
+        receipts.emit(DeliveryReceipt::Held {
+            reason: "pty-owned-awaiting-archive-or-hook".to_string(),
+        });
+        return;
+    }
+
+    let lease = match state.authority(Instant::now()) {
+        Ok(lease) => lease.clone(),
+        Err(reason) => {
+            receipts.emit(DeliveryReceipt::Held {
+                reason: reason.as_str().to_string(),
+            });
+            return;
+        }
+    };
+    let attempt_key = (
+        lease.incarnation.clone(),
+        lease.generation.clone(),
+        lease.sequence,
+    );
+    if last_attempted.as_ref() == Some(&attempt_key) {
+        receipts.emit(DeliveryReceipt::Held {
+            reason: "activity-tuple-already-attempted".to_string(),
+        });
+        return;
+    }
+    *last_attempted = Some(attempt_key);
+
+    let snapshot = match pty.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            state.invalidate();
+            receipts.emit(DeliveryReceipt::Error {
+                stage: "pty-status",
+                error: format!("PTY STATUS failed: {error}"),
+            });
+            return;
+        }
+    };
+    if !snapshot_matches_lease(&snapshot, &lease) {
+        state.invalidate();
+        receipts.emit(DeliveryReceipt::Held {
+            reason: "pty-activity-tuple-mismatch".to_string(),
+        });
+        return;
+    }
+    if !lease.is_fresh(Instant::now()) {
+        state.invalidate();
+        receipts.emit(DeliveryReceipt::Held {
+            reason: HoldReason::Stale.as_str().to_string(),
+        });
+        return;
+    }
+
+    let ownership = match hook_control::record_pty_owned(
+        inbox_dir,
+        &notice.filenames,
+        &snapshot.generation,
+        snapshot.io_revision,
+        lease.sequence,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            state.invalidate();
+            receipts.emit(DeliveryReceipt::Error {
+                stage: "ownership-record",
+                error: format!("recording PTY ownership failed: {error}"),
+            });
+            return;
+        }
+    };
+    let bytes = guarded_delivery_bytes(&notice.text);
+    match pty.compare_and_send(&snapshot.generation, snapshot.io_revision, &bytes) {
+        Ok(GuardedSend::Sent { revision }) => {
+            notice.pty_owned = true;
+            receipts.emit(DeliveryReceipt::PtyOwned {
+                generation: snapshot.generation,
+                revision,
+                sequence: lease.sequence,
+            });
+        }
+        Ok(GuardedSend::Conflict {
+            actual_generation,
+            actual_revision,
+            error,
+        }) => {
+            state.invalidate();
+            if let Err(clear_error) = hook_control::clear_pty_owned(&ownership) {
+                notice.pty_owned = true;
+                receipts.emit(DeliveryReceipt::Error {
+                    stage: "ownership-clear",
+                    error: format!(
+                        "guard conflict was zero-byte but ownership clear failed: {clear_error}"
+                    ),
+                });
+                return;
+            }
+            receipts.emit(DeliveryReceipt::GuardConflict {
+                generation: actual_generation,
+                revision: actual_revision,
+                error,
+            });
+        }
+        Err(error) => {
+            state.invalidate();
+            // The socket error is ambiguous after the packet write. Preserve the pre-recorded
+            // ownership and never retry these bytes without an archive or exact hook receipt.
+            notice.pty_owned = true;
+            receipts.emit(DeliveryReceipt::Error {
+                stage: "pty-guarded-send",
+                error: format!("PTY guarded send failed: {error}"),
+            });
+        }
+    }
+}
+
+fn run_rich_ding(
+    inbox_dir: &Path,
+    status_path: Option<&Path>,
+    session: &str,
+    adapter_argv: &[String],
+    pty: &dyn GuardedPty,
+    config: &DingConfig,
+    stop: &AtomicBool,
+) -> anyhow::Result<()> {
+    let (wake_tx, wake_rx) = channel::<()>();
+    // Rich delivery also consumes the sibling `ding-control` receipt folder.
+    let watch_at = inbox_dir.parent().unwrap_or(inbox_dir);
+    let _watcher = crate::watch::watch_recursive_mutations(watch_at, wake_tx.clone());
+    let adapter = ExternalAdapter::spawn(adapter_argv, wake_tx)?;
+    let mut adapter_state = AdapterState::new(session);
+    let mut receipts = ReceiptLog::default();
+
+    let backlog = message::list_inbox(inbox_dir).unwrap_or_default();
+    let mut seen: HashSet<String> = backlog
+        .iter()
+        .map(|message| message.filename.clone())
+        .collect();
+    let mut pending = VecDeque::new();
+    if !backlog.is_empty() {
+        pending.push_back(RichNotice::recovery(&backlog));
+    }
+    eprintln!(
+        "st2 ding: rich adapter ready — found {} existing unread message(s){}; watching for generic activity.",
+        backlog.len(),
+        if backlog.is_empty() {
+            ""
+        } else {
+            " and queued one recovery notice"
+        }
+    );
+
+    let mut watch = SessionWatch::default();
+    let mut logged_waiting = false;
+    let mut last_refresh: Option<Instant> = None;
+    let mut last_attempted = None;
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        while let Some(signal) = adapter.try_recv() {
+            match signal {
+                AdapterSignal::Line(line) => {
+                    if let Err(error) = adapter_state.apply_line(&line, Instant::now()) {
+                        receipts.emit(DeliveryReceipt::Error {
+                            stage: "adapter-event",
+                            error: error.to_string(),
+                        });
+                    }
+                }
+                AdapterSignal::Error(error) => {
+                    adapter_state.invalidate();
+                    receipts.emit(DeliveryReceipt::Error {
+                        stage: "adapter-io",
+                        error,
+                    });
+                }
+                AdapterSignal::Eof => {
+                    adapter_state.invalidate();
+                    receipts.emit(DeliveryReceipt::Error {
+                        stage: "adapter-exit",
+                        error: "activity adapter exited".to_string(),
+                    });
+                }
+            }
+        }
+
+        let alive = pty.session_alive();
+        if watch.step(alive) == WatchStep::Gone {
+            eprintln!("st2 ding: target pty session is gone — exiting.");
+            break;
+        }
+        if alive {
+            if let Some(path) = status_path
+                && last_refresh.is_none_or(|instant| instant.elapsed() >= config.status_refresh)
+            {
+                let _ = status::refresh(path);
+                last_refresh = Some(Instant::now());
+            }
+
+            let control_ready = match refresh_rich_pending(inbox_dir, &mut seen, &mut pending) {
+                Ok(hook_owned) => {
+                    if !hook_owned.is_empty() {
+                        receipts.emit(DeliveryReceipt::HookOwned {
+                            messages: hook_owned,
+                        });
+                    }
+                    true
+                }
+                Err(error) => {
+                    receipts.emit(DeliveryReceipt::Error {
+                        stage: "hook-control",
+                        error: format!("hook control failed: {error}"),
+                    });
+                    false
+                }
+            };
+            if control_ready {
+                if delivery_suppressed(status_path) {
+                    receipts.emit(DeliveryReceipt::Held {
+                        reason: "presence-dnd".to_string(),
+                    });
+                } else {
+                    attempt_rich_delivery(
+                        inbox_dir,
+                        &mut pending,
+                        &mut adapter_state,
+                        pty,
+                        &mut last_attempted,
+                        &mut receipts,
+                    );
+                }
+            }
+        } else if !watch.seen_alive && !logged_waiting {
+            eprintln!(
+                "st2 ding: target pty session not yet registered; waiting before enabling exit-when-gone."
+            );
+            logged_waiting = true;
+        }
+
+        match wake_rx.recv_timeout(config.poll) {
+            Ok(()) => drain(&wake_rx),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                thread::sleep(config.poll);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Set by SIGINT/SIGTERM so `st2 ding` exits cleanly when st2 tears the sidecar down.
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -959,17 +1361,38 @@ pub fn serve(
     inbox_dir: &Path,
     status_path: &Path,
     session: &str,
+    adapter_argv: Option<&[String]>,
     config: &DingConfig,
 ) -> anyhow::Result<()> {
-    probe_pty_on_path()?;
     install_signal_handler();
-    run_ding(
-        inbox_dir,
-        Some(status_path),
-        &PtyPoker::new(session),
-        config,
-        &STOP,
-    )
+    match adapter_argv {
+        None => {
+            probe_pty_on_path()?;
+            let mut receipts = ReceiptLog::default();
+            receipts.emit(DeliveryReceipt::Fallback {
+                reason: "adapter-not-configured",
+            });
+            run_ding(
+                inbox_dir,
+                Some(status_path),
+                &PtyPoker::new(session),
+                config,
+                &STOP,
+            )
+        }
+        Some(argv) => {
+            let pty = SocketPty::new(session)?;
+            run_rich_ding(
+                inbox_dir,
+                Some(status_path),
+                session,
+                argv,
+                &pty,
+                config,
+                &STOP,
+            )
+        }
+    }
 }
 
 fn drain(rx: &Receiver<()>) {
@@ -1068,6 +1491,208 @@ mod tests {
         fn session_alive(&self) -> bool {
             true
         }
+    }
+
+    struct FakeGuardedPty {
+        snapshot: PtySnapshot,
+        result: Mutex<GuardedSend>,
+        sends: Mutex<Vec<(String, u64, String)>>,
+    }
+
+    impl FakeGuardedPty {
+        fn matching(result: GuardedSend) -> Self {
+            Self {
+                snapshot: PtySnapshot {
+                    name: "host.agent".to_string(),
+                    generation: "generation-a".to_string(),
+                    io_revision: 41,
+                    activity: guarded_pty::PtyActivity {
+                        state: "idle".to_string(),
+                        generation: "generation-a".to_string(),
+                        producer_epoch: Some("epoch-a".to_string()),
+                        sequence: 7,
+                    },
+                },
+                result: Mutex::new(result),
+                sends: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl GuardedPty for FakeGuardedPty {
+        fn snapshot(&self) -> anyhow::Result<PtySnapshot> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn compare_and_send(
+            &self,
+            generation: &str,
+            revision: u64,
+            bytes: &str,
+        ) -> anyhow::Result<GuardedSend> {
+            self.sends
+                .lock()
+                .unwrap()
+                .push((generation.to_string(), revision, bytes.to_string()));
+            Ok(self.result.lock().unwrap().clone())
+        }
+
+        fn session_alive(&self) -> bool {
+            true
+        }
+    }
+
+    fn rich_activity(sequence: u64, state: &str, input_buffer: &str, valid_for_ms: u64) -> String {
+        format!(
+            r#"{{"v":1,"kind":"activity","session":"host.agent","incarnation":"epoch-a","generation":"generation-a","sequence":{sequence},"state":"{state}","inputBuffer":"{input_buffer}","validForMs":{valid_for_ms}}}"#
+        )
+    }
+
+    #[test]
+    fn rich_delivery_requires_matching_fresh_tuple_and_becomes_pty_owned_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        let pty = FakeGuardedPty::matching(GuardedSend::Sent { revision: 42 });
+        let mut state = AdapterState::new("host.agent");
+        state
+            .apply_line(&rich_activity(7, "idle", "empty", 500), Instant::now())
+            .unwrap();
+        let filename = send_to_inbox(&inbox, "sender", Some("subject"), None, &[], "body").unwrap();
+        let mut pending = VecDeque::from([RichNotice::message(
+            message::list_inbox(&inbox).unwrap().remove(0),
+        )]);
+        let mut sequence = None;
+        let mut receipts = ReceiptLog::default();
+        attempt_rich_delivery(
+            &inbox,
+            &mut pending,
+            &mut state,
+            &pty,
+            &mut sequence,
+            &mut receipts,
+        );
+        assert!(pending[0].pty_owned);
+        assert_eq!(pty.sends.lock().unwrap().len(), 1);
+        let sent = pty.sends.lock().unwrap()[0].clone();
+        assert_eq!(sent.0, "generation-a");
+        assert_eq!(sent.1, 41);
+        assert_eq!(sent.2, guarded_delivery_bytes(&pending[0].text));
+        assert!(sent.2.starts_with(BRACKETED_PASTE_START));
+        assert!(sent.2.ends_with("\x1b[201~\r"));
+        assert_eq!(
+            hook_control::load_pty_owned(&inbox).unwrap(),
+            HashSet::from([filename])
+        );
+
+        attempt_rich_delivery(
+            &inbox,
+            &mut pending,
+            &mut state,
+            &pty,
+            &mut sequence,
+            &mut receipts,
+        );
+        assert_eq!(pty.sends.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rich_tuple_mismatch_and_guard_conflict_send_zero_or_one_guarded_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        let mut mismatch_pty = FakeGuardedPty::matching(GuardedSend::Sent { revision: 42 });
+        mismatch_pty.snapshot.activity.sequence = 8;
+        let mut state = AdapterState::new("host.agent");
+        state
+            .apply_line(&rich_activity(7, "idle", "empty", 500), Instant::now())
+            .unwrap();
+        send_to_inbox(&inbox, "sender", Some("subject"), None, &[], "body").unwrap();
+        let mut pending = VecDeque::from([RichNotice::message(
+            message::list_inbox(&inbox).unwrap().remove(0),
+        )]);
+        let mut sequence = None;
+        let mut receipts = ReceiptLog::default();
+        attempt_rich_delivery(
+            &inbox,
+            &mut pending,
+            &mut state,
+            &mismatch_pty,
+            &mut sequence,
+            &mut receipts,
+        );
+        assert!(mismatch_pty.sends.lock().unwrap().is_empty());
+        assert!(!pending[0].pty_owned);
+
+        let conflict_pty = FakeGuardedPty::matching(GuardedSend::Conflict {
+            actual_generation: "generation-a".to_string(),
+            actual_revision: 42,
+            error: "I/O revision mismatch".to_string(),
+        });
+        let mut state = AdapterState::new("host.agent");
+        state
+            .apply_line(&rich_activity(7, "idle", "empty", 500), Instant::now())
+            .unwrap();
+        let mut sequence = None;
+        attempt_rich_delivery(
+            &inbox,
+            &mut pending,
+            &mut state,
+            &conflict_pty,
+            &mut sequence,
+            &mut receipts,
+        );
+        assert_eq!(conflict_pty.sends.lock().unwrap().len(), 1);
+        assert!(!pending[0].pty_owned);
+        assert!(hook_control::load_pty_owned(&inbox).unwrap().is_empty());
+        assert!(matches!(
+            state.authority(Instant::now()),
+            Err(HoldReason::AdapterError)
+        ));
+    }
+
+    #[test]
+    fn exact_hook_ownership_removes_only_named_unread_work_without_pty_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(tmp.path());
+        let first = send_to_inbox(&inbox, "sender", Some("one"), None, &[], "first").unwrap();
+        let second = send_to_inbox(&inbox, "sender", Some("two"), None, &[], "second").unwrap();
+        let messages = message::list_inbox(&inbox).unwrap();
+        let mut pending = VecDeque::from([RichNotice::recovery(&messages)]);
+        let mut seen = messages
+            .iter()
+            .map(|message| message.filename.clone())
+            .collect();
+        record_hook_owned(&inbox, std::slice::from_ref(&first)).unwrap();
+
+        assert_eq!(
+            refresh_rich_pending(&inbox, &mut seen, &mut pending).unwrap(),
+            vec![first]
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].filenames, HashSet::from([second]));
+    }
+
+    #[test]
+    fn durable_pty_ownership_blocks_replay_after_sidecar_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(tmp.path());
+        let filename = send_to_inbox(&inbox, "sender", Some("work"), None, &[], "body").unwrap();
+        let messages = message::list_inbox(&inbox).unwrap();
+        hook_control::record_pty_owned(&inbox, &HashSet::from([filename]), "generation-a", 41, 7)
+            .unwrap();
+
+        // A fresh in-memory queue simulates a sidecar restart. Durable ownership is reloaded before
+        // any activity lease can authorize another guarded write.
+        let mut pending = VecDeque::from([RichNotice::recovery(&messages)]);
+        let mut seen = messages
+            .iter()
+            .map(|message| message.filename.clone())
+            .collect();
+        assert!(
+            refresh_rich_pending(&inbox, &mut seen, &mut pending)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(pending[0].pty_owned);
     }
 
     #[test]

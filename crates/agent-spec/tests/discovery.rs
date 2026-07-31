@@ -175,6 +175,97 @@ agent "cos" {
 }
 
 #[test]
+fn compact_ding_adapter_lowers_structured_argv_without_a_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/host/worker/agent.kdl",
+        r#"
+agent "worker" {
+  host "host"
+  command "agent"
+  ding {
+    adapter {
+      argv "$ADAPTER_ROOT/bin/activity" "--format" "jsonl"
+    }
+  }
+}
+"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(
+        found.errors.is_empty(),
+        "unexpected errors: {:?}",
+        found.errors
+    );
+    let ding = found.specs[0]
+        .tasks
+        .iter()
+        .find(|task| task.name == "ding")
+        .unwrap();
+    assert_eq!(ding.command, None);
+    assert_eq!(
+        argv(ding),
+        vec![
+            "st2",
+            "ding",
+            "--identity",
+            "host.worker",
+            "--root",
+            "$ST_ROOT",
+            "--adapter",
+            "$ADAPTER_ROOT/bin/activity",
+            "--adapter-arg",
+            "--format",
+            "--adapter-arg",
+            "jsonl",
+        ]
+    );
+}
+
+#[test]
+fn compact_ding_adapter_rejects_ambiguous_or_incomplete_shapes() {
+    for (name, ding, expected) in [
+        (
+            "missing-argv",
+            "ding { adapter }",
+            "requires non-empty `argv`",
+        ),
+        (
+            "empty-argv",
+            "ding { adapter { argv } }",
+            "requires non-empty `argv`",
+        ),
+        (
+            "unknown-child",
+            "ding { delivery \"rich\" }",
+            "unsupported child `delivery`",
+        ),
+        (
+            "shell-command",
+            "ding { adapter { command \"activity\" } }",
+            "unsupported child `command`",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/host/{name}/agent.kdl"),
+            &format!("agent \"{name}\" {{ host \"host\"; command \"agent\"; {ding} }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.specs.len(), 0, "{name}");
+        assert_eq!(found.errors.len(), 1, "{name}");
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: {}",
+            found.errors[0].message
+        );
+    }
+}
+
+#[test]
 fn compact_adopt_only_lifecycle_lowers_to_the_generated_agent_task() {
     let tmp = tempfile::tempdir().unwrap();
     write(

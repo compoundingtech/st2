@@ -22,7 +22,7 @@ use std::process::Stdio;
 
 use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
-use crate::run::resolve_task_cwd;
+use crate::run::{expand_task_argv, managed_task_env, resolve_task_cwd};
 
 /// Supervises `exec` tasks as terminal-free processes.
 pub struct ExecBackend {
@@ -74,6 +74,7 @@ impl ExecBackend {
         // kill cannot take it; elsewhere a plain pass-through detached by the `setsid` below. Env, cwd,
         // and stdio set here reach the task in both modes.
         let unit = crate::isolate::scope_unit(&target.pty_id);
+        let managed_env = managed_task_env(target, &self.catalog_root, None);
         let (program, args): (OsString, Vec<OsString>) = match &target.launch {
             TaskLaunch::Shell(command) => (
                 OsString::from("sh"),
@@ -81,12 +82,7 @@ impl ExecBackend {
             ),
             TaskLaunch::Argv(argv) => {
                 debug_assert!(!argv.is_empty());
-                let mut expanded = argv
-                    .iter()
-                    .map(|arg| {
-                        OsString::from(crate::expand::expand_catalog(arg, &self.catalog_root))
-                    })
-                    .collect::<Vec<_>>();
+                let mut expanded = expand_task_argv(argv, &managed_env);
                 let program = expanded.remove(0);
                 (program, expanded)
             }
@@ -97,28 +93,7 @@ impl ExecBackend {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
-            .env("CATALOG", &self.catalog_root)
-            .env("ST_ROOT", &self.catalog_root)
-            .env(
-                "PTY_ROOT",
-                crate::run::effective_pty_root(&self.catalog_root),
-            );
-        if let Ok(path) = crate::hooks::hooks_root() {
-            cmd.env("ST_HOOKS", path);
-        }
-        for (k, v) in &target.env {
-            // PTY_ROOT resolves to the EFFECTIVE root (an exported ambient one wins over the rendered
-            // `$CATALOG/pty`) so a ding — an exec task that reads PTY_ROOT to find the pty it pokes —
-            // targets the same partition st2's pty ops use.
-            if k == "PTY_ROOT" {
-                cmd.env(
-                    "PTY_ROOT",
-                    crate::run::effective_pty_root(&self.catalog_root),
-                );
-            } else {
-                cmd.env(k, crate::expand::expand_catalog(v, &self.catalog_root));
-            }
-        }
+            .envs(&managed_env);
         // New session: no controlling terminal (R09) and decoupled from st2's process group, so it
         // survives st2 exit and `kill(-pid)` teardown reaps the whole group. In Scope mode this runs
         // on the outer `systemd-run`, which exec-chains into the workload, so the workload is the

@@ -1,8 +1,8 @@
 //! Spawn-time environment-variable expansion.
 //!
-//! st2 spawns via `pty run` with values passed through the child environment. Those values, `cwd`,
-//! and tags do not pass through a shell, so st2 expands them explicitly. The command itself runs
-//! under `sh -c` and expands there.
+//! st2 spawns with values, `cwd`, tags, and structured argv that do not pass through a shell, so st2
+//! expands them explicitly. Direct argv is expanded after the complete managed task environment is
+//! resolved. The command form itself runs under `sh -c` and expands there.
 //!
 //! Supported forms: `$VAR`, `${VAR}`, and `$$` → literal `$`. An **unset** variable is left as its
 //! literal token (`$VAR`) rather than blanked — a spawn-time path with an undefined var is a

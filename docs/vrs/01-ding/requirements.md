@@ -20,10 +20,9 @@ is in [`spec.md`](./spec.md).
 
 ## Assumptions
 
-- **DING-A01 Rendered screens only:** The only available evidence about a
-  composer's state is a rendered terminal screen. No maintained harness exposes
-  an evented idle signal, so every precondition below is a measured heuristic
-  over text. `DQ2` in [`../spec.md`](../spec.md) tracks closing that gap.
+- **DING-A01 Legacy rendered-screen default:** Bare `ding` uses the current
+  rendered-screen path. The optional experimental adapter path is selected only
+  by an explicit adapter declaration and does not change that default.
 - **DING-A02 Cooperative human:** The human sharing a pane is not adversarial.
   A screen that deliberately imitates another harness's composer is a
   correctness concern, not a security boundary, consistent with `A02`.
@@ -94,6 +93,45 @@ is in [`spec.md`](./spec.md).
   change, disappearance alone, and ambiguous pixels are not receipts. Until
   that evidence exists, a transport attempt retains staged ownership and
   retries by inspection without re-pasting.
+
+### Optional rich delivery must remain generic and fail closed
+
+- **DING-R11 Structured adapter launch:** An adapter declaration is one
+  executable plus argument vector, expanded against the complete resolved DING
+  task environment before direct launch. Core introduces no shell, provider
+  selector, inferred arguments, or adapter-specific environment. Adapter argv
+  participates in the DING sidecar launch fingerprint.
+- **DING-R12 Exact generic activity tuple:** Rich PTY input requires one
+  receipt-anchored, unexpired `idle` event with `inputBuffer=empty`. Its exact
+  session, incarnation, PTY generation, and strictly increasing sequence must
+  match the live PTY activity snapshot.
+- **DING-R13 Independent atomic fence:** A qualifying adapter event is only
+  authority to attempt delivery. st2 snapshots PTY's generation and monotonic
+  I/O revision, then asks PTY to compare both immediately before one bounded
+  write. A mismatch writes zero bytes and retains FIFO ownership.
+- **DING-R14 No rich fallback:** Configured rich DING never invokes legacy
+  aggressive or renderer-classified input after missing, stale, malformed, or
+  conflicting evidence. `active`, child-command-running, `unknown`, nonempty or
+  unknown input buffer, adapter EOF/error, tuple change, and PTY conflict all
+  hold.
+- **DING-R15 Typed ownership receipts:** Rich decisions distinguish legacy
+  fallback, hold, staged error, hook ownership, guard conflict, and PTY
+  ownership. A successful guarded write is staged PTY ownership, not a harness
+  acceptance receipt; it is not sent again while unread. Exact attempt
+  ownership is durable before the guarded packet, survives sidecar restart and
+  ambiguous transport errors, and is cleared only by archive or a proven
+  zero-byte conflict. Exact hook ownership independently suppresses PTY work.
+- **DING-R16 Separate turn-boundary ingress:** A provider-rendered lifecycle
+  hook may record exact filenames only after it injected those currently unread
+  files into an already-occurring next context. st2 verifies generic filenames
+  and unread state, persists hook ownership across sidecar restart, sends no PTY
+  input for owned files, and clears ownership on archive.
+- **DING-R17 No provider or interruption grammar:** Core does not install
+  provider hooks, parse provider hook payloads, identify a provider from command
+  spelling, trigger a model call, or define a mid-turn interruption mechanism.
+- **DING-R18 Compatibility:** Omitted or bare `ding` lowers to the existing
+  sidecar command byte-for-byte. Adapter presence selects the only rich policy;
+  there is no redundant delivery enum.
 
 ## Evidence
 
