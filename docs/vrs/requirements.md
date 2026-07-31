@@ -185,16 +185,20 @@ accepted.
   exact evidence, or supported generation schema fails closed. There is no
   numeric PID/process-group, path-unlink, PTY, whole-state-directory, or
   best-effort fallback. Historical exec records remain read-only and cannot be
-  retired by the general seam. A removable, explicitly typed legacy migration
-  seam may prepare a complete host-local exec-state census under the host lock,
-  classify every numeric record as exact-live or positively stale, reject the
-  entire set on ambiguity or foreign entries, and externalize a create-only
-  plan whose digest is the sole apply authority. Apply rechecks the catalog
-  root and complete remaining namespace before each resumable per-entry
-  transition. The immutable plan and completed receipt partition every numeric
-  record exactly once into a successor desired-running canonical Ding or a
-  desired-absent retired Ding, with neither undeclared records nor declaration
-  extras. The caller never enumerates paths or derives generations.
+  retired by the general seam. A removable, separately pinned predecessor
+  migration tool may prepare a complete host-local exec-state census under the
+  host lock, classify every numeric record as exact-live or positively stale,
+  reject the entire set on ambiguity or foreign entries, and externalize a
+  create-only plan whose digest is the sole apply authority. Its immutable
+  migration catalog contains only local retired agents, each with exactly one
+  canonical Exec Ding; any provider, PTY, non-Ding task, non-retired agent,
+  undeclared record, or declaration extra rejects before mutation. Apply
+  rechecks the catalog root and complete remaining namespace before each
+  resumable per-entry transition. The immutable plan and completed receipt
+  partition every numeric record exactly once as a desired-absent retired Ding.
+  The successor st2 CLI has no legacy-set drain API, never parses predecessor
+  numeric records, and consumes only the pinned typed receipt as a cutover
+  checkpoint. The caller never enumerates paths or derives generations.
   A live numeric record has no normal process-generation capability and wall
   clock or mtime reconstruction is never authority. It is retirable only as
   `legacy-scope-v1` when the dedicated systemd scope itself proves the complete

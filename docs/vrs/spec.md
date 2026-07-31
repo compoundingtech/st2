@@ -520,19 +520,25 @@ Apply accepts only the caller-held plan digest. Repeating the same apply resumes
 or returns the byte-identical completed receipt; there is no separate resume
 verb.
 
-The temporary legacy migration replaces `--id` with `--legacy-set`. It
-enumerates the complete host-local exec state namespace under the host lock and
-emits one exact-set digest plus one capability for every numeric record.
-Preparation fails without an artifact if any record is ambiguous, foreign, or
+The temporary legacy migration is a separately pinned predecessor transition
+tool, not a successor st2 subcommand. Its closed `--legacy-set` mode enumerates
+the complete host-local exec state namespace under the host lock and emits one
+exact-set digest plus one capability for every numeric record. Its immutable
+migration catalog contains only local retired agents, each declaring exactly
+one canonical Exec Ding. A provider, PTY, non-Ding task, non-retired agent,
+undeclared record, or declaration extra rejects before mutation. Preparation
+also fails without an artifact if any record is ambiguous, foreign, or
 otherwise unplanned. Live records carry exact process and dedicated-scope
 authority; positively stale/reused records carry exact record authority and a
 proof that signaling is unnecessary. Apply checks that the namespace is still
-exactly the original set minus durably completed entries. This is the only
-legacy-classification authority; consumers do not list files, parse PIDs, or
-derive generation ids. The plan and receipt also carry the complete typed
-`legacyPartition`: every numeric record appears exactly once as either a
-successor desired-running canonical Ding or a desired-absent retired Ding, and
-the declared local exec set has no extra row.
+exactly the original set minus durably completed entries. This predecessor tool
+is the only legacy-classification authority; consumers do not list files, parse
+PIDs, or derive generation ids. The plan and receipt carry the complete typed
+`legacyPartition`: every numeric record appears exactly once as a
+desired-absent retired Ding, and the declared local exec set has no extra row.
+Successor st2 consumes only that pinned typed receipt as a cutover checkpoint;
+it has no legacy-set drain API and never parses or mutates predecessor numeric
+records.
 
 The host exclusion path is
 `<canonical-catalog>/.st2.<host>.lock`. It is a persistent inode with a retained
@@ -576,11 +582,11 @@ old trajectory cannot be restored; every recovery continues forward or
 preserves a typed conflict.
 
 Only a Linux live generation with a dedicated cgroup-v2 systemd scope is
-retirable. The legacy-set seam additionally permits record-only retirement
-after a positive stale/reused proof and performs no signal or cgroup write for
-that entry. Other platforms and degraded isolation remain observable but
-return a typed unsupported error. PTY tasks continue to use the PTY backend and
-never enter this transaction.
+retirable. The separately pinned predecessor legacy-set tool additionally
+permits record-only retirement after a positive stale/reused proof and performs
+no signal or cgroup write for that entry. Other platforms and degraded
+isolation remain observable but return a typed unsupported error. PTY tasks
+continue to use the PTY backend and never enter this transaction.
 
 ### Durable cutover admission
 
