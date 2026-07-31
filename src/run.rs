@@ -18,7 +18,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
@@ -47,6 +47,31 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
     output_with_input_timeout(command, timeout, None)
 }
 
+fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Ok(None) | Err(_) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return;
+            }
+        }
+    }
+}
+
 fn output_with_input_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -72,6 +97,8 @@ fn output_with_input_timeout(
         });
     }
     let mut child = command.spawn()?;
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + timeout;
     if let Some(input) = input {
         let write = child
             .stdin
@@ -83,32 +110,16 @@ fn output_with_input_timeout(
                     .context("write metadata patch payload")
             });
         if let Err(error) = write {
-            let pid = child.id() as i32;
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_and_reap_before(child, pid, deadline);
             return Err(error);
         }
     }
-    let pid = child.id() as i32;
-    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = child.kill();
-            // Never turn the timeout into another unbounded wait. Reap asynchronously so a
-            // long-running supervisor does not accumulate zombies, while a wedged runtime cannot
-            // hold up this failed probe or a short-lived doctor process.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            terminate_and_reap_before(child, pid, deadline);
             anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -2245,6 +2256,27 @@ mod tests {
         assert!(
             !crate::host_lock::process_alive(pid),
             "failed metadata child {pid} was not terminated and reaped"
+        );
+    }
+
+    #[test]
+    fn expired_cleanup_deadline_hands_reaping_off_without_blocking() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let started = Instant::now();
+        terminate_and_reap_before(child, pid, Instant::now());
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "expired cleanup deadline blocked the caller"
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !crate::host_lock::process_alive(pid),
+            "background reaper did not collect child {pid}"
         );
     }
 
