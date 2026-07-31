@@ -631,17 +631,28 @@ untyped bypass token.
 The provider handoff is two different program actions rather than one generic
 candidate reconcile:
 
-1. `AdoptionProofAction` validates the precommitted provider generation,
-   declaration, identity, workspace, argv, profile, prompt, harness, model,
-   effort, and complete runtime inventory. It is read-only apart from advancing
-   the transaction marker after an exact proof. It has no workspace
-   materialization or provider spawn/kill/reap/remove/GC capability. A mismatch
-   leaves the cursor unchanged and is safe to inspect again.
+1. `ProviderFleetProofAction` carries one canonical ordered entry for every
+   locally authored provider task. Each entry binds identity, host, provider,
+   account, persona, workspace, exact live generation, argv, runtime profile,
+   launch-scoped immutable prompt authority, harness, model, effort, and a
+   trajectory digest. Under one coherent declaration snapshot, the proof
+   requires a bijection with the complete runtime provider inventory and
+   requires every row to be running and exact. The launch prompt is verified
+   through the runtime-profile persona entry and harness injection/launch
+   receipt; `.st2/PERSONA.md` and its loader must be absent in every workspace.
+   It is read-only apart from advancing the transaction marker after the whole
+   fleet passes. It has no workspace materialization or provider
+   spawn/kill/reap/remove/GC capability. Any missing, extra, non-running,
+   non-primary drift, legacy prompt file/loader, or trajectory mismatch leaves
+   the cursor and marker bytes unchanged.
 2. `DingReconcileAction` runs only after legacy Ding retirement and adoption
-   proof. It owns one precommitted successor notification exec set and a durable
-   per-Ding generation journal. Recovery accepts only an exact already-published
-   generation from that journal, so a crash cannot duplicate a sidecar. Its API
-   cannot address provider tasks or generic runtime teardown/GC.
+   proof. The provider proof classifies its precommitted successor notification
+   exec set separately as positively absent or exact journal-bound; Ding rows
+   never satisfy provider coverage. The action owns that exact set and a
+   durable per-Ding generation journal. Recovery accepts only an exact
+   already-published generation from that journal, so a crash cannot duplicate
+   a sidecar. Its API cannot address provider tasks or generic runtime
+   teardown/GC.
 
 Status/preflight can report either state without mutating it, allowing systemd
 `ExecStartPre` and publishers to refuse.

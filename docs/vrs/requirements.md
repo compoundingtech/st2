@@ -224,14 +224,24 @@ accepted.
 
   The gate has no PID, TTL, mtime, or wall-clock stale recovery. Missing,
   malformed, unknown-schema, or unknown-phase active state fails closed.
-  Provider generation, argv, profile, harness, model, and effort are committed
-  before the adoption proof. That proof reads the complete desired and actual
-  provider inventory and has no provider lifecycle or workspace-write
-  capability. It advances only when the inventory and trajectory are exact.
-  The following Ding action can reconcile only the precommitted successor
-  notification exec set. Its durable generation journal makes crash recovery
-  idempotent and it cannot spawn, kill, reap, remove, or garbage-collect a
-  provider.
+  A canonical ordered entry for every locally authored provider task commits
+  its identity, host, provider, account, persona, workspace, runtime
+  generation, argv, profile, launch-scoped immutable prompt authority, harness,
+  model, effort, and trajectory digest before the provider-fleet proof. That
+  proof reads one coherent complete declaration and runtime inventory and has
+  no provider lifecycle or workspace-write capability. It advances only when
+  every provider task is running at the exact committed generation and
+  trajectory, with no missing, extra, non-running, or mismatched row. For every
+  provider workspace it also proves the retired `.st2/PERSONA.md` prompt and
+  loader absent; prompt authority comes only from the immutable runtime-profile
+  persona entry and exact harness-injection/launch receipt.
+
+  Successor Ding execs are a separate exact partition: before the following
+  Ding action each is either positively absent or exact journal-bound, and none
+  counts as a provider-fleet row. The Ding action can reconcile only that
+  precommitted successor notification exec set. Its durable generation journal
+  makes crash recovery idempotent and it cannot spawn, kill, reap, remove, or
+  garbage-collect a provider.
   Completion moves the exact active record without
   replacement into durable history rather than unlinking it. Broad `st2 pty`
   and `st2 shell` lifecycle entry points and service install/change operations
