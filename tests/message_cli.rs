@@ -1,8 +1,9 @@
 //! CLI coverage for message-list filters and output modes.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn write_message(inbox: &Path, ts_ms: u64, suffix: &str, from: &str) {
     fs::create_dir_all(inbox).unwrap();
@@ -191,6 +192,70 @@ fn known_empty_native_and_catalog_less_flat_boxes_remain_valid() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
+fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bus() {
+    let send = |root: &Path, recipient: &str, root_flag: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["message", "send", recipient, root_flag])
+            .arg(root)
+            .args(["--host", "h", "--as", "h.sender"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"work\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path(), "worker");
+    let declaration = catalog.path().join("h/worker/agent.kdl");
+    fs::write(
+        &declaration,
+        fs::read_to_string(&declaration).unwrap().replace(
+            "  type \"service\"\n",
+            "  type \"service\"\n  name \"Shared Worker\"\n",
+        ),
+    )
+    .unwrap();
+
+    let display = send(catalog.path(), "Shared Worker", "--catalog");
+    assert!(!display.status.success());
+    assert!(
+        String::from_utf8_lossy(&display.stderr)
+            .contains("no agent 'Shared Worker' found in catalog")
+    );
+    assert!(!catalog.path().join("Shared Worker").exists());
+
+    let stable = send(catalog.path(), "h.worker", "--catalog");
+    assert!(
+        stable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stable.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(catalog.path().join("h/worker/resources/inbox"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let flat = tempfile::tempdir().unwrap();
+    let raw = send(flat.path(), "requester", "--root");
+    assert!(
+        raw.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(flat.path().join("requester/inbox"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
 #[test]
