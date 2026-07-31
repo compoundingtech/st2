@@ -167,6 +167,17 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   lifecycle is the explicit authority to resume ordinary replacement.
   `retired #true` remains the separate explicit teardown path.
 
+- **Catalog liveness:** The
+  [Host-local supervision contract](03-host-local/requirements.md) separates
+  continuing canonical-agent liveness from resident-supervisor state. A
+  running canonical agent keeps its catalog live across supervisor downtime;
+  DING/sidecar-only survival does not. Incomplete observation cannot prove a
+  catalog globally not live. While the catalog is live, or its supervisor is
+  running, the resolved catalog root and PTY root remain stable paths; ordinary
+  catalog edit/sync remains allowed, while relocation requires the coordinated
+  operation in
+  [issue #85](https://github.com/compoundingtech/st2/issues/85).
+
 - **Session registry:** A catalog owns the `pty` registry holding its tasks.
   `<catalog>/pty` is the default; a catalog may declare another so that one host
   can share a single registry across catalogs. Resolution is an exported
@@ -178,6 +189,32 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   observation has a short outer deadline so a wedged client fails the pass
   closed instead of hanging reconciliation. The deadline is containment, not
   the mechanism for admitting a larger fleet.
+
+## Partition and catalog activation
+
+- **R18:** Transport loss does not invalidate a host's locally applied desired
+  state. Missing, partial, or invalid incoming catalog state cannot replace the
+  last complete validated version or cause teardown.
+- **R22:** Hosts may temporarily apply different catalog versions and converge
+  independently. Peer or source absence is neutral unless a declared local
+  operation explicitly depends on it; reconnect is not itself evidence that a
+  candidate catalog is complete, valid, or newer.
+
+Current host isolation is source-backed: reconciliation filters declarations
+to one selected host
+([source](../../src/reconcile.rs#L106-L191)), a host-scoped lock detects an
+existing resident writer for the same local subject
+([source](../../src/host_lock.rs#L1-L67)), and running tasks survive control
+plane loss and adoption
+([evidence](../../tests/nomad_survival.rs#L592-L701)).
+
+The durable catalog-activation half of R18/R22 is not implemented. Each pass
+currently discovers the live catalog directory directly
+([source](../../src/run.rs#L737-L758)); `st2 validate` is separate and
+read-only. There is no staged candidate boundary, catalog version ordering,
+atomic validated activation, or durable last-known-good receipt. The exact
+candidate-completeness, version, and activation-recovery contracts remain open
+design work.
 
 ## Message lifecycle
 

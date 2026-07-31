@@ -105,6 +105,7 @@ accepted.
 - **R17 Durable error propagation:** Lifecycle, harness/eval, provider-turn,
   task/exec/PTY, hook, and delivery errors are durably reported to the
   responsible supervisor with agent/task identity and actionable context.
+
 - **R19 Targeted reconciliation:** An exact agent/task selector resolves its
   identity and pinned host before mutation; unknown, ambiguous, and wrong-host
   targets refuse before writes, listing, or actions. Materialization, hook
@@ -122,3 +123,15 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+
+### Must remain safe through host partitions
+
+- **R18 Last-known-good local desired state:** During transport loss, each host
+  continues converging locally applied work from its last complete, validated
+  catalog. A missing, partial, or invalid incoming catalog cannot replace that
+  desired state or authorize teardown.
+- **R22 Independent fleet convergence:** Temporary catalog-version skew between
+  hosts is acceptable. On reconnect, a host may apply only a complete,
+  validated, newer catalog and then converges its own work independently. Peer
+  or source reachability is factual state, not a health classification; its
+  absence affects local work only through an explicit local dependency.
