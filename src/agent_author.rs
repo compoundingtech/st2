@@ -497,22 +497,24 @@ fn agent_identity_parts(node: &KdlNode) -> Option<(Option<String>, String)> {
         .and_then(|value| value.as_string())
         .map(str::to_owned);
     let mut host = None;
-    for child in node.children()?.nodes() {
-        match child.name().value() {
-            "identity" => {
-                identity = child
-                    .get(0)
-                    .and_then(|value| value.as_string())
-                    .map(str::to_owned)
-                    .or(identity);
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            match child.name().value() {
+                "identity" => {
+                    identity = child
+                        .get(0)
+                        .and_then(|value| value.as_string())
+                        .map(str::to_owned)
+                        .or(identity);
+                }
+                "host" => {
+                    host = child
+                        .get(0)
+                        .and_then(|value| value.as_string())
+                        .map(str::to_owned);
+                }
+                _ => {}
             }
-            "host" => {
-                host = child
-                    .get(0)
-                    .and_then(|value| value.as_string())
-                    .map(str::to_owned);
-            }
-            _ => {}
         }
     }
     Some((host, identity?))
@@ -698,10 +700,40 @@ fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
         replacement.replace_range(line_start..remove_end, "");
         return Ok(replacement);
     }
-    Err(AuthorError::new(
-        "unsafe-source-shape",
-        "clearing presentation metadata requires the field to occupy its own canonical KDL line",
-    ))
+
+    let after = &text[end..line_end];
+    let after_indent = after.len() - after.trim_start_matches([' ', '\t']).len();
+    let after_content = end + after_indent;
+    if text[after_content..line_end].starts_with(';') {
+        let mut remove_end = after_content + 1;
+        while remove_end < line_end
+            && text.as_bytes()[remove_end].is_ascii_whitespace()
+            && text.as_bytes()[remove_end] != b'\n'
+            && text.as_bytes()[remove_end] != b'\r'
+        {
+            remove_end += 1;
+        }
+        let mut replacement = text.to_owned();
+        replacement.replace_range(start..remove_end, "");
+        return Ok(replacement);
+    }
+
+    let before = &text[line_start..start];
+    let before_content = line_start + before.trim_end_matches([' ', '\t']).len();
+    let preceding = text[..before_content].chars().next_back();
+    let remove_start = match preceding {
+        Some(';') => before_content - 1,
+        Some('{') => start,
+        _ => {
+            return Err(AuthorError::new(
+                "unsafe-source-shape",
+                "compact presentation metadata has no adjacent KDL separator",
+            ));
+        }
+    };
+    let mut replacement = text.to_owned();
+    replacement.replace_range(remove_start..end, "");
+    Ok(replacement)
 }
 
 fn line_indent(text: &str, offset: usize) -> Option<String> {
@@ -783,6 +815,7 @@ fn atomic_replace_checked(
             .create_new(true)
             .mode(mode)
             .open(&temporary)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(replacement)?;
         file.sync_all()
     })();

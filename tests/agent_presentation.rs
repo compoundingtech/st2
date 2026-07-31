@@ -1,7 +1,8 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -129,8 +130,102 @@ fn cli_sets_replaces_and_clears_fields_without_changing_identity_or_other_bytes(
         .unwrap();
     assert!(cleared_roster.status.success());
     let rows: serde_json::Value = serde_json::from_slice(&cleared_roster.stdout).unwrap();
-    assert!(rows[0]["name"].is_null(), "retired sibling name file was consulted");
+    assert!(
+        rows[0]["name"].is_null(),
+        "retired sibling name file was consulted"
+    );
     assert!(rows[0]["description"].is_null());
+}
+
+#[test]
+fn cli_authors_positional_identity_without_an_existing_child_block() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(root, "h/worker/agent.kdl", "agent \"worker\"\n");
+
+    let output = run(
+        root,
+        "rename",
+        &["h.worker", "Owner", "--host", "h", "--json"],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        "agent \"worker\" { name \"Owner\" }\n"
+    );
+}
+
+#[test]
+fn cli_clears_a_presentation_field_from_compact_kdl() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/worker/agent.kdl",
+        "agent \"worker\" { host \"h\"; name \"Owner\"; command \"x\" }\n",
+    );
+
+    let output = run(
+        root,
+        "rename",
+        &["h.worker", "--clear", "--host", "h", "--json"],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let authored = fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap();
+    assert_eq!(authored, "agent \"worker\" { host \"h\"; command \"x\" }\n");
+    let found = st2::discover(root);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs[0].name, None);
+}
+
+#[test]
+fn cli_preserves_declaration_mode_under_a_restrictive_umask() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let path = root.join("h/worker/agent.kdl");
+    write(
+        root,
+        "h/worker/agent.kdl",
+        &declaration("worker", None, "catalog"),
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
+    process
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "rename",
+            "h.worker",
+            "Owner",
+            "--host",
+            "h",
+            "--json",
+        ])
+        .env_remove("ST_AGENT");
+    unsafe {
+        process.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let output = process.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o644);
 }
 
 #[test]
