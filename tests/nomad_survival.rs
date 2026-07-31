@@ -135,6 +135,29 @@ impl Fixture {
         std::fs::write(path, kdl).unwrap();
     }
 
+    fn write_color_env_agent(&self, identity: &str, explicit_no_color: bool) -> PathBuf {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}"));
+        let snapshot = self.catalog.join(format!("{identity}.color-env"));
+        let explicit_env = explicit_no_color
+            .then_some("  env { NO_COLOR \"1\" }\n")
+            .unwrap_or_default();
+        let kdl = format!(
+            r##"agent "{identity}" {{
+  identity "{identity}"
+  host "{HOST}"
+  type "service"
+{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') >> "$CATALOG/{identity}.color-env""#
+}}
+"##
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+        snapshot
+    }
+
     /// Write a PTY task that records every st2-managed environment value and its cwd on each boot.
     /// The append-only snapshot lets a test compare the initial launch with a manual `pty restart`.
     fn write_restart_env_agent(&self, identity: &str) -> PathBuf {
@@ -417,6 +440,22 @@ fn pty_gate(test: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+fn scope_gate(test: &str) -> bool {
+    let runtime_dir_valid =
+        std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|path| Path::new(&path).is_dir());
+    if runtime_dir_valid && st2::isolate::mode() == st2::isolate::Isolation::Scope {
+        return true;
+    }
+    assert!(
+        std::env::var_os("ST2_ALLOW_ISOLATION_SKIP").is_some(),
+        "{test}: a valid XDG_RUNTIME_DIR and systemd user scope are required. Set \
+         ST2_ALLOW_ISOLATION_SKIP=1 to skip on a host without them."
+    );
+    eprintln!("SKIP {test}: systemd user scope unavailable (ST2_ALLOW_ISOLATION_SKIP set)");
+    false
+}
+
 #[test]
 fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle() {
     if !pty_gate("pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle") {
@@ -492,6 +531,111 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
             "down did not stop {session_id}"
         );
     }
+}
+
+#[test]
+fn managed_agents_do_not_inherit_launcher_no_color_unless_declared() {
+    if !pty_gate("managed_agents_do_not_inherit_launcher_no_color_unless_declared") {
+        return;
+    }
+    assert_managed_agent_color_contract("portable");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_agent_color_contract_crosses_systemd_scope() {
+    let test = "managed_agent_color_contract_crosses_systemd_scope";
+    if !pty_gate(test) || !scope_gate(test) {
+        return;
+    }
+    assert_eq!(
+        st2::isolate::mode(),
+        st2::isolate::Isolation::Scope,
+        "the NO_COLOR integration must exercise systemd-run, not degraded pass-through"
+    );
+    assert_managed_agent_color_contract("scope");
+}
+
+fn assert_managed_agent_color_contract(suffix: &str) {
+    let fx = Fixture::new();
+    let ambient_identity = format!("ambient-color-{suffix}");
+    let explicit_identity = format!("explicit-color-{suffix}");
+    let ambient_snapshot = fx.write_color_env_agent(&ambient_identity, false);
+    let explicit_snapshot = fx.write_color_env_agent(&explicit_identity, true);
+
+    let out = fx
+        .st2()
+        .env("NO_COLOR", "1")
+        .arg("up")
+        .arg(&fx.catalog)
+        .args(["--host", HOST, "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "st2 up --once failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(poll_until(SPAWN_TIMEOUT, || {
+        ambient_snapshot.exists() && explicit_snapshot.exists()
+    }));
+
+    assert_eq!(
+        std::fs::read_to_string(&ambient_snapshot).unwrap(),
+        "unset\n",
+        "the reconciler's capture-only NO_COLOR must not disable agent color"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&explicit_snapshot).unwrap(),
+        "1\n",
+        "an explicit Agent Spec NO_COLOR must still reach the agent"
+    );
+
+    for (identity, snapshot) in [
+        (&ambient_identity, &ambient_snapshot),
+        (&explicit_identity, &explicit_snapshot),
+    ] {
+        let mut restarted = Command::new("pty")
+            .env("NO_COLOR", "1")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["restart", "-y", "--force", &format!("{HOST}.{identity}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let observed = poll_until(SPAWN_TIMEOUT, || {
+            std::fs::read_to_string(snapshot).is_ok_and(|contents| contents.lines().count() == 2)
+        });
+        let _ = restarted.kill();
+        let output = restarted.wait_with_output().unwrap();
+        assert!(
+            observed,
+            "`pty restart -y` did not produce a second snapshot for {identity}:\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        poll_until(SPAWN_TIMEOUT, || {
+            [&ambient_snapshot, &explicit_snapshot]
+                .iter()
+                .all(|snapshot| {
+                    std::fs::read_to_string(snapshot)
+                        .is_ok_and(|contents| contents.lines().count() == 2)
+                })
+        }),
+        "restarted agents did not record their second environment snapshot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ambient_snapshot).unwrap(),
+        "unset\nunset\n",
+        "the persisted removal must win over a restart caller's ambient NO_COLOR"
+    );
+    assert_eq!(
+        std::fs::read_to_string(explicit_snapshot).unwrap(),
+        "1\n1\n",
+        "the explicit Agent Spec assignment must win on restart"
+    );
 }
 
 #[test]
