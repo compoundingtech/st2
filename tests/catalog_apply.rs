@@ -149,6 +149,47 @@ fn wait_for(path: &Path) {
     }
 }
 
+fn assert_no_writer_temporaries(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    for entry in fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.starts_with(".agent.kdl.presentation-")
+                && !name.starts_with(".agent.kdl.publish-")
+                && !name.starts_with(".catalog-apply-file-"),
+            "writer temporary escaped into the declaration plane: {}",
+            path.display()
+        );
+        if path.is_dir() && name != ".st2" {
+            assert_no_writer_temporaries(&path);
+        }
+    }
+}
+
+fn write_test_marker(catalog: &Path, original_paths: &[&str]) {
+    fs::create_dir_all(catalog.join(".st2")).unwrap();
+    let hash = "0".repeat(64);
+    let mut original_paths = original_paths.to_vec();
+    original_paths.sort();
+    let marker = serde_json::json!({
+        "schema": "st2.catalog-apply-incomplete.v1",
+        "stageName": format!("catalog-apply-stage-{hash}"),
+        "expectedRootSha256": hash,
+        "preparedRootSha256": "0".repeat(64),
+        "originalPaths": original_paths,
+    });
+    fs::write(
+        catalog.join(".st2/catalog-apply-incomplete"),
+        serde_json::to_vec(&marker).unwrap(),
+    )
+    .unwrap();
+}
+
 fn send(catalog: &Path, recipient: &str, body: &str) -> Output {
     let mut child = st2()
         .args([
@@ -924,6 +965,7 @@ fn concurrent_control_creation_fsyncs_both_the_creator_and_racing_observer_paths
 fn crashes_recover_from_the_durable_stage_without_rechecking_partial_live_state() {
     for point in [
         "marker-created",
+        "leaf-staged",
         "mid-write",
         "before-verify",
         "before-clear",
@@ -938,6 +980,19 @@ fn crashes_recover_from_the_durable_stage_without_rechecking_partial_live_state(
             agent("worker", true),
         )
         .unwrap();
+        if point == "leaf-staged" {
+            fs::write(
+                agent_dir(&catalog, "worker").join(".agent.kdl.presentation-orphan"),
+                "stale",
+            )
+            .unwrap();
+            fs::create_dir_all(catalog.join("_templates")).unwrap();
+            fs::write(
+                catalog.join("_templates/.agent.kdl.publish-orphan"),
+                "stale",
+            )
+            .unwrap();
+        }
 
         let crashed = st2()
             .args([
@@ -982,7 +1037,245 @@ fn crashes_recover_from_the_durable_stage_without_rechecking_partial_live_state(
             fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
             agent("worker", true)
         );
+        assert_no_writer_temporaries(&catalog);
+        let verified = snapshot(&catalog, &temp.path().join("verified"));
+        assert_eq!(verified["rootSha256"], recovered["afterSha256"]);
     }
+}
+
+#[test]
+fn a_crash_before_new_identity_publication_resumes_from_control_plane_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    write_agent(&prepared, "new", false);
+
+    let crashed = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_CRASH_AT", "identity-staged")
+        .output()
+        .unwrap();
+    assert!(!crashed.status.success());
+    assert!(!agent_dir(&catalog, "new").exists());
+    assert!(catalog.join(".st2/catalog-apply-incomplete").is_file());
+    fs::remove_dir_all(&prepared).unwrap();
+
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(agent_dir(&catalog, "new").join("agent.kdl").is_file());
+    assert_no_writer_temporaries(&catalog);
+}
+
+#[test]
+fn apply_post_commit_generation_failure_is_fenced_and_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let failed = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_GENERATION_FAIL_AFTER_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert_eq!(
+        fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+        fs::read_to_string(prepared.join("agents/host/worker/agent.kdl")).unwrap()
+    );
+    assert!(catalog.join(".st2/catalog-apply-incomplete").is_file());
+    assert!(catalog.join(".st2/catalog-generation-incomplete").is_file());
+    assert!(!catalog.join(".st2/catalog-generation").exists());
+    let shared = st2()
+        .args(["agents", "--catalog", catalog.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(!shared.status.success());
+
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(catalog.join(".st2/catalog-generation")).unwrap(),
+        "2\n"
+    );
+    assert!(!catalog.join(".st2/catalog-generation-incomplete").exists());
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+}
+
+#[test]
+fn control_directory_swap_cannot_redirect_apply_leaf_or_identity_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/old/agent.kdl"),
+        agent("old", true),
+    )
+    .unwrap();
+    write_agent(&prepared, "new", false);
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let apply = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_CATALOG_LOCK_HELD_READY", &ready)
+        .env("ST2_TEST_CATALOG_LOCK_HELD_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&ready);
+    let retained = temp.path().join("retained-control");
+    fs::rename(catalog.join(".st2"), &retained).unwrap();
+    let outside = temp.path().join("outside-control");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, catalog.join(".st2")).unwrap();
+    fs::write(&release, "").unwrap();
+    let apply = apply.wait_with_output().unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent_dir(&catalog, "old").join("agent.kdl")).unwrap(),
+        fs::read_to_string(prepared.join("agents/host/old/agent.kdl")).unwrap()
+    );
+    assert!(agent_dir(&catalog, "new").join("agent.kdl").is_file());
+    assert!(outside.read_dir().unwrap().next().is_none());
+    assert!(retained.join("catalog-generation").is_file());
+    assert!(!retained.join("catalog-apply-incomplete").exists());
+}
+
+#[test]
+fn cross_device_leaf_publication_fails_closed_and_remains_source_free_resumable() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let failed = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_EXDEV_AT", "leaf-staged")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("must share one filesystem"),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(catalog.join(".st2/catalog-apply-incomplete").is_file());
+    assert_eq!(
+        fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+        agent("worker", false)
+    );
+    fs::remove_dir_all(&prepared).unwrap();
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+        agent("worker", true)
+    );
+}
+
+#[test]
+fn cross_device_identity_publication_fails_closed_and_remains_source_free_resumable() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    write_agent(&prepared, "new", false);
+    let failed = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_EXDEV_AT", "identity-staged")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("must share one filesystem"));
+    assert!(catalog.join(".st2/catalog-apply-incomplete").is_file());
+    assert!(!agent_dir(&catalog, "new").exists());
+    fs::remove_dir_all(&prepared).unwrap();
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(agent_dir(&catalog, "new").join("agent.kdl").is_file());
 }
 
 #[test]
@@ -1290,8 +1583,14 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
     ] {
         fs::create_dir_all(dotted.join(path)).unwrap();
     }
-    fs::create_dir_all(dotted.join(".st2")).unwrap();
-    fs::write(dotted.join(".st2/catalog-apply-incomplete"), "{}").unwrap();
+    write_test_marker(
+        &dotted,
+        &[
+            "agents/a/b.c/agent.kdl",
+            "agents/a.b/c/agent.kdl",
+            "agents/a.b/only/agent.kdl",
+        ],
+    );
     let ambiguous_qualified = send(&dotted, "a.b.c", "ambiguous qualified");
     assert!(!ambiguous_qualified.status.success());
     let dotted_host = send(&dotted, "a.b.only", "dotted host");
@@ -1348,6 +1647,26 @@ fn state_remains_addressable_after_its_spec_is_deleted_mid_apply() {
             .is_some()
     );
     assert!(!catalog.join("host.old").exists());
+    let filename = String::from_utf8(sent.stdout).unwrap();
+    let thread = st2()
+        .args([
+            "message",
+            "thread",
+            filename.trim(),
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--host",
+            "host",
+            "--tree",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        thread.status.success(),
+        "{}",
+        String::from_utf8_lossy(&thread.stderr)
+    );
+    assert!(String::from_utf8_lossy(&thread.stdout).contains(filename.trim()));
 
     fs::write(&release, "").unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1355,6 +1674,392 @@ fn state_remains_addressable_after_its_spec_is_deleted_mid_apply() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn marker_time_message_write_remains_bound_to_its_retained_agent_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    fs::create_dir_all(agent_dir(&catalog, "old").join("resources/inbox")).unwrap();
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/old/agent.kdl"),
+        agent("old", true),
+    )
+    .unwrap();
+    let apply_ready = temp.path().join("apply-ready");
+    let apply_release = temp.path().join("apply-release");
+    let apply_child = paused_apply(
+        &catalog,
+        &prepared,
+        before["rootSha256"].as_str().unwrap(),
+        "marker-created",
+        &apply_ready,
+        &apply_release,
+    );
+    wait_for(&apply_ready);
+
+    let message_ready = temp.path().join("message-ready");
+    let message_release = temp.path().join("message-release");
+    let message = st2()
+        .args([
+            "message",
+            "send",
+            "host.old",
+            "--message",
+            "capability-bound",
+            "--as",
+            "host.sender",
+            "--host",
+            "host",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ])
+        .env("ST2_TEST_MESSAGE_CAPABILITY_READY", &message_ready)
+        .env("ST2_TEST_MESSAGE_CAPABILITY_RELEASE", &message_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&message_ready);
+    let retained_host = temp.path().join("retained-host");
+    fs::rename(catalog.join("agents/host"), &retained_host).unwrap();
+    let outside = temp.path().join("outside-host");
+    fs::create_dir_all(outside.join("old/resources/inbox")).unwrap();
+    std::os::unix::fs::symlink(&outside, catalog.join("agents/host")).unwrap();
+    fs::write(&message_release, "").unwrap();
+    let message = message.wait_with_output().unwrap();
+    assert!(
+        message.status.success(),
+        "{}",
+        String::from_utf8_lossy(&message.stderr)
+    );
+    assert!(
+        retained_host
+            .join("old/resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        outside
+            .join("old/resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    fs::remove_file(catalog.join("agents/host")).unwrap();
+    fs::rename(&retained_host, catalog.join("agents/host")).unwrap();
+    fs::write(&apply_release, "").unwrap();
+    let applied = apply_child.wait_with_output().unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+}
+
+#[test]
+fn marker_time_status_write_remains_bound_to_its_retained_agent_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/old/agent.kdl"),
+        agent("old", true),
+    )
+    .unwrap();
+    let apply_ready = temp.path().join("apply-ready");
+    let apply_release = temp.path().join("apply-release");
+    let apply_child = paused_apply(
+        &catalog,
+        &prepared,
+        before["rootSha256"].as_str().unwrap(),
+        "marker-created",
+        &apply_ready,
+        &apply_release,
+    );
+    wait_for(&apply_ready);
+
+    let state_ready = temp.path().join("state-ready");
+    let state_release = temp.path().join("state-release");
+    let state = st2()
+        .args([
+            "status",
+            "host.old",
+            "--set",
+            "busy",
+            "--host",
+            "host",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ])
+        .env("ST2_TEST_MESSAGE_CAPABILITY_READY", &state_ready)
+        .env("ST2_TEST_MESSAGE_CAPABILITY_RELEASE", &state_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&state_ready);
+    let retained_host = temp.path().join("retained-host");
+    fs::rename(catalog.join("agents/host"), &retained_host).unwrap();
+    let outside = temp.path().join("outside-host");
+    fs::create_dir_all(outside.join("old")).unwrap();
+    std::os::unix::fs::symlink(&outside, catalog.join("agents/host")).unwrap();
+    fs::write(&state_release, "").unwrap();
+    let state = state.wait_with_output().unwrap();
+    assert!(
+        state.status.success(),
+        "{}",
+        String::from_utf8_lossy(&state.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(retained_host.join("old/status")).unwrap(),
+        "busy\n"
+    );
+    assert!(!outside.join("old/status").exists());
+    fs::remove_file(catalog.join("agents/host")).unwrap();
+    fs::rename(&retained_host, catalog.join("agents/host")).unwrap();
+    fs::write(&apply_release, "").unwrap();
+    let applied = apply_child.wait_with_output().unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+}
+
+#[test]
+fn marker_time_context_and_resource_writes_reject_a_swapped_state_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    fs::create_dir_all(agent_dir(&catalog, "old").join("resources")).unwrap();
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/old/agent.kdl"),
+        agent("old", true),
+    )
+    .unwrap();
+    let apply_ready = temp.path().join("apply-ready");
+    let apply_release = temp.path().join("apply-release");
+    let apply_child = paused_apply(
+        &catalog,
+        &prepared,
+        before["rootSha256"].as_str().unwrap(),
+        "marker-created",
+        &apply_ready,
+        &apply_release,
+    );
+    wait_for(&apply_ready);
+
+    for (name, args, input) in [
+        (
+            "context",
+            vec![
+                "context",
+                "write",
+                "host.old",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--host",
+                "host",
+            ],
+            "must-not-land",
+        ),
+        (
+            "resource",
+            vec![
+                "resource",
+                "add",
+                "https://example.test/must-not-land",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--as",
+                "host.old",
+                "--host",
+                "host",
+            ],
+            "",
+        ),
+    ] {
+        let ready = temp.path().join(format!("{name}-ready"));
+        let release = temp.path().join(format!("{name}-release"));
+        let mut child = st2()
+            .args(args)
+            .env("ST2_TEST_MESSAGE_CAPABILITY_READY", &ready)
+            .env("ST2_TEST_MESSAGE_CAPABILITY_RELEASE", &release)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        wait_for(&ready);
+        let resources = agent_dir(&catalog, "old").join("resources");
+        let retained = temp.path().join(format!("{name}-retained-resources"));
+        fs::rename(&resources, &retained).unwrap();
+        let outside = temp.path().join(format!("{name}-outside"));
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &resources).unwrap();
+        fs::write(&release, "").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(outside.read_dir().unwrap().next().is_none());
+        fs::remove_file(&resources).unwrap();
+        fs::rename(retained, resources).unwrap();
+    }
+
+    fs::write(&apply_release, "").unwrap();
+    let applied = apply_child.wait_with_output().unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+}
+
+#[test]
+fn completed_apply_between_address_fence_reads_cannot_accept_a_stale_recipient() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "old", false);
+    fs::create_dir_all(agent_dir(&catalog, "old").join("resources/inbox")).unwrap();
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::remove_dir_all(prepared.join("agents")).unwrap();
+    let ready = temp.path().join("fence-ready");
+    let release = temp.path().join("fence-release");
+    let message = st2()
+        .args([
+            "message",
+            "send",
+            "host.old",
+            "--message",
+            "must-not-land",
+            "--as",
+            "host.sender",
+            "--host",
+            "host",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ])
+        .env("ST2_TEST_ADDRESS_FENCE_READY", &ready)
+        .env("ST2_TEST_ADDRESS_FENCE_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&ready);
+    let applied = apply(&catalog, &prepared, before["rootSha256"].as_str().unwrap());
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    fs::write(&release, "").unwrap();
+    let message = message.wait_with_output().unwrap();
+    assert!(!message.status.success());
+    assert!(
+        agent_dir(&catalog, "old")
+            .join("resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(!catalog.join("host.old").exists());
+}
+
+#[test]
+fn task_inventory_fails_closed_without_observing_runtime_during_a_partial_apply() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "a", false);
+    write_agent(&catalog, "b", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(prepared.join("agents/host/a/agent.kdl"), agent("a", true)).unwrap();
+    fs::write(prepared.join("agents/host/b/agent.kdl"), agent("b", true)).unwrap();
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let child = paused_apply(
+        &catalog,
+        &prepared,
+        before["rootSha256"].as_str().unwrap(),
+        "mid-write",
+        &ready,
+        &release,
+    );
+    wait_for(&ready);
+    let changed = ["a", "b"]
+        .iter()
+        .filter(|identity| {
+            fs::read_to_string(agent_dir(&catalog, identity).join("agent.kdl"))
+                .unwrap()
+                .contains("retired #true")
+        })
+        .count();
+    assert_eq!(changed, 1, "fixture must expose a stable partial catalog");
+
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let sentinel = temp.path().join("runtime-observed");
+    let pty = bin.join("pty");
+    fs::write(
+        &pty,
+        format!("#!/bin/sh\n: > {:?}\nprintf '[]\\n'\n", sentinel),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&pty).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt as _;
+    permissions.set_mode(0o755);
+    fs::set_permissions(&pty, permissions).unwrap();
+    let tasks = st2()
+        .args([
+            "tasks",
+            "--host",
+            "host",
+            "--json",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(!tasks.status.success());
+    let inventory: Value = serde_json::from_slice(&tasks.stdout).unwrap();
+    assert_eq!(inventory["complete"], false);
+    assert!(inventory["tasks"].as_array().unwrap().is_empty());
+    assert!(inventory["errors"].as_array().unwrap().iter().any(|error| {
+        error
+            .as_str()
+            .is_some_and(|error| error.contains("apply is incomplete"))
+    }));
+    assert!(
+        !sentinel.exists(),
+        "runtime observer ran inside the fenced view"
+    );
+
+    fs::write(&release, "").unwrap();
+    let applied = child.wait_with_output().unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
     );
 }
 

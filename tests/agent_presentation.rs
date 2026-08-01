@@ -3,10 +3,11 @@ use std::fs::OpenOptions;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn write(root: &Path, relative: &str, contents: &str) {
     let path = root.join(relative);
@@ -33,6 +34,18 @@ fn run(root: &Path, command: &str, args: &[&str], actor: Option<&str>) -> std::p
         process.env("ST_AGENT", actor);
     }
     process.output().unwrap()
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -419,6 +432,7 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
     let inode = fs::metadata(&lock_path).unwrap().ino();
 
+    let rename_attempt = temporary.path().join("rename-lock-attempt");
     let mut rename = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
@@ -430,13 +444,14 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
             "h",
             "--json",
         ])
+        .env("ST2_TEST_CATALOG_LOCK_ATTEMPT", &rename_attempt)
         .env_remove("ST_AGENT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(50));
+    wait_for_path(&rename_attempt);
     assert!(rename.try_wait().unwrap().is_none());
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     let output = rename.wait_with_output().unwrap();
@@ -453,6 +468,7 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
     ))
     .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let publish_attempt = temporary.path().join("publish-lock-attempt");
     let mut publish = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args([
             "agent",
@@ -466,12 +482,13 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
             "--expect-absent",
             "--json",
         ])
+        .env("ST2_TEST_CATALOG_LOCK_ATTEMPT", &publish_attempt)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(50));
+    wait_for_path(&publish_attempt);
     assert!(publish.try_wait().unwrap().is_none());
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     let output = publish.wait_with_output().unwrap();
@@ -515,6 +532,170 @@ fn catalog_lock_refuses_a_symlinked_control_directory() {
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["code"], "catalog-lock-failed");
     assert!(!outside.join("catalog-authoring.lock").exists());
+}
+
+#[test]
+fn presentation_crash_stages_only_in_the_control_plane() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("catalog");
+    let original = declaration("worker", None, "catalog");
+    write(&root, "agents/h/worker/agent.kdl", &original);
+    let crashed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "rename",
+            "h.worker",
+            "Build owner",
+            "--host",
+            "h",
+        ])
+        .env_remove("ST_AGENT")
+        .env("ST2_TEST_AGENT_AUTHOR_CRASH_AFTER_TEMP", "1")
+        .output()
+        .unwrap();
+    assert!(!crashed.status.success());
+    assert_eq!(
+        crashed.status.signal(),
+        Some(libc::SIGABRT),
+        "status {:?}, stderr {}",
+        crashed.status,
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("agents/h/worker/agent.kdl")).unwrap(),
+        original
+    );
+    assert!(!root.join(".st2/catalog-generation").exists());
+    assert!(
+        fs::read_dir(root.join("agents/h/worker"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("agent-presentation-"))
+    );
+    let retry = run(
+        &root,
+        "rename",
+        &["h.worker", "Build owner", "--host", "h", "--json"],
+        None,
+    );
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".st2/catalog-generation")).unwrap(),
+        "1\n"
+    );
+}
+
+#[test]
+fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("catalog");
+    write(
+        &root,
+        "agents/h/worker/agent.kdl",
+        &declaration("worker", None, "catalog"),
+    );
+    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "rename",
+            "h.worker",
+            "Build owner",
+            "--host",
+            "h",
+        ])
+        .env_remove("ST_AGENT")
+        .env("ST2_TEST_GENERATION_FAIL_AFTER_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        fs::read_to_string(root.join("agents/h/worker/agent.kdl"))
+            .unwrap()
+            .contains("name \"Build owner\"")
+    );
+    assert!(root.join(".st2/catalog-generation-incomplete").is_file());
+    assert!(!root.join(".st2/catalog-generation").exists());
+    let shared = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["agents", "--catalog", root.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(!shared.status.success());
+
+    let recovered = run(
+        &root,
+        "rename",
+        &["h.worker", "Build owner", "--host", "h", "--json"],
+        None,
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".st2/catalog-generation")).unwrap(),
+        "1\n"
+    );
+    assert!(!root.join(".st2/catalog-generation-incomplete").exists());
+}
+
+#[test]
+fn control_directory_swap_cannot_redirect_presentation_staging() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("catalog");
+    write(
+        &root,
+        "agents/h/worker/agent.kdl",
+        &declaration("worker", None, "catalog"),
+    );
+    let ready = temporary.path().join("ready");
+    let release = temporary.path().join("release");
+    let writer = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            root.to_str().unwrap(),
+            "rename",
+            "h.worker",
+            "Build owner",
+            "--host",
+            "h",
+        ])
+        .env_remove("ST_AGENT")
+        .env("ST2_TEST_CATALOG_LOCK_HELD_READY", &ready)
+        .env("ST2_TEST_CATALOG_LOCK_HELD_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_path(&ready);
+    let retained = temporary.path().join("retained-control");
+    fs::rename(root.join(".st2"), &retained).unwrap();
+    let outside = temporary.path().join("outside-control");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(".st2")).unwrap();
+    fs::write(&release, "").unwrap();
+    let writer = writer.wait_with_output().unwrap();
+    assert!(
+        writer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(
+        fs::read_to_string(root.join("agents/h/worker/agent.kdl"))
+            .unwrap()
+            .contains("name \"Build owner\"")
+    );
+    assert!(outside.read_dir().unwrap().next().is_none());
+    assert!(retained.join("catalog-generation").is_file());
 }
 
 #[test]

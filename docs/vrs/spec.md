@@ -95,8 +95,9 @@ st2 neither reads, writes, migrates, nor interprets it.
 3. refuses declarations explicitly marked `meta { managed-by "nix" }`,
    unsupported formats, malformed catalogs, and ambiguous targets;
 4. applies one span-bounded edit, reparses and validates the candidate;
-5. fsyncs a same-directory temporary, rechecks the original inode/version and
-   bytes, atomically renames it, then fsyncs the declaration directory.
+5. fsyncs a temporary under the reserved `.st2` control plane, rechecks the
+   original inode/version and bytes, atomically renames it through retained
+   no-follow directory capabilities, then fsyncs the declaration directory.
 
 `ST_AGENT` is a runner-provided convention in this trusted single-operator fleet,
 not an authenticated capability: a same-UID caller can alter or remove it, and
@@ -173,6 +174,20 @@ reader (SH)     : discover -> materialize/observe -> plan -> execute
 bulk apply (EX) : root CAS -> durable stage+marker -> converge -> verify+clear
 state plane     : message | context | Resource | status                    (unlocked)
 ```
+
+Every publication temporary, including a not-yet-visible identity bundle, is
+staged under `.st2`. Cross-directory rename therefore stays on the catalog
+filesystem while a crash can leave debris only in the non-projected control
+plane; declaration directories never contain writer-private leaves.
+
+Before a declaration writer mutates the live projection it durably creates
+`.st2/catalog-generation-incomplete`. Shared declaration readers and read fences
+fail closed while this intent exists. After the declaration and its parent are
+durable, the writer advances and fsyncs `catalog-generation`, then clears and
+fsyncs the intent. The next exclusive writer recovers an orphan intent by
+conservatively advancing the generation before clearing it. A crash after the
+advance but before intent removal may therefore skip a generation on recovery;
+the contract is monotonic change detection, not an exactly-once counter.
 
 The lock file is a persistent real inode: replacing or removing it would split
 the lock domain for a process that already has it open. Consequently, the first
@@ -257,9 +272,14 @@ exists. One-shot and selected reconcile fail explicitly. A resident supervisor
 instead remains alive, reports a skipped/incomplete pass, and performs no
 runtime observation or lifecycle action, avoiding a service restart storm.
 Message, context, Resource, and status operations remain available. While the
-marker exists they resolve canonical state independently of live declaration
-discovery; an existing state-only orphan remains addressable, an incomplete new
-identity does not fall back to a flat bus. A dotted bare identity is tried as
+marker exists they resolve canonical state from a validated address book: the
+marker's original canonical agent keys union currently published real specs.
+State-only directories are addressable only for original keys with recognized
+real state; an incomplete or arbitrary new identity does not fall back to a
+flat bus. Every host, identity, and message-box path is opened component by
+component without following symlinks, and state mutations remain relative to
+those retained capabilities.
+A dotted bare identity is tried as
 the complete local identity alongside every possible qualified bus-address
 split; exactly one distinct canonical address must exist. Only real state
 directories and a real regular status file can establish marker-time
@@ -367,9 +387,13 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   time, and opaque generation id derived from stable backend evidence.
 
   Discovery runs before and after runtime observation. A semantic declaration
-  change across those passes makes the result incomplete. This detects
-  observed drift but does not serialize catalog writers or claim a
-  transactional snapshot. A runtime root positively absent at admission is
+  change across those passes makes the result incomplete. The reader also
+  samples `<catalog>/.st2/catalog-generation` and the incomplete marker around
+  discovery and runtime observation. Every successful declaration writer
+  advances and fsyncs that monotonic generation after its durable commit; apply
+  does so after live verification and before clearing its marker. Even a
+  completed declaration ABA is therefore incomplete. This remains an observational
+  seqlock and does not serialize catalog writers. A runtime root positively absent at admission is
   empty and is not passed to its backend. An admitted PTY root that is removed
   or replaced during `pty list` is indeterminate; because the external backend
   creates an absent registry, concurrent root deletion is not a zero-write

@@ -144,6 +144,13 @@ accepted.
   A durable incomplete-apply marker fences every declaration-plane snapshot and
   action after a crashed whole-catalog apply; a resident supervisor stays alive
   but performs zero lifecycle actions until the transaction is completed.
+  Every successful declaration commit advances a durable monotonic catalog
+  generation; whole-catalog apply advances it before its marker clears. Unlocked
+  diagnostic readers therefore detect even a completed declaration ABA across
+  their observation. A durable incomplete-generation intent fences readers
+  across each single-writer commit and is conservatively recovered by the next
+  exclusive writer. Writer staging exists only in the reserved control plane,
+  never among authoritative declaration leaves.
   Presence, messages, context, and Resource state remain independently writable
   and are never serialized behind catalog authoring.
   A caller binds single-agent publication to the exact no-follow source capture
@@ -175,6 +182,9 @@ accepted.
   incomplete; the external backend may already have recreated a concurrently
   removed registry. This diagnostic boundary is not transactionally serialized
   with catalog or runtime writers and is not control-plane cutover authority.
+  It samples the durable catalog generation and incomplete marker around
+  discovery and runtime observation; any marker, malformed fence, or generation
+  change makes the envelope incomplete.
 - **R24 Stable identity and bounded presentation:** The positional Agent Spec
   identity and its host-qualified bus identity remain the sole stable keys for
   routing, ownership, adoption, lifecycle, and automation. Agent Specs may

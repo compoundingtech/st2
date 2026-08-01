@@ -11,8 +11,8 @@
 //! This module is location-agnostic: it operates on an inbox/agent directory a caller resolves (from
 //! the catalog for VRS-native, or `$ST_ROOT` for a compat shim).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -330,7 +330,10 @@ impl ExternalInbox {
         let mut components = Path::new(identity).components();
         let safe = matches!(components.next(), Some(Component::Normal(component)) if component == identity)
             && components.next().is_none();
-        anyhow::ensure!(safe, "external requester identity must be one non-empty relative path component");
+        anyhow::ensure!(
+            safe,
+            "external requester identity must be one non-empty relative path component"
+        );
         Ok(Self {
             root: root.to_path_buf(),
             identity: identity.to_owned(),
@@ -367,9 +370,7 @@ pub fn resolve_inbox_with_external(
         Ok(inbox) => Ok(inbox),
         Err(error) => match external {
             Some(external)
-                if external.root == root
-                    && external.identity == id
-                    && external.inbox.is_dir() =>
+                if external.root == root && external.identity == id && external.inbox.is_dir() =>
             {
                 Ok(external.inbox.clone())
             }
@@ -403,7 +404,7 @@ pub fn resolve_list_box(
         return Ok(flat());
     }
     if apply_incomplete(root) {
-        return resolve_agent_dir(root, id, host)
+        return resolve_agent_dir(root, id, host)?
             .map(|agent_dir| {
                 if archive {
                     archive_dir(&agent_dir)
@@ -437,72 +438,282 @@ pub fn resolve_list_box(
 
 /// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
 /// catalog, via content discovery. Returns `None` if no agent matches.
-pub fn resolve_agent_dir(catalog_root: &Path, recipient: &str, this_host: &str) -> Option<PathBuf> {
-    if apply_incomplete(catalog_root) {
-        let mut candidates = BTreeSet::new();
-        candidates.extend(marker_agent_dir(catalog_root, this_host, recipient));
-        for (index, _) in recipient.match_indices('.') {
-            let (host, identity) = recipient.split_at(index);
-            candidates.extend(marker_agent_dir(catalog_root, host, &identity[1..]));
+pub fn resolve_agent_dir(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    Ok(resolve_agent_handle(catalog_root, recipient, this_host)?.map(|agent| agent.path))
+}
+
+pub fn with_resolved_agent_dir<T>(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_resolved_state_dir(catalog_root, identity, this_host, &[], true, operation)
+}
+
+pub fn with_resolved_state_dir<T>(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    components: &[&str],
+    create: bool,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match resolve_agent_handle(catalog_root, identity, this_host)? {
+        Some(agent) => {
+            test_capability_checkpoint();
+            let path = match agent.capability.as_ref() {
+                Some(capability) if components.is_empty() => {
+                    crate::catalog_transaction::retained_dir_path(capability)?
+                }
+                Some(capability) => {
+                    let directory = open_message_box(capability, components, create)?
+                        .context("resolved state directory does not exist")?;
+                    let path = crate::catalog_transaction::retained_dir_path(&directory)?;
+                    return operation(&path);
+                }
+                None => components
+                    .iter()
+                    .fold(agent.path, |path, component| path.join(component)),
+            };
+            operation(&path)
         }
-        // Dots are valid in both host and hierarchical identity names, so every split point is a
-        // possible qualified address. Never guess when more than one canonical path is live.
-        return (candidates.len() == 1)
-            .then(|| candidates.into_iter().next())
-            .flatten();
+        None => {
+            let discovered = crate::discover(catalog_root);
+            anyhow::ensure!(
+                crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                    && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
+                    && discovered.specs.is_empty()
+                    && discovered.errors.is_empty(),
+                "no agent '{identity}' found in catalog {}",
+                catalog_root.display()
+            );
+            operation(
+                &components
+                    .iter()
+                    .fold(catalog_root.join(identity), |path, component| {
+                        path.join(component)
+                    }),
+            )
+        }
     }
-    let found = crate::discover(catalog_root);
-    found
-        .specs
-        .into_iter()
-        .find(|s| s.bus_id(this_host) == recipient || s.identity == recipient)
-        .and_then(|s| s.path.parent().map(Path::to_path_buf))
 }
 
-fn marker_agent_dir(catalog_root: &Path, host: &str, identity: &str) -> Option<PathBuf> {
-    if !safe_component(host) || !safe_component(identity) {
-        return None;
+fn resolve_agent_handle(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+) -> anyhow::Result<Option<AddressableAgent>> {
+    for _ in 0..3 {
+        let before = address_fence(catalog_root)?;
+        let mut candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?
+            .into_iter()
+            .filter(|candidate| candidate.bus_id == recipient || candidate.identity == recipient)
+            .collect::<Vec<_>>();
+        let after = address_fence(catalog_root)?;
+        if before != after {
+            continue;
+        }
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        candidates.dedup_by(|left, right| left.path == right.path);
+        return Ok((candidates.len() == 1).then(|| candidates.remove(0)));
     }
-    let candidate = catalog_root.join("agents").join(host).join(identity);
-    let metadata = fs::symlink_metadata(&candidate).ok()?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let complete_spec = fs::symlink_metadata(candidate.join("agent.kdl"))
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
-    let existing_state = marker_state_exists(&candidate)?;
-    (complete_spec || existing_state).then_some(candidate)
+    anyhow::bail!("catalog address book changed repeatedly while resolving {recipient:?}")
 }
 
-fn marker_state_exists(agent_dir: &Path) -> Option<bool> {
+fn address_fence(
+    catalog_root: &Path,
+) -> anyhow::Result<(
+    Option<u64>,
+    Option<crate::catalog_transaction::CatalogTransition>,
+)> {
+    let first_generation = crate::catalog_lock::read_generation_token(catalog_root)?;
+    let transition = crate::catalog_transaction::catalog_transition(catalog_root)?;
+    test_address_fence_checkpoint();
+    let second_generation = crate::catalog_lock::read_generation_token(catalog_root)?;
+    anyhow::ensure!(
+        first_generation == second_generation,
+        "catalog address book changed while sampling its transition fence"
+    );
+    Ok((second_generation, transition))
+}
+
+#[cfg(debug_assertions)]
+fn test_address_fence_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_ADDRESS_FENCE_READY"),
+        std::env::var("ST2_TEST_ADDRESS_FENCE_RELEASE"),
+    ) else {
+        return;
+    };
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ready)
+        .is_err()
+    {
+        return;
+    }
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_address_fence_checkpoint() {}
+
+#[derive(Debug)]
+struct AddressableAgent {
+    bus_id: String,
+    identity: String,
+    path: PathBuf,
+    capability: Option<File>,
+}
+
+fn addressable_agent_dirs(
+    catalog_root: &Path,
+    this_host: &str,
+    transition: Option<&crate::catalog_transaction::CatalogTransition>,
+) -> anyhow::Result<Vec<AddressableAgent>> {
+    let Some(transition) = transition else {
+        return crate::discover(catalog_root)
+            .specs
+            .into_iter()
+            .map(|spec| {
+                let path = spec
+                    .path
+                    .parent()
+                    .context("Agent Spec has no identity directory")?
+                    .to_path_buf();
+                let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
+                Ok(AddressableAgent {
+                    bus_id: spec.bus_id(this_host),
+                    identity: spec.identity,
+                    path,
+                    capability: Some(capability),
+                })
+            })
+            .collect();
+    };
+    let agents = catalog_root.join("agents");
+    let metadata = match fs::symlink_metadata(&agents) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "canonical agents path is not a real directory: {}",
+        agents.display()
+    );
+    let mut result = Vec::new();
+    for host in sorted_real_entries(&agents, "host")? {
+        let host_name = safe_entry_name(&host, "host")?;
+        for identity in sorted_real_entries(&host.path(), "identity")? {
+            let identity_name = safe_entry_name(&identity, "identity")?;
+            let key = crate::catalog_transaction::AgentKey {
+                host: host_name.clone(),
+                identity: identity_name.clone(),
+            };
+            let path = identity.path();
+            let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
+            let retained = crate::catalog_transaction::retained_dir_path(&capability)?;
+            let current_spec = marker_spec_matches(&retained, &key)?;
+            let retained_state =
+                transition.original_agents.contains(&key) && marker_state_exists(&retained)?;
+            if current_spec || retained_state {
+                result.push(AddressableAgent {
+                    bus_id: format!("{}.{}", key.host, key.identity),
+                    identity: key.identity,
+                    path,
+                    capability: Some(capability),
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn sorted_real_entries(dir: &Path, label: &str) -> anyhow::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in &entries {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "canonical {label} path is not a real directory: {}",
+            entry.path().display()
+        );
+    }
+    Ok(entries)
+}
+
+fn safe_entry_name(entry: &fs::DirEntry, label: &str) -> anyhow::Result<String> {
+    let value = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("canonical {label} is not UTF-8"))?;
+    anyhow::ensure!(safe_component(&value), "unsafe canonical {label} {value:?}");
+    Ok(value)
+}
+
+fn marker_spec_matches(
+    agent_dir: &Path,
+    key: &crate::catalog_transaction::AgentKey,
+) -> anyhow::Result<bool> {
+    let path = agent_dir.join("agent.kdl");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "canonical Agent Spec is not a real regular file: {}",
+        path.display()
+    );
+    let declared = crate::discovery::parse_declared(&path)?;
+    Ok(declared.len() == 1
+        && declared[0].host.as_deref() == Some(&key.host)
+        && declared[0].identity.as_deref() == Some(key.identity.as_str()))
+}
+
+fn marker_state_exists(agent_dir: &Path) -> anyhow::Result<bool> {
     let mut found = false;
     for name in ["resources", "archive", "inbox"] {
         let path = agent_dir.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => found = true,
-            Ok(_) => return None,
+            Ok(_) => anyhow::bail!(
+                "agent state path is not a real directory: {}",
+                path.display()
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
+            Err(error) => return Err(error.into()),
         }
     }
     match fs::symlink_metadata(agent_dir.join("status")) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => found = true,
-        Ok(_) => return None,
+        Ok(_) => anyhow::bail!("agent status is not a real regular file"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
+        Err(error) => return Err(error.into()),
     }
     let resources = agent_dir.join("resources");
     if resources.is_dir() {
         for relative in ["inbox", "archive", "context", "context/decisions", "links"] {
             match fs::symlink_metadata(resources.join(relative)) {
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Ok(_) => return None,
+                Ok(_) => anyhow::bail!("agent resource path is not a real directory"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return None,
+                Err(error) => return Err(error.into()),
             }
         }
     }
-    Some(found)
+    Ok(found)
 }
 
 fn apply_incomplete(root: &Path) -> bool {
@@ -543,22 +754,32 @@ pub struct ThreadEntry {
 /// lives in BOTH agents' boxes, so scan every agent's inbox+archive). Returns the thread in reply-tree
 /// pre-order with depth; the root's `in-reply-to` chain is walked up first. Empty if `filename` isn't
 /// found. Cycles/dangling `in-reply-to` are handled defensively.
-pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
+pub fn collect_thread(catalog_root: &Path, filename: &str) -> anyhow::Result<Vec<ThreadEntry>> {
     // Gather every message once (dedup by filename — the same file can appear in two boxes).
-    let found = crate::discover(catalog_root);
     let mut all: HashMap<String, Message> = HashMap::new();
-    for spec in &found.specs {
-        let Some(dir) = spec.path.parent() else {
-            continue;
-        };
-        for d in [inbox_dir(dir), archive_dir(dir)] {
-            for m in list_dir(&d).unwrap_or_default() {
-                all.entry(m.filename.clone()).or_insert(m);
+    let transition = crate::catalog_transaction::catalog_transition(catalog_root)?;
+    for agent in addressable_agent_dirs(catalog_root, "", transition.as_ref())? {
+        if let Some(capability) = agent.capability.as_ref() {
+            for components in [&["resources", "inbox"][..], &["resources", "archive"][..]] {
+                let Some(dir) = open_message_box(capability, components, false)? else {
+                    continue;
+                };
+                for message in list_dir(&crate::catalog_transaction::retained_dir_path(&dir)?)
+                    .unwrap_or_default()
+                {
+                    all.entry(message.filename.clone()).or_insert(message);
+                }
+            }
+        } else {
+            for dir in [inbox_dir(&agent.path), archive_dir(&agent.path)] {
+                for message in list_dir(&dir).unwrap_or_default() {
+                    all.entry(message.filename.clone()).or_insert(message);
+                }
             }
         }
     }
     if !all.contains_key(filename) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Walk up `in-reply-to` to the thread root.
@@ -608,7 +829,165 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
             }
         }
     }
-    out
+    Ok(out)
+}
+
+pub fn send_to_resolved_inbox(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+) -> anyhow::Result<String> {
+    let agent = match resolve_agent_handle(catalog_root, recipient, this_host)? {
+        Some(agent) => agent,
+        None => {
+            let discovered = crate::discover(catalog_root);
+            if crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
+                && discovered.specs.is_empty()
+                && discovered.errors.is_empty()
+            {
+                return send_to_inbox(
+                    &catalog_root.join(recipient).join("inbox"),
+                    from,
+                    subject,
+                    in_reply_to,
+                    tags,
+                    body,
+                );
+            }
+            anyhow::bail!(
+                "no agent '{recipient}' found in catalog {}",
+                catalog_root.display()
+            )
+        }
+    };
+    test_capability_checkpoint();
+    if let Some(capability) = agent.capability.as_ref() {
+        let inbox = open_message_box(capability, &["resources", "inbox"], true)?
+            .context("created inbox capability is missing")?;
+        send_to_inbox(
+            &crate::catalog_transaction::retained_dir_path(&inbox)?,
+            from,
+            subject,
+            in_reply_to,
+            tags,
+            body,
+        )
+    } else {
+        send_to_inbox(
+            &inbox_dir(&agent.path),
+            from,
+            subject,
+            in_reply_to,
+            tags,
+            body,
+        )
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_capability_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_MESSAGE_CAPABILITY_READY"),
+        std::env::var("ST2_TEST_MESSAGE_CAPABILITY_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_capability_checkpoint() {}
+
+pub fn archive_resolved_message(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    filename: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid message filename {filename:?}"
+    );
+    let agent = match resolve_agent_handle(catalog_root, identity, this_host)? {
+        Some(agent) => agent,
+        None => {
+            let discovered = crate::discover(catalog_root);
+            if crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
+                && discovered.specs.is_empty()
+                && discovered.errors.is_empty()
+            {
+                return archive_msg(
+                    &catalog_root.join(identity).join("inbox"),
+                    &catalog_root.join(identity).join("archive"),
+                    filename,
+                );
+            }
+            anyhow::bail!(
+                "no agent '{identity}' found in catalog {}",
+                catalog_root.display()
+            )
+        }
+    };
+    if let Some(capability) = agent.capability.as_ref() {
+        let inbox = open_message_box(capability, &["resources", "inbox"], false)?
+            .context("message inbox does not exist")?;
+        let archive = open_message_box(capability, &["resources", "archive"], true)?
+            .context("created archive capability is missing")?;
+        archive_msg(
+            &crate::catalog_transaction::retained_dir_path(&inbox)?,
+            &crate::catalog_transaction::retained_dir_path(&archive)?,
+            filename,
+        )
+    } else {
+        archive_msg(&inbox_dir(&agent.path), &archive_dir(&agent.path), filename)
+    }
+}
+
+fn open_message_box(
+    agent: &File,
+    components: &[&str],
+    create: bool,
+) -> anyhow::Result<Option<File>> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    let mut current = agent.try_clone()?;
+    for component in components {
+        match crate::catalog_transaction::openat_dir_nofollow(
+            &current,
+            std::ffi::OsStr::new(component),
+        ) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
+                return Ok(None);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = CString::new(*component)?;
+                let result = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(error.into());
+                    }
+                }
+                current = crate::catalog_transaction::openat_dir_nofollow(
+                    &current,
+                    std::ffi::OsStr::new(component),
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(current))
 }
 
 /// Archive `filename` from inbox to archive.
@@ -617,6 +996,10 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
 /// it is the durable receipt and wins. Remove only a duplicate inbox copy, never overwrite the
 /// archived file. A source that disappeared concurrently is also success when the receipt exists.
 pub fn archive_msg(inbox_dir: &Path, archive_dir: &Path, filename: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid message filename {filename:?}"
+    );
     fs::create_dir_all(archive_dir)?;
     let source = inbox_dir.join(filename);
     let receipt = archive_dir.join(filename);
@@ -821,7 +1204,14 @@ mod tests {
     #[test]
     fn external_inbox_rejects_unsafe_or_nested_identities() {
         let tmp = tempfile::tempdir().unwrap();
-        for identity in ["", ".", "..", "nested/requester", "../requester", "/requester"] {
+        for identity in [
+            "",
+            ".",
+            "..",
+            "nested/requester",
+            "../requester",
+            "/requester",
+        ] {
             assert!(
                 ExternalInbox::new(tmp.path(), identity).is_err(),
                 "accepted unsafe external identity {identity:?}"

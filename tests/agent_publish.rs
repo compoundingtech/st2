@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -389,6 +390,15 @@ fn incomplete_apply_marker_blocks_declarations_but_not_the_state_plane() {
         "incomplete apply reached runtime observation/action"
     );
 
+    fs::write(
+        st2::catalog_lock::apply_marker_path(&catalog),
+        format!(
+            "{{\"schema\":\"st2.catalog-apply-incomplete.v1\",\"stageName\":\"catalog-apply-stage-{hash}\",\"expectedRootSha256\":\"{hash}\",\"preparedRootSha256\":\"{hash}\",\"originalPaths\":[\"agents/host/worker/agent.kdl\"]}}\n",
+            hash = "0".repeat(64)
+        ),
+    )
+    .unwrap();
+
     let status = st2()
         .args([
             "status",
@@ -636,6 +646,250 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
 }
 
 #[test]
+fn spec_publish_crash_stages_only_in_the_control_plane() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let original = valid_spec(false);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, valid_spec(true)).unwrap();
+    let digest = source_digest("--spec", &candidate);
+    let crashed = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest,
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+        ])
+        .env("ST2_TEST_AGENT_PUBLISH_CRASH_AFTER_TEMP", "1")
+        .output()
+        .unwrap();
+    assert!(!crashed.status.success());
+    assert_eq!(crashed.status.signal(), Some(libc::SIGABRT));
+    assert_eq!(
+        fs::read_to_string(agent.join("agent.kdl")).unwrap(),
+        original
+    );
+    assert!(!catalog.join(".st2/catalog-generation").exists());
+    assert!(catalog.join(".st2/catalog-generation-incomplete").is_file());
+    assert!(fs::read_dir(&agent).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("agent-publish-leaf-")
+    }));
+    let retry = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest,
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(catalog.join(".st2/catalog-generation")).unwrap(),
+        "2\n"
+    );
+}
+
+#[test]
+fn publish_post_commit_generation_failure_is_fenced_and_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let original = valid_spec(false);
+    let desired = valid_spec(true);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, &desired).unwrap();
+    let digest = source_digest("--spec", &candidate);
+    let failed = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest,
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+        ])
+        .env("ST2_TEST_GENERATION_FAIL_AFTER_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert_eq!(
+        fs::read_to_string(agent.join("agent.kdl")).unwrap(),
+        desired
+    );
+    assert!(catalog.join(".st2/catalog-generation-incomplete").is_file());
+    assert!(!catalog.join(".st2/catalog-generation").exists());
+    let shared = st2()
+        .args(["agents", "--catalog", catalog.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(!shared.status.success());
+
+    let recovered = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest,
+            "--expect-sha256",
+            &sha256(desired.as_bytes()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(catalog.join(".st2/catalog-generation")).unwrap(),
+        "1\n"
+    );
+    assert!(!catalog.join(".st2/catalog-generation-incomplete").exists());
+}
+
+#[test]
+fn control_directory_swap_cannot_redirect_publication_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let original = valid_spec(false);
+    let desired = valid_spec(true);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, &desired).unwrap();
+    let digest = source_digest("--spec", &candidate);
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let publisher = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest,
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+        ])
+        .env("ST2_TEST_CATALOG_LOCK_HELD_READY", &ready)
+        .env("ST2_TEST_CATALOG_LOCK_HELD_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_path(&ready);
+    let retained = temp.path().join("retained-control");
+    fs::rename(catalog.join(".st2"), &retained).unwrap();
+    let outside = temp.path().join("outside-control");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, catalog.join(".st2")).unwrap();
+    fs::write(&release, "").unwrap();
+    let publisher = publisher.wait_with_output().unwrap();
+    assert!(
+        publisher.status.success(),
+        "{}",
+        String::from_utf8_lossy(&publisher.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent.join("agent.kdl")).unwrap(),
+        desired
+    );
+    assert!(outside.read_dir().unwrap().next().is_none());
+    assert!(retained.join("catalog-generation").is_file());
+}
+
+#[test]
+fn intermediate_host_swap_cannot_redirect_publication_outside_the_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let original = valid_spec(false);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, valid_spec(true)).unwrap();
+    let digest = source_digest("--spec", &candidate);
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let publisher = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &digest,
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+        ])
+        .env("ST2_TEST_AGENT_PUBLISH_READY", &ready)
+        .env("ST2_TEST_AGENT_PUBLISH_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_path(&ready);
+
+    let retained_host = temp.path().join("retained-host");
+    fs::rename(catalog.join("agents/host"), &retained_host).unwrap();
+    let outside = temp.path().join("outside-host");
+    fs::create_dir_all(outside.join("worker")).unwrap();
+    std::os::unix::fs::symlink(&outside, catalog.join("agents/host")).unwrap();
+    fs::write(&release, "").unwrap();
+    let publisher = publisher.wait_with_output().unwrap();
+    assert!(
+        !publisher.status.success(),
+        "publication unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&publisher.stdout)
+    );
+    assert!(!outside.join("worker/agent.kdl").exists());
+    assert_eq!(
+        fs::read_to_string(retained_host.join("worker/agent.kdl")).unwrap(),
+        original
+    );
+    assert!(!catalog.join(".st2/catalog-generation").exists());
+}
+
+#[test]
 fn compile_agent_is_not_a_cli_writer_anymore() {
     let output = st2().args(["compile-agent", "--help"]).output().unwrap();
     assert!(!output.status.success());
@@ -696,6 +950,7 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
     // Hold EX while both real CLI processes start, so neither can finish before the other is
     // contending on the same persistent lock.
     let gate = st2::CatalogLock::exclusive(&catalog).unwrap();
+    let first_attempt = temp.path().join("first-publisher-lock-attempt");
     let mut first = st2()
         .args([
             "agent",
@@ -710,10 +965,12 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
             &sha256(fs::read(&one).unwrap().as_slice()),
             "--json",
         ])
+        .env("ST2_TEST_CATALOG_LOCK_ATTEMPT", &first_attempt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let second_attempt = temp.path().join("second-publisher-lock-attempt");
     let mut second = st2()
         .args([
             "agent",
@@ -728,11 +985,13 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
             &sha256(fs::read(&two).unwrap().as_slice()),
             "--json",
         ])
+        .env("ST2_TEST_CATALOG_LOCK_ATTEMPT", &second_attempt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(50));
+    wait_for_path(&first_attempt);
+    wait_for_path(&second_attempt);
     assert!(first.try_wait().unwrap().is_none());
     assert!(second.try_wait().unwrap().is_none());
     drop(gate);

@@ -1306,12 +1306,32 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
             anyhow::bail!("task inventory incomplete")
         }
     };
+    let before = match st2::catalog_lock::read_fence(&catalog) {
+        Ok(fence) => fence,
+        Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
+    };
     let found = discover(&catalog);
+    let observed = match st2::catalog_lock::read_fence(&catalog) {
+        Ok(fence) if fence == before => fence,
+        Ok(_) => {
+            return print_incomplete_tasks(
+                catalog,
+                host,
+                "catalog generation changed during task discovery".to_string(),
+            );
+        }
+        Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
+    };
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
     let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
     let after = discover(&catalog);
     if !st2::task_inventory::same_discovery(&found, &after) {
         inventory.mark_incomplete("catalog declarations changed during task observation");
+    }
+    match st2::catalog_lock::read_fence(&catalog) {
+        Ok(after) if after == observed => {}
+        Ok(_) => inventory.mark_incomplete("catalog generation changed during task observation"),
+        Err(error) => inventory.mark_incomplete(error.to_string()),
     }
     println!("{}", inventory.to_json());
     if inventory.complete() {
@@ -1319,6 +1339,12 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
     } else {
         anyhow::bail!("task inventory incomplete")
     }
+}
+
+fn print_incomplete_tasks(catalog: PathBuf, host: String, detail: String) -> Result<()> {
+    let inventory = st2::task_inventory::TaskInventory::incomplete(catalog, host, detail);
+    println!("{}", inventory.to_json());
+    anyhow::bail!("task inventory incomplete")
 }
 
 fn tool_on_path(tool: &str) -> bool {
@@ -1416,7 +1442,9 @@ fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Res
             let state = st2::status::State::parse_settable(&word).with_context(|| {
                 format!("invalid state '{word}' (settable: offline|available|busy|away|dnd)")
             })?;
-            st2::status::set_state(&sp, state)?;
+            message::with_resolved_agent_dir(&root, &id, &host, |agent| {
+                st2::status::set_state(&st2::status::status_path(agent), state)
+            })?;
             println!("status: {}", state.as_str());
         }
     }
@@ -1482,7 +1510,7 @@ fn ding_cmd(
     let session = session.unwrap_or_else(|| id.clone());
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
-    let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
+    let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)?
         .unwrap_or_else(|| catalog_root.join(&id));
     let inbox = resolve_message_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
@@ -1519,7 +1547,7 @@ fn acting_id(ctx: &MsgCtx) -> Result<String> {
 
 /// Resolve a recipient/identity to its agent folder in the catalog, or a clear error.
 fn agent_dir_of(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
-    message::resolve_agent_dir(root, id, host)
+    message::resolve_agent_dir(root, id, host)?
         .with_context(|| format!("no agent '{id}' found in catalog {}", root.display()))
 }
 
@@ -1570,9 +1598,10 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = resolve_message_inbox(&root, &to, &host)?;
-            let filename = message::send_to_inbox(
-                &dir,
+            let filename = send_resolved_message(
+                &root,
+                &to,
+                &host,
                 &from,
                 subject.as_deref(),
                 in_reply_to.as_deref(),
@@ -1599,9 +1628,10 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = resolve_message_inbox(&root, &to, &host)?;
-            let sent = message::send_to_inbox(
-                &dir,
+            let sent = send_resolved_message(
+                &root,
+                &to,
+                &host,
                 &from,
                 subject.as_deref(),
                 Some(&filename),
@@ -1705,9 +1735,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            let inbox = resolve_message_inbox(&root, &id, &host)?;
-            let archive = message::resolve_archive(&root, &id, &host)?;
-            message::archive_msg(&inbox, &archive, &filename)?;
+            message::archive_resolved_message(&root, &id, &host, &filename)?;
             println!("archived");
             Ok(())
         }
@@ -1720,7 +1748,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let (root, _host) = resolve_ctx(&ctx)?;
             // `[identity] filename` — the identity is irrelevant (the walk is catalog-wide).
             let filename = second.unwrap_or(first);
-            let mut entries = message::collect_thread(&root, &filename);
+            let mut entries = message::collect_thread(&root, &filename)?;
             if entries.is_empty() {
                 anyhow::bail!(
                     "no thread found for '{filename}' in catalog {}",
@@ -1742,6 +1770,24 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn send_resolved_message(
+    root: &Path,
+    to: &str,
+    host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+) -> Result<String> {
+    if std::env::var("ST2_EVAL_REQUESTER").as_deref() == Ok(to) {
+        let inbox = resolve_message_inbox(root, to, host)?;
+        message::send_to_inbox(&inbox, from, subject, in_reply_to, tags, body)
+    } else {
+        message::send_to_resolved_inbox(root, to, host, from, subject, in_reply_to, tags, body)
     }
 }
 
@@ -1843,10 +1889,21 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             Ok(())
         }
         ContextCmd::Write { identity, ctx } => {
-            let dir = resolve_context_dir(identity, &ctx)?;
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(identity) => identity,
+                None => acting_id(&ctx)?,
+            };
             let content =
                 std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
-            context::write_now(&dir, &content)?;
+            message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "context"],
+                true,
+                |dir| context::write_now(dir, &content),
+            )?;
             eprintln!("context: wrote now.md ({} bytes)", content.len());
             Ok(())
         }
@@ -1856,8 +1913,19 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             why,
             ctx,
         } => {
-            let dir = resolve_context_dir(identity, &ctx)?;
-            let filename = context::append_decision(&dir, &decision, &why)?;
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(identity) => identity,
+                None => acting_id(&ctx)?,
+            };
+            let filename = message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "context", "decisions"],
+                true,
+                |dir| context::append_decision_to_dir(dir, &decision, &why),
+            )?;
             println!("{filename}");
             Ok(())
         }
@@ -1894,19 +1962,28 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let dir = st2::resource::links_dir(&agent_dir_of(&root, &acting_id(&ctx)?, &host)?);
+            let id = acting_id(&ctx)?;
             let body = if body_stdin {
                 std::io::read_to_string(std::io::stdin())?
             } else {
                 String::new()
             };
-            let f = st2::resource::add(
-                &dir,
-                &url,
-                title.as_deref(),
-                &tags,
-                relation.as_deref(),
-                &body,
+            let f = message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "links"],
+                true,
+                |dir| {
+                    st2::resource::add(
+                        dir,
+                        &url,
+                        title.as_deref(),
+                        &tags,
+                        relation.as_deref(),
+                        &body,
+                    )
+                },
             )?;
             println!("{f}");
             Ok(())
@@ -1950,9 +2027,17 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Remove { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            st2::resource::remove(
-                &st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?),
-                &filename,
+            anyhow::ensure!(
+                message::is_message_filename(&filename),
+                "invalid resource filename {filename:?}"
+            );
+            message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "links"],
+                false,
+                |dir| st2::resource::remove(dir, &filename),
             )?;
             println!("removed");
             Ok(())

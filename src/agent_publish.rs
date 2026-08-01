@@ -13,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::catalog_lock::CatalogLock;
-use crate::catalog_transaction::{rename_noreplace, sync_dir};
+use crate::catalog_transaction::sync_dir;
 
 const SCHEMA: &str = "st2.agent-publish.v1";
 const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
@@ -91,11 +91,6 @@ pub struct SourceDigest {
 }
 
 impl Candidate {
-    fn stage(catalog: &Path, source: PublishSource) -> Result<Self> {
-        let control = catalog.join(crate::catalog_lock::CONTROL_DIR);
-        Self::stage_in(&control, source)
-    }
-
     fn stage_in(parent: &Path, source: PublishSource) -> Result<Self> {
         let stage = tempfile::Builder::new()
             .prefix("agent-publish-")
@@ -206,8 +201,9 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         .catalog
         .canonicalize()
         .with_context(|| format!("canonicalize catalog {}", request.catalog.display()))?;
-    let _lock = CatalogLock::exclusive(&catalog)?;
-    let candidate = Candidate::stage(&catalog, request.source)?;
+    let lock = CatalogLock::exclusive(&catalog)?;
+    let control = crate::catalog_transaction::retained_dir_path(lock.control())?;
+    let candidate = Candidate::stage_in(&control, request.source)?;
     anyhow::ensure!(
         candidate.input_sha256 == request.input_sha256,
         "publication input precondition failed: expected sha256 {}, captured {}",
@@ -274,7 +270,7 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         }
     }
 
-    validate_overlay(&catalog, &candidate)?;
+    validate_overlay(&catalog, &control, &candidate)?;
     ensure_real_dir_chain(
         &catalog,
         target_dir
@@ -299,30 +295,32 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         ));
     }
 
+    test_before_publication();
+    let generation = lock.begin_generation_commit()?;
+    let published = result(
+        PublishStatus::Published,
+        &candidate,
+        target_spec.clone(),
+        before_hash,
+        after_hash,
+    );
     match candidate.kind {
         CandidateKind::Spec => {
             ensure_real_dir_chain(&catalog, &target_dir)?;
-            atomic_write_spec(&target_spec, &candidate.bytes, before.is_some())?;
+            atomic_write_spec(
+                lock.control(),
+                &catalog,
+                &target_spec,
+                &candidate.bytes,
+                before.is_some(),
+            )?;
         }
         CandidateKind::Bundle => {
-            let result = result(
-                PublishStatus::Published,
-                &candidate,
-                target_spec,
-                before_hash,
-                after_hash,
-            );
-            atomic_publish_staged_bundle(candidate.stage, &target_dir)?;
-            return Ok(result);
+            atomic_publish_staged_bundle(lock.control(), &catalog, candidate.stage, &target_dir)?;
         }
     }
-    Ok(result(
-        PublishStatus::Published,
-        &candidate,
-        target_spec,
-        before_hash,
-        after_hash,
-    ))
+    generation.commit()?;
+    Ok(published)
 }
 
 fn result(
@@ -389,8 +387,7 @@ fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn validate_overlay(catalog: &Path, candidate: &Candidate) -> Result<()> {
-    let control = catalog.join(crate::catalog_lock::CONTROL_DIR);
+fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Result<()> {
     let shadow = tempfile::Builder::new()
         .prefix("catalog-admission-")
         .tempdir_in(&control)
@@ -591,31 +588,89 @@ fn ensure_real_dir_chain(catalog: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_write_spec(target: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+fn atomic_write_spec(
+    control_file: &File,
+    catalog: &Path,
+    target: &Path,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<()> {
     let parent = target.parent().context("spec target has no parent")?;
+    let control = crate::catalog_transaction::retained_dir_path(control_file)?;
     let mut temp = tempfile::Builder::new()
-        .prefix(".agent.kdl.publish-")
-        .tempfile_in(parent)
-        .with_context(|| format!("create temporary spec in {}", parent.display()))?;
+        .prefix("agent-publish-leaf-")
+        .tempfile_in(&control)
+        .with_context(|| format!("create temporary spec in {}", control.display()))?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
+    test_crash_after_temporary_write();
     if replace {
-        temp.persist(target)
-            .map_err(|error| error.error)
-            .with_context(|| format!("replace {}", target.display()))?;
+        crate::catalog_transaction::persist_tempfile_from_control(
+            control_file,
+            catalog,
+            temp,
+            target,
+        )
+        .with_context(|| format!("replace {}", target.display()))?;
     } else {
-        fs::hard_link(temp.path(), target)
-            .with_context(|| format!("publish {}", target.display()))?;
+        crate::catalog_transaction::link_tempfile_from_control(
+            control_file,
+            catalog,
+            &temp,
+            target,
+        )
+        .with_context(|| format!("publish {}", target.display()))?;
         temp.close()?;
     }
-    sync_dir(parent)
+    crate::catalog_transaction::open_dir_beneath(catalog, parent)?
+        .sync_all()
+        .map_err(Into::into)
 }
 
-fn atomic_publish_staged_bundle(stage: tempfile::TempDir, target: &Path) -> Result<()> {
+#[cfg(debug_assertions)]
+fn test_crash_after_temporary_write() {
+    if std::env::var_os("ST2_TEST_AGENT_PUBLISH_CRASH_AFTER_TEMP").is_some() {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_crash_after_temporary_write() {}
+
+#[cfg(debug_assertions)]
+fn test_before_publication() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_AGENT_PUBLISH_READY"),
+        std::env::var("ST2_TEST_AGENT_PUBLISH_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_before_publication() {}
+
+fn atomic_publish_staged_bundle(
+    control: &File,
+    catalog: &Path,
+    stage: tempfile::TempDir,
+    target: &Path,
+) -> Result<()> {
     let parent = target.parent().context("bundle target has no parent")?;
-    rename_noreplace(&stage.keep(), target)
-        .with_context(|| format!("publish bundle {}", target.display()))?;
-    sync_dir(parent)
+    crate::catalog_transaction::rename_noreplace_between_dirs(
+        control,
+        catalog,
+        stage.path(),
+        target,
+    )
+    .with_context(|| format!("publish bundle {}", target.display()))?;
+    crate::catalog_transaction::open_dir_beneath(catalog, parent)?
+        .sync_all()
+        .map_err(Into::into)
 }
 
 fn bundle_projection_matches(source: &Path, target: &Path) -> Result<bool> {
