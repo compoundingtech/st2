@@ -1363,7 +1363,7 @@ fn ding_cmd(
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
         .unwrap_or_else(|| catalog_root.join(&id));
-    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host)?;
+    let inbox = resolve_message_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
@@ -1400,6 +1400,16 @@ fn acting_id(ctx: &MsgCtx) -> Result<String> {
 fn agent_dir_of(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
     message::resolve_agent_dir(root, id, host)
         .with_context(|| format!("no agent '{id}' found in catalog {}", root.display()))
+}
+
+/// Resolve ordinary declared messaging authority plus the exact external requester capability
+/// injected only into canonical eval seats.
+fn resolve_message_inbox(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
+    let external = std::env::var("ST2_EVAL_REQUESTER")
+        .ok()
+        .map(|identity| message::ExternalInbox::new(root, &identity))
+        .transpose()?;
+    message::resolve_inbox_with_external(root, id, host, external.as_ref())
 }
 
 /// Body from `-m`, else stdin (so `st2 message send x < file` works).
@@ -1439,7 +1449,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host)?;
+            let dir = resolve_message_inbox(&root, &to, &host)?;
             let filename = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1459,7 +1469,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
-            let my_inbox = message::resolve_inbox(&root, &from, &host)?;
+            let my_inbox = resolve_message_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
@@ -1468,7 +1478,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host)?;
+            let dir = resolve_message_inbox(&root, &to, &host)?;
             let sent = message::send_to_inbox(
                 &dir,
                 &from,
@@ -1546,7 +1556,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let dir = if archive {
                 message::resolve_archive(&root, &id, &host)
             } else {
-                message::resolve_inbox(&root, &id, &host)
+                resolve_message_inbox(&root, &id, &host)
             }?;
             if raw {
                 print!("{}", std::fs::read_to_string(dir.join(&filename))?);
@@ -1574,7 +1584,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            let inbox = message::resolve_inbox(&root, &id, &host)?;
+            let inbox = resolve_message_inbox(&root, &id, &host)?;
             let archive = message::resolve_archive(&root, &id, &host)?;
             message::archive_msg(&inbox, &archive, &filename)?;
             println!("archived");

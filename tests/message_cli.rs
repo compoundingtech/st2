@@ -196,16 +196,19 @@ fn known_empty_native_and_catalog_less_flat_boxes_remain_valid() {
 
 #[test]
 fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bus() {
-    let send = |root: &Path, recipient: &str, root_flag: &str| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let send = |root: &Path, recipient: &str, root_flag: &str, external: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        command
             .args(["message", "send", recipient, root_flag])
             .arg(root)
             .args(["--host", "h", "--as", "h.sender"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if let Some(identity) = external {
+            command.env("ST2_EVAL_REQUESTER", identity);
+        }
+        let mut child = command.spawn().unwrap();
         child.stdin.take().unwrap().write_all(b"work\n").unwrap();
         child.wait_with_output().unwrap()
     };
@@ -222,7 +225,7 @@ fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bu
     )
     .unwrap();
 
-    let display = send(catalog.path(), "Shared Worker", "--catalog");
+    let display = send(catalog.path(), "Shared Worker", "--catalog", None);
     assert!(!display.status.success());
     assert!(
         String::from_utf8_lossy(&display.stderr)
@@ -230,7 +233,7 @@ fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bu
     );
     assert!(!catalog.path().join("Shared Worker").exists());
 
-    let stable = send(catalog.path(), "h.worker", "--catalog");
+    let stable = send(catalog.path(), "h.worker", "--catalog", None);
     assert!(
         stable.status.success(),
         "{}",
@@ -243,8 +246,26 @@ fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bu
         1
     );
 
+    fs::create_dir_all(catalog.path().join("requester/inbox")).unwrap();
+    assert!(!send(catalog.path(), "requester", "--catalog", None).status.success());
+    assert!(!send(catalog.path(), "requester", "--catalog", Some("other"))
+        .status
+        .success());
+    let external = send(catalog.path(), "requester", "--catalog", Some("requester"));
+    assert!(
+        external.status.success(),
+        "{}",
+        String::from_utf8_lossy(&external.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(catalog.path().join("requester/inbox"))
+            .unwrap()
+            .count(),
+        1
+    );
+
     let flat = tempfile::tempdir().unwrap();
-    let raw = send(flat.path(), "requester", "--root");
+    let raw = send(flat.path(), "requester", "--root", None);
     assert!(
         raw.status.success(),
         "{}",

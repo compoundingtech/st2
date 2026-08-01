@@ -271,6 +271,7 @@ eval {
         fixture.join("agents/evalhost/worker/agent.kdl"),
         r#"agent "worker" {
   identity "worker"
+  name "requester"
   host "evalhost"
   workspace "$CATALOG/worker"
   supervisor "sup"
@@ -800,14 +801,6 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
             vec![(
                 "worker",
                 r#"agent "worker" { identity "worker"; host "evalhost"; pty "agent" { id ""; command "touch \"$CATALOG/SPAWNED\"; sleep 60" } }"#,
-            )],
-        ),
-        (
-            "presentation name",
-            "evalhost.worker",
-            vec![(
-                "worker",
-                r#"agent "worker" { identity "worker"; name "requester"; host "evalhost"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
             )],
         ),
         (
