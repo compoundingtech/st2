@@ -1,7 +1,10 @@
 //! Transactional publication of one canonical Agent Spec into a live catalog.
 
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::catalog_lock::CatalogLock;
 use crate::catalog_transaction::sync_dir;
 
-const SCHEMA: &str = "st2.agent-publish.v1";
+const SCHEMA: &str = "st2.agent-publish.v2";
 const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
 const BUNDLE_DIGEST_DOMAIN: &[u8] = b"st2.agent-publish-bundle.v1\0";
 
@@ -50,6 +53,8 @@ pub enum PublishStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PublishResult {
     pub schema: &'static str,
+    pub policy_profile: &'static str,
+    pub agent_spec_revision: &'static str,
     pub status: PublishStatus,
     pub bus_id: String,
     pub path: PathBuf,
@@ -301,24 +306,22 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
                 target_dir.display()
             );
         }
+        let verified_after =
+            verify_published_spec(&catalog, &target_spec, &candidate.bytes, &after_hash)?;
         return Ok(result(
             PublishStatus::Unchanged,
-            &candidate,
+            candidate.bus_id(),
+            candidate.input_sha256.clone(),
             target_spec,
             before_hash,
-            after_hash,
+            verified_after,
         ));
     }
 
     test_before_publication();
     let generation = lock.begin_generation_commit()?;
-    let published = result(
-        PublishStatus::Published,
-        &candidate,
-        target_spec.clone(),
-        before_hash,
-        after_hash,
-    );
+    let bus_id = candidate.bus_id();
+    let input_sha256 = candidate.input_sha256.clone();
     match candidate.kind {
         CandidateKind::Spec => {
             ensure_real_dir_chain(&catalog, &target_dir)?;
@@ -334,26 +337,86 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
             atomic_publish_staged_bundle(lock.control(), &catalog, candidate.stage, &target_dir)?;
         }
     }
+    test_after_publication_before_readback();
+    let verified_after =
+        verify_published_spec(&catalog, &target_spec, &candidate.bytes, &after_hash)?;
     generation.commit()?;
-    Ok(published)
+    Ok(result(
+        PublishStatus::Published,
+        bus_id,
+        input_sha256,
+        target_spec,
+        before_hash,
+        verified_after,
+    ))
 }
 
 fn result(
     status: PublishStatus,
-    candidate: &Candidate,
+    bus_id: String,
+    input_sha256: String,
     path: PathBuf,
     before_sha256: Option<String>,
     after_sha256: String,
 ) -> PublishResult {
     PublishResult {
         schema: SCHEMA,
+        policy_profile: crate::validate::CORE_CATALOG_POLICY_PROFILE,
+        agent_spec_revision: agent_spec::AGENT_SPEC_REVISION,
         status,
-        bus_id: candidate.bus_id(),
+        bus_id,
         path,
-        input_sha256: candidate.input_sha256.clone(),
+        input_sha256,
         before_sha256,
         after_sha256,
     }
+}
+
+fn verify_published_spec(
+    catalog: &Path,
+    target: &Path,
+    expected_bytes: &[u8],
+    expected_sha256: &str,
+) -> Result<String> {
+    let observed = read_regular_beneath(catalog, target)
+        .with_context(|| format!("read back published Agent Spec {}", target.display()))?;
+    let observed_sha256 = sha256(&observed);
+    anyhow::ensure!(
+        observed_sha256 == expected_sha256 && observed == expected_bytes,
+        "published Agent Spec readback mismatch: expected sha256 {expected_sha256}, found {observed_sha256}"
+    );
+    crate::catalog_transaction::validate_full_catalog(catalog)
+        .context("published catalog fails locked core/catalog re-admission")?;
+    Ok(observed_sha256)
+}
+
+fn read_regular_beneath(catalog: &Path, target: &Path) -> Result<Vec<u8>> {
+    let parent = target
+        .parent()
+        .context("published Agent Spec has no parent")?;
+    let parent = crate::catalog_transaction::open_dir_beneath(catalog, parent)?;
+    let leaf = target
+        .file_name()
+        .context("published Agent Spec has no file name")?;
+    let leaf = CString::new(leaf.as_bytes()).context("published Agent Spec name contains NUL")?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("open published Agent Spec readback");
+    }
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "published Agent Spec readback is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn validate_component(field: &str, value: &str) -> Result<()> {
@@ -670,6 +733,23 @@ fn test_before_publication() {
 
 #[cfg(not(debug_assertions))]
 fn test_before_publication() {}
+
+#[cfg(debug_assertions)]
+fn test_after_publication_before_readback() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_AGENT_PUBLISH_READBACK_READY"),
+        std::env::var("ST2_TEST_AGENT_PUBLISH_READBACK_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_after_publication_before_readback() {}
 
 fn atomic_publish_staged_bundle(
     control: &File,

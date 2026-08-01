@@ -1037,6 +1037,9 @@ fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> 
             })
             .collect();
         let out = serde_json::json!({
+            "schema": st2::validate::VALIDATE_RECEIPT_SCHEMA,
+            "policyProfile": st2::validate::CORE_CATALOG_POLICY_PROFILE,
+            "agentSpecRevision": agent_spec::AGENT_SPEC_REVISION,
             "issues": issues,
             "agents": report.agents,
             "errors": errors,

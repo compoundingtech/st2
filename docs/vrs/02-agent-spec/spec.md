@@ -166,8 +166,16 @@ The st2 transaction performs these steps in order:
    symlinks, require its digest to equal the input digest, and rerun shared parse,
    core admission, and catalog policy against the published view.
 7. Commit the catalog generation and return a typed receipt containing the
-   policy profile, input digest, before digest when present, and verified after
-   digest. Only then release the lock.
+   parser source revision, policy profile, input digest, before digest when
+   present, and verified after digest. Only then release the lock.
+
+`st2 validate --json` emits `st2.validate.v2`; successful JSON publication emits
+`st2.agent-publish.v2`. Both identify the `st2.core+catalog.v1` policy profile
+and the same `agentSpecRevision`. A hermetic clean build uses the complete
+40-hex source revision. Native dirty and revisionless builds use explicit local
+identities that cannot compare equal to a clean hermetic receipt. The byte-only
+`st2 agent digest --json` contract remains `st2.agent-source-digest.v1` because
+it makes no parser or policy claim.
 
 Failure before the atomic transition publishes nothing. Failure after it never
 returns a success receipt: the catalog transaction restores only when its
@@ -444,11 +452,12 @@ replacement of drifted work.
   generated declarations before the compatible st2 binary is activated. The
   pinned merged PTY dependency provides the exact-ID atomic metadata-patch API;
   compatible st2 and Nix provenance adoption must still deploy as one gated cohort.
-- **G10, shared admission:** st2 runner lowering, st2 publication, and Axe
-  managed admission do not yet consume one complete core-policy result and one
-  structured diagnostic envelope. Publication verifies exact digests and a
-  full-catalog overlay before its atomic transition, but must also re-admit the
-  published view under the lock and bind the policy profile in its receipt.
+- **G10, shared admission:** st2 runner lowering, validation, and publication
+  consume the shared lossless parser. Its revisioned validation and publication
+  receipts bind `st2.core+catalog.v1`; publication re-reads the exact digest and
+  re-admits the live catalog before success. Axe managed admission does not yet
+  consume that revisioned receipt and the same complete core result, so the
+  cross-tool invariant and shared diagnostic envelope remain open.
 
 ## Acceptance cases
 

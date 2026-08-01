@@ -19,6 +19,19 @@ const MANAGED: &str = r#"agent "worker" {
 "#;
 
 #[test]
+fn parser_revision_identifies_clean_or_explicitly_local_source() {
+    let revision = agent_spec::AGENT_SPEC_REVISION;
+    let clean_revision = revision.len() == 40
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    assert!(
+        clean_revision || revision.starts_with("local-dirty.") || revision == "local.unknown",
+        "unexpected parser revision: {revision}"
+    );
+}
+
+#[test]
 fn preserves_the_complete_typed_kdl_tree_and_duplicate_occurrences() {
     let parsed = parse_declared_document(Path::new("agents/dev3/worker/agent.kdl"), MANAGED);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

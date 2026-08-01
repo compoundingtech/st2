@@ -48,10 +48,24 @@ fn source_digest(flag: &str, path: &Path) -> String {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice::<Value>(&output.stdout).unwrap()["sha256"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    let receipt = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+    assert_eq!(receipt["schema"], "st2.agent-source-digest.v1");
+    receipt["sha256"].as_str().unwrap().to_string()
+}
+
+fn assert_agent_spec_revision(value: &Value) {
+    let revision = value.as_str().expect("agentSpecRevision string");
+    let clean_revision = revision.len() == 40
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    assert!(
+        clean_revision
+            || revision.starts_with("local-dirty.")
+            || revision.starts_with("nix-dirty.")
+            || revision == "local.unknown",
+        "unexpected agentSpecRevision: {revision}"
+    );
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -77,7 +91,9 @@ fn spec_create_is_typed_and_idempotent() {
         String::from_utf8_lossy(&first.stderr)
     );
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first["schema"], "st2.agent-publish.v1");
+    assert_eq!(first["schema"], "st2.agent-publish.v2");
+    assert_eq!(first["policyProfile"], "st2.core+catalog.v1");
+    assert_agent_spec_revision(&first["agentSpecRevision"]);
     assert_eq!(first["status"], "published");
     assert_eq!(first["busId"], "host.worker");
     assert_eq!(first["inputSha256"], sha256(valid_spec(false).as_bytes()));
@@ -779,6 +795,110 @@ fn publish_post_commit_generation_failure_is_fenced_and_recovered() {
         "1\n"
     );
     assert!(!catalog.join(".st2/catalog-generation-incomplete").exists());
+}
+
+#[test]
+fn success_receipt_requires_exact_locked_readback() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let original = valid_spec(false);
+    let desired = valid_spec(true);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, &desired).unwrap();
+    let ready = temp.path().join("readback-ready");
+    let release = temp.path().join("readback-release");
+    let publisher = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &sha256(desired.as_bytes()),
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+            "--json",
+        ])
+        .env("ST2_TEST_AGENT_PUBLISH_READBACK_READY", &ready)
+        .env("ST2_TEST_AGENT_PUBLISH_READBACK_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_path(&ready);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    fs::write(&release, "").unwrap();
+
+    let publisher = publisher.wait_with_output().unwrap();
+    assert!(!publisher.status.success());
+    assert!(publisher.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&publisher.stderr).contains("readback mismatch"),
+        "{}",
+        String::from_utf8_lossy(&publisher.stderr)
+    );
+    assert!(catalog.join(".st2/catalog-generation-incomplete").is_file());
+    assert!(!catalog.join(".st2/catalog-generation").exists());
+}
+
+#[test]
+fn success_receipt_requires_locked_full_catalog_readmission() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let original = valid_spec(false);
+    let desired = valid_spec(true);
+    fs::write(agent.join("agent.kdl"), &original).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, &desired).unwrap();
+    let ready = temp.path().join("readmission-ready");
+    let release = temp.path().join("readmission-release");
+    let publisher = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--spec",
+            candidate.to_str().unwrap(),
+            "--input-sha256",
+            &sha256(desired.as_bytes()),
+            "--expect-sha256",
+            &sha256(original.as_bytes()),
+            "--json",
+        ])
+        .env("ST2_TEST_AGENT_PUBLISH_READBACK_READY", &ready)
+        .env("ST2_TEST_AGENT_PUBLISH_READBACK_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_path(&ready);
+    let adjacent = catalog.join("agents/host/adjacent");
+    fs::create_dir(&adjacent).unwrap();
+    fs::write(adjacent.join("agent.kdl"), valid_spec(false)).unwrap();
+    fs::write(&release, "").unwrap();
+
+    let publisher = publisher.wait_with_output().unwrap();
+    assert!(!publisher.status.success());
+    assert!(publisher.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&publisher.stderr).contains("locked core/catalog re-admission"),
+        "{}",
+        String::from_utf8_lossy(&publisher.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent.join("agent.kdl")).unwrap(),
+        desired
+    );
+    assert!(catalog.join(".st2/catalog-generation-incomplete").is_file());
+    assert!(!catalog.join(".st2/catalog-generation").exists());
 }
 
 #[test]
