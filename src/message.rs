@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -314,19 +314,65 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join("archive")
 }
 
-/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus.
-/// Inside a catalog, an absent identity fails closed unless a real flat inbox was explicitly
-/// provisioned, as eval does for its external requester.
+/// Eval-owned authority for one external flat requester mailbox. General catalog routing remains
+/// declaration-only; possessing this value is the explicit exception at message call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalInbox {
+    root: PathBuf,
+    identity: String,
+    inbox: PathBuf,
+}
+
+impl ExternalInbox {
+    pub fn new(root: &Path, identity: &str) -> anyhow::Result<Self> {
+        let mut components = Path::new(identity).components();
+        let safe = matches!(components.next(), Some(Component::Normal(component)) if component == identity)
+            && components.next().is_none();
+        anyhow::ensure!(safe, "external requester identity must be one non-empty relative path component");
+        Ok(Self {
+            root: root.to_path_buf(),
+            identity: identity.to_owned(),
+            inbox: root.join(identity).join("inbox"),
+        })
+    }
+
+    pub fn provision(root: &Path, identity: &str) -> anyhow::Result<Self> {
+        let external = Self::new(root, identity)?;
+        fs::create_dir_all(&external.inbox).map_err(|error| {
+            anyhow::anyhow!(
+                "provisioning external requester {identity:?} inbox {}: {error}",
+                external.inbox.display()
+            )
+        })?;
+        Ok(external)
+    }
+}
+
+/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus;
+/// inside a catalog an absent identity always fails closed.
 pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
-    match resolve_list_box(root, id, host, false, false) {
+    resolve_list_box(root, id, host, false, false)
+}
+
+/// Resolve a normal declared inbox or one exact eval-owned external requester capability.
+pub fn resolve_inbox_with_external(
+    root: &Path,
+    id: &str,
+    host: &str,
+    external: Option<&ExternalInbox>,
+) -> anyhow::Result<PathBuf> {
+    match resolve_inbox(root, id, host) {
         Ok(inbox) => Ok(inbox),
-        Err(error) => {
-            let flat = root.join(id).join("inbox");
-            match fs::symlink_metadata(&flat) {
-                Ok(metadata) if metadata.file_type().is_dir() => Ok(flat),
-                _ => Err(error),
+        Err(error) => match external {
+            Some(external)
+                if external.root == root
+                    && external.identity == id
+                    && external.inbox.is_dir() =>
+            {
+                Ok(external.inbox.clone())
             }
-        }
+            _ => Err(error),
+        },
     }
 }
 
@@ -675,8 +721,27 @@ mod tests {
         );
         assert!(resolve_inbox(root, "Shared Worker", "h").is_err());
 
+        let external = ExternalInbox::new(root, "requester").unwrap();
+        assert!(resolve_inbox_with_external(root, "requester", "h", Some(&external)).is_err());
+
         let requester = root.join("requester").join("inbox");
         std::fs::create_dir_all(&requester).unwrap();
-        assert_eq!(resolve_inbox(root, "requester", "h").unwrap(), requester);
+        assert!(resolve_inbox(root, "requester", "h").is_err());
+        assert_eq!(
+            resolve_inbox_with_external(root, "requester", "h", Some(&external)).unwrap(),
+            requester
+        );
+        assert!(resolve_inbox_with_external(root, "missing", "h", Some(&external)).is_err());
+    }
+
+    #[test]
+    fn external_inbox_rejects_unsafe_or_nested_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        for identity in ["", ".", "..", "nested/requester", "../requester", "/requester"] {
+            assert!(
+                ExternalInbox::new(tmp.path(), identity).is_err(),
+                "accepted unsafe external identity {identity:?}"
+            );
+        }
     }
 }

@@ -221,7 +221,7 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             anyhow::bail!("canonical-agents Agent Spec `{bus_id}` is not runnable");
         }
         for task in &spec.tasks {
-            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT"] {
+            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT", "ST2_EVAL_REQUESTER"] {
                 if task.env.contains_key(root) {
                     anyhow::bail!(
                         "canonical-agents Agent Spec `{bus_id}` must not override eval-owned `{root}`"
@@ -1092,17 +1092,13 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                     "canonical-agents requester `{requester}` must be external to the admitted Agent Specs"
                 );
             }
-            if let Some(owner) = specs
-                .iter()
-                .find(|spec| spec.name.as_deref() == Some(requester.as_str()))
-            {
-                anyhow::bail!(
-                    "canonical-agents requester `{requester}` matches the presentation name of admitted Agent Spec `{}`",
-                    owner.bus_id(host)
-                );
+            crate::message::ExternalInbox::provision(&bus, &requester)?;
+            for spec in &mut specs {
+                for task in &mut spec.tasks {
+                    task.env
+                        .insert("ST2_EVAL_REQUESTER".to_owned(), requester.clone());
+                }
             }
-            std::fs::create_dir_all(bus.join(&requester).join("inbox"))
-                .with_context(|| format!("provisioning external requester `{requester}` inbox"))?;
         }
 
         eval_log!("== boot team ({} agents) ==", specs.len());
@@ -1676,6 +1672,18 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
   identity "worker"
   host "evalhost"
   workspace "$CATALOG/missing"
+  argv "true"
+}"#,
+                )],
+            ),
+            (
+                "ST2_EVAL_REQUESTER",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  env { ST2_EVAL_REQUESTER "shadow-requester" }
   argv "true"
 }"#,
                 )],
