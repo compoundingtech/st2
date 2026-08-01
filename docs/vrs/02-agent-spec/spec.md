@@ -22,6 +22,167 @@ Each **Authoring** link points to the canonical evals Agent Spec at exact commit
 behavior. **st2 source** and **Evidence** links show this implementation on the
 PR base.
 
+## Shared declaration admission
+
+st2 and managed publishers such as Axe consume one declaration boundary from
+the `agent-spec` library. They do not maintain sibling KDL parsers or reconstruct
+declarations from runner-normalized `AgentSpec` values.
+
+```text
+exact UTF-8 source bytes
+        |
+        v
+agent-spec lossless declaration parser
+        |-- typed KDL tree, order, duplicates, spans, exact source
+        `-- syntax and declaration-shape diagnostics
+                  |
+                  v
+        core Agent Spec admission
+          |                    |
+          v                    v
+   st2 catalog policy     Axe managed policy
+          |                    |
+          `---------+----------'
+                    v
+          digest-bound publication
+```
+
+### Strict and lossless are separate properties
+
+The parser retains the exact source bytes and a typed tree containing every
+node, argument, property, child, duplicate occurrence, source order, and source
+span. An unknown provider field therefore remains available to its owning
+policy; parsing never makes it valid by dropping it. Publication writes the
+captured bytes, not a serialization of the typed tree.
+
+Strict parsing rejects invalid KDL and declaration-shape errors such as an
+unexpected top-level node, a task without its required name, or a reserved but
+unsupported construct. It does not silently substitute a default for a value
+whose supplied type or shape is invalid. Syntax failure has no document;
+shape failure retains the document for diagnostics but cannot be admitted.
+
+The shared result has this semantic shape:
+
+```rust
+struct DeclaredParse {
+    document: Option<DeclaredDocument>,
+    diagnostics: Vec<AdmissionDiagnostic>,
+}
+
+struct DeclaredDocument {
+    source_name: PathBuf,
+    source: String,
+    nodes: Vec<DeclaredNode>,
+    agents: Vec<DeclaredAgent>,
+}
+```
+
+Convenience accessors may select a field, but the underlying collection remains
+ordered and duplicate-preserving. A policy that requires uniqueness checks the
+collection; it cannot inherit first-wins or last-wins behavior from an accessor.
+
+### Policy layers add constraints without reparsing
+
+Admission is the conjunction of ordered layers over the same immutable
+`DeclaredDocument` and exact source digest:
+
+| Layer | Owner | Decides |
+| --- | --- | --- |
+| syntax and declaration shape | `agent-spec` | whether a complete lossless typed document exists |
+| core Agent Spec | `agent-spec` | canonical field types, uniqueness, normalization, and core invariants |
+| catalog and runtime | st2 | target identity, full-catalog conflicts, host projection, and publication safety |
+| managed declaration | Axe | managed launch, persona, Resource, provenance, and provider-specific constraints |
+
+st2 never reports that Axe policy passed, and Axe never substitutes its own
+answer for core admission. Axe consumes the shared parse and core result, then
+adds managed diagnostics. This makes a stronger managed refusal and a weaker
+core acceptance explicitly different policy verdicts rather than contradictory
+parses. A publication request fixes the ordered policy profile for that request;
+the receipt names the profile and binds it to the candidate digest.
+
+### Diagnostics are structured data
+
+Every layer emits the same diagnostic envelope. Stable automation branches on
+`code`, `severity`, and `layer`, never on prose.
+
+```json
+{
+  "schema": "st2.agent-spec-diagnostic.v1",
+  "code": "task-name-missing",
+  "severity": "error",
+  "layer": "declaration",
+  "source": "agents/dev3/worker/agent.kdl",
+  "span": { "offset": 42, "length": 3, "line": 3, "column": 3 },
+  "fieldPath": ["agent", "worker", "pty"],
+  "message": "pty task must have one positional string name",
+  "help": null
+}
+```
+
+`layer` is one of `syntax`, `declaration`, `core`, `catalog`, `managed`, or
+`publication`. `source`, `span`, `fieldPath`, and `help` are optional only when
+the failing layer has no corresponding source location. Human rendering may add
+context, but JSON preserves the envelope and all causal diagnostics. Dependency
+and I/O failures use their own codes and retain the failing path or operation;
+they are not collapsed into an "invalid JSON" or generic admission message.
+
+## Digest-bound publication and re-admission
+
+Publication separates the core transaction st2 can prove under its catalog lock
+from the stronger managed verdict Axe owns:
+
+```text
+Axe                         st2                         live catalog
+ |                           |                              |
+ | parse + core + managed    |                              |
+ | candidate, digest C       |                              |
+ |--- publish(C, expected) ->|                              |
+ |                           | acquire local authoring lock |
+ |                           | re-capture candidate == C    |
+ |                           | core-admit locked overlay    |
+ |                           | atomic durable replace ----->|
+ |                           | read back == C               |
+ |                           | core re-admit published view |
+ |<-- receipt(C, before, C)--| release lock                 |
+ | read live == receipt C    |                              |
+ | core + managed re-admit   |                              |
+ | report managed success    |                              |
+```
+
+The st2 transaction performs these steps in order:
+
+1. Capture the candidate into immutable staging, retain its exact bytes and
+   typed declaration, and compute its lowercase SHA-256 source or bundle digest.
+2. Acquire the catalog's exclusive local authoring lock. No cross-host lock,
+   external lock service, or shared receipt is involved.
+3. Re-read the current target under the lock and require the caller's exact
+   absent-or-SHA-256 precondition. Require the staged digest to equal the
+   caller's input digest.
+4. Overlay the staged candidate on the locked catalog snapshot and run shared
+   parsing, core admission, and st2 catalog policy over that exact projection.
+5. Publish by an atomic, durable file or bundle transition. Preserve exact
+   candidate bytes and synchronize the containing directory before success.
+6. While retaining the lock, open the published regular file without following
+   symlinks, require its digest to equal the input digest, and rerun shared parse,
+   core admission, and catalog policy against the published view.
+7. Commit the catalog generation and return a typed receipt containing the
+   policy profile, input digest, before digest when present, and verified after
+   digest. Only then release the lock.
+
+Failure before the atomic transition publishes nothing. Failure after it never
+returns a success receipt: the catalog transaction restores only when its
+generation record proves the exact previous bytes and target; otherwise its
+durable recovery state reports an indeterminate publication and blocks dependent
+work. Re-admission is not replaced by comparing bytes alone.
+
+For a managed publication, Axe binds its candidate verdict to the same input
+digest, accepts only a matching st2 receipt, then reads the live declaration and
+reruns shared parse, core admission, and its managed policy. It reports managed
+success only when the live digest still equals the receipt's verified after
+digest. A later writer produces `superseded`, not a false success or an
+unproved rollback. st2 mutation commands that apply only core policy report a
+core publication and do not claim managed admission.
+
 ## Field rules
 
 <h3 id="f01">F01 Source form or path</h3>
@@ -283,10 +444,26 @@ replacement of drifted work.
   generated declarations before the compatible st2 binary is activated. The
   pinned merged PTY dependency provides the exact-ID atomic metadata-patch API;
   compatible st2 and Nix provenance adoption must still deploy as one gated cohort.
+- **G10, shared admission:** st2 runner lowering, st2 publication, and Axe
+  managed admission do not yet consume one complete core-policy result and one
+  structured diagnostic envelope. Publication verifies exact digests and a
+  full-catalog overlay before its atomic transition, but must also re-admit the
+  published view under the lock and bind the policy profile in its receipt.
 
 ## Acceptance cases
 
 - Source `no-op` changes nothing while an independently dead task still heals.
+- Lossless parsing preserves unknown fields, duplicates, order, exact source,
+  and spans. Syntax and shape mutations produce stable structured diagnostics;
+  no invalid supplied value becomes an omitted default.
+- st2 core admission and Axe managed admission consume the same parsed document
+  and core verdict. A managed-only refusal is labeled as managed policy, while a
+  core error blocks both without a second parse or contradictory message.
+- Concurrent publication proves the caller's before and input digests under the
+  catalog lock. The success receipt follows read-back and core re-admission of
+  the exact published digest; managed success additionally follows Axe
+  re-admission of that same live digest. A superseding writer is reported as
+  `superseded` rather than success.
 - Role and policy changes preserve healthy work; invalid values refuse.
 - A workspace survivor gets one event. Absent or dead work boots the latest
   workspace. Explicit task `cwd` drift stays visible.

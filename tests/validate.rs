@@ -50,6 +50,23 @@ fn compact_agent_catalog_is_clean() {
 }
 
 #[test]
+fn adjacent_non_agent_kdl_is_not_subject_to_agent_shape_policy() {
+    let c = catalog(&[
+        (
+            "hetz/worker/agent.kdl",
+            r#"agent "worker" { host "hetz"; command "true" }"#,
+        ),
+        (
+            "themes/layout.kdl",
+            r#"layout { pane "sidebar"; pane "main" }"#,
+        ),
+    ]);
+
+    let report = validate(c.path());
+    assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
+}
+
+#[test]
 fn opaque_resource_bindings_are_structurally_valid() {
     let c = catalog(&[(
         "Silber/cos/agent.kdl",

@@ -7,36 +7,31 @@
 //! `model`, `persona`, `permissions`, `transport`, `strategy`) and the inert `meta{}` block are
 //! ignored.
 
-use kdl::{KdlDocument, KdlNode};
-
+use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
 use crate::spec::{RawResource, RawRestart, RawSpec, RawTask};
 
-/// Parse a KDL document into zero or more raw specs (one per top-level `agent` node).
-pub(crate) fn parse_kdl(text: &str) -> anyhow::Result<Vec<RawSpec>> {
-    let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("KDL parse error: {e}"))?;
-    let mut specs = Vec::new();
-    for node in doc.nodes() {
-        if node.name().value() == "agent" {
-            specs.push(agent_node_to_raw(node)?);
-        }
-    }
-    Ok(specs)
+/// Lower an already parsed declaration document into the runner's raw representation.
+pub(crate) fn lower_declared_document(document: &DeclaredDocument) -> anyhow::Result<Vec<RawSpec>> {
+    document
+        .agents
+        .iter()
+        .map(|agent| agent_node_to_raw(&agent.node))
+        .collect()
 }
 
 /// First positional (unnamed) argument of a node, as a string.
-fn arg_string(node: &KdlNode) -> Option<String> {
-    node.get(0).and_then(|v| v.as_string()).map(String::from)
+fn arg_string(node: &DeclaredNode) -> Option<String> {
+    node.argument(0)
+        .and_then(DeclaredValue::as_str)
+        .map(String::from)
 }
 
 /// Every positional argument of a node, as strings.
-fn argv(node: &KdlNode) -> anyhow::Result<Vec<String>> {
-    node.entries()
-        .iter()
-        .filter(|entry| entry.name().is_none())
-        .map(|entry| {
-            entry
-                .value()
-                .as_string()
+fn argv(node: &DeclaredNode) -> anyhow::Result<Vec<String>> {
+    node.arguments()
+        .map(|value| {
+            value
+                .as_str()
                 .map(String::from)
                 .ok_or_else(|| anyhow::anyhow!("`argv` accepts only string arguments"))
         })
@@ -44,37 +39,35 @@ fn argv(node: &KdlNode) -> anyhow::Result<Vec<String>> {
 }
 
 /// First positional argument as a bool (`#true`/`#false`), defaulting to `false`.
-fn arg_bool(node: &KdlNode) -> bool {
-    node.get(0).and_then(|v| v.as_bool()).unwrap_or(false)
+fn arg_bool(node: &DeclaredNode) -> bool {
+    node.argument(0)
+        .and_then(DeclaredValue::as_bool)
+        .unwrap_or(false)
 }
 
 /// First positional argument as an integer.
-fn arg_u32(node: &KdlNode) -> Option<u32> {
-    node.get(0)
-        .and_then(|v| v.as_integer())
+fn arg_u32(node: &DeclaredNode) -> Option<u32> {
+    node.argument(0)
+        .and_then(DeclaredValue::as_integer)
         .and_then(|i| u32::try_from(i).ok())
 }
 
-fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
+fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
     let mut raw = RawSpec {
         identity: arg_string(node), // agent "<identity>" — may be overridden by an `identity` child
         ..Default::default()
     };
 
-    let Some(children) = node.children() else {
-        return Ok(raw);
-    };
-
     // Environment is an agent-level scope in the compact format and cascades into explicit legacy
     // tasks too. Parse it first so declaration order does not change semantics.
-    for child in children.nodes() {
-        if child.name().value() == "env" {
+    for child in &node.children {
+        if child.name == "env" {
             raw.env.extend(env_node_to_raw(child));
         }
     }
 
-    for child in children.nodes() {
-        match child.name().value() {
+    for child in &node.children {
+        match child.name.as_str() {
             "identity" => raw.identity = arg_string(child).or(raw.identity),
             "name" => parse_presentation(child, "name", &mut raw.name)?,
             "description" => parse_presentation(child, "description", &mut raw.description)?,
@@ -119,7 +112,7 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
 }
 
 fn parse_presentation(
-    node: &KdlNode,
+    node: &DeclaredNode,
     field: &str,
     destination: &mut Option<String>,
 ) -> anyhow::Result<()> {
@@ -128,41 +121,38 @@ fn parse_presentation(
         "agent declares `{field}` more than once"
     );
     anyhow::ensure!(
-        node.children().is_none()
-            && node.entries().len() == 1
-            && node.entries()[0].name().is_none(),
+        node.children.is_empty() && node.entries.len() == 1 && node.entries[0].name.is_none(),
         "agent `{field}` must contain exactly one positional string"
     );
     let value = node
-        .get(0)
-        .and_then(|value| value.as_string())
+        .argument(0)
+        .and_then(DeclaredValue::as_str)
         .ok_or_else(|| anyhow::anyhow!("agent `{field}` must contain a string"))?;
     *destination = Some(value.to_owned());
     Ok(())
 }
 
-fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)> {
-    if node.children().is_some() {
+fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResource)> {
+    if !node.children.is_empty() {
         anyhow::bail!("resource binding cannot have children");
     }
 
     let mut name = None;
     let mut tag = None;
     let mut uri = None;
-    for entry in node.entries() {
-        let Some(property) = entry.name() else {
+    for entry in &node.entries {
+        let Some(property) = entry.name.as_deref() else {
             if name.is_some() {
                 anyhow::bail!("resource binding accepts exactly one positional name");
             }
-            name = entry.value().as_string().map(String::from);
+            name = entry.value.as_str().map(String::from);
             if name.is_none() {
                 anyhow::bail!("resource binding needs a string name");
             }
             continue;
         };
 
-        let property = property.value();
-        let value = entry.value().as_string().map(String::from);
+        let value = entry.value.as_str().map(String::from);
         match property {
             "_tag" => {
                 if tag.is_some() {
@@ -195,13 +185,10 @@ fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)>
     ))
 }
 
-fn restart_node_to_raw(node: &KdlNode) -> RawRestart {
+fn restart_node_to_raw(node: &DeclaredNode) -> RawRestart {
     let mut r = RawRestart::default();
-    let Some(children) = node.children() else {
-        return r;
-    };
-    for child in children.nodes() {
-        match child.name().value() {
+    for child in &node.children {
+        match child.name.as_str() {
             "attempts" => r.attempts = arg_u32(child),
             "interval" => r.interval = arg_string(child),
             "delay" => r.delay = arg_string(child),
@@ -212,14 +199,10 @@ fn restart_node_to_raw(node: &KdlNode) -> RawRestart {
     r
 }
 
-fn task_node_to_raw(node: &KdlNode) -> anyhow::Result<RawTask> {
+fn task_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawTask> {
     let mut t = RawTask::default();
-    let Some(children) = node.children() else {
-        return Ok(t);
-    };
-
-    for child in children.nodes() {
-        match child.name().value() {
+    for child in &node.children {
+        match child.name.as_str() {
             "id" => t.id = arg_string(child),
             "command" => t.command = arg_string(child),
             "argv" => t.argv = Some(argv(child)?),
@@ -228,9 +211,9 @@ fn task_node_to_raw(node: &KdlNode) -> anyhow::Result<RawTask> {
             "lifecycle" => t.lifecycle = arg_string(child),
             // `tags role="agent" "st.network"="$CATALOG"` — properties on the node.
             "tags" => {
-                for entry in child.entries() {
-                    if let (Some(name), Some(val)) = (entry.name(), entry.value().as_string()) {
-                        t.tags.insert(name.value().to_string(), val.to_string());
+                for entry in &child.entries {
+                    if let (Some(name), Some(val)) = (entry.name.as_deref(), entry.value.as_str()) {
+                        t.tags.insert(name.to_string(), val.to_string());
                     }
                 }
             }
@@ -244,13 +227,11 @@ fn task_node_to_raw(node: &KdlNode) -> anyhow::Result<RawTask> {
     Ok(t)
 }
 
-fn env_node_to_raw(node: &KdlNode) -> std::collections::BTreeMap<String, String> {
+fn env_node_to_raw(node: &DeclaredNode) -> std::collections::BTreeMap<String, String> {
     let mut env = std::collections::BTreeMap::new();
-    if let Some(children) = node.children() {
-        for child in children.nodes() {
-            if let Some(value) = arg_string(child) {
-                env.insert(child.name().value().to_string(), value);
-            }
+    for child in &node.children {
+        if let Some(value) = arg_string(child) {
+            env.insert(child.name.clone(), value);
         }
     }
     env
