@@ -42,6 +42,30 @@ const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 const MAX_PRESENTATION_PATCHES_PER_PASS: usize = 8;
 
+#[derive(Debug, Default)]
+pub(crate) struct PresentationPatchCursor {
+    after_id: Option<String>,
+}
+
+impl PresentationPatchCursor {
+    fn batch<'a>(&mut self, presentation: &'a [PtyPresentation]) -> Vec<&'a PtyPresentation> {
+        let mut ordered = presentation.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.pty_id.cmp(&right.pty_id));
+        if ordered.is_empty() {
+            return Vec::new();
+        }
+        let start = self.after_id.as_ref().map_or(0, |after_id| {
+            let next = ordered.partition_point(|item| item.pty_id <= *after_id);
+            if next == ordered.len() { 0 } else { next }
+        });
+        let batch = (0..ordered.len().min(MAX_PRESENTATION_PATCHES_PER_PASS))
+            .map(|offset| ordered[(start + offset) % ordered.len()])
+            .collect::<Vec<_>>();
+        self.after_id = batch.last().map(|item| item.pty_id.clone());
+        batch
+    }
+}
+
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
@@ -1036,6 +1060,22 @@ pub fn execute(
     cap: &mut FlappingCap,
     report: &mut UpReport,
 ) {
+    execute_with_presentation_cursor(
+        plan,
+        runner,
+        cap,
+        &mut PresentationPatchCursor::default(),
+        report,
+    );
+}
+
+fn execute_with_presentation_cursor(
+    plan: &ReconcilePlan,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    presentation_cursor: &mut PresentationPatchCursor,
+    report: &mut UpReport,
+) {
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -1119,16 +1159,8 @@ pub fn execute(
 
     // Presentation never delays lifecycle convergence. Drift repair is bounded to eight sequential
     // children, keeping its worst-case 2s-per-child containment below the 30s supervisor cadence;
-    // the persistent cursor rotates remaining drift through later passes without starvation.
-    let presentation_count = plan
-        .presentation
-        .len()
-        .min(MAX_PRESENTATION_PATCHES_PER_PASS);
-    let presentation_start =
-        cap.presentation_batch_start(plan.presentation.len(), presentation_count);
-    for offset in 0..presentation_count {
-        let presentation =
-            &plan.presentation[(presentation_start + offset) % plan.presentation.len()];
+    // remaining drift is observed and retried on later passes.
+    for presentation in presentation_cursor.batch(&plan.presentation) {
         if let Err(error) = runner.patch_presentation(presentation) {
             report
                 .errors
@@ -1239,6 +1271,7 @@ fn reconcile_pass(
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let found = crate::discover(root);
     let mut report = UpReport {
@@ -1310,7 +1343,7 @@ fn reconcile_pass(
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute(&plan, runner, cap, &mut report);
+    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     report
 }
 
@@ -1364,6 +1397,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
+        &mut PresentationPatchCursor::default(),
     ))
 }
 
@@ -1382,6 +1416,24 @@ pub fn reconcile_pass_specs(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
 ) -> UpReport {
+    reconcile_pass_specs_with_cursor(
+        specs,
+        this_host,
+        runner,
+        cap,
+        debounce,
+        &mut PresentationPatchCursor::default(),
+    )
+}
+
+pub(crate) fn reconcile_pass_specs_with_cursor(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
+) -> UpReport {
     let mut report = UpReport::default();
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
@@ -1393,7 +1445,15 @@ pub fn reconcile_pass_specs(
             return report;
         }
     };
-    reconcile_pass_specs_with_sessions(specs, &sessions, this_host, runner, cap, debounce)
+    reconcile_pass_specs_with_sessions(
+        specs,
+        &sessions,
+        this_host,
+        runner,
+        cap,
+        debounce,
+        presentation_cursor,
+    )
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
@@ -1407,13 +1467,14 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let mut report = UpReport::default();
     let now = Instant::now();
     debounce.observe(sessions, now);
     let mut plan = crate::reconcile(specs, sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    execute(&plan, runner, cap, &mut report);
+    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     report
 }
 
@@ -1536,9 +1597,17 @@ pub fn up_loop_specs(
     install_signal_handler();
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    let mut presentation_cursor = PresentationPatchCursor::default();
     let mut reported_flapping: HashSet<String> = HashSet::new();
     loop {
-        let report = reconcile_pass_specs(specs, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass_specs_with_cursor(
+            specs,
+            this_host,
+            runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+        );
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1690,6 +1759,7 @@ fn up_loop_until(
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    let mut presentation_cursor = PresentationPatchCursor::default();
 
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
@@ -1697,7 +1767,14 @@ fn up_loop_until(
     let mut reported_flapping: HashSet<String> = HashSet::new();
 
     loop {
-        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass(
+            root,
+            this_host,
+            runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+        );
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1805,7 +1882,7 @@ pub fn detect_host() -> String {
 mod tests {
     use super::*;
     use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
 
@@ -1845,6 +1922,77 @@ mod tests {
 
         fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
             panic!("gate runner must not remove")
+        }
+    }
+
+    #[derive(Default)]
+    struct PersistentPatchRunner {
+        patched: RefCell<Vec<String>>,
+    }
+
+    impl Runner for PersistentPatchRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            unreachable!("presentation execution does not list sessions")
+        }
+
+        fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            unreachable!("presentation-only plan must not spawn")
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            unreachable!("presentation-only plan must not kill")
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            unreachable!("presentation-only plan must not remove")
+        }
+
+        fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+            self.patched.borrow_mut().push(presentation.pty_id.clone());
+            if presentation.pty_id.as_str() < "host.presented.08" {
+                anyhow::bail!("simulated persistent metadata failure");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_presentation_batches_are_deterministic_and_do_not_starve() {
+        let plan = ReconcilePlan {
+            presentation: (0..12)
+                .rev()
+                .map(|index| PtyPresentation {
+                    pty_id: format!("host.presented.{index:02}"),
+                    display_name: None,
+                    tags: BTreeMap::new(),
+                })
+                .collect(),
+            ..ReconcilePlan::default()
+        };
+        let runner = PersistentPatchRunner::default();
+        let mut cap = FlappingCap::default();
+        let mut cursor = PresentationPatchCursor::default();
+
+        for _ in 0..2 {
+            execute_with_presentation_cursor(
+                &plan,
+                &runner,
+                &mut cap,
+                &mut cursor,
+                &mut UpReport::default(),
+            );
+        }
+
+        let attempted = runner.patched.borrow();
+        assert_eq!(
+            &attempted[..8],
+            &(0..8)
+                .map(|index| format!("host.presented.{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(attempted.len(), 16);
+        for index in 8..12 {
+            assert!(attempted.contains(&format!("host.presented.{index:02}")));
         }
     }
 

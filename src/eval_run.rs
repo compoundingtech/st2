@@ -1151,6 +1151,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             let supervise_runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
             let mut sup_cap = crate::flapping::FlappingCap::default();
             let mut sup_debounce = crate::run::LivenessDebounce::new(Duration::from_secs(2));
+            let mut sup_presentation_cursor = crate::run::PresentationPatchCursor::default();
             // Crash-ding state: the boot gate immediately above proved every declared task alive, so
             // carry that proof into supervision. PTY may self-reap a fast exit before the first
             // post-kickoff list snapshot; starting empty would then misclassify the proven-live task
@@ -1208,14 +1209,16 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                                 &supervise_runner,
                                 &mut sup_cap,
                                 &mut sup_debounce,
+                                &mut sup_presentation_cursor,
                             )
                         }
-                        Err(_) => crate::run::reconcile_pass_specs(
+                        Err(_) => crate::run::reconcile_pass_specs_with_cursor(
                             &specs,
                             host,
                             &supervise_runner,
                             &mut sup_cap,
                             &mut sup_debounce,
+                            &mut sup_presentation_cursor,
                         ),
                     };
                     if !report.launched.is_empty() {
