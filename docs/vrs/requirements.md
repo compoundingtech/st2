@@ -178,6 +178,19 @@ accepted.
   visible only as a complete bundle; a preexisting declared workspace skeleton
   remains safe because the durable marker fences declaration readers and
   marker-time state routing throughout leaf publication and verification.
+  A policy-free prepared-catalog comparison takes the existing shared lock,
+  binds the live side to a caller-supplied declaration-root digest, captures the
+  prepared side through retained no-follow capabilities, and fully admits both
+  projections before returning one versioned receipt. The receipt exposes the
+  before/after declaration roots, exact added/removed/modified projected paths
+  with render/template/static classification, and normalized per-agent
+  Agent Spec-model field-address changes. Addresses expose only the structural
+  and dynamic address keys needed to locate a field; payload values and
+  per-value/agent hashes remain private. Omission and explicit defaults are
+  equivalent. Comparison never
+  writes live declarations, generation/marker state, runtime/state/workspace
+  bytes, or the prepared source, and carries no migration policy or publication
+  authority.
 - **R23 Fail-closed task inventory:** One read-only machine command exposes
   every desired local PTY and exec task by agent identity, task name, runtime
   id, kind, lifecycle, retirement, desired state, runtime state, PID, creation

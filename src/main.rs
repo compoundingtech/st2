@@ -331,6 +331,18 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum CatalogCmd {
+    /// Compare one prepared declaration directory with the coherent live catalog without writing.
+    Diff {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(long, value_name = "DIR")]
+        prepared: PathBuf,
+        /// Expected canonical declaration-root SHA-256 of the live catalog.
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: String,
+        /// Emit the versioned semantic-diff receipt. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Publish a complete prepared declaration directory as one absent catalog.
     Bootstrap {
         /// Complete prepared declaration directory. Runtime state and control paths are rejected.
@@ -769,6 +781,22 @@ fn main() -> Result<()> {
                     result.root_sha256
                 );
             }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Diff {
+            prepared,
+            expect_sha256,
+            json,
+        }) => {
+            if !json {
+                anyhow::bail!("`st2 catalog diff` v1 requires --json");
+            }
+            let result = st2::catalog_transaction::diff(st2::catalog_transaction::DiffRequest {
+                catalog: catalog_arg(None)?,
+                prepared,
+                expect_sha256,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
         Command::Catalog(CatalogCmd::Snapshot { output, json }) => {

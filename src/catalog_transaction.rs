@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use crate::catalog_lock::{APPLY_MARKER, CONTROL_DIR, CatalogLock};
 
 const SNAPSHOT_SCHEMA: &str = "st2.catalog-snapshot.v1";
+const DIFF_SCHEMA: &str = "st2.catalog-diff.v1";
 const BOOTSTRAP_SCHEMA: &str = "st2.catalog-bootstrap.v1";
 const APPLY_SCHEMA: &str = "st2.catalog-apply.v1";
 const MARKER_SCHEMA: &str = "st2.catalog-apply-incomplete.v1";
@@ -36,6 +37,103 @@ const TEMPLATE_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 pub struct SnapshotRequest {
     pub catalog: PathBuf,
     pub output: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct DiffRequest {
+    pub catalog: PathBuf,
+    pub prepared: PathBuf,
+    pub expect_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffResult {
+    pub schema: &'static str,
+    pub catalog: PathBuf,
+    pub prepared: PathBuf,
+    pub before_root_sha256: String,
+    pub after_root_sha256: String,
+    pub paths: Vec<PathDelta>,
+    pub agents: Vec<AgentSemanticDelta>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathDelta {
+    pub path: String,
+    pub kind: DeltaKind,
+    pub before: Option<PathVersion>,
+    pub after: Option<PathVersion>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathVersion {
+    pub class: PathClass,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathClass {
+    Catalog,
+    AgentSpec,
+    Render,
+    Template,
+    Static,
+    WorkspaceFact,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeltaKind {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSemanticDelta {
+    pub host: String,
+    pub identity: String,
+    pub kind: DeltaKind,
+    pub fields: Vec<FieldDelta>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldDelta {
+    pub address: String,
+    pub before: SemanticValue,
+    pub after: SemanticValue,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticValue {
+    pub state: SemanticState,
+    #[serde(rename = "type")]
+    pub value_type: SemanticType,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SemanticState {
+    Absent,
+    Default,
+    Present,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SemanticType {
+    String,
+    Bool,
+    U64,
+    Duration,
+    Object,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +285,698 @@ pub fn catalog_transition(catalog: &Path) -> Result<Option<CatalogTransition>> {
         })
         .collect();
     Ok(Some(CatalogTransition { original_agents }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticAtom {
+    value_type: SemanticType,
+    state: SemanticAtomState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SemanticAtomState {
+    Absent,
+    Default,
+    Present(String),
+}
+
+/// Compare a retained prepared capture with one coherent live declaration snapshot.
+///
+/// This operation deliberately owns no migration policy and performs no publication. The shared
+/// lock excludes cooperating declaration writers while the live projection is observed; the
+/// prepared source is copied through retained no-follow capabilities before it is parsed.
+pub fn diff(request: DiffRequest) -> Result<DiffResult> {
+    validate_sha256(&request.expect_sha256)?;
+    let catalog = canonical_real_dir_no_alias(&request.catalog, "catalog")?;
+    let prepared = canonical_real_dir_no_alias(&request.prepared, "prepared catalog")?;
+    anyhow::ensure!(
+        !prepared.starts_with(&catalog),
+        "prepared diff source must be outside the catalog: {}",
+        prepared.display()
+    );
+
+    let lock = CatalogLock::shared_existing(&catalog)?;
+    let retained_catalog = retained_dir_path(lock.root())?
+        .canonicalize()
+        .context("resolve retained live catalog")?;
+    let before = project(&retained_catalog, ProjectionSource::Current, &catalog)?;
+    validate_projection_link_counts(&retained_catalog, &before, "live catalog")?;
+    validate_live_workspace_facts(&catalog, &before.workspace_dirs)?;
+    validate_full_catalog(&retained_catalog).context("validate live catalog for diff")?;
+    anyhow::ensure!(
+        before.root_sha256 == request.expect_sha256,
+        "catalog diff precondition failed: expected root sha256 {}, found {}",
+        request.expect_sha256,
+        before.root_sha256
+    );
+
+    let captured = tempfile::tempdir().context("create prepared diff capture root")?;
+    capture_prepared_catalog(&prepared, captured.path())?;
+    let after = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
+    validate_full_catalog(captured.path()).context("validate prepared catalog for diff")?;
+
+    let before_specs = canonical_semantic_specs(&retained_catalog)?;
+    let after_specs = canonical_semantic_specs(captured.path())?;
+    let before_render = render_input_paths(&retained_catalog, &before_specs)?;
+    let after_render = render_input_paths(captured.path(), &after_specs)?;
+    let paths = path_deltas(&before, &after, &before_render, &after_render);
+    let agents = agent_semantic_deltas(&before_specs, &after_specs)?;
+
+    Ok(DiffResult {
+        schema: DIFF_SCHEMA,
+        catalog,
+        prepared,
+        before_root_sha256: before.root_sha256,
+        after_root_sha256: after.root_sha256,
+        paths,
+        agents,
+    })
+}
+
+fn canonical_semantic_specs(root: &Path) -> Result<BTreeMap<AgentKey, agent_spec::AgentSpec>> {
+    let discovered = crate::discover(root);
+    anyhow::ensure!(
+        discovered.errors.is_empty() && discovered.warnings.is_empty(),
+        "catalog semantic discovery is not exact: {} error(s), {} warning(s)",
+        discovered.errors.len(),
+        discovered.warnings.len()
+    );
+    let mut specs = BTreeMap::new();
+    for spec in discovered.specs {
+        let host = spec
+            .host
+            .as_deref()
+            .context("canonical semantic spec is missing explicit host")?;
+        let key = AgentKey {
+            host: host.to_string(),
+            identity: spec.identity.clone(),
+        };
+        anyhow::ensure!(
+            specs.insert(key.clone(), spec).is_none(),
+            "catalog semantic identity is ambiguous: {}.{}",
+            key.host,
+            key.identity
+        );
+    }
+    Ok(specs)
+}
+
+fn render_input_paths(
+    root: &Path,
+    specs: &BTreeMap<AgentKey, agent_spec::AgentSpec>,
+) -> Result<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    for spec in specs.values() {
+        let host = spec
+            .host
+            .as_deref()
+            .context("semantic spec host disappeared")?;
+        for input in crate::materialize::catalog_owned_render_inputs(root, spec, host)? {
+            paths.insert(normalized_relative(root, &input)?);
+        }
+    }
+    Ok(paths)
+}
+
+fn path_deltas(
+    before: &DeclarationProjection,
+    after: &DeclarationProjection,
+    before_render: &BTreeSet<String>,
+    after_render: &BTreeSet<String>,
+) -> Vec<PathDelta> {
+    let paths = before
+        .files
+        .keys()
+        .chain(after.files.keys())
+        .chain(before.workspace_dirs.iter())
+        .chain(after.workspace_dirs.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before_version = path_version(before, before_render, &path);
+            let after_version = path_version(after, after_render, &path);
+            if path_is_equal(before, after, before_render, after_render, &path) {
+                return None;
+            }
+            let kind = match (&before_version, &after_version) {
+                (None, Some(_)) => DeltaKind::Added,
+                (Some(_), None) => DeltaKind::Removed,
+                (Some(_), Some(_)) => DeltaKind::Modified,
+                (None, None) => unreachable!("union path must exist in one projection"),
+            };
+            Some(PathDelta {
+                path,
+                kind,
+                before: before_version,
+                after: after_version,
+            })
+        })
+        .collect()
+}
+
+fn path_is_equal(
+    before: &DeclarationProjection,
+    after: &DeclarationProjection,
+    before_render: &BTreeSet<String>,
+    after_render: &BTreeSet<String>,
+    path: &str,
+) -> bool {
+    let before_workspace = before.workspace_dirs.contains(path);
+    let after_workspace = after.workspace_dirs.contains(path);
+    if before_workspace || after_workspace {
+        return before_workspace == after_workspace;
+    }
+    match (before.files.get(path), after.files.get(path)) {
+        (Some(before), Some(after)) => {
+            before == after
+                && std::mem::discriminant(&classify_path(path, before_render))
+                    == std::mem::discriminant(&classify_path(path, after_render))
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn path_version(
+    projection: &DeclarationProjection,
+    render_inputs: &BTreeSet<String>,
+    path: &str,
+) -> Option<PathVersion> {
+    if projection.workspace_dirs.contains(path) {
+        return Some(PathVersion {
+            class: PathClass::WorkspaceFact,
+            executable: false,
+        });
+    }
+    projection.files.get(path).map(|file| PathVersion {
+        class: classify_path(path, render_inputs),
+        executable: file.executable,
+    })
+}
+
+fn classify_path(path: &str, render_inputs: &BTreeSet<String>) -> PathClass {
+    if path == crate::catalog::CONFIG_FILE {
+        PathClass::Catalog
+    } else if path.starts_with("_templates/") {
+        PathClass::Template
+    } else if is_canonical_agent_spec(path) {
+        PathClass::AgentSpec
+    } else if render_inputs.contains(path) {
+        PathClass::Render
+    } else {
+        PathClass::Static
+    }
+}
+
+fn agent_semantic_deltas(
+    before: &BTreeMap<AgentKey, agent_spec::AgentSpec>,
+    after: &BTreeMap<AgentKey, agent_spec::AgentSpec>,
+) -> Result<Vec<AgentSemanticDelta>> {
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut agents = Vec::new();
+    for key in keys {
+        let before_fields = before
+            .get(&key)
+            .map(normalize_agent)
+            .transpose()?
+            .unwrap_or_default();
+        let after_fields = after
+            .get(&key)
+            .map(normalize_agent)
+            .transpose()?
+            .unwrap_or_default();
+        let addresses = before_fields
+            .keys()
+            .chain(after_fields.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let fields = addresses
+            .into_iter()
+            .filter_map(|address| {
+                let before = before_fields
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or_else(|| absent_atom(after_fields[&address].value_type));
+                let after = after_fields
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or_else(|| absent_atom(before_fields[&address].value_type));
+                (before != after).then(|| FieldDelta {
+                    before: semantic_value(before),
+                    after: semantic_value(after),
+                    address,
+                })
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            continue;
+        }
+        let kind = match (before.contains_key(&key), after.contains_key(&key)) {
+            (false, true) => DeltaKind::Added,
+            (true, false) => DeltaKind::Removed,
+            (true, true) => DeltaKind::Modified,
+            (false, false) => unreachable!("union agent key must exist in one projection"),
+        };
+        agents.push(AgentSemanticDelta {
+            host: key.host,
+            identity: key.identity,
+            kind,
+            fields,
+        });
+    }
+    Ok(agents)
+}
+
+fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, SemanticAtom>> {
+    use agent_spec::{Restart, RestartMode, TaskKind, TaskLifecycle};
+
+    let host = spec
+        .host
+        .as_deref()
+        .context("canonical semantic spec has no host")?;
+    let base = format!(
+        "/agents/{}/{}",
+        pointer_segment(host),
+        pointer_segment(&spec.identity)
+    );
+    let mut fields = BTreeMap::new();
+    insert_value(
+        &mut fields,
+        &format!("{base}/identity"),
+        SemanticType::String,
+        &spec.identity,
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/name"),
+        SemanticType::String,
+        spec.name.as_deref(),
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/description"),
+        SemanticType::String,
+        spec.description.as_deref(),
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/host"),
+        SemanticType::String,
+        spec.host.as_deref(),
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/role"),
+        SemanticType::String,
+        spec.role.as_deref(),
+    );
+    fields.insert(format!("{base}/type"), default_atom(SemanticType::String));
+    insert_optional(
+        &mut fields,
+        &format!("{base}/workspace"),
+        SemanticType::String,
+        spec.workspace.as_deref(),
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/supervisor"),
+        SemanticType::String,
+        spec.supervisor.as_deref(),
+    );
+    insert_default_bool(&mut fields, &format!("{base}/retired"), spec.retired, false);
+    insert_default_bool(&mut fields, &format!("{base}/keep"), spec.keep, false);
+
+    let restart = spec.restart_policy();
+    let default_restart = Restart::default();
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/restart/attempts"),
+        SemanticType::U64,
+        restart.attempts.to_string(),
+        restart.attempts == default_restart.attempts,
+    );
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/restart/interval-ms"),
+        SemanticType::Duration,
+        restart.interval.as_millis().to_string(),
+        restart.interval == default_restart.interval,
+    );
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/restart/delay-ms"),
+        SemanticType::Duration,
+        restart.delay.as_millis().to_string(),
+        restart.delay == default_restart.delay,
+    );
+    let restart_mode = match restart.mode {
+        RestartMode::Fail => "fail",
+        RestartMode::Delay => "delay",
+    };
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/restart/mode"),
+        SemanticType::String,
+        restart_mode.into(),
+        restart.mode == default_restart.mode,
+    );
+
+    for resource in &spec.resources {
+        let root = format!("{base}/resources/{}", pointer_segment(resource.name()));
+        insert_value(
+            &mut fields,
+            &format!("{root}/_tag"),
+            SemanticType::String,
+            resource.tag(),
+        );
+        insert_value(
+            &mut fields,
+            &format!("{root}/uri"),
+            SemanticType::String,
+            resource.uri(),
+        );
+    }
+    for task in &spec.tasks {
+        let kind = match task.kind {
+            TaskKind::Pty => "pty",
+            TaskKind::Exec => "exec",
+        };
+        let root = format!("{base}/tasks/{kind}/{}", pointer_segment(&task.name));
+        insert_value(
+            &mut fields,
+            &format!("{root}/kind"),
+            SemanticType::String,
+            kind,
+        );
+        insert_default_bool(&mut fields, &format!("{root}/derived"), task.derived, false);
+        let effective_id = task
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("{}.{}", spec.bus_id(host), task.name));
+        insert_value(
+            &mut fields,
+            &format!("{root}/id"),
+            SemanticType::String,
+            &effective_id,
+        );
+        insert_optional(
+            &mut fields,
+            &format!("{root}/command"),
+            SemanticType::String,
+            task.command.as_deref(),
+        );
+        match &task.argv {
+            Some(argv) => {
+                fields.insert(
+                    format!("{root}/argv"),
+                    present_atom(SemanticType::Object, "argv"),
+                );
+                for (index, value) in argv.iter().enumerate() {
+                    insert_value(
+                        &mut fields,
+                        &format!("{root}/argv/{index}"),
+                        SemanticType::String,
+                        value,
+                    );
+                }
+            }
+            None => {
+                fields.insert(format!("{root}/argv"), absent_atom(SemanticType::Object));
+            }
+        }
+        match task.cwd.as_deref().or(spec.workspace.as_deref()) {
+            Some(effective_cwd) => insert_value(
+                &mut fields,
+                &format!("{root}/cwd"),
+                SemanticType::String,
+                effective_cwd,
+            ),
+            None => {
+                fields.insert(
+                    format!("{root}/cwd"),
+                    default_atom(SemanticType::String),
+                );
+            }
+        }
+        for (key, value) in &task.tags {
+            insert_value(
+                &mut fields,
+                &format!("{root}/tags/{}", pointer_segment(key)),
+                SemanticType::String,
+                value,
+            );
+        }
+        for (key, value) in &task.env {
+            insert_value(
+                &mut fields,
+                &format!("{root}/env/{}", pointer_segment(key)),
+                SemanticType::String,
+                value,
+            );
+        }
+        insert_default_bool(&mut fields, &format!("{root}/keep"), task.keep, false);
+        insert_default_value(
+            &mut fields,
+            &format!("{root}/lifecycle"),
+            SemanticType::String,
+            match task.lifecycle {
+                TaskLifecycle::Service => "service",
+                TaskLifecycle::AdoptOnly => "adopt-only",
+            }
+            .into(),
+            task.lifecycle == TaskLifecycle::Service,
+        );
+    }
+
+    for (index, operation) in crate::materialize::parse_plan(spec)?.ops.iter().enumerate() {
+        use crate::materialize::RenderOp;
+        let root = format!("{base}/render/{index}");
+        match operation {
+            RenderOp::Copy {
+                source,
+                destination,
+            } => {
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/kind"),
+                    SemanticType::String,
+                    "copy",
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/source"),
+                    SemanticType::String,
+                    source,
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/destination"),
+                    SemanticType::String,
+                    destination,
+                );
+            }
+            RenderOp::File {
+                destination,
+                content,
+            } => {
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/kind"),
+                    SemanticType::String,
+                    "file",
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/destination"),
+                    SemanticType::String,
+                    destination,
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/content"),
+                    SemanticType::String,
+                    content,
+                );
+            }
+            RenderOp::JsonUpsert {
+                destination,
+                content,
+            } => {
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/kind"),
+                    SemanticType::String,
+                    "json-upsert",
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/destination"),
+                    SemanticType::String,
+                    destination,
+                );
+                let normalized = serde_json::to_string(
+                    &serde_json::from_str::<serde_json::Value>(content)
+                        .context("normalize json-upsert content")?,
+                )?;
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/content"),
+                    SemanticType::String,
+                    &normalized,
+                );
+            }
+            RenderOp::EnsureLine { destination, line } => {
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/kind"),
+                    SemanticType::String,
+                    "ensure-line",
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/destination"),
+                    SemanticType::String,
+                    destination,
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/line"),
+                    SemanticType::String,
+                    line,
+                );
+            }
+            RenderOp::GitExclude { path } => {
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/kind"),
+                    SemanticType::String,
+                    "git-exclude",
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{root}/path"),
+                    SemanticType::String,
+                    path,
+                );
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn insert_value(
+    fields: &mut BTreeMap<String, SemanticAtom>,
+    address: &str,
+    value_type: SemanticType,
+    value: &str,
+) {
+    fields.insert(address.to_string(), present_atom(value_type, value));
+}
+
+fn insert_optional(
+    fields: &mut BTreeMap<String, SemanticAtom>,
+    address: &str,
+    value_type: SemanticType,
+    value: Option<&str>,
+) {
+    fields.insert(
+        address.to_string(),
+        value
+            .map(|value| present_atom(value_type, value))
+            .unwrap_or_else(|| absent_atom(value_type)),
+    );
+}
+
+fn insert_default_bool(
+    fields: &mut BTreeMap<String, SemanticAtom>,
+    address: &str,
+    value: bool,
+    default: bool,
+) {
+    insert_default_value(
+        fields,
+        address,
+        SemanticType::Bool,
+        value.to_string(),
+        value == default,
+    );
+}
+
+fn insert_default_value(
+    fields: &mut BTreeMap<String, SemanticAtom>,
+    address: &str,
+    value_type: SemanticType,
+    value: String,
+    is_default: bool,
+) {
+    fields.insert(
+        address.to_string(),
+        if is_default {
+            default_atom(value_type)
+        } else {
+            present_atom(value_type, &value)
+        },
+    );
+}
+
+fn pointer_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn present_atom(value_type: SemanticType, value: &str) -> SemanticAtom {
+    SemanticAtom {
+        value_type,
+        state: SemanticAtomState::Present(value.to_string()),
+    }
+}
+
+fn absent_atom(value_type: SemanticType) -> SemanticAtom {
+    SemanticAtom {
+        value_type,
+        state: SemanticAtomState::Absent,
+    }
+}
+
+fn default_atom(value_type: SemanticType) -> SemanticAtom {
+    SemanticAtom {
+        value_type,
+        state: SemanticAtomState::Default,
+    }
+}
+
+fn semantic_value(value: SemanticAtom) -> SemanticValue {
+    SemanticValue {
+        state: match value.state {
+            SemanticAtomState::Absent => SemanticState::Absent,
+            SemanticAtomState::Default => SemanticState::Default,
+            SemanticAtomState::Present(_) => SemanticState::Present,
+        },
+        value_type: value.value_type,
+    }
+}
+
+fn validate_projection_link_counts(
+    root: &Path,
+    projection: &DeclarationProjection,
+    label: &str,
+) -> Result<()> {
+    for path in projection.files.keys() {
+        let target = root.join(path);
+        let metadata = fs::symlink_metadata(&target)
+            .with_context(|| format!("inspect {label} projected file {}", target.display()))?;
+        anyhow::ensure!(
+            metadata.nlink() == 1,
+            "{label} contains a hard-linked projected file: {}",
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 /// Capture one coherent declaration plane under the shared catalog-authoring lock.
@@ -1944,6 +2734,13 @@ fn capture_dir_capability(
             capture_dir_capability(&input, &target, capture_root, mode)?;
         } else if metadata.is_file() {
             let relative = target.strip_prefix(capture_root)?;
+            if mode == CaptureMode::PreparedCatalog {
+                anyhow::ensure!(
+                    metadata.nlink() == 1,
+                    "prepared catalog contains a hard-linked file: {}",
+                    target.display()
+                );
+            }
             if relative.components().next().and_then(|value| match value {
                 Component::Normal(name) => name.to_str(),
                 _ => None,

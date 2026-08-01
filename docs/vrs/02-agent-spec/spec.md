@@ -257,8 +257,10 @@ replacement of drifted work.
 
 ## Current implementation gaps
 
-- **G01, F01/F04/F15:** watcher passes lack semantic differences, and invalid
-  KDL `type` can lower to `service`. [Parser](../../../crates/agent-spec/src/kdl_format.rs)
+- **G01, F01/F04/F15:** the prepared-catalog diff exposes normalized Agent
+  Spec-model field differences, but effect-level path normalization and watcher
+  consumption remain absent, and invalid KDL `type` can lower to `service`.
+  [Parser](../../../crates/agent-spec/src/kdl_format.rs)
 - **G02, F06-F08:** render ownership and idempotent writes exist, but dependency
   targeting and post-commit notification do not. [Materializer](../../../src/materialize.rs)
 - **G03, F02/F09-F13:** ID-only adoption lacks fingerprint and incarnation

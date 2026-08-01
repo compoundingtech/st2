@@ -228,6 +228,80 @@ identical retry is `unchanged`. Its domain-separated, path-sorted root SHA-256
 covers normalized relative paths, file bytes, executable bits, and empty
 workspace directory facts.
 
+`st2 catalog diff --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
+holds the existing authoring lock in shared mode and performs no initialization
+or publication. It projects and fully admits the coherent live catalog, rejects
+unless its declaration root equals `HEX`, captures `DIR` through retained
+no-follow capabilities into private temporary storage, then projects and fully
+admits that capture against logical `ROOT`. Any malformed, ambiguous, stale,
+symlinked, hard-linked, special, reserved, or unprojected input fails without a
+partial JSON receipt.
+
+The typed result is:
+
+```json
+{
+  "schema": "st2.catalog-diff.v1",
+  "catalog": "/catalog",
+  "prepared": "/prepared",
+  "beforeRootSha256": "<live-declaration-root>",
+  "afterRootSha256": "<prepared-declaration-root>",
+  "paths": [
+    {
+      "path": "agents/host/worker/agent.kdl",
+      "kind": "modified",
+      "before": { "class": "agent-spec", "executable": false },
+      "after": { "class": "agent-spec", "executable": false }
+    }
+  ],
+  "agents": [
+    {
+      "host": "host",
+      "identity": "worker",
+      "kind": "modified",
+      "fields": [
+        {
+          "address": "/agents/host/worker/tasks/pty/agent/argv/0",
+          "before": { "state": "present", "type": "string" },
+          "after": { "state": "present", "type": "string" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Path changes are ordered lexically and use `added`, `removed`, or `modified`.
+They describe projected-fact changes: file content, executable bit,
+classification, or workspace-fact presence. A missing `before` side for an
+addition and a missing `after` side for a removal serialize as `null`; a
+modified path has both sides. Each present side classifies the fact as
+`catalog`, `agent-spec`, `render`, `template`, `static`, or `workspace-fact`.
+File content remains private and only the existing aggregate declaration roots
+are hashed in the receipt.
+`render` means a catalog-owned bundle file consumed by a normalized render
+operation, while `_templates` remains `template` even when referenced.
+
+Agent fields lower through the shared Agent Spec model and ordered render-plan
+parser. This is model-field normalization, not resolved effect normalization:
+physical source paths, comments, formatting, map order, and explicit spellings
+of effective defaults disappear, while accepted `workspace`, task `cwd`, and
+render path strings remain exact model values. Task addresses include both kind
+and name. Dynamic JSON Pointer segments use RFC 6901 escaping; for example,
+environment key `A/B~C` becomes `A~1B~0C`. The address necessarily exposes the
+host, identity, task/resource names, and environment/tag keys needed to locate
+the field. Render operations retain their declaration order, while
+`json-upsert` object keys normalize before comparison. A changed field reports
+only `absent`, `default`, or `present` plus its type; inclusion in `fields`
+proves the two normalized payloads differ. Payload values, lengths, and
+per-field or per-agent hashes are never emitted.
+
+`paths` describes projected-fact changes, so a formatting-only source
+edit may modify `agent.kdl` while `agents` remains empty. An empty `agents`
+array is normalized agent equivalence, not byte identity. The command does not
+decide whether a change is safe, select agents for migration, inspect a PTY
+registry, or authorize apply.
+
 `st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
 rejects any prepared state/control path, symlink, special node, unprojected
 file/directory, malformed declaration, nonempty prepared workspace fact,
