@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use crate::catalog_lock::{APPLY_MARKER, CONTROL_DIR, CatalogLock};
 
 const SNAPSHOT_SCHEMA: &str = "st2.catalog-snapshot.v1";
+const BOOTSTRAP_SCHEMA: &str = "st2.catalog-bootstrap.v1";
 const APPLY_SCHEMA: &str = "st2.catalog-apply.v1";
 const MARKER_SCHEMA: &str = "st2.catalog-apply-incomplete.v1";
 const HASH_DOMAIN: &[u8] = b"st2.catalog-declaration-root.v1\0";
@@ -51,6 +52,31 @@ pub struct SnapshotResult {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SnapshotStatus {
+    Created,
+    Unchanged,
+}
+
+#[derive(Debug)]
+pub struct BootstrapRequest {
+    pub catalog: PathBuf,
+    pub prepared: PathBuf,
+    pub input_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapResult {
+    pub schema: &'static str,
+    pub status: BootstrapStatus,
+    pub catalog: PathBuf,
+    pub prepared: PathBuf,
+    pub root_sha256: String,
+    pub entries: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootstrapStatus {
     Created,
     Unchanged,
 }
@@ -232,6 +258,258 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
     })
 }
 
+/// Publish one complete prepared declaration plane as an absent catalog.
+pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
+    validate_sha256(&request.input_sha256)?;
+    let catalog = absolute_path(&request.catalog)?;
+    let parent = catalog.parent().context("catalog root has no parent")?;
+    let parent = canonical_real_dir_no_alias(parent, "catalog parent")?;
+    let name = catalog
+        .file_name()
+        .context("catalog root has no final path component")?;
+    ensure_safe_component(name, "catalog root")?;
+    let catalog = parent.join(name);
+    let parent_file = open_dir_beneath(&parent, &parent)?;
+
+    let prepared = canonical_real_dir_no_alias(&request.prepared, "prepared catalog")?;
+    anyhow::ensure!(
+        !catalog.starts_with(&prepared),
+        "catalog bootstrap target is contained by prepared source: {}",
+        catalog.display()
+    );
+    let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
+    capture_prepared_catalog(&prepared, captured.path())?;
+    let desired = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
+    anyhow::ensure!(
+        desired.root_sha256 == request.input_sha256,
+        "prepared catalog input sha256 mismatch: expected {}, found {}",
+        request.input_sha256,
+        desired.root_sha256
+    );
+
+    let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
+    materialize_projection(&desired, admission.path())?;
+    validate_full_catalog(admission.path())?;
+    let desired_config = crate::catalog::load(admission.path())?;
+    validate_external_pty_root(&catalog, &desired_config, "catalog bootstrap v1")?;
+
+    match fs::symlink_metadata(&catalog) {
+        Ok(_) => {
+            return inspect_existing_bootstrap(
+                &parent_file,
+                name,
+                &catalog,
+                &prepared,
+                &desired,
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect catalog bootstrap target {}", catalog.display())
+            });
+        }
+    }
+
+    bootstrap_checkpoint("before-stage");
+    let retained_parent = retained_dir_path(&parent_file)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".st2-catalog-bootstrap-")
+        .tempdir_in(&retained_parent)
+        .with_context(|| format!("create catalog bootstrap stage in {}", parent.display()))?;
+    let stage = stage.keep();
+    let source_name = stage
+        .file_name()
+        .context("bootstrap stage has no name")?
+        .to_os_string();
+    let staged_lock = match (|| -> Result<File> {
+        materialize_projection(&desired, &stage)?;
+        let staged = project(&stage, ProjectionSource::Prepared, &catalog)?;
+        anyhow::ensure!(
+            staged.root_sha256 == desired.root_sha256,
+            "catalog bootstrap stage verification failed: expected {}, found {}",
+            desired.root_sha256,
+            staged.root_sha256
+        );
+        validate_full_catalog(&stage)?;
+        let lock = initialize_bootstrap_control(&stage)?;
+        sync_tree_dirs(&stage)?;
+        Ok(lock)
+    })() {
+        Ok(lock) => lock,
+        Err(error) => {
+            let _ = remove_tree_at(&parent_file, &source_name);
+            return Err(error);
+        }
+    };
+    bootstrap_checkpoint("before-publish");
+
+    match renameat_noreplace(&parent_file, &source_name, &parent_file, name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            drop(staged_lock);
+            let _ = remove_tree_at(&parent_file, &source_name);
+            return inspect_existing_bootstrap(
+                &parent_file,
+                name,
+                &catalog,
+                &prepared,
+                &desired,
+            );
+        }
+        Err(error) => {
+            drop(staged_lock);
+            let _ = remove_tree_at(&parent_file, &source_name);
+            return Err(error).context("publish catalog bootstrap transaction");
+        }
+    }
+    bootstrap_checkpoint("after-publish-before-parent-sync");
+    parent_file
+        .sync_all()
+        .context("sync catalog parent after bootstrap publication")?;
+    bootstrap_checkpoint("after-parent-sync");
+    drop(staged_lock);
+
+    Ok(BootstrapResult {
+        schema: BOOTSTRAP_SCHEMA,
+        status: BootstrapStatus::Created,
+        catalog,
+        prepared,
+        entries: desired.entries(),
+        root_sha256: desired.root_sha256,
+    })
+}
+
+fn inspect_existing_bootstrap(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    catalog: &Path,
+    prepared: &Path,
+    desired: &DeclarationProjection,
+) -> Result<BootstrapResult> {
+    let target = openat_dir_nofollow(parent, name)
+        .with_context(|| format!("open existing catalog target {}", catalog.display()))?;
+    let retained_target = retained_dir_path(&target)?.join(".");
+    let lock = CatalogLock::shared_existing(&retained_target)
+        .context("existing catalog is not a completed bootstrap transaction")?;
+    let generation = lock.generation()?;
+    anyhow::ensure!(
+        generation.is_some_and(|generation| generation >= 1),
+        "existing catalog is missing a valid durable generation"
+    );
+    let retained_catalog = retained_dir_path(lock.root())?.join(".");
+    validate_live_workspace_facts(&retained_catalog, &desired.workspace_dirs)?;
+    let current = project_excluding(
+        &retained_catalog,
+        ProjectionSource::Current,
+        &catalog,
+        &desired.workspace_dirs,
+    )?;
+    validate_full_catalog(&retained_catalog)?;
+    anyhow::ensure!(
+        current.root_sha256 == desired.root_sha256,
+        "catalog bootstrap target already exists with root sha256 {}, expected {}",
+        current.root_sha256,
+        desired.root_sha256
+    );
+    let bound_target = openat_dir_nofollow(parent, name)
+        .with_context(|| format!("reopen existing catalog target {}", catalog.display()))?;
+    let locked_metadata = lock.root().metadata()?;
+    let bound_metadata = bound_target.metadata()?;
+    anyhow::ensure!(
+        locked_metadata.dev() == bound_metadata.dev()
+            && locked_metadata.ino() == bound_metadata.ino(),
+        "catalog bootstrap target changed while replay was validating it: {}",
+        catalog.display()
+    );
+    parent
+        .sync_all()
+        .context("sync catalog parent before completing bootstrap replay")?;
+    bootstrap_checkpoint("after-replay-parent-sync");
+    Ok(BootstrapResult {
+        schema: BOOTSTRAP_SCHEMA,
+        status: BootstrapStatus::Unchanged,
+        catalog: catalog.to_path_buf(),
+        prepared: prepared.to_path_buf(),
+        entries: desired.entries(),
+        root_sha256: desired.root_sha256.clone(),
+    })
+}
+
+fn initialize_bootstrap_control(stage: &Path) -> Result<File> {
+    let control = stage.join(CONTROL_DIR);
+    fs::create_dir(&control)
+        .with_context(|| format!("create bootstrap control directory {}", control.display()))?;
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700))?;
+    let control_file = File::open(&control)?;
+    let lock_path = control.join(crate::catalog_lock::LOCK_FILE);
+    let lock = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .with_context(|| format!("create bootstrap authoring lock {}", lock_path.display()))?;
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("lock staged bootstrap catalog");
+    }
+    lock.sync_all()?;
+    let generation_path = control.join(crate::catalog_lock::GENERATION_FILE);
+    let mut generation = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&generation_path)
+        .with_context(|| {
+            format!(
+                "create bootstrap catalog generation {}",
+                generation_path.display()
+            )
+        })?;
+    generation.write_all(b"1\n")?;
+    generation.sync_all()?;
+    control_file.sync_all()?;
+    Ok(lock)
+}
+
+fn remove_tree_at(parent: &File, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    let dir = openat_dir_nofollow(parent, name)?;
+    remove_dir_contents(&dir)?;
+    unlinkat(parent, name, libc::AT_REMOVEDIR)
+}
+
+fn remove_dir_contents(dir: &File) -> std::io::Result<()> {
+    let entries = capability_dir_entries(dir).map_err(std::io::Error::other)?;
+    for name in entries {
+        let entry = openat_nofollow(dir, &name).map_err(std::io::Error::other)?;
+        if entry.metadata()?.is_dir() {
+            remove_dir_contents(&entry)?;
+            unlinkat(dir, &name, libc::AT_REMOVEDIR)?;
+        } else {
+            unlinkat(dir, &name, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn unlinkat(parent: &File, name: &std::ffi::OsStr, flags: libc::c_int) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component contains NUL")
+    })?;
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Apply a complete prepared declaration plane under one exclusive transaction.
 pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     let catalog = canonical_real_dir(&request.catalog, "catalog")?;
@@ -296,7 +574,7 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     materialize_projection(&desired, admission.path())?;
     validate_full_catalog(admission.path())?;
     let desired_config = crate::catalog::load(admission.path())?;
-    validate_external_pty_root(&catalog, &desired_config)?;
+    validate_external_pty_root(&catalog, &desired_config, "catalog apply v1")?;
 
     let stage_name = stage_name(&desired.root_sha256);
     let stage_path = control.join(&stage_name);
@@ -1349,15 +1627,16 @@ fn validate_live_workspace_facts(catalog: &Path, facts: &BTreeSet<String>) -> Re
 fn validate_external_pty_root(
     catalog: &Path,
     config: &crate::catalog::CatalogConfig,
+    operation: &str,
 ) -> Result<()> {
     anyhow::ensure!(
         config.pty_root.is_some(),
-        "catalog apply v1 requires an explicit external pty-root"
+        "{operation} requires an explicit external pty-root"
     );
     let pty_root = lexical_absolute(&effective_pty_root(catalog, config))?;
     anyhow::ensure!(
         !pty_root.starts_with(catalog),
-        "catalog apply v1 requires pty-root outside the catalog: {}",
+        "{operation} requires pty-root outside the catalog: {}",
         pty_root.display()
     );
     Ok(())
@@ -1585,6 +1864,9 @@ fn capture_tree(source: &Path, destination: &Path, mode: CaptureMode) -> Result<
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(source)
         .context("open retained source directory")?;
+    if mode == CaptureMode::PreparedCatalog {
+        prepared_capture_checkpoint("source-opened");
+    }
     let source_root = retained_dir_path(&source)?
         .canonicalize()
         .context("resolve retained source directory")?;
@@ -1600,6 +1882,24 @@ fn capture_tree(source: &Path, destination: &Path, mode: CaptureMode) -> Result<
     capture_dir_capability(&source, destination, destination, mode)?;
     sync_tree_dirs(destination)
 }
+
+#[cfg(debug_assertions)]
+fn prepared_capture_checkpoint(point: &str) {
+    if std::env::var("ST2_TEST_PREPARED_CAPTURE_PAUSE_AT").as_deref() == Ok(point)
+        && let (Ok(ready), Ok(release)) = (
+            std::env::var("ST2_TEST_PREPARED_CAPTURE_READY"),
+            std::env::var("ST2_TEST_PREPARED_CAPTURE_RELEASE"),
+        )
+    {
+        let _ = fs::write(&ready, point);
+        while !Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn prepared_capture_checkpoint(_point: &str) {}
 
 pub(crate) fn retained_dir_path(dir: &File) -> Result<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1990,6 +2290,27 @@ pub(crate) fn rename_noreplace(source: &Path, target: &Path) -> std::io::Result<
         Err(std::io::Error::last_os_error())
     }
 }
+
+#[cfg(debug_assertions)]
+fn bootstrap_checkpoint(point: &str) {
+    if std::env::var("ST2_TEST_CATALOG_BOOTSTRAP_PAUSE_AT").as_deref() == Ok(point)
+        && let (Ok(ready), Ok(release)) = (
+            std::env::var("ST2_TEST_CATALOG_BOOTSTRAP_READY"),
+            std::env::var("ST2_TEST_CATALOG_BOOTSTRAP_RELEASE"),
+        )
+    {
+        let _ = fs::write(&ready, point);
+        while !Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    if std::env::var("ST2_TEST_CATALOG_BOOTSTRAP_CRASH_AT").as_deref() == Ok(point) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn bootstrap_checkpoint(_point: &str) {}
 
 #[cfg(debug_assertions)]
 fn test_checkpoint(point: &str) {

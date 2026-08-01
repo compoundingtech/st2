@@ -149,8 +149,10 @@ accepted.
   diagnostic readers therefore detect even a completed declaration ABA across
   their observation. A durable incomplete-generation intent fences readers
   across each single-writer commit and is conservatively recovered by the next
-  exclusive writer. Writer staging exists only in the reserved control plane,
-  never among authoritative declaration leaves.
+  exclusive writer. Existing-catalog writer staging exists only in the reserved
+  control plane, never among authoritative declaration leaves; fresh bootstrap
+  stages one non-authoritative sibling because its control plane does not exist
+  yet.
   Presence, messages, context, and Resource state remain independently writable
   and are never serialized behind catalog authoring.
   A caller binds single-agent publication to the exact no-follow source capture
@@ -162,9 +164,17 @@ accepted.
   digest under the exclusive lock, durably stages the desired bytes, and resumes
   after interruption solely from a closed marker and its content-addressed
   stage. Version 1 requires one explicit external PTY root and rejects effective
-  PTY-root changes. Fresh-catalog bootstrap is a separate cross-producer
-  transaction, not a catalog-apply mode. Apply never traverses, hashes, deletes,
-  or relocates workspace or runtime state. An absent canonical identity becomes
+  PTY-root changes. Fresh-catalog bootstrap is a distinct create transaction,
+  not a catalog-apply mode: it binds an exact captured prepared projection to a
+  caller-supplied digest, initializes the persistent authoring lock and first
+  catalog generation before visibility, and publishes the complete catalog by
+  one durable no-replace directory rename. A retry is unchanged only when the
+  completed existing catalog has the exact prepared declaration root. Bootstrap
+  validates and preserves one explicit external PTY root but performs no PTY
+  registry I/O; process adoption and PTY-root migration remain outside its
+  atomic boundary because the registry has independent producers. Apply never
+  traverses, hashes, deletes, or relocates workspace or runtime state. An absent
+  canonical identity becomes
   visible only as a complete bundle; a preexisting declared workspace skeleton
   remains safe because the durable marker fences declaration readers and
   marker-time state routing throughout leaf publication and verification.

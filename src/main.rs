@@ -331,6 +331,18 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum CatalogCmd {
+    /// Publish a complete prepared declaration directory as one absent catalog.
+    Bootstrap {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(long, value_name = "DIR")]
+        prepared: PathBuf,
+        /// Root SHA-256 of the exact prepared projection being published.
+        #[arg(long, value_name = "HEX")]
+        input_sha256: String,
+        /// Emit the typed bootstrap receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Capture the coherent declaration plane into a create-only canonical directory.
     Snapshot {
         /// Destination directory. It must be outside the live catalog.
@@ -731,6 +743,31 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&digest)?);
             } else {
                 println!("{}", digest.sha256);
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Bootstrap {
+            prepared,
+            input_sha256,
+            json,
+        }) => {
+            let result =
+                st2::catalog_transaction::bootstrap(st2::catalog_transaction::BootstrapRequest {
+                    catalog: catalog_arg(None)?,
+                    prepared,
+                    input_sha256,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {}",
+                    match result.status {
+                        st2::catalog_transaction::BootstrapStatus::Created => "created",
+                        st2::catalog_transaction::BootstrapStatus::Unchanged => "unchanged",
+                    },
+                    result.root_sha256
+                );
             }
             Ok(())
         }
