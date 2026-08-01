@@ -121,6 +121,8 @@ agent "<identity>" {
   // Optional metadata:
   // role "worker"
   // supervisor "<supervisor-bus-id>"
+  // name "Release worker"
+  // description "Owns release preparation and verification."
   env { ST_AGENT "<host>.<identity>" }
   argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
@@ -169,6 +171,24 @@ The envelope is intentionally only `name` + `_tag` + `uri`. It carries no requir
 access, readiness, or lifecycle policy, and URI possession conveys no authority. Resource-only
 declaration edits do not stop, replace, or relaunch a live task. Resource types and resolvers remain
 opaque to st2; catalog readers use the public `agent-spec` crate to inspect the typed bindings.
+
+The positional agent value is the stable automation identity. Optional `name` and `description`
+fields are presentation only; they never route messages, select tasks, or rename durable state.
+Mutate a catalog-owned KDL declaration through the constrained commands:
+
+```sh
+st2 rename <stable-id> "Release worker"
+st2 describe <stable-id> "Owns release preparation and verification."
+st2 rename <stable-id> --clear
+```
+
+These commands preserve unrelated KDL bytes and serialize local writers through the persistent
+private `.st2/presentation-authoring.lock`. They refuse TOML, JSON, and
+explicitly `meta { managed-by "nix" }` targets. Nix generators must emit that marker before the
+compatible st2 binary is activated. In the trusted single-operator fleet, caller-supplied
+`ST_AGENT` limits an invocation to itself or declared descendants; it is a guardrail rather than
+authentication, and absence selects the operator path. The sibling `<agent-dir>/name` convention
+is hard-retired and ignored.
 
 `argv` launches its first value directly with the remaining values as arguments. It resolves a bare
 program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
@@ -324,9 +344,10 @@ st2 context read --full
 ```
 
 The roster includes retired declarations instead of silently conflating them with runtime
-presence. Both JSON shapes contain `retired` and the declaration's ordered `resources` descriptors;
-`--enrich` additionally supplies `lastActivity` and `inbox`. Human output leaves active rows
-unchanged and appends `[retired]` to a retired row.
+presence. Both JSON shapes keep stable `identity` separate from optional `name` and `description`,
+and contain `retired` plus the declaration's ordered `resources` descriptors. `--enrich`
+additionally supplies `lastActivity` and `inbox`. Human output prints the same presentation fields
+as separate columns and appends `[retired]` to a retired row.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
@@ -391,7 +412,7 @@ st2 service uninstall
 
 ```text
 ls, up, down, validate, doctor
-message, ding, agents, status, context, resource
+message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, eval
 compile-agent (experimental)

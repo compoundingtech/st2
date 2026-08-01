@@ -121,6 +121,8 @@ accepted.
   gates, PTY inspection, and plan execution are limited to the selected
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
+  Stable IDs alone select and authorize automation; presentation values never
+  resolve a message, Resource, status, lifecycle, or authoring target.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
   order-independent Resource bindings. Each binding has a non-empty, agent-local
   unique name and preserves a non-empty, opaque type discriminator and an RFC
@@ -146,3 +148,37 @@ accepted.
   incomplete; the external backend may already have recreated a concurrently
   removed registry. This diagnostic boundary is not transactionally serialized
   with catalog or runtime writers and is not control-plane cutover authority.
+- **R24 Stable identity and bounded presentation:** The positional Agent Spec
+  identity and its host-qualified bus identity remain the sole stable keys for
+  routing, ownership, adoption, lifecycle, and automation. Agent Specs may
+  declare optional, non-empty `name` and `description` strings in canonical KDL
+  and the readable TOML/JSON forms. `name` is a non-unique mutable human label,
+  limited to 160 Unicode scalars; `description` is an enduring responsibility
+  boundary, limited to 1,000. Both are single-line: Cc control characters and
+  U+2028/U+2029 are invalid. Omission means absence. Presentation is never an
+  alias, and the declaration is its sole source of truth; a sibling `name` file
+  is ignored without migration or compatibility behavior.
+- **R25 Constrained presentation authoring:** `st2 rename` and `st2 describe`
+  set or clear only their corresponding direct field in one canonical KDL
+  declaration selected by stable identity. They preserve unrelated source
+  bytes, serialize cooperating local writers through the persistent private
+  `.st2/presentation-authoring.lock`, reject a stale source before atomic
+  replacement, fsync the result, and return classified receipts. The lock inode
+  is never removed or stale-recovered and defines one local POSIX
+  filesystem/kernel exclusion domain; it is not cross-host coordination or OS
+  isolation from direct external writers. TOML, JSON, declarations explicitly
+  marked Nix-owned, stable-ID changes, and malformed or ambiguous targets fail
+  closed. Nix emitters must publish that marker before authoring is activated.
+  In the trusted-fleet model, caller-supplied `ST_AGENT` provides a guardrail,
+  not authentication: a catalog agent may edit itself or a descendant reached
+  through declared supervisor edges, while its absence selects the operator
+  path.
+- **R26 Live PTY presentation projection:** For every healthy managed PTY, st2
+  reconciles a versioned owned tag snapshot containing the stable actor identity
+  plus optional description through one exact task-ID metadata patch. The
+  primary `agent` task additionally maps optional name to native PTY display
+  metadata; secondary PTYs preserve their task-specific display convention.
+  Projection preserves unrelated tags, removes absent owned values, reports and
+  retries failure, and is idempotent. It never uses display-name resolution or
+  enters launch, teardown, garbage collection, replacement, or flapping
+  accounting.

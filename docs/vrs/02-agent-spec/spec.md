@@ -201,6 +201,26 @@ source: [`RawSpec` and `AgentSpec`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [validation](../../../src/validate.rs) and
 [reconciliation](../../../src/reconcile.rs).
 
+<h3 id="f17">F17 Agent <code>name</code> and <code>description</code></h3>
+
+Update observable declaration and runtime presentation metadata only. Neither
+field participates in identity, routing, selection, authorization, state paths,
+launch fingerprints, workspaces, inbox events, DING, or lifecycle. The roster
+reads the declaration directly; sibling `name` files are ignored.
+
+For a healthy managed PTY, patch the exact runtime task ID in place. Every owned
+PTY receives the versioned stable-actor and optional-description tag snapshot;
+only the primary task named `agent` maps optional name to native display
+metadata. Clearing removes only the corresponding st2-owned value. Preserve
+unrelated tags and secondary display conventions. An unchanged projection is a
+no-op. Failure reports and retries without stop, reap, restart, replacement, or
+flapping accounting. Absent work receives the same projection at spawn.
+
+Authoring: canonical Agent Spec presentation fields after the matching evals
+change lands. st2 source: [`AgentSpec`](../../../crates/agent-spec/src/spec.rs),
+[roster](../../../src/agents.rs), and [reconciliation](../../../src/reconcile.rs).
+Evidence: parser, roster, exact-ID metadata, and no-restart presentation tests.
+
 Catalog and PTY roots are host runtime inputs, not Agent Spec fields. Their
 migration contract is outside this VRS. See
 [#85](https://github.com/compoundingtech/st2/issues/85).
@@ -259,6 +279,10 @@ replacement of drifted work.
   and [runner](../../../src/run.rs).
 - **G08, moved intent:** parser, status, and executor support are absent; syntax
   is unspecified. [Parser](../../../crates/agent-spec/src/kdl_format.rs)
+- **G09, F17 release ordering:** source authoring requires Nix emitters to mark
+  generated declarations before the compatible st2 binary is activated. The
+  pinned merged PTY dependency provides the exact-ID atomic metadata-patch API;
+  compatible st2 and Nix provenance adoption must still deploy as one gated cohort.
 
 ## Acceptance cases
 
@@ -274,6 +298,10 @@ replacement of drifted work.
   child removal. Legacy or partial proof holds or refuses.
 - Matching fingerprints adopt. Mismatches drift. Explicit replacement proves
   the exact incarnation through fence, quiesce, materialize, and boot.
+- Name and description changes update roster and exact PTY metadata while task
+  ID, PID, creation identity, and generation remain unchanged. Repeating the
+  desired projection emits no metadata event; clearing removes only owned
+  presentation values. A genuine retirement still follows ordinary teardown.
 - Host projections converge after overlap, absence, and reconnection without a
   shared receipt.
 - Moved intent rejects cycles, conflicts, and host changes. It removes before

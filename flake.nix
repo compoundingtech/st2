@@ -4,9 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Packaged PTY contract: the exact fleet-observation producer revision, including persisted
-    # environment removals used by managed agent restarts.
-    pty.url = "github:compoundingtech/pty/d5fabc3917407aeb937a012bd97679c303e18033";
+    # Packaged PTY dependency: the merged revision with atomic metadata patching and the
+    # fleet-observation guarantees required by st2 reconciliation.
+    pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 

@@ -32,6 +32,7 @@ pub struct FlappingCap {
     launches: HashMap<String, Vec<Instant>>,
     last_launch: HashMap<String, Instant>,
     parked: HashSet<String>,
+    presentation_batch_cursor: usize,
 }
 
 impl FlappingCap {
@@ -47,6 +48,15 @@ impl FlappingCap {
     /// The parked task ids — for reporting "gave up" once each.
     pub fn parked_ids(&self) -> impl Iterator<Item = &String> {
         self.parked.iter()
+    }
+
+    pub(crate) fn presentation_batch_start(&mut self, total: usize, batch: usize) -> usize {
+        if total == 0 {
+            return 0;
+        }
+        let start = self.presentation_batch_cursor % total;
+        self.presentation_batch_cursor = (start + batch.min(total)) % total;
+        start
     }
 
     /// Decide whether `id` may be (re)launched at `now` under `policy`. On `Allow` the caller should

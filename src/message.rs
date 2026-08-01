@@ -314,25 +314,25 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join("archive")
 }
 
-/// The inbox dir for `id` under `root`: the NATIVE catalog inbox (`<agent_dir>/resources/inbox`) if a
-/// catalog agent is discoverable, else the flat bus inbox (`<root>/<id>/inbox`). The
-/// flat fallback lets `st2 ding`/`st2 message` operate on a catalog-LESS bus — e.g. an eval's ST_ROOT,
-/// where agents are booted from a single spec (no on-disk `agent.kdl` to discover). `root` is whatever
-/// `--root`/ST_ROOT names, so the layout follows the spec, never a hardcoded path.
-pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> PathBuf {
-    match resolve_agent_dir(root, id, host) {
-        Some(dir) => inbox_dir(&dir),
-        None => root.join(id).join("inbox"),
+/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus.
+/// Inside a catalog, an absent identity fails closed unless a real flat inbox was explicitly
+/// provisioned, as eval does for its external requester.
+pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
+    match resolve_list_box(root, id, host, false, false) {
+        Ok(inbox) => Ok(inbox),
+        Err(error) => {
+            let flat = root.join(id).join("inbox");
+            match fs::symlink_metadata(&flat) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(flat),
+                _ => Err(error),
+            }
+        }
     }
 }
 
-/// The archive dir for `id` under `root` — native catalog archive if discoverable, else the flat
-/// `<root>/<id>/archive` (companion to [`resolve_inbox`]).
-pub fn resolve_archive(root: &Path, id: &str, host: &str) -> PathBuf {
-    match resolve_agent_dir(root, id, host) {
-        Some(dir) => archive_dir(&dir),
-        None => root.join(id).join("archive"),
-    }
+/// Archive companion to [`resolve_inbox`], with the same stable-ID and catalog-less boundaries.
+pub fn resolve_archive(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, id, host, true, false)
 }
 
 /// Resolve one box for `message ls`.
@@ -654,11 +654,11 @@ mod tests {
         let root = tmp.path();
         // No catalog under root → the flat bus (<root>/<id>/inbox|archive).
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h"),
+            resolve_inbox(root, "mix.sup", "h").unwrap(),
             root.join("mix.sup").join("inbox")
         );
         assert_eq!(
-            resolve_archive(root, "mix.sup", "h"),
+            resolve_archive(root, "mix.sup", "h").unwrap(),
             root.join("mix.sup").join("archive")
         );
         // A discoverable native catalog agent → its resources/inbox.
@@ -666,12 +666,17 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         std::fs::write(
             ad.join("agent.kdl"),
-            "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+            "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  name \"Shared Worker\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
         )
         .unwrap();
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h"),
+            resolve_inbox(root, "mix.sup", "h").unwrap(),
             ad.join("resources").join("inbox")
         );
+        assert!(resolve_inbox(root, "Shared Worker", "h").is_err());
+
+        let requester = root.join("requester").join("inbox");
+        std::fs::create_dir_all(&requester).unwrap();
+        assert_eq!(resolve_inbox(root, "requester", "h").unwrap(), requester);
     }
 }

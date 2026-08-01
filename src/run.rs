@@ -14,21 +14,23 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read as _, Seek as _};
+use std::io::{Read as _, Seek as _, Write as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::reconcile::{PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget};
 use crate::task_inventory::{
     DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
     RuntimeObserver, generation_id,
@@ -38,15 +40,93 @@ use agent_spec::spec::TaskKind;
 // This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+const MAX_PRESENTATION_PATCHES_PER_PASS: usize = 8;
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    output_with_input_timeout(command, timeout, None)
+}
+
+fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Ok(None) | Err(_) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn write_all_before(
+    mut stdin: ChildStdin,
+    mut input: &[u8],
+    deadline: Instant,
+) -> anyhow::Result<bool> {
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error()).context("read metadata stdin flags");
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("make metadata stdin nonblocking");
+    }
+    while !input.is_empty() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        match stdin.write(input) {
+            Ok(0) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                    .context("write metadata patch payload");
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Err(error) => return Err(error).context("write metadata patch payload"),
+        }
+    }
+    Ok(true)
+}
+
+fn output_with_input_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::from(stdout.try_clone()?))
         .stderr(Stdio::from(stderr.try_clone()?));
     unsafe {
@@ -61,21 +141,29 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
+    if let Some(input) = input {
+        let Some(stdin) = child.stdin.take() else {
+            terminate_and_reap_before(child, pid, deadline);
+            anyhow::bail!("metadata patch child has no piped stdin");
+        };
+        match write_all_before(stdin, &input, deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                terminate_and_reap_before(child, pid, deadline);
+                anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
+            }
+            Err(error) => {
+                terminate_and_reap_before(child, pid, deadline);
+                return Err(error);
+            }
+        }
+    }
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = child.kill();
-            // Never turn the timeout into another unbounded wait. Reap asynchronously so a
-            // long-running supervisor does not accumulate zombies, while a wedged runtime cannot
-            // hold up this failed probe or a short-lived doctor process.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            terminate_and_reap_before(child, pid, deadline);
             anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -114,6 +202,11 @@ pub trait Runner {
     /// Spawn `target` in the background from its explicit launch. `spec_dir` is the spec file's
     /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
+    /// Atomically reconcile display metadata and the complete st2-owned tag snapshot for one exact
+    /// existing PTY ID. The default is a no-op for non-PTY test/backends.
+    fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// SIGTERM a running session.
     fn kill(&self, pty_id: &str) -> anyhow::Result<()>;
     /// Reap an exited session before restarting it. Backends may preserve bounded diagnostics here.
@@ -158,6 +251,17 @@ struct PtyListEntry {
     /// PTY-owned generation creation time.
     #[serde(rename = "createdAt", default)]
     created_at: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct PtyMetadataPatch<'a> {
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a Option<String>>,
+    tags: &'a BTreeMap<String, Option<String>>,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -233,9 +337,10 @@ impl PtyCli {
     /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
     /// env can be unit-tested without spawning anything.
     ///
-    /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
-    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// `$VAR`s are expanded here for task-authored values that do NOT pass through a shell — env,
+    /// tags, `cwd`, and direct argv — because `pty` passes them through verbatim. The st2-owned
+    /// presentation snapshot remains literal so initial spawn and later metadata patches agree.
+    /// Shell source is left unexpanded: `sh -c` expands it at spawn from the same env.
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -243,18 +348,48 @@ impl PtyCli {
             .arg("-d") // detached: leave it running in the background
             .arg("--force") // st2 itself may run inside a pty session; allow nesting
             .args(["--id", &target.pty_id]);
-        // Keep the adoption key task-specific, but make a differing human-facing label the owning
-        // agent's stable bus identity instead of pty's auto-derived `<cwd>-sh` label. When the
-        // lifecycle id already IS that identity, suppress pty's automatic `<cwd>-sh` alias: pty
-        // rejects displayName == id, and no displayName makes the UI fall back to the stable id.
-        if target.pty_id == target.bus_id {
-            cmd.arg("--no-display-name");
-        } else {
-            cmd.args(["--name", &target.bus_id]);
+        match target
+            .presentation
+            .as_ref()
+            .map(|presentation| &presentation.display_name)
+        {
+            Some(Some(Some(name))) if name == &target.pty_id => {
+                cmd.arg("--no-display-name");
+            }
+            Some(Some(Some(name))) => {
+                cmd.args(["--name", name]);
+            }
+            Some(Some(None)) => {
+                cmd.arg("--no-display-name");
+            }
+            // Secondary tasks retain the established task-specific presentation convention.
+            _ if target.pty_id == target.bus_id => {
+                cmd.arg("--no-display-name");
+            }
+            _ => {
+                cmd.args(["--name", &target.bus_id]);
+            }
         }
         cmd.arg("--cwd").arg(&cwd);
-        for (k, v) in &target.tags {
-            cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
+        let mut tags = target
+            .tags
+            .iter()
+            .map(|(key, value)| (key.clone(), self.expand(value)))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(presentation) = &target.presentation {
+            for (key, value) in &presentation.tags {
+                match value {
+                    Some(value) => {
+                        tags.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        tags.remove(key);
+                    }
+                }
+            }
+        }
+        for (k, v) in &tags {
+            cmd.arg("--tag").arg(format!("{k}={v}"));
         }
         // Managed agent and DING sessions retain PTY exit evidence until the lifecycle owner records
         // the receipt and explicitly removes the generation. This prevents face607 clean-exit reaping
@@ -443,6 +578,29 @@ impl PtyCli {
         }
     }
 
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        let payload = serde_json::to_vec(&PtyMetadataPatch {
+            display_name: presentation.display_name.as_ref(),
+            tags: &presentation.tags,
+        })?;
+        let out = output_with_input_timeout(
+            Command::new(&self.bin)
+                .args(["metadata", "patch", "--id", &presentation.pty_id])
+                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+            PTY_LIST_TIMEOUT,
+            Some(payload),
+        )
+        .map_err(|error| anyhow::anyhow!("`pty metadata patch --id` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty metadata patch --id {}` failed: {}",
+                presentation.pty_id,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     fn list_entries(&self) -> anyhow::Result<Vec<PtyListEntry>> {
         self.list_entries_at(&effective_pty_root(&self.catalog_root))
     }
@@ -489,6 +647,10 @@ impl Runner for PtyCli {
                 pty_id: e.name,
                 alive: e.status == "running",
                 exit_code: e.exit_code,
+                presentation: Some(crate::reconcile::ObservedPtyPresentation {
+                    display_name: e.display_name,
+                    tags: e.tags,
+                }),
             })
             .collect())
     }
@@ -536,6 +698,10 @@ impl Runner for PtyCli {
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
         anyhow::bail!("spawning pty '{}' failed: {last_err}", target.pty_id);
+    }
+
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        PtyCli::patch_presentation(self, presentation)
     }
 
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -722,6 +888,10 @@ impl Runner for SystemRunner {
         }
     }
 
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        self.pty.patch_presentation(presentation)
+    }
+
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         match self.index.borrow().get(pty_id) {
             Some(TaskKind::Exec) => self.exec.kill(pty_id),
@@ -852,6 +1022,7 @@ impl UpReport {
             || !self.torn_down.is_empty()
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
+            || !self.warnings.is_empty()
             || !self.errors.is_empty()
     }
 }
@@ -944,6 +1115,34 @@ pub fn execute(
                 Err(e) => report.errors.push(format!("kill {id}: {e}")),
             }
         }
+    }
+
+    // Presentation never delays lifecycle convergence. Drift repair is bounded to eight sequential
+    // children, keeping its worst-case 2s-per-child containment below the 30s supervisor cadence;
+    // the persistent cursor rotates remaining drift through later passes without starvation.
+    let presentation_count = plan
+        .presentation
+        .len()
+        .min(MAX_PRESENTATION_PATCHES_PER_PASS);
+    let presentation_start =
+        cap.presentation_batch_start(plan.presentation.len(), presentation_count);
+    for offset in 0..presentation_count {
+        let presentation =
+            &plan.presentation[(presentation_start + offset) % plan.presentation.len()];
+        if let Err(error) = runner.patch_presentation(presentation) {
+            report
+                .errors
+                .push(format!("metadata patch {}: {error}", presentation.pty_id));
+        }
+    }
+    let deferred_presentation = plan
+        .presentation
+        .len()
+        .saturating_sub(MAX_PRESENTATION_PATCHES_PER_PASS);
+    if deferred_presentation > 0 {
+        report.warnings.push(format!(
+            "deferred {deferred_presentation} presentation patches after bounded batch of {MAX_PRESENTATION_PATCHES_PER_PASS}"
+        ));
     }
 
     report
@@ -1607,7 +1806,7 @@ mod tests {
     use super::*;
     use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
     use std::cell::Cell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
 
     fn target(id: &str, cmd: &str) -> TaskTarget {
@@ -1622,6 +1821,7 @@ mod tests {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            presentation: None,
         }
     }
 
@@ -1652,6 +1852,8 @@ mod tests {
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
             identity: "codex".into(),
+            name: None,
+            description: None,
             host: None,
             role: None,
             job_type: JobType::Service,
@@ -1735,12 +1937,15 @@ mod tests {
             pty_id: id.to_string(),
             alive,
             exit_code: None,
+            presentation: None,
         }
     }
 
     fn spec_fixture() -> AgentSpec {
         AgentSpec {
             identity: "demo".into(),
+            name: None,
+            description: None,
             host: Some("hetz".into()),
             role: None,
             job_type: JobType::Service,
@@ -1977,7 +2182,7 @@ mod tests {
     }
 
     /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
-    /// and the owning agent's bus identity as its human-facing name.
+    /// and the established fallback presentation when no Agent Spec name is projected.
     #[test]
     fn build_run_command_wraps_command_in_sh_c() {
         let cli = PtyCli::default();
@@ -2007,6 +2212,245 @@ mod tests {
                 "-c",
                 "exec claude --permission-mode bypassPermissions 'boot'"
             ]
+        );
+    }
+
+    #[test]
+    fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
+        let key = "ST2_TEST_PRESENTATION_LITERAL_71c";
+        unsafe { std::env::set_var(key, "expanded") }
+
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo", "codex");
+        t.bus_id = "hetz.demo".to_owned();
+        t.tags.insert("unrelated".to_owned(), "preserved".to_owned());
+        t.presentation = Some(PtyPresentation {
+            pty_id: "hetz.demo".to_owned(),
+            display_name: Some(Some("Build owner".to_owned())),
+            tags: BTreeMap::from([
+                (
+                    "agent.presentation.schema".to_owned(),
+                    Some("1".to_owned()),
+                ),
+                (
+                    "agent.actor.path".to_owned(),
+                    Some("hetz.demo".to_owned()),
+                ),
+                (
+                    "agent.presentation.description".to_owned(),
+                    Some(format!("${key}")),
+                ),
+            ]),
+        });
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let name = args.iter().position(|arg| arg == "--name").unwrap();
+        assert_eq!(args[name + 1], "Build owner");
+        let tags = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--tag")
+            .map(|pair| pair[1].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(tags.contains("unrelated=preserved"));
+        assert!(tags.contains("agent.presentation.schema=1"));
+        assert!(tags.contains("agent.actor.path=hetz.demo"));
+        assert!(tags.contains("agent.presentation.description=$ST2_TEST_PRESENTATION_LITERAL_71c"));
+    }
+
+    #[test]
+    fn metadata_patch_uses_exact_id_and_one_json_stdin_payload() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("pty-capture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = PtyCli {
+            bin: executable.display().to_string(),
+            catalog_root: temporary.path().to_path_buf(),
+        };
+        let presentation = PtyPresentation {
+            pty_id: "stable.agent.id".to_owned(),
+            display_name: Some(None),
+            tags: BTreeMap::from([
+                (
+                    "agent.presentation.schema".to_owned(),
+                    Some("1".to_owned()),
+                ),
+                ("agent.presentation.description".to_owned(), None),
+            ]),
+        };
+
+        cli.patch_presentation(&presentation).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(executable.with_extension("args")).unwrap(),
+            "metadata\npatch\n--id\nstable.agent.id\n"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(executable.with_extension("stdin")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["displayName"], serde_json::Value::Null);
+        assert_eq!(payload["tags"]["agent.presentation.schema"], "1");
+        assert_eq!(
+            payload["tags"]["agent.presentation.description"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn input_write_failure_terminates_and_reaps_the_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("close-stdin");
+        let pidfile = temporary.path().join("child.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nexec 0<&-\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1024 * 1024];
+        let error = output_with_input_timeout(
+            Command::new(&executable).env("PIDFILE", &pidfile),
+            Duration::from_secs(1),
+            Some(input),
+        )
+        .unwrap_err();
+        let pid = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("Broken pipe"),
+            "unexpected write error: {error:#}"
+        );
+        assert!(
+            !crate::host_lock::process_alive(pid),
+            "failed metadata child {pid} was not terminated and reaped"
+        );
+    }
+
+    #[test]
+    fn input_write_obeys_the_child_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("ignore-stdin");
+        let pidfile = temporary.path().join("child.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let error = output_with_input_timeout(
+            Command::new(&executable).env("PIDFILE", &pidfile),
+            Duration::from_millis(100),
+            Some(input),
+        )
+        .unwrap_err();
+        let pid = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected write error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked stdin write ignored the child deadline"
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::host_lock::process_alive(pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undrained_reader_does_not_retain_the_nonblocking_writer() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let pipe = std::fs::read_link(format!("/proc/self/fd/{}", reader.as_raw_fd())).unwrap();
+        let started = Instant::now();
+
+        assert!(
+            !write_all_before(
+                ChildStdin::from(writer),
+                &vec![b'x'; 1024 * 1024],
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap()
+        );
+        let retained_writers = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target == &pipe)
+            .count();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            retained_writers, 1,
+            "the undrained pipe retained a writer after the deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_write_deadline_prevents_further_progress() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let _reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        assert!(
+            !write_all_before(ChildStdin::from(writer), b"x", Instant::now()).unwrap(),
+            "an expired child deadline still allowed stdin progress"
+        );
+    }
+
+    #[test]
+    fn expired_cleanup_deadline_hands_reaping_off_without_blocking() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let started = Instant::now();
+        terminate_and_reap_before(child, pid, Instant::now());
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "expired cleanup deadline blocked the caller"
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !crate::host_lock::process_alive(pid),
+            "background reaper did not collect child {pid}"
         );
     }
 
@@ -2129,6 +2573,11 @@ mod tests {
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "exec codex 'boot'");
         t.bus_id = t.pty_id.clone();
+        t.presentation = Some(PtyPresentation {
+            pty_id: t.pty_id.clone(),
+            display_name: Some(Some(t.pty_id.clone())),
+            tags: BTreeMap::new(),
+        });
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
         let args: Vec<String> = cmd
             .get_args()
@@ -2519,7 +2968,7 @@ mod tests {
         std::fs::write(
             &fake,
             r#"#!/bin/sh
-printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"1","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
 "#,
         )
         .unwrap();
@@ -2544,6 +2993,18 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         assert!(generation.generation_id().starts_with("sha256:"));
         assert_eq!(first.observations[1].state, ObservedState::Exited);
         assert_eq!(first.observations[2].state, ObservedState::Vanished);
+
+        let sessions = cli.list_sessions().unwrap();
+        let presentation = sessions[0].presentation.as_ref().unwrap();
+        assert_eq!(presentation.display_name.as_deref(), Some("Build owner"));
+        assert_eq!(
+            presentation.tags.get("agent.presentation.schema").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            presentation.tags.get("unrelated").map(String::as_str),
+            Some("preserved")
+        );
     }
 
     #[test]

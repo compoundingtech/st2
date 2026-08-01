@@ -6,7 +6,9 @@ use std::fs;
 use std::path::Path;
 
 use st2::message;
-use st2::reconcile::{Session, TaskTarget};
+use st2::reconcile::{
+    Launch, PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown,
+};
 use st2::run::Runner;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
 use st2::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
@@ -223,6 +225,8 @@ fn selected_one_shot_unknown_refuses_before_runner_list() {
 fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
     AgentSpec {
         identity: identity.into(),
+        name: None,
+        description: None,
         host: host.map(str::to_owned),
         role: None,
         job_type: JobType::Service,
@@ -451,6 +455,7 @@ struct FakeRunner {
     killed: RefCell<Vec<String>>,
     reaped: RefCell<Vec<String>>,
     removed: RefCell<Vec<String>>,
+    patched: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
 }
 
@@ -476,7 +481,15 @@ impl Runner for FakeRunner {
         Ok(())
     }
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
+        self.ops.borrow_mut().push(format!("kill:{pty_id}"));
         self.killed.borrow_mut().push(pty_id.to_string());
+        Ok(())
+    }
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        self.ops
+            .borrow_mut()
+            .push(format!("patch:{}", presentation.pty_id));
+        self.patched.borrow_mut().push(presentation.pty_id.clone());
         Ok(())
     }
     fn reap_for_restart(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -504,6 +517,7 @@ fn live(id: &str) -> Session {
         pty_id: id.to_string(),
         alive: true,
         exit_code: None,
+        presentation: None,
     }
 }
 fn dead(id: &str) -> Session {
@@ -511,7 +525,67 @@ fn dead(id: &str) -> Session {
         pty_id: id.to_string(),
         alive: false,
         exit_code: None,
+        presentation: None,
     }
+}
+
+#[test]
+fn lifecycle_work_precedes_a_bounded_presentation_batch() {
+    let spec = task_spec("owner", None, "host.owner.work");
+    let target = TaskTarget {
+        kind: TaskKind::Exec,
+        pty_id: "host.owner.work".to_owned(),
+        bus_id: "host.owner".to_owned(),
+        name: "work".to_owned(),
+        launch: TaskLaunch::Shell("true".to_owned()),
+        cwd: None,
+        workspace: None,
+        tags: BTreeMap::new(),
+        env: BTreeMap::new(),
+        keep: false,
+        presentation: None,
+    };
+    let presentation = (0..10)
+        .map(|index| PtyPresentation {
+            pty_id: format!("host.presented.{index}"),
+            display_name: Some(Some(format!("Presented {index}"))),
+            tags: BTreeMap::new(),
+        })
+        .collect();
+    let plan = ReconcilePlan {
+        launch: vec![Launch {
+            spec: &spec,
+            tasks: vec![target],
+        }],
+        teardown: vec![Teardown {
+            spec: &spec,
+            pty_ids: vec!["host.retired.work".to_owned()],
+        }],
+        presentation,
+        ..ReconcilePlan::default()
+    };
+    let runner = FakeRunner::default();
+    let mut report = UpReport::default();
+    let mut cap = FlappingCap::default();
+
+    execute(&plan, &runner, &mut cap, &mut report);
+
+    assert_eq!(
+        &runner.ops.borrow()[..2],
+        ["spawn:host.owner.work", "kill:host.retired.work"]
+    );
+    assert_eq!(runner.patched.borrow().len(), 8);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("deferred 2 presentation patches"))
+    );
+    assert!(report.is_noteworthy());
+
+    execute(&plan, &runner, &mut cap, &mut UpReport::default());
+    let patched = runner.patched.borrow();
+    assert!((0..10).all(|index| patched.contains(&format!("host.presented.{index}"))));
 }
 
 /// A v2 service job: a pty agent + an exec ding.
