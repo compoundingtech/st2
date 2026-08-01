@@ -1076,6 +1076,16 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             None
         };
 
+        if let Some(routes) = canonical_routes.as_ref() {
+            if routes.contains_key(&requester) {
+                anyhow::bail!(
+                    "canonical-agents requester `{requester}` must be external to the admitted Agent Specs"
+                );
+            }
+            std::fs::create_dir_all(bus.join(&requester).join("inbox"))
+                .with_context(|| format!("provisioning external requester `{requester}` inbox"))?;
+        }
+
         eval_log!("== boot team ({} agents) ==", specs.len());
         let boot = boot_team(&specs, host, catalog)?;
         if eval.canonical_agents {

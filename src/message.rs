@@ -314,10 +314,20 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join("archive")
 }
 
-/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus;
-/// once declarations or discovery errors make it a catalog, an absent identity fails closed.
+/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus.
+/// Inside a catalog, an absent identity fails closed unless a real flat inbox was explicitly
+/// provisioned, as eval does for its external requester.
 pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
-    resolve_list_box(root, id, host, false, false)
+    match resolve_list_box(root, id, host, false, false) {
+        Ok(inbox) => Ok(inbox),
+        Err(error) => {
+            let flat = root.join(id).join("inbox");
+            match fs::symlink_metadata(&flat) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(flat),
+                _ => Err(error),
+            }
+        }
+    }
 }
 
 /// Archive companion to [`resolve_inbox`], with the same stable-ID and catalog-less boundaries.
@@ -656,7 +666,7 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         std::fs::write(
             ad.join("agent.kdl"),
-            "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+            "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  name \"Shared Worker\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
         )
         .unwrap();
         assert_eq!(
@@ -664,5 +674,9 @@ mod tests {
             ad.join("resources").join("inbox")
         );
         assert!(resolve_inbox(root, "Shared Worker", "h").is_err());
+
+        let requester = root.join("requester").join("inbox");
+        std::fs::create_dir_all(&requester).unwrap();
+        assert_eq!(resolve_inbox(root, "requester", "h").unwrap(), requester);
     }
 }
