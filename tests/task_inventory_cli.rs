@@ -118,6 +118,239 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
 }
 
 #[test]
+fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
+    let (tmp, catalog, bin) = fixture("[]");
+    let prepared_a = tmp.path().join("prepared-a");
+    let prepared_b = tmp.path().join("prepared-b");
+    let snapshot = |output: &Path| {
+        let result = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args([
+                "catalog",
+                "snapshot",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()
+    };
+    let root_a = snapshot(&prepared_a)["rootSha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    snapshot(&prepared_b);
+    let b_spec = prepared_b.join("agents/h/worker/agent.kdl");
+    let bytes = fs::read_to_string(&b_spec)
+        .unwrap()
+        .replace("agent \"worker\" {", "agent \"worker\" {\n  retired #true");
+    fs::write(&b_spec, bytes).unwrap();
+
+    let observer_ready = tmp.path().join("observer-ready");
+    let observer_release = tmp.path().join("observer-release");
+    write_executable(
+        &bin.join("pty"),
+        &format!(
+            "#!/bin/sh\n: > {:?}\nwhile [ ! -e {:?} ]; do :; done\nprintf '[]\\n'\n",
+            observer_ready, observer_release
+        ),
+    );
+    let inventory = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["tasks", "--host", "h", "--json", "--catalog"])
+        .arg(&catalog)
+        .env("PATH", &bin)
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !observer_ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runtime observer did not start"
+        );
+        std::thread::yield_now();
+    }
+
+    let apply = |prepared: &Path, expected: &str| {
+        Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args([
+                "catalog",
+                "apply",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--prepared",
+                prepared.to_str().unwrap(),
+                "--expect-sha256",
+                expected,
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let to_b = apply(&prepared_b, &root_a);
+    assert!(
+        to_b.status.success(),
+        "{}",
+        String::from_utf8_lossy(&to_b.stderr)
+    );
+    let root_b = serde_json::from_slice::<serde_json::Value>(&to_b.stdout).unwrap()["afterSha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let to_a = apply(&prepared_a, &root_b);
+    assert!(
+        to_a.status.success(),
+        "{}",
+        String::from_utf8_lossy(&to_a.stderr)
+    );
+    fs::write(&observer_release, "").unwrap();
+
+    let inventory = inventory.wait_with_output().unwrap();
+    assert!(!inventory.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    assert_eq!(value["complete"], false);
+    assert!(value["errors"].as_array().unwrap().iter().any(|error| {
+        error
+            .as_str()
+            .is_some_and(|error| error.contains("generation changed"))
+    }));
+}
+
+#[test]
+fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete() {
+    for writer in ["publish", "presentation"] {
+        let (tmp, catalog, bin) = fixture("[]");
+        let spec = catalog.join("agents/h/worker/agent.kdl");
+        let original = fs::read_to_string(&spec).unwrap();
+        let observer_ready = tmp.path().join("observer-ready");
+        let observer_release = tmp.path().join("observer-release");
+        write_executable(
+            &bin.join("pty"),
+            &format!(
+                "#!/bin/sh\n: > {:?}\nwhile [ ! -e {:?} ]; do :; done\nprintf '[]\\n'\n",
+                observer_ready, observer_release
+            ),
+        );
+        let inventory = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["tasks", "--host", "h", "--json", "--catalog"])
+            .arg(&catalog)
+            .env("PATH", &bin)
+            .env("XDG_STATE_HOME", tmp.path().join("state"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !observer_ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime observer did not start"
+            );
+            std::thread::yield_now();
+        }
+
+        if writer == "publish" {
+            let source_a = tmp.path().join("source-a.kdl");
+            let source_b = tmp.path().join("source-b.kdl");
+            fs::write(&source_a, &original).unwrap();
+            fs::write(
+                &source_b,
+                original.replace(
+                    "agent \"worker\" {",
+                    "agent \"worker\" {\n  name \"temporary\"",
+                ),
+            )
+            .unwrap();
+            let digest = |source: &Path| {
+                let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+                    .args(["agent", "digest", "--spec"])
+                    .arg(source)
+                    .arg("--json")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let digest_a = digest(&source_a);
+            let digest_b = digest(&source_b);
+            for (source, input, expected) in [
+                (&source_b, digest_b.as_str(), digest_a.as_str()),
+                (&source_a, digest_a.as_str(), digest_b.as_str()),
+            ] {
+                let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+                    .args([
+                        "agent",
+                        "publish",
+                        "--catalog",
+                        catalog.to_str().unwrap(),
+                        "--spec",
+                        source.to_str().unwrap(),
+                        "--input-sha256",
+                        input,
+                        "--expect-sha256",
+                        expected,
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        } else {
+            for args in [
+                vec!["rename", "h.worker", "temporary", "--host", "h"],
+                vec!["rename", "h.worker", "--clear", "--host", "h"],
+            ] {
+                let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+                    .arg("--catalog")
+                    .arg(&catalog)
+                    .args(args)
+                    .env_remove("ST_AGENT")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        assert_eq!(fs::read_to_string(&spec).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(catalog.join(".st2/catalog-generation")).unwrap(),
+            "2\n"
+        );
+        fs::write(&observer_release, "").unwrap();
+        let inventory = inventory.wait_with_output().unwrap();
+        assert!(
+            !inventory.status.success(),
+            "{writer} ABA was reported complete"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+        assert_eq!(value["complete"], false);
+        assert!(value["errors"].as_array().unwrap().iter().any(|error| {
+            error
+                .as_str()
+                .is_some_and(|error| error.contains("generation changed"))
+        }));
+    }
+}
+
+#[test]
 fn incomplete_or_malformed_pty_generation_is_json_nonzero_and_never_absent() {
     for pty_json in [
         r#"[{"name":"h.worker","status":"running","pid":77}]"#,

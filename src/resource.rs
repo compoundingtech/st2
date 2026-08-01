@@ -35,14 +35,26 @@ fn valid_url(url: &str) -> bool {
     match url.split_once(':') {
         Some((scheme, _)) => {
             !scheme.is_empty()
-                && scheme.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.')
+                && scheme.bytes().all(|b| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b == b'+'
+                        || b == b'-'
+                        || b == b'.'
+                })
         }
         None => false,
     }
 }
 
 /// Render a resource record's file contents (frontmatter + body).
-pub fn render(url: &str, title: Option<&str>, tags: &[String], relation: Option<&str>, body: &str) -> String {
+pub fn render(
+    url: &str,
+    title: Option<&str>,
+    tags: &[String],
+    relation: Option<&str>,
+    body: &str,
+) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("url: {url}\n"));
     if let Some(t) = title {
@@ -71,7 +83,9 @@ fn parse(filename: &str, contents: &str) -> Resource {
         relation: None,
         body: String::new(),
     };
-    let rest = contents.strip_prefix("---\n").or_else(|| contents.strip_prefix("---\r\n"));
+    let rest = contents
+        .strip_prefix("---\n")
+        .or_else(|| contents.strip_prefix("---\r\n"));
     if let Some(rest) = rest
         && let Some(end) = rest.find("\n---")
     {
@@ -79,12 +93,20 @@ fn parse(filename: &str, contents: &str) -> Resource {
         let after = &rest[end + 1..];
         let body = after.split_once('\n').map(|x| x.1).unwrap_or("");
         for line in front.lines() {
-            let Some((k, v)) = line.split_once(':') else { continue };
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
             let v = v.trim();
             match k.trim() {
                 "url" => r.url = v.to_string(),
                 "title" => r.title = Some(v.to_string()),
-                "tags" => r.tags = v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+                "tags" => {
+                    r.tags = v
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                }
                 "relation" => r.relation = Some(v.to_string()),
                 _ => {}
             }
@@ -118,19 +140,27 @@ pub fn add(
             return Ok(filename);
         }
     }
-    anyhow::bail!("could not allocate a unique resource filename in {}", links_dir.display())
+    anyhow::bail!(
+        "could not allocate a unique resource filename in {}",
+        links_dir.display()
+    )
 }
 
 /// List an agent's resources, sorted by add time (filename).
 pub fn list(links_dir: &Path) -> Vec<Resource> {
     let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(links_dir) else { return out };
+    let Ok(rd) = fs::read_dir(links_dir) else {
+        return out;
+    };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !message::is_message_filename(&name) {
             continue;
         }
-        out.push(parse(&name, &fs::read_to_string(e.path()).unwrap_or_default()));
+        out.push(parse(
+            &name,
+            &fs::read_to_string(e.path()).unwrap_or_default(),
+        ));
     }
     out.sort_by(|a, b| a.filename.cmp(&b.filename));
     out
@@ -145,7 +175,12 @@ pub fn read(links_dir: &Path, filename: &str) -> anyhow::Result<Resource> {
 
 /// Remove one resource record.
 pub fn remove(links_dir: &Path, filename: &str) -> anyhow::Result<()> {
-    fs::remove_file(links_dir.join(filename)).map_err(|e| anyhow::anyhow!("removing {filename}: {e}"))
+    anyhow::ensure!(
+        message::is_message_filename(filename),
+        "invalid resource filename {filename:?}"
+    );
+    fs::remove_file(links_dir.join(filename))
+        .map_err(|e| anyhow::anyhow!("removing {filename}: {e}"))
 }
 
 #[cfg(test)]
@@ -157,7 +192,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = links_dir(tmp.path());
         let tags = vec!["pr".to_string(), "st2".to_string()];
-        let f = add(&dir, "https://github.com/x/y/pull/1", Some("M2.6 PR"), &tags, Some("output"), "the resource PR").unwrap();
+        let f = add(
+            &dir,
+            "https://github.com/x/y/pull/1",
+            Some("M2.6 PR"),
+            &tags,
+            Some("output"),
+            "the resource PR",
+        )
+        .unwrap();
 
         let all = list(&dir);
         assert_eq!(all.len(), 1);
@@ -170,6 +213,19 @@ mod tests {
         assert_eq!(read(&dir, &f).unwrap().body.trim_end(), "the resource PR");
         remove(&dir, &f).unwrap();
         assert!(list(&dir).is_empty());
+    }
+
+    #[test]
+    fn remove_rejects_noncanonical_leaf_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let links = links_dir(tmp.path());
+        fs::create_dir_all(&links).unwrap();
+        fs::write(tmp.path().join("outside.md"), "unchanged").unwrap();
+        assert!(remove(&links, "../outside.md").is_err());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("outside.md")).unwrap(),
+            "unchanged"
+        );
     }
 
     #[test]

@@ -144,8 +144,30 @@ accepted.
   A durable incomplete-apply marker fences every declaration-plane snapshot and
   action after a crashed whole-catalog apply; a resident supervisor stays alive
   but performs zero lifecycle actions until the transaction is completed.
+  Every successful declaration commit advances a durable monotonic catalog
+  generation; whole-catalog apply advances it before its marker clears. Unlocked
+  diagnostic readers therefore detect even a completed declaration ABA across
+  their observation. A durable incomplete-generation intent fences readers
+  across each single-writer commit and is conservatively recovered by the next
+  exclusive writer. Writer staging exists only in the reserved control plane,
+  never among authoritative declaration leaves.
   Presence, messages, context, and Resource state remain independently writable
   and are never serialized behind catalog authoring.
+  A caller binds single-agent publication to the exact no-follow source capture
+  with an authoritative input digest. A canonical whole-catalog snapshot
+  externalizes the declaration-root digest while excluding runtime state and
+  workspace content. Its closed projection includes every regular file in a
+  bounded `_templates` library and exact declared canonical workspace directory
+  facts. Whole-catalog apply accepts only that projection, rechecks the root
+  digest under the exclusive lock, durably stages the desired bytes, and resumes
+  after interruption solely from a closed marker and its content-addressed
+  stage. Version 1 requires one explicit external PTY root and rejects effective
+  PTY-root changes. Fresh-catalog bootstrap is a separate cross-producer
+  transaction, not a catalog-apply mode. Apply never traverses, hashes, deletes,
+  or relocates workspace or runtime state. An absent canonical identity becomes
+  visible only as a complete bundle; a preexisting declared workspace skeleton
+  remains safe because the durable marker fences declaration readers and
+  marker-time state routing throughout leaf publication and verification.
 - **R23 Fail-closed task inventory:** One read-only machine command exposes
   every desired local PTY and exec task by agent identity, task name, runtime
   id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
@@ -160,6 +182,9 @@ accepted.
   incomplete; the external backend may already have recreated a concurrently
   removed registry. This diagnostic boundary is not transactionally serialized
   with catalog or runtime writers and is not control-plane cutover authority.
+  It samples the durable catalog generation and incomplete marker around
+  discovery and runtime observation; any marker, malformed fence, or generation
+  change makes the envelope incomplete.
 - **R24 Stable identity and bounded presentation:** The positional Agent Spec
   identity and its host-qualified bus identity remain the sole stable keys for
   routing, ownership, adoption, lifecycle, and automation. Agent Specs may

@@ -93,6 +93,10 @@ pub fn write_now(context_dir: &Path, content: &str) -> anyhow::Result<()> {
 /// scannable list; multi-line reasoning belongs in a doc). Renders `- <ISO> <decision>. why: <why>.`
 /// into a fresh `decisions/<unix-ms>-<rand6>.md`. Returns the entry's filename.
 pub fn append_decision(context_dir: &Path, decision: &str, why: &str) -> anyhow::Result<String> {
+    append_decision_to_dir(&decisions_dir(context_dir), decision, why)
+}
+
+pub fn append_decision_to_dir(dir: &Path, decision: &str, why: &str) -> anyhow::Result<String> {
     let decision = decision.trim();
     let why = why.trim();
     if decision.is_empty() {
@@ -106,8 +110,7 @@ pub fn append_decision(context_dir: &Path, decision: &str, why: &str) -> anyhow:
             "context append: --decision and --why must be single lines (the log is a scannable list)"
         );
     }
-    let dir = decisions_dir(context_dir);
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir)?;
     let line = format!(
         "- {} {}. why: {}.\n",
         iso_utc_now(),

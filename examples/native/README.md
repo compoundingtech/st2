@@ -25,7 +25,9 @@ Use this sequence:
 ```sh
 st2 hooks install
 st2 hooks verify
-st2 agent publish --catalog <catalog> --bundle <bundle> --expect-absent --json
+input_sha256="$(st2 agent digest --bundle <bundle>)"
+st2 agent publish --catalog <catalog> --bundle <bundle> \
+  --input-sha256 "$input_sha256" --expect-absent --json
 st2 validate <catalog>
 st2 up <catalog> --host <host> --materialize-only
 st2 up <catalog> --host <host> --once

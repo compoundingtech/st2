@@ -1846,7 +1846,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         );
         return;
     };
-    let Some(agent_dir) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
+    let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
         eprintln!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id

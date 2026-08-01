@@ -8,19 +8,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_spec::spec::{AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, validate_presentation};
 use kdl::{KdlDocument, KdlNode};
 use serde::Serialize;
 
 use crate::catalog_lock::CatalogLock;
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceVersion {
@@ -139,7 +136,7 @@ pub fn set_presentation(
     field: PresentationField,
     requested: Option<&str>,
 ) -> Result<PresentationReceipt, AuthorError> {
-    let _catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
+    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
         AuthorError::new(
             "catalog-lock-failed",
             format!("acquire catalog-authoring lock: {error:#}"),
@@ -166,6 +163,10 @@ pub fn set_presentation(
         })
         .transpose()?;
     let result = edit_declaration(
+        &catalog_lock,
+        catalog_root,
+        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
+            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
         &target.declaration,
         &target.identity,
         &target.source_host,
@@ -286,7 +287,17 @@ fn edit_declaration_for_test(
     requested: Option<&str>,
     before_commit: impl FnOnce(),
 ) -> Result<AuthorOutcome, AuthorError> {
+    let control = path
+        .parent()
+        .expect("test declaration has a parent")
+        .join(crate::catalog_lock::CONTROL_DIR);
+    fs::create_dir_all(&control).expect("create test catalog control directory");
+    let catalog_lock = CatalogLock::exclusive(path.parent().expect("test catalog has a parent"))
+        .expect("acquire test catalog lock");
     edit_declaration(
+        &catalog_lock,
+        path.parent().expect("test catalog has a parent"),
+        &control,
         path,
         expected_identity,
         expected_host,
@@ -298,6 +309,9 @@ fn edit_declaration_for_test(
 }
 
 fn edit_declaration(
+    catalog_lock: &CatalogLock,
+    catalog: &Path,
+    control: &Path,
     path: &Path,
     expected_identity: &str,
     expected_host: &str,
@@ -368,6 +382,9 @@ fn edit_declaration(
         requested,
     )?;
     atomic_replace_checked(
+        catalog_lock,
+        catalog,
+        control,
         path,
         &original,
         original_version,
@@ -710,6 +727,9 @@ fn verify_candidate(
 }
 
 fn atomic_replace_checked(
+    catalog_lock: &CatalogLock,
+    catalog: &Path,
+    control: &Path,
     path: &Path,
     original: &[u8],
     original_version: SourceVersion,
@@ -723,28 +743,27 @@ fn atomic_replace_checked(
             format!("declaration path {} has no parent", path.display()),
         )
     })?;
-    let temporary = directory.join(format!(
-        ".agent.kdl.presentation-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&temporary)?;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.write_all(replacement)?;
-        file.sync_all()
-    })();
-    if let Err(error) = write {
-        let _ = fs::remove_file(&temporary);
-        return Err(AuthorError::new(
-            "declaration-write-failed",
-            format!("staging declaration {}: {error}", path.display()),
-        ));
-    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix("agent-presentation-")
+        .tempfile_in(control)
+        .map_err(|error| {
+            AuthorError::new(
+                "declaration-write-failed",
+                format!("staging declaration {}: {error}", path.display()),
+            )
+        })?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .and_then(|()| temporary.write_all(replacement))
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| {
+            AuthorError::new(
+                "declaration-write-failed",
+                format!("staging declaration {}: {error}", path.display()),
+            )
+        })?;
+    test_crash_after_temporary_write();
     before_commit();
     let current = fs::symlink_metadata(path)
         .ok()
@@ -752,7 +771,6 @@ fn atomic_replace_checked(
         .map(|metadata| (SourceVersion::from_metadata(&metadata), fs::read(path).ok()));
     if !matches!(current, Some((version, Some(bytes))) if version == original_version && bytes == original)
     {
-        let _ = fs::remove_file(&temporary);
         return Err(AuthorError::new(
             "source-changed",
             format!(
@@ -761,8 +779,18 @@ fn atomic_replace_checked(
             ),
         ));
     }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
+    let generation = catalog_lock.begin_generation_commit().map_err(|error| {
+        AuthorError::new(
+            "declaration-write-failed",
+            format!("prepare catalog generation: {error:#}"),
+        )
+    })?;
+    if let Err(error) = crate::catalog_transaction::persist_tempfile_from_control(
+        catalog_lock.control(),
+        catalog,
+        temporary,
+        path,
+    ) {
         return Err(AuthorError::new(
             "declaration-write-failed",
             format!(
@@ -771,7 +799,7 @@ fn atomic_replace_checked(
             ),
         ));
     }
-    fs::File::open(directory)
+    crate::catalog_transaction::open_dir_beneath(catalog, directory)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
             AuthorError::new(
@@ -781,8 +809,25 @@ fn atomic_replace_checked(
                     directory.display()
                 ),
             )
-        })
+        })?;
+    generation.commit().map_err(|error| {
+        AuthorError::new(
+            "declaration-write-failed",
+            format!("advance catalog generation: {error:#}"),
+        )
+    })?;
+    Ok(())
 }
+
+#[cfg(debug_assertions)]
+fn test_crash_after_temporary_write() {
+    if std::env::var_os("ST2_TEST_AGENT_AUTHOR_CRASH_AFTER_TEMP").is_some() {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_crash_after_temporary_write() {}
 
 #[cfg(test)]
 mod tests {
@@ -908,15 +953,8 @@ mod tests {
         );
         let path = write(root, "h/worker/agent.kdl", &with_name);
 
-        let receipt = set_presentation(
-            root,
-            "h.worker",
-            "h",
-            None,
-            PresentationField::Name,
-            None,
-        )
-        .unwrap();
+        let receipt =
+            set_presentation(root, "h.worker", "h", None, PresentationField::Name, None).unwrap();
 
         assert_eq!(receipt.result, AuthorOutcome::Changed);
         assert_eq!(fs::read_to_string(path).unwrap(), original);
