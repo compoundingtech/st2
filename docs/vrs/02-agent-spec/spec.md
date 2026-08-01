@@ -453,11 +453,17 @@ replacement of drifted work.
   pinned merged PTY dependency provides the exact-ID atomic metadata-patch API;
   compatible st2 and Nix provenance adoption must still deploy as one gated cohort.
 - **G10, shared admission:** st2 runner lowering, validation, and publication
-  consume the shared lossless parser. Its revisioned validation and publication
-  receipts bind `st2.core+catalog.v1`; publication re-reads the exact digest and
-  re-admits the live catalog before success. Axe managed admission does not yet
-  consume that revisioned receipt and the same complete core result, so the
-  cross-tool invariant and shared diagnostic envelope remain open.
+  and Axe managed admission consume shared discovery and retained lossless
+  parsing. Axe accepts strict validation and publication receipts only when
+  their schema, `st2.core+catalog.v1` profile, and full parser revision match its
+  own shared parser. After st2 admits and publishes under the catalog lock, Axe
+  verifies the receipt digests, opens the exact published regular file through
+  descriptor-relative no-follow traversal, runs core and managed admission,
+  then reads and verifies the digest again; intervening drift is reported as
+  `superseded`. The cross-tool parse, admission, revision, and publication
+  invariant is closed. The common diagnostic envelope remains open: st2
+  validation issues do not yet carry the specified layer, span, field path, and
+  help fields, so Axe cannot preserve them when incorporating core diagnostics.
 
 ## Acceptance cases
 
