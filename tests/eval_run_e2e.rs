@@ -810,6 +810,20 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
                 r#"agent "worker" { identity "worker"; name "requester"; host "evalhost"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
             )],
         ),
+        (
+            "duplicate canonical route",
+            "worker",
+            vec![
+                (
+                    "worker",
+                    r#"agent "worker" { identity "worker"; host "evalhost"; argv "sh" "-c" "touch \"$CATALOG/SPAWNED\"; sleep 60" }"#,
+                ),
+                (
+                    "qualified",
+                    r#"agent "evalhost.worker" { identity "evalhost.worker"; host "evalhost"; argv "sh" "-c" "sleep 60" }"#,
+                ),
+            ],
+        ),
     ];
     for (expected, target, declarations) in cases {
         let tmp = tempfile::tempdir().unwrap();

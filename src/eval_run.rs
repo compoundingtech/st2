@@ -258,8 +258,18 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             inbox: crate::message::inbox_dir(agent_dir),
             archive: crate::message::archive_dir(agent_dir),
         };
-        routes.insert(bus_id, route.clone());
-        routes.insert(spec.identity.clone(), route);
+        for spelling in [bus_id, spec.identity.clone()] {
+            match routes.entry(spelling.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(route.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    anyhow::bail!(
+                        "canonical-agents found duplicate canonical route spelling `{spelling}`"
+                    );
+                }
+            }
+        }
     }
     runtime_tasks.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
 
