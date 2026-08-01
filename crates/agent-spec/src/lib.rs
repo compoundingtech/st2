@@ -22,6 +22,12 @@
 //! them without assigning policy, so st2 stays render-agnostic while policy consumers do not need a
 //! second parser.
 
+/// Source revision of the complete public parser and lowering contract.
+///
+/// Hermetic builds inject the full source revision. Native builds use the full clean Git revision
+/// or an explicit `local-dirty.*`/`local.unknown` identity, so unlike builds cannot compare equal.
+pub const AGENT_SPEC_REVISION: &str = env!("AGENT_SPEC_REVISION");
+
 pub mod declared;
 pub mod discovery;
 mod kdl_format;
