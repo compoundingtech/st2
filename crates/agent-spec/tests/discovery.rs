@@ -803,9 +803,12 @@ uri = 'thing://bad"quote'
     let found = discover(tmp.path());
     assert!(found.specs.is_empty(), "{:?}", found.specs);
     assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
-    assert!(found.errors.iter().all(|error| error
-        .message
-        .contains("must be an exact absolute URI")));
+    assert!(
+        found
+            .errors
+            .iter()
+            .all(|error| error.message.contains("must be an exact absolute URI"))
+    );
 }
 
 #[test]
@@ -1101,6 +1104,42 @@ fn non_spec_files_are_skipped_silently() {
     assert_eq!(found.specs.len(), 1, "only the real job, not package.json");
     assert_eq!(found.specs[0].identity, "x");
     assert!(found.errors.is_empty());
+}
+
+#[test]
+fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "themes/layout.kdl",
+        r#"layout { pane "sidebar"; pane "main" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/x/agent.kdl",
+        r#"agent "x" { host "hetz"; command "true" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert_eq!(found.specs.len(), 1);
+    assert_eq!(found.declarations.len(), 1);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+}
+
+#[test]
+fn discovery_retains_the_immutable_parse_that_it_lowered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = "agents/hetz/x/agent.kdl";
+    let source = r#"agent "x" { host "hetz"; command "true" }"#;
+    write(tmp.path(), path, source);
+
+    let found = discover(tmp.path());
+    write(tmp.path(), path, "this is no longer valid KDL {");
+
+    let parsed = found.declarations[0].parse.as_ref().unwrap();
+    assert_eq!(parsed.document.as_ref().unwrap().source, source);
+    assert!(parsed.is_valid());
+    assert_eq!(found.specs[0].identity, "x");
 }
 
 #[test]
