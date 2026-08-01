@@ -134,6 +134,18 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+- **R27 Transactional catalog authoring:** One st2 publication operation admits
+  exactly one canonical KDL Agent Spec, with explicit host and identity, against
+  the complete prospective catalog. Publication is compare-and-swap, durable,
+  and atomic: readers observe either the previous declaration set or the next
+  complete set. Reconciliation holds one coherent declaration snapshot through
+  materialization, runtime observation, planning, and execution, so a retirement
+  cannot commit and then be followed by a launch from stale catalog input.
+  A durable incomplete-apply marker fences every declaration-plane snapshot and
+  action after a crashed whole-catalog apply; a resident supervisor stays alive
+  but performs zero lifecycle actions until the transaction is completed.
+  Presence, messages, context, and Resource state remain independently writable
+  and are never serialized behind catalog authoring.
 - **R23 Fail-closed task inventory:** One read-only machine command exposes
   every desired local PTY and exec task by agent identity, task name, runtime
   id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
@@ -161,8 +173,8 @@ accepted.
 - **R25 Constrained presentation authoring:** `st2 rename` and `st2 describe`
   set or clear only their corresponding direct field in one canonical KDL
   declaration selected by stable identity. They preserve unrelated source
-  bytes, serialize cooperating local writers through the persistent private
-  `.st2/presentation-authoring.lock`, reject a stale source before atomic
+  bytes, serialize cooperating local writers through the persistent shared
+  `.st2/catalog-authoring.lock`, reject a stale source before atomic
   replacement, fsync the result, and return classified receipts. The lock inode
   is never removed or stale-recovered and defines one local POSIX
   filesystem/kernel exclusion domain; it is not cross-host coordination or OS

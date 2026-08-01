@@ -1,16 +1,15 @@
 //! Constrained, source-preserving authoring of Agent Spec presentation metadata.
 //!
-//! Presentation is declaration state, not runtime identity. Every edit holds a private persistent
-//! catalog-wide presentation lock, rechecks the original bytes, and atomically replaces exactly one
+//! Presentation is declaration state, not runtime identity. Every edit holds the shared persistent
+//! catalog-authoring lock, rechecks the original bytes, and atomically replaces exactly one
 //! canonical KDL declaration. TOML, JSON, declarations marked Nix-owned, and callers outside the
 //! supplied actor relationship fail closed. `ST_AGENT` is a trusted-fleet guardrail rather than
 //! authentication. The lock serializes cooperating local st2 writers; it is not a cross-host lock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,112 +18,9 @@ use agent_spec::spec::{AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, valida
 use kdl::{KdlDocument, KdlNode};
 use serde::Serialize;
 
+use crate::catalog_lock::CatalogLock;
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-const PRESENTATION_LOCK_FILE: &str = "presentation-authoring.lock";
-
-/// Persistent local lock for the two presentation-authoring commands. Keeping one inode is
-/// essential: unlinking a lock file while a process holds it would split the exclusion domain.
-#[derive(Debug)]
-struct PresentationAuthorLock {
-    file: File,
-}
-
-impl PresentationAuthorLock {
-    fn exclusive(catalog_root: &Path) -> anyhow::Result<Self> {
-        let catalog = catalog_root.canonicalize().map_err(|error| {
-            anyhow::anyhow!("canonicalize catalog {}: {error}", catalog_root.display())
-        })?;
-        let metadata = fs::symlink_metadata(&catalog)
-            .map_err(|error| anyhow::anyhow!("read catalog {}: {error}", catalog.display()))?;
-        anyhow::ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "catalog root is not a real directory: {}",
-            catalog.display()
-        );
-
-        let control = catalog.join(".st2");
-        match fs::symlink_metadata(&control) {
-            Ok(metadata) => anyhow::ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "catalog control path is not a real directory: {}",
-                control.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&control) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let metadata = fs::symlink_metadata(&control).map_err(|error| {
-                            anyhow::anyhow!(
-                                "re-read catalog control path {}: {error}",
-                                control.display()
-                            )
-                        })?;
-                        anyhow::ensure!(
-                            metadata.is_dir() && !metadata.file_type().is_symlink(),
-                            "catalog control path is not a real directory: {}",
-                            control.display()
-                        );
-                    }
-                    Err(error) => {
-                        return Err(anyhow::anyhow!(
-                            "create catalog control path {}: {error}",
-                            control.display()
-                        ));
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "read catalog control path {}: {error}",
-                    control.display()
-                ));
-            }
-        }
-        // Persist a newly created control-directory entry before the lock can guard a declaration
-        // replacement. Repeating this for an existing directory is harmless and closes a prior
-        // creator's crash between mkdir and parent fsync.
-        File::open(&catalog)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| anyhow::anyhow!("sync catalog {}: {error}", catalog.display()))?;
-
-        let path = control.join(PRESENTATION_LOCK_FILE);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| {
-                anyhow::anyhow!("open presentation lock {}: {error}", path.display())
-            })?;
-        let metadata = file.metadata().map_err(|error| {
-            anyhow::anyhow!("inspect presentation lock {}: {error}", path.display())
-        })?;
-        anyhow::ensure!(
-            metadata.is_file(),
-            "presentation lock is not a regular file: {}",
-            path.display()
-        );
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if result != 0 {
-            return Err(anyhow::anyhow!(
-                "lock presentation lock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(Self { file })
-    }
-}
-
-impl Drop for PresentationAuthorLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceVersion {
@@ -243,10 +139,10 @@ pub fn set_presentation(
     field: PresentationField,
     requested: Option<&str>,
 ) -> Result<PresentationReceipt, AuthorError> {
-    let _presentation_lock = PresentationAuthorLock::exclusive(catalog_root).map_err(|error| {
+    let _catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
         AuthorError::new(
-            "presentation-lock-failed",
-            format!("acquire presentation-authoring lock: {error:#}"),
+            "catalog-lock-failed",
+            format!("acquire catalog-authoring lock: {error:#}"),
         )
     })?;
     let found = crate::discover(catalog_root);

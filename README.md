@@ -4,8 +4,8 @@ st2 runs a declarative network of Codex and Claude agents from one catalog. It o
 reconciliation, native messages, normalized terminal DING delivery, presence, durable context,
 workspace materialization, and explicit teardown.
 
-Hand-authored KDL is the canonical interface. `st2 compile-agent` is experimental and must be
-reviewed before its output is materialized.
+Canonical KDL is the authoring interface. Publish one explicit Agent Spec transactionally with
+`st2 agent publish`; st2 does not compile human intent into declarations.
 
 ## Product intent and implementation contract
 
@@ -99,17 +99,17 @@ Start from the maintained [Codex](examples/native/agent-codex.kdl) or
 
 ```sh
 export CATALOG="${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog"
-mkdir -p "$CATALOG/agents/<host>/<identity>" "$CATALOG/_templates"
-cp examples/native/agent-codex.kdl "$CATALOG/agents/<host>/<identity>/agent.kdl"
-${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
+bundle="$(mktemp -d)"
+mkdir -p "$bundle/assets"
+cp examples/native/agent-codex.kdl "$bundle/agent.kdl"
+cp ./composed-AGENTS.md "$bundle/assets/AGENTS.md"
+${EDITOR:-vi} "$bundle/agent.kdl"
+st2 agent publish --catalog "$CATALOG" --bundle "$bundle" --expect-absent --json
 ```
 
-Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`. The maintained declaration does not add workspace trust.
-`compile-agent` also omits trust by default. Pass `--harness codex --trust-workspace` to opt in to an
-argv-local Codex `projects` trust override. The generator serializes the declared workspace as the
-exact decoded key; other harnesses reject the flag. This is a launch convention inside opaque argv,
-not agent-spec grammar enforced by st2.
+Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Include every file referenced by
+`copy` in the bundle. For a later declaration-only update, publish `agent.kdl` with the current
+declaration's SHA-256 via `--spec ... --expect-sha256 HEX`; sibling assets and state are preserved.
 
 The compact declaration shape is:
 
@@ -128,7 +128,7 @@ agent "<identity>" {
   ding
 
   render {
-    copy "_templates/<host>.<identity>.AGENTS.md" "AGENTS.md"
+    copy "assets/AGENTS.md" "AGENTS.md"
     json-upsert ".codex/hooks.json" #"""
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ST_HOOKS/codex-session-start.sh","timeout":5}]}]}}
 """#
@@ -183,7 +183,7 @@ st2 rename <stable-id> --clear
 ```
 
 These commands preserve unrelated KDL bytes and serialize local writers through the persistent
-private `.st2/presentation-authoring.lock`. They refuse TOML, JSON, and
+shared `.st2/catalog-authoring.lock`. They refuse TOML, JSON, and
 explicitly `meta { managed-by "nix" }` targets. Nix generators must emit that marker before the
 compatible st2 binary is activated. In the trusted single-operator fleet, caller-supplied
 `ST_AGENT` limits an invocation to itself or declared descendants; it is a guardrail rather than
@@ -415,7 +415,7 @@ ls, up, down, validate, doctor
 message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, eval
-compile-agent (experimental)
+agent publish
 completions
 ```
 
@@ -475,5 +475,6 @@ interviewer reply at-or-after the exact kickoff receipt completes it. Canonical 
 verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
 evals retain their flat bus and completion semantics.
 
-`st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
-interface, and generated output must be reviewed before materialization.
+`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) (--expect-absent |
+--expect-sha256 HEX)` is the sole catalog-declaration writer. The publisher admits the complete
+prospective catalog under a compare-and-swap lock before making one atomic change.

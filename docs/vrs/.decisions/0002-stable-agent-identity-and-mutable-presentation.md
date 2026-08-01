@@ -37,7 +37,7 @@ descendants; this is an operational guardrail, not an authenticated capability,
 and absence selects the operator path. Declarations explicitly marked Nix-owned
 remain writable only at their Nix source, and Nix emitters must publish that
 marker before authoring is activated. st2 serializes these
-edits with the private persistent `.st2/presentation-authoring.lock`, preserves
+edits with the shared persistent `.st2/catalog-authoring.lock`, preserves
 unrelated source bytes, detects stale source, and atomically replaces the
 declaration. The lock covers cooperating local st2 writers in one POSIX
 filesystem/kernel lock domain; it does not claim exclusion across independently
