@@ -566,13 +566,9 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
     };
     let runner = FakeRunner::default();
     let mut report = UpReport::default();
+    let mut cap = FlappingCap::default();
 
-    execute(
-        &plan,
-        &runner,
-        &mut FlappingCap::default(),
-        &mut report,
-    );
+    execute(&plan, &runner, &mut cap, &mut report);
 
     assert_eq!(
         &runner.ops.borrow()[..2],
@@ -586,6 +582,10 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
             .any(|warning| warning.contains("deferred 2 presentation patches"))
     );
     assert!(report.is_noteworthy());
+
+    execute(&plan, &runner, &mut cap, &mut UpReport::default());
+    let patched = runner.patched.borrow();
+    assert!((0..10).all(|index| patched.contains(&format!("host.presented.{index}"))));
 }
 
 /// A v2 service job: a pty agent + an exec ding.

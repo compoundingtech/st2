@@ -1082,6 +1082,15 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                     "canonical-agents requester `{requester}` must be external to the admitted Agent Specs"
                 );
             }
+            if let Some(owner) = specs
+                .iter()
+                .find(|spec| spec.name.as_deref() == Some(requester.as_str()))
+            {
+                anyhow::bail!(
+                    "canonical-agents requester `{requester}` matches the presentation name of admitted Agent Spec `{}`",
+                    owner.bus_id(host)
+                );
+            }
             std::fs::create_dir_all(bus.join(&requester).join("inbox"))
                 .with_context(|| format!("provisioning external requester `{requester}` inbox"))?;
         }

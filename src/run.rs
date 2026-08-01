@@ -1119,12 +1119,16 @@ pub fn execute(
 
     // Presentation never delays lifecycle convergence. Drift repair is bounded to eight sequential
     // children, keeping its worst-case 2s-per-child containment below the 30s supervisor cadence;
-    // remaining drift is observed and retried on later passes.
-    for presentation in plan
+    // the persistent cursor rotates remaining drift through later passes without starvation.
+    let presentation_count = plan
         .presentation
-        .iter()
-        .take(MAX_PRESENTATION_PATCHES_PER_PASS)
-    {
+        .len()
+        .min(MAX_PRESENTATION_PATCHES_PER_PASS);
+    let presentation_start =
+        cap.presentation_batch_start(plan.presentation.len(), presentation_count);
+    for offset in 0..presentation_count {
+        let presentation =
+            &plan.presentation[(presentation_start + offset) % plan.presentation.len()];
         if let Err(error) = runner.patch_presentation(presentation) {
             report
                 .errors
