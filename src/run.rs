@@ -40,6 +40,7 @@ use agent_spec::spec::TaskKind;
 // This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+const MAX_PRESENTATION_PATCHES_PER_PASS: usize = 8;
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
@@ -250,6 +251,10 @@ struct PtyListEntry {
     /// PTY-owned generation creation time.
     #[serde(rename = "createdAt", default)]
     created_at: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -642,6 +647,10 @@ impl Runner for PtyCli {
                 pty_id: e.name,
                 alive: e.status == "running",
                 exit_code: e.exit_code,
+                presentation: Some(crate::reconcile::ObservedPtyPresentation {
+                    display_name: e.display_name,
+                    tags: e.tags,
+                }),
             })
             .collect())
     }
@@ -1013,6 +1022,7 @@ impl UpReport {
             || !self.torn_down.is_empty()
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
+            || !self.warnings.is_empty()
             || !self.errors.is_empty()
     }
 }
@@ -1026,15 +1036,6 @@ pub fn execute(
     cap: &mut FlappingCap,
     report: &mut UpReport,
 ) {
-    // Presentation is an independent metadata path. A failure is visible and retried by the next
-    // reconcile pass, but never authorizes stop, reap, restart, or replacement.
-    for presentation in &plan.presentation {
-        if let Err(error) = runner.patch_presentation(presentation) {
-            report
-                .errors
-                .push(format!("metadata patch {}: {error}", presentation.pty_id));
-        }
-    }
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -1114,6 +1115,30 @@ pub fn execute(
                 Err(e) => report.errors.push(format!("kill {id}: {e}")),
             }
         }
+    }
+
+    // Presentation never delays lifecycle convergence. Drift repair is bounded to eight sequential
+    // children, keeping its worst-case 2s-per-child containment below the 30s supervisor cadence;
+    // remaining drift is observed and retried on later passes.
+    for presentation in plan
+        .presentation
+        .iter()
+        .take(MAX_PRESENTATION_PATCHES_PER_PASS)
+    {
+        if let Err(error) = runner.patch_presentation(presentation) {
+            report
+                .errors
+                .push(format!("metadata patch {}: {error}", presentation.pty_id));
+        }
+    }
+    let deferred_presentation = plan
+        .presentation
+        .len()
+        .saturating_sub(MAX_PRESENTATION_PATCHES_PER_PASS);
+    if deferred_presentation > 0 {
+        report.warnings.push(format!(
+            "deferred {deferred_presentation} presentation patches after bounded batch of {MAX_PRESENTATION_PATCHES_PER_PASS}"
+        ));
     }
 
     report
@@ -1908,6 +1933,7 @@ mod tests {
             pty_id: id.to_string(),
             alive,
             exit_code: None,
+            presentation: None,
         }
     }
 
@@ -2938,7 +2964,7 @@ mod tests {
         std::fs::write(
             &fake,
             r#"#!/bin/sh
-printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z"},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"1","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
 "#,
         )
         .unwrap();
@@ -2963,6 +2989,18 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         assert!(generation.generation_id().starts_with("sha256:"));
         assert_eq!(first.observations[1].state, ObservedState::Exited);
         assert_eq!(first.observations[2].state, ObservedState::Vanished);
+
+        let sessions = cli.list_sessions().unwrap();
+        let presentation = sessions[0].presentation.as_ref().unwrap();
+        assert_eq!(presentation.display_name.as_deref(), Some("Build owner"));
+        assert_eq!(
+            presentation.tags.get("agent.presentation.schema").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            presentation.tags.get("unrelated").map(String::as_str),
+            Some("preserved")
+        );
     }
 
     #[test]

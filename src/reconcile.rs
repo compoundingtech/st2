@@ -23,6 +23,15 @@ pub struct Session {
     /// The process exit code once exited (`None` while running, or if killed/vanished with no code).
     /// Reconcile ignores this; it exists only for crash-vs-clean-exit detection (the crash-ding).
     pub exit_code: Option<i64>,
+    /// PTY presentation observed in the same authoritative inventory snapshot. Exec sessions and
+    /// older/partial observations leave this unknown so reconciliation repairs them fail-closed.
+    pub presentation: Option<ObservedPtyPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedPtyPresentation {
+    pub display_name: Option<String>,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// A concrete task st2 should spawn — everything a backend needs, resolved from the spec. Produced
@@ -91,6 +100,21 @@ fn pty_presentation(
             (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
         ]),
     })
+}
+
+fn presentation_matches(
+    desired: &PtyPresentation,
+    observed: &ObservedPtyPresentation,
+) -> bool {
+    let display_name_matches = desired
+        .display_name
+        .as_ref()
+        .is_none_or(|display_name| display_name == &observed.display_name);
+    display_name_matches
+        && desired
+            .tags
+            .iter()
+            .all(|(key, value)| observed.tags.get(key) == value.as_ref())
 }
 
 /// A resolved task launch accepted by the execution backends.
@@ -222,7 +246,12 @@ pub fn reconcile_selected<'a>(
     };
     match actual {
         Some(s) if s.alive => {
-            if let Some(presentation) = target.presentation.clone() {
+            if let Some(presentation) = target.presentation.clone()
+                && !s
+                    .presentation
+                    .as_ref()
+                    .is_some_and(|observed| presentation_matches(&presentation, observed))
+            {
                 plan.presentation.push(presentation);
             }
             plan.adopt.push(owner);
@@ -276,6 +305,10 @@ pub fn reconcile<'a>(
     let by_id: HashMap<&str, bool> = sessions
         .iter()
         .map(|s| (s.pty_id.as_str(), s.alive))
+        .collect();
+    let sessions_by_id: HashMap<&str, &Session> = sessions
+        .iter()
+        .map(|session| (session.pty_id.as_str(), session))
         .collect();
 
     let mut plan = ReconcilePlan::default();
@@ -359,7 +392,15 @@ pub fn reconcile<'a>(
         for (target, lifecycle) in targets {
             match session_state(&by_id, &target.pty_id) {
                 SessionState::Alive => {
-                    if let Some(presentation) = target.presentation.clone() {
+                    let actual = sessions_by_id
+                        .get(target.pty_id.as_str())
+                        .expect("alive state has a session");
+                    if let Some(presentation) = target.presentation.clone()
+                        && !actual
+                            .presentation
+                            .as_ref()
+                            .is_some_and(|observed| presentation_matches(&presentation, observed))
+                    {
                         plan.presentation.push(presentation);
                     }
                 }

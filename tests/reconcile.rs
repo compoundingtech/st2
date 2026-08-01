@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
+use st2::reconcile::ObservedPtyPresentation;
 use st2::spec::{AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile};
 
@@ -152,6 +153,7 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
             pty_id: "host.a.x".into(),
             alive: false,
             exit_code: Some(7),
+            presentation: None,
         }],
         "host",
         "host.a.x",
@@ -175,6 +177,7 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
             pty_id: "host.b.x".into(),
             alive: false,
             exit_code: Some(7),
+            presentation: None,
         }],
         "host",
         "host.b.x",
@@ -194,6 +197,7 @@ fn selected_reconcile_holds_adopt_only_dead_or_absent_without_mutation() {
             pty_id: "host.a.agent".into(),
             alive: false,
             exit_code: Some(1),
+            presentation: None,
         }],
         vec![],
     ] {
@@ -247,16 +251,19 @@ fn selected_dead_non_keep_gc_and_relaunch_only_selected() {
                 pty_id: "host.a.x".into(),
                 alive: false,
                 exit_code: Some(1),
+                presentation: None,
             },
             Session {
                 pty_id: "host.a.y".into(),
                 alive: false,
                 exit_code: Some(1),
+                presentation: None,
             },
             Session {
                 pty_id: "host.b.z".into(),
                 alive: false,
                 exit_code: Some(1),
+                presentation: None,
             },
         ],
         "host",
@@ -396,6 +403,7 @@ fn live(id: &str) -> Session {
         pty_id: id.to_string(),
         alive: true,
         exit_code: None,
+        presentation: None,
     }
 }
 fn dead(id: &str) -> Session {
@@ -403,6 +411,7 @@ fn dead(id: &str) -> Session {
         pty_id: id.to_string(),
         alive: false,
         exit_code: None,
+        presentation: None,
     }
 }
 
@@ -529,6 +538,54 @@ fn lifecycle_equal_primary_name_is_cleared_during_live_reconciliation() {
     let plan = reconcile(&specs, &[live("hetz.worker")], HOST);
     assert_eq!(plan.presentation.len(), 1);
     assert_eq!(plan.presentation[0].display_name, Some(None));
+}
+
+#[test]
+fn live_pty_presentation_only_queues_observed_drift() {
+    let mut owner = svc(
+        "worker",
+        Some(HOST),
+        vec![task(
+            TaskKind::Pty,
+            "agent",
+            Some("hetz.worker"),
+            Some("codex"),
+        )],
+    );
+    owner.name = Some("Build owner".to_owned());
+    owner.description = Some("Owns build delivery".to_owned());
+    let specs = [owner];
+    let exact_tags = BTreeMap::from([
+        ("agent.presentation.schema".to_owned(), "1".to_owned()),
+        ("agent.actor.path".to_owned(), "hetz.worker".to_owned()),
+        (
+            "agent.presentation.description".to_owned(),
+            "Owns build delivery".to_owned(),
+        ),
+        ("unrelated".to_owned(), "preserved".to_owned()),
+    ]);
+    let exact = Session {
+        pty_id: "hetz.worker".to_owned(),
+        alive: true,
+        exit_code: None,
+        presentation: Some(ObservedPtyPresentation {
+            display_name: Some("Build owner".to_owned()),
+            tags: exact_tags.clone(),
+        }),
+    };
+    assert!(reconcile(&specs, &[exact], HOST).presentation.is_empty());
+
+    let drifted = Session {
+        pty_id: "hetz.worker".to_owned(),
+        alive: true,
+        exit_code: None,
+        presentation: Some(ObservedPtyPresentation {
+            display_name: Some("Old owner".to_owned()),
+            tags: exact_tags,
+        }),
+    };
+    assert_eq!(reconcile(&specs, &[drifted], HOST).presentation.len(), 1);
+    assert_eq!(reconcile(&specs, &[live("hetz.worker")], HOST).presentation.len(), 1);
 }
 
 #[test]

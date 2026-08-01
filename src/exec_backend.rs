@@ -211,6 +211,7 @@ impl ExecBackend {
                 pty_id: id.to_string(),
                 alive,
                 exit_code: None,
+                presentation: None,
             });
         }
         Ok(out)
