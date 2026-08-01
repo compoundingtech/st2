@@ -512,6 +512,26 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
 }
 
 #[test]
+fn lifecycle_equal_primary_name_is_cleared_during_live_reconciliation() {
+    let mut owner = svc(
+        "worker",
+        Some(HOST),
+        vec![task(
+            TaskKind::Pty,
+            "agent",
+            Some("hetz.worker"),
+            Some("codex"),
+        )],
+    );
+    owner.name = Some("hetz.worker".to_owned());
+
+    let specs = [owner];
+    let plan = reconcile(&specs, &[live("hetz.worker")], HOST);
+    assert_eq!(plan.presentation.len(), 1);
+    assert_eq!(plan.presentation[0].display_name, Some(None));
+}
+
+#[test]
 fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
     let mut spec = svc(
         "a",

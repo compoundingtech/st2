@@ -757,6 +757,34 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
         "unchanged projection emitted an event"
     );
 
+    let output = fx
+        .st2()
+        .env_remove("ST_AGENT")
+        .args([
+            "--catalog",
+            fx.catalog.to_str().unwrap(),
+            "rename",
+            &session_id,
+            &session_id,
+        ])
+        .args(["--host", HOST, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fx.up_once();
+    let lifecycle_equal = list_session();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(lifecycle_equal["createdAt"], created_at);
+    assert!(lifecycle_equal.get("displayName").is_none());
+    assert_eq!(event_count(), initial_events + 2);
+
+    fx.up_once();
+    assert_eq!(event_count(), initial_events + 2);
+
     for command in ["rename", "describe"] {
         let output = fx
             .st2()
@@ -787,7 +815,7 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
             .get("agent.presentation.description")
             .is_none()
     );
-    assert_eq!(event_count(), initial_events + 2);
+    assert_eq!(event_count(), initial_events + 3);
 
     let declaration = fx.catalog.join(HOST).join(identity).join("agent.kdl");
     let source = std::fs::read_to_string(&declaration).unwrap();

@@ -78,7 +78,10 @@ fn pty_presentation(
     }
     Some(PtyPresentation {
         pty_id: pty_id.to_owned(),
-        display_name: (task.name == "agent").then(|| spec.name.clone()),
+        display_name: (task.name == "agent").then(|| match spec.name.as_ref() {
+            Some(name) if name == pty_id => None,
+            _ => spec.name.clone(),
+        }),
         tags: BTreeMap::from([
             (
                 AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
