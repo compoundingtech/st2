@@ -348,6 +348,9 @@ impl PtyCli {
             .as_ref()
             .map(|presentation| &presentation.display_name)
         {
+            Some(Some(Some(name))) if name == &target.pty_id => {
+                cmd.arg("--no-display-name");
+            }
             Some(Some(Some(name))) => {
                 cmd.args(["--name", name]);
             }
@@ -2540,6 +2543,11 @@ mod tests {
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "exec codex 'boot'");
         t.bus_id = t.pty_id.clone();
+        t.presentation = Some(PtyPresentation {
+            pty_id: t.pty_id.clone(),
+            display_name: Some(Some(t.pty_id.clone())),
+            tags: BTreeMap::new(),
+        });
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
         let args: Vec<String> = cmd
             .get_args()
