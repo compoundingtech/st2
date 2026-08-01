@@ -87,6 +87,23 @@ fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
         .unwrap()
 }
 
+fn bootstrap(catalog: &Path, prepared: &Path, input_sha256: &str) -> Output {
+    st2()
+        .args([
+            "catalog",
+            "bootstrap",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            input_sha256,
+            "--json",
+        ])
+        .output()
+        .unwrap()
+}
+
 fn resume(catalog: &Path) -> Output {
     st2()
         .args([
@@ -135,6 +152,592 @@ fn catalog_apply_cli_exposes_exactly_the_two_closed_modes() {
             "catalog apply accepted an incomplete or ambiguous mode"
         );
     }
+}
+
+#[test]
+fn catalog_bootstrap_cli_is_create_only_and_source_bound() {
+    let help = st2()
+        .args(["catalog", "bootstrap", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    for flag in ["--prepared", "--input-sha256", "--json"] {
+        assert!(help.contains(flag), "catalog bootstrap help omitted {flag}");
+    }
+    for forbidden in ["--resume", "--expect-sha256", "--expect-absent"] {
+        assert!(
+            !help.contains(forbidden),
+            "catalog bootstrap exposed redundant or unsafe mode {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_atomically_publishes_an_absent_catalog_and_replays_exactly() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let target = temp.path().join("target");
+
+    let first = bootstrap(
+        &target,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["schema"], "st2.catalog-bootstrap.v1");
+    assert_eq!(first["status"], "created");
+    assert_eq!(first["rootSha256"], captured["rootSha256"]);
+    assert_eq!(
+        fs::read_to_string(target.join(".st2/catalog-generation")).unwrap(),
+        "1\n"
+    );
+    assert!(target.join(".st2/catalog-authoring.lock").is_file());
+    let verified = snapshot(&target, &temp.path().join("verified"));
+    assert_eq!(verified["rootSha256"], captured["rootSha256"]);
+
+    fs::create_dir_all(agent_dir(&target, "worker").join("resources/inbox")).unwrap();
+    fs::write(
+        agent_dir(&target, "worker").join("resources/inbox/message.md"),
+        "state survives replay",
+    )
+    .unwrap();
+    let replay = bootstrap(
+        &target,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["status"], "unchanged");
+    assert_eq!(
+        fs::read_to_string(
+            agent_dir(&target, "worker").join("resources/inbox/message.md")
+        )
+        .unwrap(),
+        "state survives replay"
+    );
+}
+
+#[test]
+fn bootstrap_rejects_a_different_existing_catalog_without_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "desired", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let incumbent_source = temp.path().join("incumbent-source");
+    write_agent(&incumbent_source, "incumbent", false);
+    let incumbent_prepared = temp.path().join("incumbent-prepared");
+    let incumbent = snapshot(&incumbent_source, &incumbent_prepared);
+    let target = temp.path().join("target");
+    let created = bootstrap(
+        &target,
+        &incumbent_prepared,
+        incumbent["rootSha256"].as_str().unwrap(),
+    );
+    assert!(created.status.success());
+    let before = fs::read_to_string(agent_dir(&target, "incumbent").join("agent.kdl")).unwrap();
+
+    let rejected = bootstrap(
+        &target,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("already exists with root sha256"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent_dir(&target, "incumbent").join("agent.kdl")).unwrap(),
+        before
+    );
+    assert!(!agent_dir(&target, "desired").exists());
+}
+
+#[test]
+fn bootstrap_requires_an_explicit_external_pty_root_before_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    for case in ["missing", "catalog-local"] {
+        let source = temp.path().join(format!("source-{case}"));
+        write_agent(&source, "worker", false);
+        if case == "catalog-local" {
+            fs::write(
+                source.join("catalog.kdl"),
+                "catalog { pty-root \"$CATALOG/pty\" }\n",
+            )
+            .unwrap();
+        }
+        let prepared = temp.path().join(format!("prepared-{case}"));
+        let captured = st2()
+            .args([
+                "catalog",
+                "snapshot",
+                "--catalog",
+                source.to_str().unwrap(),
+                "--output",
+                prepared.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(captured.status.success());
+        let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
+        let target = temp.path().join(format!("target-{case}"));
+        let rejected = bootstrap(
+            &target,
+            &prepared,
+            captured["rootSha256"].as_str().unwrap(),
+        );
+        assert!(!rejected.status.success());
+        assert!(!target.exists());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("requires an explicit external pty-root")
+                || stderr.contains("requires pty-root outside"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_bootstrap_has_one_publication_and_one_exact_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let target = temp.path().join("target");
+
+    let children = (0..2)
+        .map(|_| {
+            st2()
+                .args([
+                    "catalog",
+                    "bootstrap",
+                    "--catalog",
+                    target.to_str().unwrap(),
+                    "--prepared",
+                    prepared.to_str().unwrap(),
+                    "--input-sha256",
+                    captured["rootSha256"].as_str().unwrap(),
+                    "--json",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut statuses = children
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["status"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    statuses.sort();
+    assert_eq!(statuses, ["created", "unchanged"]);
+    assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".st2-catalog-bootstrap-")
+    }));
+}
+
+#[test]
+fn bootstrap_crash_boundaries_replay_from_absent_or_complete_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let expected = captured["rootSha256"].as_str().unwrap();
+
+    let before_target = temp.path().join("before-target");
+    let before = st2()
+        .args([
+            "catalog",
+            "bootstrap",
+            "--catalog",
+            before_target.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            expected,
+            "--json",
+        ])
+        .env("ST2_TEST_CATALOG_BOOTSTRAP_CRASH_AT", "before-publish")
+        .output()
+        .unwrap();
+    assert!(!before.status.success());
+    assert!(!before_target.exists());
+    let recovered_before = bootstrap(&before_target, &prepared, expected);
+    assert!(recovered_before.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered_before.stdout).unwrap()["status"],
+        "created"
+    );
+
+    let after_target = temp.path().join("after-target");
+    let after = st2()
+        .args([
+            "catalog",
+            "bootstrap",
+            "--catalog",
+            after_target.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            expected,
+            "--json",
+        ])
+        .env(
+            "ST2_TEST_CATALOG_BOOTSTRAP_CRASH_AT",
+            "after-publish-before-parent-sync",
+    )
+        .output()
+        .unwrap();
+    assert!(!after.status.success());
+    let replay_ready = temp.path().join("replay-parent-synced");
+    let replay_release = temp.path().join("replay-release");
+    let recovered_after = paused_bootstrap(
+        &after_target,
+        &prepared,
+        expected,
+        "after-replay-parent-sync",
+        &replay_ready,
+        &replay_release,
+    );
+    wait_for(&replay_ready);
+    fs::write(&replay_release, "").unwrap();
+    let recovered_after = recovered_after.wait_with_output().unwrap();
+    assert!(recovered_after.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recovered_after.stdout).unwrap()["status"],
+        "unchanged"
+    );
+}
+
+#[test]
+fn bootstrap_publishes_its_lock_before_readers_can_enter() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let target = temp.path().join("target");
+    let ready = temp.path().join("bootstrap-ready");
+    let release = temp.path().join("bootstrap-release");
+    let bootstrap_child = paused_bootstrap(
+        &target,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+        "after-publish-before-parent-sync",
+        &ready,
+        &release,
+    );
+    wait_for(&ready);
+
+    let lock_attempt = temp.path().join("reader-lock-attempt");
+    let mut reader = st2()
+        .args([
+            "catalog",
+            "snapshot",
+            "--catalog",
+            target.to_str().unwrap(),
+            "--output",
+            temp.path().join("observed").to_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT", &lock_attempt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&lock_attempt);
+    assert!(
+        reader.try_wait().unwrap().is_none(),
+        "reader crossed the staged lock before bootstrap became durable"
+    );
+    fs::write(&release, "").unwrap();
+    let published = bootstrap_child.wait_with_output().unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let observed = reader.wait_with_output().unwrap();
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+}
+
+#[test]
+fn bootstrap_capture_is_not_redirected_by_a_source_swap() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let target = temp.path().join("target");
+    let ready = temp.path().join("capture-ready");
+    let release = temp.path().join("capture-release");
+    let mut child = st2();
+    child
+        .args([
+            "catalog",
+            "bootstrap",
+            "--catalog",
+            target.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            captured["rootSha256"].as_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_PREPARED_CAPTURE_PAUSE_AT", "source-opened")
+        .env("ST2_TEST_PREPARED_CAPTURE_READY", &ready)
+        .env("ST2_TEST_PREPARED_CAPTURE_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child.spawn().unwrap();
+    wait_for(&ready);
+    let retained = temp.path().join("retained-prepared");
+    fs::rename(&prepared, &retained).unwrap();
+    write_agent(&prepared, "redirected", false);
+    ensure_external_pty_config(&prepared);
+    fs::write(&release, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(agent_dir(&target, "worker").is_dir());
+    assert!(!agent_dir(&target, "redirected").exists());
+}
+
+#[test]
+fn bootstrap_never_touches_the_external_pty_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let pty_root = temp.path().join("shared-pty");
+    fs::create_dir(&pty_root).unwrap();
+    fs::write(pty_root.join("sentinel"), "unchanged").unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    fs::write(
+        source.join("catalog.kdl"),
+        format!("catalog {{ pty-root {:?} }}\n", pty_root),
+    )
+    .unwrap();
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let target = temp.path().join("target");
+    let output = bootstrap(
+        &target,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(pty_root.join("sentinel")).unwrap(),
+        "unchanged"
+    );
+    assert_eq!(fs::read_dir(&pty_root).unwrap().count(), 1);
+}
+
+#[test]
+fn bootstrap_rejects_wrong_input_and_uninitialized_existing_targets_without_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let absent = temp.path().join("absent");
+    let wrong = bootstrap(&absent, &prepared, &"0".repeat(64));
+    assert!(!wrong.status.success());
+    assert!(!absent.exists());
+
+    let existing = temp.path().join("existing");
+    fs::create_dir(&existing).unwrap();
+    let rejected = bootstrap(
+        &existing,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(!rejected.status.success());
+    assert!(!existing.join(".st2").exists());
+}
+
+#[test]
+fn bootstrap_composes_with_the_next_root_cas_apply_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let target = temp.path().join("target");
+    let created = bootstrap(
+        &target,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(created.status.success());
+
+    let update = temp.path().join("update");
+    let before = snapshot(&target, &update);
+    fs::write(
+        update.join("agents/host/worker/agent.kdl"),
+        "agent \"worker\" { host \"host\"; role \"updated\"; argv \"true\" }\n",
+    )
+    .unwrap();
+    let applied = apply(
+        &target,
+        &update,
+        before["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(target.join(".st2/catalog-generation")).unwrap(),
+        "2\n"
+    );
+}
+
+#[test]
+fn bootstrap_target_capability_cannot_be_redirected_by_symlink_swaps() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let expected = captured["rootSha256"].as_str().unwrap();
+    let external = temp.path().join("external");
+    fs::create_dir(&external).unwrap();
+
+    let final_symlink = temp.path().join("final-symlink");
+    std::os::unix::fs::symlink(&external, &final_symlink).unwrap();
+    let rejected = bootstrap(&final_symlink, &prepared, expected);
+    assert!(!rejected.status.success());
+    assert!(external.read_dir().unwrap().next().is_none());
+
+    let parent = temp.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let target = parent.join("target");
+    let ready = temp.path().join("target-ready");
+    let release = temp.path().join("target-release");
+    let child = paused_bootstrap(
+        &target,
+        &prepared,
+        expected,
+        "before-stage",
+        &ready,
+        &release,
+    );
+    wait_for(&ready);
+    let retained_parent = temp.path().join("retained-parent");
+    fs::rename(&parent, &retained_parent).unwrap();
+    fs::create_dir(&parent).unwrap();
+    std::os::unix::fs::symlink(&external, &target).unwrap();
+    fs::write(&release, "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(agent_dir(&retained_parent.join("target"), "worker").is_dir());
+    assert!(external.read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn bootstrap_replay_validates_the_same_catalog_capability_it_locked() {
+    let temp = tempfile::tempdir().unwrap();
+    let desired_source = temp.path().join("desired-source");
+    write_agent(&desired_source, "desired", false);
+    let desired_prepared = temp.path().join("desired-prepared");
+    let desired = snapshot(&desired_source, &desired_prepared);
+    let parent = temp.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let target = parent.join("target");
+    assert!(
+        bootstrap(
+            &target,
+            &desired_prepared,
+            desired["rootSha256"].as_str().unwrap(),
+        )
+        .status
+        .success()
+    );
+
+    let incumbent_lock = st2::CatalogLock::exclusive(&target).unwrap();
+    let attempt = temp.path().join("replay-lock-attempt");
+    let mut child = st2();
+    child
+        .args([
+            "catalog",
+            "bootstrap",
+            "--catalog",
+            target.to_str().unwrap(),
+            "--prepared",
+            desired_prepared.to_str().unwrap(),
+            "--input-sha256",
+            desired["rootSha256"].as_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT", &attempt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child.spawn().unwrap();
+    wait_for(&attempt);
+
+    let displaced = parent.join("displaced");
+    fs::rename(&target, &displaced).unwrap();
+    assert!(
+        bootstrap(
+            &target,
+            &desired_prepared,
+            desired["rootSha256"].as_str().unwrap(),
+        )
+        .status
+        .success()
+    );
+    drop(incumbent_lock);
+
+    let replay = child.wait_with_output().unwrap();
+    assert!(!replay.status.success());
+    assert!(agent_dir(&displaced, "desired").is_dir());
+    assert!(agent_dir(&target, "desired").is_dir());
 }
 
 fn wait_for(path: &Path) {
@@ -258,6 +861,35 @@ fn paused_apply(
         .env("ST2_TEST_CATALOG_APPLY_PAUSE_AT", point)
         .env("ST2_TEST_CATALOG_APPLY_READY", ready)
         .env("ST2_TEST_CATALOG_APPLY_RELEASE", release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().unwrap()
+}
+
+fn paused_bootstrap(
+    catalog: &Path,
+    prepared: &Path,
+    input_sha256: &str,
+    point: &str,
+    ready: &Path,
+    release: &Path,
+) -> Child {
+    let mut command = st2();
+    command
+        .args([
+            "catalog",
+            "bootstrap",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            input_sha256,
+            "--json",
+        ])
+        .env("ST2_TEST_CATALOG_BOOTSTRAP_PAUSE_AT", point)
+        .env("ST2_TEST_CATALOG_BOOTSTRAP_READY", ready)
+        .env("ST2_TEST_CATALOG_BOOTSTRAP_RELEASE", release)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.spawn().unwrap()

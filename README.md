@@ -125,10 +125,21 @@ st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
   --expect-sha256 <rootSha256> --json
 ```
 
+To publish that exact snapshot as a new, absent catalog:
+
+```sh
+st2 catalog bootstrap --catalog "$NEW_CATALOG" --prepared ./prepared \
+  --input-sha256 <rootSha256> --json
+```
+
 `catalog apply` is policy-free. It rejects state/control content, symlinks,
 unprojected workspace facts, catalog-local/default PTY roots, and effective
-PTY-root changes. Fresh bootstrap is a separate st2+pty transaction, not an
-apply mode. A crash leaves a durable marker and content-addressed stage;
+PTY-root changes. Bootstrap is a separate create-only declaration transaction,
+not an apply mode. It atomically publishes absence or the complete catalog,
+initializes its persistent lock and generation before visibility, and never
+reads or writes the external PTY registry. Process adoption and PTY-root
+migration remain separate because that registry has independent producers. A
+crash during apply leaves a durable marker and content-addressed stage;
 `st2 catalog apply --catalog "$CATALOG" --resume --json` resumes without the
 original prepared source. Snapshots own the complete bounded `_templates`
 library and empty canonical per-agent `.workspace` directory facts, but never
@@ -439,7 +450,7 @@ message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, eval
 agent digest, agent publish
-catalog snapshot, catalog apply
+catalog bootstrap, catalog snapshot, catalog apply
 completions
 ```
 
@@ -505,3 +516,6 @@ evals retain their flat bus and completion semantics.
 (--prepared DIR --expect-sha256 ROOT_HEX | --resume)` is the complete
 declaration-plane writer. Each admits the complete prospective catalog under a
 compare-and-swap lock before making one atomic change.
+`st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 ROOT_HEX`
+is the create-only writer for an absent catalog. An exact completed replay is
+`unchanged`; any different or incomplete existing target fails closed.

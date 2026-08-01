@@ -235,10 +235,8 @@ catalog-local/default PTY root, or effective PTY-root change. Hash-CAS captures
 and validates exact prepared bytes, takes EX, rechecks the canonical live root,
 and either reports `unchanged` for exact equality or creates a durable
 content-addressed stage before publishing the marker. Version 1 requires an
-explicit PTY root outside the canonical catalog. Fresh bootstrap is a separate
-cross-producer transaction because catalog EX cannot reserve a PTY registry
-against external producers. Hash-CAS permits declared live workspace facts and
-their real ancestry to contain content. It changes
+explicit PTY root outside the canonical catalog. Hash-CAS permits declared live
+workspace facts and their real ancestry to contain content. It changes
 declaration leaves only; desired workspace facts must already exist, and
 workspace content and canonical state are never traversed, deleted, or hashed.
 When an identity path is absent, its complete bundle uses an exclusive
@@ -291,6 +289,33 @@ precondition already passed, so recovery converges the partial live tree from
 the durable desired stage and original owned-leaf list without re-enforcing
 that stale precondition. Malformed or mismatched records remain fenced.
 External lock execution and bypass flags are not part of the contract.
+
+`st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 HEX --json`
+is the create-only declaration transaction for an absent catalog. `ROOT` must
+be one absent final component below an existing canonical real parent. st2
+captures `DIR` through retained no-follow capabilities, verifies its declaration
+root against `HEX`, admits the complete projection against logical `ROOT`, and
+requires one explicit external PTY root. It materializes a 0700 sibling stage,
+creates the persistent authoring lock and generation `1` inside it, takes EX on
+that lock, fsyncs the complete tree, and publishes it with a capability-relative
+no-replace directory rename followed by a parent fsync. Readers therefore see
+absence or a complete catalog and cannot cross the already-published lock before
+the parent entry is durable.
+
+There is no bootstrap marker or resume mode: interruption before the rename
+leaves `ROOT` absent, while interruption after it leaves the complete target. A
+retry re-captures its source and returns `unchanged` only after taking the
+existing lock, rejecting incomplete markers, proving a durable generation,
+fully validating the catalog, matching the exact declaration root, proving the
+locked directory remains bound to `ROOT`, and fsyncing the retained parent. A
+different, malformed, symlinked, rebound, or uninitialized existing target fails
+without mutation. Random sibling stages are non-authoritative and are cleaned
+only by the invocation that created them; no broad orphan cleanup is permitted.
+
+Bootstrap performs zero reads or writes below the declared PTY root. The PTY
+registry has independent producers which catalog EX cannot reserve, so atomic
+process adoption, continuity, or PTY-root migration requires a separate PTY
+registry protocol. Bootstrap claims only atomic declaration publication.
 
 ## Host-local scheduling and supervision
 

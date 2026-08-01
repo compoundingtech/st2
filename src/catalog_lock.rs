@@ -146,25 +146,36 @@ enum Mode {
 pub struct CatalogLock {
     file: File,
     control: File,
+    root: File,
 }
 
 impl CatalogLock {
     pub fn shared(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Shared, false)
+        Self::acquire(catalog, Mode::Shared, false, true)
+    }
+
+    /// Acquire the existing catalog lock without initializing missing control state.
+    pub(crate) fn shared_existing(catalog: &Path) -> Result<Self> {
+        Self::acquire(catalog, Mode::Shared, false, false)
     }
 
     pub fn exclusive(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive, false)
+        Self::acquire(catalog, Mode::Exclusive, false, true)
     }
 
     /// The whole-catalog transaction is the only operation allowed to inspect and recover an
     /// incomplete apply. Every other declaration reader/writer must keep using `shared` or
     /// `exclusive`, which fail closed while the marker exists.
     pub(crate) fn exclusive_for_catalog_apply(catalog: &Path) -> Result<Self> {
-        Self::acquire(catalog, Mode::Exclusive, true)
+        Self::acquire(catalog, Mode::Exclusive, true, true)
     }
 
-    fn acquire(catalog: &Path, mode: Mode, allow_incomplete_apply: bool) -> Result<Self> {
+    fn acquire(
+        catalog: &Path,
+        mode: Mode,
+        allow_incomplete_apply: bool,
+        initialize: bool,
+    ) -> Result<Self> {
         let catalog = catalog
             .canonicalize()
             .with_context(|| format!("canonicalize catalog root {}", catalog.display()))?;
@@ -175,6 +186,8 @@ impl CatalogLock {
             "catalog root is not a real directory: {}",
             catalog.display()
         );
+        let root = crate::catalog_transaction::open_dir_beneath(&catalog, &catalog)
+            .with_context(|| format!("open catalog root capability {}", catalog.display()))?;
 
         let control = catalog.join(CONTROL_DIR);
         let control_branch = match fs::symlink_metadata(&control) {
@@ -187,6 +200,11 @@ impl CatalogLock {
                 "observed"
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    initialize,
+                    "catalog control directory is absent: {}",
+                    control.display()
+                );
                 test_control_creation_checkpoint();
                 let branch = match fs::create_dir(&control) {
                     Ok(()) => {
@@ -221,32 +239,44 @@ impl CatalogLock {
         // incomplete marker. Persist its catalog-parent entry before any caller can publish
         // declaration leaves. This is unconditional after observing a real control dir: its creator
         // may have crashed after mkdir but before its own parent fsync.
-        File::open(&catalog)
-            .with_context(|| format!("open catalog root {}", catalog.display()))?
-            .sync_all()
+        root.sync_all()
             .with_context(|| format!("sync catalog root {}", catalog.display()))?;
         #[cfg(debug_assertions)]
         if let Ok(path) = std::env::var("ST2_TEST_CATALOG_CONTROL_BRANCH") {
             let _ = fs::write(path, control_branch);
         }
 
-        let control_file = retained_control(&catalog)?
-            .context("catalog control directory disappeared while acquiring its lock")?
-            .0;
+        let control_file = crate::catalog_transaction::openat_dir_nofollow(
+            &root,
+            std::ffi::OsStr::new(CONTROL_DIR),
+        )
+        .context("catalog control directory disappeared while acquiring its lock")?;
         let control = crate::catalog_transaction::retained_dir_path(&control_file)?;
         let path = control.join(LOCK_FILE);
-        let file = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
-            .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if initialize {
+            options.create(true);
+        }
+        let file = options
             .open(&path)
             .with_context(|| format!("open catalog authoring lock {}", path.display()))?;
         let operation = match mode {
             Mode::Shared => libc::LOCK_SH,
             Mode::Exclusive => libc::LOCK_EX,
         };
+        #[cfg(debug_assertions)]
+        if let Ok(path) = std::env::var("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT") {
+            let value = match mode {
+                Mode::Shared => b"shared".as_slice(),
+                Mode::Exclusive => b"exclusive".as_slice(),
+            };
+            let _ = fs::write(path, value);
+        }
         #[cfg(debug_assertions)]
         if matches!(mode, Mode::Exclusive)
             && let Ok(path) = std::env::var("ST2_TEST_CATALOG_LOCK_ATTEMPT")
@@ -285,6 +315,7 @@ impl CatalogLock {
         let lock = Self {
             file,
             control: control_file,
+            root,
         };
         if matches!(mode, Mode::Exclusive) {
             lock.recover_generation_intent()?;
@@ -295,6 +326,14 @@ impl CatalogLock {
 
     pub(crate) fn advance_generation(&self) -> Result<()> {
         advance_generation(&self.control)
+    }
+
+    pub(crate) fn generation(&self) -> Result<Option<u64>> {
+        read_generation_from_control(&self.control)
+    }
+
+    pub(crate) fn root(&self) -> &File {
+        &self.root
     }
 
     pub(crate) fn begin_generation_commit(&self) -> Result<GenerationCommit<'_>> {
