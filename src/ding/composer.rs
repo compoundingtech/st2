@@ -18,20 +18,35 @@ pub(super) enum ComposerState {
     Ambiguous,
 }
 
+/// Logical inputs reconstructed from renderer-proven boundaries, or an unsupported shape.
+pub(super) enum SoftWrapCandidates {
+    Proven(Vec<String>),
+    Unsupported,
+}
+
+impl SoftWrapCandidates {
+    pub(super) fn proven(&self) -> Option<&[String]> {
+        match self {
+            Self::Proven(candidates) => Some(candidates),
+            Self::Unsupported => None,
+        }
+    }
+}
+
 /// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
 /// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
 /// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
-/// unfamiliar multiline input remains literal and cannot equal a normalized single-line DING.
+/// unfamiliar multiline input is unsupported rather than positive mismatch evidence.
 pub(super) fn logical_soft_wrap_candidates(
     input: &str,
     minimum_first_content_chars: usize,
-) -> Vec<String> {
+) -> SoftWrapCandidates {
     let rows: Vec<&str> = input.lines().collect();
     let Some(first) = rows.first() else {
-        return vec![String::new()];
+        return SoftWrapCandidates::Proven(vec![String::new()]);
     };
     if rows.len() == 1 {
-        return vec![(*first).to_string()];
+        return SoftWrapCandidates::Proven(vec![(*first).to_string()]);
     }
     let mut candidates = vec![(*first).to_string()];
     let mut previous = *first;
@@ -41,13 +56,13 @@ pub(super) fn logical_soft_wrap_candidates(
             || !row.starts_with("  ")
             || row.trim().is_empty()
         {
-            return vec![input.to_string()];
+            return SoftWrapCandidates::Unsupported;
         }
         let continuation = row.strip_prefix("  ").expect("prefix checked").trim_end();
         let mut next = Vec::with_capacity(candidates.len().saturating_mul(2).min(32));
         for candidate in candidates {
             if next.len() >= 32 {
-                return vec![input.to_string()];
+                return SoftWrapCandidates::Unsupported;
             }
             next.push(format!("{candidate}{continuation}"));
             next.push(format!("{candidate} {continuation}"));
@@ -55,7 +70,7 @@ pub(super) fn logical_soft_wrap_candidates(
         candidates = next;
         previous = row;
     }
-    candidates
+    SoftWrapCandidates::Proven(candidates)
 }
 
 pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
