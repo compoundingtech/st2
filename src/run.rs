@@ -1099,7 +1099,21 @@ fn execute_with_presentation_cursor(
     for launch in &plan.launch {
         let spec_dir = launch.spec.path.parent().unwrap_or_else(|| Path::new("."));
         let policy = launch.spec.restart_policy();
-        for target in &launch.tasks {
+        let launched_agent = launch
+            .tasks
+            .iter()
+            .find(|target| target.name == "agent" && !target.derived);
+        let mut agent_available = launched_agent.is_none();
+        let ordered_targets = launched_agent.into_iter().chain(
+            launch
+                .tasks
+                .iter()
+                .filter(|target| launched_agent.is_none_or(|agent| agent.pty_id != target.pty_id)),
+        );
+        for target in ordered_targets {
+            if target.derived && !agent_available {
+                continue;
+            }
             let now = Instant::now();
             match cap.decide(&target.pty_id, now, &policy) {
                 crate::flapping::RestartDecision::Allow => {}
@@ -1114,11 +1128,27 @@ fn execute_with_presentation_cursor(
                             supervisor: launch.spec.supervisor.clone(),
                         });
                     }
+                    if target.name == "agent" && !target.derived {
+                        agent_available = false;
+                        for companion_id in &launch.live_derived {
+                            match runner.kill(companion_id) {
+                                Ok(()) => report.torn_down.push(companion_id.clone()),
+                                Err(error) => report.errors.push(format!(
+                                    "kill terminal companion {companion_id}: {error}"
+                                )),
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Delaying / RateLimited: transient — skip quietly, retry a later pass, keep the corpse.
                 crate::flapping::RestartDecision::Delaying
-                | crate::flapping::RestartDecision::RateLimited => continue,
+                | crate::flapping::RestartDecision::RateLimited => {
+                    if target.name == "agent" && !target.derived {
+                        agent_available = false;
+                    }
+                    continue;
+                }
             }
             // Reap the dead record before st2 starts a replacement. A dead record blocks the
             // replacement. The backend preserves its bounded diagnostics.
@@ -1130,6 +1160,9 @@ fn execute_with_presentation_cursor(
                         report
                             .errors
                             .push(format!("reap {} for restart: {e}", target.pty_id));
+                        if target.name == "agent" && !target.derived {
+                            agent_available = false;
+                        }
                         continue;
                     }
                 }
@@ -1142,8 +1175,16 @@ fn execute_with_presentation_cursor(
                     } else {
                         report.launched.push(target.pty_id.clone());
                     }
+                    if target.name == "agent" && !target.derived {
+                        agent_available = true;
+                    }
                 }
-                Err(e) => report.errors.push(format!("spawn {}: {e}", target.pty_id)),
+                Err(e) => {
+                    report.errors.push(format!("spawn {}: {e}", target.pty_id));
+                    if target.name == "agent" && !target.derived {
+                        agent_available = false;
+                    }
+                }
             }
         }
     }
@@ -1908,6 +1949,7 @@ mod tests {
             pty_id: id.to_string(),
             bus_id: "hetz.demo".to_string(),
             name: "agent".to_string(),
+            derived: false,
             launch: TaskLaunch::Shell(cmd.to_string()),
             cwd: None,
             workspace: None,
@@ -2221,6 +2263,7 @@ mod tests {
         plan.launch.push(Launch {
             spec: &spec,
             tasks: vec![target("hetz.demo.agent", "x")],
+            live_derived: Vec::new(),
         });
         let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(2));
         assert!(
@@ -2246,10 +2289,12 @@ mod tests {
         plan.launch.push(Launch {
             spec: &left,
             tasks: vec![left_agent],
+            live_derived: Vec::new(),
         });
         plan.launch.push(Launch {
             spec: &right,
             tasks: vec![right_agent],
+            live_derived: Vec::new(),
         });
         let expected = plan
             .launch
@@ -2288,6 +2333,7 @@ mod tests {
         plan.launch.push(Launch {
             spec: &spec,
             tasks: vec![ding],
+            live_derived: Vec::new(),
         });
         let mut report = UpReport::default();
 
@@ -2319,10 +2365,12 @@ mod tests {
         plan.launch.push(Launch {
             spec: &codex,
             tasks: vec![codex_agent],
+            live_derived: Vec::new(),
         });
         plan.launch.push(Launch {
             spec: &claude,
             tasks: vec![claude_agent],
+            live_derived: Vec::new(),
         });
         let mut report = UpReport::default();
 

@@ -113,7 +113,11 @@ evidence: [materializer](../../../src/materialize.rs).
 <h3 id="f09">F09 Task set: <code>pty</code>, <code>exec</code>, or compact <code>ding</code></h3>
 
 Add only the unique missing child. Remove and clean only an old child with exact
-ownership proof. A compact DING task uses the same rule. Do not change siblings.
+ownership proof. A compact DING is a derived child: it starts only after its
+canonical agent is already live or starts successfully in the same pass. When
+that target is held or terminally parked, do not launch the derived child and
+stop an exact generated child proved live. Explicit sibling tasks, including an
+authored `exec "ding"`, remain independent. Do not change unrelated siblings.
 
 Authoring: [pinned compact and explicit tasks][evals-tasks]. st2 source:
 [`Task` and `TaskKind`](../../../crates/agent-spec/src/spec.rs). Evidence:
@@ -148,8 +152,10 @@ Evidence: [spawn construction](../../../src/run.rs).
 
 Agent or task `keep`, restart `attempts`, `interval`, `delay`, and `mode`, and
 task `lifecycle` are future policy. Adopt healthy work. `adopt-only` holds absent
-or dead work; `service` reconciles it normally. Invalid policy refuses changes
-to the related agent and tasks.
+or dead work; `service` reconciles it normally. A generated companion follows
+the canonical agent's effective eligibility: `adopt-only` holds it, and
+exhausting a fail-mode restart policy stops or suppresses it. Invalid policy
+refuses changes to the related agent and tasks.
 
 Authoring: [pinned complete declaration][evals-fields]. The
 [pinned explicit-task list][evals-task-fields] and st2 `9887b28` predate task
@@ -170,8 +176,9 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 <h3 id="f14">F14 Compact agent fields</h3>
 
 Compact `command`, `argv`, `env`, `lifecycle`, and `ding` convert to the
-generated agent PTY and sidecar. The tasks use F09, F11, and F12. Compact syntax
-adds no other behavior.
+generated agent PTY and derived sidecar. The tasks use F09, F11, and F12;
+`ding` carries the dependency on the generated agent task described there.
+Compact syntax adds no other behavior.
 
 Authoring: [pinned compact tasks][evals-tasks]. That document and st2 `9887b28`
 predate compact `argv` and `lifecycle`. Current st2 source:

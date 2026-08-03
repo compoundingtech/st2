@@ -4,9 +4,9 @@
 //!
 //! Pure and side-effect-free, so it is exhaustively unit-testable; execution lives behind backends
 //! (the `pty` CLI for `pty` tasks, direct process supervision for terminal-free `exec` tasks). st2
-//! reconciles at the **task** level — an agent declares several tasks (its harness pty + its ding
-//! exec) and each is kept running independently; a spec with one live task and one dead task is a
-//! launch of just the missing one.
+//! reconciles at the **task** level — explicitly authored sibling tasks remain independent. A
+//! generated companion is instead eligible only with its canonical agent task and is stopped when
+//! that target is held or terminally parked.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -46,6 +46,8 @@ pub struct TaskTarget {
     pub bus_id: String,
     /// The task name (`agent`, `ding`, …).
     pub name: String,
+    /// Generated from another task rather than authored as an independent sibling.
+    pub derived: bool,
     /// How to launch the task: shell source or a direct program argument vector.
     pub launch: TaskLaunch,
     /// Declared working dir; `None` → default to `workspace`, else the spec dir (resolved at spawn).
@@ -131,9 +133,12 @@ pub enum TaskLaunch {
 pub struct Launch<'a> {
     pub spec: &'a AgentSpec,
     pub tasks: Vec<TaskTarget>,
+    /// Exact derived task IDs proved live in the same inventory snapshot. Execution stops these if
+    /// the canonical agent becomes terminal while applying this launch.
+    pub live_derived: Vec<String>,
 }
 
-/// An agent to tear down (retired) — the live task ids to kill.
+/// Exact live task IDs to stop because their owner retired or their derived target is ineligible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Teardown<'a> {
     pub spec: &'a AgentSpec,
@@ -236,6 +241,7 @@ pub fn reconcile_selected<'a>(
         pty_id: runtime.clone(),
         bus_id: bus_id.clone(),
         name: task.name.clone(),
+        derived: task.derived,
         launch,
         cwd: task.cwd.clone(),
         workspace: owner.workspace.clone(),
@@ -263,17 +269,20 @@ pub fn reconcile_selected<'a>(
             plan.launch.push(Launch {
                 spec: owner,
                 tasks: vec![target],
+                live_derived: Vec::new(),
             });
         }
         _ => plan.launch.push(Launch {
             spec: owner,
             tasks: vec![target],
+            live_derived: Vec::new(),
         }),
     }
     Ok(plan)
 }
 
 /// The state of a declared task's session in the ACTUAL world.
+#[derive(Clone, Copy)]
 enum SessionState {
     Alive,
     Dead,
@@ -372,6 +381,7 @@ pub fn reconcile<'a>(
                         pty_id: pty_id.clone(),
                         bus_id: bus_id.clone(),
                         name: t.name.clone(),
+                        derived: t.derived,
                         launch,
                         cwd: t.cwd.clone(),
                         workspace: spec.workspace.clone(),
@@ -387,11 +397,42 @@ pub fn reconcile<'a>(
 
         debug_assert!(!targets.is_empty());
 
+        let agent_eligible = targets
+            .iter()
+            .find(|(target, _)| target.name == "agent" && !target.derived)
+            .is_some_and(|(target, lifecycle)| match session_state(&by_id, &target.pty_id) {
+                SessionState::Alive => true,
+                SessionState::Dead => {
+                    !target.keep && *lifecycle == TaskLifecycle::Service
+                }
+                SessionState::Absent => *lifecycle == TaskLifecycle::Service,
+            });
         let mut to_launch = Vec::new();
+        let mut live_derived = Vec::new();
+        let mut ineligible_derived = Vec::new();
+        let mut derived_cleanup = false;
         let held_before = plan.held.len();
         for (target, lifecycle) in targets {
-            match session_state(&by_id, &target.pty_id) {
+            let state = session_state(&by_id, &target.pty_id);
+            if target.derived && !agent_eligible {
+                match state {
+                    SessionState::Alive => {
+                        ineligible_derived.push(target.pty_id);
+                        derived_cleanup = true;
+                    }
+                    SessionState::Dead if !target.keep => {
+                        plan.gc.push(target.pty_id);
+                        derived_cleanup = true;
+                    }
+                    SessionState::Dead | SessionState::Absent => {}
+                }
+                continue;
+            }
+            match state {
                 SessionState::Alive => {
+                    if target.derived {
+                        live_derived.push(target.pty_id.clone());
+                    }
                     let actual = sessions_by_id
                         .get(target.pty_id.as_str())
                         .expect("alive state has a session");
@@ -417,13 +458,20 @@ pub fn reconcile<'a>(
                 SessionState::Absent => to_launch.push(target),
             }
         }
+        if !ineligible_derived.is_empty() {
+            plan.teardown.push(Teardown {
+                spec,
+                pty_ids: ineligible_derived,
+            });
+        }
 
-        if to_launch.is_empty() && plan.held.len() == held_before {
+        if to_launch.is_empty() && plan.held.len() == held_before && !derived_cleanup {
             plan.adopt.push(spec);
         } else if !to_launch.is_empty() {
             plan.launch.push(Launch {
                 spec,
                 tasks: to_launch,
+                live_derived,
             });
         }
     }

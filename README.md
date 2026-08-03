@@ -174,7 +174,9 @@ agent "<identity>" {
 For a zero-interruption migration, add `lifecycle "adopt-only"` to the compact
 agent or to an explicit `pty`/`exec` task. st2 adopts that task when its current
 generation is alive. If the generation is dead or absent, st2 reports the task
-as `held` and does not remove or launch anything:
+as `held` and does not remove or launch that task. A compact `ding` is derived
+from the generated agent task: while that agent is held, st2 suppresses a
+missing DING and stops an exact generated DING proved live:
 
 ```kdl
 agent "<identity>" {
