@@ -133,7 +133,8 @@ the original text either lost one inter-word space or split a token, so each
 boundary yields exactly two candidates. Comparison against the expected notice
 succeeds if any candidate matches exactly. The bounded notice length keeps the
 candidate set small; an unfamiliar multiline shape yields no match and fails
-closed.
+closed: it is `Ambiguous` before submission and `Unproven` after transport,
+never positive `NotRetained` evidence.
 
 ## Retry and suppression
 

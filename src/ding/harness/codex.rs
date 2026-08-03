@@ -34,9 +34,11 @@ impl Harness for Codex {
             }
             CodexComposer::Empty => ReceiptState::NotRetained,
             CodexComposer::Typed(input) => {
-                let exact = logical_soft_wrap_candidates(&input, 70)
-                    .iter()
-                    .any(|input| input == expected);
+                let candidates = logical_soft_wrap_candidates(&input, 70);
+                let Some(candidates) = candidates.proven() else {
+                    return ReceiptState::Unproven;
+                };
+                let exact = candidates.iter().any(|input| input == expected);
                 if exact && !blocked && idle_footer {
                     ReceiptState::RetainedSafe
                 } else if exact {
@@ -77,9 +79,11 @@ fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> Compose
         CodexComposer::Empty if !blocked && idle_footer => ComposerState::EmptySafe,
         CodexComposer::Empty => ComposerState::Ambiguous,
         CodexComposer::Typed(input) => {
-            let exact = logical_soft_wrap_candidates(&input, 70)
-                .iter()
-                .any(|input| input == expected);
+            let candidates = logical_soft_wrap_candidates(&input, 70);
+            let Some(candidates) = candidates.proven() else {
+                return ComposerState::Ambiguous;
+            };
+            let exact = candidates.iter().any(|input| input == expected);
             if exact && !blocked && idle_footer {
                 ComposerState::ExactSafe
             } else if exact {

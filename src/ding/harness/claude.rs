@@ -2,7 +2,9 @@
 //! footer below it.
 
 use super::{Harness, Located, ReceiptState, Screen, screen_has_accepted_notice};
-use crate::ding::composer::{ComposerState, logical_soft_wrap_candidates, looks_like_choice_menu};
+use crate::ding::composer::{
+    ComposerState, SoftWrapCandidates, logical_soft_wrap_candidates, looks_like_choice_menu,
+};
 
 pub(super) struct Claude;
 
@@ -20,6 +22,9 @@ impl Harness for Claude {
 
     fn receipt(&self, screen: &Screen<'_>, expected: &str) -> ReceiptState {
         let Some((_, logical_inputs, footer)) = located_bottom_claude_composer(screen.plain) else {
+            return ReceiptState::Unproven;
+        };
+        let Some(logical_inputs) = logical_inputs.proven() else {
             return ReceiptState::Unproven;
         };
         let exact = logical_inputs.iter().any(|input| input == expected);
@@ -41,9 +46,12 @@ impl Harness for Claude {
 
 fn classify_claude_composer(
     plain: &str,
-    (logical_inputs, footer): (Vec<String>, String),
+    (logical_inputs, footer): (SoftWrapCandidates, String),
     expected: &str,
 ) -> ComposerState {
+    let Some(logical_inputs) = logical_inputs.proven() else {
+        return ComposerState::Ambiguous;
+    };
     let exact = logical_inputs.iter().any(|input| input == expected);
     // An empty composer is a stronger positive-empty proof than the placeholder below, because no
     // human draft can be empty. Claude only shows the rotating placeholder on an unused pane.
@@ -85,7 +93,7 @@ fn is_claude_idle_placeholder(input: &str) -> bool {
 /// row Claude may either wrap at a discarded space or split a token, so each proven boundary has
 /// exactly two candidates: join with one space or with none. The bounded DING length keeps this set
 /// small; any unfamiliar multiline shape fails closed.
-fn located_bottom_claude_composer(plain: &str) -> Option<(usize, Vec<String>, String)> {
+fn located_bottom_claude_composer(plain: &str) -> Option<(usize, SoftWrapCandidates, String)> {
     let lines: Vec<&str> = plain.lines().collect();
     let separators: Vec<usize> = lines
         .iter()

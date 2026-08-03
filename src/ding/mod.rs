@@ -1890,6 +1890,38 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_composer_wraps_are_unproven_receipts() {
+        let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
+        let (first, continuation) = text.split_at(32);
+        let codex = format!(
+            "\x1b[1m›\x1b[1C\x1b[0m{first}\r\n  {continuation}\r\n\r\n\
+             \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+        );
+        let rule = claude_rule();
+        let claude = format!(
+            "Claude Code v2.1.220\r\n{rule}\r\n❯\u{00a0}{first}\r\n  {continuation}\r\n\
+             {rule}\r\n⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+
+        assert_eq!(
+            (
+                classify_receipt(&codex, text),
+                classify_receipt(&claude, text),
+            ),
+            (ReceiptState::Unproven, ReceiptState::Unproven),
+            "unsupported wraps cannot prove that the notice disappeared"
+        );
+        assert_eq!(
+            classify_receipt(&human_codex_screen(), text),
+            ReceiptState::NotRetained
+        );
+        assert_eq!(
+            classify_receipt(&staged_claude_screen("a changed human composer"), text),
+            ReceiptState::NotRetained
+        );
+    }
+
+    #[test]
     fn staged_retry_submits_only_retained_safe_and_requires_a_receipt() {
         use std::cell::RefCell;
 
