@@ -430,7 +430,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads
   never wake reconciliation; only create, modify, rename, or remove events may
-  wake it before the bounded timer.
+  wake it before the bounded timer. A generated companion is eligible only
+  while its canonical agent task is eligible. Healthy startup launches the
+  agent first and then its missing companions in the same pass. Holding or
+  failing to restart the agent, or terminally parking it, suppresses companion
+  launch and stops an exact generated companion proved live; explicitly
+  authored sibling tasks remain independent.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent. Harness readiness
   that depends on a dynamically selected account belongs to that declared
@@ -613,7 +618,10 @@ task before writing and renders only its owning agent. `st2 up --once --task
 PTY/exec state and executes a plan containing only that task. Unknown,
 ambiguous, and wrong-host selectors refuse before writes or runner inspection;
 unrelated discovery diagnostics remain visible without preventing the selected
-owner/task path.
+owner/task path. A live generated companion may be adopted or retired as that
+exact selected task. An active dead or absent generated companion is held: the
+bounded pass cannot start its canonical agent without broadening the selector.
+Explicitly authored sibling tasks retain ordinary selected-task behavior.
 
 `st2 up --materialize-only --agent <id>` remains the agent-wide rendering
 selector. Targeted task reconciliation is intentionally bounded to `--once`;

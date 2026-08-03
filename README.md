@@ -174,7 +174,9 @@ agent "<identity>" {
 For a zero-interruption migration, add `lifecycle "adopt-only"` to the compact
 agent or to an explicit `pty`/`exec` task. st2 adopts that task when its current
 generation is alive. If the generation is dead or absent, st2 reports the task
-as `held` and does not remove or launch anything:
+as `held` and does not remove or launch that task. A compact `ding` is derived
+from the generated agent task: while that agent is held, st2 suppresses a
+missing DING and stops an exact generated DING proved live:
 
 ```kdl
 agent "<identity>" {
@@ -301,6 +303,9 @@ st2 up --catalog "$CATALOG" --host <host> --once --task <host.agent.task>
 ```
 
 Unknown, ambiguous, and wrong-host task selectors refuse before workspace writes or PTY inspection.
+A selected generated DING that is dead or absent is reported as `held`, because starting its
+canonical agent would broaden the exact-task operation. Explicit sibling tasks remain independently
+selectable.
 
 `st2 doctor` accepts the absence of a live host lock as the normal manual/`--once` mode. For a
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the
