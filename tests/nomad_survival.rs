@@ -120,8 +120,7 @@ impl Fixture {
         (boots, heartbeat)
     }
 
-    /// Write a compact agent whose primary pty id is exactly its bus identity — the shape emitted
-    /// by current `compile-agent` catalogs.
+    /// Write a compact canonical agent whose primary pty id is exactly its bus identity.
     fn write_compact_agent(&self, identity: &str) {
         self.pty_sessions
             .borrow_mut()
@@ -129,6 +128,42 @@ impl Fixture {
         let kdl = format!(
             "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{HOST}\"\n  \
              type \"service\"\n  command \"{TASK_CMD}\"\n}}\n"
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+    }
+
+    fn write_color_env_agent(&self, identity: &str, explicit_no_color: bool) -> PathBuf {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}"));
+        let snapshot = self.catalog.join(format!("{identity}.color-env"));
+        let explicit_env = explicit_no_color
+            .then_some("  env { NO_COLOR \"1\" }\n")
+            .unwrap_or_default();
+        let kdl = format!(
+            r##"agent "{identity}" {{
+  identity "{identity}"
+  host "{HOST}"
+  type "service"
+{explicit_env}  command #"(printenv NO_COLOR || printf 'unset\n') >> "$CATALOG/{identity}.color-env""#
+}}
+"##
+        );
+        let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, kdl).unwrap();
+        snapshot
+    }
+
+    fn write_presented_compact_agent(&self, identity: &str, name: &str, description: &str) {
+        self.pty_sessions
+            .borrow_mut()
+            .push(format!("{HOST}.{identity}"));
+        let kdl = format!(
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{HOST}\"\n  \
+             type \"service\"\n  name {name:?}\n  description {description:?}\n  command \"{TASK_CMD}\"\n}}\n"
         );
         let path = self.catalog.join(HOST).join(identity).join("agent.kdl");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -311,7 +346,12 @@ impl Drop for Runner {
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    let raw = std::fs::read_to_string(path).ok()?;
+    raw.trim().parse().ok().or_else(|| {
+        serde_json::from_str::<serde_json::Value>(&raw).ok()?["pid"]
+            .as_i64()
+            .and_then(|pid| i32::try_from(pid).ok())
+    })
 }
 
 fn read_alive(pidfile: &Path) -> bool {
@@ -412,6 +452,22 @@ fn pty_gate(test: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+fn scope_gate(test: &str) -> bool {
+    let runtime_dir_valid =
+        std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|path| Path::new(&path).is_dir());
+    if runtime_dir_valid && st2::isolate::mode() == st2::isolate::Isolation::Scope {
+        return true;
+    }
+    assert!(
+        std::env::var_os("ST2_ALLOW_ISOLATION_SKIP").is_some(),
+        "{test}: a valid XDG_RUNTIME_DIR and systemd user scope are required. Set \
+         ST2_ALLOW_ISOLATION_SKIP=1 to skip on a host without them."
+    );
+    eprintln!("SKIP {test}: systemd user scope unavailable (ST2_ALLOW_ISOLATION_SKIP set)");
+    false
+}
+
 #[test]
 fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle() {
     if !pty_gate("pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle") {
@@ -487,6 +543,298 @@ fn pty_sessions_use_unique_agent_identity_display_names_and_preserve_lifecycle()
             "down did not stop {session_id}"
         );
     }
+}
+
+#[test]
+fn managed_agents_do_not_inherit_launcher_no_color_unless_declared() {
+    if !pty_gate("managed_agents_do_not_inherit_launcher_no_color_unless_declared") {
+        return;
+    }
+    assert_managed_agent_color_contract("portable");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_agent_color_contract_crosses_systemd_scope() {
+    let test = "managed_agent_color_contract_crosses_systemd_scope";
+    if !pty_gate(test) || !scope_gate(test) {
+        return;
+    }
+    assert_eq!(
+        st2::isolate::mode(),
+        st2::isolate::Isolation::Scope,
+        "the NO_COLOR integration must exercise systemd-run, not degraded pass-through"
+    );
+    assert_managed_agent_color_contract("scope");
+}
+
+fn assert_managed_agent_color_contract(suffix: &str) {
+    let fx = Fixture::new();
+    let ambient_identity = format!("ambient-color-{suffix}");
+    let explicit_identity = format!("explicit-color-{suffix}");
+    let ambient_snapshot = fx.write_color_env_agent(&ambient_identity, false);
+    let explicit_snapshot = fx.write_color_env_agent(&explicit_identity, true);
+
+    let out = fx
+        .st2()
+        .env("NO_COLOR", "1")
+        .arg("up")
+        .arg(&fx.catalog)
+        .args(["--host", HOST, "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "st2 up --once failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(poll_until(SPAWN_TIMEOUT, || {
+        ambient_snapshot.exists() && explicit_snapshot.exists()
+    }));
+
+    assert_eq!(
+        std::fs::read_to_string(&ambient_snapshot).unwrap(),
+        "unset\n",
+        "the reconciler's capture-only NO_COLOR must not disable agent color"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&explicit_snapshot).unwrap(),
+        "1\n",
+        "an explicit Agent Spec NO_COLOR must still reach the agent"
+    );
+
+    for (identity, snapshot) in [
+        (&ambient_identity, &ambient_snapshot),
+        (&explicit_identity, &explicit_snapshot),
+    ] {
+        let mut restarted = Command::new("pty")
+            .env("NO_COLOR", "1")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["restart", "-y", "--force", &format!("{HOST}.{identity}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let observed = poll_until(SPAWN_TIMEOUT, || {
+            std::fs::read_to_string(snapshot).is_ok_and(|contents| contents.lines().count() == 2)
+        });
+        let _ = restarted.kill();
+        let output = restarted.wait_with_output().unwrap();
+        assert!(
+            observed,
+            "`pty restart -y` did not produce a second snapshot for {identity}:\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        poll_until(SPAWN_TIMEOUT, || {
+            [&ambient_snapshot, &explicit_snapshot]
+                .iter()
+                .all(|snapshot| {
+                    std::fs::read_to_string(snapshot)
+                        .is_ok_and(|contents| contents.lines().count() == 2)
+                })
+        }),
+        "restarted agents did not record their second environment snapshot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ambient_snapshot).unwrap(),
+        "unset\nunset\n",
+        "the persisted removal must win over a restart caller's ambient NO_COLOR"
+    );
+    assert_eq!(
+        std::fs::read_to_string(explicit_snapshot).unwrap(),
+        "1\n1\n",
+        "the explicit Agent Spec assignment must win on restart"
+    );
+}
+
+#[test]
+fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
+    if !pty_gate("presentation_changes_patch_the_exact_live_pty_without_restarting_it") {
+        return;
+    }
+    let fx = Fixture::new();
+    let identity = "presented";
+    let session_id = format!("{HOST}.{identity}");
+    fx.write_presented_compact_agent(identity, "Build owner", "Owns build delivery");
+
+    let launched = fx.up_once();
+    assert!(launched.contains(&session_id), "output:\n{launched}");
+    let pidfile = fx.pty_root.join(format!("{session_id}.pid"));
+    let initial_pid = read_pid(&pidfile).unwrap();
+    let list_session = || {
+        let output = Command::new("pty")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["list", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["name"] == session_id)
+            .unwrap()
+            .clone()
+    };
+    let event_count = || {
+        let output = Command::new("pty")
+            .env("PTY_ROOT", &fx.pty_root)
+            .args(["events", "--recent", "--json", &session_id])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .matches("metadata_change")
+            .count()
+    };
+    let initial = list_session();
+    let created_at = initial["createdAt"].clone();
+    assert_eq!(initial["displayName"], "Build owner");
+    assert_eq!(initial["tags"]["agent.presentation.schema"], "1");
+    assert_eq!(initial["tags"]["agent.actor.path"], session_id);
+    assert_eq!(
+        initial["tags"]["agent.presentation.description"],
+        "Owns build delivery"
+    );
+    let initial_events = event_count();
+
+    for (command, value) in [
+        ("rename", "Release owner"),
+        ("describe", "Owns release delivery"),
+    ] {
+        let output = fx
+            .st2()
+            .env_remove("ST_AGENT")
+            .args([
+                "--catalog",
+                fx.catalog.to_str().unwrap(),
+                command,
+                &session_id,
+                value,
+            ])
+            .args(["--host", HOST, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let adopted = fx.up_once();
+    assert!(
+        adopted.contains("adopted (1): presented"),
+        "output:\n{adopted}"
+    );
+    let changed = list_session();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(changed["createdAt"], created_at);
+    assert_eq!(changed["displayName"], "Release owner");
+    assert_eq!(
+        changed["tags"]["agent.presentation.description"],
+        "Owns release delivery"
+    );
+    assert_eq!(event_count(), initial_events + 1);
+
+    fx.up_once();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(
+        event_count(),
+        initial_events + 1,
+        "unchanged projection emitted an event"
+    );
+
+    let output = fx
+        .st2()
+        .env_remove("ST_AGENT")
+        .args([
+            "--catalog",
+            fx.catalog.to_str().unwrap(),
+            "rename",
+            &session_id,
+            &session_id,
+        ])
+        .args(["--host", HOST, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fx.up_once();
+    let lifecycle_equal = list_session();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(lifecycle_equal["createdAt"], created_at);
+    assert!(lifecycle_equal.get("displayName").is_none());
+    assert_eq!(event_count(), initial_events + 2);
+
+    fx.up_once();
+    assert_eq!(event_count(), initial_events + 2);
+
+    for command in ["rename", "describe"] {
+        let output = fx
+            .st2()
+            .env_remove("ST_AGENT")
+            .args([
+                "--catalog",
+                fx.catalog.to_str().unwrap(),
+                command,
+                &session_id,
+                "--clear",
+            ])
+            .args(["--host", HOST, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fx.up_once();
+    let cleared = list_session();
+    assert_eq!(read_pid(&pidfile), Some(initial_pid));
+    assert_eq!(cleared["createdAt"], created_at);
+    assert!(cleared.get("displayName").is_none());
+    assert!(
+        cleared["tags"]
+            .get("agent.presentation.description")
+            .is_none()
+    );
+    assert_eq!(event_count(), initial_events + 3);
+
+    let declaration = fx.catalog.join(HOST).join(identity).join("agent.kdl");
+    let source = std::fs::read_to_string(&declaration).unwrap();
+    std::fs::write(
+        &declaration,
+        source.replace(
+            "  type \"service\"\n",
+            "  type \"service\"\n  retired #true\n",
+        ),
+    )
+    .unwrap();
+    let retired = fx.up_once();
+    assert!(
+        retired.contains(&format!("torn down (1): {session_id}")),
+        "output:\n{retired}"
+    );
+    assert!(
+        poll_until(DEATH_TIMEOUT, || !read_alive(&pidfile)),
+        "the genuine retirement lifecycle change did not stop the PTY"
+    );
 }
 
 #[test]

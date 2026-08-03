@@ -23,6 +23,15 @@ pub struct Session {
     /// The process exit code once exited (`None` while running, or if killed/vanished with no code).
     /// Reconcile ignores this; it exists only for crash-vs-clean-exit detection (the crash-ding).
     pub exit_code: Option<i64>,
+    /// PTY presentation observed in the same authoritative inventory snapshot. Exec sessions and
+    /// older/partial observations leave this unknown so reconciliation repairs them fail-closed.
+    pub presentation: Option<ObservedPtyPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedPtyPresentation {
+    pub display_name: Option<String>,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// A concrete task st2 should spawn — everything a backend needs, resolved from the spec. Produced
@@ -47,6 +56,65 @@ pub struct TaskTarget {
     pub env: BTreeMap<String, String>,
     /// GC pin (task-level `keep`, or the agent-level `keep`).
     pub keep: bool,
+    /// Desired PTY-only presentation projected at spawn. Exec tasks carry `None`.
+    pub presentation: Option<PtyPresentation>,
+}
+
+/// Exact, non-lifecycle metadata desired for one managed PTY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyPresentation {
+    /// Exact stable PTY task ID. Automation must never resolve this as a display alias.
+    pub pty_id: String,
+    /// `Some(value)` updates primary-agent display metadata; `Some(None)` clears it. `None` preserves
+    /// a secondary task's existing task-specific display convention.
+    pub display_name: Option<Option<String>>,
+    /// Complete st2-owned tag snapshot. `None` removes an optional owned key.
+    pub tags: BTreeMap<String, Option<String>>,
+}
+
+pub const AGENT_PRESENTATION_SCHEMA_TAG: &str = "agent.presentation.schema";
+pub const AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
+pub const AGENT_DESCRIPTION_TAG: &str = "agent.presentation.description";
+
+fn pty_presentation(
+    spec: &AgentSpec,
+    task: &crate::spec::Task,
+    pty_id: &str,
+    bus_id: &str,
+) -> Option<PtyPresentation> {
+    if task.kind != TaskKind::Pty {
+        return None;
+    }
+    Some(PtyPresentation {
+        pty_id: pty_id.to_owned(),
+        display_name: (task.name == "agent").then(|| match spec.name.as_ref() {
+            Some(name) if name == pty_id => None,
+            _ => spec.name.clone(),
+        }),
+        tags: BTreeMap::from([
+            (
+                AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
+                Some("1".to_owned()),
+            ),
+            (AGENT_ACTOR_PATH_TAG.to_owned(), Some(bus_id.to_owned())),
+            (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
+        ]),
+    })
+}
+
+fn presentation_matches(
+    desired: &PtyPresentation,
+    observed: &ObservedPtyPresentation,
+) -> bool {
+    let display_name_matches = desired
+        .display_name
+        .as_ref()
+        .is_none_or(|display_name| display_name == &observed.display_name);
+    display_name_matches
+        && desired
+            .tags
+            .iter()
+            .all(|(key, value)| observed.tags.get(key) == value.as_ref())
 }
 
 /// A resolved task launch accepted by the execution backends.
@@ -89,6 +157,8 @@ pub struct ReconcilePlan<'a> {
     pub gc: Vec<String>,
     /// Dead or absent `adopt-only` task ids held without reap or launch.
     pub held: Vec<String>,
+    /// In-place presentation updates for healthy managed PTYs, independent of lifecycle actions.
+    pub presentation: Vec<PtyPresentation>,
 }
 
 /// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
@@ -164,7 +234,7 @@ pub fn reconcile_selected<'a>(
     let target = TaskTarget {
         kind: task.kind,
         pty_id: runtime.clone(),
-        bus_id,
+        bus_id: bus_id.clone(),
         name: task.name.clone(),
         launch,
         cwd: task.cwd.clone(),
@@ -172,9 +242,20 @@ pub fn reconcile_selected<'a>(
         tags: task.tags.clone(),
         env,
         keep: task.keep || owner.keep,
+        presentation: pty_presentation(owner, task, &runtime, &bus_id),
     };
     match actual {
-        Some(s) if s.alive => plan.adopt.push(owner),
+        Some(s) if s.alive => {
+            if let Some(presentation) = target.presentation.clone()
+                && !s
+                    .presentation
+                    .as_ref()
+                    .is_some_and(|observed| presentation_matches(&presentation, observed))
+            {
+                plan.presentation.push(presentation);
+            }
+            plan.adopt.push(owner);
+        }
         _ if task.lifecycle == TaskLifecycle::AdoptOnly => plan.held.push(runtime),
         Some(_) if target.keep => plan.adopt.push(owner),
         Some(_) => {
@@ -224,6 +305,10 @@ pub fn reconcile<'a>(
     let by_id: HashMap<&str, bool> = sessions
         .iter()
         .map(|s| (s.pty_id.as_str(), s.alive))
+        .collect();
+    let sessions_by_id: HashMap<&str, &Session> = sessions
+        .iter()
+        .map(|session| (session.pty_id.as_str(), session))
         .collect();
 
     let mut plan = ReconcilePlan::default();
@@ -280,10 +365,11 @@ pub fn reconcile<'a>(
                 } else {
                     env.remove("ST_SUPERVISOR");
                 }
+                let pty_id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
                 Some((
                     TaskTarget {
                         kind: t.kind,
-                        pty_id: resolve_task_id(&bus_id, &t.name, t.id.as_deref()),
+                        pty_id: pty_id.clone(),
                         bus_id: bus_id.clone(),
                         name: t.name.clone(),
                         launch,
@@ -292,6 +378,7 @@ pub fn reconcile<'a>(
                         tags: t.tags.clone(),
                         env,
                         keep: t.keep || spec.keep,
+                        presentation: pty_presentation(spec, t, &pty_id, &bus_id),
                     },
                     t.lifecycle,
                 ))
@@ -304,7 +391,19 @@ pub fn reconcile<'a>(
         let held_before = plan.held.len();
         for (target, lifecycle) in targets {
             match session_state(&by_id, &target.pty_id) {
-                SessionState::Alive => {}
+                SessionState::Alive => {
+                    let actual = sessions_by_id
+                        .get(target.pty_id.as_str())
+                        .expect("alive state has a session");
+                    if let Some(presentation) = target.presentation.clone()
+                        && !actual
+                            .presentation
+                            .as_ref()
+                            .is_some_and(|observed| presentation_matches(&presentation, observed))
+                    {
+                        plan.presentation.push(presentation);
+                    }
+                }
                 SessionState::Dead | SessionState::Absent
                     if lifecycle == TaskLifecycle::AdoptOnly =>
                 {

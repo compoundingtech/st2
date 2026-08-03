@@ -6,6 +6,8 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use sha2::{Digest as _, Sha256};
+
 fn write_agent(catalog: &Path, host: &str, identity: &str) {
     let dir = catalog.join("agents").join(host).join(identity);
     fs::create_dir_all(&dir).unwrap();
@@ -108,30 +110,25 @@ fn global_catalog_flag_overrides_the_environment_from_a_subcommand() {
 }
 
 #[test]
-fn compile_agent_can_target_only_the_global_catalog_flag() {
+fn agent_publish_can_target_only_the_global_catalog_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
-    let workspace = tmp.path().join("workspace");
-    let persona = tmp.path().join("persona.md");
-    fs::create_dir_all(&workspace).unwrap();
-    fs::write(&persona, "# worker\n").unwrap();
+    let spec = tmp.path().join("agent.kdl");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(
+        &spec,
+        "agent \"worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let input_sha256 = format!("{:x}", Sha256::digest(fs::read(&spec).unwrap()));
 
     let out = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(&catalog)
-        .args([
-            "compile-agent",
-            "--identity",
-            "worker",
-            "--host",
-            "h",
-            "--harness",
-            "codex",
-            "--dir",
-        ])
-        .arg(&workspace)
-        .arg("--persona")
-        .arg(&persona)
+        .args(["agent", "publish", "--spec"])
+        .arg(&spec)
+        .args(["--input-sha256", &input_sha256])
+        .arg("--expect-absent")
         .output()
         .unwrap();
     assert!(
@@ -140,4 +137,36 @@ fn compile_agent_can_target_only_the_global_catalog_flag() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(catalog.join("agents/h/worker/agent.kdl").is_file());
+}
+
+#[test]
+fn catalog_aliases_share_the_canonical_reader_lock_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let alias = tmp.path().join("catalog-alias");
+    let spec = catalog.join("agents/h/worker/agent.kdl");
+    fs::create_dir_all(spec.parent().unwrap()).unwrap();
+    fs::write(
+        &spec,
+        "agent \"worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&catalog, &alias).unwrap();
+
+    for args in [["ls"].as_slice(), ["agents", "--json"].as_slice()] {
+        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(args)
+            .arg("--catalog")
+            .arg(&alias)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{} failed through alias: {}",
+            args[0],
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(catalog.join(".st2/catalog-authoring.lock").is_file());
+    assert!(!alias.join(".st2/catalog-authoring.lock").is_symlink());
 }

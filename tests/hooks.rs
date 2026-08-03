@@ -542,8 +542,8 @@ fn missing_hooks_do_not_rewrite_or_stop_an_already_live_codex_agent() {
     let pty_actions = fs::read_to_string(&pty_log).unwrap_or_default();
     assert_eq!(
         pty_actions.lines().collect::<Vec<_>>(),
-        ["list --json"],
-        "the existing Codex session must be adopted without run, kill, or remove"
+        ["list --json", "metadata patch --id h.worker"],
+        "the existing Codex session may reconcile metadata but must not run, kill, or remove"
     );
     assert!(!hooks_root.exists());
 }

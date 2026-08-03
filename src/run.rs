@@ -13,34 +13,144 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::io::{Read as _, Seek as _};
+use std::fs::File;
+use std::io::{Read as _, Seek as _, Write as _};
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::reconcile::{PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::task_inventory::{
+    DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
+    RuntimeObserver, generation_id,
+};
 use agent_spec::spec::TaskKind;
 
 // This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+const MAX_PRESENTATION_PATCHES_PER_PASS: usize = 8;
+
+#[derive(Debug, Default)]
+pub(crate) struct PresentationPatchCursor {
+    after_id: Option<String>,
+}
+
+impl PresentationPatchCursor {
+    fn batch<'a>(&mut self, presentation: &'a [PtyPresentation]) -> Vec<&'a PtyPresentation> {
+        let mut ordered = presentation.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.pty_id.cmp(&right.pty_id));
+        if ordered.is_empty() {
+            return Vec::new();
+        }
+        let start = self.after_id.as_ref().map_or(0, |after_id| {
+            let next = ordered.partition_point(|item| item.pty_id <= *after_id);
+            if next == ordered.len() { 0 } else { next }
+        });
+        let batch = (0..ordered.len().min(MAX_PRESENTATION_PATCHES_PER_PASS))
+            .map(|offset| ordered[(start + offset) % ordered.len()])
+            .collect::<Vec<_>>();
+        self.after_id = batch.last().map(|item| item.pty_id.clone());
+        batch
+    }
+}
 
 /// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
 /// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    output_with_input_timeout(command, timeout, None)
+}
+
+fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Ok(None) | Err(_) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn write_all_before(
+    mut stdin: ChildStdin,
+    mut input: &[u8],
+    deadline: Instant,
+) -> anyhow::Result<bool> {
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error()).context("read metadata stdin flags");
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("make metadata stdin nonblocking");
+    }
+    while !input.is_empty() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        match stdin.write(input) {
+            Ok(0) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                    .context("write metadata patch payload");
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Err(error) => return Err(error).context("write metadata patch payload"),
+        }
+    }
+    Ok(true)
+}
+
+fn output_with_input_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::from(stdout.try_clone()?))
         .stderr(Stdio::from(stderr.try_clone()?));
     unsafe {
@@ -55,21 +165,29 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
+    if let Some(input) = input {
+        let Some(stdin) = child.stdin.take() else {
+            terminate_and_reap_before(child, pid, deadline);
+            anyhow::bail!("metadata patch child has no piped stdin");
+        };
+        match write_all_before(stdin, &input, deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                terminate_and_reap_before(child, pid, deadline);
+                anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
+            }
+            Err(error) => {
+                terminate_and_reap_before(child, pid, deadline);
+                return Err(error);
+            }
+        }
+    }
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = child.kill();
-            // Never turn the timeout into another unbounded wait. Reap asynchronously so a
-            // long-running supervisor does not accumulate zombies, while a wedged runtime cannot
-            // hold up this failed probe or a short-lived doctor process.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            terminate_and_reap_before(child, pid, deadline);
             anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -108,6 +226,11 @@ pub trait Runner {
     /// Spawn `target` in the background from its explicit launch. `spec_dir` is the spec file's
     /// directory — part of the cwd fallback chain (task.cwd → workspace → spec dir).
     fn spawn(&self, target: &TaskTarget, spec_dir: &Path) -> anyhow::Result<()>;
+    /// Atomically reconcile display metadata and the complete st2-owned tag snapshot for one exact
+    /// existing PTY ID. The default is a no-op for non-PTY test/backends.
+    fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// SIGTERM a running session.
     fn kill(&self, pty_id: &str) -> anyhow::Result<()>;
     /// Reap an exited session before restarting it. Backends may preserve bounded diagnostics here.
@@ -146,6 +269,23 @@ struct PtyListEntry {
     /// The process exit code once `exited` (absent while running or `vanished`).
     #[serde(rename = "exitCode", default)]
     exit_code: Option<i64>,
+    /// PTY daemon PID. Together with `createdAt`, this identifies one generation.
+    #[serde(default)]
+    pid: Option<u32>,
+    /// PTY-owned generation creation time.
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct PtyMetadataPatch<'a> {
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a Option<String>>,
+    tags: &'a BTreeMap<String, Option<String>>,
 }
 
 /// The `PTY_ROOT` st2 uses for a pty op. An EXPORTED ambient `PTY_ROOT` WINS — a decoupled partition,
@@ -221,9 +361,10 @@ impl PtyCli {
     /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
     /// env can be unit-tested without spawning anything.
     ///
-    /// `$VAR`s are expanded here for everything that does NOT pass through a shell — env values, tag
-    /// values, `cwd`, and direct argv — because `pty` passes them through verbatim. Shell source is
-    /// left unexpanded: `sh -c` expands it at spawn from the same env (which includes `$CATALOG`).
+    /// `$VAR`s are expanded here for task-authored values that do NOT pass through a shell — env,
+    /// tags, `cwd`, and direct argv — because `pty` passes them through verbatim. The st2-owned
+    /// presentation snapshot remains literal so initial spawn and later metadata patches agree.
+    /// Shell source is left unexpanded: `sh -c` expands it at spawn from the same env.
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
         let mut cmd = Command::new(&self.bin);
@@ -231,18 +372,48 @@ impl PtyCli {
             .arg("-d") // detached: leave it running in the background
             .arg("--force") // st2 itself may run inside a pty session; allow nesting
             .args(["--id", &target.pty_id]);
-        // Keep the adoption key task-specific, but make a differing human-facing label the owning
-        // agent's stable bus identity instead of pty's auto-derived `<cwd>-sh` label. When the
-        // lifecycle id already IS that identity, suppress pty's automatic `<cwd>-sh` alias: pty
-        // rejects displayName == id, and no displayName makes the UI fall back to the stable id.
-        if target.pty_id == target.bus_id {
-            cmd.arg("--no-display-name");
-        } else {
-            cmd.args(["--name", &target.bus_id]);
+        match target
+            .presentation
+            .as_ref()
+            .map(|presentation| &presentation.display_name)
+        {
+            Some(Some(Some(name))) if name == &target.pty_id => {
+                cmd.arg("--no-display-name");
+            }
+            Some(Some(Some(name))) => {
+                cmd.args(["--name", name]);
+            }
+            Some(Some(None)) => {
+                cmd.arg("--no-display-name");
+            }
+            // Secondary tasks retain the established task-specific presentation convention.
+            _ if target.pty_id == target.bus_id => {
+                cmd.arg("--no-display-name");
+            }
+            _ => {
+                cmd.args(["--name", &target.bus_id]);
+            }
         }
         cmd.arg("--cwd").arg(&cwd);
-        for (k, v) in &target.tags {
-            cmd.arg("--tag").arg(format!("{k}={}", self.expand(v)));
+        let mut tags = target
+            .tags
+            .iter()
+            .map(|(key, value)| (key.clone(), self.expand(value)))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(presentation) = &target.presentation {
+            for (key, value) in &presentation.tags {
+                match value {
+                    Some(value) => {
+                        tags.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        tags.remove(key);
+                    }
+                }
+            }
+        }
+        for (k, v) in &tags {
+            cmd.arg("--tag").arg(format!("{k}={v}"));
         }
         // Managed agent and DING sessions retain PTY exit evidence until the lifecycle owner records
         // the receipt and explicitly removes the generation. This prevents face607 clean-exit reaping
@@ -255,6 +426,13 @@ impl PtyCli {
         // last-wins, then forcibly injects the new session's own PTY_SESSION identity.
         let managed_env = self.managed_task_env(target);
         cmd.envs(&managed_env);
+        // Coding-agent command runners commonly set NO_COLOR for their own captured output. That
+        // ambient preference belongs to the launcher, not to the interactive agent it happens to
+        // reconcile. Agent Spec env remains authoritative when an agent deliberately opts out.
+        if target.name == "agent" && !target.env.contains_key("NO_COLOR") {
+            cmd.env_remove("NO_COLOR");
+            cmd.arg("--unset-env").arg("NO_COLOR");
+        }
         for (key, value) in &managed_env {
             let mut assignment = key.clone();
             assignment.push("=");
@@ -275,14 +453,187 @@ impl PtyCli {
         }
         cmd
     }
-}
 
-impl Runner for PtyCli {
-    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+    /// Pure, typed PTY observation. A missing root is known empty and is not
+    /// passed to `pty`, because observation must not create it.
+    fn task_observations(&self, desired_ids: &HashSet<&str>) -> ObservationBatch {
+        let root = effective_pty_root(&self.catalog_root);
+        self.task_observations_at_root(desired_ids, &root)
+    }
+
+    fn task_observations_at_root(
+        &self,
+        desired_ids: &HashSet<&str>,
+        root: &Path,
+    ) -> ObservationBatch {
+        if desired_ids.is_empty() {
+            return ObservationBatch {
+                complete: true,
+                ..ObservationBatch::default()
+            };
+        }
+        // Retain the admitted directory inode across the external probe. `pty
+        // list` creates PTY_ROOT when absent, so a path removed and recreated
+        // during the call must never be confused with the admitted registry.
+        let root_handle = match File::open(root) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ObservationBatch {
+                    complete: true,
+                    ..ObservationBatch::default()
+                };
+            }
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "cannot inspect PTY root {}: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        let metadata = match root_handle.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "cannot inspect admitted PTY root {}: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        if !metadata.is_dir() {
+            return ObservationBatch {
+                complete: false,
+                observations: Vec::new(),
+                errors: vec![format!("PTY root {} is not a directory", root.display())],
+            };
+        }
+        let entries = match self.list_entries_at(root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![error.to_string()],
+                };
+            }
+        };
+        let final_metadata = match std::fs::metadata(root) {
+            Ok(final_metadata) => final_metadata,
+            Err(error) => {
+                return ObservationBatch {
+                    complete: false,
+                    observations: Vec::new(),
+                    errors: vec![format!(
+                        "PTY root {} disappeared during observation: {error}",
+                        root.display()
+                    )],
+                };
+            }
+        };
+        if !final_metadata.is_dir()
+            || final_metadata.dev() != metadata.dev()
+            || final_metadata.ino() != metadata.ino()
+        {
+            return ObservationBatch {
+                complete: false,
+                observations: Vec::new(),
+                errors: vec![format!(
+                    "PTY root {} changed identity during observation",
+                    root.display()
+                )],
+            };
+        }
+        let mut observations = Vec::with_capacity(entries.len());
+        let mut errors = Vec::new();
+        for entry in entries {
+            if !desired_ids.contains(entry.name.as_str()) {
+                continue;
+            }
+            let state = match entry.status.as_str() {
+                "running" => match (entry.pid, entry.created_at.as_deref()) {
+                    (Some(pid), Some(created_at)) => {
+                        let generation_id =
+                            generation_id("pty", &entry.name, pid, created_at, None);
+                        match RuntimeGeneration::new(pid, created_at.to_owned(), generation_id) {
+                            Ok(generation) => ObservedState::Running(generation),
+                            Err(error) => {
+                                let message = format!(
+                                    "invalid PTY task {:?} generation: {error}",
+                                    entry.name
+                                );
+                                errors.push(message.clone());
+                                ObservedState::Indeterminate(message)
+                            }
+                        }
+                    }
+                    _ => {
+                        let message = format!(
+                            "running PTY task {:?} lacks pid or createdAt generation evidence",
+                            entry.name
+                        );
+                        errors.push(message.clone());
+                        ObservedState::Indeterminate(message)
+                    }
+                },
+                "exited" => ObservedState::Exited,
+                "vanished" => ObservedState::Vanished,
+                other => {
+                    let message = format!("PTY task {:?} has unknown status {other:?}", entry.name);
+                    errors.push(message.clone());
+                    ObservedState::Indeterminate(message)
+                }
+            };
+            observations.push(RuntimeObservation {
+                runtime_id: entry.name,
+                state,
+            });
+        }
+        ObservationBatch {
+            complete: errors.is_empty(),
+            observations,
+            errors,
+        }
+    }
+
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        let payload = serde_json::to_vec(&PtyMetadataPatch {
+            display_name: presentation.display_name.as_ref(),
+            tags: &presentation.tags,
+        })?;
+        let out = output_with_input_timeout(
+            Command::new(&self.bin)
+                .args(["metadata", "patch", "--id", &presentation.pty_id])
+                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+            PTY_LIST_TIMEOUT,
+            Some(payload),
+        )
+        .map_err(|error| anyhow::anyhow!("`pty metadata patch --id` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty metadata patch --id {}` failed: {}",
+                presentation.pty_id,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn list_entries(&self) -> anyhow::Result<Vec<PtyListEntry>> {
+        self.list_entries_at(&effective_pty_root(&self.catalog_root))
+    }
+
+    fn list_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyListEntry>> {
         let out = output_with_timeout(
             Command::new(&self.bin)
                 .args(["list", "--json"])
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+                .env("PTY_ROOT", root),
             PTY_LIST_TIMEOUT,
         )
         .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
@@ -292,14 +643,38 @@ impl Runner for PtyCli {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let entries: Vec<PtyListEntry> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("parsing `pty list --json`: {e}"))?;
-        Ok(entries
+        serde_json::from_slice(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty list --json`: {error}"))
+    }
+}
+
+/// Apply both assignments and removals from an inner command to its isolation wrapper.
+fn apply_command_env(source: &Command, target: &mut Command) {
+    for (key, value) in source.get_envs() {
+        match value {
+            Some(value) => {
+                target.env(key, value);
+            }
+            None => {
+                target.env_remove(key);
+            }
+        }
+    }
+}
+
+impl Runner for PtyCli {
+    fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        Ok(self
+            .list_entries()?
             .into_iter()
             .map(|e| Session {
                 pty_id: e.name,
                 alive: e.status == "running",
                 exit_code: e.exit_code,
+                presentation: Some(crate::reconcile::ObservedPtyPresentation {
+                    display_name: e.display_name,
+                    tags: e.tags,
+                }),
             })
             .collect())
     }
@@ -316,10 +691,6 @@ impl Runner for PtyCli {
         let args: Vec<OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
         let arg_refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
         let unit = crate::isolate::scope_unit(&target.pty_id);
-        let envs: Vec<(OsString, OsString)> = inner
-            .get_envs()
-            .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
-            .collect();
 
         // Atomic reap-then-respawn: a session id JUST reaped in this same pass (execute's
         // reap-then-respawn after a hard-kill) can linger microseconds in the per-session pty daemon —
@@ -332,9 +703,7 @@ impl Runner for PtyCli {
         let mut last_err = String::new();
         for attempt in 0..SPAWN_ATTEMPTS {
             let mut cmd = crate::isolate::wrap(&unit, program.as_os_str(), &arg_refs);
-            for (k, v) in &envs {
-                cmd.env(k, v);
-            }
+            apply_command_env(&inner, &mut cmd);
             let out = cmd.output()?;
             if out.status.success() {
                 return Ok(());
@@ -353,6 +722,10 @@ impl Runner for PtyCli {
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
         anyhow::bail!("spawning pty '{}' failed: {last_err}", target.pty_id);
+    }
+
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        PtyCli::patch_presentation(self, presentation)
     }
 
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -443,6 +816,79 @@ impl SystemRunner {
     }
 }
 
+impl RuntimeObserver for SystemRunner {
+    fn observe(&self, desired: &[DesiredRuntime]) -> ObservationBatch {
+        let pty_ids = desired
+            .iter()
+            .filter(|runtime| runtime.kind == TaskKind::Pty)
+            .map(|runtime| runtime.runtime_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut batch = self.pty.task_observations(&pty_ids);
+
+        for runtime in desired
+            .iter()
+            .filter(|runtime| runtime.kind == TaskKind::Exec)
+        {
+            match self.exec.observe_generation_optional(&runtime.runtime_id) {
+                Ok(None) => {
+                    // Positive absence is filled by the declaration/runtime join.
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Running {
+                    pid,
+                    created_at,
+                    generation_id,
+                })) => {
+                    let state = match RuntimeGeneration::new(pid, created_at, generation_id) {
+                        Ok(generation) => ObservedState::Running(generation),
+                        Err(error) => {
+                            let message = format!(
+                                "invalid exec task {:?} generation: {error}",
+                                runtime.runtime_id
+                            );
+                            batch.errors.push(message.clone());
+                            ObservedState::Indeterminate(message)
+                        }
+                    };
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state,
+                    });
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Exited { .. })) => {
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Exited,
+                    });
+                }
+                Ok(Some(crate::exec_backend::ExecGenerationObservation::Indeterminate {
+                    reason,
+                    ..
+                })) => {
+                    let message = format!(
+                        "exec task {:?} is indeterminate: {reason}",
+                        runtime.runtime_id
+                    );
+                    batch.errors.push(message.clone());
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Indeterminate(message),
+                    });
+                }
+                Err(error) => {
+                    let message = format!("observe exec task {:?}: {error:#}", runtime.runtime_id);
+                    batch.errors.push(message.clone());
+                    batch.observations.push(RuntimeObservation {
+                        runtime_id: runtime.runtime_id.clone(),
+                        state: ObservedState::Indeterminate(message),
+                    });
+                }
+            }
+        }
+        batch.complete &= batch.errors.is_empty();
+        batch
+    }
+}
+
 impl Runner for SystemRunner {
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let mut idx = self.index.borrow_mut();
@@ -464,6 +910,10 @@ impl Runner for SystemRunner {
             TaskKind::Pty => self.pty.spawn(target, spec_dir),
             TaskKind::Exec => self.exec.spawn(target, spec_dir),
         }
+    }
+
+    fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+        self.pty.patch_presentation(presentation)
     }
 
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
@@ -538,11 +988,15 @@ pub struct UpReport {
     /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
     /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
     pub skipped: bool,
-    /// pty ids spawned this pass.
+    /// Task IDs that st2 started without a restart reap in this pass.
     pub launched: Vec<String>,
+    /// Task IDs that st2 restarted successfully in this pass. st2 reaped a dead active record
+    /// before it spawned the replacement. These IDs are not first launches or final garbage
+    /// collection.
+    pub restarted: Vec<String>,
     /// pty ids torn down (retired agents) this pass.
     pub torn_down: Vec<String>,
-    /// pty ids garbage-collected (dead, non-`keep`) this pass.
+    /// Task IDs in final garbage collection. st2 did not spawn replacements.
     pub gc: Vec<String>,
     /// pty ids whose GC/relaunch was DEFERRED this pass by the liveness debounce — a task that read
     /// not-alive but was alive within the grace window, i.e. a transient `pty list` flicker under load,
@@ -570,6 +1024,7 @@ impl UpReport {
     fn absorb(&mut self, mut other: UpReport) {
         self.skipped |= other.skipped;
         self.launched.append(&mut other.launched);
+        self.restarted.append(&mut other.restarted);
         self.torn_down.append(&mut other.torn_down);
         self.gc.append(&mut other.gc);
         self.deferred.append(&mut other.deferred);
@@ -587,9 +1042,11 @@ impl UpReport {
     pub fn is_noteworthy(&self) -> bool {
         self.skipped
             || !self.launched.is_empty()
+            || !self.restarted.is_empty()
             || !self.torn_down.is_empty()
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
+            || !self.warnings.is_empty()
             || !self.errors.is_empty()
     }
 }
@@ -601,6 +1058,22 @@ pub fn execute(
     plan: &ReconcilePlan,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
+    report: &mut UpReport,
+) {
+    execute_with_presentation_cursor(
+        plan,
+        runner,
+        cap,
+        &mut PresentationPatchCursor::default(),
+        report,
+    );
+}
+
+fn execute_with_presentation_cursor(
+    plan: &ReconcilePlan,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    presentation_cursor: &mut PresentationPatchCursor,
     report: &mut UpReport,
 ) {
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
@@ -647,11 +1120,12 @@ pub fn execute(
                 crate::flapping::RestartDecision::Delaying
                 | crate::flapping::RestartDecision::RateLimited => continue,
             }
-            // Reap the corpse first (a dead session blocks respawn), preserving any backend-owned
-            // bounded diagnostics, then respawn.
-            if gc_set.contains(target.pty_id.as_str()) {
+            // Reap the dead record before st2 starts a replacement. A dead record blocks the
+            // replacement. The backend preserves its bounded diagnostics.
+            let restarting = gc_set.contains(target.pty_id.as_str());
+            if restarting {
                 match runner.reap_for_restart(&target.pty_id) {
-                    Ok(()) => report.gc.push(target.pty_id.clone()),
+                    Ok(()) => {}
                     Err(e) => {
                         report
                             .errors
@@ -663,7 +1137,11 @@ pub fn execute(
             match runner.spawn(target, spec_dir) {
                 Ok(()) => {
                     cap.record(&target.pty_id, now);
-                    report.launched.push(target.pty_id.clone());
+                    if restarting {
+                        report.restarted.push(target.pty_id.clone());
+                    } else {
+                        report.launched.push(target.pty_id.clone());
+                    }
                 }
                 Err(e) => report.errors.push(format!("spawn {}: {e}", target.pty_id)),
             }
@@ -677,6 +1155,26 @@ pub fn execute(
                 Err(e) => report.errors.push(format!("kill {id}: {e}")),
             }
         }
+    }
+
+    // Presentation never delays lifecycle convergence. Drift repair is bounded to eight sequential
+    // children, keeping its worst-case 2s-per-child containment below the 30s supervisor cadence;
+    // remaining drift is observed and retried on later passes.
+    for presentation in presentation_cursor.batch(&plan.presentation) {
+        if let Err(error) = runner.patch_presentation(presentation) {
+            report
+                .errors
+                .push(format!("metadata patch {}: {error}", presentation.pty_id));
+        }
+    }
+    let deferred_presentation = plan
+        .presentation
+        .len()
+        .saturating_sub(MAX_PRESENTATION_PATCHES_PER_PASS);
+    if deferred_presentation > 0 {
+        report.warnings.push(format!(
+            "deferred {deferred_presentation} presentation patches after bounded batch of {MAX_PRESENTATION_PATCHES_PER_PASS}"
+        ));
     }
 
     report
@@ -773,7 +1271,20 @@ fn reconcile_pass(
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
+    let _catalog_lock = match crate::CatalogLock::shared(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return UpReport {
+                skipped: true,
+                errors: vec![format!(
+                    "acquire shared catalog-authoring lock (pass skipped): {error:#}"
+                )],
+                ..Default::default()
+            };
+        }
+    };
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -844,7 +1355,7 @@ fn reconcile_pass(
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute(&plan, runner, cap, &mut report);
+    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     report
 }
 
@@ -898,6 +1409,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
+        &mut PresentationPatchCursor::default(),
     ))
 }
 
@@ -916,6 +1428,24 @@ pub fn reconcile_pass_specs(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
 ) -> UpReport {
+    reconcile_pass_specs_with_cursor(
+        specs,
+        this_host,
+        runner,
+        cap,
+        debounce,
+        &mut PresentationPatchCursor::default(),
+    )
+}
+
+pub(crate) fn reconcile_pass_specs_with_cursor(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
+) -> UpReport {
     let mut report = UpReport::default();
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
@@ -927,7 +1457,15 @@ pub fn reconcile_pass_specs(
             return report;
         }
     };
-    reconcile_pass_specs_with_sessions(specs, &sessions, this_host, runner, cap, debounce)
+    reconcile_pass_specs_with_sessions(
+        specs,
+        &sessions,
+        this_host,
+        runner,
+        cap,
+        debounce,
+        presentation_cursor,
+    )
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
@@ -941,13 +1479,14 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let mut report = UpReport::default();
     let now = Instant::now();
     debounce.observe(sessions, now);
     let mut plan = crate::reconcile(specs, sessions, this_host);
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    execute(&plan, runner, cap, &mut report);
+    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     report
 }
 
@@ -989,6 +1528,8 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    let _catalog_lock = crate::CatalogLock::shared(catalog_root)
+        .context("acquire shared catalog-authoring lock for selected reconcile")?;
     let found = crate::discovery::discover(catalog_root);
     let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
     let mut report = UpReport::default();
@@ -1070,9 +1611,17 @@ pub fn up_loop_specs(
     install_signal_handler();
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    let mut presentation_cursor = PresentationPatchCursor::default();
     let mut reported_flapping: HashSet<String> = HashSet::new();
     loop {
-        let report = reconcile_pass_specs(specs, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass_specs_with_cursor(
+            specs,
+            this_host,
+            runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+        );
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1108,6 +1657,8 @@ pub fn up_loop_specs(
 /// one operation that ends tasks (the Nomad model: stopping the supervisor never does). Idempotent:
 /// tasks already gone are simply not in the live set. Per-kill errors are collected, never fatal.
 pub fn down(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let _catalog_lock = crate::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for teardown")?;
     let found = crate::discover(root);
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -1224,6 +1775,7 @@ fn up_loop_until(
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+    let mut presentation_cursor = PresentationPatchCursor::default();
 
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
@@ -1231,7 +1783,14 @@ fn up_loop_until(
     let mut reported_flapping: HashSet<String> = HashSet::new();
 
     loop {
-        let report = reconcile_pass(root, this_host, runner, &mut cap, &mut debounce);
+        let report = reconcile_pass(
+            root,
+            this_host,
+            runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+        );
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
@@ -1287,7 +1846,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         );
         return;
     };
-    let Some(agent_dir) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
+    let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
         eprintln!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id
@@ -1339,8 +1898,8 @@ pub fn detect_host() -> String {
 mod tests {
     use super::*;
     use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
-    use std::cell::Cell;
-    use std::collections::BTreeMap;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
 
     fn target(id: &str, cmd: &str) -> TaskTarget {
@@ -1355,6 +1914,7 @@ mod tests {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            presentation: None,
         }
     }
 
@@ -1381,10 +1941,83 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PersistentPatchRunner {
+        patched: RefCell<Vec<String>>,
+    }
+
+    impl Runner for PersistentPatchRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            unreachable!("presentation execution does not list sessions")
+        }
+
+        fn spawn(&self, _target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            unreachable!("presentation-only plan must not spawn")
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            unreachable!("presentation-only plan must not kill")
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            unreachable!("presentation-only plan must not remove")
+        }
+
+        fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+            self.patched.borrow_mut().push(presentation.pty_id.clone());
+            if presentation.pty_id.as_str() < "host.presented.08" {
+                anyhow::bail!("simulated persistent metadata failure");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_presentation_batches_are_deterministic_and_do_not_starve() {
+        let plan = ReconcilePlan {
+            presentation: (0..12)
+                .rev()
+                .map(|index| PtyPresentation {
+                    pty_id: format!("host.presented.{index:02}"),
+                    display_name: None,
+                    tags: BTreeMap::new(),
+                })
+                .collect(),
+            ..ReconcilePlan::default()
+        };
+        let runner = PersistentPatchRunner::default();
+        let mut cap = FlappingCap::default();
+        let mut cursor = PresentationPatchCursor::default();
+
+        for _ in 0..2 {
+            execute_with_presentation_cursor(
+                &plan,
+                &runner,
+                &mut cap,
+                &mut cursor,
+                &mut UpReport::default(),
+            );
+        }
+
+        let attempted = runner.patched.borrow();
+        assert_eq!(
+            &attempted[..8],
+            &(0..8)
+                .map(|index| format!("host.presented.{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(attempted.len(), 16);
+        for index in 8..12 {
+            assert!(attempted.contains(&format!("host.presented.{index:02}")));
+        }
+    }
+
     #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
             identity: "codex".into(),
+            name: None,
+            description: None,
             host: None,
             role: None,
             job_type: JobType::Service,
@@ -1468,12 +2101,15 @@ mod tests {
             pty_id: id.to_string(),
             alive,
             exit_code: None,
+            presentation: None,
         }
     }
 
     fn spec_fixture() -> AgentSpec {
         AgentSpec {
             identity: "demo".into(),
+            name: None,
+            description: None,
             host: Some("hetz".into()),
             role: None,
             job_type: JobType::Service,
@@ -1710,7 +2346,7 @@ mod tests {
     }
 
     /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
-    /// and the owning agent's bus identity as its human-facing name.
+    /// and the established fallback presentation when no Agent Spec name is projected.
     #[test]
     fn build_run_command_wraps_command_in_sh_c() {
         let cli = PtyCli::default();
@@ -1740,6 +2376,245 @@ mod tests {
                 "-c",
                 "exec claude --permission-mode bypassPermissions 'boot'"
             ]
+        );
+    }
+
+    #[test]
+    fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
+        let key = "ST2_TEST_PRESENTATION_LITERAL_71c";
+        unsafe { std::env::set_var(key, "expanded") }
+
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo", "codex");
+        t.bus_id = "hetz.demo".to_owned();
+        t.tags.insert("unrelated".to_owned(), "preserved".to_owned());
+        t.presentation = Some(PtyPresentation {
+            pty_id: "hetz.demo".to_owned(),
+            display_name: Some(Some("Build owner".to_owned())),
+            tags: BTreeMap::from([
+                (
+                    "agent.presentation.schema".to_owned(),
+                    Some("1".to_owned()),
+                ),
+                (
+                    "agent.actor.path".to_owned(),
+                    Some("hetz.demo".to_owned()),
+                ),
+                (
+                    "agent.presentation.description".to_owned(),
+                    Some(format!("${key}")),
+                ),
+            ]),
+        });
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let name = args.iter().position(|arg| arg == "--name").unwrap();
+        assert_eq!(args[name + 1], "Build owner");
+        let tags = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--tag")
+            .map(|pair| pair[1].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(tags.contains("unrelated=preserved"));
+        assert!(tags.contains("agent.presentation.schema=1"));
+        assert!(tags.contains("agent.actor.path=hetz.demo"));
+        assert!(tags.contains("agent.presentation.description=$ST2_TEST_PRESENTATION_LITERAL_71c"));
+    }
+
+    #[test]
+    fn metadata_patch_uses_exact_id_and_one_json_stdin_payload() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("pty-capture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = PtyCli {
+            bin: executable.display().to_string(),
+            catalog_root: temporary.path().to_path_buf(),
+        };
+        let presentation = PtyPresentation {
+            pty_id: "stable.agent.id".to_owned(),
+            display_name: Some(None),
+            tags: BTreeMap::from([
+                (
+                    "agent.presentation.schema".to_owned(),
+                    Some("1".to_owned()),
+                ),
+                ("agent.presentation.description".to_owned(), None),
+            ]),
+        };
+
+        cli.patch_presentation(&presentation).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(executable.with_extension("args")).unwrap(),
+            "metadata\npatch\n--id\nstable.agent.id\n"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(executable.with_extension("stdin")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["displayName"], serde_json::Value::Null);
+        assert_eq!(payload["tags"]["agent.presentation.schema"], "1");
+        assert_eq!(
+            payload["tags"]["agent.presentation.description"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn input_write_failure_terminates_and_reaps_the_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("close-stdin");
+        let pidfile = temporary.path().join("child.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nexec 0<&-\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1024 * 1024];
+        let error = output_with_input_timeout(
+            Command::new(&executable).env("PIDFILE", &pidfile),
+            Duration::from_secs(1),
+            Some(input),
+        )
+        .unwrap_err();
+        let pid = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("Broken pipe"),
+            "unexpected write error: {error:#}"
+        );
+        assert!(
+            !crate::host_lock::process_alive(pid),
+            "failed metadata child {pid} was not terminated and reaped"
+        );
+    }
+
+    #[test]
+    fn input_write_obeys_the_child_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("ignore-stdin");
+        let pidfile = temporary.path().join("child.pid");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let error = output_with_input_timeout(
+            Command::new(&executable).env("PIDFILE", &pidfile),
+            Duration::from_millis(100),
+            Some(input),
+        )
+        .unwrap_err();
+        let pid = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected write error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked stdin write ignored the child deadline"
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::host_lock::process_alive(pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undrained_reader_does_not_retain_the_nonblocking_writer() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let pipe = std::fs::read_link(format!("/proc/self/fd/{}", reader.as_raw_fd())).unwrap();
+        let started = Instant::now();
+
+        assert!(
+            !write_all_before(
+                ChildStdin::from(writer),
+                &vec![b'x'; 1024 * 1024],
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap()
+        );
+        let retained_writers = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target == &pipe)
+            .count();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            retained_writers, 1,
+            "the undrained pipe retained a writer after the deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_write_deadline_prevents_further_progress() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let _reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        assert!(
+            !write_all_before(ChildStdin::from(writer), b"x", Instant::now()).unwrap(),
+            "an expired child deadline still allowed stdin progress"
+        );
+    }
+
+    #[test]
+    fn expired_cleanup_deadline_hands_reaping_off_without_blocking() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let started = Instant::now();
+        terminate_and_reap_before(child, pid, Instant::now());
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "expired cleanup deadline blocked the caller"
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !crate::host_lock::process_alive(pid),
+            "background reaper did not collect child {pid}"
         );
     }
 
@@ -1813,11 +2688,13 @@ mod tests {
         }
         let inherited = cmd
             .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.unwrap().to_string_lossy().into_owned(),
-                )
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
@@ -1860,6 +2737,11 @@ mod tests {
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "exec codex 'boot'");
         t.bus_id = t.pty_id.clone();
+        t.presentation = Some(PtyPresentation {
+            pty_id: t.pty_id.clone(),
+            display_name: Some(Some(t.pty_id.clone())),
+            tags: BTreeMap::new(),
+        });
         let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
         let args: Vec<String> = cmd
             .get_args()
@@ -1924,6 +2806,96 @@ mod tests {
                 .is_some_and(|path| !path.contains("/sets/sha256-")),
             "managed tasks keep ST_HOOKS at the receipt-bearing root; only rendered hook commands use a versioned set"
         );
+    }
+
+    #[test]
+    fn managed_agent_scrubs_ambient_no_color_unless_explicitly_declared() {
+        let cli = PtyCli::default();
+        let agent = target("hetz.demo.agent", "exec claude 'boot'");
+        let command = cli.build_run_command(&agent, Path::new("/cat/hetz/demo"));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("NO_COLOR"))
+                .map(|(_, value)| value),
+            Some(None),
+            "ambient NO_COLOR must not silently disable an interactive agent's color"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "the removal must be persisted for PTY restart"
+        );
+
+        let mut explicit = target("hetz.explicit.agent", "exec claude 'boot'");
+        explicit.env.insert("NO_COLOR".into(), "1".into());
+        let command = cli.build_run_command(&explicit, Path::new("/cat/hetz/explicit"));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("NO_COLOR"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("1")),
+            "an explicit Agent Spec NO_COLOR remains authoritative"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "an explicit assignment must not also persist a removal"
+        );
+    }
+
+    #[test]
+    fn non_agent_task_does_not_claim_no_color_policy() {
+        let cli = PtyCli::default();
+        let mut task = target("hetz.demo.sidecar", "exec sleep 1");
+        task.name = "sidecar".into();
+        let command = cli.build_run_command(&task, Path::new("/cat/hetz/demo"));
+
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != OsStr::new("NO_COLOR")),
+            "non-agent services keep the caller's ambient NO_COLOR semantics"
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--unset-env", "NO_COLOR"]),
+            "non-agent services must not persist an st2-owned removal"
+        );
+    }
+
+    #[test]
+    fn isolation_wrapper_preserves_environment_removals() {
+        let mut inner = Command::new("pty");
+        inner.env("TERM", "xterm-256color").env_remove("NO_COLOR");
+        let mut outer = Command::new("systemd-run");
+
+        apply_command_env(&inner, &mut outer);
+
+        let env = outer
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(OsStr::new("TERM")).and_then(Option::as_deref),
+            Some(OsStr::new("xterm-256color"))
+        );
+        assert_eq!(env.get(OsStr::new("NO_COLOR")), Some(&None));
     }
 
     #[test]
@@ -2059,5 +3031,181 @@ mod tests {
         let h = detect_host();
         assert!(!h.is_empty());
         assert!(!h.contains('.'), "short name only, got {h}");
+    }
+
+    #[test]
+    fn task_observation_of_missing_pty_root_is_complete_and_does_not_create_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir(&catalog).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                tmp.path().join("missing-pty").display().to_string()
+            ),
+        )
+        .unwrap();
+        let root = effective_pty_root_from(&catalog, None);
+        assert!(!root.exists());
+        let batch = PtyCli::new(catalog).task_observations(&HashSet::from(["h.worker"]));
+        assert!(batch.complete, "{:?}", batch.errors);
+        assert!(batch.observations.is_empty());
+        assert!(!root.exists(), "read-only observation created the PTY root");
+    }
+
+    #[test]
+    fn unreadable_pty_root_evidence_is_indeterminate_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let loop_path = tmp.path().join("pty-loop");
+        std::fs::create_dir(&catalog).unwrap();
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                loop_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let batch = PtyCli::new(catalog)
+            .task_observations_at_root(&HashSet::from(["h.worker"]), &loop_path);
+        assert!(!batch.complete);
+        assert!(batch.observations.is_empty());
+        assert!(
+            batch.errors[0].contains("cannot inspect PTY root"),
+            "{:?}",
+            batch.errors
+        );
+    }
+
+    #[test]
+    fn removed_and_recreated_pty_root_is_indeterminate_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pty");
+        std::fs::create_dir(&root).unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nrmdir \"$PTY_ROOT\"\nmkdir \"$PTY_ROOT\"\nprintf '%s\\n' '[]'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let batch = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: tmp.path().join("catalog"),
+        }
+        .task_observations_at_root(&HashSet::from(["h.worker"]), &root);
+        assert!(!batch.complete);
+        assert!(batch.observations.is_empty());
+        assert!(
+            batch.errors[0].contains("changed identity during observation"),
+            "{:?}",
+            batch.errors
+        );
+    }
+
+    #[test]
+    fn pty_task_observation_preserves_exact_generation_and_closed_states() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let pty_root = tmp.path().join("pty");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::create_dir(&pty_root).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                pty_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"1","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let cli = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: catalog,
+        };
+        let desired = HashSet::from(["h.live", "h.exit", "h.gone"]);
+        let first = cli.task_observations(&desired);
+        let second = cli.task_observations(&desired);
+        assert!(first.complete, "{:?}", first.errors);
+        assert_eq!(first, second, "same PTY evidence changed generation");
+        let ObservedState::Running(generation) = &first.observations[0].state else {
+            panic!("running PTY lost generation: {:?}", first.observations[0]);
+        };
+        assert_eq!(generation.pid(), 41);
+        assert_eq!(generation.created_at(), "2026-07-31T10:00:00.000Z");
+        assert!(generation.generation_id().starts_with("sha256:"));
+        assert_eq!(first.observations[1].state, ObservedState::Exited);
+        assert_eq!(first.observations[2].state, ObservedState::Vanished);
+
+        let sessions = cli.list_sessions().unwrap();
+        let presentation = sessions[0].presentation.as_ref().unwrap();
+        assert_eq!(presentation.display_name.as_deref(), Some("Build owner"));
+        assert_eq!(
+            presentation.tags.get("agent.presentation.schema").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            presentation.tags.get("unrelated").map(String::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn running_pty_without_complete_generation_is_indeterminate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let pty_root = tmp.path().join("pty");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::create_dir(&pty_root).unwrap();
+        std::fs::write(
+            catalog.join("catalog.kdl"),
+            format!(
+                "catalog {{ pty-root {:?} }}\n",
+                pty_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"h.live\",\"status\":\"running\"}]'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let batch = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: catalog,
+        }
+        .task_observations(&HashSet::from(["h.live"]));
+        assert!(!batch.complete);
+        assert!(matches!(
+            batch.observations[0].state,
+            ObservedState::Indeterminate(_)
+        ));
     }
 }

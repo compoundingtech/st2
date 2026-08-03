@@ -80,6 +80,19 @@ pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
         return false;
     }
 
+    // Canonical state has a stable address independent of whether a declaration is currently
+    // present. This keeps orphan state after retirement/removal out of discovery and out of a
+    // whole-catalog transaction's declaration identity.
+    if components.first().and_then(|name| name.to_str()) == Some("agents")
+        && components.len() >= 4
+        && matches!(
+            components[3].to_str(),
+            Some("resources" | "archive" | "inbox" | "status")
+        )
+    {
+        return false;
+    }
+
     let mut parent = root.to_path_buf();
     for name in components {
         if matches!(name.to_str(), Some("resources" | "archive" | "inbox"))

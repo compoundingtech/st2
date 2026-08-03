@@ -52,6 +52,16 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R22 Quiet coordination after events:** A network with minimal or default
+  personas stays quiet while useful work continues. Agents coordinate only after
+  an inbox DING, a durable failure, a real blocker, a completion or decision
+  handoff, or a declared schedule with a name. They continue until they resolve
+  the need or hand it off. Repeated status messages and peer polling are not
+  substitutes. Normal supervisors handle failures and blocked work. They do not
+  continuously manage healthy work. A custom supervisor persona can require
+  more frequent coordination. CoS is only an example. st2 does not define or
+  require that role, and it gives the role no standard authority. Transport
+  loss does not stop independent host-local work.
 
 ### Must preserve delivery and launch behavior
 
@@ -112,6 +122,8 @@ accepted.
   gates, PTY inspection, and plan execution are limited to the selected
   owner/task; unrelated diagnostics remain visible while unrelated workspaces,
   tasks, and live PTY PID/generation stay unchanged.
+  Stable IDs alone select and authorize automation; presentation values never
+  resolve a message, Resource, status, lifecycle, or authoring target.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
   order-independent Resource bindings. Each binding has a non-empty, agent-local
   unique name and preserves a non-empty, opaque type discriminator and an RFC
@@ -123,15 +135,122 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
-
 ### Must remain safe through host partitions
 
 - **R18 Last-known-good local desired state:** During transport loss, each host
-  continues converging locally applied work from its last complete, validated
-  catalog. A missing, partial, or invalid incoming catalog cannot replace that
-  desired state or authorize teardown.
-- **R22 Independent fleet convergence:** Temporary catalog-version skew between
-  hosts is acceptable. On reconnect, a host may apply only a complete,
-  validated, newer catalog and then converges its own work independently. Peer
-  or source reachability is factual state, not a health classification; its
-  absence affects local work only through an explicit local dependency.
+  uses its last complete, validated catalog as local desired state. Missing,
+  partial, or invalid input cannot replace that state or authorize teardown.
+- **R28 Independent fleet convergence:** Hosts may use different catalog
+  versions during a partition. A host can accept only a complete, validated,
+  newer catalog. Each host converges its own work. Peer and source reachability
+  are facts, not health classifications. Their absence affects local work only
+  through an explicit local dependency.
+
+- **R27 Transactional catalog authoring:** One st2 publication operation admits
+  exactly one canonical KDL Agent Spec, with explicit host and identity, against
+  the complete prospective catalog. Publication is compare-and-swap, durable,
+  and atomic: readers observe either the previous declaration set or the next
+  complete set. Reconciliation holds one coherent declaration snapshot through
+  materialization, runtime observation, planning, and execution, so a retirement
+  cannot commit and then be followed by a launch from stale catalog input.
+  A durable incomplete-apply marker fences every declaration-plane snapshot and
+  action after a crashed whole-catalog apply; a resident supervisor stays alive
+  but performs zero lifecycle actions until the transaction is completed.
+  Every successful declaration commit advances a durable monotonic catalog
+  generation; whole-catalog apply advances it before its marker clears. Unlocked
+  diagnostic readers therefore detect even a completed declaration ABA across
+  their observation. A durable incomplete-generation intent fences readers
+  across each single-writer commit and is conservatively recovered by the next
+  exclusive writer. Existing-catalog writer staging exists only in the reserved
+  control plane, never among authoritative declaration leaves; fresh bootstrap
+  stages one non-authoritative sibling because its control plane does not exist
+  yet.
+  Presence, messages, context, and Resource state remain independently writable
+  and are never serialized behind catalog authoring.
+  A caller binds single-agent publication to the exact no-follow source capture
+  with an authoritative input digest. A canonical whole-catalog snapshot
+  externalizes the declaration-root digest while excluding runtime state and
+  workspace content. Its closed projection includes every regular file in a
+  bounded `_templates` library and exact declared canonical workspace directory
+  facts. Whole-catalog apply accepts only that projection, rechecks the root
+  digest under the exclusive lock, durably stages the desired bytes, and resumes
+  after interruption solely from a closed marker and its content-addressed
+  stage. Version 1 requires one explicit external PTY root and rejects effective
+  PTY-root changes. Fresh-catalog bootstrap is a distinct create transaction,
+  not a catalog-apply mode: it binds an exact captured prepared projection to a
+  caller-supplied digest, initializes the persistent authoring lock and first
+  catalog generation before visibility, and publishes the complete catalog by
+  one durable no-replace directory rename. A retry is unchanged only when the
+  completed existing catalog has the exact prepared declaration root. Bootstrap
+  validates and preserves one explicit external PTY root but performs no PTY
+  registry I/O; process adoption and PTY-root migration remain outside its
+  atomic boundary because the registry has independent producers. Apply never
+  traverses, hashes, deletes, or relocates workspace or runtime state. An absent
+  canonical identity becomes
+  visible only as a complete bundle; a preexisting declared workspace skeleton
+  remains safe because the durable marker fences declaration readers and
+  marker-time state routing throughout leaf publication and verification.
+  A policy-free prepared-catalog comparison takes the existing shared lock,
+  binds the live side to a caller-supplied declaration-root digest, captures the
+  prepared side through retained no-follow capabilities, and fully admits both
+  projections before returning one versioned receipt. The receipt exposes the
+  before/after declaration roots, exact added/removed/modified projected paths
+  with render/template/static classification, and normalized per-agent
+  Agent Spec-model field-address changes. Addresses expose only the structural
+  and dynamic address keys needed to locate a field; payload values and
+  per-value/agent hashes remain private. Omission and explicit defaults are
+  equivalent. Comparison never
+  writes live declarations, generation/marker state, runtime/state/workspace
+  bytes, or the prepared source, and carries no migration policy or publication
+  authority.
+- **R23 Fail-closed task inventory:** One read-only machine command exposes
+  every desired local PTY and exec task by agent identity, task name, runtime
+  id, kind, lifecycle, retirement, desired state, runtime state, PID, creation
+  time, and opaque runtime-generation id. Unknown, duplicate, malformed,
+  unreadable, timed-out, PID-reused, or otherwise unprovable evidence is
+  indeterminate and makes the versioned envelope incomplete and the command
+  unsuccessful; it is never reported as absence. Observation detects semantic
+  declaration drift across its runtime probe, does not invoke a backend for a
+  root positively absent at admission, and performs no reconciliation, cleanup,
+  lifecycle change, or state rewrite. An admitted PTY root that changes
+  filesystem identity during the backend probe makes the observation
+  incomplete; the external backend may already have recreated a concurrently
+  removed registry. This diagnostic boundary is not transactionally serialized
+  with catalog or runtime writers and is not control-plane cutover authority.
+  It samples the durable catalog generation and incomplete marker around
+  discovery and runtime observation; any marker, malformed fence, or generation
+  change makes the envelope incomplete.
+- **R24 Stable identity and bounded presentation:** The positional Agent Spec
+  identity and its host-qualified bus identity remain the sole stable keys for
+  routing, ownership, adoption, lifecycle, and automation. Agent Specs may
+  declare optional, non-empty `name` and `description` strings in canonical KDL
+  and the readable TOML/JSON forms. `name` is a non-unique mutable human label,
+  limited to 160 Unicode scalars; `description` is an enduring responsibility
+  boundary, limited to 1,000. Both are single-line: Cc control characters and
+  U+2028/U+2029 are invalid. Omission means absence. Presentation is never an
+  alias, and the declaration is its sole source of truth; a sibling `name` file
+  is ignored without migration or compatibility behavior.
+- **R25 Constrained presentation authoring:** `st2 rename` and `st2 describe`
+  set or clear only their corresponding direct field in one canonical KDL
+  declaration selected by stable identity. They preserve unrelated source
+  bytes, serialize cooperating local writers through the persistent shared
+  `.st2/catalog-authoring.lock`, reject a stale source before atomic
+  replacement, fsync the result, and return classified receipts. The lock inode
+  is never removed or stale-recovered and defines one local POSIX
+  filesystem/kernel exclusion domain; it is not cross-host coordination or OS
+  isolation from direct external writers. TOML, JSON, declarations explicitly
+  marked Nix-owned, stable-ID changes, and malformed or ambiguous targets fail
+  closed. Nix emitters must publish that marker before authoring is activated.
+  In the trusted-fleet model, caller-supplied `ST_AGENT` provides a guardrail,
+  not authentication: a catalog agent may edit itself or a descendant reached
+  through declared supervisor edges, while its absence selects the operator
+  path.
+- **R26 Live PTY presentation projection:** For every healthy managed PTY, st2
+  reconciles a versioned owned tag snapshot containing the stable actor identity
+  plus optional description through one exact task-ID metadata patch. The
+  primary `agent` task additionally maps optional name to native PTY display
+  metadata; secondary PTYs preserve their task-specific display convention.
+  Projection preserves unrelated tags, removes absent owned values, reports and
+  retries failure, and is idempotent. It never uses display-name resolution or
+  enters launch, teardown, garbage collection, replacement, or flapping
+  accounting.

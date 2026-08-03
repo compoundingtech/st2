@@ -14,11 +14,12 @@ agent "<identity>" {
   // st2 owns the hook declaration and installed scripts for this unattended seat. The rendered bus
   // contract requires agent-declared status: busy while executing work, available only when
   // yielding/ready, and dnd only for an explicit hold.
+  // Harness-specific launch policy stays inside this opaque argv; st2 does not parse its flags.
   argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {
-    copy "_templates/<host>.<identity>.AGENTS.md" "AGENTS.md"
+    copy "assets/AGENTS.md" "AGENTS.md"
     json-upsert ".codex/hooks.json" #"""
 {
   "hooks": {
