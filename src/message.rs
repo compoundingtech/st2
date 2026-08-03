@@ -354,7 +354,7 @@ fn publish_message_with_seam(
 ) -> anyhow::Result<String> {
     // This deliberately cannot match `is_message_filename`, so a concurrent scan ignores it.
     let tmp = inbox_dir.join(tmp_name());
-    if let Err(error) = fs::write(&tmp, &contents) {
+    if let Err(error) = fs::write(&tmp, contents) {
         let _ = fs::remove_file(&tmp);
         return Err(error.into());
     }

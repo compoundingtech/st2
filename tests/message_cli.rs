@@ -380,16 +380,10 @@ fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bu
     );
 
     fs::create_dir_all(catalog.path().join("requester/inbox")).unwrap();
-    assert!(
-        !send(catalog.path(), "requester", "--catalog", None)
-            .status
-            .success()
-    );
-    assert!(
-        !send(catalog.path(), "requester", "--catalog", Some("other"))
-            .status
-            .success()
-    );
+    assert!(!send(catalog.path(), "requester", "--catalog", None).status.success());
+    assert!(!send(catalog.path(), "requester", "--catalog", Some("other"))
+        .status
+        .success());
     let external = send(catalog.path(), "requester", "--catalog", Some("requester"));
     assert!(
         external.status.success(),
