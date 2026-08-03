@@ -252,37 +252,55 @@ agent "<identity>" {
 
 The experimental `st2 plan` surface implements only the inspectable file model from the
 [st2 plans sketch at revision `5c1d142`](https://gist.github.com/myobie/d5ecfac24cd3965e095a5031cd2e00cb/5c1d1427c0556d95d13890e5c5086cd85b25d994).
-It parses either a top-level `plan.kdl`:
+The implemented agent integration uses the existing Resource envelope; plan truth stays only in the
+linked `plan.kdl`.
+An agent links a plan with the existing Agent Spec Resource envelope:
+
+```kdl
+agent "app-web" {
+  resource "receipt-report" _tag="plan" uri="file:plans/receipt-report/plan.kdl"
+}
+```
+
+The Resource name is the agent-local role. The `_tag` selects the experimental plan reader. The
+`uri` resolves from the agent KDL file and must remain inside the selected catalog. The Resource
+has no children and owns no plan fields. It may add the agent identity to `referencedBy`, but the
+target `plan.kdl` remains the only plan authority.
+
+A plan can keep version content in referenced Markdown files:
 
 ```kdl
 plan "ship-remote-approvals" {
   owner "app-web"
-  version "0000" resource="file:versions/0000.md"
-  version "0001" resource="file:versions/0001.md" {
+  version "0000" content="file:versions/0000.md"
+  version "0001" content="file:versions/0001.md" {
     parent "0000"
     why "Browser proof exposed an approval race."
   }
 }
 ```
 
-or the equivalent agent-local form:
+Or a small plan can keep the complete version intent inline in `plan.kdl`:
 
 ```kdl
-agent "app-web" {
-  plan "review-follow-up" {
-    version "0000" resource="file:review-follow-up.md"
+plan "review-follow-up" {
+  owner "reviewer"
+  version "0000" {
+    intent #"""
+Review the accepted corrections.
+
+Done means the corrections are present and independently verified.
+"""#
   }
 }
 ```
 
-An agent links an external declaration with `plan-ref "file:relative/plan.kdl"`. Plan identity is
-the explicit KDL value, never the directory. Inline ownership comes from the containing agent;
-external plans require one `owner`. Every version has one relative `file:` resource. Revisions
-declare one or more `parent` links and a non-empty `why`; root versions have no parent. The frontier
-is derived as every version with no child, so concurrent siblings remain visible. The experiment
-stores no content digest or history. It cannot prove that an earlier declaration or resource file
-stayed unchanged.
-References resolve from the KDL file that declares them and must stay inside the selected catalog.
+Plan identity and owner are explicit in `plan.kdl`, never derived from a Resource name, directory,
+or referring agent. Each version has exactly one `content="file:..."` property or one inline
+`intent` child. Content references resolve from `plan.kdl` and remain inside the selected catalog.
+Revisions declare one or more `parent` links and a non-empty `why`; root versions have no parent.
+The frontier is every version with no child, so concurrent siblings remain visible. The experiment
+stores no digest or immutable history proof.
 
 ```sh
 st2 plan validate --catalog examples/plans

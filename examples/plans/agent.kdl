@@ -1,13 +1,11 @@
 agent "app-web" {
   host "example"
   command "true"
-  plan-ref "file:ship-remote-approvals/plan.kdl"
+  resource "release-plan" _tag="plan" uri="file:ship-remote-approvals/plan.kdl"
 }
 
 agent "reviewer" {
   host "example"
   command "true"
-  plan "review-follow-up" {
-    version "0000" resource="file:review-follow-up.md"
-  }
+  resource "review-plan" _tag="plan" uri="file:review-follow-up/plan.kdl"
 }

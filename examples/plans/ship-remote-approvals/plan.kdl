@@ -1,8 +1,8 @@
 plan "ship-remote-approvals" {
   owner "app-web"
 
-  version "0000" resource="file:versions/0000.md"
-  version "0001" resource="file:versions/0001.md" {
+  version "0000" content="file:versions/0000.md"
+  version "0001" content="file:versions/0001.md" {
     parent "0000"
     why "Browser proof exposed an approval race."
   }

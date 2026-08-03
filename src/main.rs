@@ -480,7 +480,7 @@ enum HooksCmd {
 
 #[derive(Subcommand)]
 enum PlanCmd {
-    /// Validate every external and inline plan without executing or writing anything.
+    /// Validate every Resource-linked or standalone plan without executing or writing anything.
     Validate {
         /// Catalog folder or KDL file. Prefer --catalog; defaults to the selected catalog.
         #[arg(conflicts_with = "catalog_path")]
@@ -1041,12 +1041,20 @@ fn plan_cmd(command: PlanCmd) -> Result<()> {
             let intent = serde_json::json!({
                 "identity": plan.identity,
                 "owner": plan.owner,
-                "versions": plan.versions.iter().map(|version| serde_json::json!({
-                    "identity": version.identity,
-                    "parents": version.parents,
-                    "why": version.why,
-                    "resource": version.resource,
-                })).collect::<Vec<_>>(),
+                "versions": plan.versions.iter().map(|version| {
+                    let mut row = serde_json::json!({
+                        "identity": version.identity,
+                        "parents": version.parents,
+                        "why": version.why,
+                    });
+                    if let Some(content) = &version.content {
+                        row["content"] = serde_json::json!(content);
+                    }
+                    if let Some(intent) = &version.intent {
+                        row["intent"] = serde_json::json!(intent);
+                    }
+                    row
+                }).collect::<Vec<_>>(),
                 "frontier": plan.frontier,
             });
             if json {
@@ -1059,10 +1067,15 @@ fn plan_cmd(command: PlanCmd) -> Result<()> {
                     } else {
                         ""
                     };
-                    println!(
-                        "  version {}{marker}  resource={}",
-                        version.identity, version.resource
-                    );
+                    if let Some(content) = &version.content {
+                        println!("  version {}{marker}  content={content}", version.identity);
+                    } else if let Some(intent) = &version.intent {
+                        println!(
+                            "  version {}{marker}  intent={}",
+                            version.identity,
+                            serde_json::to_string(intent)?
+                        );
+                    }
                     if !version.parents.is_empty() {
                         println!("    parents: {}", version.parents.join(", "));
                     }
@@ -1093,12 +1106,21 @@ fn plan_cmd(command: PlanCmd) -> Result<()> {
                     plan.frontier.join(",")
                 );
                 for version in &plan.versions {
-                    println!(
-                        "  {}: {} -> {}",
-                        version.identity,
-                        version.resource,
-                        version.resolved_resource.display()
-                    );
+                    if let (Some(content), Some(resolved)) =
+                        (&version.content, &version.resolved_content)
+                    {
+                        println!(
+                            "  {}: {content} -> {}",
+                            version.identity,
+                            resolved.display()
+                        );
+                    } else if let Some(intent) = &version.intent {
+                        println!(
+                            "  {}: inline intent={}",
+                            version.identity,
+                            serde_json::to_string(intent)?
+                        );
+                    }
                 }
             }
             Ok(())

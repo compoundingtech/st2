@@ -30,12 +30,11 @@ pub struct Plan {
     pub referenced_by: Vec<String>,
 }
 
-/// Whether a plan is a top-level declaration or nested in an agent declaration.
+/// A plan is always declared in its own plan KDL document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanSourceKind {
     External,
-    Inline,
 }
 
 /// One declared intent revision.
@@ -45,8 +44,12 @@ pub struct PlanVersion {
     pub identity: String,
     pub parents: Vec<String>,
     pub why: Option<String>,
-    pub resource: String,
-    pub resolved_resource: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_content: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 /// A classified plan parse or validation error.
@@ -85,7 +88,7 @@ impl std::error::Error for PlanError {}
 
 #[derive(Debug)]
 struct PlanReference {
-    owner: String,
+    agent: String,
     target: PathBuf,
 }
 
@@ -135,10 +138,10 @@ pub fn load(selected: &Path) -> Result<PlanCatalog, PlanError> {
             return Err(PlanError::new(
                 "ambiguous-plan-reference",
                 &reference.target,
-                "a plan-ref target must contain exactly one top-level plan",
+                "a plan Resource target must contain exactly one top-level plan",
             ));
         }
-        plans[matches[0]].referenced_by.push(reference.owner);
+        plans[matches[0]].referenced_by.push(reference.agent);
     }
 
     let mut identities = BTreeMap::new();
@@ -237,7 +240,7 @@ fn parse_seed(
     for node in document.nodes() {
         match node.name().value() {
             "plan" => {
-                let plan = parse_plan(node, path, boundary, PlanSourceKind::External, None)?;
+                let plan = parse_plan(node, path, boundary)?;
                 let index = plans.len();
                 plans.push(plan);
                 external_by_source
@@ -245,7 +248,7 @@ fn parse_seed(
                     .or_default()
                     .push(index);
             }
-            "agent" => parse_agent_plans(node, path, boundary, plans, references)?,
+            "agent" => parse_agent_plan_references(node, path, boundary, references)?,
             _ => {}
         }
     }
@@ -261,7 +264,7 @@ fn parse_external_file(
     let document = read_document(path)?;
     for node in document.nodes() {
         if node.name().value() == "plan" {
-            let plan = parse_plan(node, path, boundary, PlanSourceKind::External, None)?;
+            let plan = parse_plan(node, path, boundary)?;
             let index = plans.len();
             plans.push(plan);
             external_by_source
@@ -274,7 +277,7 @@ fn parse_external_file(
         return Err(PlanError::new(
             "missing-plan",
             path,
-            "plan-ref target contains no top-level plan",
+            "plan Resource target contains no top-level plan",
         ));
     }
     Ok(())
@@ -289,38 +292,37 @@ fn read_document(path: &Path) -> Result<KdlDocument, PlanError> {
     })
 }
 
-fn parse_agent_plans(
+fn parse_agent_plan_references(
     agent: &KdlNode,
     source: &Path,
     boundary: &Path,
-    plans: &mut Vec<Plan>,
     references: &mut Vec<PlanReference>,
 ) -> Result<(), PlanError> {
     let Some(children) = agent.children() else {
         return Ok(());
     };
-    let owner = explicit_agent_identity(agent);
+    let agent_identity = explicit_agent_identity(agent);
     for child in children.nodes() {
         match child.name().value() {
-            "plan" => plans.push(parse_plan(
-                child,
-                source,
-                boundary,
-                PlanSourceKind::Inline,
-                Some(required_inline_owner(owner.as_deref(), source)?),
-            )?),
-            "plan-ref" => {
-                let target = exact_string_node(child, source, "plan-ref")?;
-                let target = resolve_file_reference(source, boundary, &target, "plan-ref")?;
+            "plan" | "plan-ref" => {
+                return Err(PlanError::new(
+                    "unsupported-agent-plan-form",
+                    source,
+                    "agent plans must use a childless Resource binding tagged 'plan'",
+                ));
+            }
+            "resource" if is_declared_plan_resource(child) => {
+                let (_name, uri) = parse_plan_resource_binding(child, source)?;
+                let target = resolve_file_reference(source, boundary, &uri, "plan Resource uri")?;
                 if target.extension().and_then(|value| value.to_str()) != Some("kdl") {
                     return Err(PlanError::new(
                         "invalid-plan-reference",
                         source,
-                        "plan-ref must resolve to a KDL file",
+                        "a plan Resource must resolve to a KDL file",
                     ));
                 }
                 references.push(PlanReference {
-                    owner: required_inline_owner(owner.as_deref(), source)?,
+                    agent: required_referencing_agent(agent_identity.as_deref(), source)?,
                     target,
                 });
             }
@@ -330,14 +332,62 @@ fn parse_agent_plans(
     Ok(())
 }
 
-fn required_inline_owner(owner: Option<&str>, source: &Path) -> Result<String, PlanError> {
-    owner.map(str::to_string).ok_or_else(|| {
+fn required_referencing_agent(identity: Option<&str>, source: &Path) -> Result<String, PlanError> {
+    identity.map(str::to_string).ok_or_else(|| {
         PlanError::new(
-            "inline-owner-required",
+            "plan-reference-agent-required",
             source,
-            "an agent with inline plans or plan-ref must declare an explicit identity",
+            "an agent with a plan Resource must declare an explicit identity",
         )
     })
+}
+
+fn is_declared_plan_resource(node: &KdlNode) -> bool {
+    node.entries().iter().any(|entry| {
+        entry.name().is_some_and(|name| name.value() == "_tag")
+            && entry.value().as_string() == Some("plan")
+    })
+}
+
+fn parse_plan_resource_binding(
+    node: &KdlNode,
+    source: &Path,
+) -> Result<(String, String), PlanError> {
+    if node.children().is_some() {
+        return Err(PlanError::new(
+            "invalid-plan-resource-binding",
+            source,
+            "a plan Resource binding cannot have children",
+        ));
+    }
+    let (name, properties) =
+        exact_positional_with_properties(node, source, "plan Resource", &["_tag", "uri"])?;
+    let name = name.filter(|value| valid_text(value)).ok_or_else(|| {
+        PlanError::new(
+            "invalid-plan-resource-binding",
+            source,
+            "a plan Resource needs one non-empty local name",
+        )
+    })?;
+    if properties.get("_tag").map(String::as_str) != Some("plan") {
+        return Err(PlanError::new(
+            "invalid-plan-resource-binding",
+            source,
+            format!("plan Resource '{name}' needs _tag=\"plan\""),
+        ));
+    }
+    let uri = properties
+        .get("uri")
+        .filter(|value| valid_text(value))
+        .cloned()
+        .ok_or_else(|| {
+            PlanError::new(
+                "invalid-plan-resource-binding",
+                source,
+                format!("plan Resource '{name}' needs a non-empty uri"),
+            )
+        })?;
+    Ok((name, uri))
 }
 
 fn explicit_agent_identity(agent: &KdlNode) -> Option<String> {
@@ -352,13 +402,7 @@ fn explicit_agent_identity(agent: &KdlNode) -> Option<String> {
     identity.filter(|value| valid_text(value))
 }
 
-fn parse_plan(
-    node: &KdlNode,
-    source: &Path,
-    boundary: &Path,
-    source_kind: PlanSourceKind,
-    inline_owner: Option<String>,
-) -> Result<Plan, PlanError> {
+fn parse_plan(node: &KdlNode, source: &Path, boundary: &Path) -> Result<Plan, PlanError> {
     let identity = exact_positional_with_properties(node, source, "plan", &[])?
         .0
         .ok_or_else(|| {
@@ -378,11 +422,11 @@ fn parse_plan(
             format!("plan '{identity}' needs a body"),
         )
     })?;
-    let mut owner = inline_owner;
+    let mut owner = None;
     let mut versions = Vec::new();
     for child in children.nodes() {
         match child.name().value() {
-            "owner" if source_kind == PlanSourceKind::External => {
+            "owner" => {
                 if owner.is_some() {
                     return Err(PlanError::new(
                         "duplicate-plan-owner",
@@ -391,13 +435,6 @@ fn parse_plan(
                     ));
                 }
                 owner = Some(exact_string_node(child, source, "owner")?);
-            }
-            "owner" => {
-                return Err(PlanError::new(
-                    "inline-owner-is-derived",
-                    source,
-                    format!("inline plan '{identity}' derives owner from its containing agent"),
-                ));
             }
             "version" => versions.push(parse_version(child, source, boundary, &identity)?),
             other => {
@@ -432,7 +469,7 @@ fn parse_plan(
         versions,
         frontier,
         source: source.to_path_buf(),
-        source_kind,
+        source_kind: PlanSourceKind::External,
         referenced_by: Vec::new(),
     })
 }
@@ -444,7 +481,7 @@ fn parse_version(
     plan: &str,
 ) -> Result<PlanVersion, PlanError> {
     let (identity, properties) =
-        exact_positional_with_properties(node, source, "version", &["resource"])?;
+        exact_positional_with_properties(node, source, "version", &["content"])?;
     let identity = identity.ok_or_else(|| {
         PlanError::new(
             "version-identity-required",
@@ -459,17 +496,14 @@ fn parse_version(
             format!("plan '{plan}' has an invalid version identity"),
         ));
     }
-    let resource = properties.get("resource").cloned().ok_or_else(|| {
-        PlanError::new(
-            "version-resource-required",
-            source,
-            format!("plan '{plan}' version '{identity}' needs resource=\"file:...\""),
-        )
-    })?;
-    let resolved_resource =
-        resolve_file_reference(source, boundary, &resource, "version resource")?;
+    let content = properties.get("content").cloned();
+    let resolved_content = content
+        .as_deref()
+        .map(|reference| resolve_file_reference(source, boundary, reference, "version content"))
+        .transpose()?;
     let mut parents = Vec::new();
     let mut why = None;
+    let mut intent = None;
     if let Some(children) = node.children() {
         for child in children.nodes() {
             match child.name().value() {
@@ -486,6 +520,28 @@ fn parse_version(
                     }
                     why = Some(exact_string_node(child, source, "why")?);
                 }
+                "intent" => {
+                    if intent.is_some() {
+                        return Err(PlanError::new(
+                            "duplicate-version-intent",
+                            source,
+                            format!(
+                                "plan '{plan}' version '{identity}' declares intent more than once"
+                            ),
+                        ));
+                    }
+                    let value = exact_intent_node(child, source)?;
+                    if !valid_intent(&value) {
+                        return Err(PlanError::new(
+                            "invalid-version-intent",
+                            source,
+                            format!(
+                                "plan '{plan}' version '{identity}' needs non-empty inline intent"
+                            ),
+                        ));
+                    }
+                    intent = Some(value);
+                }
                 other => {
                     return Err(PlanError::new(
                         "unsupported-version-field",
@@ -497,6 +553,27 @@ fn parse_version(
                 }
             }
         }
+    }
+    match (content.is_some(), intent.is_some()) {
+        (true, true) => {
+            return Err(PlanError::new(
+                "ambiguous-version-intent",
+                source,
+                format!(
+                    "plan '{plan}' version '{identity}' must use content or inline intent, not both"
+                ),
+            ));
+        }
+        (false, false) => {
+            return Err(PlanError::new(
+                "version-intent-required",
+                source,
+                format!(
+                    "plan '{plan}' version '{identity}' needs content=\"file:...\" or inline intent"
+                ),
+            ));
+        }
+        _ => {}
     }
     parents.sort();
     if parents.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -517,8 +594,9 @@ fn parse_version(
         identity,
         parents,
         why,
-        resource,
-        resolved_resource,
+        content,
+        resolved_content,
+        intent,
     })
 }
 
@@ -623,6 +701,24 @@ fn exact_string_node(node: &KdlNode, source: &Path, field: &str) -> Result<Strin
     })
 }
 
+fn exact_intent_node(node: &KdlNode, source: &Path) -> Result<String, PlanError> {
+    let (value, properties) = exact_positional_with_properties(node, source, "intent", &[])?;
+    if !properties.is_empty() || node.children().is_some() {
+        return Err(PlanError::new(
+            "invalid-version-intent",
+            source,
+            "intent must be one string without properties or children",
+        ));
+    }
+    value.ok_or_else(|| {
+        PlanError::new(
+            "invalid-version-intent",
+            source,
+            "intent must be one string",
+        )
+    })
+}
+
 fn exact_positional_with_properties(
     node: &KdlNode,
     source: &Path,
@@ -693,6 +789,13 @@ fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
 }
 
+fn valid_intent(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
 fn resolve_file_reference(
     source: &Path,
     boundary: &Path,
@@ -753,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn external_and_inline_forms_normalize_and_preserve_concurrent_frontier_heads() {
+    fn resource_links_discover_both_content_forms_and_preserve_frontier_heads() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         write(
@@ -761,14 +864,23 @@ mod tests {
             "agent.kdl",
             r#"
 agent "worker" {
-  plan-ref "file:plans/shared/plan.kdl"
-  plan "local" {
-    version "v0" resource="file:plans/local-v0.md"
+  resource "shared-role" _tag="plan" uri="file:plans/shared/plan.kdl"
+  resource "local-role" _tag="plan" uri="file:plans/local/plan.kdl"
+}
+"#,
+        );
+        write(
+            root,
+            "plans/local/plan.kdl",
+            r#"
+plan "local" {
+  owner "cos"
+  version "v0" {
+    intent "Keep the complete local intent in plan.kdl."
   }
 }
 "#,
         );
-        write(root, "plans/local-v0.md", "# Local\n");
         write(root, "plans/shared/v0.md", "# v0\n");
         write(root, "plans/shared/v1.md", "# v1\n");
         write(root, "plans/shared/v2.md", "# v2\n");
@@ -778,12 +890,12 @@ agent "worker" {
             r#"
 plan "shared" {
   owner "cos"
-  version "v2" resource="file:v2.md" {
+  version "v2" content="file:v2.md" {
     parent "v0"
     why "Second concurrent direction."
   }
-  version "v0" resource="file:v0.md"
-  version "v1" resource="file:v1.md" {
+  version "v0" content="file:v0.md"
+  version "v1" content="file:v1.md" {
     parent "v0"
     why "First concurrent direction."
   }
@@ -795,14 +907,20 @@ plan "shared" {
         assert_eq!(loaded.plans.len(), 2);
         let local = &loaded.plans[0];
         assert_eq!(local.identity, "local");
-        assert_eq!(local.owner, "worker");
+        assert_eq!(local.owner, "cos");
         assert_eq!(local.frontier, ["v0"]);
-        assert_eq!(local.source_kind, PlanSourceKind::Inline);
+        assert_eq!(local.source_kind, PlanSourceKind::External);
+        assert_eq!(
+            local.versions[0].intent.as_deref(),
+            Some("Keep the complete local intent in plan.kdl.")
+        );
+        assert_eq!(local.referenced_by, ["worker"]);
 
         let shared = &loaded.plans[1];
         assert_eq!(shared.owner, "cos");
         assert_eq!(shared.frontier, ["v1", "v2"]);
         assert_eq!(shared.referenced_by, ["worker"]);
+        assert_eq!(shared.versions[0].content.as_deref(), Some("file:v0.md"));
         assert_eq!(
             shared
                 .versions
@@ -824,7 +942,7 @@ plan "shared" {
 plan "bad" {
   owner "cos"
   current "v0"
-  version "v0" resource="file:v0.md"
+  version "v0" content="file:v0.md"
 }
 "#,
         );
@@ -839,7 +957,7 @@ plan "bad" {
             r#"
 plan "bad" {
   owner "cos"
-  version "v1" resource="file:v0.md" {
+  version "v1" content="file:v0.md" {
     parent "missing"
   }
 }
@@ -856,7 +974,7 @@ plan "bad" {
             r#"
 plan "bad" {
   owner "cos"
-  version "v1" resource="file:v0.md" {
+  version "v1" content="file:v0.md" {
     parent "missing"
     why "Revision."
   }
@@ -874,11 +992,11 @@ plan "bad" {
             r#"
 plan "bad" {
   owner "cos"
-  version "v0" resource="file:v0.md" {
+  version "v0" content="file:v0.md" {
     parent "v1"
     why "First half."
   }
-  version "v1" resource="file:v0.md" {
+  version "v1" content="file:v0.md" {
     parent "v0"
     why "Second half."
   }
@@ -897,19 +1015,31 @@ plan "bad" {
             "nested/agent.kdl",
             r#"
 agent "worker" {
-  plan "local" {
-    version "v0" resource="file:body.md"
-  }
+  resource "local-role" _tag="plan" uri="file:plan.kdl"
 }
 "#,
         );
         write(root, "nested/body.md", "unchanged\n");
+        write(
+            root,
+            "nested/plan.kdl",
+            r#"
+plan "local" {
+  owner "cos"
+  version "v0" content="file:body.md"
+}
+"#,
+        );
         let before = fs::read(root.join("nested/agent.kdl")).unwrap();
         let loaded = load(root).unwrap();
         assert_eq!(
-            loaded.plans[0].versions[0].resolved_resource,
-            root.join("nested/body.md").canonicalize().unwrap()
+            loaded.plans[0].versions[0]
+                .resolved_content
+                .as_ref()
+                .unwrap(),
+            &root.join("nested/body.md").canonicalize().unwrap()
         );
+        assert_eq!(loaded.plans[0].referenced_by, ["worker"]);
         assert_eq!(fs::read(root.join("nested/agent.kdl")).unwrap(), before);
         assert_eq!(
             fs::read_to_string(root.join("nested/body.md")).unwrap(),
@@ -925,10 +1055,71 @@ agent "worker" {
             r#"
 plan "escape" {
   owner "worker"
-  version "v0" resource="file:../outside.md"
+  version "v0" content="file:../outside.md"
 }
 "#,
         );
         assert_eq!(load(&bounded).unwrap_err().code(), "plan-reference-escape");
+    }
+
+    #[test]
+    fn agent_plan_truth_and_ambiguous_version_intent_are_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "agent.kdl",
+            r#"
+agent "worker" {
+  plan-ref "file:plan.kdl"
+}
+"#,
+        );
+        assert_eq!(
+            load(temporary.path()).unwrap_err().code(),
+            "unsupported-agent-plan-form"
+        );
+
+        write(
+            temporary.path(),
+            "agent.kdl",
+            r#"
+agent "worker" {
+  resource "local-role" _tag="plan" uri="file:plan.kdl" {
+    owner "forbidden"
+  }
+}
+"#,
+        );
+        assert_eq!(
+            load(temporary.path()).unwrap_err().code(),
+            "invalid-plan-resource-binding"
+        );
+
+        write(
+            temporary.path(),
+            "agent.kdl",
+            r#"
+agent "worker" {
+  resource "local-role" _tag="plan" uri="file:plan.kdl"
+}
+"#,
+        );
+        write(temporary.path(), "body.md", "body\n");
+        write(
+            temporary.path(),
+            "plan.kdl",
+            r#"
+plan "ambiguous" {
+  owner "cos"
+  version "v0" content="file:body.md" {
+    intent "This second source of intent is forbidden."
+  }
+}
+"#,
+        );
+        assert_eq!(
+            load(temporary.path()).unwrap_err().code(),
+            "ambiguous-version-intent"
+        );
     }
 }

@@ -553,13 +553,17 @@ atomic inbox file → DING attempt → agent reads → archive receipt
 
 `st2 plan validate|list|show|inspect` is a non-executing probe for the
 [source plan sketch at revision `5c1d142`](https://gist.github.com/myobie/d5ecfac24cd3965e095a5031cd2e00cb/5c1d1427c0556d95d13890e5c5086cd85b25d994).
-It normalizes top-level external plans and agent-local inline plans into one
-model with explicit plan identity, owner, declared version and parent links,
-mandatory reasons on revisions, source-relative `file:` resources, and a
-derived frontier that retains concurrent siblings. External `plan-ref` and
-version resources resolve from the declaring KDL file and remain within the
-selected catalog. The experiment stores no content digest or history. It
-cannot prove that an earlier declaration or resource file stayed unchanged.
+The implemented agent integration uses the existing Resource envelope to link
+to plan-owned truth.
+It reads standalone plans and plans linked through a childless Agent Spec
+Resource whose `_tag` is `plan`. The Resource name is an agent-local role. The
+Resource can add `referencedBy`; it does not own plan identity, owner, version,
+parent, reason, or intent. Those fields remain in the referenced `plan.kdl`.
+Each version contains either source-relative Markdown `content` or complete
+inline `intent`. Resource URIs resolve from the agent KDL file. Content URIs
+resolve from `plan.kdl`. Both stay within the selected catalog. A derived
+frontier retains concurrent siblings. The experiment stores no content digest
+or immutable history proof.
 
 The parser is deliberately deny-by-default for plan fields beyond that model.
 It has no current pointer, controller, execution, scheduling, step graph,
