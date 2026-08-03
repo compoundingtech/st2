@@ -74,13 +74,21 @@ pub(super) fn logical_soft_wrap_candidates(
 }
 
 pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
-    let mut first = false;
-    let mut later = false;
-    for line in plain.lines().map(str::trim_start) {
-        first |= line.starts_with("› 1.") || line.starts_with("❯ 1.") || line.starts_with("> 1.");
-        later |= line.starts_with("2.") || line.starts_with("3.");
+    fn starts_with_numbered_option(line: &str) -> bool {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && line.as_bytes().get(digits) == Some(&b'.')
     }
-    first && later
+
+    let mut selected = false;
+    let mut numbered = false;
+    for line in plain.lines().map(str::trim_start) {
+        selected |= ["› ", "❯ ", "> "].iter().any(|marker| {
+            line.strip_prefix(marker)
+                .is_some_and(starts_with_numbered_option)
+        });
+        numbered |= starts_with_numbered_option(line);
+    }
+    selected && numbered
 }
 
 /// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text. Bounded

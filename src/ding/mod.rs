@@ -1301,6 +1301,28 @@ Which fixture should this test use?
 
 Enter to select · ↑/↓ to navigate · Esc to cancel";
 
+    fn captured_claude_question_form_with_selection(option: usize) -> String {
+        assert!((1..=4).contains(&option));
+        if option == 1 {
+            return CAPTURED_CLAUDE_QUESTION_FORM.to_string();
+        }
+        CAPTURED_CLAUDE_QUESTION_FORM
+            .replacen("❯ 1.", "  1.", 1)
+            .replacen(&format!("  {option}."), &format!("❯ {option}."), 1)
+    }
+
+    /// The captured form reduced only by deleting its third and fourth option rows. This pins the
+    /// real two-option shape without adding any screen layout that was not present in the capture.
+    fn captured_two_option_claude_question_form() -> String {
+        CAPTURED_CLAUDE_QUESTION_FORM.replace(
+            &format!(
+                "  3. Type something.\n{}\n  4. Chat about this\n\n",
+                claude_rule()
+            ),
+            "",
+        )
+    }
+
     /// The same used pane with an in-flight turn: a spinner status line above the composer. Every
     /// frame below was observed on a real 2.1.220 pane; the glyph animates and the elapsed timer is
     /// not always rendered, so both variations appear here.
@@ -1422,6 +1444,46 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert_eq!(
             classify_composer(&mature_staged_claude_screen(expected), expected),
             ComposerState::ExactSafe
+        );
+    }
+
+    #[test]
+    fn claude_question_form_blocks_after_selection_moves_to_second_or_last_option() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for option in [2, 4] {
+            let form = captured_claude_question_form_with_selection(option);
+            assert!(
+                composer::looks_like_choice_menu(&form),
+                "selection on option {option} must remain modal"
+            );
+            assert_eq!(
+                classify_composer(
+                    &format!("{form}\r\n{}", mature_staged_claude_screen(expected)),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "selection on option {option} must block Return"
+            );
+        }
+    }
+
+    #[test]
+    fn two_option_claude_question_form_blocks_return() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let form = captured_two_option_claude_question_form();
+
+        assert!(!form.contains("  3."));
+        assert!(!form.contains("  4."));
+        assert!(composer::looks_like_choice_menu(&form));
+        assert_eq!(
+            classify_composer(
+                &format!("{form}\r\n{}", mature_staged_claude_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
         );
     }
 
