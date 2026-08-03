@@ -27,6 +27,9 @@ pub(super) enum ReceiptState {
     RetainedSafe,
     /// The exact notice remains the complete live composer, but the harness is active or blocked.
     RetainedBlocked,
+    /// A maintained harness parsed its live composer and positively proved that the exact notice
+    /// is neither retained as its complete contents nor visible as an accepted submission.
+    NotRetained,
     /// No positive acceptance or exact retained-composer state was proven.
     Unproven,
 }

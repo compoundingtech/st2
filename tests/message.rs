@@ -37,12 +37,24 @@ fn agent_kdl(identity: &str, host: &str) -> String {
 fn send_by_bus_id_lands_in_recipient_inbox() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "hetz/st2-claude/agent.kdl", &agent_kdl("st2-claude", "hetz"));
-    write(root, "hetz/cos-claude/agent.kdl", &agent_kdl("cos-claude", "hetz"));
+    write(
+        root,
+        "hetz/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "hetz"),
+    );
+    write(
+        root,
+        "hetz/cos-claude/agent.kdl",
+        &agent_kdl("cos-claude", "hetz"),
+    );
 
     // Resolve the recipient's agent folder by its bus id, then by bare identity — both must match.
-    let dir_by_bus = resolve_agent_dir(root, "hetz.st2-claude", "hetz").expect("resolve by bus id");
-    let dir_by_ident = resolve_agent_dir(root, "st2-claude", "hetz").expect("resolve by identity");
+    let dir_by_bus = resolve_agent_dir(root, "hetz.st2-claude", "hetz")
+        .unwrap()
+        .expect("resolve by bus id");
+    let dir_by_ident = resolve_agent_dir(root, "st2-claude", "hetz")
+        .unwrap()
+        .expect("resolve by identity");
     assert_eq!(dir_by_bus, dir_by_ident);
     assert_eq!(dir_by_bus, root.join("hetz/st2-claude"));
 
@@ -51,7 +63,10 @@ fn send_by_bus_id_lands_in_recipient_inbox() {
     let f = send_to_inbox(&inbox, "hetz.cos-claude", Some("kick"), None, &[], "do M2").unwrap();
     assert!(inbox.join(&f).exists());
     let other = inbox_dir(&root.join("hetz/cos-claude"));
-    assert!(list_dir(&other).unwrap().is_empty(), "must not leak into the other agent's inbox");
+    assert!(
+        list_dir(&other).unwrap().is_empty(),
+        "must not leak into the other agent's inbox"
+    );
 
     let listed = list_dir(&inbox).unwrap();
     assert_eq!(listed.len(), 1);
@@ -69,8 +84,30 @@ fn send_by_bus_id_lands_in_recipient_inbox() {
 fn unknown_recipient_does_not_resolve() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "hetz/st2-claude/agent.kdl", &agent_kdl("st2-claude", "hetz"));
-    assert!(resolve_agent_dir(root, "hetz.nobody", "hetz").is_none());
+    write(
+        root,
+        "hetz/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "hetz"),
+    );
+    assert!(
+        resolve_agent_dir(root, "hetz.nobody", "hetz")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn archive_rejects_noncanonical_leaf_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    let archive = tmp.path().join("archive");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(tmp.path().join("outside.md"), "unchanged").unwrap();
+    assert!(archive_msg(&inbox, &archive, "../outside.md").is_err());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("outside.md")).unwrap(),
+        "unchanged"
+    );
 }
 
 /// `message thread` walks the reply chain ACROSS agents — a two-party conversation lives in both
@@ -80,29 +117,76 @@ fn unknown_recipient_does_not_resolve() {
 fn thread_walks_the_reply_chain_across_both_agents() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "h/alice-claude/agent.kdl", &agent_kdl("alice-claude", "h"));
-    write(root, "h/bob-claude/agent.kdl", &agent_kdl("bob-claude", "h"));
-    let alice = resolve_agent_dir(root, "h.alice-claude", "h").unwrap();
-    let bob = resolve_agent_dir(root, "h.bob-claude", "h").unwrap();
+    write(
+        root,
+        "h/alice-claude/agent.kdl",
+        &agent_kdl("alice-claude", "h"),
+    );
+    write(
+        root,
+        "h/bob-claude/agent.kdl",
+        &agent_kdl("bob-claude", "h"),
+    );
+    let alice = resolve_agent_dir(root, "h.alice-claude", "h")
+        .unwrap()
+        .unwrap();
+    let bob = resolve_agent_dir(root, "h.bob-claude", "h")
+        .unwrap()
+        .unwrap();
 
     // alice → bob (root), bob → alice (reply), alice → bob (reply-to-reply).
-    let f1 = send_to_inbox(&inbox_dir(&bob), "h.alice-claude", Some("plan"), None, &[], "kickoff").unwrap();
+    let f1 = send_to_inbox(
+        &inbox_dir(&bob),
+        "h.alice-claude",
+        Some("plan"),
+        None,
+        &[],
+        "kickoff",
+    )
+    .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let f2 = send_to_inbox(&inbox_dir(&alice), "h.bob-claude", Some("re: plan"), Some(&f1), &[], "on it").unwrap();
+    let f2 = send_to_inbox(
+        &inbox_dir(&alice),
+        "h.bob-claude",
+        Some("re: plan"),
+        Some(&f1),
+        &[],
+        "on it",
+    )
+    .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let f3 = send_to_inbox(&inbox_dir(&bob), "h.alice-claude", Some("re: plan"), Some(&f2), &[], "go").unwrap();
+    let f3 = send_to_inbox(
+        &inbox_dir(&bob),
+        "h.alice-claude",
+        Some("re: plan"),
+        Some(&f2),
+        &[],
+        "go",
+    )
+    .unwrap();
 
     // From ANY member, the whole thread comes back, root-first, in reply order.
     for start in [&f1, &f2, &f3] {
-        let thread = collect_thread(root, start);
+        let thread = collect_thread(root, start).unwrap();
         let names: Vec<&str> = thread.iter().map(|e| e.filename.as_str()).collect();
-        assert_eq!(names, [f1.as_str(), f2.as_str(), f3.as_str()], "thread from {start}");
+        assert_eq!(
+            names,
+            [f1.as_str(), f2.as_str(), f3.as_str()],
+            "thread from {start}"
+        );
         // Depth increases down the reply chain.
-        assert_eq!(thread.iter().map(|e| e.depth).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(
+            thread.iter().map(|e| e.depth).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
     }
 
     // An unknown filename → empty thread.
-    assert!(collect_thread(root, "0000000000000-nope00.md").is_empty());
+    assert!(
+        collect_thread(root, "0000000000000-nope00.md")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The reply flow: read an inbound message, derive recipient (its `from`) + threading, and land the
@@ -111,15 +195,34 @@ fn thread_walks_the_reply_chain_across_both_agents() {
 fn reply_threads_back_to_the_original_sender() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "hetz/st2-claude/agent.kdl", &agent_kdl("st2-claude", "hetz"));
-    write(root, "hetz/cos-claude/agent.kdl", &agent_kdl("cos-claude", "hetz"));
+    write(
+        root,
+        "hetz/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "hetz"),
+    );
+    write(
+        root,
+        "hetz/cos-claude/agent.kdl",
+        &agent_kdl("cos-claude", "hetz"),
+    );
 
-    let me = resolve_agent_dir(root, "hetz.st2-claude", "hetz").unwrap();
-    let cos = resolve_agent_dir(root, "hetz.cos-claude", "hetz").unwrap();
+    let me = resolve_agent_dir(root, "hetz.st2-claude", "hetz")
+        .unwrap()
+        .unwrap();
+    let cos = resolve_agent_dir(root, "hetz.cos-claude", "hetz")
+        .unwrap()
+        .unwrap();
 
     // cos → me
-    let original =
-        send_to_inbox(&inbox_dir(&me), "hetz.cos-claude", Some("M2 kick"), None, &[], "go").unwrap();
+    let original = send_to_inbox(
+        &inbox_dir(&me),
+        "hetz.cos-claude",
+        Some("M2 kick"),
+        None,
+        &[],
+        "go",
+    )
+    .unwrap();
 
     // me replies: recipient + subject + in-reply-to derived from the original in my inbox.
     let inbound = read_msg(&inbox_dir(&me), &original).unwrap();
@@ -179,15 +282,7 @@ fn a_concurrent_reader_never_observes_a_half_written_message() {
         let inbox = root.join(format!("inbox-{i}"));
         fs::create_dir_all(&inbox).unwrap();
         cursor.store(i, Ordering::Relaxed);
-        send_to_inbox(
-            &inbox,
-            "alice",
-            Some(&format!("big {i}")),
-            None,
-            &[],
-            &body,
-        )
-        .unwrap();
+        send_to_inbox(&inbox, "alice", Some(&format!("big {i}")), None, &[], &body).unwrap();
     }
     done.store(true, Ordering::Relaxed);
 

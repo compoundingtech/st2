@@ -48,10 +48,8 @@ fn references_variable(input: &str, variable: &str) -> bool {
     while input.contains(&marker) {
         marker.push('\0');
     }
-    crate::expand::expand_vars(input, |name| {
-        (name == variable).then(|| marker.clone())
-    })
-    .contains(&marker)
+    crate::expand::expand_vars(input, |name| (name == variable).then(|| marker.clone()))
+        .contains(&marker)
 }
 
 impl RenderOp {
@@ -61,8 +59,7 @@ impl RenderOp {
                 source,
                 destination,
             } => {
-                references_variable(source, variable)
-                    || references_variable(destination, variable)
+                references_variable(source, variable) || references_variable(destination, variable)
             }
             Self::File {
                 destination,
@@ -72,12 +69,10 @@ impl RenderOp {
                 destination,
                 content,
             } => {
-                references_variable(destination, variable)
-                    || references_variable(content, variable)
+                references_variable(destination, variable) || references_variable(content, variable)
             }
             Self::EnsureLine { destination, line } => {
-                references_variable(destination, variable)
-                    || references_variable(line, variable)
+                references_variable(destination, variable) || references_variable(line, variable)
             }
             Self::GitExclude { path } => references_variable(path, variable),
         }
@@ -238,6 +233,35 @@ pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
         Some(render) => parse_render_node(render, &spec.identity),
         None => Ok(RenderPlan::default()),
     }
+}
+
+/// Catalog-owned files read by this agent's `render { copy ... }` operations.
+///
+/// Absolute/external sources are deliberately absent: a declaration snapshot owns catalog bytes,
+/// not arbitrary workspace or host files. The returned paths are exact existing files; callers
+/// still decide which file kinds are admissible for their transaction.
+pub(crate) fn catalog_owned_render_inputs(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Result<Vec<PathBuf>> {
+    let plan = parse_plan(spec)?;
+    let env = render_env(root, spec, this_host);
+    let spec_dir = spec.path.parent().unwrap_or(root);
+    let mut inputs = BTreeSet::new();
+    for operation in plan.ops {
+        let RenderOp::Copy {
+            source: raw_source, ..
+        } = operation
+        else {
+            continue;
+        };
+        let resolved = source(root, spec_dir, &raw_source, &env)?;
+        if resolved.strip_prefix(root).is_ok() {
+            inputs.insert(resolved);
+        }
+    }
+    Ok(inputs.into_iter().collect())
 }
 
 fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {

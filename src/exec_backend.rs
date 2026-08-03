@@ -211,6 +211,7 @@ impl ExecBackend {
                 pty_id: id.to_string(),
                 alive,
                 exit_code: None,
+                presentation: None,
             });
         }
         Ok(out)
@@ -938,6 +939,7 @@ mod generation_observation_tests {
             tags: BTreeMap::new(),
             env: BTreeMap::new(),
             keep: false,
+            presentation: None,
         }
     }
 

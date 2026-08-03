@@ -76,6 +76,8 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
     for child in children.nodes() {
         match child.name().value() {
             "identity" => raw.identity = arg_string(child).or(raw.identity),
+            "name" => parse_presentation(child, "name", &mut raw.name)?,
+            "description" => parse_presentation(child, "description", &mut raw.description)?,
             "host" => raw.host = arg_string(child),
             "role" => raw.role = arg_string(child),
             "type" => raw.job_type = arg_string(child),
@@ -114,6 +116,29 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
         );
     }
     Ok(raw)
+}
+
+fn parse_presentation(
+    node: &KdlNode,
+    field: &str,
+    destination: &mut Option<String>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        destination.is_none(),
+        "agent declares `{field}` more than once"
+    );
+    anyhow::ensure!(
+        node.children().is_none()
+            && node.entries().len() == 1
+            && node.entries()[0].name().is_none(),
+        "agent `{field}` must contain exactly one positional string"
+    );
+    let value = node
+        .get(0)
+        .and_then(|value| value.as_string())
+        .ok_or_else(|| anyhow::anyhow!("agent `{field}` must contain a string"))?;
+    *destination = Some(value.to_owned());
+    Ok(())
 }
 
 fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)> {

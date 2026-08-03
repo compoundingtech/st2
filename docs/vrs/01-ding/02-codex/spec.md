@@ -51,8 +51,8 @@ The exact notice as the complete lowest live composer is `RetainedSafe` only
 with the ordinary idle proof and no blocking state; otherwise it is
 `RetainedBlocked`. `Accepted` requires both an empty lowest live composer and
 the expected notice text in the adapter's submitted-prompt or queued-message
-pattern. An empty composer alone, disappearance, a different live draft, and
-unrecognized pixels are `Unproven`.
+pattern. A parsed empty composer or different live draft that is not accepted
+is `NotRetained`. Disappearance and unrecognized pixels are `Unproven`.
 
 ## Blocked states
 

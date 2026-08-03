@@ -11,9 +11,8 @@ fn write(path: &Path, contents: impl AsRef<[u8]>) {
 }
 
 #[test]
-fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
+fn task_selector_refusal_initializes_only_the_persistent_coordination_lock() {
     let tmp = tempfile::tempdir().unwrap();
-    let before = fs::read_dir(tmp.path()).unwrap().count();
     let out = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(tmp.path())
@@ -27,7 +26,20 @@ fn task_selector_refusal_is_nonzero_before_catalog_mutation() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), before);
+    let root_entries = fs::read_dir(tmp.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(root_entries.len(), 1);
+    assert_eq!(root_entries[0].file_name(), ".st2");
+    let control_entries = fs::read_dir(root_entries[0].path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(control_entries.len(), 1);
+    assert_eq!(control_entries[0].file_name(), "catalog-authoring.lock");
+    let lock = fs::symlink_metadata(control_entries[0].path()).unwrap();
+    assert!(lock.is_file() && !lock.file_type().is_symlink());
 }
 
 #[test]

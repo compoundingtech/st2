@@ -56,7 +56,11 @@ is in [`spec.md`](./spec.md).
   changed composer, a human draft, an active turn, a modal, an unreadable
   screen, an unrecognized harness, and a bounded observation timeout never
   become `Delivered` and receive no retry input. Anything not positively
-  understood retains staged ownership.
+  understood retains staged ownership. On an inspect-only staged retry, a
+  maintained adapter may positively prove that the exact owned payload is no
+  longer retained; that proof relinquishes ownership only when an archive
+  receipt already removed the notice from the inbox. An unread notice remains
+  staged even after positive absence, so it is never pasted again.
 
 ### Must classify the surface it will actually type into
 
@@ -91,9 +95,11 @@ is in [`spec.md`](./spec.md).
   classification that the expected notice text is visible in that harness's
   submitted-prompt or queued-message pattern while its lowest live composer is
   empty or an accepted idle placeholder. PTY command success, generic screen
-  change, disappearance alone, and ambiguous pixels are not receipts. Until
-  that evidence exists, a transport attempt retains staged ownership and
-  retries by inspection without re-pasting.
+  change, disappearance alone, and ambiguous pixels are not receipts. A
+  maintained adapter that successfully parses the live composer may separately
+  prove `NotRetained`; this is never delivery and releases only an already
+  archived staged head. Unread, unreadable, unrecognized, and ambiguous attempts
+  retain staged ownership and retry by inspection without re-pasting.
 
 ## Evidence
 

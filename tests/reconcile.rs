@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
+use st2::reconcile::ObservedPtyPresentation;
 use st2::spec::{AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile};
 
@@ -152,6 +153,7 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
             pty_id: "host.a.x".into(),
             alive: false,
             exit_code: Some(7),
+            presentation: None,
         }],
         "host",
         "host.a.x",
@@ -175,6 +177,7 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
             pty_id: "host.b.x".into(),
             alive: false,
             exit_code: Some(7),
+            presentation: None,
         }],
         "host",
         "host.b.x",
@@ -194,6 +197,7 @@ fn selected_reconcile_holds_adopt_only_dead_or_absent_without_mutation() {
             pty_id: "host.a.agent".into(),
             alive: false,
             exit_code: Some(1),
+            presentation: None,
         }],
         vec![],
     ] {
@@ -247,16 +251,19 @@ fn selected_dead_non_keep_gc_and_relaunch_only_selected() {
                 pty_id: "host.a.x".into(),
                 alive: false,
                 exit_code: Some(1),
+                presentation: None,
             },
             Session {
                 pty_id: "host.a.y".into(),
                 alive: false,
                 exit_code: Some(1),
+                presentation: None,
             },
             Session {
                 pty_id: "host.b.z".into(),
                 alive: false,
                 exit_code: Some(1),
+                presentation: None,
             },
         ],
         "host",
@@ -368,6 +375,8 @@ fn spec(
 ) -> AgentSpec {
     AgentSpec {
         identity: identity.to_string(),
+        name: None,
+        description: None,
         host: host.map(String::from),
         role: None,
         job_type,
@@ -394,6 +403,7 @@ fn live(id: &str) -> Session {
         pty_id: id.to_string(),
         alive: true,
         exit_code: None,
+        presentation: None,
     }
 }
 fn dead(id: &str) -> Session {
@@ -401,6 +411,7 @@ fn dead(id: &str) -> Session {
         pty_id: id.to_string(),
         alive: false,
         exit_code: None,
+        presentation: None,
     }
 }
 
@@ -448,6 +459,133 @@ fn all_tasks_live_is_adopted() {
     let plan = reconcile(&specs, &sessions, HOST);
     assert!(plan.launch.is_empty());
     assert_eq!(plan.adopt.len(), 1);
+}
+
+#[test]
+fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
+    let mut owner = svc(
+        "worker",
+        Some(HOST),
+        vec![
+            task(
+                TaskKind::Pty,
+                "agent",
+                Some("hetz.worker"),
+                Some("codex"),
+            ),
+            task(
+                TaskKind::Pty,
+                "shell",
+                Some("hetz.worker.shell"),
+                Some("sh"),
+            ),
+        ],
+    );
+    owner.name = Some("Build owner".to_owned());
+    owner.description = Some("Owns build delivery".to_owned());
+    let specs = [owner];
+    let plan = reconcile(
+        &specs,
+        &[live("hetz.worker"), live("hetz.worker.shell")],
+        HOST,
+    );
+
+    assert!(plan.launch.is_empty());
+    assert!(plan.teardown.is_empty());
+    assert!(plan.gc.is_empty());
+    assert_eq!(plan.presentation.len(), 2);
+    let primary = plan
+        .presentation
+        .iter()
+        .find(|item| item.pty_id == "hetz.worker")
+        .unwrap();
+    assert_eq!(primary.display_name, Some(Some("Build owner".to_owned())));
+    assert_eq!(
+        primary.tags,
+        BTreeMap::from([
+            ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
+            ("agent.actor.path".to_owned(), Some("hetz.worker".to_owned())),
+            (
+                "agent.presentation.description".to_owned(),
+                Some("Owns build delivery".to_owned()),
+            ),
+        ])
+    );
+    let secondary = plan
+        .presentation
+        .iter()
+        .find(|item| item.pty_id == "hetz.worker.shell")
+        .unwrap();
+    assert_eq!(secondary.display_name, None);
+    assert_eq!(secondary.tags, primary.tags);
+}
+
+#[test]
+fn lifecycle_equal_primary_name_is_cleared_during_live_reconciliation() {
+    let mut owner = svc(
+        "worker",
+        Some(HOST),
+        vec![task(
+            TaskKind::Pty,
+            "agent",
+            Some("hetz.worker"),
+            Some("codex"),
+        )],
+    );
+    owner.name = Some("hetz.worker".to_owned());
+
+    let specs = [owner];
+    let plan = reconcile(&specs, &[live("hetz.worker")], HOST);
+    assert_eq!(plan.presentation.len(), 1);
+    assert_eq!(plan.presentation[0].display_name, Some(None));
+}
+
+#[test]
+fn live_pty_presentation_only_queues_observed_drift() {
+    let mut owner = svc(
+        "worker",
+        Some(HOST),
+        vec![task(
+            TaskKind::Pty,
+            "agent",
+            Some("hetz.worker"),
+            Some("codex"),
+        )],
+    );
+    owner.name = Some("Build owner".to_owned());
+    owner.description = Some("Owns build delivery".to_owned());
+    let specs = [owner];
+    let exact_tags = BTreeMap::from([
+        ("agent.presentation.schema".to_owned(), "1".to_owned()),
+        ("agent.actor.path".to_owned(), "hetz.worker".to_owned()),
+        (
+            "agent.presentation.description".to_owned(),
+            "Owns build delivery".to_owned(),
+        ),
+        ("unrelated".to_owned(), "preserved".to_owned()),
+    ]);
+    let exact = Session {
+        pty_id: "hetz.worker".to_owned(),
+        alive: true,
+        exit_code: None,
+        presentation: Some(ObservedPtyPresentation {
+            display_name: Some("Build owner".to_owned()),
+            tags: exact_tags.clone(),
+        }),
+    };
+    assert!(reconcile(&specs, &[exact], HOST).presentation.is_empty());
+
+    let drifted = Session {
+        pty_id: "hetz.worker".to_owned(),
+        alive: true,
+        exit_code: None,
+        presentation: Some(ObservedPtyPresentation {
+            display_name: Some("Old owner".to_owned()),
+            tags: exact_tags,
+        }),
+    };
+    assert_eq!(reconcile(&specs, &[drifted], HOST).presentation.len(), 1);
+    assert_eq!(reconcile(&specs, &[live("hetz.worker")], HOST).presentation.len(), 1);
 }
 
 #[test]

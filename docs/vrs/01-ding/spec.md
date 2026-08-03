@@ -34,12 +34,14 @@ record ownership ─► combined transport (paste ─► 0.5s ─► Return) ─
                          └──────────────────────────────────────────────► Staged
 
 receipt ─┬─ Accepted ──────────────────────────────────────────────► Delivered
-         └─ RetainedSafe / RetainedBlocked / Unproven ────────────► Staged
+         └─ RetainedSafe / RetainedBlocked / NotRetained / Unproven ► Staged
 
 staged retry ─► receipt ─┬─ Accepted ──────────────────────────────► Delivered
                          ├─ RetainedSafe ─► final receipt ─┬─ Accepted ─► Delivered
                          │                                 ├─ RetainedSafe ─► Return ─► receipt
                          │                                 └─ other ────────► Staged
+                         ├─ NotRetained + archived ────────────────► release head
+                         ├─ NotRetained + unread ──────────────────► Staged
                          └─ RetainedBlocked / Unproven ─────────────► Staged
 ```
 
@@ -56,7 +58,7 @@ re-pasting. A staged retry is inspect-only unless two adjacent `RetainedSafe`
 observations authorize one bare Return (`DING-R02`).
 
 Return is transport, not a delivery receipt. After any submission attempt, a
-bounded observation loop asks the selected harness adapter for one of four
+bounded observation loop asks the selected harness adapter for one of five
 states:
 
 | Receipt state | Meaning |
@@ -64,14 +66,19 @@ states:
 | `Accepted` | The expected notice text is visible in an adapter-recognized submitted-prompt or queued-message pattern while the lowest live composer is empty or an accepted idle placeholder |
 | `RetainedSafe` | The exact notice remains the complete live composer and Return is currently safe |
 | `RetainedBlocked` | The exact notice remains the complete live composer but the harness is active or blocked |
+| `NotRetained` | A maintained adapter parsed the live composer and positively proved that the exact notice is neither its complete contents nor an accepted submission |
 | `Unproven` | No positive acceptance or exact retained-composer state was proven |
 
 Only `Accepted` becomes `Delivered` (`DING-R10`). PTY command success, generic
 screen change, disappearance alone, a changed composer, unreadable output, and
-observation timeout retain `Staged` ownership. A staged retry completes without
-input when it observes `Accepted`; it may send one bare Return only after two
-adjacent `RetainedSafe` observations, then must obtain the same positive
-receipt. `RetainedBlocked` and `Unproven` send no input. No retry re-pastes.
+observation timeout never become delivery. `NotRetained` requires successful
+parsing by a maintained adapter; missing or unrecognized composer evidence stays
+`Unproven`. A staged retry completes without input when it observes `Accepted`;
+it may send one bare Return only after two adjacent `RetainedSafe` observations,
+then must obtain the same positive receipt. `NotRetained` releases ownership
+only when the notice is already archived; an unread notice remains staged.
+`RetainedBlocked`, `NotRetained`, and `Unproven` send no input. No retry
+re-pastes.
 
 ## Harness dispatch
 
@@ -126,13 +133,16 @@ the original text either lost one inter-word space or split a token, so each
 boundary yields exactly two candidates. Comparison against the expected notice
 succeeds if any candidate matches exactly. The bounded notice length keeps the
 candidate set small; an unfamiliar multiline shape yields no match and fails
-closed.
+closed: it is `Ambiguous` before submission and `Unproven` after transport,
+never positive `NotRetained` evidence.
 
 ## Retry and suppression
 
 Deferred notices retain FIFO order and retry on a bounded backoff, so an
 indefinitely occupied composer cannot spawn a terminal probe per inbox poll
-(`DING-R08`). Archive receipts remove pending notices without another attempt.
+(`DING-R08`). A staged archived head advances FIFO only after a maintained
+adapter positively observes `NotRetained`; an unread head does not release.
+Archive receipts remove pending notices that do not already own a transport.
 Declared `busy` never suppresses delivery; only fresh `dnd` defers it
 (`DING-R09`).
 

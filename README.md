@@ -4,8 +4,8 @@ st2 runs a declarative network of Codex and Claude agents from one catalog. It o
 reconciliation, native messages, normalized terminal DING delivery, presence, durable context,
 workspace materialization, and explicit teardown.
 
-Hand-authored KDL is the canonical interface. `st2 compile-agent` is experimental and must be
-reviewed before its output is materialized.
+Canonical KDL is the authoring interface. Publish one explicit Agent Spec transactionally with
+`st2 agent publish`; st2 does not compile human intent into declarations.
 
 ## Product intent and implementation contract
 
@@ -19,7 +19,7 @@ implementation changes. Nathan must approve changes to `docs/vrs/vision.md` or
 Prerequisites:
 
 - Rust and Cargo;
-- `pty` on `PATH`;
+- `pty` on `PATH` with `pty run --unset-env` support;
 - at least one supported harness on `PATH`: `codex` or `claude`;
 - Git when a declaration materializes workspace files;
 - Bash and `jq` on `PATH` when lifecycle hooks are enabled.
@@ -33,6 +33,13 @@ pty --help
 st2 hooks install
 st2 hooks verify
 ```
+
+When upgrading, deploy and activate the compatible `pty` before this version of
+`st2`. An older `pty` may silently ignore the unknown `--unset-env` option and
+still launch the agent without persisting the removal. The initial environment
+can therefore look correct while a later restart reintroduces the caller's
+ambient value. The Nix input and development shell pin the compatible artifact;
+Cargo installs rely on the operator to satisfy this runtime prerequisite.
 
 The standard catalog is:
 
@@ -92,17 +99,51 @@ Start from the maintained [Codex](examples/native/agent-codex.kdl) or
 
 ```sh
 export CATALOG="${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog"
-mkdir -p "$CATALOG/agents/<host>/<identity>" "$CATALOG/_templates"
-cp examples/native/agent-codex.kdl "$CATALOG/agents/<host>/<identity>/agent.kdl"
-${EDITOR:-vi} "$CATALOG/agents/<host>/<identity>/agent.kdl"
+bundle="$(mktemp -d)"
+mkdir -p "$bundle/assets"
+cp examples/native/agent-codex.kdl "$bundle/agent.kdl"
+cp ./composed-AGENTS.md "$bundle/assets/AGENTS.md"
+${EDITOR:-vi} "$bundle/agent.kdl"
+input_sha256="$(st2 agent digest --bundle "$bundle")"
+st2 agent publish --catalog "$CATALOG" --bundle "$bundle" \
+  --input-sha256 "$input_sha256" --expect-absent --json
 ```
 
-Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Add every file referenced by
-`copy` under `$CATALOG/_templates`. The maintained declaration does not add workspace trust.
-`compile-agent` also omits trust by default. Pass `--harness codex --trust-workspace` to opt in to an
-argv-local Codex `projects` trust override. The generator serializes the declared workspace as the
-exact decoded key; other harnesses reject the flag. This is a launch convention inside opaque argv,
-not agent-spec grammar enforced by st2.
+Replace `<host>`, `<identity>`, `<workspace>`, and `<boot prompt>`. Include every file referenced by
+`copy` in the bundle. For a later declaration-only update, publish `agent.kdl` with the current
+declaration's SHA-256 via `--spec ... --expect-sha256 HEX`; sibling assets and state are preserved.
+Bind either operation to the exact captured source with the SHA-256 returned by
+`st2 agent digest`.
+
+To prepare and apply a complete declaration-plane replacement without copying
+runtime state or workspaces:
+
+```sh
+st2 catalog snapshot --catalog "$CATALOG" --output ./prepared --json
+# Edit/render ./prepared, then retain the rootSha256 from the snapshot receipt.
+st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
+  --expect-sha256 <rootSha256> --json
+```
+
+To publish that exact snapshot as a new, absent catalog:
+
+```sh
+st2 catalog bootstrap --catalog "$NEW_CATALOG" --prepared ./prepared \
+  --input-sha256 <rootSha256> --json
+```
+
+`catalog apply` is policy-free. It rejects state/control content, symlinks,
+unprojected workspace facts, catalog-local/default PTY roots, and effective
+PTY-root changes. Bootstrap is a separate create-only declaration transaction,
+not an apply mode. It atomically publishes absence or the complete catalog,
+initializes its persistent lock and generation before visibility, and never
+reads or writes the external PTY registry. Process adoption and PTY-root
+migration remain separate because that registry has independent producers. A
+crash during apply leaves a durable marker and content-addressed stage;
+`st2 catalog apply --catalog "$CATALOG" --resume --json` resumes without the
+original prepared source. Snapshots own the complete bounded `_templates`
+library and empty canonical per-agent `.workspace` directory facts, but never
+traverse, hash, copy, or delete workspace content.
 
 The compact declaration shape is:
 
@@ -114,12 +155,14 @@ agent "<identity>" {
   // Optional metadata:
   // role "worker"
   // supervisor "<supervisor-bus-id>"
+  // name "Release worker"
+  // description "Owns release preparation and verification."
   env { ST_AGENT "<host>.<identity>" }
   argv "codex" "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust" "<boot prompt>"
   ding
 
   render {
-    copy "_templates/<host>.<identity>.AGENTS.md" "AGENTS.md"
+    copy "assets/AGENTS.md" "AGENTS.md"
     json-upsert ".codex/hooks.json" #"""
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$ST_HOOKS/codex-session-start.sh","timeout":5}]}]}}
 """#
@@ -162,6 +205,24 @@ The envelope is intentionally only `name` + `_tag` + `uri`. It carries no requir
 access, readiness, or lifecycle policy, and URI possession conveys no authority. Resource-only
 declaration edits do not stop, replace, or relaunch a live task. Resource types and resolvers remain
 opaque to st2; catalog readers use the public `agent-spec` crate to inspect the typed bindings.
+
+The positional agent value is the stable automation identity. Optional `name` and `description`
+fields are presentation only; they never route messages, select tasks, or rename durable state.
+Mutate a catalog-owned KDL declaration through the constrained commands:
+
+```sh
+st2 rename <stable-id> "Release worker"
+st2 describe <stable-id> "Owns release preparation and verification."
+st2 rename <stable-id> --clear
+```
+
+These commands preserve unrelated KDL bytes and serialize local writers through the persistent
+shared `.st2/catalog-authoring.lock`. They refuse TOML, JSON, and
+explicitly `meta { managed-by "nix" }` targets. Nix generators must emit that marker before the
+compatible st2 binary is activated. In the trusted single-operator fleet, caller-supplied
+`ST_AGENT` limits an invocation to itself or declared descendants; it is a guardrail rather than
+authentication, and absence selects the operator path. The sibling `<agent-dir>/name` convention
+is hard-retired and ignored.
 
 `argv` launches its first value directly with the remaining values as arguments. It resolves a bare
 program such as `codex` through the task environment's `PATH`, preserves argument boundaries, and
@@ -365,9 +426,10 @@ st2 context read --full
 ```
 
 The roster includes retired declarations instead of silently conflating them with runtime
-presence. Both JSON shapes contain `retired` and the declaration's ordered `resources` descriptors;
-`--enrich` additionally supplies `lastActivity` and `inbox`. Human output leaves active rows
-unchanged and appends `[retired]` to a retired row.
+presence. Both JSON shapes keep stable `identity` separate from optional `name` and `description`,
+and contain `retired` plus the declaration's ordered `resources` descriptors. `--enrich`
+additionally supplies `lastActivity` and `inbox`. Human output prints the same presentation fields
+as separate columns and appends `[retired]` to a retired row.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
@@ -432,10 +494,11 @@ st2 service uninstall
 
 ```text
 ls, up, down, validate, doctor
-message, ding, agents, status, context, resource
+message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, eval
-compile-agent (experimental)
+agent digest, agent publish
+catalog bootstrap, catalog snapshot, catalog apply
 completions
 ```
 
@@ -495,5 +558,12 @@ interviewer reply at-or-after the exact kickoff receipt completes it. Canonical 
 verdict. Without the directive, Agent Spec-shaped files inside a fixture remain inert and compact
 evals retain their flat bus and completion semantics.
 
-`st2 compile-agent` remains experimental. Hand-authored KDL is the canonical st2 authoring
-interface, and generated output must be reviewed before materialization.
+`st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) --input-sha256 HEX
+(--expect-absent | --expect-sha256 HEX)` is the single-agent declaration writer.
+`st2 catalog apply --catalog ROOT
+(--prepared DIR --expect-sha256 ROOT_HEX | --resume)` is the complete
+declaration-plane writer. Each admits the complete prospective catalog under a
+compare-and-swap lock before making one atomic change.
+`st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 ROOT_HEX`
+is the create-only writer for an absent catalog. An exact completed replay is
+`unchanged`; any different or incomplete existing target fails closed.

@@ -4,9 +4,12 @@
 //! declared task running and delivers native messages. Harness-specific behavior stays explicit in
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
+pub mod agent_author;
+pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
-pub mod compile_agent;
+pub mod catalog_lock;
+pub mod catalog_transaction;
 pub mod context;
 pub mod ding;
 pub mod eval_run;
@@ -41,11 +44,14 @@ pub use agent_spec::spec::{
     AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
     parse_duration,
 };
+pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;
 pub use expand::{expand_env, expand_vars};
 pub use flapping::FlappingCap;
 pub use host_lock::HostLock;
-pub use reconcile::{Launch, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile};
+pub use reconcile::{
+    Launch, PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown, reconcile,
+};
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
     up_loop, up_loop_specs, up_once, up_once_selected, up_once_selected_specs, up_once_specs,
