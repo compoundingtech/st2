@@ -94,7 +94,7 @@ fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> Compose
 fn codex_idle_footer(screen_from_composer: &str) -> bool {
     strip_ansi(screen_from_composer).lines().any(|line| {
         let line = line.trim();
-        line.starts_with("gpt-") && line.contains(" · /")
+        line.starts_with("gpt-") && (line.contains(" · /") || line.contains(" · ~/"))
     })
 }
 

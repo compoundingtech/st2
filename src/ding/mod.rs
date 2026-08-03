@@ -1170,6 +1170,10 @@ mod tests {
             .to_string()
     }
 
+    fn idle_codex_screen_with_home_relative_cwd() -> String {
+        idle_codex_screen().replace(" · /workspace", " · ~/Code/st2")
+    }
+
     fn staged_codex_screen(text: &str) -> String {
         let rendered = text.replace(' ', "\x1b[1C");
         format!(
@@ -1439,6 +1443,10 @@ mod tests {
             "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
         assert_eq!(
             classify_composer(&idle_codex_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&idle_codex_screen_with_home_relative_cwd(), expected),
             ComposerState::EmptySafe
         );
         assert_eq!(
