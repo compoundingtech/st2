@@ -34,7 +34,7 @@ impl Harness for Claude {
         } else if placeholder && screen_has_accepted_notice(screen, '❯', expected) {
             ReceiptState::Accepted
         } else {
-            ReceiptState::Unproven
+            ReceiptState::NotRetained
         }
     }
 }

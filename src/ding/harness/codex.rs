@@ -32,7 +32,7 @@ impl Harness for Codex {
             CodexComposer::Empty if screen_has_accepted_notice(screen, '›', expected) => {
                 ReceiptState::Accepted
             }
-            CodexComposer::Empty => ReceiptState::Unproven,
+            CodexComposer::Empty => ReceiptState::NotRetained,
             CodexComposer::Typed(input) => {
                 let exact = logical_soft_wrap_candidates(&input, 70)
                     .iter()
@@ -42,7 +42,7 @@ impl Harness for Codex {
                 } else if exact {
                     ReceiptState::RetainedBlocked
                 } else {
-                    ReceiptState::Unproven
+                    ReceiptState::NotRetained
                 }
             }
         }

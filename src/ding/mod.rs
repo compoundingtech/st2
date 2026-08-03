@@ -152,6 +152,9 @@ pub fn pty_delivery_args(session: &str, text: &str) -> Vec<String> {
 pub enum PokeOutcome {
     Delivered,
     Staged,
+    /// A maintained adapter positively proved that the exact staged notice is absent. Queue state
+    /// decides whether an archive receipt makes that proof sufficient to relinquish ownership.
+    NotRetained,
     Deferred,
 }
 
@@ -390,6 +393,7 @@ fn retry_staged_with_window(
             before_submit,
             observation_window,
         ),
+        ReceiptState::NotRetained => Ok(PokeOutcome::NotRetained),
         ReceiptState::RetainedBlocked | ReceiptState::Unproven => Ok(PokeOutcome::Staged),
     }
 }
@@ -414,6 +418,7 @@ fn submit_retained_after_final_observation(
     match classify_receipt(&screen, text) {
         ReceiptState::Accepted => return Ok(PokeOutcome::Delivered),
         ReceiptState::RetainedSafe => {}
+        ReceiptState::NotRetained => return Ok(PokeOutcome::NotRetained),
         ReceiptState::RetainedBlocked | ReceiptState::Unproven => {
             return Ok(PokeOutcome::Staged);
         }
@@ -662,6 +667,13 @@ impl PendingNotice {
     fn in_inbox(&self) -> bool {
         match self {
             Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => *in_inbox,
+            Self::Adopted { .. } => false,
+        }
+    }
+
+    fn is_archived(&self) -> bool {
+        match self {
+            Self::Recovery { in_inbox, .. } | Self::Message { in_inbox, .. } => !*in_inbox,
             Self::Adopted { .. } => false,
         }
     }
@@ -917,6 +929,13 @@ fn flush_pending(
                 pending.pop_front();
             }
             Ok(PokeOutcome::Staged) => {
+                notice.set_staged_text(Some(text));
+                break;
+            }
+            Ok(PokeOutcome::NotRetained) if was_staged && notice.is_archived() => {
+                pending.pop_front();
+            }
+            Ok(PokeOutcome::NotRetained) => {
                 notice.set_staged_text(Some(text));
                 break;
             }
@@ -1825,7 +1844,7 @@ mod tests {
                 &format!("ordinary transcript: {text}\r\n{}", idle_codex_screen()),
                 text
             ),
-            ReceiptState::Unproven,
+            ReceiptState::NotRetained,
             "notice text outside an adapter-recognized accepted pattern is not a receipt"
         );
         assert_eq!(
@@ -1833,8 +1852,17 @@ mod tests {
                 &format!("old receipt: {text}\r\n{}", human_codex_screen()),
                 text
             ),
+            ReceiptState::NotRetained,
+            "a parsed changed live composer positively excludes the exact owned notice"
+        );
+        assert_eq!(
+            classify_receipt(&idle_codex_screen(), text),
+            ReceiptState::NotRetained
+        );
+        assert_eq!(
+            classify_receipt("unknown renderer", text),
             ReceiptState::Unproven,
-            "a changed live composer cannot be accepted from transcript evidence"
+            "an unrecognized screen cannot prove that the owned notice disappeared"
         );
 
         assert_eq!(
@@ -1853,7 +1881,11 @@ mod tests {
                 &format!("ordinary transcript: {text}\r\n{}", idle_claude_screen()),
                 text
             ),
-            ReceiptState::Unproven
+            ReceiptState::NotRetained
+        );
+        assert_eq!(
+            classify_receipt(&idle_claude_screen(), text),
+            ReceiptState::NotRetained
         );
     }
 
@@ -1884,11 +1916,14 @@ mod tests {
         assert_eq!(outcome, PokeOutcome::Staged);
         assert_eq!(*submits.borrow(), 1);
 
-        for screen in [
-            format!("Create a plan?\r\n{}", staged_codex_screen(text)),
-            idle_codex_screen(),
-            human_codex_screen(),
-            "unknown renderer".to_string(),
+        for (screen, expected) in [
+            (
+                format!("Create a plan?\r\n{}", staged_codex_screen(text)),
+                PokeOutcome::Staged,
+            ),
+            (idle_codex_screen(), PokeOutcome::NotRetained),
+            (human_codex_screen(), PokeOutcome::NotRetained),
+            ("unknown renderer".to_string(), PokeOutcome::Staged),
         ] {
             let submits = RefCell::new(0);
             let outcome = retry_staged_with_window(
@@ -1903,7 +1938,7 @@ mod tests {
                 Duration::ZERO,
             )
             .unwrap();
-            assert_eq!(outcome, PokeOutcome::Staged);
+            assert_eq!(outcome, expected);
             assert_eq!(
                 *submits.borrow(),
                 0,
@@ -1929,6 +1964,35 @@ mod tests {
             PokeOutcome::Delivered
         );
         assert_eq!(*submits.borrow(), 0);
+    }
+
+    #[test]
+    fn staged_retry_keeps_unproven_and_retained_blocked_owned() {
+        use std::cell::RefCell;
+
+        let text = "[DING] new st2 message: [id:abc123] retry truth (from cos); check your inbox";
+        for screen in [
+            "unknown renderer".to_string(),
+            format!("Create a plan?\r\n{}", staged_codex_screen(text)),
+        ] {
+            let submits = RefCell::new(0);
+            assert_eq!(
+                retry_staged_with_window(
+                    text,
+                    &mut || Ok(screen.clone()),
+                    &mut || {
+                        *submits.borrow_mut() += 1;
+                        Ok(())
+                    },
+                    &mut || {},
+                    &mut || Ok(()),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+                PokeOutcome::Staged
+            );
+            assert_eq!(*submits.borrow(), 0);
+        }
     }
 
     #[test]
@@ -2036,6 +2100,81 @@ mod tests {
             poker.retries.lock().unwrap().as_slice(),
             [expected.as_str(), expected.as_str()]
         );
+    }
+
+    #[test]
+    fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
+        let agent = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(agent.path());
+        let archive = archive_dir(agent.path());
+        let first = send_to_inbox(&inbox, "alice", Some("first"), None, &[], "one").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let second = send_to_inbox(&inbox, "bob", Some("second"), None, &[], "two").unwrap();
+        let mut pending: VecDeque<PendingNotice> = message::list_inbox(&inbox)
+            .unwrap()
+            .into_iter()
+            .map(PendingNotice::message)
+            .collect();
+        let first_text = pending[0].text();
+        let second_text = pending[1].text();
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Delivered,
+            ])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        archive_msg(&inbox, &archive, &first).unwrap();
+        prune_archived_pending(&inbox, &mut pending);
+        flush_pending(None, &mut pending, &poker);
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [first_text.as_str(), second_text.as_str()]
+        );
+        assert_eq!(poker.retries.lock().unwrap().as_slice(), [first_text]);
+        assert!(!inbox.join(first).exists());
+        assert!(inbox.join(second).exists());
+    }
+
+    #[test]
+    fn unread_not_retained_keeps_fifo_ownership_without_repasting() {
+        let agent = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(agent.path());
+        send_to_inbox(&inbox, "alice", Some("first"), None, &[], "one").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        send_to_inbox(&inbox, "bob", Some("second"), None, &[], "two").unwrap();
+        let mut pending: VecDeque<PendingNotice> = message::list_inbox(&inbox)
+            .unwrap()
+            .into_iter()
+            .map(PendingNotice::message)
+            .collect();
+        let first_text = pending[0].text();
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([
+                PokeOutcome::Staged,
+                PokeOutcome::Delivered,
+            ])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        };
+
+        flush_pending(None, &mut pending, &poker);
+        flush_pending(None, &mut pending, &poker);
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].staged_text(), Some(first_text.as_str()));
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [first_text.as_str()]
+        );
+        assert_eq!(poker.retries.lock().unwrap().as_slice(), [first_text]);
     }
 
     #[test]
