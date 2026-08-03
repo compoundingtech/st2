@@ -988,6 +988,9 @@ pub struct UpReport {
     /// The pass could not obtain an authoritative session snapshot, so it deliberately performed no
     /// reconciliation. Long-running supervisors retry; a one-shot caller must exit unsuccessfully.
     pub skipped: bool,
+    /// Discovery rejected at least one Agent Spec declaration. Valid siblings may still reconcile,
+    /// but a one-shot caller must report the invalid desired state through its process exit.
+    pub invalid_declarations: bool,
     /// Task IDs that st2 started without a restart reap in this pass.
     pub launched: Vec<String>,
     /// Task IDs that st2 restarted successfully in this pass. st2 reaped a dead active record
@@ -1023,6 +1026,7 @@ pub struct UpReport {
 impl UpReport {
     fn absorb(&mut self, mut other: UpReport) {
         self.skipped |= other.skipped;
+        self.invalid_declarations |= other.invalid_declarations;
         self.launched.append(&mut other.launched);
         self.restarted.append(&mut other.restarted);
         self.torn_down.append(&mut other.torn_down);
@@ -1338,6 +1342,7 @@ fn reconcile_pass(
     };
     let found = crate::discover(root);
     let mut report = UpReport {
+        invalid_declarations: !found.errors.is_empty(),
         warnings: found.warnings.clone(),
         errors: found
             .errors

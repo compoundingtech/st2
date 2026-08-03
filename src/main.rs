@@ -2302,6 +2302,9 @@ fn up(
         if report.skipped {
             anyhow::bail!("one-shot reconcile pass was skipped");
         }
+        if report.invalid_declarations {
+            anyhow::bail!("one-shot reconcile pass contained invalid Agent Spec declarations");
+        }
         if targeted && !report.errors.is_empty() {
             anyhow::bail!("targeted one-shot reconcile pass reported errors");
         }

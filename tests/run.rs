@@ -730,6 +730,7 @@ fn up_once_launches_only_the_missing_task() {
         ..Default::default()
     };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(!report.invalid_declarations);
     assert_eq!(report.launched, vec!["hetz.demo.ding"]);
 }
 
@@ -1180,6 +1181,7 @@ fn up_once_surfaces_discovery_errors_and_unrunnable() {
     );
     let runner = FakeRunner::default();
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(report.invalid_declarations);
     assert_eq!(report.launched, vec!["hetz.good.agent"]);
     assert_eq!(report.unrunnable, vec!["nr"]);
     assert_eq!(report.errors.len(), 1);

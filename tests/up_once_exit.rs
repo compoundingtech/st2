@@ -14,6 +14,12 @@ fn failing_pty_path() -> tempfile::TempDir {
     bin
 }
 
+fn empty_pty_path() -> tempfile::TempDir {
+    let bin = tempfile::tempdir().unwrap();
+    executable(&bin.path().join("pty"), "#!/bin/sh\nprintf '[]\\n'\n");
+    bin
+}
+
 fn assert_skipped_once_exits_nonzero(command: &mut Command) {
     let output = command.output().unwrap();
     assert!(
@@ -71,5 +77,46 @@ fn spec_up_once_exits_nonzero_when_the_pass_is_skipped() {
             .args(["--host", "h", "--once"])
             .env("PATH", bin.path())
             .env("XDG_STATE_HOME", tmp.path().join("state")),
+    );
+}
+
+#[test]
+fn catalog_up_once_exits_nonzero_when_a_launch_method_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = empty_pty_path();
+    let agent = tmp.path().join("catalog/agents/h/worker/agent.kdl");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    fs::write(
+        &agent,
+        r#"agent "worker" {
+  host "h"
+  start { argv "fresh" }
+  launch { default "resume" }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("up")
+        .arg("--catalog")
+        .arg(tmp.path().join("catalog"))
+        .args(["--host", "h", "--once"])
+        .env("PATH", bin.path())
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an invalid launch declaration reported success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "agent 'worker' default launch method 'resume' is unavailable and no declared `on-unavailable` method can be selected"
+        ) && stderr.contains("one-shot reconcile pass contained invalid Agent Spec declarations"),
+        "missing launch-method refusal:\n{stderr}"
     );
 }
