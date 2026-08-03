@@ -181,6 +181,29 @@ generated agent PTY and derived sidecar. The tasks use F09, F11, and F12;
 `ding` carries the dependency on the generated agent task described there.
 Compact syntax adds no other behavior.
 
+As an alternative to one legacy top-level `command` or `argv`, an agent may
+declare `start { argv ... }` and/or `resume { argv ... }` plus one
+`launch { default ...; on-unavailable ... }` policy. Each declared method owns
+one complete, non-empty argv; `resume` may additionally preserve one optional,
+non-empty, opaque `session` pin. Method form cannot coexist with a legacy
+compact launch or explicit `pty "agent"`.
+
+Method availability is declaration-level. The renderer owns provider-native
+session resolution and emits only complete methods; core st2 never probes a
+transcript or synthesizes provider flags. st2 selects the default method when
+its block exists, otherwise selects the declared `on-unavailable` method when
+that block exists, otherwise refuses the agent. The selected argv lowers to the
+generated agent PTY; the model preserves both full methods and the selection.
+Omitting `on-unavailable` makes an absent default fail closed.
+
+This is a concrete proposal for the open lifecycle design in
+[st2#124](https://github.com/compoundingtech/st2/issues/124), not a claim that
+the syntax or provider-session boundary is ratified. Legacy compact launches
+lower to the same task launch. A pre-method st2 ignores the new blocks and
+reports a method-only declaration as not runnable, so binary activation must
+precede catalog publication. Full method payloads duplicate shared adapter axes
+and can drift independently.
+
 Authoring: [pinned compact tasks][evals-tasks]. That document and st2 `9887b28`
 predate compact `argv` and `lifecycle`. Current st2 source:
 [KDL fields](../../../crates/agent-spec/src/kdl_format.rs). Evidence:

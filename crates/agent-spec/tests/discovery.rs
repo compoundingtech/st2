@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use agent_spec::spec::{TaskKind, TaskLifecycle};
+use agent_spec::spec::{LaunchMethodName, TaskKind, TaskLifecycle};
 use agent_spec::{AgentSpec, JobType, Resource, Task, discover};
 
 fn write(root: &Path, rel: &str, contents: &str) {
@@ -274,6 +274,232 @@ fn direct_argv_lowers_for_compact_and_explicit_kdl_tasks() {
                 .unwrap()
         ),
         ["printf", "%s", "$CATALOG"]
+    );
+}
+
+#[test]
+fn launch_methods_select_the_declared_default_and_preserve_the_resume_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (identity, default, expected_program) in [
+        ("starts", "start", "start-program"),
+        ("resumes", "resume", "resume-program"),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!(
+                r#"agent "{identity}" {{
+  host "h"
+  start {{ argv "start-program" "--fresh" }}
+  resume {{
+    session "a84bc6f5-4f23-494f-ab89-277e0d6eec87"
+    argv "resume-program" "--continue"
+  }}
+  launch {{ default "{default}"; on-unavailable "start" }}
+}}"#
+            ),
+        );
+
+        let found = discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.tasks.len(), 1);
+        assert_eq!(spec.tasks[0].kind, TaskKind::Pty);
+        assert_eq!(spec.tasks[0].name, "agent");
+        assert_eq!(argv(&spec.tasks[0])[0], expected_program);
+
+        let methods = spec.launch_methods.as_ref().unwrap();
+        assert_eq!(
+            methods.selected,
+            if default == "start" {
+                LaunchMethodName::Start
+            } else {
+                LaunchMethodName::Resume
+            }
+        );
+        assert_eq!(
+            methods
+                .resume
+                .as_ref()
+                .and_then(|method| method.session.as_deref()),
+            Some("a84bc6f5-4f23-494f-ab89-277e0d6eec87")
+        );
+    }
+}
+
+#[test]
+fn unavailable_default_launch_method_selects_the_declared_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/fallback/agent.kdl",
+        r#"agent "fallback" {
+  host "h"
+  start { argv "start-program" "--fresh" }
+  launch { default "resume"; on-unavailable "start" }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = &found.specs[0];
+    assert_eq!(argv(&spec.tasks[0]), ["start-program", "--fresh"]);
+    assert_eq!(
+        spec.launch_methods.as_ref().unwrap().selected,
+        LaunchMethodName::Start
+    );
+}
+
+#[test]
+fn launch_methods_lower_from_toml_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml-method/agent.toml",
+        r#"identity = "toml-method"
+host = "h"
+
+[start]
+argv = ["start-program"]
+
+[launch]
+default = "start"
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json-method/agent.json",
+        r#"{
+  "identity": "json-method",
+  "host": "h",
+  "resume": {
+    "session": "native-session",
+    "argv": ["resume-program"]
+  },
+  "launch": { "default": "resume" }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(
+        argv(&find(&found.specs, "toml-method").tasks[0]),
+        ["start-program"]
+    );
+    let json = find(&found.specs, "json-method");
+    assert_eq!(argv(&json.tasks[0]), ["resume-program"]);
+    assert_eq!(
+        json.launch_methods
+            .as_ref()
+            .unwrap()
+            .resume
+            .as_ref()
+            .unwrap()
+            .session
+            .as_deref(),
+        Some("native-session")
+    );
+}
+
+#[test]
+fn launch_method_cardinality_and_selection_ambiguity_are_rejected() {
+    for (identity, body, diagnostic) in [
+        (
+            "legacy-and-method",
+            r#"argv "legacy"
+  start { argv "start" }
+  launch { default "start" }"#,
+            "declares both a legacy compact launch and explicit launch methods",
+        ),
+        (
+            "duplicate-method-argv",
+            r#"start { argv "one"; argv "two" }
+  launch { default "start" }"#,
+            "`start` method declares `argv` more than once",
+        ),
+        (
+            "missing-policy",
+            r#"start { argv "start" }"#,
+            "declares launch methods without a `launch` selection policy",
+        ),
+        (
+            "policy-without-method",
+            r#"launch { default "start" }"#,
+            "declares `launch` policy without a `start` or `resume` method",
+        ),
+        (
+            "unavailable-without-fallback",
+            r#"start { argv "start" }
+  launch { default "resume" }"#,
+            "default launch method 'resume' is unavailable",
+        ),
+        (
+            "method-and-agent-pty",
+            r#"start { argv "start" }
+  launch { default "start" }
+  pty "agent" { argv "nested" }"#,
+            "declares both a compact launch and `pty \"agent\"`",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; {body} }}"),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{identity}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{identity}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(diagnostic),
+            "{identity}: {}",
+            found.errors[0].message
+        );
+    }
+}
+
+#[test]
+fn legacy_single_argv_form_is_unchanged_by_launch_methods() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/legacy/agent.kdl",
+        r#"agent "legacy" {
+  host "h"
+  argv "axe" "agent" "launch" "--harness" "claude"
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = &found.specs[0];
+    assert!(spec.launch_methods.is_none());
+    assert_eq!(
+        argv(&spec.tasks[0]),
+        ["axe", "agent", "launch", "--harness", "claude"]
+    );
+}
+
+#[test]
+fn malformed_launch_method_is_rejected_with_a_specific_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/broken/agent.kdl",
+        r#"agent "broken" {
+  host "h"
+  start { argv "start-program" }
+  resume { session "a84bc6f5-4f23-494f-ab89-277e0d6eec87" }
+  launch { default "resume"; on-unavailable "start" }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty());
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert_eq!(
+        found.errors[0].message,
+        "agent 'broken' resume method must declare exactly one non-empty `argv`"
     );
 }
 

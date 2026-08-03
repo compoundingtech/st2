@@ -9,7 +9,10 @@
 
 use kdl::{KdlDocument, KdlNode};
 
-use crate::spec::{RawResource, RawRestart, RawSpec, RawTask};
+use crate::spec::{
+    RawLaunchPolicy, RawResource, RawRestart, RawResumeLaunchMethod, RawSpec, RawStartLaunchMethod,
+    RawTask,
+};
 
 /// Parse a KDL document into zero or more raw specs (one per top-level `agent` node).
 pub(crate) fn parse_kdl(text: &str) -> anyhow::Result<Vec<RawSpec>> {
@@ -93,6 +96,24 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
             }
             "command" => raw.command = arg_string(child),
             "argv" => raw.argv = Some(argv(child)?),
+            "start" => {
+                anyhow::ensure!(raw.start.is_none(), "agent declares `start` more than once");
+                raw.start = Some(start_node_to_raw(child)?);
+            }
+            "resume" => {
+                anyhow::ensure!(
+                    raw.resume.is_none(),
+                    "agent declares `resume` more than once"
+                );
+                raw.resume = Some(resume_node_to_raw(child)?);
+            }
+            "launch" => {
+                anyhow::ensure!(
+                    raw.launch.is_none(),
+                    "agent declares `launch` more than once"
+                );
+                raw.launch = Some(launch_node_to_raw(child)?);
+            }
             "ding" => raw.ding = true,
             "env" => {}
             "pty" => {
@@ -116,6 +137,107 @@ fn agent_node_to_raw(node: &KdlNode) -> anyhow::Result<RawSpec> {
         );
     }
     Ok(raw)
+}
+
+fn start_node_to_raw(node: &KdlNode) -> anyhow::Result<RawStartLaunchMethod> {
+    ensure_block_without_entries(node, "start")?;
+    let mut method = RawStartLaunchMethod::default();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            match child.name().value() {
+                "argv" => parse_method_argv(child, "start", &mut method.argv)?,
+                other => anyhow::bail!("agent `start` method has unsupported field `{other}`"),
+            }
+        }
+    }
+    Ok(method)
+}
+
+fn resume_node_to_raw(node: &KdlNode) -> anyhow::Result<RawResumeLaunchMethod> {
+    ensure_block_without_entries(node, "resume")?;
+    let mut method = RawResumeLaunchMethod::default();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            match child.name().value() {
+                "session" => {
+                    anyhow::ensure!(
+                        method.session.is_none(),
+                        "agent `resume` method declares `session` more than once"
+                    );
+                    method.session = Some(exactly_one_string(child, "resume `session`")?);
+                }
+                "argv" => parse_method_argv(child, "resume", &mut method.argv)?,
+                other => anyhow::bail!("agent `resume` method has unsupported field `{other}`"),
+            }
+        }
+    }
+    Ok(method)
+}
+
+fn launch_node_to_raw(node: &KdlNode) -> anyhow::Result<RawLaunchPolicy> {
+    ensure_block_without_entries(node, "launch")?;
+    let mut policy = RawLaunchPolicy::default();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            match child.name().value() {
+                "default" => {
+                    anyhow::ensure!(
+                        policy.default.is_none(),
+                        "agent `launch` policy declares `default` more than once"
+                    );
+                    policy.default = Some(exactly_one_string(child, "launch `default`")?);
+                }
+                "on-unavailable" => {
+                    anyhow::ensure!(
+                        policy.on_unavailable.is_none(),
+                        "agent `launch` policy declares `on-unavailable` more than once"
+                    );
+                    policy.on_unavailable =
+                        Some(exactly_one_string(child, "launch `on-unavailable`")?);
+                }
+                other => anyhow::bail!("agent `launch` policy has unsupported field `{other}`"),
+            }
+        }
+    }
+    Ok(policy)
+}
+
+fn ensure_block_without_entries(node: &KdlNode, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        node.entries().is_empty(),
+        "agent `{name}` must be a block without positional arguments or properties"
+    );
+    Ok(())
+}
+
+fn parse_method_argv(
+    node: &KdlNode,
+    method: &str,
+    destination: &mut Option<Vec<String>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        destination.is_none(),
+        "agent `{method}` method declares `argv` more than once"
+    );
+    anyhow::ensure!(
+        node.children().is_none() && node.entries().iter().all(|entry| entry.name().is_none()),
+        "agent `{method}` method `argv` accepts only positional string arguments"
+    );
+    *destination = Some(argv(node)?);
+    Ok(())
+}
+
+fn exactly_one_string(node: &KdlNode, field: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        node.children().is_none()
+            && node.entries().len() == 1
+            && node.entries()[0].name().is_none(),
+        "agent {field} must contain exactly one positional string"
+    );
+    node.get(0)
+        .and_then(|value| value.as_string())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("agent {field} must contain a string"))
 }
 
 fn parse_presentation(

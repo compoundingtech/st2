@@ -28,6 +28,6 @@ pub use discovery::{
     Declared, Discovered, SpecError, discover, is_catalog_path, parse_declared, path_defaults,
 };
 pub use spec::{
-    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
-    parse_duration,
+    AgentLaunchMethods, AgentSpec, JobType, LaunchMethodName, Resource, Restart, RestartMode,
+    ResumeLaunchMethod, StartLaunchMethod, Task, TaskKind, TaskLifecycle, parse_duration,
 };

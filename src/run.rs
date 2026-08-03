@@ -2079,6 +2079,7 @@ mod tests {
             keep: false,
             restart: None,
             resources: vec![],
+            launch_methods: None,
             tasks: vec![Task {
                 kind: TaskKind::Pty,
                 derived: false,
@@ -2171,6 +2172,7 @@ mod tests {
             keep: false,
             restart: None,
             resources: vec![],
+            launch_methods: None,
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }

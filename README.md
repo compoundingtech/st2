@@ -171,6 +171,42 @@ agent "<identity>" {
 }
 ```
 
+The explicit lifecycle form preserves separate, complete start and resume payloads and selects one
+before lowering the generated agent PTY:
+
+```kdl
+agent "<identity>" {
+  host "<host>"
+  workspace "<workspace>"
+
+  start {
+    argv "axe" "agent" "launch" "--harness" "claude" "<fresh axes>"
+  }
+
+  resume {
+    // Optional: pin one exact prior provider-native session. Without it, the rendered adapter
+    // continues the session already associated with this seat.
+    session "a84bc6f5-4f23-494f-ab89-277e0d6eec87"
+    argv "axe" "agent" "launch" "--harness" "claude" "<resume axes>"
+  }
+
+  launch { default "resume"; on-unavailable "start" }
+}
+```
+
+At this normalized boundary a method is available when its complete block is declared. The renderer
+owns provider-native session discovery and may omit `resume` when it cannot render that method; st2
+does not inspect transcripts or synthesize provider flags. st2 selects the declared `default`, or
+the declared `on-unavailable` method when the default block is absent, and otherwise rejects the
+agent. Omitting `on-unavailable` therefore makes an unavailable default fail closed. Every declared
+method contains exactly one non-empty `argv`; method form cannot be mixed with top-level
+`command`/`argv` or `pty "agent"`.
+
+The legacy top-level `command`/`argv` form remains unchanged. Conversely, st2 versions predating
+explicit methods ignore these blocks and report a method-only agent as `not-runnable`; activate a
+compatible binary before publishing this form. The two full payloads deliberately duplicate adapter
+axes, so authors must keep shared model, effort, persona, mode, and boot-contract changes aligned.
+
 For a zero-interruption migration, add `lifecycle "adopt-only"` to the compact
 agent or to an explicit `pty`/`exec` task. st2 adopts that task when its current
 generation is alive. If the generation is dead or absent, st2 reports the task

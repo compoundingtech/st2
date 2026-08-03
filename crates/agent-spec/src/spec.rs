@@ -53,6 +53,9 @@ pub struct AgentSpec {
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
+    /// Optional explicit start/resume methods and the policy-selected method. Legacy compact
+    /// `command`/`argv` declarations leave this unset.
+    pub launch_methods: Option<AgentLaunchMethods>,
     /// The runnable tasks (`pty` + `exec`), sorted by name for determinism.
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
@@ -73,6 +76,64 @@ pub struct Resource {
     relation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+/// The closed set of lifecycle launch methods understood by the normalized Agent Spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMethodName {
+    Start,
+    Resume,
+}
+
+impl LaunchMethodName {
+    fn parse(identity: &str, field: &str, value: &str) -> anyhow::Result<Self> {
+        match value {
+            "start" => Ok(Self::Start),
+            "resume" => Ok(Self::Resume),
+            other => anyhow::bail!(
+                "agent '{identity}' launch `{field}` names unknown method '{other}'; expected 'start' or 'resume'"
+            ),
+        }
+    }
+}
+
+/// A complete fresh-start launch payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartLaunchMethod {
+    pub argv: Vec<String>,
+}
+
+/// A complete resume launch payload plus an optional exact provider-native session pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeLaunchMethod {
+    pub session: Option<String>,
+    pub argv: Vec<String>,
+}
+
+/// Explicit method selection for one generated agent task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLaunchMethods {
+    pub start: Option<StartLaunchMethod>,
+    pub resume: Option<ResumeLaunchMethod>,
+    pub default: LaunchMethodName,
+    pub on_unavailable: Option<LaunchMethodName>,
+    pub selected: LaunchMethodName,
+}
+
+impl AgentLaunchMethods {
+    fn has_method(&self, method: LaunchMethodName) -> bool {
+        match method {
+            LaunchMethodName::Start => self.start.is_some(),
+            LaunchMethodName::Resume => self.resume.is_some(),
+        }
+    }
+
+    fn selected_argv(&self) -> &[String] {
+        match self.selected {
+            LaunchMethodName::Start => &self.start.as_ref().expect("selected start exists").argv,
+            LaunchMethodName::Resume => &self.resume.as_ref().expect("selected resume exists").argv,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -356,6 +417,12 @@ pub(crate) struct RawSpec {
     pub ding: bool,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
     pub lifecycle: Option<String>,
+    /// Explicit fresh-start payload. Mutually exclusive with legacy compact `command`/`argv`.
+    pub start: Option<RawStartLaunchMethod>,
+    /// Explicit resume payload. Mutually exclusive with legacy compact `command`/`argv`.
+    pub resume: Option<RawResumeLaunchMethod>,
+    /// Selection policy for explicit launch methods.
+    pub launch: Option<RawLaunchPolicy>,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
     #[serde(default)]
     pub pty: BTreeMap<String, RawTask>,
@@ -390,6 +457,27 @@ pub(crate) struct RawTask {
     #[serde(default)]
     pub keep: bool,
     pub lifecycle: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawStartLaunchMethod {
+    pub(crate) argv: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawResumeLaunchMethod {
+    pub(crate) session: Option<String>,
+    pub(crate) argv: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawLaunchPolicy {
+    pub(crate) default: Option<String>,
+    #[serde(rename = "on-unavailable")]
+    pub(crate) on_unavailable: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -692,6 +780,105 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
     Ok(())
 }
 
+fn lower_launch_methods(
+    identity: &str,
+    start: Option<RawStartLaunchMethod>,
+    resume: Option<RawResumeLaunchMethod>,
+    policy: Option<RawLaunchPolicy>,
+) -> anyhow::Result<Option<AgentLaunchMethods>> {
+    if start.is_none() && resume.is_none() {
+        anyhow::ensure!(
+            policy.is_none(),
+            "agent '{identity}' declares `launch` policy without a `start` or `resume` method"
+        );
+        return Ok(None);
+    }
+
+    let policy = policy.ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent '{identity}' declares launch methods without a `launch` selection policy"
+        )
+    })?;
+    let start = start
+        .map(|method| -> anyhow::Result<StartLaunchMethod> {
+            let argv = method.argv.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent '{identity}' start method must declare exactly one non-empty `argv`"
+                )
+            })?;
+            validate_method_argv(identity, LaunchMethodName::Start, &argv)?;
+            Ok(StartLaunchMethod { argv })
+        })
+        .transpose()?;
+    let resume = resume
+        .map(|method| -> anyhow::Result<ResumeLaunchMethod> {
+            if method.session.as_ref().is_some_and(String::is_empty) {
+                anyhow::bail!("agent '{identity}' resume method declares an empty `session`");
+            }
+            let argv = method.argv.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent '{identity}' resume method must declare exactly one non-empty `argv`"
+                )
+            })?;
+            validate_method_argv(identity, LaunchMethodName::Resume, &argv)?;
+            Ok(ResumeLaunchMethod {
+                session: method.session,
+                argv,
+            })
+        })
+        .transpose()?;
+    let default = policy.default.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("agent '{identity}' launch policy must declare exactly one `default`")
+    })?;
+    let default = LaunchMethodName::parse(identity, "default", default)?;
+    let on_unavailable = policy
+        .on_unavailable
+        .as_deref()
+        .map(|value| LaunchMethodName::parse(identity, "on-unavailable", value))
+        .transpose()?;
+
+    let mut methods = AgentLaunchMethods {
+        start,
+        resume,
+        default,
+        on_unavailable,
+        selected: default,
+    };
+    methods.selected = if methods.has_method(default) {
+        default
+    } else if let Some(fallback) = on_unavailable
+        && methods.has_method(fallback)
+    {
+        fallback
+    } else {
+        let unavailable = match default {
+            LaunchMethodName::Start => "start",
+            LaunchMethodName::Resume => "resume",
+        };
+        anyhow::bail!(
+            "agent '{identity}' default launch method '{unavailable}' is unavailable and no declared `on-unavailable` method can be selected"
+        );
+    };
+
+    Ok(Some(methods))
+}
+
+fn validate_method_argv(
+    identity: &str,
+    method: LaunchMethodName,
+    argv: &[String],
+) -> anyhow::Result<()> {
+    let method = match method {
+        LaunchMethodName::Start => "start",
+        LaunchMethodName::Resume => "resume",
+    };
+    anyhow::ensure!(
+        !argv.is_empty() && argv.first().is_some_and(|program| !program.is_empty()),
+        "agent '{identity}' {method} method must declare exactly one non-empty `argv`"
+    );
+    Ok(())
+}
+
 impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity, a
     /// `type`, or task blocks. Random TOML/JSON in the tree has none of these and is skipped.
@@ -700,6 +887,9 @@ impl RawSpec {
             || self.job_type.is_some()
             || self.command.is_some()
             || self.argv.is_some()
+            || self.start.is_some()
+            || self.resume.is_some()
+            || self.launch.is_some()
             || self.ding
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
@@ -725,7 +915,14 @@ impl RawSpec {
             self.argv.as_ref(),
             "compact task",
         )?;
-        if (self.command.is_some() || self.argv.is_some()) && self.pty.contains_key("agent") {
+        let launch_methods = lower_launch_methods(&identity, self.start, self.resume, self.launch)?;
+        let legacy_launch = self.command.is_some() || self.argv.is_some();
+        anyhow::ensure!(
+            !(legacy_launch && launch_methods.is_some()),
+            "agent '{identity}' declares both a legacy compact launch and explicit launch methods; choose one form"
+        );
+        let compact_launch = legacy_launch || launch_methods.is_some();
+        if compact_launch && self.pty.contains_key("agent") {
             anyhow::bail!(
                 "agent '{identity}' declares both a compact launch and `pty \"agent\"`; choose one form"
             );
@@ -740,7 +937,7 @@ impl RawSpec {
         for (name, t) in self.exec {
             tasks.push(t.lower(&identity, TaskKind::Exec, name, &self.env)?);
         }
-        if self.command.is_some() || self.argv.is_some() {
+        if compact_launch {
             let lifecycle =
                 parse_task_lifecycle(&identity, "compact task", self.lifecycle.as_deref())?;
             let mut tags = BTreeMap::new();
@@ -752,7 +949,11 @@ impl RawSpec {
                 // An agent IS its pty: ding defaults its poke target to this same bus id.
                 id: Some(bus_id.clone()),
                 command: self.command,
-                argv: self.argv,
+                argv: self.argv.or_else(|| {
+                    launch_methods
+                        .as_ref()
+                        .map(|methods| methods.selected_argv().to_vec())
+                }),
                 cwd: None,
                 tags,
                 env: self.env.clone(),
@@ -794,6 +995,7 @@ impl RawSpec {
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             resources,
+            launch_methods,
             tasks,
             path,
         })

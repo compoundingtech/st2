@@ -452,6 +452,16 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   manual PTY restart under a different ambient environment reconstructs the
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
+
+  A compact agent has one unambiguous launch form. The legacy form declares
+  exactly one top-level `command` or `argv`. The explicit lifecycle form
+  declares one complete argv for each present `start`/`resume` method and a
+  `launch` policy that selects exactly one present method: the declared default,
+  then an optional declared `on-unavailable` fallback. Method presence is the
+  provider-neutral availability boundary; renderers own provider-session
+  resolution. st2 preserves the complete methods but passes only the selected
+  argv to the launcher. Mixing lifecycle methods with legacy compact launch or
+  explicit `pty "agent"` is invalid.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both

@@ -9,3 +9,6 @@
 
 # Local scratch note.
 .ding-bus-quoting-note.md
+
+# Agent work state and task-local scratch.
+/tmp/

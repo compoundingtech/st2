@@ -50,6 +50,47 @@ fn compact_agent_catalog_is_clean() {
 }
 
 #[test]
+fn explicit_launch_method_catalog_is_clean() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  start { argv "axe" "agent" "launch" "--fresh" }
+  resume { argv "axe" "agent" "launch" "--resume" }
+  launch { default "resume"; on-unavailable "start" }
+}"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
+    assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
+}
+
+#[test]
+fn malformed_launch_method_is_a_specific_parse_error() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  start { argv "axe" "agent" "launch" "--fresh" }
+  resume { session "native-session" }
+  launch { default "resume"; on-unavailable "start" }
+}"#,
+    )]);
+    let report = validate(c.path());
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "parse-error")
+        .expect("malformed method must be a parse error");
+    assert_eq!(issue.severity, Severity::Error);
+    assert!(
+        issue
+            .message
+            .contains("resume method must declare exactly one non-empty `argv`")
+    );
+}
+
+#[test]
 fn opaque_resource_bindings_are_structurally_valid() {
     let c = catalog(&[(
         "Silber/cos/agent.kdl",

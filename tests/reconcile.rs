@@ -386,6 +386,7 @@ fn spec(
         keep: false,
         restart: None,
         resources: Vec::new(),
+        launch_methods: None,
         tasks,
         path: PathBuf::from(format!(
             "/cat/agents/{}/{identity}/agent.kdl",
