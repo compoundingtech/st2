@@ -3,7 +3,8 @@
 //! A job reads like a Nomad job: the *agent* is the job, its **tasks** are `pty{}` (interactive —
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
-//! `identity`, `host`, `role` (metadata only), `type`, `workspace`, `retired`, `keep`, `supervisor`,
+//! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
+//! `workspace`, `retired`, `keep`, `supervisor`,
 //! `restart{}`, task lifecycle, Resource bindings (declaration metadata), and the tasks. Everything render-only
 //! (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta{}`) is baked into
 //! the tasks/commands by the render layer and ignored here.
@@ -19,11 +20,20 @@ use std::time::Duration;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+/// Maximum Unicode scalar count for an agent's human-facing label.
+pub const AGENT_NAME_MAX_CHARS: usize = 160;
+/// Maximum Unicode scalar count for an agent's enduring responsibility description.
+pub const AGENT_DESCRIPTION_MAX_CHARS: usize = 1_000;
+
 /// A rendered agent job, lowered to the shared declaration fields st2 and other readers inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
     /// Unique id; the bus id is `<host>.<identity>`.
     pub identity: String,
+    /// Optional mutable human-facing label. Never used as an automation selector.
+    pub name: Option<String>,
+    /// Optional enduring responsibility boundary. Never used for lifecycle decisions.
+    pub description: Option<String>,
     /// Which machine runs this agent. `None` → resolved to the path's host / this machine.
     pub host: Option<String>,
     /// Optional declared persona role. Preserved as metadata and ignored for execution.
@@ -264,6 +274,8 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RawSpec {
     pub identity: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
     pub host: Option<String>,
     pub role: Option<String>,
     #[serde(rename = "type")]
@@ -600,6 +612,12 @@ impl RawSpec {
         host: Option<String>,
         path: PathBuf,
     ) -> anyhow::Result<AgentSpec> {
+        validate_presentation("name", self.name.as_deref(), AGENT_NAME_MAX_CHARS)?;
+        validate_presentation(
+            "description",
+            self.description.as_deref(),
+            AGENT_DESCRIPTION_MAX_CHARS,
+        )?;
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -664,6 +682,8 @@ impl RawSpec {
 
         Ok(AgentSpec {
             identity,
+            name: self.name,
+            description: self.description,
             host,
             role: self.role,
             job_type,
@@ -677,6 +697,36 @@ impl RawSpec {
             path,
         })
     }
+}
+
+/// Validate one optional presentation field at the shared parse/authoring boundary.
+pub fn validate_presentation(
+    field: &str,
+    value: Option<&str>,
+    max_chars: usize,
+) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !value.is_empty(),
+        "agent presentation `{field}` cannot be empty; omit it to clear it"
+    );
+    anyhow::ensure!(
+        value.trim() == value,
+        "agent presentation `{field}` cannot begin or end with whitespace"
+    );
+    anyhow::ensure!(
+        !value.chars().any(|character| {
+            character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+        }),
+        "agent presentation `{field}` must be one printable line without control characters or Unicode line separators"
+    );
+    anyhow::ensure!(
+        value.chars().count() <= max_chars,
+        "agent presentation `{field}` exceeds the {max_chars}-character limit"
+    );
+    Ok(())
 }
 
 impl RawTask {

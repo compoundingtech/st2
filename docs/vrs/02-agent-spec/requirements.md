@@ -13,7 +13,8 @@ the Agent Spec. General field-change behavior that the canonical specification
 does not yet define is proposed until a matching evals specification and proof
 change adopts it.
 
-This work supports root [R01, R06, R11, and R13 through R19](../requirements.md).
+This work supports root [R01, R06, R11, R13 through R19, and R24 through
+R26](../requirements.md).
 It applies to every st2 tool that runs an agent or test. A valid local catalog
 and host-local runtime state are sufficient. It requires no compare-and-swap
 (CAS), lock service, cross-host call, or external registry.
@@ -27,7 +28,7 @@ Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
 [F06](./spec.md#f06), [F07](./spec.md#f07), [F08](./spec.md#f08),
 [F09](./spec.md#f09), [F10](./spec.md#f10), [F11](./spec.md#f11),
 [F12](./spec.md#f12), [F13](./spec.md#f13), [F14](./spec.md#f14),
-[F15](./spec.md#f15), and [F16](./spec.md#f16).
+[F15](./spec.md#f15), [F16](./spec.md#f16), and [F17](./spec.md#f17).
 
 ## Shared invariants
 
@@ -59,6 +60,8 @@ Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
   inputs form a versioned launch fingerprint. A healthy fingerprint mismatch is
   visible as `drifted` or `unknown`, but it does not authorize replacement.
   Unrelated work receives no action.
+  Presentation changes use exact-ID metadata projection only; they do not alter
+  launch fingerprints or authorize lifecycle work.
 
 - **SPEC-R04 Change membership and lifecycle only for exact IDs.** Add only a
   missing ID. Remove only an exactly attributed old ID. Retirement stops the

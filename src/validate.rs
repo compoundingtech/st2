@@ -263,9 +263,17 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             ));
         }
 
-        // Path fields must be absolute or $CATALOG-rooted, and must exist.
+        // Path fields must be absolute, $CATALOG-rooted, or the one canonical relative workspace.
         for (field, raw) in path_fields(s) {
-            if let Some(issue) = check_path(root, &rp, &ag, &field, &raw, runs_on_selected_host) {
+            if let Some(issue) = check_path(
+                root,
+                s.path.parent().unwrap_or(root),
+                &rp,
+                &ag,
+                &field,
+                &raw,
+                runs_on_selected_host,
+            ) {
                 issues.push(issue);
             }
         }
@@ -339,36 +347,31 @@ fn path_fields(s: &AgentSpec) -> Vec<(String, String)> {
     v
 }
 
-/// Check one path field: `$CATALOG` expands to the catalog root; a path bearing any *other* `$VAR` is
-/// skipped (an unset var is a literal token — do not guess). What remains must be absolute (R11:
-/// final-spec paths are absolute or $CATALOG-rooted, never relative). Catalog-owned paths must
-/// always exist; external paths are checked only for an agent assigned to the selected host.
+/// Check one path field through the shared launch-equivalent resolver. Absolute paths remain valid;
+/// a relative path must normalize to the declaring bundle's `.workspace`, and an unresolved
+/// variable fails closed. Catalog-owned paths must always exist; external paths are checked only
+/// for an agent assigned to the selected host.
 fn check_path(
     root: &Path,
+    spec_dir: &Path,
     rp: &str,
     ag: &Option<String>,
     field: &str,
     raw: &str,
     check_external_presence: bool,
 ) -> Option<Issue> {
-    let root_s = root.to_string_lossy();
-    let expanded = raw
-        .replace("${CATALOG}", &root_s)
-        .replace("$CATALOG", &root_s);
-    if expanded.contains('$') {
-        return None; // another variable — cannot resolve without runtime env; do not guess
-    }
-    let p = Path::new(&expanded);
-    if !p.is_absolute() {
-        return Some(Issue::error(
-            "bad-path",
-            rp.to_string(),
-            ag.clone(),
-            format!(
-                "{field} '{raw}' is relative (final-spec paths must be absolute or $CATALOG-rooted)"
-            ),
-        ));
-    }
+    let resolved = match crate::expand::resolve_spec_path(raw, root, spec_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            return Some(Issue::error(
+                "bad-path",
+                rp.to_string(),
+                ag.clone(),
+                format!("{field} '{raw}' is invalid: {error}"),
+            ));
+        }
+    };
+    let p = &resolved;
     if !p.exists() {
         // A **catalog-rooted** path is the renderer's own output — its absence is a real render bug
         // (ERROR). An **external** absolute path is checked only for the selected run host; its

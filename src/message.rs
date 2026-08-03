@@ -12,14 +12,15 @@
 //! the catalog for VRS-native, or `$ST_ROOT` for a compat shim).
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
-use std::fs;
-use std::io::{Read, Write as _};
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
+use anyhow::Context as _;
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
 /// a strict subset of what the reader accepts: the frozen bus grammar is `[0-9a-z]{6}`, so a peer
@@ -44,30 +45,16 @@ pub struct Message {
     pub tags: Vec<String>,
     /// `priority:` — `low` | `normal` | `high`, if set.
     pub priority: Option<String>,
-    /// `source:` — the optional external producer identity for idempotent ingress.
-    pub source: Option<String>,
-    /// `event-id:` — the producer's optional stable event identity.
-    pub event_id: Option<String>,
-    /// `receipt-id:` — the stable message filename for idempotent ingress.
-    pub receipt_id: Option<String>,
+    /// `idempotency-key:` — the optional sender key for local retry deduplication.
+    pub idempotency_key: Option<String>,
     /// The markdown body.
     pub body: String,
 }
 
-/// The stable result of one idempotent message ingress attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SendReceipt {
-    /// The first message filename allocated for this recipient and event key.
-    pub filename: String,
-    /// True only for the attempt that published the durable event claim.
-    pub created: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IngressSeam {
-    BeforeClaimPublication,
-    AfterClaimPublication,
-    BeforeInboxLink,
+enum IdempotentSendSeam {
+    BeforePublication,
+    AfterPublication,
 }
 
 /// Current unix time in milliseconds.
@@ -131,44 +118,21 @@ pub fn render_message(
     tags: &[String],
     body: &str,
 ) -> String {
-    render_message_fields(
-        from,
-        subject,
-        in_reply_to,
-        tags,
-        body,
-        None,
-        None,
-        None,
-        None,
-    )
+    render_message_fields(from, subject, in_reply_to, tags, body, None)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_message_fields(
     from: &str,
     subject: Option<&str>,
     in_reply_to: Option<&str>,
     tags: &[String],
     body: &str,
-    source: Option<&str>,
-    event_id: Option<&str>,
-    receipt_id: Option<&str>,
-    claim_digest: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("from: {from}\n"));
-    if let Some(source) = source {
-        s.push_str(&format!("source: {source}\n"));
-    }
-    if let Some(event_id) = event_id {
-        s.push_str(&format!("event-id: {event_id}\n"));
-    }
-    if let Some(receipt_id) = receipt_id {
-        s.push_str(&format!("receipt-id: {receipt_id}\n"));
-    }
-    if let Some(claim_digest) = claim_digest {
-        s.push_str(&format!("claim-digest: {claim_digest}\n"));
+    if let Some(key) = idempotency_key {
+        s.push_str(&format!("idempotency-key: {key}\n"));
     }
     if let Some(subj) = subject {
         s.push_str(&format!("subject: {subj}\n"));
@@ -202,9 +166,7 @@ fn parse_message(filename: &str, contents: &str) -> Message {
         in_reply_to: None,
         tags: Vec::new(),
         priority: None,
-        source: None,
-        event_id: None,
-        receipt_id: None,
+        idempotency_key: None,
         body: String::new(),
     };
 
@@ -236,9 +198,7 @@ fn parse_message(filename: &str, contents: &str) -> Message {
                         .collect()
                 }
                 "priority" => msg.priority = Some(v.to_string()),
-                "source" => msg.source = Some(v.to_string()),
-                "event-id" => msg.event_id = Some(v.to_string()),
-                "receipt-id" => msg.receipt_id = Some(v.to_string()),
+                "idempotency-key" => msg.idempotency_key = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -266,36 +226,14 @@ pub fn send_to_inbox(
 ) -> anyhow::Result<String> {
     fs::create_dir_all(inbox_dir)?;
     let contents = render_message(from, subject, in_reply_to, tags, body);
-    // This deliberately cannot match `is_message_filename`, so a concurrent scan ignores it.
-    let tmp = inbox_dir.join(tmp_name());
-    if let Err(error) = fs::write(&tmp, &contents) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    for _ in 0..8 {
-        let filename = new_filename();
-        let path = inbox_dir.join(&filename);
-        if !path.exists() {
-            if let Err(error) = fs::rename(&tmp, &path) {
-                let _ = fs::remove_file(&tmp);
-                return Err(error.into());
-            }
-            return Ok(filename);
-        }
-    }
-    let _ = fs::remove_file(&tmp);
-    anyhow::bail!(
-        "could not allocate a unique message filename in {}",
-        inbox_dir.display()
-    )
+    publish_message_with_seam(inbox_dir, &contents, |_| Ok(()))
 }
 
-/// Send one external event to an inbox exactly once on this local recipient filesystem.
+/// Send one normal message with a local idempotency key.
 ///
-/// The durable claim is scoped to `inbox_dir` and `(source, event_id)`. It is not a global
-/// exactly-once claim across replicated catalogs. The first complete claim owns the message bytes
-/// and filename. A retry repairs a missing inbox link from that claim, or returns the same filename
-/// when the message is already in the inbox or archive.
+/// While the short local lock is held, st2 searches the recipient inbox first and archive second.
+/// A retry returns the first matching normal message. If that message is deleted, st2 forgets the
+/// key and a later send creates a new message.
 #[allow(clippy::too_many_arguments)]
 pub fn send_idempotent_to_inbox(
     inbox_dir: &Path,
@@ -304,9 +242,8 @@ pub fn send_idempotent_to_inbox(
     in_reply_to: Option<&str>,
     tags: &[String],
     body: &str,
-    source: &str,
-    event_id: &str,
-) -> anyhow::Result<SendReceipt> {
+    idempotency_key: &str,
+) -> anyhow::Result<String> {
     send_idempotent_to_inbox_with_seam(
         inbox_dir,
         from,
@@ -314,8 +251,7 @@ pub fn send_idempotent_to_inbox(
         in_reply_to,
         tags,
         body,
-        source,
-        event_id,
+        idempotency_key,
         |_| Ok(()),
     )
 }
@@ -328,257 +264,118 @@ fn send_idempotent_to_inbox_with_seam(
     in_reply_to: Option<&str>,
     tags: &[String],
     body: &str,
-    source: &str,
-    event_id: &str,
-    mut seam: impl FnMut(IngressSeam) -> anyhow::Result<()>,
-) -> anyhow::Result<SendReceipt> {
-    validate_ingress_value("source", source)?;
-    validate_ingress_value("event-id", event_id)?;
-
+    idempotency_key: &str,
+    seam: impl FnMut(IdempotentSendSeam) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    validate_idempotency_key(idempotency_key)?;
     fs::create_dir_all(inbox_dir)?;
-    let receipts_dir = message_receipts_dir(inbox_dir);
-    ensure_plain_directory(&receipts_dir)?;
-    let claim_path = receipts_dir.join(format!("{}.receipt", ingress_key(source, event_id)));
+    let _lock = MessageIdempotencyLock::acquire(inbox_dir)?;
 
-    if claim_path.exists() {
-        let filename = validate_claim(&claim_path, source, event_id)?;
-        seam(IngressSeam::BeforeInboxLink)?;
-        ensure_inbox_link(inbox_dir, &claim_path, &filename)?;
-        return Ok(SendReceipt {
-            filename,
-            created: false,
-        });
+    if let Some(filename) = find_idempotent_message(inbox_dir, idempotency_key)? {
+        return Ok(filename);
     }
 
-    let filename = allocate_receipt_filename(inbox_dir)?;
-    let unsigned = render_message_fields(
-        from,
-        subject,
-        in_reply_to,
-        tags,
-        body,
-        Some(source),
-        Some(event_id),
-        Some(&filename),
-        None,
-    );
-    let claim_digest = sha256_hex(unsigned.as_bytes());
     let contents = render_message_fields(
         from,
         subject,
         in_reply_to,
         tags,
         body,
-        Some(source),
-        Some(event_id),
-        Some(&filename),
-        Some(&claim_digest),
+        Some(idempotency_key),
     );
-    let temporary = receipts_dir.join(claim_tmp_name());
-    write_synced_new(&temporary, &contents)?;
-    seam(IngressSeam::BeforeClaimPublication)?;
-
-    let created = match fs::hard_link(&temporary, &claim_path) {
-        Ok(()) => {
-            sync_directory(&receipts_dir)?;
-            true
-        }
-        Err(_) if claim_path.exists() => false,
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(anyhow::anyhow!(
-                "publishing message ingress claim {}: {error}",
-                claim_path.display()
-            ));
-        }
-    };
-    seam(IngressSeam::AfterClaimPublication)?;
-    remove_temporary(&temporary)?;
-
-    let filename = validate_claim(&claim_path, source, event_id)?;
-    seam(IngressSeam::BeforeInboxLink)?;
-    ensure_inbox_link(inbox_dir, &claim_path, &filename)?;
-    Ok(SendReceipt { filename, created })
+    publish_message_with_seam(inbox_dir, &contents, seam)
 }
 
-fn validate_ingress_value(field: &str, value: &str) -> anyhow::Result<()> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        anyhow::bail!("message ingress {field} must be non-empty single-line text");
-    }
+fn validate_idempotency_key(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control),
+        "message idempotency key must be non-empty single-line text without surrounding whitespace"
+    );
     Ok(())
 }
 
-fn message_receipts_dir(inbox_dir: &Path) -> PathBuf {
-    inbox_dir
-        .parent()
-        .unwrap_or(inbox_dir)
-        .join("message-receipts")
+fn find_idempotent_message(inbox_dir: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    for message in list_dir(inbox_dir)? {
+        if message.idempotency_key.as_deref() == Some(key) {
+            return Ok(Some(message.filename));
+        }
+    }
+    for message in list_dir(&sibling_archive_dir(inbox_dir))? {
+        if message.idempotency_key.as_deref() == Some(key) {
+            return Ok(Some(message.filename));
+        }
+    }
+    Ok(None)
 }
 
-fn ensure_plain_directory(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!(
-            "message receipt path is not a plain directory: {}",
+const IDEMPOTENCY_LOCK_FILE: &str = ".message-idempotency.lock";
+
+struct MessageIdempotencyLock {
+    file: File,
+}
+
+impl MessageIdempotencyLock {
+    fn acquire(inbox_dir: &Path) -> anyhow::Result<Self> {
+        let path = inbox_dir.join(IDEMPOTENCY_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("open message idempotency lock {}", path.display()))?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "message idempotency lock is not a regular file: {}",
             path.display()
         );
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("lock message idempotency file {}", path.display()));
+        }
+        Ok(Self { file })
     }
-    Ok(())
 }
 
-fn ingress_key(source: &str, event_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    for value in [source, event_id] {
-        hasher.update((value.len() as u64).to_be_bytes());
-        hasher.update(value.as_bytes());
+impl Drop for MessageIdempotencyLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
-    hex_digest(hasher.finalize())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex_digest(Sha256::digest(bytes))
-}
-
-fn hex_digest(digest: impl AsRef<[u8]>) -> String {
-    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
-    for byte in digest.as_ref() {
-        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+fn publish_message_with_seam(
+    inbox_dir: &Path,
+    contents: &str,
+    mut seam: impl FnMut(IdempotentSendSeam) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    // This deliberately cannot match `is_message_filename`, so a concurrent scan ignores it.
+    let tmp = inbox_dir.join(tmp_name());
+    if let Err(error) = fs::write(&tmp, &contents) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.into());
     }
-    hex
-}
-
-fn allocate_receipt_filename(inbox_dir: &Path) -> anyhow::Result<String> {
-    let archive_dir = sibling_archive_dir(inbox_dir);
+    seam(IdempotentSendSeam::BeforePublication)?;
     for _ in 0..8 {
         let filename = new_filename();
-        if !inbox_dir.join(&filename).exists() && !archive_dir.join(&filename).exists() {
+        let path = inbox_dir.join(&filename);
+        if !path.exists() {
+            if let Err(error) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(error.into());
+            }
+            seam(IdempotentSendSeam::AfterPublication)?;
             return Ok(filename);
         }
     }
+    let _ = fs::remove_file(&tmp);
     anyhow::bail!(
-        "could not allocate a unique message receipt in {}",
+        "could not allocate a unique message filename in {}",
         inbox_dir.display()
     )
-}
-
-fn claim_tmp_name() -> String {
-    format!(
-        ".claim.tmp-{}-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-        rand6()
-    )
-}
-
-fn write_synced_new(path: &Path, contents: &str) -> anyhow::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> anyhow::Result<()> {
-    fs::File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-fn remove_temporary(path: &Path) -> anyhow::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn validate_claim(claim_path: &Path, source: &str, event_id: &str) -> anyhow::Result<String> {
-    let metadata = fs::symlink_metadata(claim_path).map_err(|error| {
-        anyhow::anyhow!(
-            "reading message ingress claim {}: {error}",
-            claim_path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!(
-            "message ingress claim is not a plain file: {}",
-            claim_path.display()
-        );
-    }
-    let contents = fs::read_to_string(claim_path)?;
-    verify_claim_digest(&contents)?;
-    let parsed = parse_message("0000000000000-000000.md", &contents);
-    if parsed.source.as_deref() != Some(source) || parsed.event_id.as_deref() != Some(event_id) {
-        anyhow::bail!("message ingress claim provenance does not match its key");
-    }
-    let filename = parsed
-        .receipt_id
-        .filter(|value| is_message_filename(value))
-        .ok_or_else(|| anyhow::anyhow!("message ingress claim has an unsafe receipt-id"))?;
-    Ok(filename)
-}
-
-fn verify_claim_digest(contents: &str) -> anyhow::Result<()> {
-    let mut digest = None;
-    let mut unsigned = String::with_capacity(contents.len());
-    for line in contents.split_inclusive('\n') {
-        if let Some(value) = line.strip_prefix("claim-digest: ") {
-            if digest.is_some() {
-                anyhow::bail!("message ingress claim has duplicate claim-digest fields");
-            }
-            digest = Some(value.trim_end_matches(['\r', '\n']).to_string());
-        } else {
-            unsigned.push_str(line);
-        }
-    }
-    let digest = digest.ok_or_else(|| anyhow::anyhow!("message ingress claim has no digest"))?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("message ingress claim has an invalid digest");
-    }
-    if sha256_hex(unsigned.as_bytes()) != digest {
-        anyhow::bail!("message ingress claim digest does not match its contents");
-    }
-    Ok(())
-}
-
-fn ensure_inbox_link(inbox_dir: &Path, claim_path: &Path, filename: &str) -> anyhow::Result<()> {
-    let inbox_path = inbox_dir.join(filename);
-    let archive_path = sibling_archive_dir(inbox_dir).join(filename);
-    if archive_path.exists() {
-        return verify_existing_receipt(&archive_path, claim_path);
-    }
-    if inbox_path.exists() {
-        return verify_existing_receipt(&inbox_path, claim_path);
-    }
-
-    match fs::hard_link(claim_path, &inbox_path) {
-        Ok(()) => sync_directory(inbox_dir),
-        Err(_) if archive_path.exists() => verify_existing_receipt(&archive_path, claim_path),
-        Err(_) if inbox_path.exists() => verify_existing_receipt(&inbox_path, claim_path),
-        Err(error) => Err(anyhow::anyhow!(
-            "publishing message receipt {filename} to {}: {error}",
-            inbox_dir.display()
-        )),
-    }
-}
-
-fn verify_existing_receipt(existing: &Path, claim: &Path) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(existing)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!(
-            "message receipt path is not a plain file: {}",
-            existing.display()
-        );
-    }
-    if fs::read(existing)? != fs::read(claim)? {
-        anyhow::bail!(
-            "message receipt collides with different bytes: {}",
-            existing.display()
-        );
-    }
-    Ok(())
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -673,25 +470,72 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join("archive")
 }
 
-/// The inbox dir for `id` under `root`: the NATIVE catalog inbox (`<agent_dir>/resources/inbox`) if a
-/// catalog agent is discoverable, else the flat bus inbox (`<root>/<id>/inbox`). The
-/// flat fallback lets `st2 ding`/`st2 message` operate on a catalog-LESS bus — e.g. an eval's ST_ROOT,
-/// where agents are booted from a single spec (no on-disk `agent.kdl` to discover). `root` is whatever
-/// `--root`/ST_ROOT names, so the layout follows the spec, never a hardcoded path.
-pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> PathBuf {
-    match resolve_agent_dir(root, id, host) {
-        Some(dir) => inbox_dir(&dir),
-        None => root.join(id).join("inbox"),
+/// Eval-owned authority for one external flat requester mailbox. General catalog routing remains
+/// declaration-only; possessing this value is the explicit exception at message call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalInbox {
+    root: PathBuf,
+    identity: String,
+    inbox: PathBuf,
+}
+
+impl ExternalInbox {
+    pub fn new(root: &Path, identity: &str) -> anyhow::Result<Self> {
+        let mut components = Path::new(identity).components();
+        let safe = matches!(components.next(), Some(Component::Normal(component)) if component == identity)
+            && components.next().is_none();
+        anyhow::ensure!(
+            safe,
+            "external requester identity must be one non-empty relative path component"
+        );
+        Ok(Self {
+            root: root.to_path_buf(),
+            identity: identity.to_owned(),
+            inbox: root.join(identity).join("inbox"),
+        })
+    }
+
+    pub fn provision(root: &Path, identity: &str) -> anyhow::Result<Self> {
+        let external = Self::new(root, identity)?;
+        fs::create_dir_all(&external.inbox).map_err(|error| {
+            anyhow::anyhow!(
+                "provisioning external requester {identity:?} inbox {}: {error}",
+                external.inbox.display()
+            )
+        })?;
+        Ok(external)
     }
 }
 
-/// The archive dir for `id` under `root` — native catalog archive if discoverable, else the flat
-/// `<root>/<id>/archive` (companion to [`resolve_inbox`]).
-pub fn resolve_archive(root: &Path, id: &str, host: &str) -> PathBuf {
-    match resolve_agent_dir(root, id, host) {
-        Some(dir) => archive_dir(&dir),
-        None => root.join(id).join("archive"),
+/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus;
+/// inside a catalog an absent identity always fails closed.
+pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, id, host, false, false)
+}
+
+/// Resolve a normal declared inbox or one exact eval-owned external requester capability.
+pub fn resolve_inbox_with_external(
+    root: &Path,
+    id: &str,
+    host: &str,
+    external: Option<&ExternalInbox>,
+) -> anyhow::Result<PathBuf> {
+    match resolve_inbox(root, id, host) {
+        Ok(inbox) => Ok(inbox),
+        Err(error) => match external {
+            Some(external)
+                if external.root == root && external.identity == id && external.inbox.is_dir() =>
+            {
+                Ok(external.inbox.clone())
+            }
+            _ => Err(error),
+        },
     }
+}
+
+/// Archive companion to [`resolve_inbox`], with the same stable-ID and catalog-less boundaries.
+pub fn resolve_archive(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, id, host, true, false)
 }
 
 /// Resolve one box for `message ls`.
@@ -712,6 +556,19 @@ pub fn resolve_list_box(
     };
     if orphan {
         return Ok(flat());
+    }
+    if apply_incomplete(root) {
+        return resolve_agent_dir(root, id, host)?
+            .map(|agent_dir| {
+                if archive {
+                    archive_dir(&agent_dir)
+                } else {
+                    inbox_dir(&agent_dir)
+                }
+            })
+            .with_context(|| {
+                format!("agent '{id}' is not addressable while catalog apply is incomplete")
+            });
     }
     let discovered = crate::discover(root);
     if let Some(agent_dir) = discovered
@@ -735,13 +592,292 @@ pub fn resolve_list_box(
 
 /// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
 /// catalog, via content discovery. Returns `None` if no agent matches.
-pub fn resolve_agent_dir(catalog_root: &Path, recipient: &str, this_host: &str) -> Option<PathBuf> {
-    let found = crate::discover(catalog_root);
-    found
-        .specs
-        .into_iter()
-        .find(|s| s.bus_id(this_host) == recipient || s.identity == recipient)
-        .and_then(|s| s.path.parent().map(Path::to_path_buf))
+pub fn resolve_agent_dir(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    Ok(resolve_agent_handle(catalog_root, recipient, this_host)?.map(|agent| agent.path))
+}
+
+pub fn with_resolved_agent_dir<T>(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_resolved_state_dir(catalog_root, identity, this_host, &[], true, operation)
+}
+
+pub fn with_resolved_state_dir<T>(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    components: &[&str],
+    create: bool,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match resolve_agent_handle(catalog_root, identity, this_host)? {
+        Some(agent) => {
+            test_capability_checkpoint();
+            let path = match agent.capability.as_ref() {
+                Some(capability) if components.is_empty() => {
+                    crate::catalog_transaction::retained_dir_path(capability)?
+                }
+                Some(capability) => {
+                    let directory = open_message_box(capability, components, create)?
+                        .context("resolved state directory does not exist")?;
+                    let path = crate::catalog_transaction::retained_dir_path(&directory)?;
+                    return operation(&path);
+                }
+                None => components
+                    .iter()
+                    .fold(agent.path, |path, component| path.join(component)),
+            };
+            operation(&path)
+        }
+        None => {
+            let discovered = crate::discover(catalog_root);
+            anyhow::ensure!(
+                crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                    && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
+                    && discovered.specs.is_empty()
+                    && discovered.errors.is_empty(),
+                "no agent '{identity}' found in catalog {}",
+                catalog_root.display()
+            );
+            operation(
+                &components
+                    .iter()
+                    .fold(catalog_root.join(identity), |path, component| {
+                        path.join(component)
+                    }),
+            )
+        }
+    }
+}
+
+fn resolve_agent_handle(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+) -> anyhow::Result<Option<AddressableAgent>> {
+    for _ in 0..3 {
+        let before = address_fence(catalog_root)?;
+        let mut candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?
+            .into_iter()
+            .filter(|candidate| candidate.bus_id == recipient || candidate.identity == recipient)
+            .collect::<Vec<_>>();
+        let after = address_fence(catalog_root)?;
+        if before != after {
+            continue;
+        }
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        candidates.dedup_by(|left, right| left.path == right.path);
+        return Ok((candidates.len() == 1).then(|| candidates.remove(0)));
+    }
+    anyhow::bail!("catalog address book changed repeatedly while resolving {recipient:?}")
+}
+
+fn address_fence(
+    catalog_root: &Path,
+) -> anyhow::Result<(
+    Option<u64>,
+    Option<crate::catalog_transaction::CatalogTransition>,
+)> {
+    let first_generation = crate::catalog_lock::read_generation_token(catalog_root)?;
+    let transition = crate::catalog_transaction::catalog_transition(catalog_root)?;
+    test_address_fence_checkpoint();
+    let second_generation = crate::catalog_lock::read_generation_token(catalog_root)?;
+    anyhow::ensure!(
+        first_generation == second_generation,
+        "catalog address book changed while sampling its transition fence"
+    );
+    Ok((second_generation, transition))
+}
+
+#[cfg(debug_assertions)]
+fn test_address_fence_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_ADDRESS_FENCE_READY"),
+        std::env::var("ST2_TEST_ADDRESS_FENCE_RELEASE"),
+    ) else {
+        return;
+    };
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ready)
+        .is_err()
+    {
+        return;
+    }
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_address_fence_checkpoint() {}
+
+#[derive(Debug)]
+struct AddressableAgent {
+    bus_id: String,
+    identity: String,
+    path: PathBuf,
+    capability: Option<File>,
+}
+
+fn addressable_agent_dirs(
+    catalog_root: &Path,
+    this_host: &str,
+    transition: Option<&crate::catalog_transaction::CatalogTransition>,
+) -> anyhow::Result<Vec<AddressableAgent>> {
+    let Some(transition) = transition else {
+        return crate::discover(catalog_root)
+            .specs
+            .into_iter()
+            .map(|spec| {
+                let path = spec
+                    .path
+                    .parent()
+                    .context("Agent Spec has no identity directory")?
+                    .to_path_buf();
+                let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
+                Ok(AddressableAgent {
+                    bus_id: spec.bus_id(this_host),
+                    identity: spec.identity,
+                    path,
+                    capability: Some(capability),
+                })
+            })
+            .collect();
+    };
+    let agents = catalog_root.join("agents");
+    let metadata = match fs::symlink_metadata(&agents) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "canonical agents path is not a real directory: {}",
+        agents.display()
+    );
+    let mut result = Vec::new();
+    for host in sorted_real_entries(&agents, "host")? {
+        let host_name = safe_entry_name(&host, "host")?;
+        for identity in sorted_real_entries(&host.path(), "identity")? {
+            let identity_name = safe_entry_name(&identity, "identity")?;
+            let key = crate::catalog_transaction::AgentKey {
+                host: host_name.clone(),
+                identity: identity_name.clone(),
+            };
+            let path = identity.path();
+            let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
+            let retained = crate::catalog_transaction::retained_dir_path(&capability)?;
+            let current_spec = marker_spec_matches(&retained, &key)?;
+            let retained_state =
+                transition.original_agents.contains(&key) && marker_state_exists(&retained)?;
+            if current_spec || retained_state {
+                result.push(AddressableAgent {
+                    bus_id: format!("{}.{}", key.host, key.identity),
+                    identity: key.identity,
+                    path,
+                    capability: Some(capability),
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn sorted_real_entries(dir: &Path, label: &str) -> anyhow::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in &entries {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "canonical {label} path is not a real directory: {}",
+            entry.path().display()
+        );
+    }
+    Ok(entries)
+}
+
+fn safe_entry_name(entry: &fs::DirEntry, label: &str) -> anyhow::Result<String> {
+    let value = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("canonical {label} is not UTF-8"))?;
+    anyhow::ensure!(safe_component(&value), "unsafe canonical {label} {value:?}");
+    Ok(value)
+}
+
+fn marker_spec_matches(
+    agent_dir: &Path,
+    key: &crate::catalog_transaction::AgentKey,
+) -> anyhow::Result<bool> {
+    let path = agent_dir.join("agent.kdl");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "canonical Agent Spec is not a real regular file: {}",
+        path.display()
+    );
+    let declared = crate::discovery::parse_declared(&path)?;
+    Ok(declared.len() == 1
+        && declared[0].host.as_deref() == Some(&key.host)
+        && declared[0].identity.as_deref() == Some(key.identity.as_str()))
+}
+
+fn marker_state_exists(agent_dir: &Path) -> anyhow::Result<bool> {
+    let mut found = false;
+    for name in ["resources", "archive", "inbox"] {
+        let path = agent_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => found = true,
+            Ok(_) => anyhow::bail!(
+                "agent state path is not a real directory: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match fs::symlink_metadata(agent_dir.join("status")) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => found = true,
+        Ok(_) => anyhow::bail!("agent status is not a real regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let resources = agent_dir.join("resources");
+    if resources.is_dir() {
+        for relative in ["inbox", "archive", "context", "context/decisions", "links"] {
+            match fs::symlink_metadata(resources.join(relative)) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => anyhow::bail!("agent resource path is not a real directory"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn apply_incomplete(root: &Path) -> bool {
+    fs::symlink_metadata(crate::catalog_lock::apply_marker_path(root)).is_ok()
+}
+
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | ".." | ".git" | ".st2")
+        && Path::new(value).components().count() == 1
 }
 
 /// The default subject for a reply to a message whose subject was `original`: the original prefixed
@@ -772,22 +908,32 @@ pub struct ThreadEntry {
 /// lives in BOTH agents' boxes, so scan every agent's inbox+archive). Returns the thread in reply-tree
 /// pre-order with depth; the root's `in-reply-to` chain is walked up first. Empty if `filename` isn't
 /// found. Cycles/dangling `in-reply-to` are handled defensively.
-pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
+pub fn collect_thread(catalog_root: &Path, filename: &str) -> anyhow::Result<Vec<ThreadEntry>> {
     // Gather every message once (dedup by filename — the same file can appear in two boxes).
-    let found = crate::discover(catalog_root);
     let mut all: HashMap<String, Message> = HashMap::new();
-    for spec in &found.specs {
-        let Some(dir) = spec.path.parent() else {
-            continue;
-        };
-        for d in [inbox_dir(dir), archive_dir(dir)] {
-            for m in list_dir(&d).unwrap_or_default() {
-                all.entry(m.filename.clone()).or_insert(m);
+    let transition = crate::catalog_transaction::catalog_transition(catalog_root)?;
+    for agent in addressable_agent_dirs(catalog_root, "", transition.as_ref())? {
+        if let Some(capability) = agent.capability.as_ref() {
+            for components in [&["resources", "inbox"][..], &["resources", "archive"][..]] {
+                let Some(dir) = open_message_box(capability, components, false)? else {
+                    continue;
+                };
+                for message in list_dir(&crate::catalog_transaction::retained_dir_path(&dir)?)
+                    .unwrap_or_default()
+                {
+                    all.entry(message.filename.clone()).or_insert(message);
+                }
+            }
+        } else {
+            for dir in [inbox_dir(&agent.path), archive_dir(&agent.path)] {
+                for message in list_dir(&dir).unwrap_or_default() {
+                    all.entry(message.filename.clone()).or_insert(message);
+                }
             }
         }
     }
     if !all.contains_key(filename) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Walk up `in-reply-to` to the thread root.
@@ -837,7 +983,234 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
             }
         }
     }
-    out
+    Ok(out)
+}
+
+pub fn send_to_resolved_inbox(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+) -> anyhow::Result<String> {
+    send_to_resolved_inbox_with_key(
+        catalog_root,
+        recipient,
+        this_host,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn send_idempotent_to_resolved_inbox(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<String> {
+    send_to_resolved_inbox_with_key(
+        catalog_root,
+        recipient,
+        this_host,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        Some(idempotency_key),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_to_resolved_inbox_with_key(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> anyhow::Result<String> {
+    let agent = match resolve_agent_handle(catalog_root, recipient, this_host)? {
+        Some(agent) => agent,
+        None => {
+            let discovered = crate::discover(catalog_root);
+            if crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
+                && discovered.specs.is_empty()
+                && discovered.errors.is_empty()
+            {
+                return send_to_inbox_with_optional_key(
+                    &catalog_root.join(recipient).join("inbox"),
+                    from,
+                    subject,
+                    in_reply_to,
+                    tags,
+                    body,
+                    idempotency_key,
+                );
+            }
+            anyhow::bail!(
+                "no agent '{recipient}' found in catalog {}",
+                catalog_root.display()
+            )
+        }
+    };
+    test_capability_checkpoint();
+    if let Some(capability) = agent.capability.as_ref() {
+        let inbox = open_message_box(capability, &["resources", "inbox"], true)?
+            .context("created inbox capability is missing")?;
+        send_to_inbox_with_optional_key(
+            &crate::catalog_transaction::retained_dir_path(&inbox)?,
+            from,
+            subject,
+            in_reply_to,
+            tags,
+            body,
+            idempotency_key,
+        )
+    } else {
+        send_to_inbox_with_optional_key(
+            &inbox_dir(&agent.path),
+            from,
+            subject,
+            in_reply_to,
+            tags,
+            body,
+            idempotency_key,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_to_inbox_with_optional_key(
+    inbox: &Path,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> anyhow::Result<String> {
+    match idempotency_key {
+        Some(key) => send_idempotent_to_inbox(inbox, from, subject, in_reply_to, tags, body, key),
+        None => send_to_inbox(inbox, from, subject, in_reply_to, tags, body),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_capability_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_MESSAGE_CAPABILITY_READY"),
+        std::env::var("ST2_TEST_MESSAGE_CAPABILITY_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_capability_checkpoint() {}
+
+pub fn archive_resolved_message(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    filename: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid message filename {filename:?}"
+    );
+    let agent = match resolve_agent_handle(catalog_root, identity, this_host)? {
+        Some(agent) => agent,
+        None => {
+            let discovered = crate::discover(catalog_root);
+            if crate::catalog_transaction::catalog_transition(catalog_root)?.is_none()
+                && !catalog_root.join(crate::catalog_lock::CONTROL_DIR).exists()
+                && discovered.specs.is_empty()
+                && discovered.errors.is_empty()
+            {
+                return archive_msg(
+                    &catalog_root.join(identity).join("inbox"),
+                    &catalog_root.join(identity).join("archive"),
+                    filename,
+                );
+            }
+            anyhow::bail!(
+                "no agent '{identity}' found in catalog {}",
+                catalog_root.display()
+            )
+        }
+    };
+    if let Some(capability) = agent.capability.as_ref() {
+        let inbox = open_message_box(capability, &["resources", "inbox"], false)?
+            .context("message inbox does not exist")?;
+        let archive = open_message_box(capability, &["resources", "archive"], true)?
+            .context("created archive capability is missing")?;
+        archive_msg(
+            &crate::catalog_transaction::retained_dir_path(&inbox)?,
+            &crate::catalog_transaction::retained_dir_path(&archive)?,
+            filename,
+        )
+    } else {
+        archive_msg(&inbox_dir(&agent.path), &archive_dir(&agent.path), filename)
+    }
+}
+
+fn open_message_box(
+    agent: &File,
+    components: &[&str],
+    create: bool,
+) -> anyhow::Result<Option<File>> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    let mut current = agent.try_clone()?;
+    for component in components {
+        match crate::catalog_transaction::openat_dir_nofollow(
+            &current,
+            std::ffi::OsStr::new(component),
+        ) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
+                return Ok(None);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = CString::new(*component)?;
+                let result = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(error.into());
+                    }
+                }
+                current = crate::catalog_transaction::openat_dir_nofollow(
+                    &current,
+                    std::ffi::OsStr::new(component),
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(current))
 }
 
 /// Archive `filename` from inbox to archive.
@@ -846,6 +1219,10 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> Vec<ThreadEntry> {
 /// it is the durable receipt and wins. Remove only a duplicate inbox copy, never overwrite the
 /// archived file. A source that disappeared concurrently is also success when the receipt exists.
 pub fn archive_msg(inbox_dir: &Path, archive_dir: &Path, filename: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid message filename {filename:?}"
+    );
     fs::create_dir_all(archive_dir)?;
     let source = inbox_dir.join(filename);
     let receipt = archive_dir.join(filename);
@@ -1007,46 +1384,41 @@ mod tests {
         assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);
     }
 
-    fn send_event(inbox: &Path, source: &str, event_id: &str, body: &str) -> SendReceipt {
+    fn send_with_key(inbox: &Path, key: &str, body: &str) -> String {
         send_idempotent_to_inbox(
             inbox,
             "producer",
-            Some("external event"),
+            Some("retryable message"),
             None,
             &[],
             body,
-            source,
-            event_id,
+            key,
         )
         .unwrap()
     }
 
     #[test]
-    fn idempotent_send_keeps_the_first_message_in_inbox_and_archive() {
+    fn idempotent_send_follows_inbox_archive_and_deletion_lifetime() {
         let temporary = tempfile::tempdir().unwrap();
         let inbox = temporary.path().join("inbox");
         let archive = temporary.path().join("archive");
 
-        let first = send_event(&inbox, "systemd:daily", "2026-07-31", "first body");
-        assert!(first.created);
-        let first_bytes = fs::read(inbox.join(&first.filename)).unwrap();
-        let first_modified = fs::metadata(inbox.join(&first.filename))
+        let first = send_with_key(&inbox, "daily-2026-07-31", "first body");
+        let first_bytes = fs::read(inbox.join(&first)).unwrap();
+        let first_modified = fs::metadata(inbox.join(&first))
             .unwrap()
             .modified()
             .unwrap();
-        let parsed = read_msg(&inbox, &first.filename).unwrap();
-        assert_eq!(parsed.source.as_deref(), Some("systemd:daily"));
-        assert_eq!(parsed.event_id.as_deref(), Some("2026-07-31"));
-        assert_eq!(parsed.receipt_id.as_deref(), Some(first.filename.as_str()));
+        let parsed = read_msg(&inbox, &first).unwrap();
+        assert_eq!(parsed.idempotency_key.as_deref(), Some("daily-2026-07-31"));
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let inbox_retry = send_event(&inbox, "systemd:daily", "2026-07-31", "changed body");
-        assert!(!inbox_retry.created);
-        assert_eq!(inbox_retry.filename, first.filename);
+        let inbox_retry = send_with_key(&inbox, "daily-2026-07-31", "changed body");
+        assert_eq!(inbox_retry, first);
         assert_eq!(list_dir(&inbox).unwrap().len(), 1);
-        assert_eq!(fs::read(inbox.join(&first.filename)).unwrap(), first_bytes);
+        assert_eq!(fs::read(inbox.join(&first)).unwrap(), first_bytes);
         assert_eq!(
-            fs::metadata(inbox.join(&first.filename))
+            fs::metadata(inbox.join(&first))
                 .unwrap()
                 .modified()
                 .unwrap(),
@@ -1054,17 +1426,24 @@ mod tests {
             "a retry must not rewrite the DING-triggering inbox file"
         );
 
-        archive_msg(&inbox, &archive, &first.filename).unwrap();
-        let archived_retry = send_event(&inbox, "systemd:daily", "2026-07-31", "third body");
-        assert!(!archived_retry.created);
-        assert_eq!(archived_retry.filename, first.filename);
+        archive_msg(&inbox, &archive, &first).unwrap();
+        let archived_retry = send_with_key(&inbox, "daily-2026-07-31", "third body");
+        assert_eq!(archived_retry, first);
         assert!(list_dir(&inbox).unwrap().is_empty());
         assert_eq!(list_dir(&archive).unwrap().len(), 1);
-        assert!(message_receipts_dir(&inbox).is_dir());
+
+        fs::remove_file(archive.join(&first)).unwrap();
+        let after_delete = send_with_key(&inbox, "daily-2026-07-31", "new lifetime");
+        assert_ne!(after_delete, first);
+        assert_eq!(
+            read_msg(&inbox, &after_delete).unwrap().body.trim_end(),
+            "new lifetime"
+        );
+        assert!(!temporary.path().join("message-receipts").exists());
     }
 
     #[test]
-    fn concurrent_retries_create_one_claim_and_different_keys_create_different_messages() {
+    fn concurrent_retries_create_one_normal_message() {
         use std::sync::{Arc, Barrier};
 
         let temporary = tempfile::tempdir().unwrap();
@@ -1077,38 +1456,26 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                send_event(
-                    &inbox,
-                    "github:webhook",
-                    "delivery-42",
-                    &format!("body {index}"),
-                )
+                send_with_key(&inbox, "delivery-42", &format!("body {index}"))
             }));
         }
-        let receipts: Vec<SendReceipt> = threads
+        let filenames: Vec<String> = threads
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect();
-        assert_eq!(receipts.iter().filter(|receipt| receipt.created).count(), 1);
-        assert!(
-            receipts
-                .iter()
-                .all(|receipt| receipt.filename == receipts[0].filename)
-        );
+        assert!(filenames.iter().all(|filename| filename == &filenames[0]));
         assert_eq!(list_dir(&inbox).unwrap().len(), 1);
 
-        let other = send_event(&inbox, "github:webhook", "delivery-43", "other");
-        assert!(other.created);
-        assert_ne!(other.filename, receipts[0].filename);
+        let other = send_with_key(&inbox, "delivery-43", "other");
+        assert_ne!(other, filenames[0]);
         assert_eq!(list_dir(&inbox).unwrap().len(), 2);
     }
 
     #[test]
-    fn retries_recover_at_each_claim_to_inbox_crash_seam() {
-        for (crash, retry_created) in [
-            (IngressSeam::BeforeClaimPublication, true),
-            (IngressSeam::AfterClaimPublication, false),
-            (IngressSeam::BeforeInboxLink, false),
+    fn retry_recovers_at_each_message_publication_crash_seam() {
+        for crash in [
+            IdempotentSendSeam::BeforePublication,
+            IdempotentSendSeam::AfterPublication,
         ] {
             let temporary = tempfile::tempdir().unwrap();
             let inbox = temporary.path().join("inbox");
@@ -1119,7 +1486,6 @@ mod tests {
                 None,
                 &[],
                 "first body",
-                "monitor",
                 "alert-1",
                 |seam| {
                     if seam == crash {
@@ -1130,58 +1496,31 @@ mod tests {
             );
             assert!(failed.is_err(), "{crash:?}");
 
-            let retry = send_event(&inbox, "monitor", "alert-1", "retry body");
-            assert_eq!(retry.created, retry_created, "{crash:?}");
+            let retry = send_with_key(&inbox, "alert-1", "retry body");
             assert_eq!(list_dir(&inbox).unwrap().len(), 1, "{crash:?}");
-            let message = read_msg(&inbox, &retry.filename).unwrap();
-            let expected_body = if retry_created {
-                "retry body"
-            } else {
-                "first body"
+            let message = read_msg(&inbox, &retry).unwrap();
+            let expected_body = match crash {
+                IdempotentSendSeam::BeforePublication => "retry body",
+                IdempotentSendSeam::AfterPublication => "first body",
             };
             assert_eq!(message.body.trim_end(), expected_body, "{crash:?}");
         }
     }
 
     #[test]
-    fn corrupt_or_unsafe_claims_fail_closed() {
-        let corrupt = tempfile::tempdir().unwrap();
-        let inbox = corrupt.path().join("inbox");
-        send_event(&inbox, "source", "event", "body");
-        let claim = message_receipts_dir(&inbox)
-            .join(format!("{}.receipt", ingress_key("source", "event")));
-        fs::write(&claim, "corrupt").unwrap();
-        let error = send_idempotent_to_inbox(
-            &inbox,
-            "producer",
-            None,
-            None,
-            &[],
-            "retry",
-            "source",
-            "event",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("claim has no digest"));
+    fn inbox_match_wins_before_archive_match() {
+        let temporary = tempfile::tempdir().unwrap();
+        let inbox = temporary.path().join("inbox");
+        let archive = temporary.path().join("archive");
+        let archived = send_with_key(&inbox, "same", "archived");
+        archive_msg(&inbox, &archive, &archived).unwrap();
 
-        let unsafe_shape = tempfile::tempdir().unwrap();
-        let inbox = unsafe_shape.path().join("inbox");
-        let receipts = message_receipts_dir(&inbox);
-        fs::create_dir_all(&receipts).unwrap();
-        fs::create_dir(receipts.join(format!("{}.receipt", ingress_key("source", "event"))))
-            .unwrap();
-        let error = send_idempotent_to_inbox(
-            &inbox,
-            "producer",
-            None,
-            None,
-            &[],
-            "retry",
-            "source",
-            "event",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("not a plain file"));
+        let contents = render_message_fields("producer", None, None, &[], "inbox", Some("same"));
+        let inbox_copy = publish_message_with_seam(&inbox, &contents, |_| Ok(())).unwrap();
+        assert_ne!(inbox_copy, archived);
+
+        let selected = send_with_key(&inbox, "same", "retry");
+        assert_eq!(selected, inbox_copy);
     }
 
     #[test]
@@ -1190,11 +1529,11 @@ mod tests {
         let root = tmp.path();
         // No catalog under root → the flat bus (<root>/<id>/inbox|archive).
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h"),
+            resolve_inbox(root, "mix.sup", "h").unwrap(),
             root.join("mix.sup").join("inbox")
         );
         assert_eq!(
-            resolve_archive(root, "mix.sup", "h"),
+            resolve_archive(root, "mix.sup", "h").unwrap(),
             root.join("mix.sup").join("archive")
         );
         // A discoverable native catalog agent → its resources/inbox.
@@ -1202,12 +1541,43 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         std::fs::write(
             ad.join("agent.kdl"),
-            "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+            "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  name \"Shared Worker\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
         )
         .unwrap();
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h"),
+            resolve_inbox(root, "mix.sup", "h").unwrap(),
             ad.join("resources").join("inbox")
         );
+        assert!(resolve_inbox(root, "Shared Worker", "h").is_err());
+
+        let external = ExternalInbox::new(root, "requester").unwrap();
+        assert!(resolve_inbox_with_external(root, "requester", "h", Some(&external)).is_err());
+
+        let requester = root.join("requester").join("inbox");
+        std::fs::create_dir_all(&requester).unwrap();
+        assert!(resolve_inbox(root, "requester", "h").is_err());
+        assert_eq!(
+            resolve_inbox_with_external(root, "requester", "h", Some(&external)).unwrap(),
+            requester
+        );
+        assert!(resolve_inbox_with_external(root, "missing", "h", Some(&external)).is_err());
+    }
+
+    #[test]
+    fn external_inbox_rejects_unsafe_or_nested_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        for identity in [
+            "",
+            ".",
+            "..",
+            "nested/requester",
+            "../requester",
+            "/requester",
+        ] {
+            assert!(
+                ExternalInbox::new(tmp.path(), identity).is_err(),
+                "accepted unsafe external identity {identity:?}"
+            );
+        }
     }
 }

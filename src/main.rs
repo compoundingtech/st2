@@ -120,44 +120,16 @@ enum Command {
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// EXPERIMENTAL: generate one compact agent declaration plus catalog-owned templates. Hand-authored
-    /// KDL is canonical. Inspect the full generated KDL and every workspace `render {}` target before
-    /// materialization. The workspace remains untouched until `st2 up --materialize-only` or `st2 up`.
-    #[command(name = "compile-agent")]
-    CompileAgent {
-        /// Optional positional catalog folder. Prefer --catalog; defaults to $CATALOG, then the
-        /// standard st2 catalog.
-        #[arg(conflicts_with = "catalog_path")]
-        catalog: Option<PathBuf>,
-        #[arg(long)]
-        identity: String,
-        #[arg(long, default_value = "worker")]
-        role: String,
-        /// The agent's workspace directory (its cwd).
-        #[arg(long)]
-        dir: String,
-        /// Persona source file to vendor into the catalog-owned overlay.
-        #[arg(long)]
-        persona: PathBuf,
-        #[arg(long, default_value = "claude")]
-        harness: String,
-        /// Add an argv-local Codex project trust override for the exact workspace. This is opt-in
-        /// and requires `--harness codex`.
-        #[arg(long)]
-        trust_workspace: bool,
-        /// Host (defaults to the local hostname).
-        #[arg(long)]
-        host: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        supervisor: Option<String>,
-        /// Extra harness arg spliced into the seat's `exec claude/codex …` command before the boot
-        /// prompt (repeatable, hyphen values allowed) — e.g. `--extra-arg=--plugin-dir
-        /// --extra-arg=/path`. The st2 analog of a per-seat command edit; omit for a normal seat.
-        #[arg(long = "extra-arg", allow_hyphen_values = true)]
-        extra_arg: Vec<String>,
-    },
+    /// Set or clear an agent's human-facing name without changing stable identity.
+    Rename(PresentationArgs),
+    /// Set or clear an agent's enduring responsibility description.
+    Describe(PresentationArgs),
+    /// Transactionally publish one canonical Agent Spec into the live catalog.
+    #[command(subcommand)]
+    Agent(AgentCmd),
+    /// Canonical declaration snapshots and crash-recoverable whole-catalog application.
+    #[command(subcommand)]
+    Catalog(CatalogCmd),
     /// Explicit teardown: kill every live task of this host's catalog agents. The ONLY thing that ends
     /// tasks (stopping/crashing st2 never does). Idempotent.
     Down {
@@ -291,6 +263,134 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Compute the authoritative digest bound by `agent publish --input-sha256`.
+    Digest {
+        /// A canonical KDL file containing exactly one top-level `agent` node.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        spec: Option<PathBuf>,
+        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "spec",
+            conflicts_with = "spec"
+        )]
+        bundle: Option<PathBuf>,
+        /// Emit the typed source-digest receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish exactly one explicit-host, explicit-identity agent under a catalog-wide CAS lock.
+    Publish {
+        /// A canonical KDL file containing exactly one top-level `agent` node.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "bundle",
+            conflicts_with = "bundle"
+        )]
+        spec: Option<PathBuf>,
+        /// A create-only directory whose root contains exactly one canonical `agent.kdl`.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "spec",
+            conflicts_with = "spec"
+        )]
+        bundle: Option<PathBuf>,
+        /// Create only. An identical existing agent.kdl is reported as `unchanged`.
+        #[arg(
+            long,
+            required_unless_present = "expect_sha256",
+            conflicts_with = "expect_sha256"
+        )]
+        expect_absent: bool,
+        /// Replace only when the current agent.kdl has this lowercase SHA-256.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required_unless_present = "expect_absent",
+            conflicts_with = "expect_absent"
+        )]
+        expect_sha256: Option<String>,
+        /// SHA-256 returned by `st2 agent digest` for the exact source capability.
+        #[arg(long, value_name = "HEX")]
+        input_sha256: String,
+        /// Emit the typed publication result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCmd {
+    /// Compare one prepared declaration directory with the coherent live catalog without writing.
+    Diff {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(long, value_name = "DIR")]
+        prepared: PathBuf,
+        /// Expected canonical declaration-root SHA-256 of the live catalog.
+        #[arg(long, value_name = "HEX")]
+        expect_sha256: String,
+        /// Emit the versioned semantic-diff receipt. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish a complete prepared declaration directory as one absent catalog.
+    Bootstrap {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(long, value_name = "DIR")]
+        prepared: PathBuf,
+        /// Root SHA-256 of the exact prepared projection being published.
+        #[arg(long, value_name = "HEX")]
+        input_sha256: String,
+        /// Emit the typed bootstrap receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture the coherent declaration plane into a create-only canonical directory.
+    Snapshot {
+        /// Destination directory. It must be outside the live catalog.
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+        /// Emit the typed snapshot receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a complete canonical declaration directory under declaration-root CAS.
+    Apply {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(
+            long,
+            value_name = "DIR",
+            required_unless_present = "resume",
+            conflicts_with = "resume"
+        )]
+        prepared: Option<PathBuf>,
+        /// Expected canonical declaration-root SHA-256 of the live catalog.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required_unless_present = "resume",
+            conflicts_with = "resume"
+        )]
+        expect_sha256: Option<String>,
+        /// Resume the durable incomplete marker and internal stage without the original source.
+        #[arg(long, conflicts_with_all = ["prepared", "expect_sha256"])]
+        resume: bool,
+        /// Emit the typed application receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Shared context for message subcommands: where the catalog is, who "I" am, and the local host.
 /// Defaults come from the same env st2 sets on every task it spawns (`$CATALOG`, `$ST_AGENT`), so a
 /// running agent needs no flags.
@@ -305,6 +405,28 @@ struct MsgCtx {
     #[arg(long = "as")]
     as_id: Option<String>,
     /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(Args)]
+struct PresentationArgs {
+    /// Exact bus identity, or a bare stable identity only when unique in the selected catalog.
+    identity: String,
+    /// Presentation text. Use --clear to remove the field.
+    #[arg(
+        value_name = "TEXT",
+        required_unless_present = "clear",
+        conflicts_with = "clear"
+    )]
+    value: Option<String>,
+    /// Remove the optional field.
+    #[arg(long)]
+    clear: bool,
+    /// Emit a stable JSON receipt or classified refusal.
+    #[arg(long)]
+    json: bool,
+    /// Host used only to resolve declarations whose host is omitted.
     #[arg(long)]
     host: Option<String>,
 }
@@ -449,15 +571,9 @@ enum MessageCmd {
         /// Comma-separated tags.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
-        /// Stable external producer identity. Requires `--event-id` and enables local idempotency.
-        #[arg(long, requires = "event_id")]
-        source: Option<String>,
-        /// Stable producer event identity. Requires `--source` and enables local idempotency.
-        #[arg(long = "event-id", requires = "source")]
-        event_id: Option<String>,
-        /// Print a stable machine-readable send receipt.
-        #[arg(long)]
-        json: bool,
+        /// Return the first matching normal message for this local recipient and key.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -587,6 +703,161 @@ fn main() -> Result<()> {
             interval,
         } => ding_cmd(session, identity, root, host, interval),
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
+        Command::Describe(args) => {
+            presentation_cmd(st2::agent_author::PresentationField::Description, args)
+        }
+        Command::Agent(AgentCmd::Publish {
+            spec,
+            bundle,
+            expect_absent,
+            expect_sha256,
+            input_sha256,
+            json,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let source = match (spec, bundle) {
+                (Some(path), None) => st2::agent_publish::PublishSource::Spec(path),
+                (None, Some(path)) => st2::agent_publish::PublishSource::Bundle(path),
+                _ => unreachable!("clap enforces one publication source"),
+            };
+            let expectation = match (expect_absent, expect_sha256) {
+                (true, None) => st2::agent_publish::PublishExpectation::Absent,
+                (false, Some(hash)) => st2::agent_publish::PublishExpectation::Sha256(hash),
+                _ => unreachable!("clap enforces one publication expectation"),
+            };
+            let result = st2::agent_publish::publish(st2::agent_publish::PublishRequest {
+                catalog,
+                source,
+                expectation,
+                input_sha256,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {} {}",
+                    match result.status {
+                        st2::agent_publish::PublishStatus::Published => "published",
+                        st2::agent_publish::PublishStatus::Unchanged => "unchanged",
+                    },
+                    result.bus_id,
+                    result.path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Agent(AgentCmd::Digest { spec, bundle, json }) => {
+            let source = match (spec, bundle) {
+                (Some(path), None) => st2::agent_publish::PublishSource::Spec(path),
+                (None, Some(path)) => st2::agent_publish::PublishSource::Bundle(path),
+                _ => unreachable!("clap enforces one source"),
+            };
+            let digest = st2::agent_publish::digest_source(source)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&digest)?);
+            } else {
+                println!("{}", digest.sha256);
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Bootstrap {
+            prepared,
+            input_sha256,
+            json,
+        }) => {
+            let result =
+                st2::catalog_transaction::bootstrap(st2::catalog_transaction::BootstrapRequest {
+                    catalog: catalog_arg(None)?,
+                    prepared,
+                    input_sha256,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {}",
+                    match result.status {
+                        st2::catalog_transaction::BootstrapStatus::Created => "created",
+                        st2::catalog_transaction::BootstrapStatus::Unchanged => "unchanged",
+                    },
+                    result.root_sha256
+                );
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Diff {
+            prepared,
+            expect_sha256,
+            json,
+        }) => {
+            if !json {
+                anyhow::bail!("`st2 catalog diff` v1 requires --json");
+            }
+            let result = st2::catalog_transaction::diff(st2::catalog_transaction::DiffRequest {
+                catalog: catalog_arg(None)?,
+                prepared,
+                expect_sha256,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Snapshot { output, json }) => {
+            let result =
+                st2::catalog_transaction::snapshot(st2::catalog_transaction::SnapshotRequest {
+                    catalog: catalog_arg(None)?,
+                    output,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {} {}",
+                    match result.status {
+                        st2::catalog_transaction::SnapshotStatus::Created => "created",
+                        st2::catalog_transaction::SnapshotStatus::Unchanged => "unchanged",
+                    },
+                    result.root_sha256,
+                    result.output.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Apply {
+            prepared,
+            expect_sha256,
+            resume,
+            json,
+        }) => {
+            let mode = if resume {
+                st2::catalog_transaction::ApplyMode::Resume
+            } else {
+                let prepared = prepared.context("clap requires --prepared unless --resume")?;
+                let expect_sha256 =
+                    expect_sha256.context("clap requires --expect-sha256 unless --resume")?;
+                st2::catalog_transaction::ApplyMode::Prepared {
+                    prepared,
+                    expect_sha256,
+                }
+            };
+            let result = st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
+                catalog: catalog_arg(None)?,
+                mode,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "{} {}",
+                    match result.status {
+                        st2::catalog_transaction::ApplyStatus::Applied => "applied",
+                        st2::catalog_transaction::ApplyStatus::Unchanged => "unchanged",
+                    },
+                    result.after_sha256
+                );
+            }
+            Ok(())
+        }
         Command::Agents {
             catalog,
             status,
@@ -600,34 +871,6 @@ fn main() -> Result<()> {
             }
             let catalog = catalog_arg(None)?;
             tasks_cmd(&catalog, host)
-        }
-        Command::CompileAgent {
-            catalog,
-            identity,
-            role,
-            dir,
-            persona,
-            harness,
-            trust_workspace,
-            host,
-            model,
-            supervisor,
-            extra_arg,
-        } => {
-            let catalog = catalog_arg(catalog)?;
-            compile_agent_cmd(
-                &catalog,
-                &identity,
-                &role,
-                &dir,
-                &persona,
-                &harness,
-                trust_workspace,
-                host,
-                model,
-                supervisor,
-                extra_arg,
-            )
         }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
@@ -676,45 +919,6 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_agent_cmd(
-    catalog: &Path,
-    identity: &str,
-    role: &str,
-    dir: &str,
-    persona: &Path,
-    harness: &str,
-    trust_workspace: bool,
-    host: Option<String>,
-    model: Option<String>,
-    supervisor: Option<String>,
-    extra_arg: Vec<String>,
-) -> Result<()> {
-    let host = host.unwrap_or_else(detect_host);
-    let input = st2::compile_agent::AgentInput {
-        identity: identity.to_string(),
-        host: host.clone(),
-        role: role.to_string(),
-        harness: harness.to_string(),
-        trust_workspace,
-        model,
-        workspace: dir.to_string(),
-        supervisor,
-        extra_args: extra_arg,
-    };
-    let agent_dir = st2::compile_agent::compile_agent(&input, catalog, persona)
-        .with_context(|| format!("compiling agent '{identity}'"))?;
-    println!(
-        "compiled {host}.{identity} → {}  \
-         (next: st2 hooks install; st2 validate --catalog {}; st2 up --catalog {} --host {host} --materialize-only; then st2 up --catalog {} --host {host} --once)",
-        agent_dir.display(),
-        catalog.display(),
-        catalog.display(),
-        catalog.display()
-    );
-    Ok(())
 }
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
@@ -844,6 +1048,8 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
 fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let host = host.unwrap_or_else(detect_host);
+    let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+        .context("acquire shared catalog-authoring lock for validation")?;
     let report = st2::validate::validate_for_host(&catalog_root, &host);
     let (errors, warnings) = (report.errors(), report.warnings());
 
@@ -1054,6 +1260,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
 
     // 3) Per this-host declaration: active tasks must be alive with fresh presence; retired tasks
     // must all be absent and need no presence file.
+    let _catalog_lock = st2::CatalogLock::shared(&catalog)
+        .context("acquire shared catalog-authoring lock for doctor snapshot")?;
     let found = discover(&catalog);
     for e in &found.errors {
         report_check(
@@ -1166,12 +1374,32 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
             anyhow::bail!("task inventory incomplete")
         }
     };
+    let before = match st2::catalog_lock::read_fence(&catalog) {
+        Ok(fence) => fence,
+        Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
+    };
     let found = discover(&catalog);
+    let observed = match st2::catalog_lock::read_fence(&catalog) {
+        Ok(fence) if fence == before => fence,
+        Ok(_) => {
+            return print_incomplete_tasks(
+                catalog,
+                host,
+                "catalog generation changed during task discovery".to_string(),
+            );
+        }
+        Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
+    };
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
     let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
     let after = discover(&catalog);
     if !st2::task_inventory::same_discovery(&found, &after) {
         inventory.mark_incomplete("catalog declarations changed during task observation");
+    }
+    match st2::catalog_lock::read_fence(&catalog) {
+        Ok(after) if after == observed => {}
+        Ok(_) => inventory.mark_incomplete("catalog generation changed during task observation"),
+        Err(error) => inventory.mark_incomplete(error.to_string()),
     }
     println!("{}", inventory.to_json());
     if inventory.complete() {
@@ -1179,6 +1407,12 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
     } else {
         anyhow::bail!("task inventory incomplete")
     }
+}
+
+fn print_incomplete_tasks(catalog: PathBuf, host: String, detail: String) -> Result<()> {
+    let inventory = st2::task_inventory::TaskInventory::incomplete(catalog, host, detail);
+    println!("{}", inventory.to_json());
+    anyhow::bail!("task inventory incomplete")
 }
 
 fn tool_on_path(tool: &str) -> bool {
@@ -1200,6 +1434,69 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
     }
 }
 
+fn presentation_cmd(
+    field: st2::agent_author::PresentationField,
+    args: PresentationArgs,
+) -> Result<()> {
+    let PresentationArgs {
+        identity,
+        value,
+        clear,
+        json,
+        host,
+    } = args;
+    let root = catalog_arg(None)?;
+    let host = host.unwrap_or_else(detect_host);
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let requested = if clear { None } else { value.as_deref() };
+    match st2::agent_author::set_presentation(
+        &root,
+        &identity,
+        &host,
+        actor.as_deref(),
+        field,
+        requested,
+    ) {
+        Ok(receipt) => {
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                let state = match (receipt.result, receipt.value.as_deref()) {
+                    (st2::agent_author::AuthorOutcome::Changed, Some(value)) => {
+                        format!("set to {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Changed, None) => "cleared".to_owned(),
+                    (st2::agent_author::AuthorOutcome::Unchanged, Some(value)) => {
+                        format!("already {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Unchanged, None) => {
+                        "already clear".to_owned()
+                    }
+                };
+                println!("{} {}: {state}", receipt.identity, field.as_str());
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "error",
+                        "code": error.code(),
+                        "identity": identity,
+                        "field": field,
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Result<()> {
     let (root, host) = resolve_ctx(&ctx)?;
     let id = match identity {
@@ -1213,7 +1510,9 @@ fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Res
             let state = st2::status::State::parse_settable(&word).with_context(|| {
                 format!("invalid state '{word}' (settable: offline|available|busy|away|dnd)")
             })?;
-            st2::status::set_state(&sp, state)?;
+            message::with_resolved_agent_dir(&root, &id, &host, |agent| {
+                st2::status::set_state(&st2::status::status_path(agent), state)
+            })?;
             println!("status: {}", state.as_str());
         }
     }
@@ -1235,6 +1534,8 @@ fn agents_cmd(
         ctx.root = catalog;
     }
     let (root, host) = resolve_ctx(&ctx)?;
+    let _catalog_lock = st2::CatalogLock::shared(&root)
+        .context("acquire shared catalog-authoring lock for agent roster")?;
     let mut rows = st2::agents::roster(&root, &host);
     if let Some(f) = &status_filter {
         rows.retain(|r| r.status.as_str() == f);
@@ -1245,10 +1546,11 @@ fn agents_cmd(
         for r in &rows {
             let retired = if r.retired { "\t[retired]" } else { "" };
             println!(
-                "{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 r.name.as_deref().unwrap_or(""),
+                r.description.as_deref().unwrap_or(""),
                 retired,
             );
         }
@@ -1276,9 +1578,9 @@ fn ding_cmd(
     let session = session.unwrap_or_else(|| id.clone());
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
-    let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)
+    let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)?
         .unwrap_or_else(|| catalog_root.join(&id));
-    let inbox = message::resolve_inbox(&catalog_root, &id, &this_host);
+    let inbox = resolve_message_inbox(&catalog_root, &id, &this_host)?;
     let status_path = st2::status::status_path(&agent_dir);
     eprintln!(
         "st2 ding: watching {}'s inbox ({}) → poking pty '{session}'",
@@ -1313,8 +1615,18 @@ fn acting_id(ctx: &MsgCtx) -> Result<String> {
 
 /// Resolve a recipient/identity to its agent folder in the catalog, or a clear error.
 fn agent_dir_of(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
-    message::resolve_agent_dir(root, id, host)
+    message::resolve_agent_dir(root, id, host)?
         .with_context(|| format!("no agent '{id}' found in catalog {}", root.display()))
+}
+
+/// Resolve ordinary declared messaging authority plus the exact external requester capability
+/// injected only into canonical eval seats.
+fn resolve_message_inbox(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
+    let external = std::env::var("ST2_EVAL_REQUESTER")
+        .ok()
+        .map(|identity| message::ExternalInbox::new(root, &identity))
+        .transpose()?;
+    message::resolve_inbox_with_external(root, id, host, external.as_ref())
 }
 
 /// Body from `-m`, else stdin (so `st2 message send x < file` works).
@@ -1349,60 +1661,24 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             subject,
             in_reply_to,
             tags,
-            source,
-            event_id,
-            json,
+            idempotency_key,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
-            let (filename, outcome) = match (source.as_deref(), event_id.as_deref()) {
-                (Some(source), Some(event_id)) => {
-                    let receipt = message::send_idempotent_to_inbox(
-                        &dir,
-                        &from,
-                        subject.as_deref(),
-                        in_reply_to.as_deref(),
-                        &tags,
-                        &body,
-                        source,
-                        event_id,
-                    )?;
-                    let outcome = if receipt.created {
-                        "created"
-                    } else {
-                        "deduplicated"
-                    };
-                    (receipt.filename, outcome)
-                }
-                (None, None) => (
-                    message::send_to_inbox(
-                        &dir,
-                        &from,
-                        subject.as_deref(),
-                        in_reply_to.as_deref(),
-                        &tags,
-                        &body,
-                    )?,
-                    "created",
-                ),
-                _ => unreachable!("clap requires --source and --event-id together"),
-            };
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&SendReceiptJson {
-                        recipient: &to,
-                        filename: &filename,
-                        receipt_id: &filename,
-                        outcome,
-                    })?
-                );
-            } else {
-                println!("{filename}");
-            }
+            let filename = send_resolved_message(
+                &root,
+                &to,
+                &host,
+                &from,
+                subject.as_deref(),
+                in_reply_to.as_deref(),
+                &tags,
+                &body,
+                idempotency_key.as_deref(),
+            )?;
+            println!("{filename}");
             Ok(())
         }
         MessageCmd::Reply {
@@ -1413,7 +1689,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
-            let my_inbox = message::resolve_inbox(&root, &from, &host);
+            let my_inbox = resolve_message_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
@@ -1422,14 +1698,16 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
-            let dir = message::resolve_inbox(&root, &to, &host);
-            let sent = message::send_to_inbox(
-                &dir,
+            let sent = send_resolved_message(
+                &root,
+                &to,
+                &host,
                 &from,
                 subject.as_deref(),
                 Some(&filename),
                 &[],
                 &body,
+                None,
             )?;
             println!("{sent}");
             Ok(())
@@ -1500,8 +1778,8 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let dir = if archive {
                 message::resolve_archive(&root, &id, &host)
             } else {
-                message::resolve_inbox(&root, &id, &host)
-            };
+                resolve_message_inbox(&root, &id, &host)
+            }?;
             if raw {
                 print!("{}", std::fs::read_to_string(dir.join(&filename))?);
                 return Ok(());
@@ -1521,14 +1799,8 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             if !m.tags.is_empty() {
                 println!("tags:        {}", m.tags.join(", "));
             }
-            if let Some(source) = &m.source {
-                println!("source:      {source}");
-            }
-            if let Some(event_id) = &m.event_id {
-                println!("event-id:    {event_id}");
-            }
-            if let Some(receipt_id) = &m.receipt_id {
-                println!("receipt-id:  {receipt_id}");
+            if let Some(key) = &m.idempotency_key {
+                println!("idempotency-key: {key}");
             }
             println!();
             print!("{}", m.body);
@@ -1537,11 +1809,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Archive { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            message::archive_msg(
-                &message::resolve_inbox(&root, &id, &host),
-                &message::resolve_archive(&root, &id, &host),
-                &filename,
-            )?;
+            message::archive_resolved_message(&root, &id, &host, &filename)?;
             println!("archived");
             Ok(())
         }
@@ -1554,7 +1822,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let (root, _host) = resolve_ctx(&ctx)?;
             // `[identity] filename` — the identity is irrelevant (the walk is catalog-wide).
             let filename = second.unwrap_or(first);
-            let mut entries = message::collect_thread(&root, &filename);
+            let mut entries = message::collect_thread(&root, &filename)?;
             if entries.is_empty() {
                 anyhow::bail!(
                     "no thread found for '{filename}' in catalog {}",
@@ -1579,14 +1847,56 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     }
 }
 
-/// `st2 message send --json` — the stable result of a normal or idempotent send.
-#[derive(serde::Serialize)]
-struct SendReceiptJson<'a> {
-    recipient: &'a str,
-    filename: &'a str,
-    #[serde(rename = "receiptId")]
-    receipt_id: &'a str,
-    outcome: &'a str,
+fn send_resolved_message(
+    root: &Path,
+    to: &str,
+    host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> Result<String> {
+    if std::env::var("ST2_EVAL_REQUESTER").as_deref() == Ok(to) {
+        let inbox = resolve_message_inbox(root, to, host)?;
+        match idempotency_key {
+            Some(key) => message::send_idempotent_to_inbox(
+                &inbox,
+                from,
+                subject,
+                in_reply_to,
+                tags,
+                body,
+                key,
+            ),
+            None => message::send_to_inbox(&inbox, from, subject, in_reply_to, tags, body),
+        }
+    } else {
+        match idempotency_key {
+            Some(key) => message::send_idempotent_to_resolved_inbox(
+                root,
+                to,
+                host,
+                from,
+                subject,
+                in_reply_to,
+                tags,
+                body,
+                key,
+            ),
+            None => message::send_to_resolved_inbox(
+                root,
+                to,
+                host,
+                from,
+                subject,
+                in_reply_to,
+                tags,
+                body,
+            ),
+        }
+    }
 }
 
 /// `st2 message ls --json` row (stable st2 wire contract).
@@ -1600,12 +1910,8 @@ struct LsItemJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<&'a str>,
-    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
-    event_id: Option<&'a str>,
-    #[serde(rename = "receiptId", skip_serializing_if = "Option::is_none")]
-    receipt_id: Option<&'a str>,
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
 }
@@ -1620,9 +1926,7 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
-            source: m.source.as_deref(),
-            event_id: m.event_id.as_deref(),
-            receipt_id: m.receipt_id.as_deref(),
+            idempotency_key: m.idempotency_key.as_deref(),
             body: None,
         }
     }
@@ -1649,12 +1953,8 @@ struct MessageJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<&'a str>,
-    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
-    event_id: Option<&'a str>,
-    #[serde(rename = "receiptId", skip_serializing_if = "Option::is_none")]
-    receipt_id: Option<&'a str>,
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     body: &'a str,
 }
 
@@ -1668,9 +1968,7 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
-            source: m.source.as_deref(),
-            event_id: m.event_id.as_deref(),
-            receipt_id: m.receipt_id.as_deref(),
+            idempotency_key: m.idempotency_key.as_deref(),
             body: &m.body,
         }
     }
@@ -1705,10 +2003,21 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             Ok(())
         }
         ContextCmd::Write { identity, ctx } => {
-            let dir = resolve_context_dir(identity, &ctx)?;
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(identity) => identity,
+                None => acting_id(&ctx)?,
+            };
             let content =
                 std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
-            context::write_now(&dir, &content)?;
+            message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "context"],
+                true,
+                |dir| context::write_now(dir, &content),
+            )?;
             eprintln!("context: wrote now.md ({} bytes)", content.len());
             Ok(())
         }
@@ -1718,8 +2027,19 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             why,
             ctx,
         } => {
-            let dir = resolve_context_dir(identity, &ctx)?;
-            let filename = context::append_decision(&dir, &decision, &why)?;
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(identity) => identity,
+                None => acting_id(&ctx)?,
+            };
+            let filename = message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "context", "decisions"],
+                true,
+                |dir| context::append_decision_to_dir(dir, &decision, &why),
+            )?;
             println!("{filename}");
             Ok(())
         }
@@ -1756,19 +2076,28 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let dir = st2::resource::links_dir(&agent_dir_of(&root, &acting_id(&ctx)?, &host)?);
+            let id = acting_id(&ctx)?;
             let body = if body_stdin {
                 std::io::read_to_string(std::io::stdin())?
             } else {
                 String::new()
             };
-            let f = st2::resource::add(
-                &dir,
-                &url,
-                title.as_deref(),
-                &tags,
-                relation.as_deref(),
-                &body,
+            let f = message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "links"],
+                true,
+                |dir| {
+                    st2::resource::add(
+                        dir,
+                        &url,
+                        title.as_deref(),
+                        &tags,
+                        relation.as_deref(),
+                        &body,
+                    )
+                },
             )?;
             println!("{f}");
             Ok(())
@@ -1812,9 +2141,17 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Remove { first, second, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let (id, filename) = box_target(first, second, &ctx)?;
-            st2::resource::remove(
-                &st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?),
-                &filename,
+            anyhow::ensure!(
+                message::is_message_filename(&filename),
+                "invalid resource filename {filename:?}"
+            );
+            message::with_resolved_state_dir(
+                &root,
+                &id,
+                &host,
+                &["resources", "links"],
+                false,
+                |dir| st2::resource::remove(dir, &filename),
             )?;
             println!("removed");
             Ok(())
@@ -1934,6 +2271,8 @@ fn up(
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     if materialize_only {
+        let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+            .context("acquire shared catalog-authoring lock for materialization")?;
         let mut found = discover(&catalog_root);
         let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
@@ -2102,6 +2441,8 @@ fn ls(root: &Path) -> Result<()> {
         }
         return Ok(());
     }
+    let _catalog_lock = st2::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for catalog listing")?;
     let found = discover(root);
 
     if found.specs.is_empty() {

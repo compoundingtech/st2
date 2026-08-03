@@ -24,6 +24,7 @@ fn exec_target(id: &str, command: &str) -> TaskTarget {
         tags: BTreeMap::new(),
         env: BTreeMap::new(),
         keep: false,
+        presentation: None,
     }
 }
 

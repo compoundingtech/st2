@@ -995,9 +995,7 @@ mod tests {
             in_reply_to: None,
             tags: vec![],
             priority: None,
-            source: None,
-            event_id: None,
-            receipt_id: None,
+            idempotency_key: None,
             body: String::new(),
         }
     }
@@ -1171,6 +1169,10 @@ mod tests {
         "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
          \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
             .to_string()
+    }
+
+    fn idle_codex_screen_with_home_relative_cwd() -> String {
+        idle_codex_screen().replace(" · /workspace", " · ~/Code/st2")
     }
 
     fn staged_codex_screen(text: &str) -> String {
@@ -1442,6 +1444,10 @@ mod tests {
             "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
         assert_eq!(
             classify_composer(&idle_codex_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&idle_codex_screen_with_home_relative_cwd(), expected),
             ComposerState::EmptySafe
         );
         assert_eq!(

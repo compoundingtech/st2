@@ -4,9 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Packaged PTY contract: the exact fleet-observation producer revision, including persisted
-    # environment removals used by managed agent restarts.
-    pty.url = "github:compoundingtech/pty/d5fabc3917407aeb937a012bd97679c303e18033";
+    # Packaged PTY dependency: the merged revision with atomic metadata patching and the
+    # fleet-observation guarantees required by st2 reconciliation.
+    pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
     pty.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -135,6 +135,19 @@
           ];
         });
 
+        # Bootstrap's crash/race tests use causal barrier hooks compiled only with debug
+        # assertions. Keep the package's release-mode test boundary unchanged and gate this
+        # transaction family in one explicit, non-vacuous derivation.
+        st2CatalogBootstrap = st2.overrideAttrs (_: {
+          pname = "st2-catalog-bootstrap-check";
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
+          cargoTestFlags = [
+            "--test"
+            "catalog_apply"
+            "bootstrap_"
+          ];
+        });
+
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
           chmod -R u+w $out
@@ -168,6 +181,7 @@
         # wants them.
         checks.st2 = st2;
         checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
+        checks.catalog-bootstrap = st2CatalogBootstrap;
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed

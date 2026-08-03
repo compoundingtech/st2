@@ -90,6 +90,8 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
             }
             AgentSpec {
                 identity: a.id.clone(),
+                name: a.name.clone(),
+                description: a.description.clone(),
                 host: Some(host.to_string()),
                 role: None,
                 job_type: JobType::Service,
@@ -219,7 +221,7 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             anyhow::bail!("canonical-agents Agent Spec `{bus_id}` is not runnable");
         }
         for task in &spec.tasks {
-            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT"] {
+            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT", "ST2_EVAL_REQUESTER"] {
                 if task.env.contains_key(root) {
                     anyhow::bail!(
                         "canonical-agents Agent Spec `{bus_id}` must not override eval-owned `{root}`"
@@ -256,8 +258,18 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             inbox: crate::message::inbox_dir(agent_dir),
             archive: crate::message::archive_dir(agent_dir),
         };
-        routes.insert(bus_id, route.clone());
-        routes.insert(spec.identity.clone(), route);
+        for spelling in [bus_id, spec.identity.clone()] {
+            match routes.entry(spelling.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(route.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    anyhow::bail!(
+                        "canonical-agents found duplicate canonical route spelling `{spelling}`"
+                    );
+                }
+            }
+        }
     }
     runtime_tasks.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
 
@@ -1074,6 +1086,21 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             None
         };
 
+        if let Some(routes) = canonical_routes.as_ref() {
+            if routes.contains_key(&requester) {
+                anyhow::bail!(
+                    "canonical-agents requester `{requester}` must be external to the admitted Agent Specs"
+                );
+            }
+            crate::message::ExternalInbox::provision(&bus, &requester)?;
+            for spec in &mut specs {
+                for task in &mut spec.tasks {
+                    task.env
+                        .insert("ST2_EVAL_REQUESTER".to_owned(), requester.clone());
+                }
+            }
+        }
+
         eval_log!("== boot team ({} agents) ==", specs.len());
         let boot = boot_team(&specs, host, catalog)?;
         if eval.canonical_agents {
@@ -1124,6 +1151,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             let supervise_runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
             let mut sup_cap = crate::flapping::FlappingCap::default();
             let mut sup_debounce = crate::run::LivenessDebounce::new(Duration::from_secs(2));
+            let mut sup_presentation_cursor = crate::run::PresentationPatchCursor::default();
             // Crash-ding state: the boot gate immediately above proved every declared task alive, so
             // carry that proof into supervision. PTY may self-reap a fast exit before the first
             // post-kickoff list snapshot; starting empty would then misclassify the proven-live task
@@ -1181,14 +1209,16 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                                 &supervise_runner,
                                 &mut sup_cap,
                                 &mut sup_debounce,
+                                &mut sup_presentation_cursor,
                             )
                         }
-                        Err(_) => crate::run::reconcile_pass_specs(
+                        Err(_) => crate::run::reconcile_pass_specs_with_cursor(
                             &specs,
                             host,
                             &supervise_runner,
                             &mut sup_cap,
                             &mut sup_debounce,
+                            &mut sup_presentation_cursor,
                         ),
                     };
                     if !report.launched.is_empty() {
@@ -1562,6 +1592,7 @@ mod tests {
                     pty_id: id.into(),
                     alive: true,
                     exit_code: None,
+                    presentation: None,
                 })
                 .collect(),
             killed: RefCell::new(Vec::new()),
@@ -1649,6 +1680,18 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 )],
             ),
             (
+                "ST2_EVAL_REQUESTER",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  env { ST2_EVAL_REQUESTER "shadow-requester" }
+  argv "true"
+}"#,
+                )],
+            ),
+            (
                 "duplicate runtime task id",
                 vec![
                     (
@@ -1717,14 +1760,14 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
 
     #[test]
     fn reap_race_errors_converge_only_after_empty_list() {
-        let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None }], vec![]]), ops: RefCell::new(Vec::new()) };
+        let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None, presentation: None }], vec![]]), ops: RefCell::new(Vec::new()) };
         assert!(reap_all_eval_sessions_with_runner(&runner, "test").is_ok());
         assert_eq!(runner.ops.borrow().len(), 2);
     }
 
     struct PersistentRunner { lists: RefCell<usize>, ops: RefCell<usize> }
     impl Runner for PersistentRunner {
-        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { *self.lists.borrow_mut() += 1; Ok(vec![Session { pty_id: "stuck".into(), alive: true, exit_code: None }]) }
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { *self.lists.borrow_mut() += 1; Ok(vec![Session { pty_id: "stuck".into(), alive: true, exit_code: None, presentation: None }]) }
         fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
         fn kill(&self, _: &str) -> anyhow::Result<()> { *self.ops.borrow_mut() += 1; Ok(()) }
         fn remove(&self, _: &str) -> anyhow::Result<()> { *self.ops.borrow_mut() += 1; Ok(()) }
@@ -1742,7 +1785,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     #[test]
     fn cleanup_guard_reaps_on_unwind_without_double_panic() {
         use std::rc::Rc;
-        let lists = Rc::new(RefCell::new(vec![vec![Session { pty_id: "panic".into(), alive: true, exit_code: None }], vec![]]));
+        let lists = Rc::new(RefCell::new(vec![vec![Session { pty_id: "panic".into(), alive: true, exit_code: None, presentation: None }], vec![]]));
         let ops = Rc::new(RefCell::new(Vec::new()));
         struct Shared { lists: Rc<RefCell<Vec<Vec<Session>>>>, ops: Rc<RefCell<Vec<String>>> }
         impl Runner for Shared {
@@ -1765,7 +1808,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     fn cleanup_guard_catalog_lifetime_matrix() {
         for keep in [false, true] {
             let dir = tempfile::tempdir().unwrap(); let catalog = dir.path().join("catalog"); std::fs::create_dir_all(&catalog).unwrap();
-            let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None }], vec![]]), ops: RefCell::new(Vec::new()) };
+            let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None, presentation: None }], vec![]]), ops: RefCell::new(Vec::new()) };
             { let _guard = EvalCleanupGuard { runner, catalog: catalog.clone(), host: "test".into(), keep }; }
             assert_eq!(catalog.exists(), keep);
         }

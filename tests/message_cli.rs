@@ -1,8 +1,9 @@
 //! CLI coverage for message-list filters and output modes.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn write_message(inbox: &Path, ts_ms: u64, suffix: &str, from: &str) {
     fs::create_dir_all(inbox).unwrap();
@@ -77,20 +78,22 @@ fn ordinary_send_keeps_its_bytes_output_and_storage_path() {
         fs::read_to_string(temporary.path().join("bob/inbox").join(filename)).unwrap(),
         "---\nfrom: alice\nsubject: ordinary\n---\nordinary body\n"
     );
-    assert!(!temporary.path().join("bob/message-receipts").exists());
+    assert!(
+        !temporary
+            .path()
+            .join("bob/inbox/.message-idempotency.lock")
+            .exists()
+    );
 }
 
 #[test]
-fn idempotent_send_returns_stable_json_across_inbox_and_archive_retries() {
+fn idempotent_send_tracks_the_normal_message_lifetime() {
     let temporary = tempfile::tempdir().unwrap();
     let flags = [
         "--subject",
         "daily check",
-        "--source",
-        "systemd:daily",
-        "--event-id",
-        "2026-07-31",
-        "--json",
+        "--idempotency-key",
+        "daily-2026-07-31",
     ];
     let first = send(temporary.path(), "first body", &flags);
     assert!(
@@ -98,34 +101,28 @@ fn idempotent_send_returns_stable_json_across_inbox_and_archive_retries() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first["recipient"], "bob");
-    assert_eq!(first["outcome"], "created");
-    assert_eq!(first["receiptId"], first["filename"]);
-    let filename = first["filename"].as_str().unwrap();
+    let filename = String::from_utf8(first.stdout).unwrap().trim().to_string();
+    assert!(st2::message::is_message_filename(&filename));
 
     let retry = send(temporary.path(), "changed body must not win", &flags);
-    let retry: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
-    assert_eq!(retry["outcome"], "deduplicated");
-    assert_eq!(retry["filename"], first["filename"]);
-    let message = st2::message::read_msg(&temporary.path().join("bob/inbox"), filename).unwrap();
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8_lossy(&retry.stdout).trim(), filename);
+    let message = st2::message::read_msg(&temporary.path().join("bob/inbox"), &filename).unwrap();
     assert_eq!(message.body.trim_end(), "first body");
-    assert_eq!(message.source.as_deref(), Some("systemd:daily"));
-    assert_eq!(message.event_id.as_deref(), Some("2026-07-31"));
+    assert_eq!(message.idempotency_key.as_deref(), Some("daily-2026-07-31"));
     let listed = list(temporary.path(), &["--count"]);
     assert!(listed.status.success());
     assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "1");
 
-    let archived = archive(temporary.path(), filename);
+    let archived = archive(temporary.path(), &filename);
     assert!(
         archived.status.success(),
         "{}",
         String::from_utf8_lossy(&archived.stderr)
     );
     let retry = send(temporary.path(), "another changed body", &flags);
-    let retry: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
-    assert_eq!(retry["outcome"], "deduplicated");
-    assert_eq!(retry["filename"], first["filename"]);
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8_lossy(&retry.stdout).trim(), filename);
     assert!(
         st2::message::list_dir(&temporary.path().join("bob/inbox"))
             .unwrap()
@@ -137,30 +134,37 @@ fn idempotent_send_returns_stable_json_across_inbox_and_archive_retries() {
             .len(),
         1
     );
+
+    fs::remove_file(temporary.path().join("bob/archive").join(&filename)).unwrap();
+    let after_delete = send(temporary.path(), "new lifetime", &flags);
+    assert!(after_delete.status.success());
+    let after_delete = String::from_utf8(after_delete.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(after_delete, filename);
+    assert_eq!(
+        st2::message::read_msg(&temporary.path().join("bob/inbox"), &after_delete)
+            .unwrap()
+            .body
+            .trim_end(),
+        "new lifetime"
+    );
+    assert!(!temporary.path().join("bob/message-receipts").exists());
 }
 
 #[test]
-fn idempotency_flags_are_paired_and_different_keys_do_not_deduplicate() {
+fn different_keys_create_different_normal_messages_and_invalid_keys_fail() {
     let temporary = tempfile::tempdir().unwrap();
-    let incomplete = send(temporary.path(), "body", &["--source", "producer"]);
-    assert!(!incomplete.status.success());
+    let invalid = send(temporary.path(), "body", &["--idempotency-key", " leading"]);
+    assert!(!invalid.status.success());
     assert!(!temporary.path().join("bob/inbox").exists());
 
-    let first = send(
-        temporary.path(),
-        "one",
-        &["--source", "producer", "--event-id", "one", "--json"],
-    );
-    let second = send(
-        temporary.path(),
-        "two",
-        &["--source", "producer", "--event-id", "two", "--json"],
-    );
-    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
-    assert_eq!(first["outcome"], "created");
-    assert_eq!(second["outcome"], "created");
-    assert_ne!(first["filename"], second["filename"]);
+    let first = send(temporary.path(), "one", &["--idempotency-key", "one"]);
+    let second = send(temporary.path(), "two", &["--idempotency-key", "two"]);
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_ne!(first.stdout, second.stdout);
     assert_eq!(
         st2::message::list_dir(&temporary.path().join("bob/inbox"))
             .unwrap()
@@ -321,6 +325,97 @@ fn known_empty_native_and_catalog_less_flat_boxes_remain_valid() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
+fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bus() {
+    let send = |root: &Path, recipient: &str, root_flag: &str, external: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        command
+            .args(["message", "send", recipient, root_flag])
+            .arg(root)
+            .args(["--host", "h", "--as", "h.sender"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(identity) = external {
+            command.env("ST2_EVAL_REQUESTER", identity);
+        }
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"work\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path(), "worker");
+    let declaration = catalog.path().join("h/worker/agent.kdl");
+    fs::write(
+        &declaration,
+        fs::read_to_string(&declaration).unwrap().replace(
+            "  type \"service\"\n",
+            "  type \"service\"\n  name \"Shared Worker\"\n",
+        ),
+    )
+    .unwrap();
+
+    let display = send(catalog.path(), "Shared Worker", "--catalog", None);
+    assert!(!display.status.success());
+    assert!(
+        String::from_utf8_lossy(&display.stderr)
+            .contains("no agent 'Shared Worker' found in catalog")
+    );
+    assert!(!catalog.path().join("Shared Worker").exists());
+
+    let stable = send(catalog.path(), "h.worker", "--catalog", None);
+    assert!(
+        stable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stable.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(catalog.path().join("h/worker/resources/inbox"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    fs::create_dir_all(catalog.path().join("requester/inbox")).unwrap();
+    assert!(
+        !send(catalog.path(), "requester", "--catalog", None)
+            .status
+            .success()
+    );
+    assert!(
+        !send(catalog.path(), "requester", "--catalog", Some("other"))
+            .status
+            .success()
+    );
+    let external = send(catalog.path(), "requester", "--catalog", Some("requester"));
+    assert!(
+        external.status.success(),
+        "{}",
+        String::from_utf8_lossy(&external.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(catalog.path().join("requester/inbox"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let flat = tempfile::tempdir().unwrap();
+    let raw = send(flat.path(), "requester", "--root", None);
+    assert!(
+        raw.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(flat.path().join("requester/inbox"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
 #[test]
