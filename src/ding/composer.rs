@@ -77,7 +77,7 @@ pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
     let mut first = false;
     let mut later = false;
     for line in plain.lines().map(str::trim_start) {
-        first |= line.starts_with("› 1.") || line.starts_with("> 1.");
+        first |= line.starts_with("› 1.") || line.starts_with("❯ 1.") || line.starts_with("> 1.");
         later |= line.starts_with("2.") || line.starts_with("3.");
     }
     first && later

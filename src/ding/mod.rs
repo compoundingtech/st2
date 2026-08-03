@@ -1281,6 +1281,26 @@ mod tests {
         mature_claude_screen(&format!("❯\u{00a0}{text}"))
     }
 
+    /// Form region captured with `pty peek --plain st2-claude-form-fixture-clean` from a dedicated
+    /// 80x24 Claude Code 2.1.220 pane in safe/manual mode on 2026-08-03. Claude rendered this after
+    /// an `AskUserQuestion` call. The host-local banner and working directory are intentionally
+    /// omitted; every retained row is verbatim from the captured form.
+    const CAPTURED_CLAUDE_QUESTION_FORM: &str = "
+────────────────────────────────────────────────────────────────────────────────
+☐ Fixture
+
+Which fixture should this test use?
+
+❯ 1. Captured form
+     Use a captured form fixture
+  2. Plain composer
+     Use a plain composer fixture\u{20}
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
     /// The same used pane with an in-flight turn: a spinner status line above the composer. Every
     /// frame below was observed on a real 2.1.220 pane; the glyph animates and the elapsed timer is
     /// not always rendered, so both variations appear here.
@@ -1374,6 +1394,51 @@ mod tests {
                 "finished turn must stay submittable: {status}"
             );
         }
+    }
+
+    #[test]
+    fn claude_question_form_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        assert!(composer::looks_like_choice_menu(
+            CAPTURED_CLAUDE_QUESTION_FORM
+        ));
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{CAPTURED_CLAUDE_QUESTION_FORM}\r\n{}",
+                    mature_staged_claude_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&mature_staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+    }
+
+    #[test]
+    fn legacy_numbered_choice_menu_still_blocks_return() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let legacy_menu = "› 1. Continue\r\n  2. Cancel";
+
+        assert!(composer::looks_like_choice_menu(legacy_menu));
+        assert_eq!(
+            classify_composer(
+                &format!("{legacy_menu}\r\n{}", mature_staged_claude_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
     }
 
     /// The two locators do not natively work in the same units. Codex is matched with `rfind` over
