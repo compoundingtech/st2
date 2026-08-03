@@ -571,6 +571,9 @@ enum MessageCmd {
         /// Comma-separated tags.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Return the first matching normal message for this local recipient and key.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -1658,6 +1661,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             subject,
             in_reply_to,
             tags,
+            idempotency_key,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
@@ -1672,6 +1676,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 in_reply_to.as_deref(),
                 &tags,
                 &body,
+                idempotency_key.as_deref(),
             )?;
             println!("{filename}");
             Ok(())
@@ -1702,6 +1707,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(&filename),
                 &[],
                 &body,
+                None,
             )?;
             println!("{sent}");
             Ok(())
@@ -1793,6 +1799,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             if !m.tags.is_empty() {
                 println!("tags:        {}", m.tags.join(", "));
             }
+            if let Some(key) = &m.idempotency_key {
+                println!("idempotency-key: {key}");
+            }
             println!();
             print!("{}", m.body);
             Ok(())
@@ -1847,12 +1856,46 @@ fn send_resolved_message(
     in_reply_to: Option<&str>,
     tags: &[String],
     body: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<String> {
     if std::env::var("ST2_EVAL_REQUESTER").as_deref() == Ok(to) {
         let inbox = resolve_message_inbox(root, to, host)?;
-        message::send_to_inbox(&inbox, from, subject, in_reply_to, tags, body)
+        match idempotency_key {
+            Some(key) => message::send_idempotent_to_inbox(
+                &inbox,
+                from,
+                subject,
+                in_reply_to,
+                tags,
+                body,
+                key,
+            ),
+            None => message::send_to_inbox(&inbox, from, subject, in_reply_to, tags, body),
+        }
     } else {
-        message::send_to_resolved_inbox(root, to, host, from, subject, in_reply_to, tags, body)
+        match idempotency_key {
+            Some(key) => message::send_idempotent_to_resolved_inbox(
+                root,
+                to,
+                host,
+                from,
+                subject,
+                in_reply_to,
+                tags,
+                body,
+                key,
+            ),
+            None => message::send_to_resolved_inbox(
+                root,
+                to,
+                host,
+                from,
+                subject,
+                in_reply_to,
+                tags,
+                body,
+            ),
+        }
     }
 }
 
@@ -1867,6 +1910,8 @@ struct LsItemJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
 }
@@ -1881,6 +1926,7 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            idempotency_key: m.idempotency_key.as_deref(),
             body: None,
         }
     }
@@ -1907,6 +1953,8 @@ struct MessageJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     body: &'a str,
 }
 
@@ -1920,6 +1968,7 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            idempotency_key: m.idempotency_key.as_deref(),
             body: &m.body,
         }
     }

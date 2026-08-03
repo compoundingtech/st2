@@ -40,6 +40,139 @@ fn list(root: &Path, extra: &[&str]) -> std::process::Output {
     list_identity(root, "bob", extra)
 }
 
+fn send(root: &Path, body: &str, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "bob", "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", "alice", "--message", body])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn archive(root: &Path, filename: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "archive", "bob", filename, "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", "alice"])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn ordinary_send_keeps_its_bytes_output_and_storage_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = send(
+        temporary.path(),
+        "ordinary body",
+        &["--subject", "ordinary"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let filename = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert!(st2::message::is_message_filename(&filename));
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("bob/inbox").join(filename)).unwrap(),
+        "---\nfrom: alice\nsubject: ordinary\n---\nordinary body\n"
+    );
+    assert!(
+        !temporary
+            .path()
+            .join("bob/inbox/.message-idempotency.lock")
+            .exists()
+    );
+}
+
+#[test]
+fn idempotent_send_tracks_the_normal_message_lifetime() {
+    let temporary = tempfile::tempdir().unwrap();
+    let flags = [
+        "--subject",
+        "daily check",
+        "--idempotency-key",
+        "daily-2026-07-31",
+    ];
+    let first = send(temporary.path(), "first body", &flags);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let filename = String::from_utf8(first.stdout).unwrap().trim().to_string();
+    assert!(st2::message::is_message_filename(&filename));
+
+    let retry = send(temporary.path(), "changed body must not win", &flags);
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8_lossy(&retry.stdout).trim(), filename);
+    let message = st2::message::read_msg(&temporary.path().join("bob/inbox"), &filename).unwrap();
+    assert_eq!(message.body.trim_end(), "first body");
+    assert_eq!(message.idempotency_key.as_deref(), Some("daily-2026-07-31"));
+    let listed = list(temporary.path(), &["--count"]);
+    assert!(listed.status.success());
+    assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "1");
+
+    let archived = archive(temporary.path(), &filename);
+    assert!(
+        archived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&archived.stderr)
+    );
+    let retry = send(temporary.path(), "another changed body", &flags);
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8_lossy(&retry.stdout).trim(), filename);
+    assert!(
+        st2::message::list_dir(&temporary.path().join("bob/inbox"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        st2::message::list_dir(&temporary.path().join("bob/archive"))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    fs::remove_file(temporary.path().join("bob/archive").join(&filename)).unwrap();
+    let after_delete = send(temporary.path(), "new lifetime", &flags);
+    assert!(after_delete.status.success());
+    let after_delete = String::from_utf8(after_delete.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(after_delete, filename);
+    assert_eq!(
+        st2::message::read_msg(&temporary.path().join("bob/inbox"), &after_delete)
+            .unwrap()
+            .body
+            .trim_end(),
+        "new lifetime"
+    );
+    assert!(!temporary.path().join("bob/message-receipts").exists());
+}
+
+#[test]
+fn different_keys_create_different_normal_messages_and_invalid_keys_fail() {
+    let temporary = tempfile::tempdir().unwrap();
+    let invalid = send(temporary.path(), "body", &["--idempotency-key", " leading"]);
+    assert!(!invalid.status.success());
+    assert!(!temporary.path().join("bob/inbox").exists());
+
+    let first = send(temporary.path(), "one", &["--idempotency-key", "one"]);
+    let second = send(temporary.path(), "two", &["--idempotency-key", "two"]);
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_ne!(first.stdout, second.stdout);
+    assert_eq!(
+        st2::message::list_dir(&temporary.path().join("bob/inbox"))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn since_is_strict_and_composes_with_other_list_filters() {
     let tmp = tempfile::tempdir().unwrap();

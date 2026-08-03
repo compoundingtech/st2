@@ -14,6 +14,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,8 +45,16 @@ pub struct Message {
     pub tags: Vec<String>,
     /// `priority:` — `low` | `normal` | `high`, if set.
     pub priority: Option<String>,
+    /// `idempotency-key:` — the optional sender key for local retry deduplication.
+    pub idempotency_key: Option<String>,
     /// The markdown body.
     pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdempotentSendSeam {
+    BeforePublication,
+    AfterPublication,
 }
 
 /// Current unix time in milliseconds.
@@ -108,8 +118,22 @@ pub fn render_message(
     tags: &[String],
     body: &str,
 ) -> String {
+    render_message_fields(from, subject, in_reply_to, tags, body, None)
+}
+
+fn render_message_fields(
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("from: {from}\n"));
+    if let Some(key) = idempotency_key {
+        s.push_str(&format!("idempotency-key: {key}\n"));
+    }
     if let Some(subj) = subject {
         s.push_str(&format!("subject: {subj}\n"));
     }
@@ -142,6 +166,7 @@ fn parse_message(filename: &str, contents: &str) -> Message {
         in_reply_to: None,
         tags: Vec::new(),
         priority: None,
+        idempotency_key: None,
         body: String::new(),
     };
 
@@ -173,6 +198,7 @@ fn parse_message(filename: &str, contents: &str) -> Message {
                         .collect()
                 }
                 "priority" => msg.priority = Some(v.to_string()),
+                "idempotency-key" => msg.idempotency_key = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -200,12 +226,139 @@ pub fn send_to_inbox(
 ) -> anyhow::Result<String> {
     fs::create_dir_all(inbox_dir)?;
     let contents = render_message(from, subject, in_reply_to, tags, body);
+    publish_message_with_seam(inbox_dir, &contents, |_| Ok(()))
+}
+
+/// Send one normal message with a local idempotency key.
+///
+/// While the short local lock is held, st2 searches the recipient inbox first and archive second.
+/// A retry returns the first matching normal message. If that message is deleted, st2 forgets the
+/// key and a later send creates a new message.
+#[allow(clippy::too_many_arguments)]
+pub fn send_idempotent_to_inbox(
+    inbox_dir: &Path,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<String> {
+    send_idempotent_to_inbox_with_seam(
+        inbox_dir,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        idempotency_key,
+        |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_idempotent_to_inbox_with_seam(
+    inbox_dir: &Path,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: &str,
+    seam: impl FnMut(IdempotentSendSeam) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    validate_idempotency_key(idempotency_key)?;
+    fs::create_dir_all(inbox_dir)?;
+    let _lock = MessageIdempotencyLock::acquire(inbox_dir)?;
+
+    if let Some(filename) = find_idempotent_message(inbox_dir, idempotency_key)? {
+        return Ok(filename);
+    }
+
+    let contents = render_message_fields(
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        Some(idempotency_key),
+    );
+    publish_message_with_seam(inbox_dir, &contents, seam)
+}
+
+fn validate_idempotency_key(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control),
+        "message idempotency key must be non-empty single-line text without surrounding whitespace"
+    );
+    Ok(())
+}
+
+fn find_idempotent_message(inbox_dir: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    for message in list_dir(inbox_dir)? {
+        if message.idempotency_key.as_deref() == Some(key) {
+            return Ok(Some(message.filename));
+        }
+    }
+    for message in list_dir(&sibling_archive_dir(inbox_dir))? {
+        if message.idempotency_key.as_deref() == Some(key) {
+            return Ok(Some(message.filename));
+        }
+    }
+    Ok(None)
+}
+
+const IDEMPOTENCY_LOCK_FILE: &str = ".message-idempotency.lock";
+
+struct MessageIdempotencyLock {
+    file: File,
+}
+
+impl MessageIdempotencyLock {
+    fn acquire(inbox_dir: &Path) -> anyhow::Result<Self> {
+        let path = inbox_dir.join(IDEMPOTENCY_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("open message idempotency lock {}", path.display()))?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "message idempotency lock is not a regular file: {}",
+            path.display()
+        );
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("lock message idempotency file {}", path.display()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for MessageIdempotencyLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn publish_message_with_seam(
+    inbox_dir: &Path,
+    contents: &str,
+    mut seam: impl FnMut(IdempotentSendSeam) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
     // This deliberately cannot match `is_message_filename`, so a concurrent scan ignores it.
     let tmp = inbox_dir.join(tmp_name());
-    if let Err(error) = fs::write(&tmp, &contents) {
+    if let Err(error) = fs::write(&tmp, contents) {
         let _ = fs::remove_file(&tmp);
         return Err(error.into());
     }
+    seam(IdempotentSendSeam::BeforePublication)?;
     for _ in 0..8 {
         let filename = new_filename();
         let path = inbox_dir.join(&filename);
@@ -214,6 +367,7 @@ pub fn send_to_inbox(
                 let _ = fs::remove_file(&tmp);
                 return Err(error.into());
             }
+            seam(IdempotentSendSeam::AfterPublication)?;
             return Ok(filename);
         }
     }
@@ -842,6 +996,56 @@ pub fn send_to_resolved_inbox(
     tags: &[String],
     body: &str,
 ) -> anyhow::Result<String> {
+    send_to_resolved_inbox_with_key(
+        catalog_root,
+        recipient,
+        this_host,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn send_idempotent_to_resolved_inbox(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<String> {
+    send_to_resolved_inbox_with_key(
+        catalog_root,
+        recipient,
+        this_host,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        Some(idempotency_key),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_to_resolved_inbox_with_key(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> anyhow::Result<String> {
     let agent = match resolve_agent_handle(catalog_root, recipient, this_host)? {
         Some(agent) => agent,
         None => {
@@ -851,13 +1055,14 @@ pub fn send_to_resolved_inbox(
                 && discovered.specs.is_empty()
                 && discovered.errors.is_empty()
             {
-                return send_to_inbox(
+                return send_to_inbox_with_optional_key(
                     &catalog_root.join(recipient).join("inbox"),
                     from,
                     subject,
                     in_reply_to,
                     tags,
                     body,
+                    idempotency_key,
                 );
             }
             anyhow::bail!(
@@ -870,23 +1075,41 @@ pub fn send_to_resolved_inbox(
     if let Some(capability) = agent.capability.as_ref() {
         let inbox = open_message_box(capability, &["resources", "inbox"], true)?
             .context("created inbox capability is missing")?;
-        send_to_inbox(
+        send_to_inbox_with_optional_key(
             &crate::catalog_transaction::retained_dir_path(&inbox)?,
             from,
             subject,
             in_reply_to,
             tags,
             body,
+            idempotency_key,
         )
     } else {
-        send_to_inbox(
+        send_to_inbox_with_optional_key(
             &inbox_dir(&agent.path),
             from,
             subject,
             in_reply_to,
             tags,
             body,
+            idempotency_key,
         )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_to_inbox_with_optional_key(
+    inbox: &Path,
+    from: &str,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> anyhow::Result<String> {
+    match idempotency_key {
+        Some(key) => send_idempotent_to_inbox(inbox, from, subject, in_reply_to, tags, body, key),
+        None => send_to_inbox(inbox, from, subject, in_reply_to, tags, body),
     }
 }
 
@@ -1159,6 +1382,145 @@ mod tests {
         // Source already absent + receipt present is idempotent success too.
         archive_msg(&inbox, &archive, &filename).unwrap();
         assert_eq!(fs::read(archive.join(&filename)).unwrap(), receipt);
+    }
+
+    fn send_with_key(inbox: &Path, key: &str, body: &str) -> String {
+        send_idempotent_to_inbox(
+            inbox,
+            "producer",
+            Some("retryable message"),
+            None,
+            &[],
+            body,
+            key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn idempotent_send_follows_inbox_archive_and_deletion_lifetime() {
+        let temporary = tempfile::tempdir().unwrap();
+        let inbox = temporary.path().join("inbox");
+        let archive = temporary.path().join("archive");
+
+        let first = send_with_key(&inbox, "daily-2026-07-31", "first body");
+        let first_bytes = fs::read(inbox.join(&first)).unwrap();
+        let first_modified = fs::metadata(inbox.join(&first))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let parsed = read_msg(&inbox, &first).unwrap();
+        assert_eq!(parsed.idempotency_key.as_deref(), Some("daily-2026-07-31"));
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let inbox_retry = send_with_key(&inbox, "daily-2026-07-31", "changed body");
+        assert_eq!(inbox_retry, first);
+        assert_eq!(list_dir(&inbox).unwrap().len(), 1);
+        assert_eq!(fs::read(inbox.join(&first)).unwrap(), first_bytes);
+        assert_eq!(
+            fs::metadata(inbox.join(&first))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            first_modified,
+            "a retry must not rewrite the DING-triggering inbox file"
+        );
+
+        archive_msg(&inbox, &archive, &first).unwrap();
+        let archived_retry = send_with_key(&inbox, "daily-2026-07-31", "third body");
+        assert_eq!(archived_retry, first);
+        assert!(list_dir(&inbox).unwrap().is_empty());
+        assert_eq!(list_dir(&archive).unwrap().len(), 1);
+
+        fs::remove_file(archive.join(&first)).unwrap();
+        let after_delete = send_with_key(&inbox, "daily-2026-07-31", "new lifetime");
+        assert_ne!(after_delete, first);
+        assert_eq!(
+            read_msg(&inbox, &after_delete).unwrap().body.trim_end(),
+            "new lifetime"
+        );
+        assert!(!temporary.path().join("message-receipts").exists());
+    }
+
+    #[test]
+    fn concurrent_retries_create_one_normal_message() {
+        use std::sync::{Arc, Barrier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let inbox = Arc::new(temporary.path().join("inbox"));
+        let workers = 12;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut threads = Vec::new();
+        for index in 0..workers {
+            let inbox = Arc::clone(&inbox);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                send_with_key(&inbox, "delivery-42", &format!("body {index}"))
+            }));
+        }
+        let filenames: Vec<String> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(filenames.iter().all(|filename| filename == &filenames[0]));
+        assert_eq!(list_dir(&inbox).unwrap().len(), 1);
+
+        let other = send_with_key(&inbox, "delivery-43", "other");
+        assert_ne!(other, filenames[0]);
+        assert_eq!(list_dir(&inbox).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retry_recovers_at_each_message_publication_crash_seam() {
+        for crash in [
+            IdempotentSendSeam::BeforePublication,
+            IdempotentSendSeam::AfterPublication,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let inbox = temporary.path().join("inbox");
+            let failed = send_idempotent_to_inbox_with_seam(
+                &inbox,
+                "producer",
+                Some("crash seam"),
+                None,
+                &[],
+                "first body",
+                "alert-1",
+                |seam| {
+                    if seam == crash {
+                        anyhow::bail!("injected crash at {seam:?}");
+                    }
+                    Ok(())
+                },
+            );
+            assert!(failed.is_err(), "{crash:?}");
+
+            let retry = send_with_key(&inbox, "alert-1", "retry body");
+            assert_eq!(list_dir(&inbox).unwrap().len(), 1, "{crash:?}");
+            let message = read_msg(&inbox, &retry).unwrap();
+            let expected_body = match crash {
+                IdempotentSendSeam::BeforePublication => "retry body",
+                IdempotentSendSeam::AfterPublication => "first body",
+            };
+            assert_eq!(message.body.trim_end(), expected_body, "{crash:?}");
+        }
+    }
+
+    #[test]
+    fn inbox_match_wins_before_archive_match() {
+        let temporary = tempfile::tempdir().unwrap();
+        let inbox = temporary.path().join("inbox");
+        let archive = temporary.path().join("archive");
+        let archived = send_with_key(&inbox, "same", "archived");
+        archive_msg(&inbox, &archive, &archived).unwrap();
+
+        let contents = render_message_fields("producer", None, None, &[], "inbox", Some("same"));
+        let inbox_copy = publish_message_with_seam(&inbox, &contents, |_| Ok(())).unwrap();
+        assert_ne!(inbox_copy, archived);
+
+        let selected = send_with_key(&inbox, "same", "retry");
+        assert_eq!(selected, inbox_copy);
     }
 
     #[test]

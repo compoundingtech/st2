@@ -377,6 +377,23 @@ st2 agents --json --enrich
 st2 context read --full
 ```
 
+Use one optional key when a sender can retry the same message:
+
+```sh
+check_status | st2 message send <recipient> \
+  --idempotency-key daily-check-2026-07-31 \
+  --subject "Daily check"
+```
+
+st2 stores the key in the normal message frontmatter. It takes a short local
+lock and searches the recipient inbox first. It then searches the archive. A
+retry returns the first matching filename. It does not create another inbox
+file or another DING. If the archived message is deleted, st2 forgets the key.
+
+This rule applies to one recipient on one local catalog filesystem. It is not a
+global exactly-once rule across replicas. Without `--idempotency-key`, `message
+send` keeps its existing bytes, filename output, and inbox behavior.
+
 The roster includes retired declarations instead of silently conflating them with runtime
 presence. Both JSON shapes keep stable `identity` separate from optional `name` and `description`,
 and contain `retired` plus the declaration's ordered `resources` descriptors. `--enrich`
