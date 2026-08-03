@@ -149,6 +149,8 @@ fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)>
     let mut name = None;
     let mut tag = None;
     let mut uri = None;
+    let mut relation = None;
+    let mut reason = None;
     for entry in node.entries() {
         let Some(property) = entry.name() else {
             if name.is_some() {
@@ -182,6 +184,24 @@ fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)>
                     anyhow::bail!("resource binding needs string `uri`");
                 }
             }
+            "relation" => {
+                if relation.is_some() {
+                    anyhow::bail!("resource binding has duplicate `relation`");
+                }
+                relation = value;
+                if relation.is_none() {
+                    anyhow::bail!("resource binding needs string `relation`");
+                }
+            }
+            "reason" => {
+                if reason.is_some() {
+                    anyhow::bail!("resource binding has duplicate `reason`");
+                }
+                reason = value;
+                if reason.is_none() {
+                    anyhow::bail!("resource binding needs string `reason`");
+                }
+            }
             other => anyhow::bail!("resource binding has unsupported property `{other}`"),
         }
     }
@@ -191,6 +211,8 @@ fn resource_node_to_raw(node: &KdlNode) -> anyhow::Result<(String, RawResource)>
         RawResource {
             tag: tag.ok_or_else(|| anyhow::anyhow!("resource binding needs string `_tag`"))?,
             uri: uri.ok_or_else(|| anyhow::anyhow!("resource binding needs string `uri`"))?,
+            relation,
+            reason,
         },
     ))
 }

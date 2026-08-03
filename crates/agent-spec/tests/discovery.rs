@@ -456,8 +456,8 @@ fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
         "agents/h/kdl/agent.kdl",
         r#"agent "kdl" {
   host "h"
-  resource "source" _tag="worktree" uri="worktree://github.com/example/project/main"
-  resource "work" _tag="github-issue" uri="github-issue://example/project/41"
+  resource "source" _tag="worktree" uri="worktree://github.com/example/project/main" relation="uses" reason="Primary checkout."
+  resource "work" _tag="github-issue" uri="github-issue://example/project/41" relation="current-work" reason="Current implementation task."
   command "true"
 }"#,
     );
@@ -468,8 +468,8 @@ fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
   "identity": "json",
   "host": "h",
   "resource": {
-    "work": {"_tag": "github-issue", "uri": "github-issue://example/project/41"},
-    "source": {"_tag": "worktree", "uri": "worktree://github.com/example/project/main"}
+    "work": {"_tag": "github-issue", "uri": "github-issue://example/project/41", "relation": "current-work", "reason": "Current implementation task."},
+    "source": {"_tag": "worktree", "uri": "worktree://github.com/example/project/main", "relation": "uses", "reason": "Primary checkout."}
   },
   "command": "true"
 }"#,
@@ -484,26 +484,34 @@ command = "true"
 [resource.work]
 _tag = "github-issue"
 uri = "github-issue://example/project/41"
+relation = "current-work"
+reason = "Current implementation task."
 
 [resource.source]
 _tag = "worktree"
 uri = "worktree://github.com/example/project/main"
+relation = "uses"
+reason = "Primary checkout."
 "#,
     );
 
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let expected = vec![
-        Resource::new(
+        Resource::new_with_relation_reason(
             "source".into(),
             "worktree".into(),
             "worktree://github.com/example/project/main".into(),
+            "uses".into(),
+            "Primary checkout.".into(),
         )
         .unwrap(),
-        Resource::new(
+        Resource::new_with_relation_reason(
             "work".into(),
             "github-issue".into(),
             "github-issue://example/project/41".into(),
+            "current-work".into(),
+            "Current implementation task.".into(),
         )
         .unwrap(),
     ];
@@ -514,11 +522,142 @@ uri = "worktree://github.com/example/project/main"
     let json = serde_json::to_string(&expected).unwrap();
     assert_eq!(
         json,
-        r#"[{"name":"source","_tag":"worktree","uri":"worktree://github.com/example/project/main"},{"name":"work","_tag":"github-issue","uri":"github-issue://example/project/41"}]"#
+        r#"[{"name":"source","_tag":"worktree","uri":"worktree://github.com/example/project/main","relation":"uses","reason":"Primary checkout."},{"name":"work","_tag":"github-issue","uri":"github-issue://example/project/41","relation":"current-work","reason":"Current implementation task."}]"#
     );
     assert_eq!(
         serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
         expected
+    );
+}
+
+#[test]
+fn legacy_resources_remain_compatible_and_relation_reason_are_an_optional_pair() {
+    let legacy = Resource::new(
+        "source".into(),
+        "worktree".into(),
+        "worktree://example/project".into(),
+    )
+    .unwrap();
+    assert_eq!(legacy.relation(), None);
+    assert_eq!(legacy.reason(), None);
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        r#"{"name":"source","_tag":"worktree","uri":"worktree://example/project"}"#
+    );
+
+    for descriptor in [
+        r#"{"name":"work","_tag":"issue","uri":"issue://one","relation":"uses"}"#,
+        r#"{"name":"work","_tag":"issue","uri":"issue://one","reason":"Needed here."}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<Resource>(descriptor).is_err(),
+            "{descriptor}"
+        );
+    }
+}
+
+#[test]
+fn malformed_relation_and_reason_values_are_rejected_causally() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (identity, relation, reason) in [
+        ("missing-reason", " relation=\"uses\"", ""),
+        ("missing-relation", "", " reason=\"Needed here.\""),
+        (
+            "relation-uppercase",
+            " relation=\"Uses\"",
+            " reason=\"Needed here.\"",
+        ),
+        (
+            "relation-double-hyphen",
+            " relation=\"current--work\"",
+            " reason=\"Needed here.\"",
+        ),
+        (
+            "reason-leading-space",
+            " relation=\"uses\"",
+            " reason=\" Needed here.\"",
+        ),
+        (
+            "reason-line-separator",
+            " relation=\"uses\"",
+            " reason=\"Needed\u{2028}here.\"",
+        ),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!(
+                "agent \"{identity}\" {{\n  host \"h\"\n  resource \"work\" _tag=\"issue\" uri=\"issue://one\"{relation}{reason}\n  command \"true\"\n}}"
+            ),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    let messages = found
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("must also declare string `reason`"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("must also declare string `relation`"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("ASCII kebab-case"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|error| error.contains("surrounding Unicode whitespace"))
+    );
+}
+
+#[test]
+fn relation_and_reason_byte_bounds_are_enforced() {
+    let valid_relation = "a".repeat(64);
+    let too_long_relation = "a".repeat(65);
+    let valid_reason = "x".repeat(160);
+    let multibyte_too_long_reason = "é".repeat(81);
+
+    assert!(
+        Resource::new_with_relation_reason(
+            "work".into(),
+            "issue".into(),
+            "issue://one".into(),
+            valid_relation,
+            valid_reason,
+        )
+        .is_ok()
+    );
+    assert!(
+        Resource::new_with_relation_reason(
+            "work".into(),
+            "issue".into(),
+            "issue://one".into(),
+            too_long_relation,
+            "Needed here.".into(),
+        )
+        .is_err()
+    );
+    assert!(
+        Resource::new_with_relation_reason(
+            "work".into(),
+            "issue".into(),
+            "issue://one".into(),
+            "uses".into(),
+            multibyte_too_long_reason,
+        )
+        .is_err()
     );
 }
 
