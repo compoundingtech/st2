@@ -807,6 +807,7 @@ fn up_once_collects_spawn_errors_without_aborting() {
         ..Default::default()
     };
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(!report.invalid_declarations);
     assert_eq!(report.launched, vec!["hetz.demo.ding"]);
     assert_eq!(report.errors.len(), 1);
     assert!(report.errors[0].contains("hetz.demo-claude"));
