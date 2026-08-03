@@ -1069,6 +1069,21 @@ pub fn execute(
     );
 }
 
+fn stop_live_derived_companions(
+    launch: &crate::reconcile::Launch<'_>,
+    runner: &dyn Runner,
+    report: &mut UpReport,
+) {
+    for companion_id in &launch.live_derived {
+        match runner.kill(companion_id) {
+            Ok(()) => report.torn_down.push(companion_id.clone()),
+            Err(error) => report
+                .errors
+                .push(format!("kill unavailable derived companion {companion_id}: {error}")),
+        }
+    }
+}
+
 fn execute_with_presentation_cursor(
     plan: &ReconcilePlan,
     runner: &dyn Runner,
@@ -1130,14 +1145,7 @@ fn execute_with_presentation_cursor(
                     }
                     if target.name == "agent" && !target.derived {
                         agent_available = false;
-                        for companion_id in &launch.live_derived {
-                            match runner.kill(companion_id) {
-                                Ok(()) => report.torn_down.push(companion_id.clone()),
-                                Err(error) => report.errors.push(format!(
-                                    "kill terminal companion {companion_id}: {error}"
-                                )),
-                            }
-                        }
+                        stop_live_derived_companions(launch, runner, report);
                     }
                     continue;
                 }
@@ -1162,6 +1170,7 @@ fn execute_with_presentation_cursor(
                             .push(format!("reap {} for restart: {e}", target.pty_id));
                         if target.name == "agent" && !target.derived {
                             agent_available = false;
+                            stop_live_derived_companions(launch, runner, report);
                         }
                         continue;
                     }
@@ -1183,6 +1192,7 @@ fn execute_with_presentation_cursor(
                     report.errors.push(format!("spawn {}: {e}", target.pty_id));
                     if target.name == "agent" && !target.derived {
                         agent_available = false;
+                        stop_live_derived_companions(launch, runner, report);
                     }
                 }
             }

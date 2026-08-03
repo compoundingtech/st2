@@ -303,6 +303,9 @@ st2 up --catalog "$CATALOG" --host <host> --once --task <host.agent.task>
 ```
 
 Unknown, ambiguous, and wrong-host task selectors refuse before workspace writes or PTY inspection.
+A selected generated DING that is dead or absent is reported as `held`, because starting its
+canonical agent would broaden the exact-task operation. Explicit sibling tasks remain independently
+selectable.
 
 `st2 doctor` accepts the absence of a live host lock as the normal manual/`--once` mode. For a
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the

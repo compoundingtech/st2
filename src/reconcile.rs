@@ -218,6 +218,10 @@ pub fn reconcile_selected<'a>(
         }
         return Ok(plan);
     }
+    if task.derived && !actual.is_some_and(|session| session.alive) {
+        plan.held.push(runtime);
+        return Ok(plan);
+    }
     let launch = match (&task.command, &task.argv) {
         (Some(command), None) => TaskLaunch::Shell(command.clone()),
         (None, Some(argv)) => TaskLaunch::Argv(argv.clone()),

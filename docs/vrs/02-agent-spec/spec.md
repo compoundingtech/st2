@@ -115,9 +115,10 @@ evidence: [materializer](../../../src/materialize.rs).
 Add only the unique missing child. Remove and clean only an old child with exact
 ownership proof. A compact DING is a derived child: it starts only after its
 canonical agent is already live or starts successfully in the same pass. When
-that target is held or terminally parked, do not launch the derived child and
-stop an exact generated child proved live. Explicit sibling tasks, including an
-authored `exec "ding"`, remain independent. Do not change unrelated siblings.
+that target is held, fails to restart, or is terminally parked, do not launch
+the derived child and stop an exact generated child proved live. Explicit
+sibling tasks, including an authored `exec "ding"`, remain independent. Do not
+change unrelated siblings.
 
 Authoring: [pinned compact and explicit tasks][evals-tasks]. st2 source:
 [`Task` and `TaskKind`](../../../crates/agent-spec/src/spec.rs). Evidence:

@@ -330,6 +330,25 @@ fn selected_adopt_only_absent_task_is_reported_held_without_runner_mutation() {
 }
 
 #[test]
+fn selected_missing_derived_ding_is_held_without_broadening_to_its_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner::default();
+
+    let report = up_once_selected(tmp.path(), "hetz.demo.ding", "hetz", &runner).unwrap();
+
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(report.held, ["hetz.demo.ding"]);
+    assert!(report.launched.is_empty());
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
+}
+
+#[test]
 fn selected_one_shot_live_adopts_without_actions() {
     let runner = FakeRunner {
         sessions: vec![
@@ -877,6 +896,46 @@ fn up_once_does_not_report_failed_replacement_as_restarted() {
             .iter()
             .any(|error| error == "spawn hetz.demo-claude: simulated spawn failure")
     );
+}
+
+#[test]
+fn failed_compact_agent_restart_stops_its_live_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        fail_spawn: Some("hetz.demo".into()),
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+}
+
+#[test]
+fn failed_compact_agent_reap_stops_its_live_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        fail_reap: Some("hetz.demo".into()),
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
 }
 
 #[test]
