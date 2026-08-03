@@ -40,6 +40,31 @@ fn retired_agent_kdl(identity: &str, host: &str) -> String {
     )
 }
 
+#[test]
+fn agents_help_marks_cross_host_presence_experimental_and_non_authoritative() {
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["agents", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).unwrap();
+    for required in [
+        "EXPERIMENTAL: Cross-host presence is best-effort",
+        "delayed, stale, or asymmetric",
+        "A remote `unknown` means no fresh observation",
+        "not proof that an agent or host is unhealthy",
+        "never gates local work or triggers restart, teardown, reconciliation",
+        "or a global-fleet health conclusion",
+        "Host-local runtime and service evidence remains authoritative",
+    ] {
+        assert!(help.contains(required), "missing {required:?} in:\n{help}");
+    }
+}
+
 /// The roster enumerates every catalog agent by bus id (sorted), projects each one's presence, and —
 /// with enrich data — its inbox count and last-activity.
 #[test]

@@ -229,6 +229,12 @@ enum Command {
     },
     /// List every agent in the catalog with presence and retirement state. `--json [--enrich]` is
     /// the stable machine-readable roster.
+    ///
+    /// EXPERIMENTAL: Cross-host presence is best-effort. Ordinary catalog replication may be
+    /// delayed, stale, or asymmetric. A remote `unknown` means no fresh observation, not proof that
+    /// an agent or host is unhealthy. Cross-host presence never gates local work or triggers
+    /// restart, teardown, reconciliation, or a global-fleet health conclusion. Host-local runtime
+    /// and service evidence remains authoritative for lifecycle decisions.
     Agents {
         /// The catalog folder (like `st2 ls`/`up`). Falls back to `--root`/`$CATALOG`.
         #[arg(conflicts_with = "catalog_path")]
