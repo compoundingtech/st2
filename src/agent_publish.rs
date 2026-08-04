@@ -7,8 +7,8 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use agent_spec::discovery::parse_declared;
+use agent_spec::{DeclaredValue, parse_declared_document};
 use anyhow::{Context, Result};
-use kdl::KdlDocument;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -137,27 +137,42 @@ impl Candidate {
         let bytes = fs::read(&spec_path)
             .with_context(|| format!("read candidate spec {}", spec_path.display()))?;
         let text = std::str::from_utf8(&bytes).context("candidate Agent Spec is not UTF-8")?;
-        let document = KdlDocument::parse(text)
-            .map_err(|error| anyhow::anyhow!("KDL parse error: {error}"))?;
+        let parsed = parse_declared_document(&spec_path, text);
         anyhow::ensure!(
-            document.nodes().len() == 1 && document.nodes()[0].name().value() == "agent",
+            parsed.is_valid(),
+            "candidate fails strict declaration parsing:\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == agent_spec::DeclaredSeverity::Error)
+                .map(|diagnostic| format!(
+                    "{}:{}:{} [{}]: {}",
+                    diagnostic.source.display(),
+                    diagnostic.span.line,
+                    diagnostic.span.column,
+                    diagnostic.code,
+                    diagnostic.message
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let document = parsed
+            .document
+            .context("candidate Agent Spec has no parsed declaration")?;
+        anyhow::ensure!(
+            document.nodes.len() == 1 && document.agents.len() == 1,
             "candidate must contain exactly one top-level `agent` node"
         );
-        let declared = parse_declared(&spec_path)
-            .with_context(|| format!("parse candidate Agent Spec {}", spec_path.display()))?;
-        anyhow::ensure!(
-            declared.len() == 1,
-            "candidate must declare exactly one agent (found {})",
-            declared.len()
-        );
-        let host = declared[0]
-            .host
-            .as_deref()
+        let declared = &document.agents[0];
+        let host = declared
+            .field("host")
+            .and_then(|field| field.argument(0))
+            .and_then(DeclaredValue::as_str)
             .filter(|value| !value.is_empty())
             .context("candidate must declare a non-empty explicit host")?;
-        let identity = declared[0]
-            .identity
-            .as_deref()
+        let identity = declared
+            .identity()
+            .and_then(DeclaredValue::as_str)
             .filter(|value| !value.is_empty())
             .context("candidate must declare a non-empty explicit identity")?;
         validate_component("host", host)?;
@@ -454,6 +469,8 @@ fn copy_filtered_catalog(
 }
 
 fn is_declaration_parent(path: &Path) -> Result<bool> {
+    // These are independent catalog children discovered while constructing the post-write shadow,
+    // not a reparse of `Candidate`: each file must be admitted before its adjacent state is pruned.
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let entry = entry?;
         let candidate = entry.path();
