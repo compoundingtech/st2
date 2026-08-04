@@ -1652,7 +1652,11 @@ fn agents_cmd(
     let (root, host) = resolve_ctx(&ctx)?;
     let _catalog_lock = st2::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for agent roster")?;
-    let found = st2::discover(&root);
+    let found = if identity.is_some() {
+        st2::discover_strict(&root)
+    } else {
+        st2::discover(&root)
+    };
     if identity.is_some() && !found.errors.is_empty() {
         let errors = found
             .errors

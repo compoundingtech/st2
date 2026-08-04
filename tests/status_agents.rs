@@ -4,6 +4,8 @@
 //! roster, and derive `unknown` from staleness.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -363,6 +365,40 @@ fn exact_identity_rejects_incomplete_catalog_discovery() {
     assert!(ordinary.status.success());
     let rows: serde_json::Value = serde_json::from_slice(&ordinary.stdout).unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_identity_rejects_incomplete_catalog_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "valid/worker.kdl", &agent_kdl("worker", "h"));
+    write(root, "unreadable/hidden.kdl", &agent_kdl("worker", "h"));
+    fs::set_permissions(
+        root.join("unreadable"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+
+    fs::set_permissions(
+        root.join("unreadable"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(!selected.status.success());
+    let stderr = String::from_utf8_lossy(&selected.stderr);
+    assert!(
+        stderr.contains("cannot select an exact Agent Spec while catalog discovery has 1 error")
+    );
+    assert!(stderr.contains("unreadable"));
+    assert!(stderr.contains("catalog directory traversal failed"));
 }
 
 #[test]
