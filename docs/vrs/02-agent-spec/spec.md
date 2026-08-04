@@ -332,7 +332,7 @@ relaunch. An agent identity removal in the same change uses F02. A child removal
 uses F09 or F10 proof.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:
-[`AgentSpec::retired`](../../../crates/agent-spec/src/spec.rs). Evidence:
+[`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [retirement planning](../../../src/reconcile.rs).
 
 <h3 id="f14">F14 Compact agent fields</h3>
@@ -369,6 +369,45 @@ Authoring: [pinned validation, health, and lifecycle][evals-lifecycle]. st2
 source: [`RawSpec` and `AgentSpec`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [validation](../../../src/validate.rs) and
 [reconciliation](../../../src/reconcile.rs).
+
+<h3 id="f18">F18 <code>desired-state</code> and <code>reason</code></h3>
+
+`desired-state` is one of `running`, `suspended`, or `retired`. Its omission is
+running. A suspended or new-style retired declaration carries exactly one
+`reason` property of 1..160 UTF-8 bytes with no surrounding whitespace,
+controls, or Unicode line separators. Running carries no reason. Legacy
+`retired #true` remains readable without a reason; any declaration containing
+both lifecycle forms is invalid.
+
+Running enters the ordinary field rules. Suspended and retired declarations
+fence launch and materialization, then remove their exact live task set,
+including generated companions. A suspended declaration is healthy when no
+task is live and every retained dead record is explicitly keep-pinned. A
+retired declaration is complete only when every declared task record is
+absent. Resume does not override `keep`, `adopt-only`, ownership proof, or
+drift/replacement policy. Inbox, archive, context, resources, and presence files
+are outside task teardown and remain addressable.
+
+The canonical KDL authoring form is:
+
+```kdl
+desired-state "suspended" reason="Waiting for capacity"
+```
+
+The safe authoring surface is
+`st2 agent desired-state <identity> <state> [--reason ...]`. It serializes with
+other catalog writers, preserves unrelated
+source bytes, refuses Nix-owned declarations, and returns an authored-intent
+receipt. It does not imply that reconciliation or Doctor has observed
+convergence.
+
+st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
+[KDL lowering](../../../crates/agent-spec/src/kdl_format.rs),
+[authoring](../../../src/agent_author.rs), and
+[reconciliation](../../../src/reconcile.rs). Evidence:
+[parser](../../../crates/agent-spec/tests/discovery.rs),
+[authoring](../../../tests/agent_desired_state.rs), and
+[planning](../../../tests/reconcile.rs).
 
 <h3 id="f17">F17 Agent <code>name</code> and <code>description</code></h3>
 
@@ -412,7 +451,7 @@ Plan the snapshot, normalized difference, ownership, conflicts, and rollback.
 Refuse before mutation when a required proof is missing. Then omit empty phases
 from this fixed order:
 
-1. **FENCE:** prevent launch of old, replaced, and retired IDs.
+1. **FENCE:** prevent launch of old, replaced, suspended, and retired IDs.
 2. **REMOVE/QUIESCE:** stop exact old incarnations and release their resources.
 3. **MATERIALIZE:** write final state for survivors and additions.
 4. **ADD/BOOT:** boot missing or explicitly replaced work from final bytes.
@@ -478,11 +517,16 @@ replacement of drifted work.
 - A workspace survivor gets one event. Absent or dead work boots the latest
   workspace. Explicit task `cwd` drift stays visible.
 - Changed render or Resource state commits before one combined event. Unchanged,
-  failed, rolled-back, periodic, new, replaced, and retired paths emit none.
+  failed, rolled-back, periodic, new, replaced, suspended, and retired paths emit none.
 - DING failure retains the event. Replay has no extra effect, and inbox events
   do not cause inbox events.
 - Add, remove, rename, and retirement affect exact IDs, including simultaneous
   child removal. Legacy or partial proof holds or refuses.
+- Suspension stops the exact live task set, including a derived DING, while an
+  unrelated sibling retains its generation and a durable inbox message retains
+  its filename. Resume uses ordinary keep/adopt-only/service rules. Doctor
+  accepts only no-live plus keep-pinned dead records for suspension and still
+  requires complete record absence for retirement.
 - Matching fingerprints adopt. Mismatches drift. Explicit replacement proves
   the exact incarnation through fence, quiesce, materialize, and boot.
 - Name and description changes update roster and exact PTY metadata while task

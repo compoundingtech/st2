@@ -1,4 +1,4 @@
-//! Constrained, source-preserving authoring of Agent Spec presentation metadata.
+//! Constrained, source-preserving authoring of Agent Spec presentation and desired state.
 //!
 //! Presentation is declaration state, not runtime identity. Every edit holds the shared persistent
 //! catalog-authoring lock, rechecks the original bytes, and atomically replaces exactly one
@@ -13,7 +13,10 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use agent_spec::spec::{AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, validate_presentation};
+use agent_spec::spec::{
+    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, validate_desired_state_reason,
+    validate_presentation,
+};
 use kdl::{KdlDocument, KdlNode};
 use serde::Serialize;
 
@@ -86,6 +89,34 @@ pub struct PresentationReceipt {
     pub retired: bool,
 }
 
+/// Stable authored desired-state selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DesiredStateValue {
+    Running,
+    Suspended,
+    Retired,
+}
+
+impl DesiredStateValue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Suspended => "suspended",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+/// Stable machine-readable receipt from one desired-state edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesiredStateReceipt {
+    pub result: AuthorOutcome,
+    pub identity: String,
+    pub desired_state: DesiredStateValue,
+    pub reason: Option<String>,
+}
+
 /// A classified authoring refusal. `code` is stable for machine consumers.
 #[derive(Debug)]
 pub struct AuthorError {
@@ -123,6 +154,80 @@ struct AgentTarget {
     retired: bool,
 }
 
+/// Author one whole-agent desired state without claiming runtime convergence.
+pub fn set_desired_state(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    state: DesiredStateValue,
+    reason: Option<&str>,
+) -> Result<DesiredStateReceipt, AuthorError> {
+    match state {
+        DesiredStateValue::Running if reason.is_some() => {
+            return Err(AuthorError::new(
+                "invalid-desired-state",
+                "running desired state forbids --reason",
+            ));
+        }
+        DesiredStateValue::Suspended | DesiredStateValue::Retired if reason.is_none() => {
+            return Err(AuthorError::new(
+                "invalid-desired-state",
+                format!("{} desired state requires --reason", state.as_str()),
+            ));
+        }
+        _ => {}
+    }
+    if let Some(reason) = reason {
+        validate_desired_state_reason(reason).map_err(|error| {
+            AuthorError::new("invalid-desired-state", error.to_string())
+        })?;
+    }
+    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
+        AuthorError::new(
+            "catalog-lock-failed",
+            format!("acquire catalog-authoring lock: {error:#}"),
+        )
+    })?;
+    let found = crate::discover(catalog_root);
+    if let Some(error) = found.errors.first() {
+        return Err(AuthorError::new(
+            "catalog-malformed",
+            format!(
+                "cannot prove an exact desired-state target while {} is malformed: {}",
+                error.path.display(), error.message
+            ),
+        ));
+    }
+    let target = resolve_target(&found.specs, selector, this_host)?;
+    authorize_actor(
+        &found.specs,
+        &target.identity,
+        this_host,
+        actor,
+        "desired-state-not-authorized",
+    )?;
+    let result = edit_desired_state_declaration(
+        &catalog_lock,
+        catalog_root,
+        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
+            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
+        &target.declaration,
+        &target.identity,
+        &target.source_host,
+        &target.source_identity,
+        state,
+        reason,
+        || {},
+    )?;
+    Ok(DesiredStateReceipt {
+        result,
+        identity: target.identity,
+        desired_state: state,
+        reason: reason.map(str::to_owned),
+    })
+}
+
 /// Set or clear one presentation field for one stable Agent Spec identity.
 ///
 /// `actor` is the caller-supplied `ST_AGENT` identity. An absent actor is the explicit operator
@@ -154,7 +259,13 @@ pub fn set_presentation(
         ));
     }
     let target = resolve_target(&found.specs, selector, this_host)?;
-    authorize_actor(&found.specs, &target.identity, this_host, actor)?;
+    authorize_actor(
+        &found.specs,
+        &target.identity,
+        this_host,
+        actor,
+        "presentation-not-authorized",
+    )?;
     let requested = requested
         .map(|value| {
             validate_presentation(field.as_str(), Some(value), field.max_chars())
@@ -211,7 +322,7 @@ fn resolve_target(
             source_host: spec.resolved_host(this_host).to_owned(),
             source_identity: spec.identity.clone(),
             declaration: spec.path.clone(),
-            retired: spec.retired,
+            retired: spec.desired_state.is_retired(),
         }),
         many => {
             let mut candidates = many
@@ -235,6 +346,7 @@ fn authorize_actor(
     target: &str,
     this_host: &str,
     actor: Option<&str>,
+    refusal_code: &'static str,
 ) -> Result<(), AuthorError> {
     let Some(actor) = actor else {
         return Ok(());
@@ -272,7 +384,7 @@ fn authorize_actor(
         current = qualified;
     }
     Err(AuthorError::new(
-        "presentation-not-authorized",
+        refusal_code,
         format!("agent {actor:?} may edit only itself or a declared descendant, not {target:?}"),
     ))
 }
@@ -304,6 +416,34 @@ fn edit_declaration_for_test(
         expected_agent,
         field,
         requested,
+        before_commit,
+    )
+}
+
+#[cfg(test)]
+fn edit_desired_state_for_test(
+    path: &Path,
+    state: DesiredStateValue,
+    reason: Option<&str>,
+    before_commit: impl FnOnce(),
+) -> Result<AuthorOutcome, AuthorError> {
+    let control = path
+        .parent()
+        .expect("test declaration has a parent")
+        .join(crate::catalog_lock::CONTROL_DIR);
+    fs::create_dir_all(&control).expect("create test catalog control directory");
+    let catalog_lock = CatalogLock::exclusive(path.parent().expect("test catalog has a parent"))
+        .expect("acquire test catalog lock");
+    edit_desired_state_declaration(
+        &catalog_lock,
+        path.parent().expect("test catalog has a parent"),
+        &control,
+        path,
+        "h.worker",
+        "h",
+        "worker",
+        state,
+        reason,
         before_commit,
     )
 }
@@ -393,6 +533,156 @@ fn edit_declaration(
         before_commit,
     )?;
     Ok(AuthorOutcome::Changed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_desired_state_declaration(
+    catalog_lock: &CatalogLock,
+    catalog: &Path,
+    control: &Path,
+    path: &Path,
+    expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
+    state: DesiredStateValue,
+    reason: Option<&str>,
+    before_commit: impl FnOnce(),
+) -> Result<AuthorOutcome, AuthorError> {
+    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
+        return Err(AuthorError::new(
+            "unsupported-declaration-format",
+            format!("desired-state authoring requires canonical KDL, found {}", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AuthorError::new("declaration-read-failed", format!("reading declaration {}: {error}", path.display()))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(AuthorError::new(
+            "unsafe-declaration-path",
+            format!("refusing non-regular declaration path {}", path.display()),
+        ));
+    }
+    let original = fs::read(path).map_err(|error| {
+        AuthorError::new("declaration-read-failed", format!("reading declaration {}: {error}", path.display()))
+    })?;
+    let original_version = SourceVersion::from_metadata(&metadata);
+    let text = std::str::from_utf8(&original).map_err(|error| {
+        AuthorError::new("malformed-declaration", format!("declaration {} is not UTF-8: {error}", path.display()))
+    })?;
+    let document = KdlDocument::parse(text).map_err(|error| {
+        AuthorError::new("malformed-declaration", format!("parsing declaration {}: {error}", path.display()))
+    })?;
+    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    if is_nix_managed(target) {
+        return Err(AuthorError::new(
+            "nix-managed-declaration",
+            format!("agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}", path.display()),
+        ));
+    }
+    let Some(replacement) = desired_state_edit(text, target, state, reason)? else {
+        return Ok(AuthorOutcome::Unchanged);
+    };
+    verify_desired_state_candidate(
+        &replacement,
+        expected_identity,
+        expected_host,
+        expected_agent,
+        state,
+        reason,
+    )?;
+    atomic_replace_checked(
+        catalog_lock,
+        catalog,
+        control,
+        path,
+        &original,
+        original_version,
+        replacement.as_bytes(),
+        metadata.permissions().mode() & 0o7777,
+        before_commit,
+    )?;
+    Ok(AuthorOutcome::Changed)
+}
+
+fn desired_state_edit(
+    text: &str,
+    target: &KdlNode,
+    state: DesiredStateValue,
+    reason: Option<&str>,
+) -> Result<Option<String>, AuthorError> {
+    let lifecycle = target
+        .children()
+        .into_iter()
+        .flat_map(|children| children.nodes())
+        .filter(|child| matches!(child.name().value(), "desired-state" | "retired"))
+        .collect::<Vec<_>>();
+    if lifecycle.len() > 1 {
+        return Err(AuthorError::new(
+            "duplicate-lifecycle-field",
+            "target declares more than one lifecycle field",
+        ));
+    }
+    if state == DesiredStateValue::Running {
+        return lifecycle
+            .first()
+            .map(|node| remove_field(text, node).map(Some))
+            .unwrap_or(Ok(None));
+    }
+    let authored = format!(
+        "desired-state {} reason={}",
+        quoted(state.as_str())?,
+        quoted(reason.expect("validated by set_desired_state"))?
+    );
+    match lifecycle.as_slice() {
+        [] => insert_node(text, target, &authored).map(Some),
+        [node] => {
+            let span = node.span();
+            let range = span.offset()..span.offset() + span.len();
+            if text.get(range.clone()) == Some(authored.as_str()) {
+                return Ok(None);
+            }
+            let mut replacement = text.to_owned();
+            replacement.replace_range(range, &authored);
+            Ok(Some(replacement))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn verify_desired_state_candidate(
+    candidate: &str,
+    expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
+    state: DesiredStateValue,
+    reason: Option<&str>,
+) -> Result<(), AuthorError> {
+    let document = KdlDocument::parse(candidate).map_err(|error| {
+        AuthorError::new("unsafe-source-edit", format!("desired-state edit did not produce valid KDL: {error}"))
+    })?;
+    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let lifecycle = target
+        .children()
+        .into_iter()
+        .flat_map(|children| children.nodes())
+        .filter(|child| matches!(child.name().value(), "desired-state" | "retired"))
+        .collect::<Vec<_>>();
+    if state == DesiredStateValue::Running {
+        if lifecycle.is_empty() {
+            return Ok(());
+        }
+    } else if let [node] = lifecycle.as_slice()
+        && node.name().value() == "desired-state"
+        && node.get(0).and_then(|entry| entry.as_string()) == Some(state.as_str())
+        && node.get("reason").and_then(|entry| entry.as_string()) == reason
+    {
+        return Ok(());
+    }
+    Err(AuthorError::new(
+        "unsafe-source-edit",
+        "desired-state candidate did not read back as the authored intent",
+    ))
 }
 
 fn exact_agent_node<'a>(
@@ -554,6 +844,14 @@ fn insert_field(
     field: PresentationField,
     value: &str,
 ) -> Result<String, AuthorError> {
+    insert_node(
+        text,
+        target,
+        &format!("{} {}", field.as_str(), quoted(value)?),
+    )
+}
+
+fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, AuthorError> {
     let span = target.span();
     let start = span.offset();
     let end = start + span.len();
@@ -563,7 +861,6 @@ fn insert_field(
             "agent span falls outside the declaration",
         )
     })?;
-    let authored = format!("{} {}", field.as_str(), quoted(value)?);
     let mut replacement = text.to_owned();
     if target.children().is_none() {
         replacement.insert_str(end, &format!(" {{ {authored} }}"));
@@ -744,7 +1041,7 @@ fn atomic_replace_checked(
         )
     })?;
     let mut temporary = tempfile::Builder::new()
-        .prefix("agent-presentation-")
+        .prefix("agent-author-")
         .tempfile_in(control)
         .map_err(|error| {
             AuthorError::new(
@@ -774,7 +1071,7 @@ fn atomic_replace_checked(
         return Err(AuthorError::new(
             "source-changed",
             format!(
-                "declaration {} changed while presentation was authored",
+                "declaration {} changed while the edit was authored",
                 path.display()
             ),
         ));
@@ -1074,5 +1371,25 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "source-changed");
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn desired_state_authoring_refuses_a_stale_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = write(
+            temporary.path(),
+            "agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+        let changed = declaration("worker", "h", None, "external");
+        let error = edit_desired_state_for_test(
+            &path,
+            DesiredStateValue::Suspended,
+            Some("Waiting for capacity"),
+            || fs::write(&path, &changed).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "source-changed");
+        assert_eq!(fs::read_to_string(path).unwrap(), changed);
     }
 }

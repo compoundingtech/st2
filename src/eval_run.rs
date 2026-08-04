@@ -16,7 +16,7 @@ use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
 use crate::reconcile::reconcile;
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
-use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+use agent_spec::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 macro_rules! eval_log {
     ($($arg:tt)*) => {
@@ -97,7 +97,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 job_type: JobType::Service,
                 workspace: a.workspace.clone(),
                 supervisor: a.supervisor.clone(),
-                retired: false,
+                desired_state: AgentDesiredState::Running,
                 keep: false,
                 restart: None,
                 resources: Vec::new(),
@@ -214,8 +214,11 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
         if !bus_ids.insert(bus_id.clone()) {
             anyhow::bail!("canonical-agents found duplicate Agent Spec bus identity `{bus_id}`");
         }
-        if spec.retired {
-            anyhow::bail!("canonical-agents refuses retired Agent Spec `{bus_id}`");
+        if !spec.desired_state.is_running() {
+            anyhow::bail!(
+                "canonical-agents refuses non-running Agent Spec `{bus_id}` ({})",
+                spec.desired_state.as_str()
+            );
         }
         if !spec.is_runnable() {
             anyhow::bail!("canonical-agents Agent Spec `{bus_id}` is not runnable");
@@ -675,7 +678,7 @@ fn teardown_team_with_runner(
         .iter()
         .cloned()
         .map(|mut s| {
-            s.retired = true;
+            s.desired_state = AgentDesiredState::Retired { reason: None };
             s
         })
         .collect();

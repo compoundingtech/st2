@@ -12,7 +12,7 @@ use st2::reconcile::{
 };
 use st2::run::Runner;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
-use st2::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+use st2::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
     format!(
@@ -233,7 +233,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         job_type: JobType::Service,
         workspace: None,
         supervisor: None,
-        retired: false,
+        desired_state: AgentDesiredState::Running,
         keep: false,
         restart: None,
         resources: vec![],
@@ -775,6 +775,62 @@ fn retired_compact_agent_stops_agent_and_derived_ding() {
 
     assert_eq!(report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
     assert!(report.launched.is_empty());
+}
+
+#[test]
+fn suspend_and_resume_cover_derived_ding_sibling_continuity_and_inbox_retention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let running = COMPACT_AGENT_WITH_DING;
+    let suspended = running.replacen(
+        "  host \"hetz\"",
+        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    write(
+        tmp.path(),
+        "agents/hetz/sibling/agent.kdl",
+        "agent \"sibling\" { host \"hetz\"; command \"true\" }\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/demo/resources/inbox/1234567890000-proof.md",
+        "---\nfrom: hetz.sibling\n---\nretained\n",
+    );
+    let suspend_runner = FakeRunner {
+        sessions: vec![
+            live("hetz.demo"),
+            live("hetz.demo.ding"),
+            live("hetz.sibling"),
+        ],
+        ..Default::default()
+    };
+
+    let suspended_report = up_once(tmp.path(), "hetz", &suspend_runner).unwrap();
+    assert_eq!(suspended_report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(suspended_report.adopted, ["sibling"]);
+    assert!(suspended_report.launched.is_empty());
+    assert!(tmp
+        .path()
+        .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+        .is_file());
+
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", running);
+    let resume_runner = FakeRunner {
+        sessions: vec![
+            dead("hetz.demo"),
+            dead("hetz.demo.ding"),
+            live("hetz.sibling"),
+        ],
+        ..Default::default()
+    };
+    let resumed_report = up_once(tmp.path(), "hetz", &resume_runner).unwrap();
+    assert_eq!(resumed_report.restarted, ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(resumed_report.adopted, ["sibling"]);
+    assert!(tmp
+        .path()
+        .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+        .is_file());
 }
 
 #[test]

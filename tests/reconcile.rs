@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
 use st2::reconcile::ObservedPtyPresentation;
-use st2::spec::{AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
+use st2::spec::{AgentDesiredState, AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile};
 
 #[test]
@@ -169,7 +169,7 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
             t
         }],
     );
-    retired.retired = true;
+    retired.desired_state = AgentDesiredState::Retired { reason: None };
     let specs = [retired];
     let p = reconcile_selected(
         &specs,
@@ -283,7 +283,7 @@ fn selected_dead_non_keep_gc_and_relaunch_only_selected() {
 #[test]
 fn selected_retired_live_tears_down_only_selected() {
     let mut s = svc("a", None, vec![task(TaskKind::Exec, "x", None, Some("a")), task(TaskKind::Exec, "sib", None, Some("b"))]);
-    s.retired = true;
+    s.desired_state = AgentDesiredState::Retired { reason: None };
     let specs = [s, svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))])];
     let p = reconcile_selected(
         &specs,
@@ -382,7 +382,11 @@ fn spec(
         job_type,
         workspace: None,
         supervisor: None,
-        retired,
+        desired_state: if retired {
+            AgentDesiredState::Retired { reason: None }
+        } else {
+            AgentDesiredState::Running
+        },
         keep: false,
         restart: None,
         resources: Vec::new(),
@@ -396,6 +400,73 @@ fn spec(
 
 fn svc(identity: &str, host: Option<&str>, tasks: Vec<Task>) -> AgentSpec {
     spec(identity, host, JobType::Service, false, tasks)
+}
+
+fn suspended(identity: &str, tasks: Vec<Task>) -> AgentSpec {
+    let mut spec = svc(identity, None, tasks);
+    spec.desired_state = AgentDesiredState::Suspended {
+        reason: "Temporarily idle".into(),
+    };
+    spec
+}
+
+#[test]
+fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
+    let specs = vec![suspended(
+        "idle",
+        vec![
+            task(TaskKind::Pty, "agent", Some("host.idle.agent"), Some("run")),
+            task(TaskKind::Exec, "ding", Some("host.idle.ding"), Some("ding")),
+            {
+                let mut retained = task(
+                    TaskKind::Exec,
+                    "retained",
+                    Some("host.idle.retained"),
+                    Some("retained"),
+                );
+                retained.keep = true;
+                retained
+            },
+        ],
+    )];
+    let plan = reconcile(
+        &specs,
+        &[
+            live("host.idle.agent"),
+            live("host.idle.ding"),
+            dead("host.idle.retained"),
+        ],
+        "host",
+    );
+
+    assert!(plan.launch.is_empty());
+    assert!(plan.adopt.is_empty());
+    assert!(plan.gc.is_empty(), "keep-pinned dead records remain frozen");
+    assert_eq!(plan.teardown.len(), 1);
+    assert_eq!(
+        plan.teardown[0].pty_ids,
+        vec!["host.idle.agent", "host.idle.ding"]
+    );
+}
+
+#[test]
+fn resuming_uses_ordinary_reconcile_and_does_not_override_keep() {
+    let mut spec = suspended(
+        "idle",
+        vec![task(
+            TaskKind::Pty,
+            "agent",
+            Some("host.idle.agent"),
+            Some("run"),
+        )],
+    );
+    spec.keep = true;
+    spec.desired_state = AgentDesiredState::Running;
+
+    let specs = [spec];
+    let plan = reconcile(&specs, &[dead("host.idle.agent")], "host");
+    assert!(plan.launch.is_empty());
+    assert_eq!(plan.adopt.len(), 1, "resume preserves the existing keep contract");
 }
 
 fn live(id: &str) -> Session {

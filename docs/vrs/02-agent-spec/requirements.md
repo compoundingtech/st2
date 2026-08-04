@@ -28,7 +28,8 @@ Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
 [F06](./spec.md#f06), [F07](./spec.md#f07), [F08](./spec.md#f08),
 [F09](./spec.md#f09), [F10](./spec.md#f10), [F11](./spec.md#f11),
 [F12](./spec.md#f12), [F13](./spec.md#f13), [F14](./spec.md#f14),
-[F15](./spec.md#f15), [F16](./spec.md#f16), and [F17](./spec.md#f17).
+[F15](./spec.md#f15), [F16](./spec.md#f16), [F17](./spec.md#f17), and F18 in
+the same field-rules specification.
 
 ## Shared invariants
 
@@ -71,6 +72,13 @@ Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
   addition on the new host, never process migration. The hosts require no shared
   order, receipt, or proof. Catalog skew can cause temporary overlap or absence;
   each host retains its local last-known-good ownership.
+
+  Suspension is reversible desired absence, not a second runtime state
+  machine. It tears down the same exact owned task set as retirement, including
+  derived companions, but permits explicitly keep-pinned dead records and
+  preserves all catalog-backed durable state. Retirement completes only when
+  every declared task record is absent. Returning to running uses ordinary
+  `keep`, `adopt-only`, ownership, and launch rules.
 
 - **SPEC-R05 Plan every related action before mutation.** Plan every action,
   refusal, proof, conflict, and rollback condition for the related agents,

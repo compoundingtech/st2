@@ -772,7 +772,7 @@ fn canonical_agents_fail_closed_matrix_is_pre_spawn_and_non_vacuous() {
             ],
         ),
         (
-            "retired Agent Spec",
+            "non-running Agent Spec `evalhost.worker` (retired)",
             "evalhost.worker",
             vec![(
                 "worker",

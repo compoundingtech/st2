@@ -609,7 +609,25 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         SemanticType::String,
         spec.supervisor.as_deref(),
     );
-    insert_default_bool(&mut fields, &format!("{base}/retired"), spec.retired, false);
+    insert_default_bool(
+        &mut fields,
+        &format!("{base}/retired"),
+        spec.desired_state.is_retired(),
+        false,
+    );
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/desired-state"),
+        SemanticType::String,
+        spec.desired_state.as_str().to_owned(),
+        spec.desired_state.is_running(),
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/desired-state/reason"),
+        SemanticType::String,
+        spec.desired_state.reason(),
+    );
     insert_default_bool(&mut fields, &format!("{base}/keep"), spec.keep, false);
 
     let restart = spec.restart_policy();

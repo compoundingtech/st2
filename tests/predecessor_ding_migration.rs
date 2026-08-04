@@ -505,7 +505,7 @@ fn assert_migration_catalog_safe(catalog: &Path, expected_ids: &[&str]) -> Resul
     let expected = expected_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     for spec in &found.specs {
-        if !spec.retired {
+        if !spec.desired_state.is_retired() {
             return Err(format!("migration agent {} is not retired", spec.identity));
         }
         if spec.tasks.len() != 1 {

@@ -25,6 +25,10 @@ pub struct AgentRow {
     pub description: Option<String>,
     /// Whether the declaration is explicitly retired. Presence remains a separate runtime signal.
     pub retired: bool,
+    /// Declarative whole-agent lifecycle intent.
+    pub desired_state: String,
+    /// Human-facing rationale for suspended/retired new-style declarations.
+    pub desired_state_reason: Option<String>,
     /// Typed Resource bindings declared directly by the agent.
     pub resources: Vec<Resource>,
     /// Newest mtime (unix ms) across the agent's inbox, archive, and status file; `None` if nothing
@@ -48,7 +52,9 @@ pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: s.name.clone(),
                 description: s.description.clone(),
-                retired: s.retired,
+                retired: s.desired_state.is_retired(),
+                desired_state: s.desired_state.as_str().to_owned(),
+                desired_state_reason: s.desired_state.reason().map(str::to_owned),
                 resources: s.resources.clone(),
                 last_activity_ms: newest_mtime_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
@@ -68,6 +74,10 @@ struct SummaryJson<'a> {
     description: Option<&'a str>,
     retired: bool,
     resources: &'a [Resource],
+    #[serde(rename = "desiredState")]
+    desired_state: &'a str,
+    #[serde(rename = "desiredStateReason")]
+    desired_state_reason: Option<&'a str>,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -82,6 +92,10 @@ struct EnrichedJson<'a> {
     #[serde(rename = "lastActivity")]
     last_activity: Option<f64>,
     inbox: usize,
+    #[serde(rename = "desiredState")]
+    desired_state: &'a str,
+    #[serde(rename = "desiredStateReason")]
+    desired_state_reason: Option<&'a str>,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -96,6 +110,8 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 description: r.description.as_deref(),
                 retired: r.retired,
                 resources: &r.resources,
+                desired_state: &r.desired_state,
+                desired_state_reason: r.desired_state_reason.as_deref(),
                 last_activity: r.last_activity_ms,
                 inbox: r.inbox,
             })
@@ -111,6 +127,8 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 description: r.description.as_deref(),
                 retired: r.retired,
                 resources: &r.resources,
+                desired_state: &r.desired_state,
+                desired_state_reason: r.desired_state_reason.as_deref(),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -171,6 +189,8 @@ mod tests {
             name: name.map(str::to_string),
             description: None,
             retired,
+            desired_state: if retired { "retired" } else { "running" }.to_owned(),
+            desired_state_reason: None,
             resources: Vec::new(),
             last_activity_ms: last,
             inbox,
@@ -194,11 +214,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[]},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[]}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -225,7 +245,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","_tag":"vendor-specific-type","uri":"vendor+thing://authority/exact%20identity"}]}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","_tag":"vendor-specific-type","uri":"vendor+thing://authority/exact%20identity"}],"desiredState":"running","desiredStateReason":null}]"#
         );
     }
 }

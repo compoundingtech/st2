@@ -31,6 +31,10 @@ It performs these check groups:
   ([source](../../../src/main.rs#L1103-L1121)).
 - **Retirement:** Every task record for a retired local declaration is absent
   ([source](../../../src/main.rs#L1068-L1089); [tests](../../../tests/doctor.rs#L196-L302)).
+- **Suspension:** No task of a suspended local declaration is alive. A dead
+  record is accepted only when the task or agent is keep-pinned; presence is
+  not required. This remains distinct from retirement's full-record absence
+  ([source](../../../src/main.rs); [tests](../../../tests/doctor.rs)).
 
 ## Output contract
 

@@ -30,7 +30,7 @@ declaration-driven teardown; remote-host declarations remain inert.
 
 Admission applies `validate_for_host` strictly, then fails before spawn when
 discovery is malformed or warning-bearing, when the selected local projection
-is empty, duplicate, retired, root-overriding, or unrunnable, or when any
+is empty, duplicate, non-running, root-overriding, or unrunnable, or when any
 resolved local task runtime ID is empty or duplicates another local task.
 Materialization warnings and backend launch errors are fatal. The kickoff
 target must resolve to exactly one local agent. The eval owns one native
@@ -491,7 +491,9 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   but classifies a dead or absent generation as `held` without garbage
   collection or launch. Returning the declaration to the default `service`
   lifecycle is the explicit authority to resume ordinary replacement.
-  `retired #true` remains the separate explicit teardown path.
+  A non-running agent desired state remains the separate explicit teardown
+  path. Suspension and retirement never use task lifecycle as an implicit
+  resume or replacement authority.
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
   `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
@@ -517,6 +519,34 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   identity, unchanged content and metadata, the final path identity, process
   start token, and record mtime without rewriting them. If that proof is
   unavailable on a supported OS, the generation remains indeterminate.
+
+  Each row retains the task-level `desiredState` (`running` or `absent`) and
+  appends the declaration-level `agentDesiredState` plus
+  `agentDesiredStateReason`. The legacy `retired` boolean remains a projection
+  for compatible readers. `st2 agents --json` likewise appends `desiredState`
+  and `desiredStateReason`; presence remains an independent observed signal.
+
+- **R27/R28:** Agent lifecycle intent is one closed declaration state:
+  `running`, `suspended`, or `retired`. The KDL form is a direct child such as
+  `desired-state "suspended" reason="Waiting for capacity"`. Omission means
+  running. New suspended and retired states require a bounded rationale;
+  running forbids one. Legacy `retired #true` remains readable without a
+  rationale, but old and new lifecycle syntax cannot coexist.
+
+  Reconciliation treats both non-running states as desired task absence and
+  includes derived companions. Materialization skips them. Suspension is
+  converged when no task is live and only explicitly keep-pinned dead records
+  remain; retirement is complete only after every task record is absent.
+  Resume simply returns to ordinary task planning, preserving `keep`,
+  `adopt-only`, ownership, and replacement fences. Durable messages, context,
+  resources, and the declaration are not task runtime and remain available.
+
+  `st2 agent desired-state` performs one source-preserving canonical KDL edit
+  under the persistent catalog-authoring lock. The self/descendant trusted-fleet
+  guardrail and Nix-owned refusal match presentation authoring. Running removes
+  lifecycle syntax; suspended and retired emit the canonical node. A success
+  receipt proves authored intent only. Reconciliation and Doctor separately
+  prove observed convergence.
 
   Inventory performs no reconciliation, launch, teardown, cleanup, lifecycle
   edit, state migration, or catalog write. It does not authorize a staged

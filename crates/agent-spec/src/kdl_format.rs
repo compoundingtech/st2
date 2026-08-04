@@ -76,7 +76,39 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
             "type" => raw.job_type = arg_string(child),
             "workspace" => raw.workspace = arg_string(child),
             "supervisor" => raw.supervisor = arg_string(child),
-            "retired" => raw.retired = arg_bool(child),
+            "retired" => {
+                anyhow::ensure!(raw.retired.is_none(), "agent declares `retired` more than once");
+                raw.retired = Some(arg_bool(child));
+            }
+            "desired-state" => {
+                anyhow::ensure!(
+                    raw.desired_state.is_none(),
+                    "agent declares `desired-state` more than once"
+                );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.arguments().count() == 1
+                        && child.properties_named("reason").count() <= 1
+                        && child.entries.len() <= 2,
+                    "agent `desired-state` must contain one state string and at most one `reason` property"
+                );
+                anyhow::ensure!(
+                    child.entries.iter().all(|entry| {
+                        entry.name.is_none() || entry.name.as_deref() == Some("reason")
+                    }),
+                    "agent `desired-state` accepts only the `reason` property"
+                );
+                raw.desired_state = arg_string(child);
+                raw.desired_state_reason = child
+                    .property("reason")
+                    .and_then(DeclaredValue::as_str)
+                    .map(String::from);
+                anyhow::ensure!(
+                    child.property("reason").is_none() || raw.desired_state_reason.is_some(),
+                    "agent desired-state `reason` must be a string"
+                );
+            }
             "keep" => raw.keep = arg_bool(child),
             "lifecycle" => raw.lifecycle = arg_string(child),
             "restart" => raw.restart = Some(restart_node_to_raw(child)),

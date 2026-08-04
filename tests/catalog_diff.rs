@@ -138,6 +138,27 @@ agent "worker" {
 }
 
 #[test]
+fn desired_state_and_reason_have_distinct_secret_safe_semantic_addresses() {
+    let (_temp, catalog, prepared, root) = fixture();
+    let reason = "Waiting for capacity";
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        format!(
+            "agent \"worker\" {{\n  host \"host\"\n  desired-state \"suspended\" reason={reason:?}\n  argv \"tool\" \"arg\"\n}}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = diff(&catalog, &prepared, &root);
+    let receipt = parsed(&output);
+    let fields = agent_fields(&receipt);
+    assert!(fields.contains(&"/agents/host/worker/desired-state".to_string()));
+    assert!(fields.contains(&"/agents/host/worker/desired-state/reason".to_string()));
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    assert!(!rendered.contains(reason));
+}
+
+#[test]
 fn effective_task_id_and_cwd_defaults_normalize_to_explicit_values() {
     let (_temp, catalog, prepared, _root) = fixture();
     fs::write(

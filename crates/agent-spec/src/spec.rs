@@ -4,7 +4,7 @@
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
-//! `workspace`, `retired`, `keep`, `supervisor`,
+//! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
 //! `restart{}`, task lifecycle, Resource bindings (declaration metadata), and the tasks. Everything render-only
 //! (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta{}`) is baked into
 //! the tasks/commands by the render layer and ignored here.
@@ -24,6 +24,47 @@ use serde::{Deserialize, Serialize};
 pub const AGENT_NAME_MAX_CHARS: usize = 160;
 /// Maximum Unicode scalar count for an agent's enduring responsibility description.
 pub const AGENT_DESCRIPTION_MAX_CHARS: usize = 1_000;
+/// Maximum UTF-8 byte length for a non-running desired-state rationale.
+pub const AGENT_DESIRED_STATE_REASON_MAX_BYTES: usize = 160;
+
+/// Declarative whole-agent lifecycle intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentDesiredState {
+    Running,
+    Suspended { reason: String },
+    /// `None` exists only for legacy `retired #true` declarations.
+    Retired { reason: Option<String> },
+}
+
+impl AgentDesiredState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Suspended { .. } => "suspended",
+            Self::Retired { .. } => "retired",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Running => None,
+            Self::Suspended { reason } => Some(reason),
+            Self::Retired { reason } => reason.as_deref(),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        matches!(self, Self::Suspended { .. })
+    }
+
+    pub fn is_retired(&self) -> bool {
+        matches!(self, Self::Retired { .. })
+    }
+}
 
 /// A rendered agent job, lowered to the shared declaration fields st2 and other readers inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +85,8 @@ pub struct AgentSpec {
     pub workspace: Option<String>,
     /// Bare identity or `<host>.<identity>` of this agent's supervisor — crash-dings route here.
     pub supervisor: Option<String>,
-    /// `true` decommissions the agent (an edit, never a file delete) → torn down by reconcile.
-    pub retired: bool,
+    /// Whole-agent lifecycle intent. Non-running states are reconciled absent.
+    pub desired_state: AgentDesiredState,
     /// Agent-level GC pin: `true` exempts all of its tasks from garbage collection.
     pub keep: bool,
     /// Crash/restart policy (§4). `None` → the runner's default policy.
@@ -335,8 +376,9 @@ pub(crate) struct RawSpec {
     pub job_type: Option<String>,
     pub workspace: Option<String>,
     pub supervisor: Option<String>,
-    #[serde(default)]
-    pub retired: bool,
+    pub retired: Option<bool>,
+    pub desired_state: Option<String>,
+    pub desired_state_reason: Option<String>,
     #[serde(default)]
     pub keep: bool,
     pub restart: Option<RawRestart>,
@@ -719,6 +761,11 @@ impl RawSpec {
             self.description.as_deref(),
             AGENT_DESCRIPTION_MAX_CHARS,
         )?;
+        let desired_state = lower_desired_state(
+            self.retired,
+            self.desired_state.as_deref(),
+            self.desired_state_reason,
+        )?;
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -790,7 +837,7 @@ impl RawSpec {
             job_type,
             workspace: self.workspace,
             supervisor: self.supervisor,
-            retired: self.retired,
+            desired_state,
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             resources,
@@ -798,6 +845,60 @@ impl RawSpec {
             path,
         })
     }
+}
+
+fn lower_desired_state(
+    retired: Option<bool>,
+    state: Option<&str>,
+    reason: Option<String>,
+) -> anyhow::Result<AgentDesiredState> {
+    anyhow::ensure!(
+        retired.is_none() || state.is_none(),
+        "agent declares both legacy `retired` and `desired-state`; choose one lifecycle form"
+    );
+    match (state, reason) {
+        (None, None) => Ok(if retired == Some(true) {
+            AgentDesiredState::Retired { reason: None }
+        } else {
+            AgentDesiredState::Running
+        }),
+        (None, Some(_)) => anyhow::bail!("agent lifecycle `reason` requires `desired-state`"),
+        (Some("running"), None) => Ok(AgentDesiredState::Running),
+        (Some("running"), Some(_)) => {
+            anyhow::bail!("agent `desired-state \"running\"` forbids `reason`")
+        }
+        (Some("suspended"), Some(reason)) => {
+            validate_desired_state_reason(&reason)?;
+            Ok(AgentDesiredState::Suspended { reason })
+        }
+        (Some("retired"), Some(reason)) => {
+            validate_desired_state_reason(&reason)?;
+            Ok(AgentDesiredState::Retired {
+                reason: Some(reason),
+            })
+        }
+        (Some("suspended" | "retired"), None) => {
+            anyhow::bail!("agent `desired-state {state:?}` requires `reason`")
+        }
+        (Some(other), _) => anyhow::bail!(
+            "unknown agent desired state '{other}'; expected running, suspended, or retired"
+        ),
+    }
+}
+
+/// Validate the rationale carried by a non-running desired state.
+pub fn validate_desired_state_reason(reason: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !reason.is_empty() && reason.len() <= AGENT_DESIRED_STATE_REASON_MAX_BYTES,
+        "agent desired-state `reason` must be 1..{AGENT_DESIRED_STATE_REASON_MAX_BYTES} UTF-8 bytes"
+    );
+    anyhow::ensure!(
+        reason.trim() == reason
+            && !reason.chars().any(|character| character.is_control()
+                || matches!(character, '\u{2028}' | '\u{2029}')),
+        "agent desired-state `reason` must have no surrounding Unicode whitespace, controls, or line separators"
+    );
+    Ok(())
 }
 
 /// Validate one optional presentation field at the shared parse/authoring boundary.

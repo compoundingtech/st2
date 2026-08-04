@@ -578,6 +578,34 @@ fn untracked_and_non_git_targets_remain_materializable() {
 }
 
 #[test]
+fn suspended_declaration_does_not_materialize_workspace_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(&workspace.join("AGENTS.md"), "existing\n");
+    write(&catalog.join("_templates/AGENTS.md"), "new\n");
+    let declaration = agent_kdl(
+        &workspace,
+        r#"    copy "_templates/AGENTS.md" "AGENTS.md""#,
+    )
+    .replace(
+        "  host \"Silber\"\n",
+        "  host \"Silber\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+    );
+    write(&catalog.join("agents/Silber/cos/agent.kdl"), declaration);
+
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    assert!(report.is_clean(), "{:?}", report.errors);
+    assert_eq!(
+        fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+        "existing\n"
+    );
+}
+
+#[test]
 fn missing_git_executable_fails_closed_before_workspace_write() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
