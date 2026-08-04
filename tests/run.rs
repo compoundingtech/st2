@@ -999,7 +999,7 @@ fn up_once_finally_removes_dead_retired_tasks_without_restarting_them() {
     let tmp = tempfile::tempdir().unwrap();
     let retired = AGENT.replacen(
         "type = \"service\"",
-        "type = \"service\"\nretired = true",
+        "type = \"service\"\nretired = true\nkeep = true",
         1,
     );
     write(tmp.path(), "agents/hetz/demo/agent.toml", &retired);

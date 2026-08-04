@@ -136,7 +136,7 @@ fn selected_reconcile_launches_missing_and_adopts_live_without_siblings() {
 }
 
 #[test]
-fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
+fn selected_reconcile_freezes_suspended_dead_keep_but_collects_retired_task_keep() {
     let keep = svc(
         "a",
         None,
@@ -183,7 +183,8 @@ fn selected_reconcile_freezes_dead_keep_and_retired_task_keep() {
         "host.b.x",
     )
     .unwrap();
-    assert!(p.teardown.is_empty() && p.gc.is_empty());
+    assert!(p.teardown.is_empty());
+    assert_eq!(p.gc, ["host.b.x"]);
 }
 
 #[test]
