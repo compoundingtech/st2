@@ -102,6 +102,41 @@ fn desired_state_has_equivalent_toml_and_json_lowering() {
 }
 
 #[test]
+fn lifecycle_fields_make_path_placed_files_agent_candidates() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/suspended/agent.toml",
+        "desired_state = \"suspended\"\ndesired_state_reason = \"Waiting for capacity\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/retired/agent.json",
+        r#"{"retired":true}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/orphan-reason/agent.json",
+        r#"{"desired_state_reason":"Missing state"}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(matches!(
+        &find(&found.specs, "suspended").desired_state,
+        AgentDesiredState::Suspended { reason } if reason == "Waiting for capacity"
+    ));
+    assert!(find(&found.specs, "retired").desired_state.is_retired());
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("lifecycle `reason` requires `desired-state`"),
+        "{:?}",
+        found.errors
+    );
+}
+
+#[test]
 fn explicit_json_null_lifecycle_fields_are_rejected_instead_of_granting_running_intent() {
     for (name, lifecycle) in [
         ("null-retired", r#""retired":null"#),

@@ -738,11 +738,15 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
 }
 
 impl RawSpec {
-    /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity, a
-    /// `type`, or task blocks. Random TOML/JSON in the tree has none of these and is skipped.
+    /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
+    /// lifecycle intent, a `type`, or task blocks. Random TOML/JSON in the tree has none of these
+    /// and is skipped.
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
             || self.job_type.is_some()
+            || self.retired.is_some()
+            || self.desired_state.is_some()
+            || self.desired_state_reason.is_some()
             || self.command.is_some()
             || self.argv.is_some()
             || self.ding
