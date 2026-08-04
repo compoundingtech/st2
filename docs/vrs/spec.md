@@ -113,6 +113,31 @@ interference but is not a distributed CAS or lock service. The classified
 refusal codes are an operational trusted-fleet boundary, not adversarial OS
 isolation.
 
+Harness drivers consume Agent Spec presentation directly:
+
+```text
+Agent Spec name/description (sole authority)
+          |
+          +--> roster
+          +--> PTY metadata
+          `--> exact roster query --> harness driver --> provider-native name
+```
+
+`st2 agents --identity <host>.<identity> --json` acquires the ordinary shared
+catalog-authoring lock, lowers the current declaration, and returns exactly
+one stable roster row or fails if that qualified identity is absent or
+ambiguous. The row keeps stable identity separate from explicitly nullable
+`name` and `description`. This is a read of the current Agent Spec, not another
+state file or Resource binding. It therefore works for co-located declarations
+without inventing a second path identity or synchronization protocol.
+
+st2 core does not invoke a harness driver. A driver owns provider-native
+translation and must join any application to its independently fenced exact
+runtime and native session. It may consume the lowered `AgentSpec` directly
+in-process or use the exact roster query from an external hook or driver.
+Neither read path gains launch, adoption, restart, teardown, replacement, or
+other lifecycle authority.
+
 For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 `pty metadata patch --id <task-id>` request. Every PTY receives the versioned
 st2-owned tags `agent.presentation.schema=1`,

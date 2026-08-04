@@ -4,6 +4,8 @@
 //! roster, and derive `unknown` from staleness.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -224,6 +226,53 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     assert_eq!(rows[1]["status"], "busy");
     assert_eq!(rows[1]["retired"], true);
 
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.live", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["identity"], "h.live");
+
+    let absent = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.missing", "--json"])
+        .output()
+        .unwrap();
+    assert!(!absent.status.success());
+    assert!(
+        String::from_utf8_lossy(&absent.stderr)
+            .contains("expected exactly one Agent Spec with identity `h.missing`, found 0")
+    );
+
+    let filtered_out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args([
+            "--host",
+            "h",
+            "--identity",
+            "h.live",
+            "--status",
+            "busy",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!filtered_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&filtered_out.stderr)
+            .contains("Agent Spec `h.live` does not match status `busy`")
+    );
+
     let human = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
@@ -239,6 +288,154 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         String::from_utf8(human.stdout).unwrap(),
         "h.live\tavailable\t\t\nh.retired\tbusy\t\t\t[retired]\n"
     );
+}
+
+#[test]
+fn exact_identity_rejects_duplicates_before_status_filtering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "declarations/one/agent.kdl",
+        &agent_kdl("worker", "h"),
+    );
+    write(
+        root,
+        "declarations/two/agent.kdl",
+        &agent_kdl("worker", "h"),
+    );
+    set_state(
+        &status_path(&root.join("declarations/one")),
+        State::Busy,
+    )
+    .unwrap();
+    set_state(
+        &status_path(&root.join("declarations/two")),
+        State::Available,
+    )
+    .unwrap();
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args([
+            "--host",
+            "h",
+            "--identity",
+            "h.worker",
+            "--status",
+            "busy",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!selected.status.success());
+    assert!(
+        String::from_utf8_lossy(&selected.stderr)
+            .contains("expected exactly one Agent Spec with identity `h.worker`, found 2")
+    );
+}
+
+#[test]
+fn exact_identity_rejects_incomplete_catalog_discovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "valid/worker.kdl", &agent_kdl("worker", "h"));
+    write(root, "h/worker/agent.kdl", "this is malformed KDL {");
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+    assert!(!selected.status.success());
+    let stderr = String::from_utf8_lossy(&selected.stderr);
+    assert!(
+        stderr.contains("cannot select an exact Agent Spec while catalog discovery has 1 error")
+    );
+    assert!(stderr.contains("h/worker/agent.kdl"));
+
+    let ordinary = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--json"])
+        .output()
+        .unwrap();
+    assert!(ordinary.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&ordinary.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_identity_rejects_incomplete_catalog_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let unreadable = root.join("unreadable");
+    write(root, "valid/worker.kdl", &agent_kdl("worker", "h"));
+    write(root, "unreadable/hidden.kdl", &agent_kdl("worker", "h"));
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&unreadable).is_ok() {
+        // Root or CAP_DAC_OVERRIDE can bypass mode 000, so this environment cannot induce the
+        // traversal failure the test is intended to exercise.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!selected.status.success());
+    let stderr = String::from_utf8_lossy(&selected.stderr);
+    assert!(
+        stderr.contains("cannot select an exact Agent Spec while catalog discovery has 1 error")
+    );
+    assert!(stderr.contains("unreadable"));
+    assert!(stderr.contains("catalog directory traversal failed"));
+}
+
+#[test]
+fn exact_identity_selects_one_of_multiple_agent_specs_in_one_declaration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "h/pair.kdl",
+        r#"
+agent "one" {
+  host "h"
+  name "First Agent Spec"
+  pty "agent" { command "true" }
+}
+agent "two" {
+  host "h"
+  name "Second Agent Spec"
+  pty "agent" { command "true" }
+}
+"#,
+    );
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.two", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["identity"], "h.two");
+    assert_eq!(selected[0]["name"], "Second Agent Spec");
 }
 
 /// A status file older than the stale window projects as `unknown` in the roster, no matter its value.

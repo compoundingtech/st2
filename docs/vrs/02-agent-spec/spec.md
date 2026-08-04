@@ -416,6 +416,12 @@ field participates in identity, routing, selection, authorization, state paths,
 launch fingerprints, workspaces, inbox events, DING, or lifecycle. The roster
 reads the declaration directly; sibling `name` files are ignored.
 
+External harness consumers read the current Agent Spec rather than a duplicate
+derived file. `st2 agents --identity <host>.<identity> --json` returns exactly
+one stable roster row or fails; in-process drivers may consume the same lowered
+`AgentSpec` directly. Both paths preserve explicitly nullable name and
+description and grant no lifecycle authority.
+
 For a healthy managed PTY, patch the exact runtime task ID in place. Every owned
 PTY receives the versioned stable-actor and optional-description tag snapshot;
 only the primary task named `agent` maps optional name to native display
@@ -529,9 +535,10 @@ replacement of drifted work.
   requires complete record absence for retirement.
 - Matching fingerprints adopt. Mismatches drift. Explicit replacement proves
   the exact incarnation through fence, quiesce, materialize, and boot.
-- Name and description changes update roster and exact PTY metadata while task
-  ID, PID, creation identity, and generation remain unchanged. Repeating the
-  desired projection emits no metadata event; clearing removes only owned
+- Name and description changes update the exact Agent Spec roster row and PTY
+  metadata while task ID, PID, creation identity, and generation remain
+  unchanged. Exact qualified roster selection returns one row or fails without
+  publishing duplicate presentation state. Clearing removes only owned
   presentation values. A genuine retirement still follows ordinary teardown.
 - Host projections converge after overlap, absence, and reconnection without a
   shared receipt.

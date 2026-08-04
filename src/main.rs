@@ -236,6 +236,9 @@ enum Command {
         /// Only agents whose effective status matches (offline|available|busy|away|dnd|unknown).
         #[arg(long = "status")]
         status: Option<String>,
+        /// Select one exact Agent Spec by its fully qualified `<host>.<identity>`.
+        #[arg(long, value_name = "HOST.IDENTITY")]
+        identity: Option<String>,
         /// Machine-readable JSON array, including retirement and declared Resource bindings.
         #[arg(long)]
         json: bool,
@@ -882,10 +885,11 @@ fn main() -> Result<()> {
         Command::Agents {
             catalog,
             status,
+            identity,
             json,
             enrich,
             ctx,
-        } => agents_cmd(catalog, status, json, enrich, ctx),
+        } => agents_cmd(catalog, status, identity, json, enrich, ctx),
         Command::Tasks { host, json } => {
             if !json {
                 anyhow::bail!("`st2 tasks` v1 requires --json");
@@ -1633,6 +1637,7 @@ fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Res
 fn agents_cmd(
     catalog: Option<PathBuf>,
     status_filter: Option<String>,
+    identity: Option<String>,
     json: bool,
     enrich: bool,
     mut ctx: MsgCtx,
@@ -1647,9 +1652,40 @@ fn agents_cmd(
     let (root, host) = resolve_ctx(&ctx)?;
     let _catalog_lock = st2::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for agent roster")?;
-    let mut rows = st2::agents::roster(&root, &host);
+    let found = if identity.is_some() {
+        st2::discover_strict(&root)
+    } else {
+        st2::discover(&root)
+    };
+    if identity.is_some() && !found.errors.is_empty() {
+        let errors = found
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path.display(), error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "cannot select an exact Agent Spec while catalog discovery has {} error(s): {errors}",
+            found.errors.len()
+        );
+    }
+    let mut rows = st2::agents::roster_from_discovered(&found, &host);
+    if let Some(identity) = &identity {
+        rows.retain(|row| row.identity == *identity);
+        anyhow::ensure!(
+            rows.len() == 1,
+            "expected exactly one Agent Spec with identity `{identity}`, found {}",
+            rows.len()
+        );
+    }
     if let Some(f) = &status_filter {
         rows.retain(|r| r.status.as_str() == f);
+        if let Some(identity) = &identity {
+            anyhow::ensure!(
+                rows.len() == 1,
+                "Agent Spec `{identity}` does not match status `{f}`"
+            );
+        }
     }
     if json {
         println!("{}", st2::agents::to_json(&rows, enrich));

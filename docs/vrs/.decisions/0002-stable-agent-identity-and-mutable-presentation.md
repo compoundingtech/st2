@@ -31,7 +31,7 @@ Spec declaration is their sole source of truth; a sibling `name` file is neither
 read nor written.
 
 Constrained KDL-only commands may mutate one presentation field without
-publishing a second representation. Within the trusted-fleet model,
+accepting a second authored representation. Within the trusted-fleet model,
 caller-supplied `ST_AGENT` limits an invocation to itself or declared
 descendants; this is an operational guardrail, not an authenticated capability,
 and absence selects the operator path. Declarations explicitly marked Nix-owned
@@ -50,6 +50,14 @@ optional description. Name is not duplicated in tags. One real patch emits one
 coherent `metadata_change` event; an unchanged patch emits none. Automation
 never uses human display-name resolution. Presentation drift degrades and
 retries without restart or lifecycle accounting.
+
+Harness drivers consume the current lowered Agent Spec rather than a second derived
+presentation file. In-process drivers may read the lowered `AgentSpec` directly;
+external hooks or drivers may select the exact qualified stable identity through
+`st2 agents --identity <host>.<identity> --json`. The roster query returns
+exactly one row or fails and keeps nullable name and description separate from
+stable identity. Provider-native translation and exact session fencing remain
+driver responsibilities; this read interface grants no lifecycle authority.
 
 ## Consequences
 
@@ -70,6 +78,8 @@ retries without restart or lifecycle accounting.
 - parser and roster tests across KDL, TOML, and JSON;
 - source-preservation, authority, Nix refusal, and stale-writer tests;
 - exact-ID PTY projection tests for set, clear, idempotence, and partial failure;
+- exact qualified roster selection, nullable values, absent-identity refusal,
+  and co-located declaration tests;
 - a live no-restart test preserving stable task ID, PID, creation identity, and
-  generation across presentation changes;
+  generation across Agent Spec presentation changes;
 - a genuine lifecycle-change control that still performs ordinary replacement.

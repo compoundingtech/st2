@@ -396,6 +396,7 @@ st2 message read <filename>
 st2 message reply <filename> -m "Handled."
 st2 message archive <filename>
 st2 agents --json --enrich
+st2 agents --identity "$ST_AGENT" --json
 st2 context read --full
 ```
 
@@ -405,6 +406,9 @@ lifecycle with runtime presence. Both JSON shapes keep stable `identity` separat
 `desiredStateReason`, plus the declaration's ordered `resources` descriptors. `--enrich`
 additionally supplies `lastActivity` and `inbox`. Human output prints the same presentation fields
 as separate columns and appends the non-running state and rationale.
+`--identity <host>.<identity>` selects exactly one qualified Agent Spec or fails,
+so external harness hooks can read its current name and description without parsing KDL or relying
+on a duplicate state file.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and

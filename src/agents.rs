@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::message;
 use crate::status::{self, State};
-use crate::Resource;
+use crate::{Discovered, Resource};
 
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
@@ -42,6 +42,12 @@ pub struct AgentRow {
 /// walks discovered specs and each agent's resources, mutating nothing.
 pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
     let found = crate::discover(catalog_root);
+    roster_from_discovered(&found, this_host)
+}
+
+/// Project a roster from one immutable discovery result. Exact selectors use this after proving
+/// discovery complete so the uniqueness check and returned metadata describe the same snapshot.
+pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentRow> {
     let mut rows: Vec<AgentRow> = found
         .specs
         .iter()

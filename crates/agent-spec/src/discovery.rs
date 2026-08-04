@@ -48,9 +48,19 @@ const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 /// Walk `root` recursively and lower every agent spec found. Returns empty (no error) when `root`
 /// does not exist yet — a fresh, un-seeded folder is a valid state.
 pub fn discover(root: &Path) -> Discovered {
+    discover_impl(root, false)
+}
+
+/// Discover a catalog while treating directory traversal failures as uncertainty. Consumers that
+/// must prove a global property such as identity uniqueness should use this mode.
+pub fn discover_strict(root: &Path) -> Discovered {
+    discover_impl(root, true)
+}
+
+fn discover_impl(root: &Path, strict: bool) -> Discovered {
     let mut out = Discovered::default();
     let mut files = Vec::new();
-    collect_spec_files(root, root, &mut files);
+    collect_spec_files(root, root, &mut files, strict, &mut out.errors);
     files.sort();
     for path in files {
         let ParsedRawFile { raws, declaration } = parse_raw_file_with_declaration(&path);
@@ -166,23 +176,57 @@ fn is_declaration_parent(dir: &Path) -> bool {
 /// Recursively gather candidate spec files, skipping only explicit control/runtime namespaces and
 /// anything that isn't one of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble
 /// an agent spec; it is runner state, never catalog input. Unreadable directories are skipped, not
-/// fatal.
-fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
+/// fatal in ordinary discovery. Strict discovery records them as uncertainty.
+fn collect_spec_files(
+    root: &Path,
+    dir: &Path,
+    acc: &mut Vec<PathBuf>,
+    strict: bool,
+    errors: &mut Vec<SpecError>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(error) => {
+            if strict && !(dir == root && error.kind() == std::io::ErrorKind::NotFound) {
+                errors.push(SpecError {
+                    path: dir.to_path_buf(),
+                    message: format!("catalog directory traversal failed: {error}"),
+                });
+            }
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if strict {
+                    errors.push(SpecError {
+                        path: dir.to_path_buf(),
+                        message: format!("catalog directory entry traversal failed: {error}"),
+                    });
+                }
+                continue;
+            }
+        };
         let path = entry.path();
         if !is_catalog_path(root, &path) {
             continue;
         }
         let ft = match entry.file_type() {
             Ok(ft) => ft,
-            Err(_) => continue,
+            Err(error) => {
+                if strict {
+                    errors.push(SpecError {
+                        path,
+                        message: format!("catalog entry type inspection failed: {error}"),
+                    });
+                }
+                continue;
+            }
         };
         if ft.is_dir() {
-            collect_spec_files(root, &path, acc);
+            collect_spec_files(root, &path, acc, strict, errors);
         } else if ft.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && SPEC_EXTS.contains(&ext)
