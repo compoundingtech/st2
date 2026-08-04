@@ -97,9 +97,27 @@ fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> Compose
 
 fn codex_idle_footer(screen_from_composer: &str) -> bool {
     strip_ansi(screen_from_composer).lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("gpt-") && (line.contains(" · /") || line.contains(" · ~/"))
+        let mut fields = line.trim().split(" · ");
+        fields.next().is_some_and(|model| model.starts_with("gpt-"))
+            && fields.any(|field| {
+                field.starts_with('/') || field.starts_with("~/") || codex_context_field(field)
+            })
     })
+}
+
+fn codex_context_field(field: &str) -> bool {
+    let Some(context) = field.strip_prefix("Context ") else {
+        return false;
+    };
+    let mut parts = context.split(' ');
+    let (Some(percent), Some(direction), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    matches!(direction, "left" | "used")
+        && percent
+            .strip_suffix('%')
+            .and_then(|value| value.parse::<u8>().ok())
+            .is_some_and(|value| value <= 100)
 }
 
 fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)> {

@@ -1183,22 +1183,31 @@ mod tests {
         );
     }
 
+    fn idle_codex_screen_with_footer(footer: &str) -> String {
+        format!(
+            "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
+             \x1b[2C\x1b[0m{footer}"
+        )
+    }
+
     fn idle_codex_screen() -> String {
-        "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
-         \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
-            .to_string()
+        idle_codex_screen_with_footer("gpt-5.6-sol xhigh · /workspace")
     }
 
     fn idle_codex_screen_with_home_relative_cwd() -> String {
         idle_codex_screen().replace(" · /workspace", " · ~/Code/st2")
     }
 
-    fn staged_codex_screen(text: &str) -> String {
+    fn staged_codex_screen_with_footer(text: &str, footer: &str) -> String {
         let rendered = text.replace(' ', "\x1b[1C");
         format!(
             "\x1b[1m›\x1b[1C\x1b[0m{rendered}\r\n\r\n\
-             \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+             \x1b[2C\x1b[0m{footer}"
         )
+    }
+
+    fn staged_codex_screen(text: &str) -> String {
+        staged_codex_screen_with_footer(text, "gpt-5.6-sol xhigh · /workspace")
     }
 
     fn human_codex_screen() -> String {
@@ -1550,6 +1559,90 @@ mod tests {
             classify_composer("unknown terminal pixels", expected),
             ComposerState::Ambiguous
         );
+    }
+
+    #[test]
+    fn maintained_codex_context_footers_are_narrow_and_position_bound() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for footer in [
+            "gpt-5.6-sol xhigh · ding-fix · Context 73% left",
+            "gpt-5.6-sol xhigh · Context 0% used",
+            "gpt-5.6-sol xhigh · Context 100% left",
+        ] {
+            assert_eq!(
+                classify_composer(&idle_codex_screen_with_footer(footer), expected),
+                ComposerState::EmptySafe,
+                "maintained empty composer footer: {footer}"
+            );
+            assert_eq!(
+                classify_composer(&staged_codex_screen_with_footer(expected, footer), expected),
+                ComposerState::ExactSafe,
+                "maintained staged composer footer: {footer}"
+            );
+        }
+
+        for footer in [
+            "gpt-5.6-sol xhigh · ding-fix",
+            "gpt-5.6-sol xhigh · Contextual 73% left",
+            "gpt-5.6-sol xhigh · Context 73 left",
+            "gpt-5.6-sol xhigh · Context 101% left",
+            "gpt-5.6-sol xhigh · Context left 73%",
+            "gpt-5.6-sol xhigh · Context 73% remaining",
+        ] {
+            assert_eq!(
+                classify_composer(&idle_codex_screen_with_footer(footer), expected),
+                ComposerState::Ambiguous,
+                "unsupported empty composer footer: {footer}"
+            );
+            assert_eq!(
+                classify_composer(&staged_codex_screen_with_footer(expected, footer), expected),
+                ComposerState::ExactBlocked,
+                "unsupported staged composer footer: {footer}"
+            );
+        }
+
+        let maintained_footer = "gpt-5.6-sol xhigh · ding-fix · Context 73% left";
+        let branch_only_footer = "gpt-5.6-sol xhigh · ding-fix";
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{maintained_footer}\r\n{}",
+                    staged_codex_screen_with_footer(expected, branch_only_footer)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked,
+            "a valid-looking transcript row above the live composer is not its footer"
+        );
+        assert_eq!(
+            classify_composer(
+                &staged_codex_screen_with_footer(
+                    "please keep my half-written draft",
+                    maintained_footer
+                ),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        for blocking_chrome in [
+            "Esc to interrupt",
+            "Create a plan?",
+            "› 1. Allow\r\n  2. Deny",
+        ] {
+            assert_eq!(
+                classify_composer(
+                    &format!(
+                        "{blocking_chrome}\r\n{}",
+                        staged_codex_screen_with_footer(expected, maintained_footer)
+                    ),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "blocking chrome: {blocking_chrome}"
+            );
+        }
     }
 
     #[test]
