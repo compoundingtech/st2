@@ -691,20 +691,31 @@ fn exact_agent_node<'a>(
     expected_host: &str,
     expected_agent: &str,
 ) -> Result<&'a KdlNode, AuthorError> {
-    let matches = document
+    let agents = document
         .nodes()
         .iter()
+        .filter(|node| node.name().value() == "agent")
+        .collect::<Vec<_>>();
+    let explicit = agents
+        .iter()
+        .copied()
         .filter(|node| {
-            if node.name().value() != "agent" {
-                return false;
-            }
             let (host, identity) = agent_identity_parts(node);
-            identity
-                .as_deref()
-                .is_none_or(|identity| identity == expected_agent)
+            identity.as_deref() == Some(expected_agent)
                 && host.as_deref().is_none_or(|host| host == expected_host)
         })
         .collect::<Vec<_>>();
+    let matches = if explicit.is_empty() {
+        agents
+            .into_iter()
+            .filter(|node| {
+                let (host, identity) = agent_identity_parts(node);
+                identity.is_none() && host.as_deref().is_none_or(|host| host == expected_host)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        explicit
+    };
     match matches.as_slice() {
         [target] => Ok(*target),
         [] => Err(AuthorError::new(
@@ -1409,5 +1420,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "source-changed");
         assert_eq!(fs::read_to_string(path).unwrap(), changed);
+    }
+
+    #[test]
+    fn desired_state_authoring_prefers_an_explicit_target_over_an_anonymous_sibling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = write(
+            temporary.path(),
+            "agent.kdl",
+            "agent \"worker\" { host \"h\"; command \"sleep 60\" }\nagent { host \"h\"; command \"sleep 60\" }\n",
+        );
+
+        let result = edit_desired_state_for_test(
+            &path,
+            DesiredStateValue::Suspended,
+            Some("Waiting for capacity"),
+            || {},
+        )
+        .unwrap();
+
+        assert_eq!(result, AuthorOutcome::Changed);
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "agent \"worker\" { host \"h\"; command \"sleep 60\"; desired-state \"suspended\" reason=\"Waiting for capacity\" }\nagent { host \"h\"; command \"sleep 60\" }\n"
+        );
     }
 }
