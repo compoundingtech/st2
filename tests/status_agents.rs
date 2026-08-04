@@ -251,6 +251,26 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
             .contains("expected exactly one Agent Spec with identity `h.missing`, found 0")
     );
 
+    let filtered_out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args([
+            "--host",
+            "h",
+            "--identity",
+            "h.live",
+            "--status",
+            "busy",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!filtered_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&filtered_out.stderr)
+            .contains("expected exactly one Agent Spec with identity `h.live`, found 0")
+    );
+
     let human = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
