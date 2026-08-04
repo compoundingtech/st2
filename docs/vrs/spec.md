@@ -113,6 +113,49 @@ interference but is not a distributed CAS or lock service. The classified
 refusal codes are an operational trusted-fleet boundary, not adversarial OS
 isolation.
 
+Presentation has one provider-neutral desired-state projection:
+
+```text
+Agent Spec name/description (sole authority)
+          |
+          +--> roster
+          +--> PTY metadata
+          `--> resources/presentation.json
+                         |
+                         `--> harness driver --> provider-native presentation
+```
+
+For every active host-local catalog Agent Spec, st2 publishes
+`<agent-dir>/resources/presentation.json` with all five keys present:
+
+```json
+{
+  "schema": "st2.agent-presentation.v1",
+  "host": "host",
+  "identity": "worker",
+  "name": "Release worker",
+  "description": "Owns release preparation and verification."
+}
+```
+
+`host` and unqualified `identity` validate association with the owning Agent
+Spec. Absent `name` and `description` values are JSON `null`. Serialization is
+deterministic and ends with one newline. Equal desired bytes perform no
+filesystem mutation. Changed bytes are written to a unique same-directory
+temporary, fsynced, atomically renamed over the prior snapshot, and followed by
+a directory fsync; creation of a missing directory is likewise durably
+published. A symlink or non-regular target fails independently for that agent.
+
+The snapshot is derived state excluded from declaration snapshots and catalog
+generation. It carries no embedded source revision: a consumer may hash the
+exact canonical bytes as a change detector without treating that hash as
+lifecycle authority. It contains no provider, account, native session, task,
+run, or lifecycle fields and is neither an Agent Spec source nor a declared
+Resource binding. st2 core publishes this neutral contract but does not invoke
+a harness driver. A driver owns provider-native translation and must join any
+application to its independently fenced exact runtime and native session; a
+snapshot failure never blocks launch, adoption, PTY repair, or teardown.
+
 For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 `pty metadata patch --id <task-id>` request. Every PTY receives the versioned
 st2-owned tags `agent.presentation.schema=1`,

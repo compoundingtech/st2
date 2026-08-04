@@ -1346,6 +1346,9 @@ fn reconcile_pass(
             .collect(),
         ..Default::default()
     };
+    report
+        .errors
+        .extend(crate::presentation::publish_local(&found.specs, this_host));
 
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
@@ -1592,6 +1595,10 @@ pub fn up_once_selected(
             .map(|e| format!("{}: {}", e.path.display(), e.message)),
     );
     let owner = owner.clone();
+    report.errors.extend(crate::presentation::publish_local(
+        std::slice::from_ref(&owner),
+        this_host,
+    ));
     if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
         && let Err(error) = crate::hooks::verify_installed()
     {

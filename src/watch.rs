@@ -153,6 +153,10 @@ mod tests {
                 &root.join(format!("agents/h/live/{reserved}/project/agent.kdl"))
             ));
         }
+        assert!(!is_declaration_path(
+            root,
+            &root.join("agents/h/live/resources/presentation.json")
+        ));
         assert!(!is_declaration_path(root, &root.join("team/rendered.kdl")));
     }
 

@@ -31,7 +31,7 @@ Spec declaration is their sole source of truth; a sibling `name` file is neither
 read nor written.
 
 Constrained KDL-only commands may mutate one presentation field without
-publishing a second representation. Within the trusted-fleet model,
+accepting a second authored representation. Within the trusted-fleet model,
 caller-supplied `ST_AGENT` limits an invocation to itself or declared
 descendants; this is an operational guardrail, not an authenticated capability,
 and absence selects the operator path. Declarations explicitly marked Nix-owned
@@ -50,6 +50,17 @@ optional description. Name is not duplicated in tags. One real patch emits one
 coherent `metadata_change` event; an unchanged patch emits none. Automation
 never uses human display-name resolution. Presentation drift degrades and
 retries without restart or lifecycle accounting.
+
+st2 also publishes the same desired presentation as one fixed provider-neutral
+derived state snapshot at `<agent-dir>/resources/presentation.json`. The
+snapshot contains a versioned schema, host, stable unqualified identity, and
+explicitly nullable name and description. It is intrinsic state rather than a
+declared Resource binding and carries no provider, account, session, or
+lifecycle data. Harness drivers own provider-native translation; the generic
+projection grants them no lifecycle authority. Equal canonical bytes are a
+no-op, while changed bytes are durably replaced through a synced
+same-directory temporary and atomic rename. No catalog-wide generation is
+embedded because unrelated declaration changes do not revise presentation.
 
 ## Consequences
 
@@ -70,6 +81,8 @@ retries without restart or lifecycle accounting.
 - parser and roster tests across KDL, TOML, and JSON;
 - source-preservation, authority, Nix refusal, and stale-writer tests;
 - exact-ID PTY projection tests for set, clear, idempotence, and partial failure;
+- exact presentation snapshot schema/path, nullable clearing, unchanged-byte
+  no-op, atomic durable replacement, and state-plane exclusion tests;
 - a live no-restart test preserving stable task ID, PID, creation identity, and
-  generation across presentation changes;
+  generation across PTY and snapshot presentation changes;
 - a genuine lifecycle-change control that still performs ordinary replacement.

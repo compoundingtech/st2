@@ -915,6 +915,11 @@ fn snapshot_is_typed_deterministic_and_excludes_state_and_workspaces() {
     .unwrap();
     fs::create_dir_all(dir.join("resources/inbox")).unwrap();
     fs::write(dir.join("resources/inbox/live.md"), "state").unwrap();
+    fs::write(
+        dir.join("resources/presentation.json"),
+        "{\"schema\":\"st2.agent-presentation.v1\"}\n",
+    )
+    .unwrap();
     fs::write(dir.join("status"), "busy").unwrap();
     fs::create_dir_all(dir.join("assets")).unwrap();
     fs::write(dir.join("assets/tool.sh"), "#!/bin/sh\ntrue\n").unwrap();
@@ -1074,6 +1079,11 @@ fn apply_is_cas_guarded_idempotent_and_preserves_orphan_state() {
     let dir = agent_dir(&catalog, "worker");
     fs::create_dir_all(dir.join("resources/inbox")).unwrap();
     fs::write(dir.join("resources/inbox/live.md"), "keep").unwrap();
+    fs::write(
+        dir.join("resources/presentation.json"),
+        "{\"schema\":\"st2.agent-presentation.v1\"}\n",
+    )
+    .unwrap();
     fs::write(dir.join("status"), "busy").unwrap();
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);
@@ -1100,6 +1110,10 @@ fn apply_is_cas_guarded_idempotent_and_preserves_orphan_state() {
     assert_eq!(
         fs::read_to_string(dir.join("resources/inbox/live.md")).unwrap(),
         "keep"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("resources/presentation.json")).unwrap(),
+        "{\"schema\":\"st2.agent-presentation.v1\"}\n"
     );
     assert_eq!(fs::read_to_string(dir.join("status")).unwrap(), "busy");
 

@@ -233,15 +233,23 @@ accepted.
   not authentication: a catalog agent may edit itself or a descendant reached
   through declared supervisor edges, while its absence selects the operator
   path.
-- **R26 Live PTY presentation projection:** For every healthy managed PTY, st2
-  reconciles a versioned owned tag snapshot containing the stable actor identity
-  plus optional description through one exact task-ID metadata patch. The
-  primary `agent` task additionally maps optional name to native PTY display
-  metadata; secondary PTYs preserve their task-specific display convention.
-  Projection preserves unrelated tags, removes absent owned values, reports and
-  retries failure, and is idempotent. It never uses display-name resolution or
-  enters launch, teardown, garbage collection, replacement, or flapping
-  accounting.
+- **R26 Nondisruptive presentation projection:** For every active host-local
+  catalog Agent Spec, st2 publishes one versioned machine-readable presentation
+  snapshot at the fixed declaration-local state path
+  `resources/presentation.json`. The snapshot contains stable host and identity
+  plus optional name and description derived solely from the current Agent
+  Spec. Publication is deterministic, atomic, durable, and idempotent. The
+  snapshot contains no provider, account, session, or lifecycle data; it is
+  intrinsic st2 state, not a Resource binding, and has no routing, selection,
+  authorization, launch, adoption, restart, teardown, replacement, or other
+  lifecycle authority. For every healthy managed PTY, st2 also reconciles a
+  versioned owned tag snapshot containing the stable actor identity plus
+  optional description through one exact task-ID metadata patch. The primary
+  `agent` task additionally maps optional name to native PTY display metadata;
+  secondary PTYs preserve their task-specific display convention. Projection
+  preserves unrelated tags, removes absent owned values, reports and retries
+  failure, and is idempotent. It never uses display-name resolution or enters
+  launch, teardown, garbage collection, replacement, or flapping accounting.
 - **R27 Typed agent desired state:** Every admitted Agent Spec has exactly one
   whole-agent desired state: `running`, `suspended`, or `retired`. Omission and
   legacy `retired #false` mean running; legacy `retired #true` means retired
