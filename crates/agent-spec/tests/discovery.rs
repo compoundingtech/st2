@@ -1143,6 +1143,24 @@ fn discovery_retains_the_immutable_parse_that_it_lowered() {
 }
 
 #[test]
+fn shape_invalid_declarations_never_become_runnable_specs() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/x/agent.kdl",
+        r#"agent "x" {
+  host "hetz"
+  schedule "daily" { command "true" }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.is_empty(), "shape-invalid spec was lowered");
+    assert_eq!(found.errors.len(), 1);
+    assert!(found.errors[0].message.contains("unsupported-schedule"));
+}
+
+#[test]
 fn render_only_fields_are_ignored_not_errored() {
     let tmp = tempfile::tempdir().unwrap();
     // A job carrying every render-only field — st2 must parse it cleanly, ignoring them.

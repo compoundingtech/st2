@@ -253,17 +253,35 @@ fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
     };
     if ext == "kdl" {
         let declaration = parse_declared_document(path, &text);
-        let raws = declaration.document.as_ref().map_or_else(
-            || {
-                let detail = declaration
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.as_str())
-                    .unwrap_or("invalid KDL syntax");
-                Err(anyhow::anyhow!("KDL parse error: {detail}"))
-            },
-            crate::kdl_format::lower_declared_document,
-        );
+        let is_adjacent_kdl = declaration
+            .document
+            .as_ref()
+            .is_some_and(|document| document.agents.is_empty())
+            && path.file_stem().and_then(|stem| stem.to_str()) != Some("agent");
+        let raws = if declaration.is_valid() || is_adjacent_kdl {
+            crate::kdl_format::lower_declared_document(
+                declaration
+                    .document
+                    .as_ref()
+                    .expect("valid or adjacent KDL has a document"),
+            )
+        } else if declaration.document.is_none() {
+            let detail = declaration
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .unwrap_or("invalid KDL syntax");
+            Err(anyhow::anyhow!("KDL parse error: {detail}"))
+        } else {
+            let detail = declaration
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == crate::DeclaredSeverity::Error)
+                .map(|diagnostic| format!("[{}]: {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(anyhow::anyhow!("KDL declaration error: {detail}"))
+        };
         return ParsedRawFile {
             raws,
             declaration: Some(declaration),

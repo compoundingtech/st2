@@ -110,6 +110,27 @@ fn unnamed_tasks_and_reserved_schedules_are_causal_red_shape_errors() {
 }
 
 #[test]
+fn duplicate_routing_fields_are_shape_errors() {
+    let source = r#"agent "worker" {
+  identity "first"
+  identity "second"
+  host "first"
+  host "second"
+}"#;
+    let parsed = parse_declared_document(Path::new("candidate.kdl"), source);
+    assert!(parsed.document.is_some());
+    assert_eq!(
+        parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        ["duplicate-routing-field", "duplicate-routing-field"]
+    );
+    assert!(!parsed.is_valid());
+}
+
+#[test]
 fn parsing_is_deterministic_across_a_small_mutation_corpus() {
     let mutations = [
         MANAGED.to_owned(),

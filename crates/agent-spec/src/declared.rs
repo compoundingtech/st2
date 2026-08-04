@@ -38,6 +38,7 @@ pub enum DeclaredDiagnosticCode {
     UnexpectedTopLevelNode,
     TaskNameMissing,
     UnsupportedSchedule,
+    DuplicateRoutingField,
 }
 
 impl DeclaredDiagnosticCode {
@@ -47,6 +48,7 @@ impl DeclaredDiagnosticCode {
             Self::UnexpectedTopLevelNode => "unexpected-top-level-node",
             Self::TaskNameMissing => "task-name-missing",
             Self::UnsupportedSchedule => "unsupported-schedule",
+            Self::DuplicateRoutingField => "duplicate-routing-field",
         }
     }
 }
@@ -280,6 +282,22 @@ pub fn parse_declared_document(source_name: &Path, source: &str) -> DeclaredPars
                 ),
             ));
             continue;
+        }
+        for field in node.children_named("identity").skip(1) {
+            diagnostics.push(shape_diagnostic(
+                source_name,
+                field.span,
+                DeclaredDiagnosticCode::DuplicateRoutingField,
+                "agent identity must be declared exactly once".to_owned(),
+            ));
+        }
+        for field in node.children_named("host").skip(1) {
+            diagnostics.push(shape_diagnostic(
+                source_name,
+                field.span,
+                DeclaredDiagnosticCode::DuplicateRoutingField,
+                "agent host must be declared exactly once".to_owned(),
+            ));
         }
         for child in &node.children {
             match child.name.as_str() {

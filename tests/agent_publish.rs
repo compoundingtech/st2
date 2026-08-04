@@ -511,6 +511,32 @@ fn malformed_multiple_and_implicit_specs_fail_closed() {
 }
 
 #[test]
+fn duplicate_routing_fields_are_not_publishable() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let spec = temp.path().join("duplicate-host.kdl");
+    fs::write(
+        &spec,
+        r#"agent "worker" {
+  host "first"
+  host "second"
+  argv "true"
+}
+"#,
+    )
+    .unwrap();
+
+    let output = publish(&catalog, &spec, &["--expect-absent"]);
+    assert!(
+        !output.status.success(),
+        "duplicate routing fields unexpectedly published: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!catalog.join("agents").exists());
+}
+
+#[test]
 fn catalog_control_names_and_path_traversal_are_not_publishable_placements() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
