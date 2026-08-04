@@ -372,13 +372,16 @@ fn exact_identity_rejects_incomplete_catalog_discovery() {
 fn exact_identity_rejects_incomplete_catalog_traversal() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    let unreadable = root.join("unreadable");
     write(root, "valid/worker.kdl", &agent_kdl("worker", "h"));
     write(root, "unreadable/hidden.kdl", &agent_kdl("worker", "h"));
-    fs::set_permissions(
-        root.join("unreadable"),
-        fs::Permissions::from_mode(0o000),
-    )
-    .unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&unreadable).is_ok() {
+        // Root or CAP_DAC_OVERRIDE can bypass mode 000, so this environment cannot induce the
+        // traversal failure the test is intended to exercise.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
 
     let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
@@ -387,11 +390,7 @@ fn exact_identity_rejects_incomplete_catalog_traversal() {
         .output()
         .unwrap();
 
-    fs::set_permissions(
-        root.join("unreadable"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(!selected.status.success());
     let stderr = String::from_utf8_lossy(&selected.stderr);
     assert!(
