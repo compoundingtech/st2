@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use st2::message;
 use st2::reconcile::{
@@ -11,7 +12,7 @@ use st2::reconcile::{
 };
 use st2::run::Runner;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
-use st2::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+use st2::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
     format!(
@@ -232,7 +233,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         job_type: JobType::Service,
         workspace: None,
         supervisor: None,
-        retired: false,
+        desired_state: AgentDesiredState::Running,
         keep: false,
         restart: None,
         resources: vec![],
@@ -326,6 +327,25 @@ fn selected_adopt_only_absent_task_is_reported_held_without_runner_mutation() {
     assert!(runner.spawned.borrow().is_empty());
     assert!(runner.reaped.borrow().is_empty());
     assert!(runner.removed.borrow().is_empty());
+}
+
+#[test]
+fn selected_missing_derived_ding_is_held_without_broadening_to_its_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner::default();
+
+    let report = up_once_selected(tmp.path(), "hetz.demo.ding", "hetz", &runner).unwrap();
+
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(report.held, ["hetz.demo.ding"]);
+    assert!(report.launched.is_empty());
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(runner.reaped.borrow().is_empty());
 }
 
 #[test]
@@ -537,6 +557,7 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
         pty_id: "host.owner.work".to_owned(),
         bus_id: "host.owner".to_owned(),
         name: "work".to_owned(),
+        derived: false,
         launch: TaskLaunch::Shell("true".to_owned()),
         cwd: None,
         workspace: None,
@@ -557,6 +578,7 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
         launch: vec![Launch {
             spec: &spec,
             tasks: vec![target],
+            live_derived: Vec::new(),
         }],
         teardown: vec![Teardown {
             spec: &spec,
@@ -600,6 +622,24 @@ id = "hetz.demo.ding"
 command = "st2 ding hetz.demo"
 "#;
 
+const COMPACT_AGENT_WITH_DING: &str = r#"
+agent "demo" {
+  host "hetz"
+  command "exit 24"
+  ding
+  restart { attempts 1; interval "60s"; delay "0s"; mode "fail" }
+}
+"#;
+
+const COMPACT_ADOPT_ONLY_AGENT_WITH_DING: &str = r#"
+agent "demo" {
+  host "hetz"
+  command "true"
+  lifecycle "adopt-only"
+  ding
+}
+"#;
+
 #[test]
 fn up_once_launches_all_tasks_of_a_fresh_agent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -616,6 +656,55 @@ fn up_once_launches_all_tasks_of_a_fresh_agent() {
     assert!(report.errors.is_empty());
     let dirs = runner.spawn_dirs.borrow();
     assert!(dirs.iter().all(|(_, d)| d.ends_with("agents/hetz/demo")));
+}
+
+#[test]
+fn fresh_compact_agent_launches_with_its_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+
+    let report = up_once(tmp.path(), "hetz", &FakeRunner::default()).unwrap();
+
+    assert_eq!(report.launched, ["hetz.demo", "hetz.demo.ding"]);
+}
+
+#[test]
+fn absent_adopt_only_compact_agent_holds_its_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_ADOPT_ONLY_AGENT_WITH_DING,
+    );
+
+    let report = up_once(tmp.path(), "hetz", &FakeRunner::default()).unwrap();
+
+    assert_eq!(report.held, ["hetz.demo"]);
+    assert!(report.launched.is_empty());
+}
+
+#[test]
+fn held_adopt_only_compact_agent_stops_its_live_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_ADOPT_ONLY_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.held, ["hetz.demo"]);
+    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
+    assert!(report.launched.is_empty());
 }
 
 #[test]
@@ -666,6 +755,82 @@ command = "st2 ding hetz.demo"
     torn.sort();
     assert_eq!(torn, vec!["hetz.demo-claude", "hetz.demo.ding"]);
     assert!(report.launched.is_empty());
+}
+
+#[test]
+fn retired_compact_agent_stops_agent_and_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let retired = COMPACT_AGENT_WITH_DING.replacen(
+        "  host \"hetz\"",
+        "  host \"hetz\"\n  retired #true",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &retired);
+    let runner = FakeRunner {
+        sessions: vec![live("hetz.demo"), live("hetz.demo.ding")],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
+    assert!(report.launched.is_empty());
+}
+
+#[test]
+fn suspend_and_resume_cover_derived_ding_sibling_continuity_and_inbox_retention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let running = COMPACT_AGENT_WITH_DING;
+    let suspended = running.replacen(
+        "  host \"hetz\"",
+        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    write(
+        tmp.path(),
+        "agents/hetz/sibling/agent.kdl",
+        "agent \"sibling\" { host \"hetz\"; command \"true\" }\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/demo/resources/inbox/1234567890000-proof.md",
+        "---\nfrom: hetz.sibling\n---\nretained\n",
+    );
+    let suspend_runner = FakeRunner {
+        sessions: vec![
+            live("hetz.demo"),
+            live("hetz.demo.ding"),
+            live("hetz.sibling"),
+        ],
+        ..Default::default()
+    };
+
+    let suspended_report = up_once(tmp.path(), "hetz", &suspend_runner).unwrap();
+    assert_eq!(suspended_report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(suspended_report.adopted, ["sibling"]);
+    assert!(suspended_report.launched.is_empty());
+    assert!(tmp
+        .path()
+        .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+        .is_file());
+
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", running);
+    let resume_runner = FakeRunner {
+        sessions: vec![
+            dead("hetz.demo"),
+            dead("hetz.demo.ding"),
+            live("hetz.sibling"),
+        ],
+        ..Default::default()
+    };
+    let resumed_report = up_once(tmp.path(), "hetz", &resume_runner).unwrap();
+    assert_eq!(resumed_report.restarted, ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(resumed_report.adopted, ["sibling"]);
+    assert!(tmp
+        .path()
+        .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+        .is_file());
 }
 
 #[test]
@@ -790,11 +955,51 @@ fn up_once_does_not_report_failed_replacement_as_restarted() {
 }
 
 #[test]
+fn failed_compact_agent_restart_stops_its_live_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        fail_spawn: Some("hetz.demo".into()),
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+}
+
+#[test]
+fn failed_compact_agent_reap_stops_its_live_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        fail_reap: Some("hetz.demo".into()),
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+}
+
+#[test]
 fn up_once_finally_removes_dead_retired_tasks_without_restarting_them() {
     let tmp = tempfile::tempdir().unwrap();
     let retired = AGENT.replacen(
         "type = \"service\"",
-        "type = \"service\"\nretired = true",
+        "type = \"service\"\nretired = true\nkeep = true",
         1,
     );
     write(tmp.path(), "agents/hetz/demo/agent.toml", &retired);
@@ -854,6 +1059,60 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
     assert_eq!(cl.identity, "demo");
     assert_eq!(cl.supervisor.as_deref(), Some("cos-claude"));
     assert_eq!(cl.agent_bus_id("hetz"), "hetz.demo");
+}
+
+#[test]
+fn parked_compact_agent_stops_its_live_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let found = discover(tmp.path());
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        ..Default::default()
+    };
+    let mut cap = FlappingCap::default();
+
+    let first = reconcile(&found.specs, &runner.sessions, "hetz");
+    execute(&first, &runner, &mut cap, &mut UpReport::default());
+    let second = reconcile(&found.specs, &runner.sessions, "hetz");
+    let mut report = UpReport::default();
+    execute(&second, &runner, &mut cap, &mut report);
+
+    assert_eq!(report.flapping, ["hetz.demo"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+}
+
+#[test]
+fn parked_compact_agent_does_not_relaunch_its_exited_derived_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    let found = discover(tmp.path());
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), dead("hetz.demo.ding")],
+        ..Default::default()
+    };
+    let mut cap = FlappingCap::default();
+    cap.record("hetz.demo", Instant::now());
+
+    let plan = reconcile(&found.specs, &runner.sessions, "hetz");
+    let mut report = UpReport::default();
+    execute(&plan, &runner, &mut cap, &mut report);
+
+    assert_eq!(report.flapping, ["hetz.demo"]);
+    assert!(
+        !runner
+            .spawned
+            .borrow()
+            .contains(&"hetz.demo.ding".to_string())
+    );
 }
 
 /// A parked crash-loop is surfaced to the agent's supervisor over the native bus: a `crash-loop`-tagged

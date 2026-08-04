@@ -1,21 +1,24 @@
 //! Transactional publication of one canonical Agent Spec into a live catalog.
 
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use agent_spec::discovery::parse_declared;
+use agent_spec::{DeclaredValue, parse_declared_document};
 use anyhow::{Context, Result};
-use kdl::KdlDocument;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::catalog_lock::CatalogLock;
 use crate::catalog_transaction::sync_dir;
 
-const SCHEMA: &str = "st2.agent-publish.v1";
+const SCHEMA: &str = "st2.agent-publish.v2";
 const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
 const BUNDLE_DIGEST_DOMAIN: &[u8] = b"st2.agent-publish-bundle.v1\0";
 
@@ -50,6 +53,8 @@ pub enum PublishStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PublishResult {
     pub schema: &'static str,
+    pub policy_profile: &'static str,
+    pub agent_spec_revision: &'static str,
     pub status: PublishStatus,
     pub bus_id: String,
     pub path: PathBuf,
@@ -137,27 +142,42 @@ impl Candidate {
         let bytes = fs::read(&spec_path)
             .with_context(|| format!("read candidate spec {}", spec_path.display()))?;
         let text = std::str::from_utf8(&bytes).context("candidate Agent Spec is not UTF-8")?;
-        let document = KdlDocument::parse(text)
-            .map_err(|error| anyhow::anyhow!("KDL parse error: {error}"))?;
+        let parsed = parse_declared_document(&spec_path, text);
         anyhow::ensure!(
-            document.nodes().len() == 1 && document.nodes()[0].name().value() == "agent",
+            parsed.is_valid(),
+            "candidate fails strict declaration parsing:\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == agent_spec::DeclaredSeverity::Error)
+                .map(|diagnostic| format!(
+                    "{}:{}:{} [{}]: {}",
+                    diagnostic.source.display(),
+                    diagnostic.span.line,
+                    diagnostic.span.column,
+                    diagnostic.code,
+                    diagnostic.message
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let document = parsed
+            .document
+            .context("candidate Agent Spec has no parsed declaration")?;
+        anyhow::ensure!(
+            document.nodes.len() == 1 && document.agents.len() == 1,
             "candidate must contain exactly one top-level `agent` node"
         );
-        let declared = parse_declared(&spec_path)
-            .with_context(|| format!("parse candidate Agent Spec {}", spec_path.display()))?;
-        anyhow::ensure!(
-            declared.len() == 1,
-            "candidate must declare exactly one agent (found {})",
-            declared.len()
-        );
-        let host = declared[0]
-            .host
-            .as_deref()
+        let declared = &document.agents[0];
+        let host = declared
+            .field("host")
+            .and_then(|field| field.argument(0))
+            .and_then(DeclaredValue::as_str)
             .filter(|value| !value.is_empty())
             .context("candidate must declare a non-empty explicit host")?;
-        let identity = declared[0]
-            .identity
-            .as_deref()
+        let identity = declared
+            .identity()
+            .and_then(DeclaredValue::as_str)
             .filter(|value| !value.is_empty())
             .context("candidate must declare a non-empty explicit identity")?;
         validate_component("host", host)?;
@@ -286,24 +306,22 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
                 target_dir.display()
             );
         }
+        let verified_after =
+            verify_published_spec(&catalog, &target_spec, &candidate.bytes, &after_hash)?;
         return Ok(result(
             PublishStatus::Unchanged,
-            &candidate,
+            candidate.bus_id(),
+            candidate.input_sha256.clone(),
             target_spec,
             before_hash,
-            after_hash,
+            verified_after,
         ));
     }
 
     test_before_publication();
     let generation = lock.begin_generation_commit()?;
-    let published = result(
-        PublishStatus::Published,
-        &candidate,
-        target_spec.clone(),
-        before_hash,
-        after_hash,
-    );
+    let bus_id = candidate.bus_id();
+    let input_sha256 = candidate.input_sha256.clone();
     match candidate.kind {
         CandidateKind::Spec => {
             ensure_real_dir_chain(&catalog, &target_dir)?;
@@ -319,26 +337,86 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
             atomic_publish_staged_bundle(lock.control(), &catalog, candidate.stage, &target_dir)?;
         }
     }
+    test_after_publication_before_readback();
+    let verified_after =
+        verify_published_spec(&catalog, &target_spec, &candidate.bytes, &after_hash)?;
     generation.commit()?;
-    Ok(published)
+    Ok(result(
+        PublishStatus::Published,
+        bus_id,
+        input_sha256,
+        target_spec,
+        before_hash,
+        verified_after,
+    ))
 }
 
 fn result(
     status: PublishStatus,
-    candidate: &Candidate,
+    bus_id: String,
+    input_sha256: String,
     path: PathBuf,
     before_sha256: Option<String>,
     after_sha256: String,
 ) -> PublishResult {
     PublishResult {
         schema: SCHEMA,
+        policy_profile: crate::validate::CORE_CATALOG_POLICY_PROFILE,
+        agent_spec_revision: agent_spec::AGENT_SPEC_REVISION,
         status,
-        bus_id: candidate.bus_id(),
+        bus_id,
         path,
-        input_sha256: candidate.input_sha256.clone(),
+        input_sha256,
         before_sha256,
         after_sha256,
     }
+}
+
+fn verify_published_spec(
+    catalog: &Path,
+    target: &Path,
+    expected_bytes: &[u8],
+    expected_sha256: &str,
+) -> Result<String> {
+    let observed = read_regular_beneath(catalog, target)
+        .with_context(|| format!("read back published Agent Spec {}", target.display()))?;
+    let observed_sha256 = sha256(&observed);
+    anyhow::ensure!(
+        observed_sha256 == expected_sha256 && observed == expected_bytes,
+        "published Agent Spec readback mismatch: expected sha256 {expected_sha256}, found {observed_sha256}"
+    );
+    crate::catalog_transaction::validate_full_catalog(catalog)
+        .context("published catalog fails locked core/catalog re-admission")?;
+    Ok(observed_sha256)
+}
+
+fn read_regular_beneath(catalog: &Path, target: &Path) -> Result<Vec<u8>> {
+    let parent = target
+        .parent()
+        .context("published Agent Spec has no parent")?;
+    let parent = crate::catalog_transaction::open_dir_beneath(catalog, parent)?;
+    let leaf = target
+        .file_name()
+        .context("published Agent Spec has no file name")?;
+    let leaf = CString::new(leaf.as_bytes()).context("published Agent Spec name contains NUL")?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("open published Agent Spec readback");
+    }
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "published Agent Spec readback is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn validate_component(field: &str, value: &str) -> Result<()> {
@@ -454,6 +532,8 @@ fn copy_filtered_catalog(
 }
 
 fn is_declaration_parent(path: &Path) -> Result<bool> {
+    // These are independent catalog children discovered while constructing the post-write shadow,
+    // not a reparse of `Candidate`: each file must be admitted before its adjacent state is pruned.
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let entry = entry?;
         let candidate = entry.path();
@@ -653,6 +733,23 @@ fn test_before_publication() {
 
 #[cfg(not(debug_assertions))]
 fn test_before_publication() {}
+
+#[cfg(debug_assertions)]
+fn test_after_publication_before_readback() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_AGENT_PUBLISH_READBACK_READY"),
+        std::env::var("ST2_TEST_AGENT_PUBLISH_READBACK_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_after_publication_before_readback() {}
 
 fn atomic_publish_staged_bundle(
     control: &File,

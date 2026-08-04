@@ -19,8 +19,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_spec::discovery::{discover, parse_declared, path_defaults};
+use agent_spec::discovery::{discover, path_defaults};
 use agent_spec::spec::{AgentSpec, JobType};
+use agent_spec::{DeclaredDiagnosticCode, DeclaredParse, DeclaredSeverity, DeclaredValue};
+
+pub const VALIDATE_RECEIPT_SCHEMA: &str = "st2.validate.v2";
+pub const CORE_CATALOG_POLICY_PROFILE: &str = "st2.core+catalog.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -149,33 +153,30 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
     // 3. Raw pass (once per file): a typo'd `type` is normalized to `service` by the parser, so it can
     //    only be seen before lowering. A KDL `pty`/`exec` block with no name is silently dropped — the
     //    task just vanishes, the classic "silently does the wrong thing".
-    let mut files: Vec<&PathBuf> = d.specs.iter().map(|s| &s.path).collect();
-    files.sort();
-    files.dedup();
     let mut explicit_placements: HashSet<(PathBuf, String, String)> = HashSet::new();
-    for f in files {
-        if let Ok(raws) = parse_declared(f) {
-            for raw in raws {
-                if let (Some(identity), Some(host)) = (&raw.identity, &raw.host) {
-                    explicit_placements.insert((f.clone(), identity.clone(), host.clone()));
-                }
-                if let Some(t) = &raw.job_type
-                    && t != "service"
-                {
-                    // FOLLOW-UP (CoS-noted, deferred): a broader "unknown field / typo" WARN lint
-                    // (e.g. a `harnes` typo) is worth having, but it must not error on render-only
-                    // nodes st2 ignores by design — kept out of scope for now to preserve
-                    // render-agnosticism. `type` is safe to check because its value set is closed.
-                    issues.push(Issue::error(
-                        "unknown-type",
-                        rel(root, f),
-                        raw.identity.clone(),
-                        format!("unknown type '{t}' (expected service; `type = batch` is retired — use `st2 eval`)"),
-                    ));
-                }
+    for file in &d.declarations {
+        for raw in &file.agents {
+            if let (Some(identity), Some(host)) = (&raw.identity, &raw.host) {
+                explicit_placements.insert((file.path.clone(), identity.clone(), host.clone()));
+            }
+            if let Some(t) = &raw.job_type
+                && t != "service"
+            {
+                // FOLLOW-UP (CoS-noted, deferred): a broader "unknown field / typo" WARN lint
+                // (e.g. a `harnes` typo) is worth having, but it must not error on render-only
+                // nodes st2 ignores by design — kept out of scope for now to preserve
+                // render-agnosticism. `type` is safe to check because its value set is closed.
+                issues.push(Issue::error(
+                    "unknown-type",
+                    rel(root, &file.path),
+                    raw.identity.clone(),
+                    format!("unknown type '{t}' (expected service; `type = batch` is retired — use `st2 eval`)"),
+                ));
             }
         }
-        issues.extend(kdl_shape_check(root, f));
+        if let Some(parse) = &file.parse {
+            issues.extend(kdl_shape_check(root, &file.path, parse));
+        }
     }
 
     // 4. Resolved pass: cross-spec + field checks over each agent.
@@ -399,46 +400,45 @@ fn check_path(
 
 /// Catch runner-significant KDL shapes that the permissive lowerer cannot accept silently. TOML/JSON
 /// tasks are keyed maps and cannot be nameless; `schedule` is a reserved future KDL surface.
-fn kdl_shape_check(root: &Path, path: &Path) -> Vec<Issue> {
-    if path.extension().and_then(|e| e.to_str()) != Some("kdl") {
-        return Vec::new();
-    }
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(doc) = kdl::KdlDocument::parse(&text) else {
-        return Vec::new(); // a parse failure is already reported via discovery
-    };
-    let mut out = Vec::new();
-    for node in doc.nodes() {
-        if node.name().value() != "agent" {
-            continue;
-        }
-        let agent = node.get(0).and_then(|v| v.as_string()).map(String::from);
-        for child in node.children().into_iter().flat_map(|c| c.nodes()) {
-            let kind = child.name().value();
-            if (kind == "pty" || kind == "exec")
-                && child.get(0).and_then(|v| v.as_string()).is_none()
-            {
-                out.push(Issue::error(
-                    "unknown-task-kind",
-                    rel(root, path),
-                    agent.clone(),
-                    format!("{kind} task has no name — it is silently dropped and never runs"),
-                ));
-            }
-            if kind == "schedule" {
-                out.push(Issue::error(
-                    "unsupported-schedule",
-                    rel(root, path),
-                    agent.clone(),
-                    "scheduled work is reserved for a future contract and is not implemented"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-    out
+fn kdl_shape_check(root: &Path, path: &Path, parsed: &DeclaredParse) -> Vec<Issue> {
+    let document = parsed.document.as_ref();
+    parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DeclaredSeverity::Error)
+        // Discovery already reports syntax errors through its established parse-error contract.
+        .filter(|diagnostic| diagnostic.code != DeclaredDiagnosticCode::KdlSyntax)
+        .map(|diagnostic| {
+            let agent = document.and_then(|document| {
+                document
+                    .agents
+                    .iter()
+                    .find(|agent| {
+                        let end = agent.span.offset + agent.span.length;
+                        diagnostic.span.offset >= agent.span.offset && diagnostic.span.offset < end
+                    })
+                    .and_then(|agent| agent.identity())
+                    .and_then(DeclaredValue::as_str)
+                    .map(str::to_owned)
+            });
+            Issue::error(
+                if diagnostic.code == DeclaredDiagnosticCode::TaskNameMissing {
+                    "unknown-task-kind"
+                } else {
+                    match diagnostic.code {
+                        DeclaredDiagnosticCode::UnsupportedSchedule => "unsupported-schedule",
+                        DeclaredDiagnosticCode::UnexpectedTopLevelNode => {
+                            "unexpected-top-level-node"
+                        }
+                        _ => "declaration-shape",
+                    }
+                },
+                rel(root, path),
+                agent,
+                diagnostic.message.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Best-effort persona-overlay lint: if render's overlay is present in the agent's workspace

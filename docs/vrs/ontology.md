@@ -100,6 +100,38 @@ st2's runtime observation of whether a task record is alive.
 
 Authority: [`reconcile::Session`](../../src/reconcile.rs#L16-L26)
 
+### agent desired state
+
+The declaration-owned whole-agent lifecycle intent: `running`, `suspended`, or
+`retired`. It is distinct from presence and session state.
+
+Authority: [R27 typed agent desired state](requirements.md);
+[`AgentDesiredState`](../../crates/agent-spec/src/spec.rs)
+
+### suspension
+
+Reversible desired absence of an agent's live tasks while its declaration and
+catalog-backed durable state remain available. Suspension is not process pause
+or checkpointing.
+
+Authority: [R27 typed agent desired state](requirements.md);
+[Agent Spec field rules](02-agent-spec/spec.md)
+
+### retirement
+
+Terminal desired absence whose completion additionally requires every declared
+task record to be collected. Legacy `retired #true` is a readable spelling.
+
+Authority: [R27 typed agent desired state](requirements.md);
+[Doctor retired absence](02-doctor/requirements.md)
+
+### desired-state rationale
+
+The bounded human explanation required by a new suspended or retired desired
+state. It explains intent and grants no lifecycle authority of its own.
+
+Authority: [R27 typed agent desired state](requirements.md)
+
 ### reconciliation
 
 Comparing declared host-local work with observed runtime state to produce a

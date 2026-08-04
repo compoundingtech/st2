@@ -581,7 +581,7 @@ pub fn render_ownership_conflicts(
 ) -> Vec<RenderOwnershipConflict> {
     let mut by_destination = BTreeMap::<PathBuf, BTreeMap<String, Vec<RenderClaim>>>::new();
     for spec in specs {
-        if spec.retired || spec.resolved_host(this_host) != this_host {
+        if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
         let Ok(claims) = claims_for_agent(root, spec, this_host) else {
@@ -892,7 +892,7 @@ pub fn materialize_catalog_against(
     }
 
     for spec in selected_specs {
-        if spec.retired || spec.resolved_host(this_host) != this_host {
+        if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
         let bus_id = spec.bus_id(this_host);

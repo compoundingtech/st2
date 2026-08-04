@@ -10,6 +10,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::declared::{DeclaredParse, parse_declared_document};
 use crate::spec::{AgentSpec, RawSpec};
 
 /// The result of walking a catalog folder. Sorted + deterministic.
@@ -21,6 +22,18 @@ pub struct Discovered {
     pub warnings: Vec<String>,
     /// Files that looked like specs but failed to parse/resolve — surfaced, never silently dropped.
     pub errors: Vec<SpecError>,
+    /// Declaration parses retained so runner lowering and validation consume one immutable result.
+    pub declarations: Vec<DiscoveredDeclaration>,
+}
+
+/// One declaration candidate parsed during discovery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveredDeclaration {
+    pub path: PathBuf,
+    /// Pre-lowering runner-significant fields for every declaration in the file.
+    pub agents: Vec<Declared>,
+    /// Full canonical KDL parse. `None` for legacy TOML/JSON declarations.
+    pub parse: Option<DeclaredParse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +48,39 @@ const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 /// Walk `root` recursively and lower every agent spec found. Returns empty (no error) when `root`
 /// does not exist yet — a fresh, un-seeded folder is a valid state.
 pub fn discover(root: &Path) -> Discovered {
+    discover_impl(root, false)
+}
+
+/// Discover a catalog while treating directory traversal failures as uncertainty. Consumers that
+/// must prove a global property such as identity uniqueness should use this mode.
+pub fn discover_strict(root: &Path) -> Discovered {
+    discover_impl(root, true)
+}
+
+fn discover_impl(root: &Path, strict: bool) -> Discovered {
     let mut out = Discovered::default();
     let mut files = Vec::new();
-    collect_spec_files(root, root, &mut files);
+    collect_spec_files(root, root, &mut files, strict, &mut out.errors);
     files.sort();
     for path in files {
-        match load_specs(root, &path) {
+        let ParsedRawFile { raws, declaration } = parse_raw_file_with_declaration(&path);
+        let agents = raws
+            .as_ref()
+            .map(|raws| raws.iter().map(Declared::from).collect())
+            .unwrap_or_default();
+        let is_generic_agent = path.file_stem().and_then(|stem| stem.to_str()) == Some("agent");
+        let is_declaration = is_generic_agent
+            || raws
+                .as_ref()
+                .is_ok_and(|raws| raws.iter().any(RawSpec::looks_like_spec));
+        if is_declaration {
+            out.declarations.push(DiscoveredDeclaration {
+                path: path.clone(),
+                agents,
+                parse: declaration,
+            });
+        }
+        match raws.and_then(|raws| load_specs(root, &path, raws)) {
             Ok((specs, warnings)) => {
                 out.specs.extend(specs);
                 out.warnings.extend(warnings);
@@ -136,23 +176,57 @@ fn is_declaration_parent(dir: &Path) -> bool {
 /// Recursively gather candidate spec files, skipping only explicit control/runtime namespaces and
 /// anything that isn't one of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble
 /// an agent spec; it is runner state, never catalog input. Unreadable directories are skipped, not
-/// fatal.
-fn collect_spec_files(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) {
+/// fatal in ordinary discovery. Strict discovery records them as uncertainty.
+fn collect_spec_files(
+    root: &Path,
+    dir: &Path,
+    acc: &mut Vec<PathBuf>,
+    strict: bool,
+    errors: &mut Vec<SpecError>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(error) => {
+            if strict && !(dir == root && error.kind() == std::io::ErrorKind::NotFound) {
+                errors.push(SpecError {
+                    path: dir.to_path_buf(),
+                    message: format!("catalog directory traversal failed: {error}"),
+                });
+            }
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                if strict {
+                    errors.push(SpecError {
+                        path: dir.to_path_buf(),
+                        message: format!("catalog directory entry traversal failed: {error}"),
+                    });
+                }
+                continue;
+            }
+        };
         let path = entry.path();
         if !is_catalog_path(root, &path) {
             continue;
         }
         let ft = match entry.file_type() {
             Ok(ft) => ft,
-            Err(_) => continue,
+            Err(error) => {
+                if strict {
+                    errors.push(SpecError {
+                        path,
+                        message: format!("catalog entry type inspection failed: {error}"),
+                    });
+                }
+                continue;
+            }
         };
         if ft.is_dir() {
-            collect_spec_files(root, &path, acc);
+            collect_spec_files(root, &path, acc, strict, errors);
         } else if ft.is_file()
             && let Some(ext) = path.extension().and_then(|e| e.to_str())
             && SPEC_EXTS.contains(&ext)
@@ -179,45 +253,106 @@ pub struct Declared {
     pub job_type: Option<String>,
 }
 
+impl From<&RawSpec> for Declared {
+    fn from(raw: &RawSpec) -> Self {
+        Self {
+            identity: raw.identity.clone(),
+            host: raw.host.clone(),
+            job_type: raw.job_type.clone(),
+        }
+    }
+}
+
 /// Read the declared (pre-lowering) values of every agent in a file — one per `agent` node for KDL,
 /// 0-or-1 for TOML/JSON, empty for a non-spec extension.
 ///
 /// One entry per parsed node, *including* nodes [`discover`] skips as non-specs, so this is not
 /// positionally paired with that file's [`Discovered::specs`].
 pub fn parse_declared(path: &Path) -> anyhow::Result<Vec<Declared>> {
-    Ok(parse_raw_file(path)?
-        .into_iter()
-        .map(|raw| Declared {
-            identity: raw.identity,
-            host: raw.host,
-            job_type: raw.job_type,
-        })
-        .collect())
+    Ok(parse_raw_file(path)?.iter().map(Declared::from).collect())
 }
 
 /// Parse a spec file into its raw (pre-resolution) shape — one per `agent` node for KDL, 0-or-1 for
 /// TOML/JSON. Non-spec extensions yield an empty vec. Shared by discovery and [`parse_declared`]
 /// (which exposes the *raw* `type` and `identity` before normalization, without leaking [`RawSpec`]).
 fn parse_raw_file(path: &Path) -> anyhow::Result<Vec<RawSpec>> {
+    parse_raw_file_with_declaration(path).raws
+}
+
+struct ParsedRawFile {
+    raws: anyhow::Result<Vec<RawSpec>>,
+    declaration: Option<DeclaredParse>,
+}
+
+fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let text = fs::read_to_string(path)?;
-    Ok(match ext {
-        "toml" => {
-            vec![toml::from_str(&text).map_err(|e| anyhow::anyhow!("TOML parse error: {e}"))?]
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            return ParsedRawFile {
+                raws: Err(error.into()),
+                declaration: None,
+            };
         }
-        "json" => vec![
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("JSON parse error: {e}"))?,
-        ],
-        "kdl" => crate::kdl_format::parse_kdl(&text)?,
-        _ => Vec::new(),
-    })
+    };
+    if ext == "kdl" {
+        let declaration = parse_declared_document(path, &text);
+        let is_adjacent_kdl = declaration
+            .document
+            .as_ref()
+            .is_some_and(|document| document.agents.is_empty())
+            && path.file_stem().and_then(|stem| stem.to_str()) != Some("agent");
+        let raws = if declaration.is_valid() || is_adjacent_kdl {
+            crate::kdl_format::lower_declared_document(
+                declaration
+                    .document
+                    .as_ref()
+                    .expect("valid or adjacent KDL has a document"),
+            )
+        } else if declaration.document.is_none() {
+            let detail = declaration
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .unwrap_or("invalid KDL syntax");
+            Err(anyhow::anyhow!("KDL parse error: {detail}"))
+        } else {
+            let detail = declaration
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == crate::DeclaredSeverity::Error)
+                .map(|diagnostic| format!("[{}]: {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(anyhow::anyhow!("KDL declaration error: {detail}"))
+        };
+        return ParsedRawFile {
+            raws,
+            declaration: Some(declaration),
+        };
+    }
+    let raws = match ext {
+        "toml" => toml::from_str(&text)
+            .map(|raw| vec![raw])
+            .map_err(|error| anyhow::anyhow!("TOML parse error: {error}")),
+        "json" => serde_json::from_str(&text)
+            .map(|raw| vec![raw])
+            .map_err(|error| anyhow::anyhow!("JSON parse error: {error}")),
+        _ => Ok(Vec::new()),
+    };
+    ParsedRawFile {
+        raws,
+        declaration: None,
+    }
 }
 
 /// Parse one file into `(specs, warnings)`. TOML/JSON yield 0-or-1 spec; KDL yields one per `agent`
 /// node. Non-spec files yield an empty vec; a malformed file is an `Err` (collected, never fatal).
-fn load_specs(root: &Path, path: &Path) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
-    let raws = parse_raw_file(path)?;
-
+fn load_specs(
+    root: &Path,
+    path: &Path,
+    raws: Vec<RawSpec>,
+) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
     let mut specs = Vec::new();
     let mut warnings = Vec::new();
     for raw in raws {

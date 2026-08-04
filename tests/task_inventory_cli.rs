@@ -101,6 +101,9 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     assert_eq!(value["tasks"][0]["agent"], "h.worker");
     assert_eq!(value["tasks"][0]["task"], "agent");
     assert_eq!(value["tasks"][0]["runtimeId"], "h.worker");
+    assert_eq!(value["tasks"][0]["desiredState"], "running");
+    assert_eq!(value["tasks"][0]["agentDesiredState"], "running");
+    assert!(value["tasks"][0]["agentDesiredStateReason"].is_null());
     assert_eq!(value["tasks"][0]["runtime"]["pid"], 77);
     assert_eq!(
         value["tasks"][0]["runtime"]["createdAt"],
@@ -115,6 +118,29 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     assert_eq!(fs::read(agent).unwrap(), before_agent);
     assert_eq!(fs::read(catalog_config).unwrap(), before_catalog);
     assert!(!state.exists(), "read-only inventory created runtime state");
+}
+
+#[test]
+fn suspended_agent_projects_task_absence_and_agent_rationale_separately() {
+    let (tmp, catalog, bin) = fixture("[]");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let authored = fs::read_to_string(&declaration)
+        .unwrap()
+        .replace(
+            "  host \"h\"\n",
+            "  host \"h\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+        );
+    fs::write(declaration, authored).unwrap();
+
+    let output = tasks(&catalog, &bin, &tmp.path().join("state"));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &value["tasks"][0];
+    assert_eq!(row["retired"], false);
+    assert_eq!(row["desiredState"], "absent");
+    assert_eq!(row["agentDesiredState"], "suspended");
+    assert_eq!(row["agentDesiredStateReason"], "Waiting for capacity");
+    assert_eq!(row["runtime"]["state"], "absent");
 }
 
 #[test]

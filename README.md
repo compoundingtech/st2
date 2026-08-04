@@ -174,7 +174,9 @@ agent "<identity>" {
 For a zero-interruption migration, add `lifecycle "adopt-only"` to the compact
 agent or to an explicit `pty`/`exec` task. st2 adopts that task when its current
 generation is alive. If the generation is dead or absent, st2 reports the task
-as `held` and does not remove or launch anything:
+as `held` and does not remove or launch that task. A compact `ding` is derived
+from the generated agent task: while that agent is held, st2 suppresses a
+missing DING and stops an exact generated DING proved live:
 
 ```kdl
 agent "<identity>" {
@@ -188,7 +190,24 @@ agent "<identity>" {
 This is a fence, not a restart policy. After inspecting or recovering the
 original generation, deliberately change the lifecycle back to `"service"` (or
 remove the field) to authorize ordinary absent launch and dead replacement.
-`retired #true` remains an explicit teardown instruction and takes precedence.
+Whole-agent desired state remains an explicit, separate lifecycle instruction
+and takes precedence over task lifecycle. To keep an agent in the catalog while
+running none of its tasks:
+
+```sh
+st2 --catalog <catalog> agent desired-state <identity> suspended \
+  --reason "Waiting for capacity"
+st2 --catalog <catalog> agent desired-state <identity> running
+st2 --catalog <catalog> agent desired-state <identity> retired \
+  --reason "Mission complete"
+```
+
+The canonical KDL is `desired-state "suspended" reason="..."`. Running is
+canonically omitted. New suspended and retired states require a bounded reason;
+legacy `retired #true` remains readable. Suspension stops the agent and its
+derived DING without deleting its declaration, inbox, context, or Resources.
+Resume uses ordinary `service`, `adopt-only`, and `keep` behavior. Nix-owned
+declarations must be changed at their Nix source.
 
 `resource` binds an agent-local semantic name to an exact RFC 3986 absolute URI. `_tag` selects a
 concrete resource contract understood by downstream readers; st2 preserves arbitrary non-empty tags
@@ -301,6 +320,9 @@ st2 up --catalog "$CATALOG" --host <host> --once --task <host.agent.task>
 ```
 
 Unknown, ambiguous, and wrong-host task selectors refuse before workspace writes or PTY inspection.
+A selected generated DING that is dead or absent is reported as `held`, because starting its
+canonical agent would broaden the exact-task operation. Explicit sibling tasks remain independently
+selectable.
 
 `st2 doctor` accepts the absence of a live host lock as the normal manual/`--once` mode. For a
 resident `st2 up` deployment, use `st2 doctor --require-supervisor` to make a missing loop fail the
@@ -374,14 +396,19 @@ st2 message read <filename>
 st2 message reply <filename> -m "Handled."
 st2 message archive <filename>
 st2 agents --json --enrich
+st2 agents --identity "$ST_AGENT" --json
 st2 context read --full
 ```
 
-The roster includes retired declarations instead of silently conflating them with runtime
-presence. Both JSON shapes keep stable `identity` separate from optional `name` and `description`,
-and contain `retired` plus the declaration's ordered `resources` descriptors. `--enrich`
+The roster includes suspended and retired declarations instead of silently conflating desired
+lifecycle with runtime presence. Both JSON shapes keep stable `identity` separate from optional
+`name` and `description`, and contain the compatibility `retired` projection, `desiredState`,
+`desiredStateReason`, plus the declaration's ordered `resources` descriptors. `--enrich`
 additionally supplies `lastActivity` and `inbox`. Human output prints the same presentation fields
-as separate columns and appends `[retired]` to a retired row.
+as separate columns and appends the non-running state and rationale.
+`--identity <host>.<identity>` selects exactly one qualified Agent Spec or fails,
+so external harness hooks can read its current name and description without parsing KDL or relying
+on a duplicate state file.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and

@@ -933,6 +933,7 @@ mod generation_observation_tests {
             pty_id: id.to_string(),
             bus_id: "host.test".to_string(),
             name: "probe".to_string(),
+            derived: false,
             launch: TaskLaunch::Shell("sleep 30".to_string()),
             cwd: None,
             workspace: None,

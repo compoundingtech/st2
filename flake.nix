@@ -36,6 +36,11 @@
         sourceRev = self.shortRev or self.dirtyShortRev or "unknown";
         sourceCommitUnix = self.lastModified or 0;
         sourceDirty = !(self ? rev);
+        agentSpecRevision =
+          if self ? rev then
+            self.rev
+          else
+            "nix-dirty.${self.dirtyRev or self.dirtyShortRev or "unknown"}";
         buildStamp = builtins.toJSON {
           type = "nix";
           inherit version;
@@ -66,6 +71,7 @@
           # env var, captured at compile time by `option_env!` (see
           # src/version.rs). A derivation env var change rebuilds the crate.
           CLI_BUILD_STAMP = buildStamp;
+          AGENT_SPEC_REVISION = agentSpecRevision;
 
           # The hook integration test executes the shipped Bash scripts with
           # their real jq dependency. `git` is present for tests that initialize

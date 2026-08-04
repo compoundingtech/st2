@@ -7,27 +7,42 @@
 //! - [`discovery`] — the catalog walk: parse every `*.{kdl,toml,json}` that looks like a
 //!   declaration, and resolve each one's `identity`/`host` with the catalog's precedence rule
 //!   (content wins, the path supplies defaults, a mismatch is a warning).
+//! - [`declared`] — the strict, source-located canonical KDL document. It preserves the complete
+//!   typed node tree and duplicate occurrences for publication and downstream policy checks.
 //!
-//! KDL is the canonical on-disk format; TOML and JSON lower to the same model. The KDL parser is a
-//! private implementation detail — [`discovery`] is the only supported entry point, so every reader
-//! resolves identity and host the same way rather than re-deriving it from filenames.
+//! KDL is the canonical on-disk format; TOML and JSON lower to the runner model. Consumers that need
+//! declared shape use [`DeclaredDocument`]; consumers that need resolved runtime meaning use
+//! [`discovery`]. Both flow through the same KDL parser.
 //!
 //! st2 consumes this crate, which is what keeps it a reference implementation rather than a copy:
 //! a second reader (a TUI, a linter) sees exactly the fields the runner sees, including the ones
 //! the runner's roster JSON does not carry (`supervisor`, `role`, `workspace`, `host`).
 //!
-//! Render-only fields (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`,
-//! `meta{}`) are read by the render layer and deliberately dropped here — that is what keeps a
-//! consumer render-agnostic.
+//! The runner-normalized model deliberately drops render-only fields. [`DeclaredDocument`] retains
+//! them without assigning policy, so st2 stays render-agnostic while policy consumers do not need a
+//! second parser.
 
+/// Source revision of the complete public parser and lowering contract.
+///
+/// Hermetic builds inject the full source revision. Native builds use the full clean Git revision
+/// or an explicit `local-dirty.*`/`local.unknown` identity, so unlike builds cannot compare equal.
+pub const AGENT_SPEC_REVISION: &str = env!("AGENT_SPEC_REVISION");
+
+pub mod declared;
 pub mod discovery;
 mod kdl_format;
 pub mod spec;
 
+pub use declared::{
+    DeclaredAgent, DeclaredDiagnostic, DeclaredDiagnosticCode, DeclaredDocument, DeclaredEntry,
+    DeclaredNode, DeclaredParse, DeclaredSeverity, DeclaredSpan, DeclaredValue,
+    parse_declared_document, parse_declared_file,
+};
 pub use discovery::{
-    Declared, Discovered, SpecError, discover, is_catalog_path, parse_declared, path_defaults,
+    Declared, Discovered, SpecError, discover, discover_strict, is_catalog_path, parse_declared,
+    path_defaults,
 };
 pub use spec::{
-    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
-    parse_duration,
+    AgentDesiredState, AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind,
+    TaskLifecycle, parse_duration, validate_desired_state_reason,
 };

@@ -24,6 +24,18 @@ fn retired_catalog(root: &Path) -> Child {
     owner
 }
 
+fn suspended_catalog(root: &Path, keep: bool) {
+    let declaration = root.join("agents/h/idle/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::write(
+        declaration,
+        format!(
+            "agent \"idle\" {{ host \"h\"; desired-state \"suspended\" reason=\"Waiting for capacity\"; keep #{keep}; command \"true\" }}\n"
+        ),
+    )
+    .unwrap();
+}
+
 fn doctor(catalog: &Path, bin: &Path, state: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
@@ -299,4 +311,53 @@ fn retired_declaration_is_unhealthy_while_a_dead_task_record_remains() {
         "stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn suspended_declaration_is_healthy_when_tasks_are_absent_without_presence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    suspended_catalog(&catalog, false);
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
+    );
+
+    let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("✓ h.idle suspension effective (no live tasks)"), "{stdout}");
+    assert!(!stdout.contains("h.idle presence"), "{stdout}");
+}
+
+#[test]
+fn suspended_declaration_distinguishes_live_dead_keep_and_dead_nonkeep() {
+    for (status, keep, healthy, detail) in [
+        ("running", false, false, "h.idle (alive)"),
+        ("exited", false, false, "h.idle (dead non-keep)"),
+        ("exited", true, true, ""),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        suspended_catalog(&catalog, keep);
+        executable(
+            &bin.join("pty"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{{\"name\":\"h.idle\",\"status\":\"{status}\"}}]\\n'; fi\n"
+            ),
+        );
+
+        let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.success(), healthy, "status={status} keep={keep}\n{stdout}");
+        assert!(stdout.contains("h.idle suspension effective (no live tasks)"), "{stdout}");
+        if !detail.is_empty() {
+            assert!(stdout.contains(detail), "{stdout}");
+        }
+        assert!(!stdout.contains("h.idle presence"), "{stdout}");
+    }
 }

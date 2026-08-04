@@ -4,7 +4,7 @@
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
-//! `workspace`, `retired`, `keep`, `supervisor`,
+//! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
 //! `restart{}`, task lifecycle, Resource bindings (declaration metadata), and the tasks. Everything render-only
 //! (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta{}`) is baked into
 //! the tasks/commands by the render layer and ignored here.
@@ -24,6 +24,47 @@ use serde::{Deserialize, Serialize};
 pub const AGENT_NAME_MAX_CHARS: usize = 160;
 /// Maximum Unicode scalar count for an agent's enduring responsibility description.
 pub const AGENT_DESCRIPTION_MAX_CHARS: usize = 1_000;
+/// Maximum UTF-8 byte length for a non-running desired-state rationale.
+pub const AGENT_DESIRED_STATE_REASON_MAX_BYTES: usize = 160;
+
+/// Declarative whole-agent lifecycle intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentDesiredState {
+    Running,
+    Suspended { reason: String },
+    /// `None` exists only for legacy `retired #true` declarations.
+    Retired { reason: Option<String> },
+}
+
+impl AgentDesiredState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Suspended { .. } => "suspended",
+            Self::Retired { .. } => "retired",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Running => None,
+            Self::Suspended { reason } => Some(reason),
+            Self::Retired { reason } => reason.as_deref(),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        matches!(self, Self::Suspended { .. })
+    }
+
+    pub fn is_retired(&self) -> bool {
+        matches!(self, Self::Retired { .. })
+    }
+}
 
 /// A rendered agent job, lowered to the shared declaration fields st2 and other readers inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +85,8 @@ pub struct AgentSpec {
     pub workspace: Option<String>,
     /// Bare identity or `<host>.<identity>` of this agent's supervisor — crash-dings route here.
     pub supervisor: Option<String>,
-    /// `true` decommissions the agent (an edit, never a file delete) → torn down by reconcile.
-    pub retired: bool,
+    /// Whole-agent lifecycle intent. Non-running states are reconciled absent.
+    pub desired_state: AgentDesiredState,
     /// Agent-level GC pin: `true` exempts all of its tasks from garbage collection.
     pub keep: bool,
     /// Crash/restart policy (§4). `None` → the runner's default policy.
@@ -69,6 +110,10 @@ pub struct Resource {
     #[serde(rename = "_tag")]
     tag: String,
     uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +123,8 @@ struct ResourceDescriptor {
     #[serde(rename = "_tag")]
     tag: String,
     uri: String,
+    relation: Option<String>,
+    reason: Option<String>,
 }
 
 impl Resource {
@@ -92,7 +139,28 @@ impl Resource {
         validate_absolute_uri(&uri).map_err(|reason| {
             format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
         })?;
-        Ok(Self { name, tag, uri })
+        Ok(Self {
+            name,
+            tag,
+            uri,
+            relation: None,
+            reason: None,
+        })
+    }
+
+    /// Construct a descriptor with an explicit semantic relation and human-facing rationale.
+    pub fn new_with_relation_reason(
+        name: String,
+        tag: String,
+        uri: String,
+        relation: String,
+        reason: String,
+    ) -> Result<Self, String> {
+        let mut resource = Self::new(name, tag, uri)?;
+        validate_relation_reason(&resource.name, &relation, &reason)?;
+        resource.relation = Some(relation);
+        resource.reason = Some(reason);
+        Ok(resource)
     }
 
     pub fn name(&self) -> &str {
@@ -106,6 +174,14 @@ impl Resource {
     pub fn uri(&self) -> &str {
         &self.uri
     }
+
+    pub fn relation(&self) -> Option<&str> {
+        self.relation.as_deref()
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
 }
 
 impl<'de> Deserialize<'de> for Resource {
@@ -114,7 +190,25 @@ impl<'de> Deserialize<'de> for Resource {
         D: serde::Deserializer<'de>,
     {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
-        Self::new(descriptor.name, descriptor.tag, descriptor.uri).map_err(de::Error::custom)
+        let resource = match (descriptor.relation, descriptor.reason) {
+            (None, None) => Self::new(descriptor.name, descriptor.tag, descriptor.uri),
+            (Some(relation), Some(reason)) => Self::new_with_relation_reason(
+                descriptor.name,
+                descriptor.tag,
+                descriptor.uri,
+                relation,
+                reason,
+            ),
+            (Some(_), None) => Err(format!(
+                "resource binding '{}' with `relation` must also declare string `reason`",
+                descriptor.name
+            )),
+            (None, Some(_)) => Err(format!(
+                "resource binding '{}' with `reason` must also declare string `relation`",
+                descriptor.name
+            )),
+        };
+        resource.map_err(de::Error::custom)
     }
 }
 
@@ -282,8 +376,12 @@ pub(crate) struct RawSpec {
     pub job_type: Option<String>,
     pub workspace: Option<String>,
     pub supervisor: Option<String>,
-    #[serde(default)]
-    pub retired: bool,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub retired: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub desired_state: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub desired_state_reason: Option<Option<String>>,
     #[serde(default)]
     pub keep: bool,
     pub restart: Option<RawRestart>,
@@ -320,6 +418,8 @@ pub(crate) struct RawResource {
     #[serde(rename = "_tag")]
     pub(crate) tag: String,
     pub(crate) uri: String,
+    pub(crate) relation: Option<String>,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -379,7 +479,19 @@ impl RawResources {
         self.0
             .into_iter()
             .map(|(name, resource)| {
-                Resource::new(name, resource.tag, resource.uri).map_err(anyhow::Error::msg)
+                match (resource.relation, resource.reason) {
+                    (None, None) => Resource::new(name, resource.tag, resource.uri),
+                    (Some(relation), Some(reason)) => Resource::new_with_relation_reason(
+                        name, resource.tag, resource.uri, relation, reason,
+                    ),
+                    (Some(_), None) => Err(format!(
+                        "resource binding '{name}' with `relation` must also declare string `reason`"
+                    )),
+                    (None, Some(_)) => Err(format!(
+                        "resource binding '{name}' with `reason` must also declare string `relation`"
+                    )),
+                }
+                .map_err(anyhow::Error::msg)
             })
             .collect()
     }
@@ -417,6 +529,40 @@ impl<'de> Deserialize<'de> for RawResources {
 
         deserializer.deserialize_map(ResourceMapVisitor)
     }
+}
+
+fn validate_relation_reason(name: &str, relation: &str, reason: &str) -> Result<(), String> {
+    let relation_bytes = relation.as_bytes();
+    let valid_relation = (1..=64).contains(&relation_bytes.len())
+        && relation_bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && relation_bytes
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && relation_bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && !relation_bytes.windows(2).any(|pair| pair == b"--");
+    if !valid_relation {
+        return Err(format!(
+            "resource binding '{name}' `relation` must be ASCII kebab-case of 1..64 bytes"
+        ));
+    }
+
+    if reason.is_empty() || reason.len() > 160 {
+        return Err(format!(
+            "resource binding '{name}' `reason` must be 1..160 UTF-8 bytes"
+        ));
+    }
+    if reason.trim() != reason
+        || reason
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(format!(
+            "resource binding '{name}' `reason` must have no surrounding Unicode whitespace, controls, or line separators"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
@@ -592,11 +738,15 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
 }
 
 impl RawSpec {
-    /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity, a
-    /// `type`, or task blocks. Random TOML/JSON in the tree has none of these and is skipped.
+    /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
+    /// lifecycle intent, a `type`, or task blocks. Random TOML/JSON in the tree has none of these
+    /// and is skipped.
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
             || self.job_type.is_some()
+            || self.retired.is_some()
+            || self.desired_state.is_some()
+            || self.desired_state_reason.is_some()
             || self.command.is_some()
             || self.argv.is_some()
             || self.ding
@@ -617,6 +767,16 @@ impl RawSpec {
             "description",
             self.description.as_deref(),
             AGENT_DESCRIPTION_MAX_CHARS,
+        )?;
+        let retired = reject_explicit_null("retired", self.retired)?;
+        let desired_state_value =
+            reject_explicit_null("desired_state", self.desired_state)?;
+        let desired_state_reason =
+            reject_explicit_null("desired_state_reason", self.desired_state_reason)?;
+        let desired_state = lower_desired_state(
+            retired,
+            desired_state_value.as_deref(),
+            desired_state_reason,
         )?;
         validate_launch(
             &identity,
@@ -689,7 +849,7 @@ impl RawSpec {
             job_type,
             workspace: self.workspace,
             supervisor: self.supervisor,
-            retired: self.retired,
+            desired_state,
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             resources,
@@ -697,6 +857,80 @@ impl RawSpec {
             path,
         })
     }
+}
+
+/// Preserve the distinction between an omitted TOML/JSON field and an explicit `null`.
+/// Serde's ordinary `Option<T>` representation intentionally collapses those cases.
+fn deserialize_explicit_optional<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn reject_explicit_null<T>(field: &str, value: Option<Option<T>>) -> anyhow::Result<Option<T>> {
+    match value {
+        None => Ok(None),
+        Some(Some(value)) => Ok(Some(value)),
+        Some(None) => anyhow::bail!("agent lifecycle field `{field}` must not be null"),
+    }
+}
+
+fn lower_desired_state(
+    retired: Option<bool>,
+    state: Option<&str>,
+    reason: Option<String>,
+) -> anyhow::Result<AgentDesiredState> {
+    anyhow::ensure!(
+        retired.is_none() || state.is_none(),
+        "agent declares both legacy `retired` and `desired-state`; choose one lifecycle form"
+    );
+    match (state, reason) {
+        (None, None) => Ok(if retired == Some(true) {
+            AgentDesiredState::Retired { reason: None }
+        } else {
+            AgentDesiredState::Running
+        }),
+        (None, Some(_)) => anyhow::bail!("agent lifecycle `reason` requires `desired-state`"),
+        (Some("running"), None) => Ok(AgentDesiredState::Running),
+        (Some("running"), Some(_)) => {
+            anyhow::bail!("agent `desired-state \"running\"` forbids `reason`")
+        }
+        (Some("suspended"), Some(reason)) => {
+            validate_desired_state_reason(&reason)?;
+            Ok(AgentDesiredState::Suspended { reason })
+        }
+        (Some("retired"), Some(reason)) => {
+            validate_desired_state_reason(&reason)?;
+            Ok(AgentDesiredState::Retired {
+                reason: Some(reason),
+            })
+        }
+        (Some("suspended" | "retired"), None) => {
+            anyhow::bail!("agent `desired-state {state:?}` requires `reason`")
+        }
+        (Some(other), _) => anyhow::bail!(
+            "unknown agent desired state '{other}'; expected running, suspended, or retired"
+        ),
+    }
+}
+
+/// Validate the rationale carried by a non-running desired state.
+pub fn validate_desired_state_reason(reason: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !reason.is_empty() && reason.len() <= AGENT_DESIRED_STATE_REASON_MAX_BYTES,
+        "agent desired-state `reason` must be 1..{AGENT_DESIRED_STATE_REASON_MAX_BYTES} UTF-8 bytes"
+    );
+    anyhow::ensure!(
+        reason.trim() == reason
+            && !reason.chars().any(|character| character.is_control()
+                || matches!(character, '\u{2028}' | '\u{2029}')),
+        "agent desired-state `reason` must have no surrounding Unicode whitespace, controls, or line separators"
+    );
+    Ok(())
 }
 
 /// Validate one optional presentation field at the shared parse/authoring boundary.

@@ -38,10 +38,10 @@ mod watch;
 // `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
 pub use agent_spec::{discovery, spec};
 
-pub use agent_spec::discovery::{Discovered, SpecError, discover};
+pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_strict};
 pub use agent_spec::spec::{
-    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
-    parse_duration,
+    AgentDesiredState, AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind,
+    TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

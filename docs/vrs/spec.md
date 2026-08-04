@@ -30,7 +30,7 @@ declaration-driven teardown; remote-host declarations remain inert.
 
 Admission applies `validate_for_host` strictly, then fails before spawn when
 discovery is malformed or warning-bearing, when the selected local projection
-is empty, duplicate, retired, root-overriding, or unrunnable, or when any
+is empty, duplicate, non-running, root-overriding, or unrunnable, or when any
 resolved local task runtime ID is empty or duplicates another local task.
 Materialization warnings and backend launch errors are fatal. The kickoff
 target must resolve to exactly one local agent. The eval owns one native
@@ -112,6 +112,31 @@ synchronized hosts do not participate; the source recheck detects observed
 interference but is not a distributed CAS or lock service. The classified
 refusal codes are an operational trusted-fleet boundary, not adversarial OS
 isolation.
+
+Harness drivers consume Agent Spec presentation directly:
+
+```text
+Agent Spec name/description (sole authority)
+          |
+          +--> roster
+          +--> PTY metadata
+          `--> exact roster query --> harness driver --> provider-native name
+```
+
+`st2 agents --identity <host>.<identity> --json` acquires the ordinary shared
+catalog-authoring lock, lowers the current declaration, and returns exactly
+one stable roster row or fails if that qualified identity is absent or
+ambiguous. The row keeps stable identity separate from explicitly nullable
+`name` and `description`. This is a read of the current Agent Spec, not another
+state file or Resource binding. It therefore works for co-located declarations
+without inventing a second path identity or synchronization protocol.
+
+st2 core does not invoke a harness driver. A driver owns provider-native
+translation and must join any application to its independently fenced exact
+runtime and native session. It may consume the lowered `AgentSpec` directly
+in-process or use the exact roster query from an external hook or driver.
+Neither read path gains launch, adoption, restart, teardown, replacement, or
+other lifecycle authority.
 
 For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 `pty metadata patch --id <task-id>` request. Every PTY receives the versioned
@@ -204,6 +229,16 @@ matches. `--expect-absent` is idempotent for identical input.
 stale declaration writer. Full-catalog admission rejects any
 structural validation error before publication. The typed result is
 `published` or `unchanged`.
+
+Before returning success, publication reads the exact live declaration back
+under the catalog lock, verifies its digest and bytes, and re-admits the live
+catalog. `st2 validate --json` emits `st2.validate.v2`; successful JSON
+publication emits `st2.agent-publish.v2`. Both identify the
+`st2.core+catalog.v1` policy profile and the same `agentSpecRevision`. A clean
+hermetic build uses the complete 40-hex source revision; dirty or revisionless
+local builds use explicit identities that cannot compare equal to a clean
+hermetic receipt. The byte-only `st2 agent digest --json` contract remains
+`st2.agent-source-digest.v1` because it makes no parser or policy claim.
 
 `st2 catalog snapshot --catalog ROOT --output DIR --json` holds SH while it
 captures the canonical declaration projection: `catalog.kdl`, exact
@@ -430,7 +465,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads
   never wake reconciliation; only create, modify, rename, or remove events may
-  wake it before the bounded timer.
+  wake it before the bounded timer. A generated companion is eligible only
+  while its canonical agent task is eligible. Healthy startup launches the
+  agent first and then its missing companions in the same pass. Holding or
+  failing to restart the agent, or terminally parking it, suppresses companion
+  launch and stops an exact generated companion proved live; explicitly
+  authored sibling tasks remain independent.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent. Harness readiness
   that depends on a dynamically selected account belongs to that declared
@@ -476,7 +516,9 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   but classifies a dead or absent generation as `held` without garbage
   collection or launch. Returning the declaration to the default `service`
   lifecycle is the explicit authority to resume ordinary replacement.
-  `retired #true` remains the separate explicit teardown path.
+  A non-running agent desired state remains the separate explicit teardown
+  path. Suspension and retirement never use task lifecycle as an implicit
+  resume or replacement authority.
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
   `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
@@ -502,6 +544,34 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   identity, unchanged content and metadata, the final path identity, process
   start token, and record mtime without rewriting them. If that proof is
   unavailable on a supported OS, the generation remains indeterminate.
+
+  Each row retains the task-level `desiredState` (`running` or `absent`) and
+  appends the declaration-level `agentDesiredState` plus
+  `agentDesiredStateReason`. The legacy `retired` boolean remains a projection
+  for compatible readers. `st2 agents --json` likewise appends `desiredState`
+  and `desiredStateReason`; presence remains an independent observed signal.
+
+- **R27/R28:** Agent lifecycle intent is one closed declaration state:
+  `running`, `suspended`, or `retired`. The KDL form is a direct child such as
+  `desired-state "suspended" reason="Waiting for capacity"`. Omission means
+  running. New suspended and retired states require a bounded rationale;
+  running forbids one. Legacy `retired #true` remains readable without a
+  rationale, but old and new lifecycle syntax cannot coexist.
+
+  Reconciliation treats both non-running states as desired task absence and
+  includes derived companions. Materialization skips them. Suspension is
+  converged when no task is live and only explicitly keep-pinned dead records
+  remain; retirement is complete only after every task record is absent.
+  Resume simply returns to ordinary task planning, preserving `keep`,
+  `adopt-only`, ownership, and replacement fences. Durable messages, context,
+  resources, and the declaration are not task runtime and remain available.
+
+  `st2 agent desired-state` performs one source-preserving canonical KDL edit
+  under the persistent catalog-authoring lock. The self/descendant trusted-fleet
+  guardrail and Nix-owned refusal match presentation authoring. Running removes
+  lifecycle syntax; suspended and retired emit the canonical node. A success
+  receipt proves authored intent only. Reconciliation and Doctor separately
+  prove observed convergence.
 
   Inventory performs no reconciliation, launch, teardown, cleanup, lifecycle
   edit, state migration, or catalog write. It does not authorize a staged
@@ -757,7 +827,10 @@ task before writing and renders only its owning agent. `st2 up --once --task
 PTY/exec state and executes a plan containing only that task. Unknown,
 ambiguous, and wrong-host selectors refuse before writes or runner inspection;
 unrelated discovery diagnostics remain visible without preventing the selected
-owner/task path.
+owner/task path. A live generated companion may be adopted or retired as that
+exact selected task. An active dead or absent generated companion is held: the
+bounded pass cannot start its canonical agent without broadening the selector.
+Explicitly authored sibling tasks retain ordinary selected-task behavior.
 
 `st2 up --materialize-only --agent <id>` remains the agent-wide rendering
 selector. Targeted task reconciliation is intentionally bounded to `--once`;
