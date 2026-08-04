@@ -1,9 +1,9 @@
 //! Native inbox-to-terminal DING delivery.
 //!
-//! Fresh delivery preserves one bounded production transport containing the normalized
-//! bracketed-paste, a 0.5 second delay, and Return. Once that transaction has started, any command
-//! or receipt ambiguity retains staged ownership. A later bare-Return retry is allowed only after
-//! two adjacent adapter observations prove the exact retained composer is safe.
+//! Fresh delivery first proves an empty maintained composer, bracketed-pastes without Return, then
+//! requires two adjacent adapter observations to prove the exact retained composer is safe before
+//! sending bare Return. Once paste starts, any command or receipt ambiguity retains staged
+//! ownership. A later retry uses the same adjacent-observation requirement.
 //!
 //! Once a paste command starts, the sidecar owns that payload and retries by inspection only. It
 //! never pastes the same notice again while that transport attempt remains owned.
@@ -221,10 +221,11 @@ impl PtyPoker {
         text: &str,
         before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<PokeOutcome> {
-        transport_and_observe_with_window(
+        observed_poke_with_window(
             text,
-            &mut || self.run(pty_delivery_args(&self.session, text), "send"),
             &mut || self.peek(),
+            &mut || self.run(pty_stage_args(&self.session, text), "send"),
+            &mut || self.run(pty_submit_args(&self.session), "send"),
             &mut || thread::sleep(COMPOSER_OBSERVATION_POLL),
             before_submit,
             COMPOSER_OBSERVATION_WINDOW,
@@ -318,6 +319,7 @@ fn exact_staged_candidate(screen: &str, candidates: &[String]) -> Option<String>
     })
 }
 
+#[cfg(test)]
 fn transport_and_observe_with_window(
     text: &str,
     transport: &mut dyn FnMut() -> anyhow::Result<()>,
@@ -1281,6 +1283,72 @@ mod tests {
         mature_claude_screen(&format!("❯\u{00a0}{text}"))
     }
 
+    /// Selection region captured with `pty peek --plain st2-codex-selection-fixture` from a
+    /// dedicated 80x24 Codex CLI 0.145.0 pane on 2026-08-04. Codex rendered this built-in trust
+    /// selection after `codex --no-alt-screen -a untrusted -s read-only` launched in a fresh
+    /// untrusted directory. The command used no bypass flag. The leading working-directory row is
+    /// intentionally omitted; every retained row is verbatim from the captured selection.
+    const CAPTURED_CODEX_TRUST_SELECTION: &str = "
+  Do you trust the contents of this directory? Working with untrusted contents
+  comes with higher risk of prompt injection. Trusting the directory allows
+  project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue";
+
+    /// Exact public-safe suffix from default raw `pty peek` while Codex CLI 0.145.0's `/model`
+    /// picker was open. It begins at the picker heading and preserves every emitted byte through
+    /// the end of stdout.
+    const CAPTURED_CODEX_MODEL_PICKER: &str =
+        include_str!("fixtures/codex-model-picker-default-to-end.bin");
+
+    const CODEX_LATENCY_RETRY_NOTICE: &str =
+        "Our systems are thinking a bit more\r\n\r\nRetry with a faster model";
+
+    /// Form region captured with `pty peek --plain st2-claude-form-fixture-clean` from a dedicated
+    /// 80x24 Claude Code 2.1.220 pane in safe/manual mode on 2026-08-03. Claude rendered this after
+    /// an `AskUserQuestion` call. The host-local banner and working directory are intentionally
+    /// omitted; every retained row is verbatim from the captured form.
+    const CAPTURED_CLAUDE_QUESTION_FORM: &str = "
+────────────────────────────────────────────────────────────────────────────────
+☐ Fixture
+
+Which fixture should this test use?
+
+❯ 1. Captured form
+     Use a captured form fixture
+  2. Plain composer
+     Use a plain composer fixture\u{20}
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+    fn captured_claude_question_form_with_selection(option: usize) -> String {
+        assert!((1..=4).contains(&option));
+        if option == 1 {
+            return CAPTURED_CLAUDE_QUESTION_FORM.to_string();
+        }
+        CAPTURED_CLAUDE_QUESTION_FORM
+            .replacen("❯ 1.", "  1.", 1)
+            .replacen(&format!("  {option}."), &format!("❯ {option}."), 1)
+    }
+
+    /// The captured form reduced only by deleting its third and fourth option rows. This pins the
+    /// real two-option shape without adding any screen layout that was not present in the capture.
+    fn captured_two_option_claude_question_form() -> String {
+        CAPTURED_CLAUDE_QUESTION_FORM.replace(
+            &format!(
+                "  3. Type something.\n{}\n  4. Chat about this\n\n",
+                claude_rule()
+            ),
+            "",
+        )
+    }
+
     /// The same used pane with an in-flight turn: a spinner status line above the composer. Every
     /// frame below was observed on a real 2.1.220 pane; the glyph animates and the elapsed timer is
     /// not always rendered, so both variations appear here.
@@ -1374,6 +1442,208 @@ mod tests {
                 "finished turn must stay submittable: {status}"
             );
         }
+    }
+
+    #[test]
+    fn claude_question_form_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        assert!(composer::looks_like_choice_menu(
+            CAPTURED_CLAUDE_QUESTION_FORM
+        ));
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{CAPTURED_CLAUDE_QUESTION_FORM}\r\n{}",
+                    mature_staged_claude_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer(&mature_idle_claude_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&mature_staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+    }
+
+    #[test]
+    fn codex_trust_selection_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        assert!(composer::looks_like_choice_menu(
+            CAPTURED_CODEX_TRUST_SELECTION
+        ));
+        assert_eq!(
+            classify_composer(CAPTURED_CODEX_TRUST_SELECTION, expected),
+            ComposerState::Ambiguous
+        );
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{CAPTURED_CODEX_TRUST_SELECTION}\r\n{}",
+                    staged_codex_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer(&idle_codex_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&staged_codex_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+    }
+
+    #[test]
+    fn captured_codex_model_picker_is_recognized_as_a_choice_menu() {
+        let plain = composer::strip_ansi(CAPTURED_CODEX_MODEL_PICKER);
+
+        assert!(composer::looks_like_choice_menu(&plain));
+        assert_eq!(
+            classify_composer(CAPTURED_CODEX_MODEL_PICKER, "unused notice"),
+            ComposerState::Ambiguous
+        );
+
+        let without_selected_option = plain.replacen("› 1.", "  1.", 1);
+        assert!(!composer::looks_like_choice_menu(&without_selected_option));
+    }
+
+    #[test]
+    fn fresh_delivery_does_not_return_after_idle_changes_to_model_picker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let text = "[DING] unread st2 messages remain; check your inbox";
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("pty");
+        let idle = temp.path().join("idle.bin");
+        let picker = temp.path().join("picker.bin");
+        let changed = temp.path().join("changed");
+        let audit = temp.path().join("audit.log");
+        std::fs::write(&idle, idle_codex_screen()).unwrap();
+        std::fs::write(&picker, CAPTURED_CODEX_MODEL_PICKER).unwrap();
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = peek ]; then\n\
+                   if [ -e '{}' ]; then cat '{}'; else cat '{}'; fi\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = send ]; then : > '{}'; exit 0; fi\n\
+                 exit 1\n",
+                audit.display(),
+                changed.display(),
+                picker.display(),
+                idle.display(),
+                changed.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let poker = PtyPoker {
+            bin: bin.to_string_lossy().into_owned(),
+            session: "fixture".to_string(),
+        };
+        assert_eq!(
+            poker.poke_with(text, &mut || Ok(())).unwrap(),
+            PokeOutcome::Staged
+        );
+
+        let audit = std::fs::read_to_string(audit).unwrap();
+        assert_eq!(audit.lines().next(), Some("peek fixture"));
+        assert!(
+            !audit.contains("key:return"),
+            "Return must be withheld after the staged paste exposes a picker: {audit:?}"
+        );
+    }
+
+    #[test]
+    fn codex_latency_retry_notice_blocks_without_choice_menu_structure() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] latency control (from cos); check your inbox";
+
+        assert!(!composer::looks_like_choice_menu(
+            CODEX_LATENCY_RETRY_NOTICE
+        ));
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{CODEX_LATENCY_RETRY_NOTICE}\r\n{}",
+                    staged_codex_screen(expected)
+                ),
+                expected,
+            ),
+            ComposerState::ExactBlocked
+        );
+    }
+
+    #[test]
+    fn claude_question_form_blocks_after_selection_moves_to_second_or_last_option() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for option in [2, 4] {
+            let form = captured_claude_question_form_with_selection(option);
+            assert!(
+                composer::looks_like_choice_menu(&form),
+                "selection on option {option} must remain modal"
+            );
+            assert_eq!(
+                classify_composer(
+                    &format!("{form}\r\n{}", mature_staged_claude_screen(expected)),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "selection on option {option} must block Return"
+            );
+        }
+    }
+
+    #[test]
+    fn two_option_claude_question_form_blocks_return() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let form = captured_two_option_claude_question_form();
+
+        assert!(!form.contains("  3."));
+        assert!(!form.contains("  4."));
+        assert!(composer::looks_like_choice_menu(&form));
+        assert_eq!(
+            classify_composer(
+                &format!("{form}\r\n{}", mature_staged_claude_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+    }
+
+    #[test]
+    fn legacy_numbered_choice_menu_still_blocks_return() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let legacy_menu = "› 1. Continue\r\n  2. Cancel";
+
+        assert!(composer::looks_like_choice_menu(legacy_menu));
+        assert_eq!(
+            classify_composer(
+                &format!("{legacy_menu}\r\n{}", mature_staged_claude_screen(expected)),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
     }
 
     /// The two locators do not natively work in the same units. Codex is matched with `rfind` over
