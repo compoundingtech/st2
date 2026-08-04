@@ -96,13 +96,27 @@ fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> Compose
 }
 
 fn codex_idle_footer(screen_from_composer: &str) -> bool {
-    strip_ansi(screen_from_composer).lines().any(|line| {
-        let mut fields = line.trim().split(" · ");
-        fields.next().is_some_and(|model| model.starts_with("gpt-"))
-            && fields.any(|field| {
-                field.starts_with('/') || field.starts_with("~/") || codex_context_field(field)
-            })
-    })
+    let plain = strip_ansi(screen_from_composer);
+    let lines = plain
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidates = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("gpt-"));
+    let Some(footer) = candidates.next() else {
+        return false;
+    };
+    if candidates.next().is_some() || lines.last() != Some(&footer) {
+        return false;
+    }
+    let mut fields = footer.split(" · ");
+    fields.next().is_some_and(|model| model.starts_with("gpt-"))
+        && fields.any(|field| {
+            field.starts_with('/') || field.starts_with("~/") || codex_context_field(field)
+        })
 }
 
 fn codex_context_field(field: &str) -> bool {

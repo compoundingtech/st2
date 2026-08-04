@@ -1626,6 +1626,25 @@ mod tests {
             ),
             ComposerState::Changed
         );
+        for footer in [
+            format!("{maintained_footer}\r\n{maintained_footer}"),
+            format!("{maintained_footer}\r\n{branch_only_footer}"),
+            format!("{maintained_footer}\r\nunknown trailing chrome"),
+        ] {
+            assert_eq!(
+                classify_composer(&idle_codex_screen_with_footer(&footer), expected),
+                ComposerState::Ambiguous,
+                "duplicated or trailing footer chrome must not prove an empty composer idle: {footer}"
+            );
+            assert_eq!(
+                classify_composer(
+                    &staged_codex_screen_with_footer(expected, &footer),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "duplicated or trailing footer chrome must not prove Return safe: {footer}"
+            );
+        }
         for blocking_chrome in [
             "Esc to interrupt",
             "Create a plan?",

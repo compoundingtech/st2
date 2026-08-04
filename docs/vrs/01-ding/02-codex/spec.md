@@ -31,9 +31,12 @@ product name and the model-identifier line as corroborating evidence.
 
 ## Proving idle
 
-The footer is read from the composer downward. Idle requires the status line
-this harness renders below its composer, identified by the model-identifier
-prefix together with the separator that precedes its command hint.
+The footer is read from the composer downward. Idle requires exactly one
+model-identifier status row in that suffix, and that row must be the final
+non-empty row. Its separated fields must include either an absolute or
+home-relative working directory, or a bounded `Context <percent>% left|used`
+field. Missing, malformed, duplicated, or trailing unknown footer chrome is
+ambiguous.
 
 ## Composer contents
 
