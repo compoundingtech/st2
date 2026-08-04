@@ -335,6 +335,37 @@ fn exact_identity_rejects_duplicates_before_status_filtering() {
 }
 
 #[test]
+fn exact_identity_rejects_incomplete_catalog_discovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "valid/worker.kdl", &agent_kdl("worker", "h"));
+    write(root, "h/worker/agent.kdl", "this is malformed KDL {");
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+    assert!(!selected.status.success());
+    let stderr = String::from_utf8_lossy(&selected.stderr);
+    assert!(
+        stderr.contains("cannot select an exact Agent Spec while catalog discovery has 1 error")
+    );
+    assert!(stderr.contains("h/worker/agent.kdl"));
+
+    let ordinary = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--json"])
+        .output()
+        .unwrap();
+    assert!(ordinary.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&ordinary.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn exact_identity_selects_one_of_multiple_agent_specs_in_one_declaration() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

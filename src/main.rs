@@ -1652,7 +1652,20 @@ fn agents_cmd(
     let (root, host) = resolve_ctx(&ctx)?;
     let _catalog_lock = st2::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for agent roster")?;
-    let mut rows = st2::agents::roster(&root, &host);
+    let found = st2::discover(&root);
+    if identity.is_some() && !found.errors.is_empty() {
+        let errors = found
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path.display(), error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "cannot select an exact Agent Spec while catalog discovery has {} error(s): {errors}",
+            found.errors.len()
+        );
+    }
+    let mut rows = st2::agents::roster_from_discovered(&found, &host);
     if let Some(identity) = &identity {
         rows.retain(|row| row.identity == *identity);
         anyhow::ensure!(
