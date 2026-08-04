@@ -11,8 +11,116 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 
 use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
+
+/// Immutable inputs captured once before generated tasks are compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCompileContext {
+    catalog_root: PathBuf,
+    st2_executable: PathBuf,
+}
+
+impl TaskCompileContext {
+    pub fn new(catalog_root: PathBuf, st2_executable: PathBuf) -> Result<Self> {
+        anyhow::ensure!(
+            catalog_root.is_absolute(),
+            "task compilation catalog root is not absolute: {}",
+            catalog_root.display()
+        );
+        anyhow::ensure!(
+            st2_executable.is_absolute(),
+            "task compilation st2 executable is not absolute: {}",
+            st2_executable.display()
+        );
+        anyhow::ensure!(
+            st2_executable
+                .try_exists()
+                .with_context(|| format!("checking st2 executable {}", st2_executable.display()))?,
+            "task compilation st2 executable does not exist: {}",
+            st2_executable.display()
+        );
+        anyhow::ensure!(
+            st2_executable
+                .metadata()
+                .with_context(|| format!("reading st2 executable {}", st2_executable.display()))?
+                .is_file(),
+            "task compilation st2 executable is not a file: {}",
+            st2_executable.display()
+        );
+        Ok(Self {
+            catalog_root,
+            st2_executable,
+        })
+    }
+
+    pub fn current(catalog_root: PathBuf) -> Result<Self> {
+        let catalog_root = if catalog_root.is_absolute() {
+            catalog_root
+        } else {
+            std::env::current_dir()
+                .context("resolving the task compilation catalog root")?
+                .join(catalog_root)
+        };
+        let st2_executable =
+            std::env::current_exe().context("resolving the running st2 executable")?;
+        Self::new(catalog_root, st2_executable)
+    }
+
+    pub fn st2_executable(&self) -> &Path {
+        &self.st2_executable
+    }
+}
+
+/// Replace only runner-generated DING markers with exact direct argv. Authored tasks never carry
+/// `derived=true`, so source that happens to invoke `st2 ding` remains byte-for-byte unchanged.
+pub fn compile_generated_ding_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    let st2_executable = context
+        .st2_executable
+        .to_str()
+        .context("running st2 executable path is not UTF-8")?
+        .to_owned();
+    for spec in specs {
+        let bus_id = spec.bus_id(this_host);
+        for task in &mut spec.tasks {
+            if !task.derived {
+                continue;
+            }
+            anyhow::ensure!(
+                task.kind == TaskKind::Exec
+                    && (task.name == "ding" || task.name.ends_with(".ding")),
+                "unsupported derived task: {}",
+                task.name
+            );
+            let effective_root = task
+                .env
+                .get("ST_ROOT")
+                .map(|root| crate::expand::expand_catalog(root, &context.catalog_root))
+                .unwrap_or_else(|| context.catalog_root.display().to_string());
+            anyhow::ensure!(
+                Path::new(&effective_root).is_absolute(),
+                "derived DING root is not absolute: {effective_root}"
+            );
+            task.command = None;
+            task.argv = Some(vec![
+                st2_executable.clone(),
+                "ding".to_string(),
+                "--identity".to_string(),
+                bus_id.clone(),
+                "--root".to_string(),
+                effective_root,
+            ]);
+        }
+    }
+    Ok(())
+}
 
 /// ACTUAL state: one running/known task as st2 observes it (unioned across backends).
 #[derive(Debug, Clone, PartialEq, Eq)]

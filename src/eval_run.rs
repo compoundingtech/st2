@@ -16,7 +16,7 @@ use crate::eval_spec::{
 };
 use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
-use crate::reconcile::reconcile;
+use crate::reconcile::{TaskCompileContext, compile_generated_ding_tasks, reconcile};
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
 use agent_spec::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
@@ -464,15 +464,12 @@ pub fn load_spec(spec_file: &Path) -> Result<(Spec, PathBuf)> {
 }
 
 /// Prepare the launcher's env before spawning harness seats: (1) strip the launcher's agent-identity
-/// vars so each seat boots as a FRESH top-level agent, not a nested child (see [`sanitize_agent_env`]),
-/// and (2) prepend THIS binary's dir to PATH so the seats' bare `st2 ding`/`st2 message` resolve to the
-/// same st2 as the runner (not a stale ambient install). Called by `st2 up <spec>` (fleet) and mirrored
-/// by `st2 eval`. Idempotent; single-threaded contract (before any seat spawns).
-pub fn prepare_spawn_env() {
+/// vars so each seat boots as a fresh top-level agent, and (2) prepend this binary's dir to PATH for
+/// authored bare `st2` commands. Generated DING argv does not consult PATH. Idempotent and called
+/// before any seat spawns.
+pub fn prepare_spawn_env(st2_executable: &Path) {
     sanitize_agent_env();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    if let Some(dir) = st2_executable.parent() {
         let path = std::env::var("PATH").unwrap_or_default();
         unsafe { std::env::set_var("PATH", format!("{}:{path}", dir.display())) };
     }
@@ -775,13 +772,11 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
     // sub-processes so a sub-`st2 up --host X` can't see or reap another eval's or the fleet's exec tasks.
     unsafe { std::env::set_var("XDG_STATE_HOME", catalog.join("state")) };
 
-    // Make the eval SELF-CONSISTENT on the st2 binary: the spec's bare `st2 ding`/`st2 message` commands
-    // are PATH-resolved, so a STALE `st2` earlier on PATH (e.g. an old `cargo install`) would run the
-    // wrong version in the sidecars even when `st2 eval` itself is fresh — the ding-wake failure mode.
-    // Prepend THIS binary's dir so every bare `st2` in the eval resolves to the same binary as the runner.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    let task_context = TaskCompileContext::current(catalog.clone())?;
+
+    // Keep authored bare `st2` commands self-consistent with the runner. Generated DING sidecars use
+    // the exact executable captured in `task_context` and never consult PATH.
+    if let Some(dir) = task_context.st2_executable().parent() {
         let path = std::env::var("PATH").unwrap_or_default();
         unsafe { std::env::set_var("PATH", format!("{}:{path}", dir.display())) };
     }
@@ -789,7 +784,7 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
     let result = if EVAL_INTERRUPTED.load(Ordering::SeqCst) {
         Err(anyhow::anyhow!("eval interrupted by SIGINT/SIGTERM"))
     } else {
-        run_eval_inner(&spec, &eval, &spec_dir, &catalog, &host)
+        run_eval_inner(&spec, &eval, &spec_dir, &catalog, &host, &task_context)
     };
     reap_all_eval_sessions(&catalog, &host)?;
     // Seats are already torn down inside run_eval_inner (no leaks). `--keep` preserves the catalog
@@ -1023,7 +1018,14 @@ fn crash_ding(
     }
 }
 
-fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, host: &str) -> Result<EvalReport> {
+fn run_eval_inner(
+    spec: &Spec,
+    eval: &Eval,
+    spec_dir: &Path,
+    catalog: &Path,
+    host: &str,
+    task_context: &TaskCompileContext,
+) -> Result<EvalReport> {
     // Copy the fixture's CONTENTS into the catalog root (the start world), _git → .git.
     if let Some(copy) = &eval.copy {
         let src = spec_dir.join(copy);
@@ -1091,6 +1093,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                 .collect::<Vec<_>>();
             (specs, runtime_tasks, participants, None)
         };
+        compile_generated_ding_tasks(&mut specs, host, task_context)?;
         let task_ids = runtime_tasks
             .iter()
             .map(|task| task.runtime_id.clone())
@@ -1513,6 +1516,7 @@ mod tests {
     use super::*;
     use crate::reconcile::{Session, TaskTarget};
     use std::cell::{Cell, RefCell};
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn write_eval_agent(catalog: &Path, relative: &str, body: &str) {
         let path = catalog.join(relative);
@@ -2071,6 +2075,184 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             "original\n"
         );
         assert!(!workspace.join("new").exists());
+    }
+
+    #[test]
+    fn task_compile_derived_ding_binds_exact_executable_and_ignores_task_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("catalog root");
+        let exact = tmp.path().join("exact bin/st2 current");
+        let trap = tmp.path().join("path trap");
+        let exact_receipt = tmp.path().join("exact-receipt");
+        let trap_receipt = tmp.path().join("trap-receipt");
+        std::fs::create_dir_all(exact.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&trap).unwrap();
+        std::fs::write(
+            &exact,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                shell_single_quote(&exact_receipt.display().to_string())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exact, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let trap_st2 = trap.join("st2");
+        std::fs::write(
+            &trap_st2,
+            format!(
+                "#!/bin/sh\n: > {}\nexit 99\n",
+                shell_single_quote(&trap_receipt.display().to_string())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&trap_st2, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let source = format!(
+            r#"agent "worker" {{
+  env {{ PATH "{}"; ST_ROOT "$CATALOG/bus root" }}
+  command "st2 ding --identity authored-agent --root '/agent root'"
+  ding
+  exec "authored" {{ command "st2 ding --identity authored --root '/authored root'" }}
+}}"#,
+            trap.display()
+        );
+        let spec = parse_spec(&source).unwrap();
+        let context = TaskCompileContext::new(root.clone(), exact.clone()).unwrap();
+        let mut specs = spec_to_agent_specs(&spec.agents, "host", &root);
+        compile_generated_ding_tasks(&mut specs, "host", &context).unwrap();
+        assert_eq!(
+            specs[0].tasks[0].command.as_deref(),
+            Some("st2 ding --identity authored-agent --root '/agent root'")
+        );
+        assert_eq!(specs[0].tasks[0].argv, None);
+        let derived = &specs[0].tasks[1];
+
+        assert!(derived.derived);
+        assert_eq!(derived.command, None);
+        assert_eq!(
+            derived.argv.as_deref(),
+            Some(
+                [
+                    exact.display().to_string(),
+                    "ding".into(),
+                    "--identity".into(),
+                    "host.worker".into(),
+                    "--root".into(),
+                    root.join("bus root").display().to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(derived.env.get("PATH"), Some(&trap.display().to_string()));
+        assert!(
+            !derived
+                .argv
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "sh" || arg == "-c")
+        );
+        let argv = derived.argv.as_ref().unwrap();
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("PATH", &trap)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&exact_receipt).unwrap(),
+            format!(
+                "ding\n--identity\nhost.worker\n--root\n{}\n",
+                root.join("bus root").display()
+            )
+        );
+        assert!(
+            !trap_receipt.exists(),
+            "the decoy PATH executable must never run"
+        );
+
+        let authored = &specs[0].tasks[2];
+        assert!(!authored.derived);
+        assert_eq!(
+            authored.command.as_deref(),
+            Some("st2 ding --identity authored --root '/authored root'")
+        );
+        assert_eq!(authored.argv, None);
+    }
+
+    #[test]
+    fn task_compile_rejects_a_missing_captured_st2_despite_a_path_decoy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing st2");
+        let trap = tmp.path().join("path/st2");
+        std::fs::create_dir_all(trap.parent().unwrap()).unwrap();
+        std::fs::write(&trap, "decoy").unwrap();
+        let error = TaskCompileContext::new(tmp.path().to_path_buf(), missing.clone()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not exist")
+                && error.to_string().contains(&missing.display().to_string()),
+            "unexpected error for {}: {error:#}",
+            missing.display()
+        );
+        assert!(trap.exists(), "the PATH decoy is a positive control");
+    }
+
+    #[test]
+    fn task_compile_compact_and_eval_agents_share_exact_derived_ding_lowering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("catalog");
+        let agent_dir = root.join("agents/host/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  env { ST_ROOT "$CATALOG/bus root" }
+  command "true"
+  ding
+}"#,
+        )
+        .unwrap();
+        let exact = tmp.path().join("st2 exact");
+        std::fs::write(&exact, "exact").unwrap();
+        let context = TaskCompileContext::new(root.clone(), exact).unwrap();
+        let mut compact_specs = agent_spec::discovery::discover(&root).specs;
+        let eval = parse_spec(
+            r#"eval {
+  message { from "requester"; to "worker"; content "go" }
+  max-timeout "5s"
+  agent "worker" {
+    env { ST_ROOT "$CATALOG/bus root" }
+    command "true"
+    ding
+  }
+}"#,
+        )
+        .unwrap();
+
+        compile_generated_ding_tasks(&mut compact_specs, "host", &context).unwrap();
+        let mut eval_specs = spec_to_agent_specs(&eval.eval.unwrap().agents, "host", &root);
+        compile_generated_ding_tasks(&mut eval_specs, "host", &context).unwrap();
+        let compact_ding = compact_specs[0]
+            .tasks
+            .iter()
+            .find(|task| task.derived)
+            .unwrap();
+        let eval_ding = eval_specs[0]
+            .tasks
+            .iter()
+            .find(|task| task.derived)
+            .unwrap();
+        let compact_runtime = task_runtime_id(&compact_specs[0], &compact_specs[0].tasks[0], "host");
+        let eval_runtime = task_runtime_id(&eval_specs[0], &eval_specs[0].tasks[0], "host");
+
+        assert_eq!(compact_ding.command, eval_ding.command);
+        assert_eq!(compact_ding.argv, eval_ding.argv);
+        assert_eq!(compact_runtime, "host.worker");
+        assert_eq!(eval_runtime, "host.worker");
+        assert_eq!(compact_ding.argv.as_ref().unwrap()[3], compact_runtime);
+        assert_eq!(eval_ding.argv.as_ref().unwrap()[3], eval_runtime);
     }
 
     fn seed_msg(inbox: &Path, ts: u64, rand: &str, from: &str) {
