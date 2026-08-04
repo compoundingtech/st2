@@ -1281,6 +1281,21 @@ mod tests {
         mature_claude_screen(&format!("❯\u{00a0}{text}"))
     }
 
+    /// Selection region captured with `pty peek --plain st2-codex-selection-fixture` from a
+    /// dedicated 80x24 Codex CLI 0.145.0 pane on 2026-08-04. Codex rendered this built-in trust
+    /// selection after `codex --no-alt-screen -a untrusted -s read-only` launched in a fresh
+    /// untrusted directory. The command used no bypass flag. The leading working-directory row is
+    /// intentionally omitted; every retained row is verbatim from the captured selection.
+    const CAPTURED_CODEX_TRUST_SELECTION: &str = "
+  Do you trust the contents of this directory? Working with untrusted contents
+  comes with higher risk of prompt injection. Trusting the directory allows
+  project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue";
+
     /// Form region captured with `pty peek --plain st2-claude-form-fixture-clean` from a dedicated
     /// 80x24 Claude Code 2.1.220 pane in safe/manual mode on 2026-08-03. Claude rendered this after
     /// an `AskUserQuestion` call. The host-local banner and working directory are intentionally
@@ -1443,6 +1458,39 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
         assert_eq!(
             classify_composer(&mature_staged_claude_screen(expected), expected),
+            ComposerState::ExactSafe
+        );
+    }
+
+    #[test]
+    fn codex_trust_selection_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        assert!(composer::looks_like_choice_menu(
+            CAPTURED_CODEX_TRUST_SELECTION
+        ));
+        assert_eq!(
+            classify_composer(CAPTURED_CODEX_TRUST_SELECTION, expected),
+            ComposerState::Ambiguous
+        );
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{CAPTURED_CODEX_TRUST_SELECTION}\r\n{}",
+                    staged_codex_screen(expected)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked
+        );
+
+        assert_eq!(
+            classify_composer(&idle_codex_screen(), expected),
+            ComposerState::EmptySafe
+        );
+        assert_eq!(
+            classify_composer(&staged_codex_screen(expected), expected),
             ComposerState::ExactSafe
         );
     }
