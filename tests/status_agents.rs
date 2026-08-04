@@ -224,6 +224,33 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     assert_eq!(rows[1]["status"], "busy");
     assert_eq!(rows[1]["retired"], true);
 
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.live", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["identity"], "h.live");
+
+    let absent = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.missing", "--json"])
+        .output()
+        .unwrap();
+    assert!(!absent.status.success());
+    assert!(
+        String::from_utf8_lossy(&absent.stderr)
+            .contains("expected exactly one Agent Spec with identity `h.missing`, found 0")
+    );
+
     let human = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
@@ -239,6 +266,44 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         String::from_utf8(human.stdout).unwrap(),
         "h.live\tavailable\t\t\nh.retired\tbusy\t\t\t[retired]\n"
     );
+}
+
+#[test]
+fn exact_identity_selects_one_of_multiple_agent_specs_in_one_declaration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "h/pair.kdl",
+        r#"
+agent "one" {
+  host "h"
+  name "First Agent Spec"
+  pty "agent" { command "true" }
+}
+agent "two" {
+  host "h"
+  name "Second Agent Spec"
+  pty "agent" { command "true" }
+}
+"#,
+    );
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--identity", "h.two", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["identity"], "h.two");
+    assert_eq!(selected[0]["name"], "Second Agent Spec");
 }
 
 /// A status file older than the stale window projects as `unknown` in the roster, no matter its value.

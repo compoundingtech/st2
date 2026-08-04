@@ -721,36 +721,6 @@ fn up_once_adopts_when_all_tasks_already_live() {
 }
 
 #[test]
-fn presentation_projection_failure_is_advisory_to_live_adoption() {
-    let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
-    let target = tmp
-        .path()
-        .join("agents/hetz/demo/resources/presentation.json");
-    fs::create_dir_all(&target).unwrap();
-    let runner = FakeRunner {
-        sessions: vec![live("hetz.demo-claude"), live("hetz.demo.ding")],
-        ..Default::default()
-    };
-
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
-
-    assert_eq!(report.adopted, ["demo"]);
-    assert!(runner.spawned.borrow().is_empty());
-    assert!(runner.killed.borrow().is_empty());
-    assert!(runner.removed.borrow().is_empty());
-    assert!(runner.reaped.borrow().is_empty());
-    assert!(
-        report.errors.iter().any(|error| {
-            error.contains("publish presentation snapshot for hetz.demo")
-                && error.contains("not a real regular file")
-        }),
-        "{:?}",
-        report.errors
-    );
-}
-
-#[test]
 fn up_once_launches_only_the_missing_task() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);

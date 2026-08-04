@@ -51,16 +51,13 @@ coherent `metadata_change` event; an unchanged patch emits none. Automation
 never uses human display-name resolution. Presentation drift degrades and
 retries without restart or lifecycle accounting.
 
-st2 also publishes the same desired presentation as one fixed provider-neutral
-derived state snapshot at `<agent-dir>/resources/presentation.json`. The
-snapshot contains a versioned schema, host, stable unqualified identity, and
-explicitly nullable name and description. It is intrinsic state rather than a
-declared Resource binding and carries no provider, account, session, or
-lifecycle data. Harness drivers own provider-native translation; the generic
-projection grants them no lifecycle authority. Equal canonical bytes are a
-no-op, while changed bytes are durably replaced through a synced
-same-directory temporary and atomic rename. No catalog-wide generation is
-embedded because unrelated declaration changes do not revise presentation.
+Harness drivers consume the current lowered Agent Spec rather than a second derived
+presentation file. In-process drivers may read the lowered `AgentSpec` directly;
+external hooks or drivers may select the exact qualified stable identity through
+`st2 agents --identity <host>.<identity> --json`. The roster query returns
+exactly one row or fails and keeps nullable name and description separate from
+stable identity. Provider-native translation and exact session fencing remain
+driver responsibilities; this read interface grants no lifecycle authority.
 
 ## Consequences
 
@@ -81,8 +78,8 @@ embedded because unrelated declaration changes do not revise presentation.
 - parser and roster tests across KDL, TOML, and JSON;
 - source-preservation, authority, Nix refusal, and stale-writer tests;
 - exact-ID PTY projection tests for set, clear, idempotence, and partial failure;
-- exact presentation snapshot schema/path, nullable clearing, unchanged-byte
-  no-op, atomic durable replacement, and state-plane exclusion tests;
+- exact qualified roster selection, nullable values, absent-identity refusal,
+  and co-located declaration tests;
 - a live no-restart test preserving stable task ID, PID, creation identity, and
-  generation across PTY and snapshot presentation changes;
+  generation across Agent Spec presentation changes;
 - a genuine lifecycle-change control that still performs ordinary replacement.

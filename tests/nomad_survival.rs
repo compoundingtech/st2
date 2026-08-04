@@ -663,11 +663,6 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
     let launched = fx.up_once();
     assert!(launched.contains(&session_id), "output:\n{launched}");
     let pidfile = fx.pty_root.join(format!("{session_id}.pid"));
-    let presentation_path = fx
-        .catalog
-        .join(HOST)
-        .join(identity)
-        .join("resources/presentation.json");
     let initial_pid = read_pid(&pidfile).unwrap();
     let list_session = || {
         let output = Command::new("pty")
@@ -713,18 +708,6 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
         initial["tags"]["agent.presentation.description"],
         "Owns build delivery"
     );
-    assert_eq!(
-        std::fs::read_to_string(&presentation_path).unwrap(),
-        concat!(
-            "{\n",
-            "  \"schema\": \"st2.agent-presentation.v1\",\n",
-            "  \"host\": \"nomadtest\",\n",
-            "  \"identity\": \"presented\",\n",
-            "  \"name\": \"Build owner\",\n",
-            "  \"description\": \"Owns build delivery\"\n",
-            "}\n"
-        )
-    );
     let initial_events = event_count();
 
     for (command, value) in [
@@ -763,28 +746,10 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
         changed["tags"]["agent.presentation.description"],
         "Owns release delivery"
     );
-    assert_eq!(
-        std::fs::read_to_string(&presentation_path).unwrap(),
-        concat!(
-            "{\n",
-            "  \"schema\": \"st2.agent-presentation.v1\",\n",
-            "  \"host\": \"nomadtest\",\n",
-            "  \"identity\": \"presented\",\n",
-            "  \"name\": \"Release owner\",\n",
-            "  \"description\": \"Owns release delivery\"\n",
-            "}\n"
-        )
-    );
     assert_eq!(event_count(), initial_events + 1);
 
-    let changed_snapshot_inode = std::fs::metadata(&presentation_path).unwrap().ino();
     fx.up_once();
     assert_eq!(read_pid(&pidfile), Some(initial_pid));
-    assert_eq!(
-        std::fs::metadata(&presentation_path).unwrap().ino(),
-        changed_snapshot_inode,
-        "unchanged presentation snapshot was rewritten"
-    );
     assert_eq!(
         event_count(),
         initial_events + 1,
@@ -814,13 +779,6 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
     assert_eq!(read_pid(&pidfile), Some(initial_pid));
     assert_eq!(lifecycle_equal["createdAt"], created_at);
     assert!(lifecycle_equal.get("displayName").is_none());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(&presentation_path).unwrap()
-        )
-        .unwrap()["name"],
-        session_id
-    );
     assert_eq!(event_count(), initial_events + 2);
 
     fx.up_once();
@@ -856,10 +814,6 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
             .get("agent.presentation.description")
             .is_none()
     );
-    let cleared_snapshot: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&presentation_path).unwrap()).unwrap();
-    assert!(cleared_snapshot["name"].is_null());
-    assert!(cleared_snapshot["description"].is_null());
     assert_eq!(event_count(), initial_events + 3);
 
     let declaration = fx.catalog.join(HOST).join(identity).join("agent.kdl");

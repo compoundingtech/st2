@@ -113,48 +113,30 @@ interference but is not a distributed CAS or lock service. The classified
 refusal codes are an operational trusted-fleet boundary, not adversarial OS
 isolation.
 
-Presentation has one provider-neutral desired-state projection:
+Harness drivers consume Agent Spec presentation directly:
 
 ```text
 Agent Spec name/description (sole authority)
           |
           +--> roster
           +--> PTY metadata
-          `--> resources/presentation.json
-                         |
-                         `--> harness driver --> provider-native presentation
+          `--> exact roster query --> harness driver --> provider-native name
 ```
 
-For every active host-local catalog Agent Spec, st2 publishes
-`<agent-dir>/resources/presentation.json` with all five keys present:
+`st2 agents --identity <host>.<identity> --json` acquires the ordinary shared
+catalog-authoring lock, lowers the current declaration, and returns exactly
+one stable roster row or fails if that qualified identity is absent or
+ambiguous. The row keeps stable identity separate from explicitly nullable
+`name` and `description`. This is a read of the current Agent Spec, not another
+state file or Resource binding. It therefore works for co-located declarations
+without inventing a second path identity or synchronization protocol.
 
-```json
-{
-  "schema": "st2.agent-presentation.v1",
-  "host": "host",
-  "identity": "worker",
-  "name": "Release worker",
-  "description": "Owns release preparation and verification."
-}
-```
-
-`host` and unqualified `identity` validate association with the owning Agent
-Spec. Absent `name` and `description` values are JSON `null`. Serialization is
-deterministic and ends with one newline. Equal desired bytes perform no
-filesystem mutation. Changed bytes are written to a unique same-directory
-temporary, fsynced, atomically renamed over the prior snapshot, and followed by
-a directory fsync; creation of a missing directory is likewise durably
-published. A symlink or non-regular target fails independently for that agent.
-
-The snapshot is derived state excluded from declaration snapshots and catalog
-generation. It carries no embedded source revision: a consumer may hash the
-exact canonical bytes as a change detector without treating that hash as
-lifecycle authority. It contains no provider, account, native session, task,
-run, or lifecycle fields and is neither an Agent Spec source nor a declared
-Resource binding. st2 core publishes this neutral contract but does not invoke
-a harness driver. A driver owns provider-native translation and must join any
-application to its independently fenced exact runtime and native session; a
-snapshot failure never blocks launch, adoption, PTY repair, or teardown.
+st2 core does not invoke a harness driver. A driver owns provider-native
+translation and must join any application to its independently fenced exact
+runtime and native session. It may consume the lowered `AgentSpec` directly
+in-process or use the exact roster query from an external hook or driver.
+Neither read path gains launch, adoption, restart, teardown, replacement, or
+other lifecycle authority.
 
 For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 `pty metadata patch --id <task-id>` request. Every PTY receives the versioned

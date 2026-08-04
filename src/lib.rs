@@ -23,7 +23,6 @@ pub mod isolate;
 pub mod materialize;
 pub mod message;
 pub mod pretrust;
-pub mod presentation;
 pub mod reconcile;
 pub mod resource;
 pub mod run;
@@ -32,7 +31,6 @@ pub mod status;
 pub mod task_inventory;
 pub mod validate;
 pub mod version;
-mod state_projection;
 mod watch;
 
 // The declaration model and the catalog walk live in the `agent-spec` crate, so st2 and any other
