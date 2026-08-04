@@ -268,7 +268,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     assert!(!filtered_out.status.success());
     assert!(
         String::from_utf8_lossy(&filtered_out.stderr)
-            .contains("expected exactly one Agent Spec with identity `h.live`, found 0")
+            .contains("Agent Spec `h.live` does not match status `busy`")
     );
 
     let human = Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -285,6 +285,52 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
         "h.live\tavailable\t\t\nh.retired\tbusy\t\t\t[retired]\n"
+    );
+}
+
+#[test]
+fn exact_identity_rejects_duplicates_before_status_filtering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "declarations/one/agent.kdl",
+        &agent_kdl("worker", "h"),
+    );
+    write(
+        root,
+        "declarations/two/agent.kdl",
+        &agent_kdl("worker", "h"),
+    );
+    set_state(
+        &status_path(&root.join("declarations/one")),
+        State::Busy,
+    )
+    .unwrap();
+    set_state(
+        &status_path(&root.join("declarations/two")),
+        State::Available,
+    )
+    .unwrap();
+
+    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args([
+            "--host",
+            "h",
+            "--identity",
+            "h.worker",
+            "--status",
+            "busy",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!selected.status.success());
+    assert!(
+        String::from_utf8_lossy(&selected.stderr)
+            .contains("expected exactly one Agent Spec with identity `h.worker`, found 2")
     );
 }
 

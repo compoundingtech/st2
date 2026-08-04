@@ -1653,9 +1653,6 @@ fn agents_cmd(
     let _catalog_lock = st2::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for agent roster")?;
     let mut rows = st2::agents::roster(&root, &host);
-    if let Some(f) = &status_filter {
-        rows.retain(|r| r.status.as_str() == f);
-    }
     if let Some(identity) = &identity {
         rows.retain(|row| row.identity == *identity);
         anyhow::ensure!(
@@ -1663,6 +1660,15 @@ fn agents_cmd(
             "expected exactly one Agent Spec with identity `{identity}`, found {}",
             rows.len()
         );
+    }
+    if let Some(f) = &status_filter {
+        rows.retain(|r| r.status.as_str() == f);
+        if let Some(identity) = &identity {
+            anyhow::ensure!(
+                rows.len() == 1,
+                "Agent Spec `{identity}` does not match status `{f}`"
+            );
+        }
     }
     if json {
         println!("{}", st2::agents::to_json(&rows, enrich));
