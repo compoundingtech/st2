@@ -611,12 +611,28 @@ uses zero age for this bounded future value.
 A timestamp more than sixty seconds in the future produces `unknown`. The
 reader does not use file mtime as a fallback for malformed version 1.
 
+Current readers treat a future legacy status mtime as fresh because they cannot
+calculate its age. A sufficiently future `dnd` mtime can therefore suppress
+delivery until the reader's clock catches up. The version 1 skew rules close
+this defect. They clamp only bounded future time and map larger future time to
+`unknown`.
+
 An unrecognized state still produces `offline`. A literal `unknown` produces
 `unknown`. A valid state with a malformed version, timestamp, or extra line
 also produces `unknown`.
 
 The sixty-second allowance is smaller than the five-minute refresh margin. It
 can extend a fresh DND hold by no more than sixty seconds.
+
+#### Why readers use origin time
+
+Replica arrival time measures transport delay, not agent activity. The
+embedded writer time protects presence freshness, DND expiry, and the status
+contribution to `lastActivity`.
+
+The same reason applies to the context boot freshness check. A replica arrival
+must not make old context appear fresh. This proposal does not change the
+context record.
 
 #### DND behavior
 
