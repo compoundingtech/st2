@@ -37,6 +37,17 @@ fn write_agent_for_host(catalog: &Path, host: &str, identity: &str, retired: boo
     .unwrap();
 }
 
+fn assert_version_1_status(path: &Path, expected_state: &str) {
+    let raw = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    assert_eq!(lines.len(), 2, "status record: {raw:?}");
+    assert_eq!(lines[0], expected_state);
+    assert!(lines[1].strip_prefix("v1 ").is_some_and(|timestamp| {
+        !timestamp.is_empty() && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+    }));
+    assert!(raw.ends_with('\n'));
+}
+
 fn ensure_external_pty_config(catalog: &Path) {
     let config = catalog.join("catalog.kdl");
     if !config.exists() {
@@ -2191,7 +2202,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
             .next()
             .is_some()
     );
-    assert_eq!(fs::read_to_string(old.join("status")).unwrap(), "busy\n");
+    assert_version_1_status(&old.join("status"), "busy");
 
     let phantom = send(&catalog, "host.new", "too early");
     assert!(!phantom.status.success());
@@ -2452,10 +2463,7 @@ fn marker_time_status_write_remains_bound_to_its_retained_agent_capability() {
         "{}",
         String::from_utf8_lossy(&state.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(retained_host.join("old/status")).unwrap(),
-        "busy\n"
-    );
+    assert_version_1_status(&retained_host.join("old/status"), "busy");
     assert!(!outside.join("old/status").exists());
     fs::remove_file(catalog.join("agents/host")).unwrap();
     fs::rename(&retained_host, catalog.join("agents/host")).unwrap();

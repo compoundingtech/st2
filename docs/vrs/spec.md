@@ -549,10 +549,10 @@ atomic inbox file → DING attempt → agent reads → archive receipt
 - **R10:** Fleet identities are agents. General-purpose identity kinds are
   unsupported.
 
-### Proposed presence record and freshness (R08)
+### Presence record and freshness (R08)
 
-This section answers the presence part of DQ3. It is not implemented.
-Implementation and merge require Nathan's approval.
+This section answers the presence part of DQ3. The version 1 implementation
+follows this contract.
 
 #### Version 1 record
 
@@ -625,6 +625,13 @@ The sixty-second allowance is smaller than the five-minute refresh margin. It
 can extend a fresh DND hold by no more than sixty seconds.
 
 #### Why readers use origin time
+
+st2 does not require one catalog transport. Fabric is preferred, and Git over
+SSH or a plain copy remains supported.
+
+Git does not preserve file modification times. A checkout gives files the
+checkout time. Therefore, presence freshness lives in record bytes. No
+supported transport must preserve file metadata.
 
 Replica arrival time measures transport delay, not agent activity. The
 embedded writer time protects presence freshness, DND expiry, and the status
@@ -772,7 +779,7 @@ the resident supervisor continues to reconcile the complete local catalog.
   changes may defer delivery. Resolve the remaining gap with a stronger evented
   signal or other measured classifier; a small on-device model is an optional
   experiment, not a required architecture.
-- **DQ3 Remaining catalog agent state:** The proposed R08 presence record above
+- **DQ3 Remaining catalog agent state:** The R08 presence record above
   defines the presence path, schema, freshness, and atomic update rules.
   Activity status, current plan, and current plan step remain undefined. Prove
   their stale-state and supervisor-following behavior before adding their shape
