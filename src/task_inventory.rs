@@ -204,6 +204,8 @@ struct TaskRow {
     lifecycle: &'static str,
     retired: bool,
     desired_state: &'static str,
+    agent_desired_state: String,
+    agent_desired_state_reason: Option<String>,
     runtime: RuntimeJson,
 }
 
@@ -225,6 +227,8 @@ struct DesiredTask {
     kind: TaskKind,
     lifecycle: TaskLifecycle,
     retired: bool,
+    agent_desired_state: String,
+    agent_desired_state_reason: Option<String>,
 }
 
 /// Whether two deterministic discovery passes describe the same semantic catalog.
@@ -261,7 +265,7 @@ pub fn inventory(
         for task in &spec.tasks {
             // Active declaration-only metadata has no desired runtime. Retired tasks remain in the
             // inventory even without launch material so stale generations stay visible.
-            if !spec.retired && task.command.is_none() && task.argv.is_none() {
+            if spec.desired_state.is_running() && task.command.is_none() && task.argv.is_none() {
                 continue;
             }
             let runtime_id = task
@@ -278,7 +282,9 @@ pub fn inventory(
                 runtime_id,
                 kind: task.kind,
                 lifecycle: task.lifecycle,
-                retired: spec.retired,
+                retired: spec.desired_state.is_retired(),
+                agent_desired_state: spec.desired_state.as_str().to_owned(),
+                agent_desired_state_reason: spec.desired_state.reason().map(str::to_owned),
             });
         }
     }
@@ -397,7 +403,13 @@ pub fn inventory(
                     TaskLifecycle::AdoptOnly => "adopt-only",
                 },
                 retired: task.retired,
-                desired_state: if task.retired { "absent" } else { "running" },
+                desired_state: if task.agent_desired_state == "running" {
+                    "running"
+                } else {
+                    "absent"
+                },
+                agent_desired_state: task.agent_desired_state,
+                agent_desired_state_reason: task.agent_desired_state_reason,
                 runtime: RuntimeJson {
                     state,
                     pid,
@@ -519,6 +531,8 @@ mod tests {
                 "lifecycle": "adopt-only",
                 "retired": false,
                 "desiredState": "running",
+                "agentDesiredState": "running",
+                "agentDesiredStateReason": null,
                 "runtime": {
                     "state": "running",
                     "pid": 11,

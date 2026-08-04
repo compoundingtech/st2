@@ -42,6 +42,6 @@ pub use discovery::{
     Declared, Discovered, SpecError, discover, is_catalog_path, parse_declared, path_defaults,
 };
 pub use spec::{
-    AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
-    parse_duration,
+    AgentDesiredState, AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind,
+    TaskLifecycle, parse_duration, validate_desired_state_reason,
 };

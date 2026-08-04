@@ -213,8 +213,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Health check for a catalog: tools available, active agents alive with fresh presence, and
-    /// retired agents fully absent. Exits non-zero on problems.
+    /// Health check for a catalog: active agents alive, suspended agents not live, and retired
+    /// agents fully absent. Exits non-zero on problems.
     Doctor {
         /// Legacy positional catalog path. Prefer --catalog; defaults to $CATALOG, then the default
         /// st2 catalog.
@@ -265,6 +265,23 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AgentCmd {
+    /// Author reversible whole-agent lifecycle intent in one canonical KDL declaration.
+    DesiredState {
+        /// Exact bus identity, or a bare stable identity only when unique.
+        identity: String,
+        /// Desired whole-agent lifecycle state.
+        #[arg(value_parser = ["running", "suspended", "retired"])]
+        state: String,
+        /// Required rationale for suspended/retired; forbidden for running.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Host used only to resolve declarations whose host is omitted.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit a stable JSON authoring receipt.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute the authoritative digest bound by `agent publish --input-sha256`.
     Digest {
         /// A canonical KDL file containing exactly one top-level `agent` node.
@@ -704,6 +721,13 @@ fn main() -> Result<()> {
         Command::Describe(args) => {
             presentation_cmd(st2::agent_author::PresentationField::Description, args)
         }
+        Command::Agent(AgentCmd::DesiredState {
+            identity,
+            state,
+            reason,
+            host,
+            json,
+        }) => desired_state_cmd(identity, state, reason, host, json),
         Command::Agent(AgentCmd::Publish {
             spec,
             bundle,
@@ -1258,8 +1282,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         ),
     }
 
-    // 3) Per this-host declaration: active tasks must be alive with fresh presence; retired tasks
-    // must all be absent and need no presence file.
+    // 3) Per this-host declaration: active tasks require liveness and fresh presence; suspended
+    // tasks require no live work; retired tasks require complete record absence.
     let _catalog_lock = st2::CatalogLock::shared(&catalog)
         .context("acquire shared catalog-authoring lock for doctor snapshot")?;
     let found = discover(&catalog);
@@ -1298,7 +1322,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             continue;
         }
         let bus_id = spec.bus_id(&this_host);
-        if spec.retired {
+        if spec.desired_state.is_retired() {
             let still_present = spec
                 .tasks
                 .iter()
@@ -1318,6 +1342,30 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 still_present.is_empty(),
                 &format!("{bus_id} retirement complete (all declared tasks absent)"),
                 &format!("still present: {}", still_present.join(", ")),
+            );
+            continue;
+        }
+        if spec.desired_state.is_suspended() {
+            let not_converged = spec
+                .tasks
+                .iter()
+                .filter_map(|task| {
+                    let id = task
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+                    present.get(&id).and_then(|alive| {
+                        (*alive || !(task.keep || spec.keep)).then(|| {
+                            format!("{id} ({})", if *alive { "alive" } else { "dead non-keep" })
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            report_check(
+                &mut problems,
+                not_converged.is_empty(),
+                &format!("{bus_id} suspension effective (no live tasks)"),
+                &format!("still present: {}", not_converged.join(", ")),
             );
             continue;
         }
@@ -1497,6 +1545,69 @@ fn presentation_cmd(
     }
 }
 
+fn desired_state_cmd(
+    identity: String,
+    state: String,
+    reason: Option<String>,
+    host: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let state = match state.as_str() {
+        "running" => st2::agent_author::DesiredStateValue::Running,
+        "suspended" => st2::agent_author::DesiredStateValue::Suspended,
+        "retired" => st2::agent_author::DesiredStateValue::Retired,
+        _ => unreachable!("clap validates desired state"),
+    };
+    let root = catalog_arg(None)?;
+    let host = host.unwrap_or_else(detect_host);
+    let actor = std::env::var("ST_AGENT").ok().filter(|value| !value.is_empty());
+    match st2::agent_author::set_desired_state(
+        &root,
+        &identity,
+        &host,
+        actor.as_deref(),
+        state,
+        reason.as_deref(),
+    ) {
+        Ok(receipt) => {
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{} desired-state {}{} ({})",
+                    receipt.identity,
+                    receipt.desired_state.as_str(),
+                    receipt
+                        .reason
+                        .as_deref()
+                        .map(|reason| format!(" reason={reason:?}"))
+                        .unwrap_or_default(),
+                    match receipt.result {
+                        st2::agent_author::AuthorOutcome::Changed => "changed",
+                        st2::agent_author::AuthorOutcome::Unchanged => "unchanged",
+                    }
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "error",
+                        "code": error.code(),
+                        "identity": identity,
+                        "desiredState": state,
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Result<()> {
     let (root, host) = resolve_ctx(&ctx)?;
     let id = match identity {
@@ -1544,14 +1655,25 @@ fn agents_cmd(
         println!("{}", st2::agents::to_json(&rows, enrich));
     } else {
         for r in &rows {
-            let retired = if r.retired { "\t[retired]" } else { "" };
+            let lifecycle = if r.desired_state == "running" {
+                String::new()
+            } else {
+                format!(
+                    "\t[{}{}]",
+                    r.desired_state,
+                    r.desired_state_reason
+                        .as_deref()
+                        .map(|reason| format!(": {reason}"))
+                        .unwrap_or_default()
+                )
+            };
             println!(
                 "{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 r.name.as_deref().unwrap_or(""),
                 r.description.as_deref().unwrap_or(""),
-                retired,
+                lifecycle,
             );
         }
     }
@@ -2412,9 +2534,20 @@ fn ls(root: &Path) -> Result<()> {
         } else {
             "  [UNRENDERED: no task launch]"
         };
-        let retired = if spec.retired { "  [retired]" } else { "" };
+        let lifecycle = if spec.desired_state.is_running() {
+            String::new()
+        } else {
+            format!(
+                "  [{}{}]",
+                spec.desired_state.as_str(),
+                spec.desired_state
+                    .reason()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            )
+        };
         println!(
-            "{host}.{ident}  [{kind}] ({n} task{plural}){runnable}{retired}\n    {path}",
+            "{host}.{ident}  [{kind}] ({n} task{plural}){runnable}{lifecycle}\n    {path}",
             ident = spec.identity,
             n = spec.tasks.len(),
             plural = if spec.tasks.len() == 1 { "" } else { "s" },

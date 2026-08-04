@@ -9,7 +9,161 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::{TaskKind, TaskLifecycle};
-use agent_spec::{AgentSpec, JobType, Resource, Task, discover};
+use agent_spec::{AgentDesiredState, AgentSpec, JobType, Resource, Task, discover};
+
+#[test]
+fn desired_state_is_typed_and_legacy_retirement_remains_readable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/suspended/agent.kdl",
+        r#"agent "suspended" { desired-state "suspended" reason="Waiting for capacity"; argv "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/retired/agent.kdl",
+        r#"agent "retired" { retired #true; argv "true" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(matches!(
+        &find(&found.specs, "suspended").desired_state,
+        AgentDesiredState::Suspended { reason } if reason == "Waiting for capacity"
+    ));
+    assert!(matches!(
+        &find(&found.specs, "retired").desired_state,
+        AgentDesiredState::Retired { reason: None }
+    ));
+}
+
+#[test]
+fn desired_state_rejects_illegal_state_reason_combinations() {
+    for (name, lifecycle) in [
+        ("missing-reason", "desired-state \"suspended\""),
+        ("running-reason", "desired-state \"running\" reason=\"no\""),
+        ("unknown", "desired-state \"paused\" reason=\"no\""),
+        ("non-string-state", "desired-state #true"),
+        (
+            "non-string-reason",
+            "desired-state \"suspended\" reason=#true",
+        ),
+        ("unknown-property", "desired-state \"running\" because=\"no\""),
+        (
+            "duplicate-reason",
+            "desired-state \"suspended\" reason=\"one\" reason=\"two\"",
+        ),
+        ("typed", "(state)desired-state \"running\""),
+        ("empty-reason", "desired-state \"suspended\" reason=\"\""),
+        (
+            "line-separator",
+            "desired-state \"suspended\" reason=\"left right\"",
+        ),
+        (
+            "mixed",
+            "retired #false; desired-state \"suspended\" reason=\"no\"",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!("agent \"{name}\" {{ {lifecycle}; argv \"true\" }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+    }
+}
+
+#[test]
+fn desired_state_has_equivalent_toml_and_json_lowering() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        "identity = \"toml\"\nhost = \"h\"\ndesired_state = \"suspended\"\ndesired_state_reason = \"Waiting for capacity\"\nargv = [\"true\"]\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","desired_state":"retired","desired_state_reason":"Mission complete","argv":["true"]}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(matches!(
+        &find(&found.specs, "toml").desired_state,
+        AgentDesiredState::Suspended { reason } if reason == "Waiting for capacity"
+    ));
+    assert!(matches!(
+        &find(&found.specs, "json").desired_state,
+        AgentDesiredState::Retired { reason: Some(reason) } if reason == "Mission complete"
+    ));
+}
+
+#[test]
+fn lifecycle_fields_make_path_placed_files_agent_candidates() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/suspended/agent.toml",
+        "desired_state = \"suspended\"\ndesired_state_reason = \"Waiting for capacity\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/retired/agent.json",
+        r#"{"retired":true}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/orphan-reason/agent.json",
+        r#"{"desired_state_reason":"Missing state"}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(matches!(
+        &find(&found.specs, "suspended").desired_state,
+        AgentDesiredState::Suspended { reason } if reason == "Waiting for capacity"
+    ));
+    assert!(find(&found.specs, "retired").desired_state.is_retired());
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("lifecycle `reason` requires `desired-state`"),
+        "{:?}",
+        found.errors
+    );
+}
+
+#[test]
+fn explicit_json_null_lifecycle_fields_are_rejected_instead_of_granting_running_intent() {
+    for (name, lifecycle) in [
+        ("null-retired", r#""retired":null"#),
+        ("null-state", r#""desired_state":null"#),
+        (
+            "null-reason",
+            r#""desired_state":"suspended","desired_state_reason":null"#,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.json"),
+            &format!(
+                r#"{{"identity":"{name}","host":"h",{lifecycle},"argv":["true"]}}"#
+            ),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains("must not be null"),
+            "{name}: {:?}",
+            found.errors
+        );
+    }
+}
 
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
@@ -94,7 +248,7 @@ fn parses_full_kdl_service_job() {
     assert_eq!(s.job_type, JobType::Service);
     assert_eq!(s.workspace.as_deref(), Some("/repos/fabric"));
     assert_eq!(s.supervisor.as_deref(), Some("cos"));
-    assert!(!s.retired);
+    assert!(!s.desired_state.is_retired());
 
     // restart{} parsed with duration strings
     let r = s.restart.clone().unwrap();
@@ -1218,7 +1372,7 @@ command = "x"
     write(tmp.path(), "agents/hetz/old/agent.toml", toml);
     let found = discover(tmp.path());
     let s = &found.specs[0];
-    assert!(s.retired);
+    assert!(s.desired_state.is_retired());
     assert!(s.keep);
 }
 
@@ -1300,7 +1454,7 @@ fn only_contextually_reserved_namespaces_are_ignored() {
         );
     }
     assert!(
-        !find(&found.specs, "dot-retired").retired,
+        !find(&found.specs, "dot-retired").desired_state.is_retired(),
         "a .retired folder has no lifecycle meaning"
     );
     assert!(

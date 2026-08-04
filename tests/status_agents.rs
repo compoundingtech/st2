@@ -40,6 +40,35 @@ fn retired_agent_kdl(identity: &str, host: &str) -> String {
     )
 }
 
+fn suspended_agent_kdl(identity: &str, host: &str) -> String {
+    agent_kdl(identity, host).replace(
+        "  type \"service\"\n",
+        "  type \"service\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+    )
+}
+
+#[test]
+fn roster_keeps_presence_separate_from_suspended_desired_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "h/worker/agent.kdl",
+        &suspended_agent_kdl("worker", "h"),
+    );
+    set_state(&status_path(&root.join("h/worker")), State::Available).unwrap();
+
+    let rows = roster(root, "h");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, State::Available);
+    assert!(!rows[0].retired);
+    assert_eq!(rows[0].desired_state, "suspended");
+    assert_eq!(
+        rows[0].desired_state_reason.as_deref(),
+        Some("Waiting for capacity")
+    );
+}
+
 /// The roster enumerates every catalog agent by bus id (sorted), projects each one's presence, and —
 /// with enrich data — its inbox count and last-activity.
 #[test]

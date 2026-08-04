@@ -242,3 +242,24 @@ accepted.
   retries failure, and is idempotent. It never uses display-name resolution or
   enters launch, teardown, garbage collection, replacement, or flapping
   accounting.
+- **R27 Typed agent desired state:** Every admitted Agent Spec has exactly one
+  whole-agent desired state: `running`, `suspended`, or `retired`. Omission and
+  legacy `retired #false` mean running; legacy `retired #true` means retired
+  without a rationale. New suspended and retired declarations require one
+  valid human rationale of 1..160 UTF-8 bytes. Running forbids a rationale, and
+  a declaration that mixes legacy `retired` with `desired-state` is invalid.
+  Running uses ordinary task reconciliation. Suspended and retired agents do
+  not launch or materialize tasks and tear down every live owned task,
+  including generated companions. Suspension preserves the declaration,
+  inbox, context, resources, and existing `keep` and `adopt-only` policy; resume
+  grants no replacement authority beyond ordinary reconciliation. Retirement
+  retains its stronger collection contract.
+- **R28 Desired-state authoring and observation:** `st2 agent desired-state`
+  changes lifecycle intent only in one canonical KDL declaration selected by
+  stable identity. It uses the same source-preserving, durable, serialized,
+  exact-target, trusted-fleet authority boundary as presentation authoring and
+  refuses Nix-owned, malformed, ambiguous, or unsupported declarations.
+  Running is canonically omitted; suspended and retired states persist their
+  rationale. Its receipt proves the declaration edit, never runtime
+  convergence. Human listing, roster JSON, task inventory, and Doctor expose
+  desired state without conflating it with presence or observed liveness.

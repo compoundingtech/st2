@@ -205,14 +205,14 @@ pub fn reconcile_selected<'a>(
     let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
     let mut plan = ReconcilePlan::default();
     let actual = sessions.iter().find(|s| s.pty_id == runtime);
-    if owner.retired {
+    if !owner.desired_state.is_running() {
         if let Some(s) = actual {
             if s.alive {
                 plan.teardown.push(Teardown {
                     spec: owner,
                     pty_ids: vec![runtime],
                 });
-            } else if !(task.keep || owner.keep) {
+            } else if owner.desired_state.is_retired() || !(task.keep || owner.keep) {
                 plan.gc.push(runtime);
             }
         }
@@ -332,14 +332,14 @@ pub fn reconcile<'a>(
         }
         let bus_id = spec.bus_id(this_host);
 
-        if spec.retired {
+        if !spec.desired_state.is_running() {
             let mut teardown_ids = Vec::new();
             for t in &spec.tasks {
                 let id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
-                let keep = t.keep || spec.keep;
+                let retain_dead = spec.desired_state.is_suspended() && (t.keep || spec.keep);
                 match session_state(&by_id, &id) {
                     SessionState::Alive => teardown_ids.push(id),
-                    SessionState::Dead if !keep => plan.gc.push(id),
+                    SessionState::Dead if !retain_dead => plan.gc.push(id),
                     _ => {}
                 }
             }

@@ -24,6 +24,11 @@ It does not define fleet health.
 - **DOCTOR-R06 Retired absence:** A retired declaration is healthy only when all
   declared task records are absent. A live or dead record is unhealthy. A
   retired declaration does not require presence or active-declaration checks.
+- **DOCTOR-R07 Suspended absence:** A suspended declaration is healthy only
+  when no declared task is alive and every retained dead task record is
+  explicitly keep-pinned. It does not require presence or active-declaration
+  checks. A dead non-keep record is unhealthy because ordinary reconciliation
+  still owes its collection. This weaker predicate does not satisfy retirement.
 
 The [Retirement health invariant](../../../INVARIANTS.md#L20) and its tests prove
 the retirement rule. The [specification](spec.md) owns the mechanism, check
