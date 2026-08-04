@@ -2,8 +2,8 @@
 # `package.version` out of this file as the single source of truth for the
 # build, and a virtual root has no `[package]` to read.
 [workspace]
-members = ["crates/agent-spec"]
-default-members = [".", "crates/agent-spec"]
+members = ["crates/agent-spec", "crates/st2-wire"]
+default-members = [".", "crates/agent-spec", "crates/st2-wire"]
 
 [package]
 name = "st2"
@@ -24,6 +24,7 @@ path = "src/lib.rs"
 # Sync by design: the runner is I/O-light (shell-outs to `pty` plus a
 # folder watch + a sleep), so no tokio. Deps grow per milestone; M0 needs only parse + CLI.
 agent-spec = { path = "crates/agent-spec" }
+st2-wire = { path = "crates/st2-wire" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

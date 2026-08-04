@@ -536,8 +536,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "st2-wire",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "st2-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

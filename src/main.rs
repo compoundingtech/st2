@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use st2_wire::message::MessageRow;
 
 use st2::{
     HostLock, Runner, SystemRunner, UpReport, detect_host, ding, discover, exec_state_dir, message,
@@ -1739,9 +1740,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 return Ok(());
             }
             if json {
-                let items: Vec<LsItemJson> = msgs
+                let items: Vec<MessageRow> = msgs
                     .iter()
-                    .map(|m| LsItemJson::from_message(m, include_body))
+                    .map(|m| message_row(m, include_body.then_some(m.body.as_str())))
                     .collect();
                 println!("{}", serde_json::to_string(&items)?);
                 return Ok(());
@@ -1780,7 +1781,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             }
             let m = message::read_msg(&dir, &filename)?;
             if json {
-                println!("{}", serde_json::to_string(&MessageJson::from(&m))?);
+                println!("{}", serde_json::to_string(&message_row(&m, Some(&m.body)))?);
                 return Ok(());
             }
             println!("from:        {}", m.from.as_deref().unwrap_or("<unknown>"));
@@ -1856,74 +1857,24 @@ fn send_resolved_message(
     }
 }
 
-/// `st2 message ls --json` row (stable st2 wire contract).
-#[derive(serde::Serialize)]
-struct LsItemJson<'a> {
-    filename: &'a str,
-    ts: u64,
-    from: Option<&'a str>,
-    subject: Option<&'a str>,
-    #[serde(rename = "inReplyTo")]
-    in_reply_to: Option<&'a str>,
-    tags: &'a [String],
-    priority: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body: Option<&'a str>,
-}
-
-impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
-    fn from(m: &'a st2::message::Message) -> Self {
-        LsItemJson {
-            filename: &m.filename,
-            ts: m.ts_ms,
-            from: m.from.as_deref(),
-            subject: m.subject.as_deref(),
-            in_reply_to: m.in_reply_to.as_deref(),
-            tags: &m.tags,
-            priority: m.priority.as_deref(),
-            body: None,
-        }
+/// Lower a parsed message onto the shared wire row (`st2_wire::message::MessageRow`).
+///
+/// The row type is owned by `st2-wire` and pinned by every reader, so this is the single place the
+/// runner's domain type meets the published contract. `body` is carried only when the caller asked
+/// for it: `ls --json` omits the key entirely without `--include-body`, `read --json` always sets it.
+fn message_row(m: &st2::message::Message, body: Option<&str>) -> MessageRow {
+    MessageRow {
+        filename: m.filename.clone(),
+        ts: m.ts_ms,
+        from: m.from.clone(),
+        subject: m.subject.clone(),
+        in_reply_to: m.in_reply_to.clone(),
+        tags: m.tags.clone(),
+        priority: m.priority.clone(),
+        body: body.map(str::to_owned),
     }
 }
 
-impl<'a> LsItemJson<'a> {
-    fn from_message(m: &'a st2::message::Message, include_body: bool) -> Self {
-        let mut item = Self::from(m);
-        if include_body {
-            item.body = Some(&m.body);
-        }
-        item
-    }
-}
-
-/// `st2 message read --json` — the full message.
-#[derive(serde::Serialize)]
-struct MessageJson<'a> {
-    filename: &'a str,
-    ts: u64,
-    from: Option<&'a str>,
-    subject: Option<&'a str>,
-    #[serde(rename = "inReplyTo")]
-    in_reply_to: Option<&'a str>,
-    tags: &'a [String],
-    priority: Option<&'a str>,
-    body: &'a str,
-}
-
-impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
-    fn from(m: &'a st2::message::Message) -> Self {
-        MessageJson {
-            filename: &m.filename,
-            ts: m.ts_ms,
-            from: m.from.as_deref(),
-            subject: m.subject.as_deref(),
-            in_reply_to: m.in_reply_to.as_deref(),
-            tags: &m.tags,
-            priority: m.priority.as_deref(),
-            body: &m.body,
-        }
-    }
-}
 
 fn context_cmd(cmd: ContextCmd) -> Result<()> {
     use st2::context::{self, View};
