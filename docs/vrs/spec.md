@@ -205,6 +205,16 @@ stale declaration writer. Full-catalog admission rejects any
 structural validation error before publication. The typed result is
 `published` or `unchanged`.
 
+Before returning success, publication reads the exact live declaration back
+under the catalog lock, verifies its digest and bytes, and re-admits the live
+catalog. `st2 validate --json` emits `st2.validate.v2`; successful JSON
+publication emits `st2.agent-publish.v2`. Both identify the
+`st2.core+catalog.v1` policy profile and the same `agentSpecRevision`. A clean
+hermetic build uses the complete 40-hex source revision; dirty or revisionless
+local builds use explicit identities that cannot compare equal to a clean
+hermetic receipt. The byte-only `st2 agent digest --json` contract remains
+`st2.agent-source-digest.v1` because it makes no parser or policy claim.
+
 `st2 catalog snapshot --catalog ROOT --output DIR --json` holds SH while it
 captures the canonical declaration projection: `catalog.kdl`, exact
 `agents/<host>/<identity>/agent.kdl` files, static files inside those bounded
