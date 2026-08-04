@@ -16,6 +16,7 @@ pub const LOCK_FILE: &str = "catalog-authoring.lock";
 pub const APPLY_MARKER: &str = "catalog-apply-incomplete";
 pub const GENERATION_FILE: &str = "catalog-generation";
 pub const GENERATION_INTENT_FILE: &str = "catalog-generation-incomplete";
+const CONTROL_EXCLUDE: &str = ".st2/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogReadFence(Option<u64>);
@@ -205,6 +206,7 @@ impl CatalogLock {
                     "catalog control directory is absent: {}",
                     control.display()
                 );
+                ensure_git_control_exclusion(&catalog)?;
                 test_control_creation_checkpoint();
                 let branch = match fs::create_dir(&control) {
                     Ok(()) => {
@@ -466,4 +468,103 @@ pub fn lock_path(catalog: &Path) -> PathBuf {
 
 pub fn apply_marker_path(catalog: &Path) -> PathBuf {
     catalog.join(CONTROL_DIR).join(APPLY_MARKER)
+}
+
+/// Add the host-local catalog control directory to the repository-local Git exclusion when the
+/// catalog belongs to a Git worktree. Non-Git catalogs do not require Git.
+pub(crate) fn ensure_git_control_exclusion(catalog: &Path) -> Result<()> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    use std::process::Command;
+
+    let output = match Command::new("git")
+        .args(["-C"])
+        .arg(catalog)
+        .args([
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--git-path",
+            "info/exclude",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                !has_git_metadata_ancestor(catalog),
+                "catalog belongs to a Git worktree, but git is unavailable"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("locate catalog Git exclusion"),
+    };
+    if !output.status.success() {
+        anyhow::ensure!(
+            !has_git_metadata_ancestor(catalog),
+            "cannot locate the catalog Git exclusion: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(());
+    }
+
+    let raw = String::from_utf8(output.stdout).context("git returned a non-UTF-8 exclude path")?;
+    let mut lines = raw.lines();
+    let inside_worktree = lines.next().context("git omitted its worktree result")?;
+    if inside_worktree != "true" {
+        return Ok(());
+    }
+    let raw_path = lines.next().context("git omitted its exclude path")?;
+    anyhow::ensure!(
+        !raw_path.is_empty() && lines.next().is_none(),
+        "git returned an invalid exclude path"
+    );
+    let path = if Path::new(raw_path).is_absolute() {
+        PathBuf::from(raw_path)
+    } else {
+        catalog.join(raw_path)
+    };
+    let parent = path.parent().context("Git exclude path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Git exclude parent {}", parent.display()))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("open catalog Git exclusion {}", path.display()))?;
+    // SAFETY: `file` owns a valid descriptor for the duration of this function.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("lock catalog Git exclusion {}", path.display()));
+    }
+
+    let mut current = Vec::new();
+    file.read_to_end(&mut current)?;
+    let already_present = current
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == CONTROL_EXCLUDE.as_bytes());
+    if already_present {
+        return Ok(());
+    }
+    file.seek(std::io::SeekFrom::End(0))?;
+    if !current.is_empty() && !current.ends_with(b"\n") {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(CONTROL_EXCLUDE.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+        .with_context(|| format!("sync catalog Git exclusion {}", path.display()))?;
+    Ok(())
+}
+
+fn has_git_metadata_ancestor(path: &Path) -> bool {
+    path.ancestors()
+        .any(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
 }

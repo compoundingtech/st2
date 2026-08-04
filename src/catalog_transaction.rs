@@ -1123,6 +1123,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
         );
         validate_full_catalog(&stage)?;
         let lock = initialize_bootstrap_control(&stage)?;
+        crate::catalog_lock::ensure_git_control_exclusion(&parent)?;
         sync_tree_dirs(&stage)?;
         Ok(lock)
     })() {

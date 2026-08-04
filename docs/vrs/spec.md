@@ -191,8 +191,9 @@ the contract is monotonic change detection, not an exactly-once counter.
 
 The lock file is a persistent real inode: replacing or removing it would split
 the lock domain for a process that already has it open. Consequently, the first
-coherent declaration reader may initialize exactly `.st2` and this lock even
-when its requested operation later refuses. Refusal still performs no
+coherent declaration reader may initialize `.st2`, this lock, and the
+repository-local Git exclusion. A non-Git catalog does not require Git. The
+requested operation may still refuse after initialization. Refusal performs no
 declaration, workspace, or state mutation.
 
 The publisher derives the destination from the captured declaration, replaces
@@ -332,6 +333,10 @@ files remain live while a declaration is admitted.
 
 `<catalog>/.st2/catalog-apply-incomplete` is the durable whole-catalog
 transaction fence. Any presence is authoritative, including malformed content.
+The `.st2/` directory is host-local and must not enter catalog transport. A
+copied incomplete marker blocks declaration reads at the destination. When the
+catalog belongs to a Git worktree, st2 adds `.st2/` to the repository-local Git
+exclusion during control initialization and bootstrap.
 The reserved canonical record is:
 
 ```json
@@ -370,11 +375,12 @@ be one absent final component below an existing canonical real parent. st2
 captures `DIR` through retained no-follow capabilities, verifies its declaration
 root against `HEX`, admits the complete projection against logical `ROOT`, and
 requires one explicit external PTY root. It materializes a 0700 sibling stage,
-creates the persistent authoring lock and generation `1` inside it, takes EX on
-that lock, fsyncs the complete tree, and publishes it with a capability-relative
+ensures the repository-local Git exclusion when applicable, creates the
+persistent authoring lock and generation `1` inside it, takes EX on that lock,
+fsyncs the complete tree, and publishes it with a capability-relative
 no-replace directory rename followed by a parent fsync. Readers therefore see
-absence or a complete catalog and cannot cross the already-published lock before
-the parent entry is durable.
+absence or a complete catalog and cannot cross the already-published lock
+before the parent entry is durable.
 
 There is no bootstrap marker or resume mode: interruption before the rename
 leaves `ROOT` absent, while interruption after it leaves the complete target. A
