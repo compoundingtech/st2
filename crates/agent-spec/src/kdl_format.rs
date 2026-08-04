@@ -78,7 +78,7 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
             "supervisor" => raw.supervisor = arg_string(child),
             "retired" => {
                 anyhow::ensure!(raw.retired.is_none(), "agent declares `retired` more than once");
-                raw.retired = Some(arg_bool(child));
+                raw.retired = Some(Some(arg_bool(child)));
             }
             "desired-state" => {
                 anyhow::ensure!(
@@ -99,13 +99,18 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                     }),
                     "agent `desired-state` accepts only the `reason` property"
                 );
-                raw.desired_state = arg_string(child);
+                let desired_state = arg_string(child);
+                anyhow::ensure!(
+                    desired_state.is_some(),
+                    "agent desired-state value must be a string"
+                );
+                raw.desired_state = Some(desired_state);
                 raw.desired_state_reason = child
                     .property("reason")
-                    .and_then(DeclaredValue::as_str)
-                    .map(String::from);
+                    .map(|reason| reason.as_str().map(String::from));
                 anyhow::ensure!(
-                    child.property("reason").is_none() || raw.desired_state_reason.is_some(),
+                    child.property("reason").is_none()
+                        || matches!(raw.desired_state_reason, Some(Some(_))),
                     "agent desired-state `reason` must be a string"
                 );
             }

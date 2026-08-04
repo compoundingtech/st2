@@ -376,9 +376,12 @@ pub(crate) struct RawSpec {
     pub job_type: Option<String>,
     pub workspace: Option<String>,
     pub supervisor: Option<String>,
-    pub retired: Option<bool>,
-    pub desired_state: Option<String>,
-    pub desired_state_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub retired: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub desired_state: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub desired_state_reason: Option<Option<String>>,
     #[serde(default)]
     pub keep: bool,
     pub restart: Option<RawRestart>,
@@ -761,10 +764,15 @@ impl RawSpec {
             self.description.as_deref(),
             AGENT_DESCRIPTION_MAX_CHARS,
         )?;
+        let retired = reject_explicit_null("retired", self.retired)?;
+        let desired_state_value =
+            reject_explicit_null("desired_state", self.desired_state)?;
+        let desired_state_reason =
+            reject_explicit_null("desired_state_reason", self.desired_state_reason)?;
         let desired_state = lower_desired_state(
-            self.retired,
-            self.desired_state.as_deref(),
-            self.desired_state_reason,
+            retired,
+            desired_state_value.as_deref(),
+            desired_state_reason,
         )?;
         validate_launch(
             &identity,
@@ -844,6 +852,26 @@ impl RawSpec {
             tasks,
             path,
         })
+    }
+}
+
+/// Preserve the distinction between an omitted TOML/JSON field and an explicit `null`.
+/// Serde's ordinary `Option<T>` representation intentionally collapses those cases.
+fn deserialize_explicit_optional<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn reject_explicit_null<T>(field: &str, value: Option<Option<T>>) -> anyhow::Result<Option<T>> {
+    match value {
+        None => Ok(None),
+        Some(Some(value)) => Ok(Some(value)),
+        Some(None) => anyhow::bail!("agent lifecycle field `{field}` must not be null"),
     }
 }
 

@@ -43,6 +43,11 @@ fn desired_state_rejects_illegal_state_reason_combinations() {
         ("missing-reason", "desired-state \"suspended\""),
         ("running-reason", "desired-state \"running\" reason=\"no\""),
         ("unknown", "desired-state \"paused\" reason=\"no\""),
+        ("non-string-state", "desired-state #true"),
+        (
+            "non-string-reason",
+            "desired-state \"suspended\" reason=#true",
+        ),
         ("unknown-property", "desired-state \"running\" because=\"no\""),
         (
             "duplicate-reason",
@@ -94,6 +99,35 @@ fn desired_state_has_equivalent_toml_and_json_lowering() {
         &find(&found.specs, "json").desired_state,
         AgentDesiredState::Retired { reason: Some(reason) } if reason == "Mission complete"
     ));
+}
+
+#[test]
+fn explicit_json_null_lifecycle_fields_are_rejected_instead_of_granting_running_intent() {
+    for (name, lifecycle) in [
+        ("null-retired", r#""retired":null"#),
+        ("null-state", r#""desired_state":null"#),
+        (
+            "null-reason",
+            r#""desired_state":"suspended","desired_state_reason":null"#,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.json"),
+            &format!(
+                r#"{{"identity":"{name}","host":"h",{lifecycle},"argv":["true"]}}"#
+            ),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains("must not be null"),
+            "{name}: {:?}",
+            found.errors
+        );
+    }
 }
 
 fn write(root: &Path, rel: &str, contents: &str) {
