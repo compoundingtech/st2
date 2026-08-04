@@ -82,6 +82,21 @@ fn cli_suspends_resumes_and_retires_without_rewriting_unrelated_source() {
 }
 
 #[test]
+fn cli_resume_preserves_same_line_leading_comment() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let initial = "agent \"worker\" {\n  host \"h\"\n  /* operator note */ desired-state \"suspended\" reason=\"Waiting for capacity\"\n  command \"true\"\n}\n";
+    write(root, "h/worker/agent.kdl", initial);
+
+    let running = author(root, "running", None);
+    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        "agent \"worker\" {\n  host \"h\"\n  /* operator note */\n  command \"true\"\n}\n"
+    );
+}
+
+#[test]
 fn cli_rejects_invalid_reason_contract_without_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

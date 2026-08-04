@@ -932,6 +932,21 @@ fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
         return Ok(replacement);
     }
 
+    // A KDL node's span excludes leading trivia. Preserve an admitted inline
+    // block comment by leaving that trivia on its line while removing only the
+    // lifecycle declaration and the whitespace around it. Candidate parsing
+    // below remains the final guard against accepting some other unsafe prefix.
+    if text[end..line_end]
+        .chars()
+        .all(|value| matches!(value, ' ' | '\t' | '\r'))
+    {
+        let before = &text[line_start..start];
+        let remove_start = line_start + before.trim_end_matches([' ', '\t']).len();
+        let mut replacement = text.to_owned();
+        replacement.replace_range(remove_start..line_end, "");
+        return Ok(replacement);
+    }
+
     let after = &text[end..line_end];
     let after_indent = after.len() - after.trim_start_matches([' ', '\t']).len();
     let after_content = end + after_indent;
