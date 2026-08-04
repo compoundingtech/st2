@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::reconcile::{
+    PtyPresentation, ReconcilePlan, Session, TaskCompileContext, TaskLaunch, TaskTarget,
+    compile_generated_ding_tasks,
+};
 use crate::task_inventory::{
     DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
     RuntimeObserver, generation_id,
@@ -1319,6 +1322,7 @@ impl LivenessDebounce {
 fn reconcile_pass(
     root: &Path,
     this_host: &str,
+    task_context: &TaskCompileContext,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
@@ -1386,12 +1390,19 @@ fn reconcile_pass(
     );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
-    let eligible_specs: Vec<_> = found
+    let mut eligible_specs: Vec<_> = found
         .specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
         .collect();
+    if let Err(error) = compile_generated_ding_tasks(&mut eligible_specs, this_host, task_context) {
+        report.skipped = true;
+        report
+            .errors
+            .push(format!("compile generated DING tasks (pass skipped): {error:#}"));
+        return report;
+    }
 
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
@@ -1464,10 +1475,12 @@ fn gate_codex_launches_on_hooks<'a, V>(
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     Ok(reconcile_pass(
         root,
         this_host,
+        &task_context,
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
@@ -1662,10 +1675,14 @@ where
 {
     crate::reconcile::resolve_task(specs, selector, this_host)?;
     crate::reconcile::validate_task_identities(specs, this_host)?;
+    let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?;
+    let mut compiled_specs = specs.to_vec();
+    compile_generated_ding_tasks(&mut compiled_specs, this_host, &task_context)?;
     let sessions = runner
         .list_sessions()
         .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
-    let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
+    let mut plan =
+        crate::reconcile::reconcile_selected(&compiled_specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
     gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
     execute(&plan, runner, &mut FlappingCap::default(), &mut report);
@@ -1846,6 +1863,7 @@ fn up_loop_until(
     stop: &AtomicBool,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
     let _watcher = crate::watch::watch_catalog_declarations(root, tx);
     let mut cap = FlappingCap::default();
@@ -1863,6 +1881,7 @@ fn up_loop_until(
         let report = reconcile_pass(
             root,
             this_host,
+            &task_context,
             runner,
             &mut cap,
             &mut debounce,

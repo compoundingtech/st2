@@ -2305,10 +2305,12 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     let this_host = host
         .or_else(|| spec.host.clone())
         .unwrap_or_else(detect_host);
-    // Seats boot as fresh top-level agents (strip the launcher's agent identity) and their bare
-    // `st2 …` resolve to this binary (PATH prepend) — same prep `st2 eval` does.
-    st2::eval_run::prepare_spawn_env();
-    let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
+    // Seats boot as fresh top-level agents. Authored bare `st2` commands use the PATH prepend while
+    // generated DING sidecars bind directly to the executable captured by this context.
+    let task_context = st2::reconcile::TaskCompileContext::current(root.clone())?;
+    st2::eval_run::prepare_spawn_env(task_context.st2_executable());
+    let mut specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
+    st2::reconcile::compile_generated_ding_tasks(&mut specs, &this_host, &task_context)?;
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
@@ -2456,7 +2458,7 @@ fn up(
             Some(selector) => {
                 st2::run::up_once_selected(&catalog_root, selector, &this_host, &runner)?
             }
-            None => up_once(root, &this_host, &runner)?,
+            None => up_once(&catalog_root, &this_host, &runner)?,
         };
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
@@ -2479,7 +2481,7 @@ fn up(
         root.display()
     );
     let result = up_loop(
-        root,
+        &catalog_root,
         &this_host,
         &runner,
         Duration::from_secs(interval),
