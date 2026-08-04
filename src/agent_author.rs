@@ -695,18 +695,21 @@ fn exact_agent_node<'a>(
         .nodes()
         .iter()
         .filter(|node| {
-            node.name().value() == "agent"
-                && agent_identity_parts(node).is_some_and(|(host, identity)| {
-                    identity == expected_agent
-                        && host.as_deref().is_none_or(|host| host == expected_host)
-                })
+            if node.name().value() != "agent" {
+                return false;
+            }
+            let (host, identity) = agent_identity_parts(node);
+            identity
+                .as_deref()
+                .is_none_or(|identity| identity == expected_agent)
+                && host.as_deref().is_none_or(|host| host == expected_host)
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [target] => Ok(*target),
         [] => Err(AuthorError::new(
             "target-changed",
-            format!("declaration no longer contains explicit agent {expected_identity:?}"),
+            format!("declaration no longer contains agent {expected_identity:?}"),
         )),
         _ => Err(AuthorError::new(
             "target-ambiguous",
@@ -715,7 +718,7 @@ fn exact_agent_node<'a>(
     }
 }
 
-fn agent_identity_parts(node: &KdlNode) -> Option<(Option<String>, String)> {
+fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<String>) {
     let mut identity = node
         .get(0)
         .and_then(|value| value.as_string())
@@ -741,7 +744,7 @@ fn agent_identity_parts(node: &KdlNode) -> Option<(Option<String>, String)> {
             }
         }
     }
-    Some((host, identity?))
+    (host, identity)
 }
 
 fn is_nix_managed(node: &KdlNode) -> bool {

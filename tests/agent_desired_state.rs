@@ -97,6 +97,26 @@ fn cli_resume_preserves_same_line_leading_comment() {
 }
 
 #[test]
+fn cli_authors_a_canonical_path_derived_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let initial = "agent {\n  command \"true\"\n}\n";
+    write(root, "h/worker/agent.kdl", initial);
+
+    let suspended = author(root, "suspended", Some("Waiting for capacity"));
+    assert!(suspended.status.success(), "{}", String::from_utf8_lossy(&suspended.stderr));
+    assert!(
+        fs::read_to_string(root.join("h/worker/agent.kdl"))
+            .unwrap()
+            .contains("desired-state \"suspended\" reason=\"Waiting for capacity\"")
+    );
+
+    let running = author(root, "running", None);
+    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
+    assert_eq!(fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(), initial);
+}
+
+#[test]
 fn cli_rejects_invalid_reason_contract_without_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
