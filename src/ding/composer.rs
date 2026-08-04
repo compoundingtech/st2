@@ -91,7 +91,7 @@ pub(super) fn looks_like_choice_menu(plain: &str) -> bool {
     selected && numbered
 }
 
-/// Strip the CSI/OSC sequences emitted by `pty peek` while preserving rendered text. Bounded
+/// Strip the ANSI control sequences emitted by `pty peek` while preserving rendered text. Bounded
 /// cursor-forward sequences represent visible spaces in current Codex and Claude panes.
 pub(super) fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -154,7 +154,14 @@ pub(super) fn strip_ansi(input: &str) -> String {
                     index += 1;
                 }
             }
-            _ => index += 1,
+            _ => {
+                while index < bytes.len() && (0x20..=0x2f).contains(&bytes[index]) {
+                    index += 1;
+                }
+                if index < bytes.len() && (0x30..=0x7e).contains(&bytes[index]) {
+                    index += 1;
+                }
+            }
         }
     }
     out

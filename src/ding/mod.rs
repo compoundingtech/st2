@@ -1185,22 +1185,31 @@ mod tests {
         );
     }
 
+    fn idle_codex_screen_with_footer(footer: &str) -> String {
+        format!(
+            "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
+             \x1b[2C\x1b[0m{footer}"
+        )
+    }
+
     fn idle_codex_screen() -> String {
-        "\x1b[1m›\x1b[1C\x1b[22;2mFind and fix a bug in @filename\r\n\r\n\
-         \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
-            .to_string()
+        idle_codex_screen_with_footer("gpt-5.6-sol xhigh · /workspace")
     }
 
     fn idle_codex_screen_with_home_relative_cwd() -> String {
         idle_codex_screen().replace(" · /workspace", " · ~/Code/st2")
     }
 
-    fn staged_codex_screen(text: &str) -> String {
+    fn staged_codex_screen_with_footer(text: &str, footer: &str) -> String {
         let rendered = text.replace(' ', "\x1b[1C");
         format!(
             "\x1b[1m›\x1b[1C\x1b[0m{rendered}\r\n\r\n\
-             \x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace"
+             \x1b[2C\x1b[0m{footer}"
         )
+    }
+
+    fn staged_codex_screen(text: &str) -> String {
+        staged_codex_screen_with_footer(text, "gpt-5.6-sol xhigh · /workspace")
     }
 
     fn human_codex_screen() -> String {
@@ -1819,6 +1828,139 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert_eq!(
             classify_composer("unknown terminal pixels", expected),
             ComposerState::Ambiguous
+        );
+    }
+
+    #[test]
+    fn maintained_codex_context_footers_are_narrow_and_position_bound() {
+        let expected =
+            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+
+        for footer in [
+            "gpt-5.6-sol xhigh · ding-fix · Context 73% left",
+            "gpt-5.6-sol xhigh · Context 0% used",
+            "gpt-5.6-sol xhigh · Context 100% left",
+        ] {
+            assert_eq!(
+                classify_composer(&idle_codex_screen_with_footer(footer), expected),
+                ComposerState::EmptySafe,
+                "maintained empty composer footer: {footer}"
+            );
+            assert_eq!(
+                classify_composer(&staged_codex_screen_with_footer(expected, footer), expected),
+                ComposerState::ExactSafe,
+                "maintained staged composer footer: {footer}"
+            );
+        }
+
+        for footer in [
+            "gpt-5.6-sol xhigh · ding-fix",
+            "gpt-5.6-sol xhigh · Contextual 73% left",
+            "gpt-5.6-sol xhigh · Context 73 left",
+            "gpt-5.6-sol xhigh · Context 101% left",
+            "gpt-5.6-sol xhigh · Context left 73%",
+            "gpt-5.6-sol xhigh · Context 73% remaining",
+        ] {
+            assert_eq!(
+                classify_composer(&idle_codex_screen_with_footer(footer), expected),
+                ComposerState::Ambiguous,
+                "unsupported empty composer footer: {footer}"
+            );
+            assert_eq!(
+                classify_composer(&staged_codex_screen_with_footer(expected, footer), expected),
+                ComposerState::ExactBlocked,
+                "unsupported staged composer footer: {footer}"
+            );
+        }
+
+        let maintained_footer = "gpt-5.6-sol xhigh · ding-fix · Context 73% left";
+        let branch_only_footer = "gpt-5.6-sol xhigh · ding-fix";
+        assert_eq!(
+            classify_composer(
+                &format!(
+                    "{maintained_footer}\r\n{}",
+                    staged_codex_screen_with_footer(expected, branch_only_footer)
+                ),
+                expected
+            ),
+            ComposerState::ExactBlocked,
+            "a valid-looking transcript row above the live composer is not its footer"
+        );
+        assert_eq!(
+            classify_composer(
+                &staged_codex_screen_with_footer(
+                    "please keep my half-written draft",
+                    maintained_footer
+                ),
+                expected
+            ),
+            ComposerState::Changed
+        );
+        for footer in [
+            format!("{maintained_footer}\r\n{maintained_footer}"),
+            format!("{maintained_footer}\r\n{branch_only_footer}"),
+            format!("{maintained_footer}\r\nunknown trailing chrome"),
+        ] {
+            assert_eq!(
+                classify_composer(&idle_codex_screen_with_footer(&footer), expected),
+                ComposerState::Ambiguous,
+                "duplicated or trailing footer chrome must not prove an empty composer idle: {footer}"
+            );
+            assert_eq!(
+                classify_composer(
+                    &staged_codex_screen_with_footer(expected, &footer),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "duplicated or trailing footer chrome must not prove Return safe: {footer}"
+            );
+        }
+        for blocking_chrome in [
+            "Esc to interrupt",
+            "Create a plan?",
+            "› 1. Allow\r\n  2. Deny",
+        ] {
+            assert_eq!(
+                classify_composer(
+                    &format!(
+                        "{blocking_chrome}\r\n{}",
+                        staged_codex_screen_with_footer(expected, maintained_footer)
+                    ),
+                    expected
+                ),
+                ComposerState::ExactBlocked,
+                "blocking chrome: {blocking_chrome}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserved_clean_codex_context_footer_is_idle() {
+        // Composer-to-end slice of clean zero-turn capture bb1eddba2725672287e4a73b0aaf50652250611566d9826977dc3c6639d70360.
+        let screen = "\x1b[1m›\x1b[22m \x1b[2mImprove documentation in @filename\r\n\x1b[22m \r\n\x1b[0m\x1b[2X\x1b[2C\x1b[38;2;246;226;183mgpt-5.6-sol low\x1b[39;2m · \x1b[38;2;242;181;144;22mContext 0% used\x1b[45X\x1b[2A\x1b[33D\x1b[0m\x1b[?2004h\x1b[?1004h\x1b[?1049l\x1b[?1l\x1b[?7h\x1b[?6l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?25h\x1b[?2004l\x1b[4l\x1b[r\x1b[0m\x1b[0 q\x1b>\x1b(B\x1b[<99u\x1b[999;1H\n";
+
+        assert_eq!(
+            classify_composer(screen, "generic staged notice"),
+            ComposerState::EmptySafe
+        );
+    }
+
+    #[test]
+    fn preserved_post_turn_codex_frame_stays_ambiguous() {
+        // Composer-to-end slice of post-turn capture f4abd2a65c008db1f52d62fa53f813dedde5c830632133c80a732dfbe12b95fe.
+        let screen = "\x1b[48;2;30;30;30m \x1b[79X\r\n\x1b[1m›\x1b[22m \x1b[2mFind and fix a bug in @filename\x1b[47X\r\n\x1b[22m \x1b[79X\r\n\x1b[0m  \x1b[38;2;246;226;183mgpt-5.6-sol low\x1b[39;2mi· \x1b[38;2;242;181;144;22mContext 3% used\x1b[2A\x1b[33D\x1b[0m\x1b[?2004h\x1b[?1004h\x1b[?1049l\x1b[?1l\x1b[?7h\x1b[?6l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?25h\x1b[?2004l\x1b[4l\x1b[r\x1b[0m\x1b[0 q\x1b>\x1b(B\x1b[<99u\x1b[999;1H\n";
+
+        assert_eq!(
+            classify_composer(screen, "generic staged notice"),
+            ComposerState::Ambiguous
+        );
+    }
+
+    #[test]
+    fn strip_ansi_consumes_designate_g0_charset_sequence() {
+        assert_eq!(
+            composer::strip_ansi("Context 0% used\x1b>\x1b(B"),
+            "Context 0% used"
         );
     }
 
