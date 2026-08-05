@@ -116,7 +116,7 @@ pub fn validate_task_identities(
     this_host: &str,
 ) -> Result<(), TaskIdentityAdmissionError> {
     for spec in specs {
-        if spec.retired || spec.resolved_host(this_host) != this_host {
+        if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
         let bus_id = spec.bus_id(this_host);

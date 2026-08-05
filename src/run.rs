@@ -2150,7 +2150,7 @@ mod tests {
             job_type: JobType::Service,
             workspace: None,
             supervisor: None,
-            retired: false,
+            desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
             resources: vec![],
