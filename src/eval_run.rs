@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
-use crate::eval_spec::{Check, Eval, Judge, JudgeKind, RunStep, Spec, SpecAgent, parse_spec};
+use crate::eval_spec::{
+    Check, Eval, Judge, JudgeKind, RunStep, Spec, SpecAgent, ding_exec, parse_spec,
+};
 use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
 use crate::reconcile::reconcile;
@@ -57,12 +59,20 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
     agents
         .iter()
         .map(|a| {
+            let host_prefix = format!("{host}.");
+            let identity = a.id.strip_prefix(&host_prefix).unwrap_or(&a.id).to_owned();
+            let actor_id = format!("{host}.{identity}");
+            let runtime_id = |source: &str| match source.strip_prefix(&a.id) {
+                Some("") => actor_id.clone(),
+                Some(suffix) if suffix.starts_with('.') => format!("{actor_id}{suffix}"),
+                _ => source.to_owned(),
+            };
             let mut tasks = Vec::new();
             tasks.push(Task {
                 kind: TaskKind::Pty,
                 derived: false,
                 name: "agent".to_string(),
-                id: Some(a.id.clone()), // explicit id → the session is exactly the agent id (mix.sup)
+                id: Some(actor_id.clone()),
                 command: Some(a.command.clone()),
                 argv: None,
                 cwd: None, // → the agent's workspace (resolved relative to `root`)
@@ -72,12 +82,17 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 lifecycle: TaskLifecycle::Service,
             });
             for ex in &a.execs {
+                let command = if ex.derived {
+                    ding_exec(&actor_id).command
+                } else {
+                    ex.command.clone()
+                };
                 tasks.push(Task {
                     kind: TaskKind::Exec,
                     derived: ex.derived,
                     name: ex.id.clone(),
-                    id: Some(ex.id.clone()),
-                    command: Some(ex.command.clone()),
+                    id: Some(runtime_id(&ex.id)),
+                    command: Some(command),
                     argv: None,
                     cwd: None,
                     tags: BTreeMap::new(),
@@ -87,14 +102,18 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 });
             }
             AgentSpec {
-                identity: a.id.clone(),
+                identity,
                 name: a.name.clone(),
                 description: a.description.clone(),
                 host: Some(host.to_string()),
                 role: None,
                 job_type: JobType::Service,
                 workspace: a.workspace.clone(),
-                supervisor: a.supervisor.clone(),
+                supervisor: a.supervisor.as_deref().map(|supervisor| {
+                    supervisor
+                        .strip_prefix(&host_prefix)
+                        .map_or_else(|| format!("{host}.{supervisor}"), |_| supervisor.to_owned())
+                }),
                 desired_state: AgentDesiredState::Running,
                 keep: false,
                 restart: None,
@@ -301,17 +320,23 @@ fn shell_single_quote(value: &str) -> String {
 
 /// Wrap supervised eval seats so their natural exit code survives PTY metadata sweeping. A killed
 /// wrapper cannot write the marker, which deliberately remains distinguishable from a clean exit.
-fn add_eval_exit_markers(specs: &mut [AgentSpec], catalog: &Path) {
+fn add_eval_exit_markers(specs: &mut [AgentSpec], catalog: &Path, host: &str) {
     let marker_dir = catalog.join(".eval-exits");
     let _ = std::fs::create_dir_all(&marker_dir);
     for spec in specs {
-        let Some(task) = spec.tasks.iter_mut().find(|task| task.kind == TaskKind::Pty) else {
+        let Some(index) = spec
+            .tasks
+            .iter()
+            .position(|task| task.kind == TaskKind::Pty)
+        else {
             continue;
         };
+        let runtime_id = task_runtime_id(spec, &spec.tasks[index], host);
+        let task = &mut spec.tasks[index];
         let Some(command) = task.command.take() else {
             continue;
         };
-        let marker = marker_dir.join(format!("{}.status", spec.identity));
+        let marker = marker_dir.join(format!("{runtime_id}.status"));
         let script = concat!(
             "marker=$1; command=$2; rm -f \"$marker\"; ",
             "sh -c \"$command\"; code=$?; ",
@@ -1047,17 +1072,22 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             )
         } else {
             let specs = spec_to_agent_specs(&compact_agents, host, catalog);
-            let runtime_tasks = compact_agents
+            let runtime_tasks = specs
                 .iter()
-                .map(|agent| EvalRuntimeTask {
-                    agent_id: agent.id.clone(),
-                    runtime_id: agent.id.clone(),
-                    is_pty: true,
+                .flat_map(|spec| {
+                    spec.tasks
+                        .iter()
+                        .filter(|task| task_is_launchable(task))
+                        .map(|task| EvalRuntimeTask {
+                            agent_id: spec.bus_id(host),
+                            runtime_id: task_runtime_id(spec, task, host),
+                            is_pty: task.kind == TaskKind::Pty,
+                        })
                 })
                 .collect::<Vec<_>>();
-            let participants = compact_agents
+            let participants = specs
                 .iter()
-                .map(|agent| agent.id.clone())
+                .map(|spec| spec.bus_id(host))
                 .collect::<Vec<_>>();
             (specs, runtime_tasks, participants, None)
         };
@@ -1071,7 +1101,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
             .map(|task| task.runtime_id.clone())
             .collect::<Vec<_>>();
         if eval.supervise && !eval.canonical_agents {
-            add_eval_exit_markers(&mut specs, catalog);
+            add_eval_exit_markers(&mut specs, catalog, host);
         }
         if !eval.canonical_agents {
             // Compact legacy agents intentionally retain their historical ambient trust behavior.
@@ -1085,28 +1115,27 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
                 let _ = crate::pretrust::pretrust(&dirs);
             }
         }
-        let canonical_sup = if eval.canonical_agents {
-            let msg = eval.message.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "a canonical-agents eval needs a message{{}} kickoff before any agent can launch"
-                )
-            })?;
-            let matches = specs
-                .iter()
-                .filter(|agent| agent.identity == msg.to || agent.bus_id(host) == msg.to)
-                .map(|agent| agent.bus_id(host))
-                .collect::<Vec<_>>();
-            let [target] = matches.as_slice() else {
-                anyhow::bail!(
-                    "canonical-agents kickoff target `{}` must resolve to exactly one Agent Spec, found {}",
-                    msg.to,
-                    matches.len()
-                );
+        let msg = eval.message.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("a team eval needs a message{{}} kickoff before any agent can launch")
+        })?;
+        let matches = specs
+            .iter()
+            .filter(|agent| agent.identity == msg.to || agent.bus_id(host) == msg.to)
+            .map(|agent| agent.bus_id(host))
+            .collect::<Vec<_>>();
+        let [sup] = matches.as_slice() else {
+            let authority = if eval.canonical_agents {
+                "canonical-agents"
+            } else {
+                "compact"
             };
-            Some(target.clone())
-        } else {
-            None
+            anyhow::bail!(
+                "{authority} kickoff target `{}` must resolve to exactly one Agent Spec, found {}",
+                msg.to,
+                matches.len()
+            );
         };
+        let sup = sup.clone();
 
         if let Some(routes) = canonical_routes.as_ref() {
             if routes.contains_key(&requester) {
@@ -1131,11 +1160,7 @@ fn run_eval_inner(spec: &Spec, eval: &Eval, spec_dir: &Path, catalog: &Path, hos
         boot_gate(&task_ids, &specs, host, catalog)?;
 
         // Deliver the kickoff onto the bus the agents' DING tasks watch (ST_ROOT), from the requester.
-        let msg = eval.message.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("a team eval needs a message{{}} kickoff (only a team-less eval may omit it)")
-        })?;
         let body = resolve_content(&msg.content, spec_dir)?;
-        let sup = canonical_sup.unwrap_or_else(|| msg.to.clone());
         let to_inbox = match canonical_routes.as_ref() {
             Some(routes) => admitted_route(routes, &sup).inbox.clone(),
             None => bus.join(&sup).join("inbox"),
@@ -1915,7 +1940,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     }
 
     #[test]
-    fn maps_agents_to_pty_plus_exec_tasks_keyed_by_id() {
+    fn compact_agents_use_one_host_qualified_identity_namespace() {
         let spec = parse_spec(
             r#"
             env { ST_ROOT "$CATALOG/custom-bus" }
@@ -1923,33 +1948,129 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
               agent "sup" {
                 workspace "./sup"
                 command "exec claude 'boot'"
-                exec "mix.sup.ding" { command "st2 ding mix.sup --identity mix.sup --root $CATALOG/custom-bus" }
+                ding
+              }
+              agent "worker" {
+                workspace "./worker"
+                supervisor "mix.sup"
+                command "exec claude 'work'"
+                ding
               }
             }
             "#,
         )
         .unwrap();
         let root = Path::new("/tmp/eval-root");
-        let specs = spec_to_agent_specs(&spec.agents, "local", root);
-        assert_eq!(specs.len(), 1);
-        let a = &specs[0];
-        assert_eq!(a.identity, "mix.sup");
-        assert_eq!(a.host.as_deref(), Some("local"));
-        assert_eq!(a.job_type, JobType::Service);
-        assert_eq!(a.workspace.as_deref(), Some("./sup"));
+        let specs = spec_to_agent_specs(&spec.agents, "evalhost", root);
+        assert_eq!(specs.len(), 2);
+        let sup = &specs[0];
+        let worker = &specs[1];
+        assert_eq!(sup.identity, "mix.sup");
+        assert_eq!(sup.host.as_deref(), Some("evalhost"));
+        assert_eq!(sup.job_type, JobType::Service);
+        assert_eq!(sup.workspace.as_deref(), Some("./sup"));
+        assert_eq!(worker.supervisor.as_deref(), Some("evalhost.mix.sup"));
         // spec.path.parent() must be `root` (the cwd/$CATALOG base).
-        assert_eq!(a.path.parent().unwrap(), root);
-        // Task 0 = the agent's own command as a pty keyed by the agent id.
-        assert!(matches!(a.tasks[0].kind, TaskKind::Pty));
-        assert_eq!(a.tasks[0].id.as_deref(), Some("mix.sup"));
-        assert_eq!(a.tasks[0].command.as_deref(), Some("exec claude 'boot'"));
-        assert_eq!(a.tasks[0].env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded
-        assert!(!a.tasks[0].env.contains_key("ST_AGENT"));
-        // Task 1 = the ding exec keyed by its id, inheriting the agent env.
-        assert!(matches!(a.tasks[1].kind, TaskKind::Exec));
-        assert_eq!(a.tasks[1].id.as_deref(), Some("mix.sup.ding"));
-        assert!(a.tasks[1].command.as_deref().unwrap().starts_with("st2 ding mix.sup"));
-        assert!(!a.tasks[1].env.contains_key("ST_AGENT"));
+        assert_eq!(sup.path.parent().unwrap(), root);
+        assert!(matches!(sup.tasks[0].kind, TaskKind::Pty));
+        assert_eq!(sup.tasks[0].id.as_deref(), Some("evalhost.mix.sup"));
+        assert_eq!(sup.tasks[0].command.as_deref(), Some("exec claude 'boot'"));
+        assert_eq!(
+            sup.tasks[0].env.get("ST_ROOT").unwrap(),
+            "$CATALOG/custom-bus"
+        );
+        assert!(matches!(sup.tasks[1].kind, TaskKind::Exec));
+        assert_eq!(sup.tasks[1].id.as_deref(), Some("evalhost.mix.sup.ding"));
+        assert_eq!(
+            sup.tasks[1].command.as_deref(),
+            Some("st2 ding --identity evalhost.mix.sup --root $ST_ROOT")
+        );
+
+        let plan = reconcile(&specs, &[], "evalhost").unwrap();
+        let targets = plan
+            .launch
+            .iter()
+            .flat_map(|launch| launch.tasks.iter())
+            .map(|target| (target.pty_id.as_str(), &target.env))
+            .collect::<BTreeMap<_, _>>();
+        for id in [
+            "evalhost.mix.sup",
+            "evalhost.mix.sup.ding",
+            "evalhost.mix.worker",
+            "evalhost.mix.worker.ding",
+        ] {
+            assert_eq!(
+                targets[id].get("ST_AGENT").map(String::as_str),
+                Some(id.trim_end_matches(".ding"))
+            );
+        }
+        assert_eq!(
+            targets["evalhost.mix.worker"]
+                .get("ST_SUPERVISOR")
+                .map(String::as_str),
+            Some("evalhost.mix.sup")
+        );
+    }
+
+    #[test]
+    fn supervised_exit_markers_share_the_projected_runtime_identity() {
+        let parsed = parse_spec(r#"agent "worker" { command "exit 0" }"#).unwrap();
+        let catalog = tempfile::tempdir().unwrap();
+        let mut specs = spec_to_agent_specs(&parsed.agents, "evalhost", catalog.path());
+
+        add_eval_exit_markers(&mut specs, catalog.path(), "evalhost");
+
+        let command = specs[0].tasks[0].command.as_deref().unwrap();
+        let canonical = catalog
+            .path()
+            .join(".eval-exits/evalhost.worker.status");
+        let flat = catalog.path().join(".eval-exits/worker.status");
+        assert!(command.contains(&canonical.display().to_string()));
+        assert!(!command.contains(&flat.display().to_string()));
+
+        std::fs::write(&canonical, "0\n").unwrap();
+        std::fs::write(&flat, "1\n").unwrap();
+        assert_eq!(eval_exit_code(catalog.path(), "evalhost.worker"), Some(0));
+    }
+
+    #[test]
+    fn canonical_identity_conflict_refuses_before_render_changes_workspace() {
+        let catalog = tempfile::tempdir().unwrap();
+        let workspace = catalog.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
+        std::fs::write(workspace.join("existing"), "original\n").unwrap();
+        std::fs::write(
+            catalog.path().join("_templates/replacement"),
+            "replacement\n",
+        )
+        .unwrap();
+        write_eval_agent(
+            catalog.path(),
+            "agents/evalhost/worker/agent.kdl",
+            r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  workspace "$CATALOG/workspace"
+  env { ST_AGENT "wrong.actor" }
+  argv "true"
+  render {
+    copy "_templates/replacement" "existing"
+    copy "_templates/replacement" "new"
+  }
+}"#,
+        );
+
+        let error = load_canonical_eval_team(catalog.path(), "evalhost")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("conflicting ST_AGENT"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("existing")).unwrap(),
+            "original\n"
+        );
+        assert!(!workspace.join("new").exists());
     }
 
     fn seed_msg(inbox: &Path, ts: u64, rand: &str, from: &str) {

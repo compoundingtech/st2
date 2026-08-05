@@ -421,11 +421,17 @@ fn suspended(identity: &str, tasks: Vec<Task>) -> AgentSpec {
 
 #[test]
 fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
-    let specs = vec![suspended(
+    let mut spec = suspended(
         "idle",
         vec![
             task(TaskKind::Pty, "agent", Some("host.idle.agent"), Some("run")),
             task(TaskKind::Exec, "ding", Some("host.idle.ding"), Some("ding")),
+            task(
+                TaskKind::Exec,
+                "stale",
+                Some("host.idle.stale"),
+                Some("stale"),
+            ),
             {
                 let mut retained = task(
                     TaskKind::Exec,
@@ -437,12 +443,17 @@ fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
                 retained
             },
         ],
-    )];
+    );
+    spec.tasks[0]
+        .env
+        .insert("ST_AGENT".into(), "wrong.actor".into());
+    let specs = vec![spec];
     let plan = reconcile(
         &specs,
         &[
             live("host.idle.agent"),
             live("host.idle.ding"),
+            dead("host.idle.stale"),
             dead("host.idle.retained"),
         ],
         "host",
@@ -450,12 +461,17 @@ fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
 
     assert!(plan.launch.is_empty());
     assert!(plan.adopt.is_empty());
-    assert!(plan.gc.is_empty(), "keep-pinned dead records remain frozen");
+    assert_eq!(plan.gc, ["host.idle.stale"]);
     assert_eq!(plan.teardown.len(), 1);
     assert_eq!(
         plan.teardown[0].pty_ids,
         vec!["host.idle.agent", "host.idle.ding"]
     );
+
+    let mut running = specs[0].clone();
+    running.desired_state = AgentDesiredState::Running;
+    let error = reconcile_result(&[running], &[], "host").unwrap_err();
+    assert!(error.to_string().contains("conflicting ST_AGENT"));
 }
 
 #[test]
