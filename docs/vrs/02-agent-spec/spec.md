@@ -281,6 +281,14 @@ the derived child and stop an exact generated child proved live. Explicit
 sibling tasks, including an authored `exec "ding"`, remain independent. Do not
 change unrelated siblings.
 
+Before compact tasks are compiled, st2 captures its current absolute executable
+once. A generated DING lowers to direct argv using that executable, the agent's
+bus identity, and its effective absolute bus root. The executable and root are
+separate arguments; neither shell parsing nor later `PATH` changes can select a
+different target. A missing captured executable aborts compilation before task
+execution. Authored command and exec source remains unchanged, including source
+that happens to invoke `st2 ding`.
+
 Authoring: [pinned compact and explicit tasks][evals-tasks]. st2 source:
 [`Task` and `TaskKind`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [task reconciliation](../../../src/reconcile.rs).

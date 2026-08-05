@@ -5,10 +5,10 @@
 //! the PARSER + model (P1); `st2 up`/`st2 eval` (team boot + eval flow + judge engine) build on it.
 //!
 //! Principles (from the design — do not violate): legible top-to-bottom, everything in one file, st2
-//! self-contained (`st2 ding`, only `pty` on PATH). Ergonomic collapses (review-driven): a bare `ding`
-//! node is the built-in sidecar (auto-prefixed `team.agent.ding`, `--root $ST_ROOT`) — dedicated, so
-//! `exec` reserves no magic name; `exec`/custom labels auto-prefix to `team.agent.<leaf>`.
-//! (`ding` → `ping` later.)
+//! self-contained (generated DING binds the running st2 executable instead of resolving st2 on PATH).
+//! Ergonomic collapses (review-driven): a bare `ding` node is the built-in sidecar (auto-prefixed
+//! `team.agent.ding`, `--root $ST_ROOT`) — dedicated, so `exec` reserves no magic name;
+//! `exec`/custom labels auto-prefix to `team.agent.<leaf>`. (`ding` → `ping` later.)
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -323,10 +323,11 @@ fn cascade(parent: &BTreeMap<String, String>, child: &BTreeMap<String, String>) 
     out
 }
 
-/// The canonical ding sidecar for an agent — exactly what `exec "ding"` (no command block)
-/// generates, and the long-term `ding {}` collapse. `--root $ST_ROOT` resolves from the cascaded env
-/// at spawn (the exec backend `$CATALOG`-expands env values, so `ST_ROOT` is an absolute path there) —
-/// not a re-derived default, so a spec that overrides `ST_ROOT` is honored.
+// ── Future-collapse helpers (kept expanded in the spec for now; the collapse is unit-tested) ──────
+
+/// The parsed marker for a generated DING sidecar. Task compilation replaces its descriptive command
+/// with direct argv bound to the running st2 executable, the projected canonical bus identity, and
+/// the effective `ST_ROOT` resolved against `$CATALOG`.
 pub fn ding_exec(agent_id: &str) -> SpecExec {
     SpecExec {
         id: format!("{agent_id}.ding"),
