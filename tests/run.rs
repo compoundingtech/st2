@@ -904,6 +904,15 @@ fn up_once_launches_all_tasks_of_a_fresh_agent() {
     assert!(report.errors.is_empty());
     let dirs = runner.spawn_dirs.borrow();
     assert!(dirs.iter().all(|(_, d)| d.ends_with("agents/hetz/demo")));
+    let targets = runner.spawned_targets.borrow();
+    let authored_ding = targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo.ding")
+        .unwrap();
+    assert_eq!(
+        &authored_ding.launch,
+        &TaskLaunch::Shell("st2 ding hetz.demo".into())
+    );
 }
 
 #[test]
@@ -915,9 +924,26 @@ fn fresh_compact_agent_launches_with_its_derived_ding() {
         COMPACT_AGENT_WITH_DING,
     );
 
-    let report = up_once(tmp.path(), "hetz", &FakeRunner::default()).unwrap();
+    let runner = FakeRunner::default();
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
 
     assert_eq!(report.launched, ["hetz.demo", "hetz.demo.ding"]);
+    let targets = runner.spawned_targets.borrow();
+    let ding = targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo.ding")
+        .unwrap();
+    assert_eq!(
+        &ding.launch,
+        &TaskLaunch::Argv(vec![
+            std::env::current_exe().unwrap().display().to_string(),
+            "ding".into(),
+            "--identity".into(),
+            "hetz.demo".into(),
+            "--root".into(),
+            tmp.path().display().to_string(),
+        ])
+    );
 }
 
 #[test]
