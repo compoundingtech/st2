@@ -7,7 +7,15 @@ use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
 use st2::reconcile::ObservedPtyPresentation;
 use st2::spec::{AgentDesiredState, AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
-use st2::{Session, reconcile};
+use st2::{Session, reconcile as reconcile_result};
+
+fn reconcile<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    host: &str,
+) -> st2::ReconcilePlan<'a> {
+    reconcile_result(specs, sessions, host).unwrap()
+}
 
 #[test]
 fn exact_task_selector_matrix() {
@@ -413,11 +421,17 @@ fn suspended(identity: &str, tasks: Vec<Task>) -> AgentSpec {
 
 #[test]
 fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
-    let specs = vec![suspended(
+    let mut spec = suspended(
         "idle",
         vec![
             task(TaskKind::Pty, "agent", Some("host.idle.agent"), Some("run")),
             task(TaskKind::Exec, "ding", Some("host.idle.ding"), Some("ding")),
+            task(
+                TaskKind::Exec,
+                "stale",
+                Some("host.idle.stale"),
+                Some("stale"),
+            ),
             {
                 let mut retained = task(
                     TaskKind::Exec,
@@ -429,12 +443,17 @@ fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
                 retained
             },
         ],
-    )];
+    );
+    spec.tasks[0]
+        .env
+        .insert("ST_AGENT".into(), "wrong.actor".into());
+    let specs = vec![spec];
     let plan = reconcile(
         &specs,
         &[
             live("host.idle.agent"),
             live("host.idle.ding"),
+            dead("host.idle.stale"),
             dead("host.idle.retained"),
         ],
         "host",
@@ -442,12 +461,17 @@ fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
 
     assert!(plan.launch.is_empty());
     assert!(plan.adopt.is_empty());
-    assert!(plan.gc.is_empty(), "keep-pinned dead records remain frozen");
+    assert_eq!(plan.gc, ["host.idle.stale"]);
     assert_eq!(plan.teardown.len(), 1);
     assert_eq!(
         plan.teardown[0].pty_ids,
         vec!["host.idle.agent", "host.idle.ding"]
     );
+
+    let mut running = specs[0].clone();
+    running.desired_state = AgentDesiredState::Running;
+    let error = reconcile_result(&[running], &[], "host").unwrap_err();
+    assert!(error.to_string().contains("conflicting ST_AGENT"));
 }
 
 #[test]
@@ -581,6 +605,8 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
                 "agent.presentation.description".to_owned(),
                 Some("Owns build delivery".to_owned()),
             ),
+            ("role".to_owned(), Some("agent".to_owned())),
+            ("run.role".to_owned(), Some("coding-agent".to_owned())),
         ])
     );
     let secondary = plan
@@ -589,7 +615,22 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         .find(|item| item.pty_id == "hetz.worker.shell")
         .unwrap();
     assert_eq!(secondary.display_name, None);
-    assert_eq!(secondary.tags, primary.tags);
+    assert_eq!(
+        secondary.tags,
+        BTreeMap::from([
+            ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
+            (
+                "agent.actor.path".to_owned(),
+                Some("hetz.worker".to_owned()),
+            ),
+            (
+                "agent.presentation.description".to_owned(),
+                Some("Owns build delivery".to_owned()),
+            ),
+            ("role".to_owned(), None),
+            ("run.role".to_owned(), None),
+        ])
+    );
 }
 
 #[test]
@@ -634,6 +675,8 @@ fn live_pty_presentation_only_queues_observed_drift() {
             "agent.presentation.description".to_owned(),
             "Owns build delivery".to_owned(),
         ),
+        ("role".to_owned(), "agent".to_owned()),
+        ("run.role".to_owned(), "coding-agent".to_owned()),
         ("unrelated".to_owned(), "preserved".to_owned()),
     ]);
     let exact = Session {
