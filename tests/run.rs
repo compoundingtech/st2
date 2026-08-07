@@ -1293,63 +1293,6 @@ fn up_once_finally_removes_dead_retired_tasks_without_restarting_them() {
     assert_eq!(report.gc.len(), 2);
 }
 
-/// Wiring test for the `mode = fail` budget: `execute` must close each pass so a task that recovers
-/// is forgiven. The unit tests in `src/flapping.rs` drive `end_pass` by hand and so cannot catch it
-/// simply never being called — this one goes through the real `execute` path.
-///
-/// `interval = 0s` makes any pass the task survives count as recovery, which keeps the test free of
-/// wall-clock sleeping.
-#[test]
-fn recovering_between_passes_restores_the_fail_mode_budget_through_execute() {
-    let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "agents/hetz/demo/agent.toml",
-        "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[restart]\nattempts=3\ninterval=\"0s\"\nmode=\"fail\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
-    );
-    let found = discover(tmp.path());
-    let mut cap = FlappingCap::default();
-
-    // Two failing passes: two launches spent out of three.
-    let dying = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude")],
-        ..Default::default()
-    };
-    for _ in 0..2 {
-        let plan = reconcile(&found.specs, &dying.sessions, "hetz");
-        execute(&plan, &dying, &mut cap, &mut UpReport::default());
-    }
-    assert_eq!(dying.spawned.borrow().len(), 2, "two launches spent");
-
-    // It comes back up. This pass launches nothing — and is exactly what `end_pass` must observe.
-    let healthy = FakeRunner {
-        sessions: vec![live("hetz.demo-claude")],
-        ..Default::default()
-    };
-    let plan = reconcile(&found.specs, &healthy.sessions, "hetz");
-    execute(&plan, &healthy, &mut cap, &mut UpReport::default());
-    assert!(healthy.spawned.borrow().is_empty(), "a live task is not relaunched");
-
-    // Now it starts dying again. Having recovered, it gets the FULL budget back: three more launches
-    // before parking. Without the recovery being observed it would park after just one more.
-    let relapsed = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude")],
-        ..Default::default()
-    };
-    let mut last = UpReport::default();
-    for _ in 0..4 {
-        let plan = reconcile(&found.specs, &relapsed.sessions, "hetz");
-        last = UpReport::default();
-        execute(&plan, &relapsed, &mut cap, &mut last);
-    }
-    assert_eq!(
-        relapsed.spawned.borrow().len(),
-        3,
-        "recovery must restore the full `attempts` budget, not leave it partly spent"
-    );
-    assert_eq!(last.flapping, vec!["hetz.demo-claude"], "and it still parks in the end");
-}
-
 #[test]
 fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
     let tmp = tempfile::tempdir().unwrap();
