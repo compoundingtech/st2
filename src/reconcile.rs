@@ -354,6 +354,12 @@ pub struct ReconcilePlan<'a> {
     pub held: Vec<String>,
     /// In-place presentation updates for healthy managed PTYs, independent of lifecycle actions.
     pub presentation: Vec<PtyPresentation>,
+    /// Declared task ids this pass PROVED alive in the inventory snapshot — the positive evidence
+    /// the restart cap needs. It is deliberately not "everything we did not launch": a task can be
+    /// missing from `launch` because it was never considered (its owner failed to materialize, its
+    /// launch was gated, its death was debounced as a flicker), and inferring liveness from that
+    /// silence credits uptime to a task nobody looked at. Excludes ids headed for `teardown`.
+    pub live: Vec<String>,
 }
 
 /// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
@@ -450,6 +456,7 @@ pub fn reconcile_selected<'a>(
             {
                 plan.presentation.push(presentation);
             }
+            plan.live.push(runtime);
             plan.adopt.push(owner);
         }
         _ if task.lifecycle == TaskLifecycle::AdoptOnly => plan.held.push(runtime),
@@ -613,6 +620,7 @@ pub fn reconcile<'a>(
             }
             match state {
                 SessionState::Alive => {
+                    plan.live.push(target.pty_id.clone());
                     if target.derived {
                         live_derived.push(target.pty_id.clone());
                     }

@@ -45,9 +45,11 @@ pub struct FlappingCap {
     /// Deliberately not wall-clock scoped — see [`end_pass`](Self::end_pass).
     consecutive: HashMap<String, u32>,
     /// When a task was first observed to have survived a pass. Cleared the moment it needs
-    /// relaunching again, so only *uninterrupted* uptime counts toward forgiveness.
+    /// relaunching again — or the moment a pass stops seeing it alive — so only *uninterrupted,
+    /// observed* uptime counts toward forgiveness.
     healthy_since: HashMap<String, Instant>,
-    /// Ids [`decide`](Self::decide)d this pass. Everything else the cap tracks stayed up.
+    /// Ids [`decide`](Self::decide)d this pass — i.e. proved *not* up. Liveness is supplied
+    /// separately to [`end_pass`](Self::end_pass); it is never the complement of this set.
     decided_this_pass: HashSet<String>,
 }
 
@@ -112,14 +114,25 @@ impl FlappingCap {
         *self.consecutive.entry(id.to_string()).or_default() += 1;
     }
 
-    /// Close a reconcile pass at `now`. Every tracked task the supervisor did *not* have to
-    /// (re)launch this pass is up, and uptime is what forgives a failure history — so the budget is
-    /// tied to the task actually recovering rather than to wall-clock elapsing while it keeps dying.
-    pub fn end_pass(&mut self, now: Instant) {
+    /// Close a reconcile pass at `now`, given the ids the pass PROVED alive. Uptime is what forgives
+    /// a failure history, so the budget is tied to the task actually recovering rather than to
+    /// wall-clock elapsing while it keeps dying.
+    ///
+    /// Liveness must be *observed*, never inferred from a task's absence from the pass: a task can
+    /// go unconsidered (owner failed to materialize, launch gated on hooks, death debounced as a
+    /// flicker) while it is in fact dead. So a tracked task this pass did not observe alive has its
+    /// accrued uptime dropped, not extended — otherwise a `healthy_since` from *before* the blind
+    /// spot survives it, and the next [`decide`](Self::decide) measures uptime across a stretch
+    /// nobody looked at and hands back a full budget.
+    pub fn end_pass(&mut self, now: Instant, observed_live: &[String]) {
         let decided = std::mem::take(&mut self.decided_this_pass);
-        for id in self.consecutive.keys() {
-            if !decided.contains(id) {
-                self.healthy_since.entry(id.clone()).or_insert(now);
+        let live: HashSet<&str> = observed_live.iter().map(String::as_str).collect();
+        let tracked: Vec<String> = self.consecutive.keys().cloned().collect();
+        for id in tracked {
+            if !decided.contains(&id) && live.contains(id.as_str()) {
+                self.healthy_since.entry(id).or_insert(now);
+            } else {
+                self.healthy_since.remove(&id);
             }
         }
     }
@@ -255,16 +268,16 @@ mod tests {
         let p = policy(3, 60, 0, RestartMode::Fail);
         let t0 = Instant::now();
 
-        // Two failures, then it comes back up.
+        // Two failures, then it comes back up. A pass that had to relaunch it saw it dead.
         for i in 0..2 {
             let now = t0 + Duration::from_secs(30 * i);
             assert_eq!(cap.decide("p", now, &p), RestartDecision::Allow);
             cap.record("p", now);
-            cap.end_pass(now);
+            cap.end_pass(now, &[]);
         }
-        // Passes 2..6 do not touch it — it is up.
+        // Passes 2..6 observe it alive.
         for i in 2..6 {
-            cap.end_pass(t0 + Duration::from_secs(30 * i));
+            cap.end_pass(t0 + Duration::from_secs(30 * i), &["p".to_string()]);
         }
         // It dies again 120s after recovering: history forgiven, full budget available.
         let mut launches = 0;
@@ -273,7 +286,7 @@ mod tests {
             match cap.decide("p", now, &p) {
                 RestartDecision::Allow => {
                     cap.record("p", now);
-                    cap.end_pass(now);
+                    cap.end_pass(now, &[]);
                     launches += 1;
                 }
                 RestartDecision::GaveUp => {
@@ -299,6 +312,8 @@ mod tests {
         let mut launches = 0;
         for pass in 0..40u32 {
             let now = t0 + cadence * pass;
+            let mut observed_live: &[String] = &[];
+            let alive = ["p".to_string()];
             if pass % 2 == 0 {
                 match cap.decide("p", now, &p) {
                     RestartDecision::Allow => {
@@ -311,8 +326,10 @@ mod tests {
                     }
                     other => panic!("unexpected {other:?}"),
                 }
+            } else {
+                observed_live = &alive;
             }
-            cap.end_pass(now);
+            cap.end_pass(now, observed_live);
         }
         panic!("slow flapper never parked: {launches} launches over 40 passes");
     }

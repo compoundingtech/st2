@@ -555,6 +555,33 @@ fn dead(id: &str) -> Session {
     }
 }
 
+/// The restart cap forgives a `mode = fail` budget on observed uptime, so the plan has to carry
+/// positive evidence of liveness instead of leaving `execute` to infer it from an empty launch set.
+/// The two cases below are indistinguishable by that inference — one task is alive, the other was
+/// simply never part of the pass — which is exactly why the plan states it.
+#[test]
+fn the_plan_reports_only_the_tasks_it_proved_alive() {
+    let up = task_spec("up", None, "host.up.work");
+    let gone = task_spec("gone", None, "host.gone.work");
+
+    let sessions = [live("host.up.work"), dead("host.gone.work")];
+
+    let both = [up, gone.clone()];
+    let plan = reconcile(&both, &sessions, "host");
+    assert_eq!(plan.live, ["host.up.work"]);
+
+    // The pass never reached `up` (its owner failed to materialize, so it was filtered out before
+    // reconcile). Its session is still alive in the snapshot, and it is still not this plan's
+    // business to say so.
+    let reduced = [gone];
+    let plan = reconcile(&reduced, &sessions, "host");
+    assert!(
+        plan.live.is_empty(),
+        "a task the pass did not consider is unobserved, not alive: {:?}",
+        plan.live
+    );
+}
+
 #[test]
 fn lifecycle_work_precedes_a_bounded_presentation_batch() {
     let spec = task_spec("owner", None, "host.owner.work");
