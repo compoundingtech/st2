@@ -1202,6 +1202,12 @@ fn execute_with_presentation_cursor(
         }
     }
 
+    // Every task the cap tracks that this pass did not have to (re)launch is up. That is how a
+    // `mode = fail` budget gets forgiven, so it is closed on every pass, not only on passes that
+    // launched something. A pass that bailed before `execute` (lock failure, skipped) observed
+    // nothing and so never gets here — it credits no uptime, which is the safe direction.
+    cap.end_pass(Instant::now());
+
     for td in &plan.teardown {
         for id in &td.pty_ids {
             match runner.kill(id) {

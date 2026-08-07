@@ -2,9 +2,18 @@
 //! (spec.md §4 / R16), so every conformant runner behaves identically on a flapping task.
 //!
 //! st2 owns liveness (it respawns a dead task on the next reconcile), so it also owns the restart
-//! decision. Per task it tracks launch times in a sliding `interval` window and enforces `delay`
-//! spacing. When `attempts` within the window are exhausted, `mode` decides: `fail` **parks** the task
-//! (give up + surface it) while `delay` just **rate-limits** (keep restarting once the window clears).
+//! decision. Per task it enforces `delay` spacing, then applies `mode`: `delay` **rate-limits** using
+//! a sliding `interval` window (keep restarting once the window clears), while `fail` **parks** the
+//! task (give up + surface it) once its failure budget is spent.
+//!
+//! Those two need different counters, because a rate window cannot express a budget. The supervisor
+//! reconciles every 30s by default, so it can start a task at most twice a minute — below the
+//! 3-per-minute that the default `attempts 3 / interval 60s` budgets. Counted in a window, `fail`'s
+//! budget could never accrue and a permanently-broken task relaunched forever. So `fail` counts
+//! launches since the task last *stayed up* for a full `interval`, which is uptime-scoped rather than
+//! wall-clock-scoped and cannot be outrun by a coarse cadence. That makes [`FlappingCap::end_pass`]
+//! load-bearing: it is how the cap learns a task survived.
+//!
 //! The clock is injected (`now: Instant`) so every branch is unit-testable without sleeping.
 
 use std::collections::HashMap;
@@ -32,6 +41,14 @@ pub struct FlappingCap {
     launches: HashMap<String, Vec<Instant>>,
     last_launch: HashMap<String, Instant>,
     parked: HashSet<String>,
+    /// `mode = fail`'s durable budget: launches since the task last stayed up for a full `interval`.
+    /// Deliberately not wall-clock scoped — see [`end_pass`](Self::end_pass).
+    consecutive: HashMap<String, u32>,
+    /// When a task was first observed to have survived a pass. Cleared the moment it needs
+    /// relaunching again, so only *uninterrupted* uptime counts toward forgiveness.
+    healthy_since: HashMap<String, Instant>,
+    /// Ids [`decide`](Self::decide)d this pass. Everything else the cap tracks stayed up.
+    decided_this_pass: HashSet<String>,
 }
 
 impl FlappingCap {
@@ -52,8 +69,16 @@ impl FlappingCap {
     /// Decide whether `id` may be (re)launched at `now` under `policy`. On `Allow` the caller should
     /// spawn and then call [`record`](Self::record).
     pub fn decide(&mut self, id: &str, now: Instant, policy: &Restart) -> RestartDecision {
+        // Deciding at all means the task needed (re)launching, so it is not up right now.
+        self.decided_this_pass.insert(id.to_string());
+        let survived = self.healthy_since.remove(id);
+
         if self.parked.contains(id) {
             return RestartDecision::GaveUp;
+        }
+        // Staying up for a full `interval` forgives the failure history.
+        if survived.is_some_and(|since| now.duration_since(since) >= policy.interval) {
+            self.consecutive.remove(id);
         }
         // `delay` spacing between restarts.
         if let Some(&last) = self.last_launch.get(id)
@@ -61,15 +86,20 @@ impl FlappingCap {
         {
             return RestartDecision::Delaying;
         }
-        // `attempts` within the `interval` window.
-        let recent = self.recent_count(id, now, policy);
-        if recent >= policy.attempts as usize {
-            match policy.mode {
-                RestartMode::Fail => {
+        match policy.mode {
+            // A failure budget, not a rate: counted since the task last stayed up, so a reconcile
+            // cadence coarser than `interval / attempts` cannot stop it accruing.
+            RestartMode::Fail => {
+                if self.consecutive.get(id).copied().unwrap_or(0) >= policy.attempts {
                     self.parked.insert(id.to_string());
                     return RestartDecision::GaveUp;
                 }
-                RestartMode::Delay => return RestartDecision::RateLimited,
+            }
+            // A rate limit, exactly as documented: `attempts` within the sliding `interval` window.
+            RestartMode::Delay => {
+                if self.recent_count(id, now, policy) >= policy.attempts as usize {
+                    return RestartDecision::RateLimited;
+                }
             }
         }
         RestartDecision::Allow
@@ -79,6 +109,19 @@ impl FlappingCap {
     pub fn record(&mut self, id: &str, now: Instant) {
         self.launches.entry(id.to_string()).or_default().push(now);
         self.last_launch.insert(id.to_string(), now);
+        *self.consecutive.entry(id.to_string()).or_default() += 1;
+    }
+
+    /// Close a reconcile pass at `now`. Every tracked task the supervisor did *not* have to
+    /// (re)launch this pass is up, and uptime is what forgives a failure history — so the budget is
+    /// tied to the task actually recovering rather than to wall-clock elapsing while it keeps dying.
+    pub fn end_pass(&mut self, now: Instant) {
+        let decided = std::mem::take(&mut self.decided_this_pass);
+        for id in self.consecutive.keys() {
+            if !decided.contains(id) {
+                self.healthy_since.entry(id.clone()).or_insert(now);
+            }
+        }
     }
 
     /// Count (and prune) launches of `id` within `policy.interval` ending at `now`.
@@ -159,5 +202,118 @@ mod tests {
         cap.record("a", t0);
         assert_eq!(cap.decide("a", t0 + Duration::from_secs(1), &p), RestartDecision::GaveUp);
         assert_eq!(cap.decide("b", t0 + Duration::from_secs(1), &p), RestartDecision::Allow);
+    }
+
+    /// Reproduction for the crash-loop budget being unreachable at the supervisor's own cadence.
+    ///
+    /// The window counts only launches newer than `interval`, so at a reconcile cadence `c` the count
+    /// seen at decision time saturates at `ceil(interval / c) - 1`. `st2 up --interval` defaults to
+    /// 30s and the default policy is `attempts 3 / interval 60s`, giving a ceiling of 1: the budget
+    /// never reaches 3, `mode = fail` never engages, and a task that dies every pass relaunches
+    /// forever.
+    ///
+    /// The launch rate is the thing that is bounded. A supervisor reconciling every 30s can start a
+    /// task at most twice a minute, which is below the 3-per-minute the policy budgets, so no
+    /// windowing scheme can let the budget accrue — the counter has to stop being wall-clock scoped.
+    ///
+    /// Positive control: `fail_mode_parks_after_attempts` drives this exact policy at 1s spacing and
+    /// does reach `GaveUp`, so a failure here is the cadence and not the harness.
+    #[test]
+    fn fail_mode_parks_at_the_default_supervisor_cadence() {
+        let mut cap = FlappingCap::new();
+        let p = policy(3, 60, 0, RestartMode::Fail);
+        let t0 = Instant::now();
+        let cadence = Duration::from_secs(30);
+
+        // The task dies before every pass, so every pass is a relaunch attempt.
+        let mut launches = 0u32;
+        for pass in 0..20u32 {
+            let now = t0 + cadence * pass;
+            match cap.decide("p", now, &p) {
+                RestartDecision::Allow => {
+                    cap.record("p", now);
+                    launches += 1;
+                }
+                RestartDecision::GaveUp => {
+                    assert_eq!(launches, 3, "parked, but not after exactly `attempts` launches");
+                    return;
+                }
+                other => panic!("unexpected {other:?} at pass {pass} (delay is 0)"),
+            }
+        }
+        panic!(
+            "never parked: {launches} launches over 20 passes at a {}s cadence under `attempts 3`",
+            cadence.as_secs()
+        );
+    }
+
+    /// The budget is spent by failing, not by existing: a task that comes back and stays up for a
+    /// full `interval` is forgiven and may use the budget again later.
+    #[test]
+    fn staying_up_for_an_interval_forgives_the_budget() {
+        let mut cap = FlappingCap::new();
+        let p = policy(3, 60, 0, RestartMode::Fail);
+        let t0 = Instant::now();
+
+        // Two failures, then it comes back up.
+        for i in 0..2 {
+            let now = t0 + Duration::from_secs(30 * i);
+            assert_eq!(cap.decide("p", now, &p), RestartDecision::Allow);
+            cap.record("p", now);
+            cap.end_pass(now);
+        }
+        // Passes 2..6 do not touch it — it is up.
+        for i in 2..6 {
+            cap.end_pass(t0 + Duration::from_secs(30 * i));
+        }
+        // It dies again 120s after recovering: history forgiven, full budget available.
+        let mut launches = 0;
+        for i in 6..12 {
+            let now = t0 + Duration::from_secs(30 * i);
+            match cap.decide("p", now, &p) {
+                RestartDecision::Allow => {
+                    cap.record("p", now);
+                    cap.end_pass(now);
+                    launches += 1;
+                }
+                RestartDecision::GaveUp => {
+                    assert_eq!(launches, 3, "forgiveness did not restore the full budget");
+                    return;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("never parked after forgiveness: {launches} launches");
+    }
+
+    /// Only *uninterrupted* uptime forgives. A task that survives a pass but dies again well inside
+    /// `interval` is still crash-looping, and must still reach `GaveUp`.
+    #[test]
+    fn a_slow_flapper_still_parks() {
+        let mut cap = FlappingCap::new();
+        let p = policy(3, 60, 0, RestartMode::Fail);
+        let t0 = Instant::now();
+        let cadence = Duration::from_secs(30);
+
+        // Alternating: up for one pass, dead the next. Never a full 60s of uptime.
+        let mut launches = 0;
+        for pass in 0..40u32 {
+            let now = t0 + cadence * pass;
+            if pass % 2 == 0 {
+                match cap.decide("p", now, &p) {
+                    RestartDecision::Allow => {
+                        cap.record("p", now);
+                        launches += 1;
+                    }
+                    RestartDecision::GaveUp => {
+                        assert_eq!(launches, 3);
+                        return;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            cap.end_pass(now);
+        }
+        panic!("slow flapper never parked: {launches} launches over 40 passes");
     }
 }
