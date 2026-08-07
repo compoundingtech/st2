@@ -98,12 +98,17 @@
               --fish completions-fish
           '';
 
-          # Run the hermetic unit tests plus agent-spec's discovery test and the
-          # real lifecycle-hook integration tests. The remaining root integration
-          # tests assume facilities the Nix build sandbox deliberately lacks:
-          # `/usr/bin/git` on a hardcoded `PATH`, live PTY backends, or a systemd
-          # `--user` manager. They remain native gates, while the flake proves
-          # that its parser and packaged hooks execute.
+          # Run the hermetic unit tests plus agent-spec's discovery test, the real
+          # lifecycle-hook integration tests, and the reconcile/execute suite. Most
+          # remaining root integration tests assume facilities the Nix build sandbox
+          # deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`, live PTY
+          # backends, or a systemd `--user` manager. They remain native gates, while
+          # the flake proves that its parser and packaged hooks execute.
+          # `run` is hermetic despite living alongside them — it drives `reconcile`
+          # and `execute` against `FakeRunner` and `tempfile` only — so it is gated
+          # here. It covers the restart cap's supervision behaviour, which is
+          # otherwise unprotected: deleting the flapping cap's per-pass hook left
+          # this build green before `run` was added.
           # `--workspace` because the root is a real package: without it cargo
           # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
@@ -116,6 +121,8 @@
             "codex_hooks"
             "--test"
             "hooks"
+            "--test"
+            "run"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
