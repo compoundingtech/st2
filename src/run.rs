@@ -2686,10 +2686,24 @@ mod tests {
             Some(input),
         )
         .unwrap_err();
-        let pid = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        // The child records its pid as its first action, but nothing orders that against the input
+        // deadline expiring: the timeout bounds *our* write, not when the child gets scheduled. Wait
+        // for a complete pid — the file is also observable after truncation and before the write —
+        // rather than assuming 100ms of slack, which is a race a busier platform loses.
+        let pid_deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(recorded) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = recorded.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < pid_deadline,
+                "child never recorded its pid in {}",
+                pidfile.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
 
         assert!(
             format!("{error:#}").contains("timed out"),
