@@ -732,10 +732,7 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
         Some(&Some("hetz.demo".to_owned()))
     );
     assert_eq!(primary_tags.get("role"), Some(&Some("agent".to_owned())));
-    assert_eq!(
-        primary_tags.get("run.role"),
-        Some(&Some("coding-agent".to_owned()))
-    );
+    assert!(!primary_tags.contains_key("run.role"));
 
     let secondary = explicit_targets
         .iter()
@@ -747,7 +744,7 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
         Some(&Some("hetz.demo".to_owned()))
     );
     assert_eq!(secondary_tags.get("role"), Some(&None));
-    assert_eq!(secondary_tags.get("run.role"), Some(&None));
+    assert!(!secondary_tags.contains_key("run.role"));
 
     let sidecar = explicit_targets
         .iter()

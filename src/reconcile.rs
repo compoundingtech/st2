@@ -188,8 +188,6 @@ pub const AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
 pub const AGENT_DESCRIPTION_TAG: &str = "agent.presentation.description";
 /// Compatibility role owned by st2 only on the canonical agent PTY.
 pub const COMPATIBILITY_ROLE_TAG: &str = "role";
-/// Stable run role owned by st2 only on the canonical agent PTY.
-pub const RUN_ROLE_TAG: &str = "run.role";
 
 /// Fail-closed admission errors for runner-owned task identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,10 +283,6 @@ fn pty_presentation(
             (
                 COMPATIBILITY_ROLE_TAG.to_owned(),
                 canonical_agent.then(|| "agent".to_owned()),
-            ),
-            (
-                RUN_ROLE_TAG.to_owned(),
-                canonical_agent.then(|| "coding-agent".to_owned()),
             ),
         ]),
     })
