@@ -1212,6 +1212,23 @@ mod tests {
         staged_codex_screen_with_footer(text, "gpt-5.6-sol xhigh · /workspace")
     }
 
+    fn staged_wrapped_codex_screen() -> (&'static str, String) {
+        let text = "[DING] new st2 message: [id:abc123] a deliberately long synthetic notification with enough content to reach another renderer boundary before the final words; check your inbox";
+        let composer = concat!(
+            "[DING] new st2 message: [id:abc123] a deliberately long synthetic notification",
+            "\x1b[3X\r\n",
+            "  with enough content to reach another renderer boundary before the final words; check",
+            "\x1b[2X\r\n",
+            "  your inbox",
+        );
+        (
+            text,
+            format!(
+                "\x1b[1m›\x1b[22m {composer}\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol low · Context 14% used"
+            ),
+        )
+    }
+
     fn human_codex_screen() -> String {
         staged_codex_screen("please keep my half-written draft")
     }
@@ -1932,6 +1949,31 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 "blocking chrome: {blocking_chrome}"
             );
         }
+    }
+
+    #[test]
+    fn codex_renderer_wraps_preserve_possible_inter_word_spaces() {
+        let (expected, screen) = staged_wrapped_codex_screen();
+        let token_split = expected.replace("check your", "checkyour");
+        let changed = expected.replace("synthetic", "different");
+
+        assert_eq!(
+            classify_composer(&screen, expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_receipt(&screen, expected),
+            ReceiptState::RetainedSafe
+        );
+        assert_eq!(
+            classify_composer(&screen, &token_split),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(classify_composer(&screen, &changed), ComposerState::Changed);
+        assert_eq!(
+            classify_receipt(&screen, &changed),
+            ReceiptState::NotRetained
+        );
     }
 
     #[test]
