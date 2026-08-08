@@ -267,3 +267,17 @@ accepted.
   rationale. Its receipt proves the declaration edit, never runtime
   convergence. Human listing, roster JSON, task inventory, and Doctor expose
   desired state without conflating it with presence or observed liveness.
+- **R29 Visible, nondisruptive launch drift:** st2 derives a versioned desired
+  launch fingerprint from the minimal effective fields it already passes to a
+  task. Only an st2 launch records an observed fingerprint, bound to that
+  launch's exact runtime identity and creation incarnation. A missing or
+  mismatched binding reports `unknown`; otherwise inspection reports
+  `converged` or `drifted`. Healthy `drifted` and `unknown` tasks are adopted
+  without implicit restart.
+- **R30 Explicit replacement boundary:** An absent or dead active task launches
+  from the latest current declaration. Retirement stops live work and prevents
+  relaunch. Replacing live work is a separate, explicitly selected operation
+  fenced by catalog, host, effective PTY root, task set, and an exact runtime
+  identity recheck immediately before disruption. Renaming remains
+  retire-old/add-new. Every behavior remains complete with an ordinary catalog
+  folder and without CAS, captured generations, or replacement journals.

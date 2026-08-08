@@ -723,3 +723,83 @@ the resident supervisor continues to reconcile the complete local catalog.
   plan, and current plan step. Prove that stale state is distinguishable and
   that a supervisor can follow plan progress without inspecting a PTY before
   adding the shape to `AGENT-SPEC.md`.
+- **DQ4 Relaunch boundary (R29-R30):** Preserve R11's nondisruptive adoption
+  while making launch drift visible. For each declared task, derive the desired
+  launch fingerprint from a deterministic, versioned encoding of only:
+  backend kind, lowered shell source or direct argv, resolved working directory,
+  and the st2-managed plus declared effective environment. Tags, descriptive
+  metadata, unrelated inherited environment, file contents, and other boot-time
+  snapshots are not part of this fingerprint.
+
+  As part of its own successful task launch, st2 records the observed
+  fingerprint together with that launch's exact runtime identity and creation
+  incarnation. The observed fingerprint is trustworthy only while the current
+  live runtime exactly matches that binding. Inspection then reports:
+
+  | State | Meaning | Healthy-task action |
+  | --- | --- | --- |
+  | `converged` | desired and bound observed fingerprints match | adopt |
+  | `drifted` | desired and bound observed fingerprints differ | adopt and report drift |
+  | `unknown` | the observed binding is missing or does not match the live runtime | adopt and report unknown |
+
+  `unknown` includes a healthy legacy or externally adopted runtime, as well as
+  a manual PTY restart or external child replacement whose runtime identity or
+  creation incarnation no longer matches st2's launch record. Stale observed
+  metadata is never reused for the new incarnation. Catalog publication,
+  supervisor restart, metadata edits, and launch-field edits do not implicitly
+  disrupt any healthy task.
+
+  Ordinary reconciliation remains sufficient after every interruption:
+
+  | Declaration | Process | Action |
+  | --- | --- | --- |
+  | active | absent or dead | reap stale state and launch the latest current desired contract |
+  | active | alive | adopt and report `converged`, `drifted`, or `unknown` |
+  | retired | alive | stop; do not relaunch |
+  | retired | absent or dead | do not launch |
+
+  Replacing live drifted work is a separate explicit operation. Its scope is
+  one selected catalog, pinned host, resolved effective PTY root, and selected
+  task set. A future interface may preview drifted tasks and select one, a
+  subset, or all of them; this contract does not reserve a command name. The
+  operation must re-read the selected task and recheck its exact live runtime
+  identity immediately before each stop. A missing, changed, wrong-host, or
+  wrong-root target refuses without disruption.
+
+  Replacement does not capture an old launch contract or boot inputs. If st2
+  stops after the identity check and is then interrupted, ordinary
+  absent/dead reconciliation launches the latest current desired contract.
+  There is no replay of an older generation, durable operation journal,
+  operation ID, phase machine, terminal receipt, or atomic old-to-new runtime
+  transition. A task rename is the explicit sequence retire old, then add new.
+
+  This entire lifecycle works from an ordinary copied or synchronized catalog
+  folder. CAS may later add publication, history, or storage optimization, but
+  fingerprinting, inspection, reconciliation, replacement, retirement,
+  recovery, and rename must neither require nor become incomplete without it.
+
+  Executable acceptance proves:
+
+  1. metadata, tags, and Resource-only edits preserve the fingerprint and live
+     runtime, while kind, launch, resolved-cwd, or effective-environment edits
+     report `drifted` without changing runtime identity;
+  2. a healthy legacy runtime reports `unknown` and remains unchanged, and a
+     manual or external restart with a changed runtime identity or creation
+     incarnation cannot reuse the prior observed fingerprint and reports
+     `unknown`;
+  3. natural exit or death launches once from the latest current declaration
+     and records that launch's observed fingerprint;
+  4. explicit replacement refuses stale identity or scope, and affects only
+     the selected drifted tasks;
+  5. interruption after stop heals through ordinary reconciliation to the
+     latest current desired contract, without old-state replay;
+  6. retirement stops and prevents relaunch, while rename works as
+     retire-old/add-new; and
+  7. the same proofs pass using only a plain local catalog folder with no CAS
+     service, CAS metadata, database, or network dependency.
+
+  The executable acceptance above resolves this open implementation design.
+  See [#40](https://github.com/compoundingtech/st2/issues/40),
+  [#41](https://github.com/compoundingtech/st2/issues/41),
+  [#44](https://github.com/compoundingtech/st2/issues/44), and
+  [#60](https://github.com/compoundingtech/st2/issues/60).
