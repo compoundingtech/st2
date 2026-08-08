@@ -146,6 +146,19 @@ fn output_with_input_timeout(
     timeout: Duration,
     input: Option<Vec<u8>>,
 ) -> anyhow::Result<Output> {
+    output_with_input_timeout_observed(command, timeout, input, |_| {})
+}
+
+/// `on_spawn` observes the direct child's pid at the moment it exists. The child is `setsid`, so
+/// that pid is also its process group id — the group this function signals on every failure path.
+/// Tests need it to assert the child was reaped, and the child cannot supply it: a test whose
+/// deadline expires before the child is first scheduled would never see anything the child wrote.
+fn output_with_input_timeout_observed(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+    on_spawn: impl FnOnce(i32),
+) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -167,6 +180,7 @@ fn output_with_input_timeout(
     }
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
+    on_spawn(pid);
     let deadline = Instant::now() + timeout;
     if let Some(input) = input {
         let Some(stdin) = child.stdin.take() else {
@@ -2671,25 +2685,24 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("ignore-stdin");
-        let pidfile = temporary.path().join("child.pid");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nsleep 60\n",
-        )
-        .unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
         let started = Instant::now();
-        let error = output_with_input_timeout(
-            Command::new(&executable).env("PIDFILE", &pidfile),
+        // The pid comes from the parent at spawn, not from the child. This case is precisely the one
+        // where the child may never be scheduled: the write blocks as soon as the pipe buffer fills,
+        // which needs no execution by the child at all, and the deadline then terminates the whole
+        // group. Anything the child was supposed to record would never be written, so a test that
+        // waits for it fails on exactly the condition it exists to cover.
+        let mut spawned = None;
+        let error = output_with_input_timeout_observed(
+            &mut Command::new(&executable),
             Duration::from_millis(100),
             Some(input),
+            |pid| spawned = Some(pid),
         )
         .unwrap_err();
-        let pid = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = spawned.expect("the child was spawned before the input deadline expired");
 
         assert!(
             format!("{error:#}").contains("timed out"),
