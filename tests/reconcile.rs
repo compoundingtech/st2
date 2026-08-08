@@ -969,3 +969,26 @@ fn adopting_a_live_task_proves_it_alive_to_the_restart_cap() {
     assert!(plan.launch.is_empty());
     assert!(plan.gc.is_empty());
 }
+
+/// The same evidence, on the task-scoped path. `reconcile_selected` has its own adopt arm and its
+/// own `plan.live` push; covering the whole-catalog path says nothing about this one, and a `st2`
+/// invocation scoped to a single task still feeds the restart cap.
+#[test]
+fn selecting_a_live_task_proves_it_alive_to_the_restart_cap() {
+    let specs = vec![svc(
+        "worker",
+        None,
+        vec![task(TaskKind::Pty, "agent", None, Some("run"))],
+    )];
+    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0].pty_id.clone();
+
+    let plan = reconcile_selected(&specs, &[live(&runtime)], HOST, &runtime).unwrap();
+
+    assert_eq!(
+        plan.live,
+        vec![runtime.clone()],
+        "a selected live task must be reported as proved alive"
+    );
+    assert_eq!(plan.adopt.len(), 1);
+    assert!(plan.launch.is_empty());
+}
