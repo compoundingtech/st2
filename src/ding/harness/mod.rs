@@ -9,7 +9,7 @@
 //! Active-turn and modal detection is per-harness on purpose: the shapes are harness-specific TUI
 //! chrome, not a shared contract. Only genuinely cross-harness shapes stay in `composer`.
 
-pub(super) mod claude;
+pub(crate) mod claude;
 pub(super) mod codex;
 
 use super::composer::ComposerState;
@@ -19,7 +19,7 @@ use super::composer::ComposerState;
 /// The shared delivery state machine consumes only this type. Harness-specific screen vocabulary
 /// stays behind [`Harness`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReceiptState {
+pub(crate) enum ReceiptState {
     /// The expected notice text is visible in the harness's submitted-prompt or queued-message
     /// pattern while the live composer is empty or an accepted idle placeholder.
     Accepted,

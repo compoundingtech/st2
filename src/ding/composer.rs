@@ -5,7 +5,7 @@ use super::harness::{self, ReceiptState, Screen};
 
 /// What the current bottom composer proves about one exact normalized notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ComposerState {
+pub(crate) enum ComposerState {
     /// A maintained harness is positively idle and contains only its known placeholder.
     EmptySafe,
     /// The exact notice is the complete composer and the harness is positively idle.

@@ -24,7 +24,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod composer;
+#[cfg(test)]
+mod frame_probe;
 mod harness;
+#[cfg(test)]
+mod wrap_repro;
 
 use crate::message::{self, Message};
 use crate::status;

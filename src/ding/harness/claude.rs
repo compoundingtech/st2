@@ -93,7 +93,22 @@ fn is_claude_idle_placeholder(input: &str) -> bool {
 /// row Claude may either wrap at a discarded space or split a token, so each proven boundary has
 /// exactly two candidates: join with one space or with none. The bounded DING length keeps this set
 /// small; any unfamiliar multiline shape fails closed.
+#[cfg(test)]
+pub(crate) fn located_bottom_claude_composer_probe(
+    plain: &str,
+) -> Option<(usize, SoftWrapCandidates, String, String)> {
+    located_bottom_claude_composer_inner(plain)
+        .map(|(row, candidates, footer, input)| (row, candidates, footer, input))
+}
+
 fn located_bottom_claude_composer(plain: &str) -> Option<(usize, SoftWrapCandidates, String)> {
+    located_bottom_claude_composer_inner(plain)
+        .map(|(row, candidates, footer, _input)| (row, candidates, footer))
+}
+
+fn located_bottom_claude_composer_inner(
+    plain: &str,
+) -> Option<(usize, SoftWrapCandidates, String, String)> {
     let lines: Vec<&str> = plain.lines().collect();
     let separators: Vec<usize> = lines
         .iter()
@@ -125,7 +140,7 @@ fn located_bottom_claude_composer(plain: &str) -> Option<(usize, SoftWrapCandida
     let footer = lines[bottom + 1..].join("\n");
     // `top + 1` is the composer's first row, which is what the router compares against the Codex
     // composer's row to find the lower — and therefore live — of the two.
-    Some((top + 1, candidates, footer))
+    Some((top + 1, candidates, footer, input))
 }
 
 /// Claude 2.1.220 renders an in-flight turn as a status line and ships no interrupt hint with it.
