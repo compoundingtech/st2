@@ -290,7 +290,8 @@ pub fn list_dir(dir: &Path) -> anyhow::Result<Vec<Message>> {
     let mut msgs = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Ok(msgs), // no dir yet → empty
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(msgs),
+        Err(error) => return Err(error.into()),
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();

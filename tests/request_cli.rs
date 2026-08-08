@@ -429,6 +429,51 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
 }
 
 #[test]
+fn request_status_propagates_non_not_found_message_directory_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    declare_agent(tmp.path(), "worker");
+    declare_principal(tmp.path(), "example-ci");
+
+    let sent = request(
+        tmp.path(),
+        &[
+            "send",
+            "h.worker",
+            "--as",
+            "h.example-ci",
+            "--idempotency-key",
+            "repair:42",
+            "-m",
+            "{}",
+            "--json",
+        ],
+    );
+    assert!(sent.status.success());
+
+    let inbox = tmp
+        .path()
+        .join("principals/h/example-ci/resources/inbox");
+    fs::create_dir_all(inbox.parent().unwrap()).unwrap();
+    fs::write(&inbox, "not a directory").unwrap();
+    assert!(inbox.is_file());
+
+    let status = request(
+        tmp.path(),
+        &[
+            "status",
+            "--as",
+            "h.example-ci",
+            "--idempotency-key",
+            "repair:42",
+            "--json",
+        ],
+    );
+
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("Not a directory"));
+}
+
+#[test]
 fn concurrent_replays_publish_exactly_one_request() {
     let tmp = tempfile::tempdir().unwrap();
     declare_agent(tmp.path(), "worker");
