@@ -174,70 +174,9 @@ fn located_bottom_codex_composer(screen: &str) -> Option<(usize, CodexComposer)>
     ))
 }
 
-/// Strip ANSI from one bottom-composer input while joining only renderer-proven Codex soft wraps.
+/// Strip ANSI from one bottom-composer input while preserving rows for soft-wrap reconstruction.
 fn normalize_codex_composer_input(input: &str) -> String {
-    const VIEWPORT_WIDTH: usize = 80;
-    const PROMPT_WIDTH: usize = 2;
-    const WRAP_RIGHT_MARGIN: usize = 2;
-    const CONTINUATION_INDENT: &str = "  ";
-    const WRAP_PADDING: &str = "\x1b[2X";
-
-    fn split_row(input: &str) -> (&str, Option<&str>) {
-        let Some(newline) = input.find('\n') else {
-            return (input, None);
-        };
-        let row_end = if input[..newline].ends_with('\r') {
-            newline - 1
-        } else {
-            newline
-        };
-        (&input[..row_end], Some(&input[newline + 1..]))
-    }
-
-    fn proven_wrap(row: &str, next: &str, first: bool) -> bool {
-        let Some(row_without_padding) = row.strip_suffix(WRAP_PADDING) else {
-            return false;
-        };
-        let visible = strip_ansi(row_without_padding);
-        let next_content = next.strip_prefix(CONTINUATION_INDENT);
-        visible.is_ascii()
-            && next_content.is_some_and(|content| {
-                content
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| !ch.is_control() && !ch.is_whitespace())
-            })
-            && usize::from(first) * PROMPT_WIDTH + visible.len() + WRAP_RIGHT_MARGIN
-                == VIEWPORT_WIDTH
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    let mut first = true;
-    let mut strip_continuation_indent = false;
-    loop {
-        let (row, next) = split_row(rest);
-        let visible = strip_ansi(row);
-        if strip_continuation_indent {
-            out.push_str(
-                visible
-                    .strip_prefix(CONTINUATION_INDENT)
-                    .unwrap_or(&visible),
-            );
-        } else {
-            out.push_str(&visible);
-        }
-        let Some(next) = next else {
-            break;
-        };
-        strip_continuation_indent = proven_wrap(row, next, first);
-        if !strip_continuation_indent {
-            out.push('\n');
-        }
-        rest = next;
-        first = false;
-    }
-    out
+    strip_ansi(input)
 }
 
 /// States in which Return must not be sent. Several of these strings are Claude-specific chrome
