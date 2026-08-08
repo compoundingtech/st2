@@ -143,10 +143,10 @@ For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 st2-owned tags `agent.presentation.schema=1`,
 `agent.actor.path=<host>.<identity>`, and the optional
 `agent.presentation.description`. The canonical PTY whose task is named `agent`
-and whose ID is `<host>.<identity>` additionally receives the compatibility tags
-`role=agent` and `run.role=coding-agent`, and maps `name` to native
+and whose ID is `<host>.<identity>` additionally receives the compatibility tag
+`role=agent`, and maps `name` to native
 `displayName`. Secondary PTYs retain their task-specific display convention and
-clear those compatibility tags. Exec tasks receive no PTY presentation. Name is
+clear that compatibility tag. Exec tasks receive no PTY presentation. Name is
 not duplicated in tags. Clearing removes only the owned native value or tag,
 and unrelated PTY metadata is preserved. Repeating the same projection is a
 no-op. Failure is reported and retried by the ordinary loop, never converted

@@ -606,7 +606,6 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
                 Some("Owns build delivery".to_owned()),
             ),
             ("role".to_owned(), Some("agent".to_owned())),
-            ("run.role".to_owned(), Some("coding-agent".to_owned())),
         ])
     );
     let secondary = plan
@@ -628,7 +627,6 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
                 Some("Owns build delivery".to_owned()),
             ),
             ("role".to_owned(), None),
-            ("run.role".to_owned(), None),
         ])
     );
 }
