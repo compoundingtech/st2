@@ -170,3 +170,63 @@ fn catalog_aliases_share_the_canonical_reader_lock_domain() {
     assert!(catalog.join(".st2/catalog-authoring.lock").is_file());
     assert!(!alias.join(".st2/catalog-authoring.lock").is_symlink());
 }
+
+#[test]
+fn catalog_initialization_adds_the_control_directory_to_the_local_git_exclusion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    write_agent(&catalog, "h", "worker");
+    let initialized = Command::new("git")
+        .args(["init", "-q"])
+        .arg(&catalog)
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    let exclude = catalog.join(".git/info/exclude");
+    fs::write(&exclude, "existing-pattern").unwrap();
+
+    let catalog_arg = catalog.to_str().unwrap();
+    for _ in 0..2 {
+        let output = agents(&["--catalog", catalog_arg], None, &tmp.path().join("state"));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(exclude).unwrap(),
+        "existing-pattern\n.st2/\n"
+    );
+    let ignored = Command::new("git")
+        .args(["-C"])
+        .arg(&catalog)
+        .args(["check-ignore", "-q", ".st2/catalog-authoring.lock"])
+        .status()
+        .unwrap();
+    assert!(ignored.success());
+}
+
+#[test]
+fn a_copied_incomplete_marker_blocks_destination_catalog_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    write_agent(&catalog, "h", "worker");
+    let catalog_arg = catalog.to_str().unwrap();
+    let initialized = agents(&["--catalog", catalog_arg], None, &tmp.path().join("state"));
+    assert!(initialized.status.success());
+    fs::write(
+        catalog.join(".st2/catalog-apply-incomplete"),
+        "copied from another host\n",
+    )
+    .unwrap();
+
+    let blocked = agents(&["--catalog", catalog_arg], None, &tmp.path().join("state"));
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("catalog apply is incomplete"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+}

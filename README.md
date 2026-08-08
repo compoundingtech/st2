@@ -132,6 +132,15 @@ st2 catalog bootstrap --catalog "$NEW_CATALOG" --prepared ./prepared \
   --input-sha256 <rootSha256> --json
 ```
 
+A Git-backed catalog must exclude `.st2/`. st2 adds this line to the
+repository-local `.git/info/exclude` when it creates or initializes the catalog
+control directory. For an existing catalog, add the exact `.st2/` line before
+the next sync. This directory is host-local. A copied incomplete marker blocks
+catalog reads at the destination. If Git already tracks `.st2`, an exclusion
+cannot untrack it. After adding the exclusion, run
+`git -C "$CATALOG" rm -r --cached -- .st2` and commit that index removal. This
+keeps the local control files.
+
 `catalog apply` is policy-free. It rejects state/control content, symlinks,
 unprojected workspace facts, catalog-local/default PTY roots, and effective
 PTY-root changes. Bootstrap is a separate create-only declaration transaction,

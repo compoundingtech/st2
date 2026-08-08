@@ -232,6 +232,38 @@ fn bootstrap_atomically_publishes_an_absent_catalog_and_replays_exactly() {
 }
 
 #[test]
+fn bootstrap_adds_the_control_directory_to_the_containing_git_exclusion() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let captured = snapshot(&source, &prepared);
+    let initialized = Command::new("git")
+        .args(["init", "-q"])
+        .arg(temp.path())
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    let target = temp.path().join("target");
+
+    let created = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let exclude = fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap();
+    assert_eq!(exclude.lines().filter(|line| *line == ".st2/").count(), 1);
+    let ignored = Command::new("git")
+        .args(["-C"])
+        .arg(temp.path())
+        .args(["check-ignore", "-q", "target/.st2/catalog-generation"])
+        .status()
+        .unwrap();
+    assert!(ignored.success());
+}
+
+#[test]
 fn bootstrap_rejects_a_different_existing_catalog_without_mutation() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
