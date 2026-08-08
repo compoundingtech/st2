@@ -940,3 +940,53 @@ fn declared_supervisor_is_the_single_source_for_the_spawn_environment() {
     let plan = reconcile(std::slice::from_ref(&s), &[], HOST);
     assert!(!plan.launch[0].tasks[0].env.contains_key("ST_SUPERVISOR"));
 }
+
+/// `plan.live` is the restart cap's only positive evidence, and the adopt path is where an
+/// already-running task supplies it. Dropping the push there is invisible to every lifecycle
+/// assertion — the task is still adopted, still not launched, still not reaped — while the cap
+/// silently stops being told the task is up and starts forgiving its failure budget on silence.
+#[test]
+fn adopting_a_live_task_proves_it_alive_to_the_restart_cap() {
+    let specs = vec![svc(
+        "worker",
+        None,
+        vec![task(TaskKind::Pty, "agent", None, Some("run"))],
+    )];
+    // Take the runtime id from the launch plan itself rather than restating the derivation.
+    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0].pty_id.clone();
+
+    let plan = reconcile(&specs, &[live(&runtime)], HOST);
+
+    assert_eq!(
+        plan.live,
+        vec![runtime.clone()],
+        "an adopted live task must be reported as proved alive"
+    );
+    // The lifecycle side is unchanged, which is exactly why `live` needs its own assertion.
+    assert_eq!(plan.adopt.len(), 1);
+    assert!(plan.launch.is_empty());
+    assert!(plan.gc.is_empty());
+}
+
+/// The same evidence, on the task-scoped path. `reconcile_selected` has its own adopt arm and its
+/// own `plan.live` push; covering the whole-catalog path says nothing about this one, and a `st2`
+/// invocation scoped to a single task still feeds the restart cap.
+#[test]
+fn selecting_a_live_task_proves_it_alive_to_the_restart_cap() {
+    let specs = vec![svc(
+        "worker",
+        None,
+        vec![task(TaskKind::Pty, "agent", None, Some("run"))],
+    )];
+    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0].pty_id.clone();
+
+    let plan = reconcile_selected(&specs, &[live(&runtime)], HOST, &runtime).unwrap();
+
+    assert_eq!(
+        plan.live,
+        vec![runtime.clone()],
+        "a selected live task must be reported as proved alive"
+    );
+    assert_eq!(plan.adopt.len(), 1);
+    assert!(plan.launch.is_empty());
+}
