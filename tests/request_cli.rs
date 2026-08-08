@@ -9,11 +9,15 @@ fn write(root: &Path, relative: &str, contents: &str) {
 }
 
 fn declare_agent(root: &Path, identity: &str) {
+    declare_agent_on_host(root, identity, "h");
+}
+
+fn declare_agent_on_host(root: &Path, identity: &str, host: &str) {
     write(
         root,
-        &format!("h/{identity}/agent.kdl"),
+        &format!("{host}/{identity}/agent.kdl"),
         &format!(
-            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{host}\"\n  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
         ),
     );
 }
@@ -160,6 +164,32 @@ fn request_api_rejects_agent_impersonation_and_unknown_flat_principals() {
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("collides with an Agent Spec"));
+}
+
+#[test]
+fn bare_request_recipient_does_not_resolve_an_agent_on_another_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    declare_agent_on_host(tmp.path(), "worker", "remote");
+    declare_principal(tmp.path(), "example-ci");
+
+    let output = request(
+        tmp.path(),
+        &[
+            "send",
+            "worker",
+            "--as",
+            "h.example-ci",
+            "--idempotency-key",
+            "one",
+            "-m",
+            "{}",
+            "--json",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no agent 'worker' found"));
+    assert!(!tmp.path().join("remote/worker/resources/inbox").exists());
 }
 
 #[test]

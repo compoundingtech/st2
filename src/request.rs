@@ -226,7 +226,10 @@ fn resolve_agent(
     let spec = discovered
         .specs
         .into_iter()
-        .find(|spec| spec.bus_id(this_host) == identity || spec.identity == identity)
+        .find(|spec| {
+            spec.bus_id(this_host) == identity
+                || (spec.resolved_host(this_host) == this_host && spec.identity == identity)
+        })
         .with_context(|| format!("no agent '{identity}' found in catalog {}", root.display()))?;
     let bus_id = spec.bus_id(this_host);
     let path = spec
