@@ -158,7 +158,7 @@ endpoint at
 `principals/<host>/<identity>/principal.kdl`:
 
 ```kdl
-principal "hypermerge" host="dev3"
+principal "example-ci" host="host-a"
 ```
 
 The declaration creates no task, presence, persona, or Agent Spec authority.

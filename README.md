@@ -420,8 +420,8 @@ Services use a separate declared request surface; they do not borrow an Agent
 Spec identity. Declare the endpoint without creating a task:
 
 ```kdl
-// <catalog>/principals/dev3/hypermerge/principal.kdl
-principal "hypermerge" host="dev3"
+// <catalog>/principals/host-a/example-ci/principal.kdl
+principal "example-ci" host="host-a"
 ```
 
 Then publish once, let the addressed agent reply from its normal inbox, and
@@ -429,10 +429,10 @@ observe the typed result. Bodies are JSON and `--tag` is a repeatable
 `key=value` map:
 
 ```sh
-st2 request send dev3.repair-agent \
-  --as dev3.hypermerge \
+st2 request send host-a.repair-agent \
+  --as host-a.example-ci \
   --idempotency-key 'escalate:repo#7:abc' \
-  --tag kind=hypermerge.escalation \
+  --tag kind=example-ci.escalation \
   -m '{"candidate":"abc"}' --json
 
 st2 request read <request-filename> --json
@@ -441,7 +441,7 @@ st2 request reply <request-filename> \
   --tag outcome=needs-human \
   -m '{"outcome":"needs-human"}' --json
 
-st2 request status --as dev3.hypermerge \
+st2 request status --as host-a.example-ci \
   --idempotency-key 'escalate:repo#7:abc' --json
 ```
 

@@ -39,17 +39,17 @@ fn request(root: &Path, args: &[&str]) -> std::process::Output {
 fn stable_request_key_atomically_deduplicates_one_canonical_agent_message() {
     let tmp = tempfile::tempdir().unwrap();
     declare_agent(tmp.path(), "worker");
-    declare_principal(tmp.path(), "hypermerge");
+    declare_principal(tmp.path(), "example-ci");
 
     let args = [
         "send",
         "h.worker",
         "--as",
-        "h.hypermerge",
+        "h.example-ci",
         "--idempotency-key",
         "escalate:repo#7:abc",
         "--tag",
-        "kind=hypermerge.escalation",
+        "kind=example-ci.escalation",
         "--tag",
         "schema=1",
         "-m",
@@ -82,10 +82,10 @@ fn stable_request_key_atomically_deduplicates_one_canonical_agent_message() {
     let inbox = tmp.path().join("h/worker/resources/inbox");
     let messages = st2::message::list_dir(&inbox).unwrap();
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].from.as_deref(), Some("h.hypermerge"));
+    assert_eq!(messages[0].from.as_deref(), Some("h.example-ci"));
     assert_eq!(messages[0].in_reply_to, None);
     assert!(messages[0].body.contains("\"candidate\":\"abc\""));
-    assert!(!tmp.path().join("h.hypermerge/inbox").exists());
+    assert!(!tmp.path().join("h.example-ci/inbox").exists());
 
     let conflict = request(
         tmp.path(),
@@ -93,7 +93,7 @@ fn stable_request_key_atomically_deduplicates_one_canonical_agent_message() {
             "send",
             "h.worker",
             "--as",
-            "h.hypermerge",
+            "h.example-ci",
             "--idempotency-key",
             "escalate:repo#7:abc",
             "-m",
@@ -141,16 +141,16 @@ fn request_api_rejects_agent_impersonation_and_unknown_flat_principals() {
     );
 
     let collision = tempfile::tempdir().unwrap();
-    declare_agent(collision.path(), "hypermerge");
+    declare_agent(collision.path(), "example-ci");
     declare_agent(collision.path(), "worker");
-    declare_principal(collision.path(), "hypermerge");
+    declare_principal(collision.path(), "example-ci");
     let output = request(
         collision.path(),
         &[
             "send",
             "h.worker",
             "--as",
-            "h.hypermerge",
+            "h.example-ci",
             "--idempotency-key",
             "one",
             "-m",
@@ -166,14 +166,14 @@ fn request_api_rejects_agent_impersonation_and_unknown_flat_principals() {
 fn malformed_or_misplaced_principal_declarations_fail_before_publication() {
     for declaration in [
         "principal \"different\" host=\"h\"\n",
-        "principal \"hypermerge\"\n",
-        "principal \"hypermerge\" host=\"h\"\nprincipal \"second\" host=\"h\"\n",
+        "principal \"example-ci\"\n",
+        "principal \"example-ci\" host=\"h\"\nprincipal \"second\" host=\"h\"\n",
     ] {
         let tmp = tempfile::tempdir().unwrap();
         declare_agent(tmp.path(), "worker");
         write(
             tmp.path(),
-            "principals/h/hypermerge/principal.kdl",
+            "principals/h/example-ci/principal.kdl",
             declaration,
         );
         let output = request(
@@ -182,7 +182,7 @@ fn malformed_or_misplaced_principal_declarations_fail_before_publication() {
                 "send",
                 "h.worker",
                 "--as",
-                "h.hypermerge",
+                "h.example-ci",
                 "--idempotency-key",
                 "one",
                 "-m",
@@ -203,7 +203,7 @@ fn malformed_or_misplaced_principal_declarations_fail_before_publication() {
 fn request_json_and_typed_tags_fail_closed_at_the_cli_boundary() {
     let tmp = tempfile::tempdir().unwrap();
     declare_agent(tmp.path(), "worker");
-    declare_principal(tmp.path(), "hypermerge");
+    declare_principal(tmp.path(), "example-ci");
 
     for tail in [
         vec!["-m", "not-json"],
@@ -214,7 +214,7 @@ fn request_json_and_typed_tags_fail_closed_at_the_cli_boundary() {
             "send",
             "h.worker",
             "--as",
-            "h.hypermerge",
+            "h.example-ci",
             "--idempotency-key",
             "one",
         ];
@@ -234,11 +234,11 @@ fn request_json_and_typed_tags_fail_closed_at_the_cli_boundary() {
 fn request_read_and_reply_bind_the_json_envelope_to_native_message_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     declare_agent(tmp.path(), "worker");
-    declare_principal(tmp.path(), "hypermerge");
+    declare_principal(tmp.path(), "example-ci");
     let inbox = tmp.path().join("h/worker/resources/inbox");
     fs::create_dir_all(&inbox).unwrap();
     let filename = "1784649988123-abc23z.md";
-    let envelope = r#"{"version":1,"idempotencyKey":"forged","from":"h.hypermerge","to":"h.worker","replyTo":"h.hypermerge","tags":{},"body":{}}"#;
+    let envelope = r#"{"version":1,"idempotencyKey":"forged","from":"h.example-ci","to":"h.worker","replyTo":"h.example-ci","tags":{},"body":{}}"#;
     fs::write(
         inbox.join(filename),
         st2::message::render_message(
@@ -260,7 +260,7 @@ fn request_read_and_reply_bind_the_json_envelope_to_native_message_provenance() 
         assert!(String::from_utf8_lossy(&output.stderr).contains("frontmatter sender"));
     }
     assert!(
-        st2::message::list_dir(&tmp.path().join("principals/h/hypermerge/resources/inbox"))
+        st2::message::list_dir(&tmp.path().join("principals/h/example-ci/resources/inbox"))
             .unwrap()
             .is_empty()
     );
@@ -270,7 +270,7 @@ fn request_read_and_reply_bind_the_json_envelope_to_native_message_provenance() 
 fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
     let tmp = tempfile::tempdir().unwrap();
     declare_agent(tmp.path(), "worker");
-    declare_principal(tmp.path(), "hypermerge");
+    declare_principal(tmp.path(), "example-ci");
 
     let sent = request(
         tmp.path(),
@@ -278,11 +278,11 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
             "send",
             "h.worker",
             "--as",
-            "h.hypermerge",
+            "h.example-ci",
             "--idempotency-key",
             "repair:42",
             "--tag",
-            "kind=hypermerge.escalation",
+            "kind=example-ci.escalation",
             "-m",
             r#"{"candidate":"abc"}"#,
             "--json",
@@ -308,10 +308,10 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
     let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
     assert_eq!(read["status"], "request");
     assert_eq!(read["idempotencyKey"], "repair:42");
-    assert_eq!(read["from"], "h.hypermerge");
+    assert_eq!(read["from"], "h.example-ci");
     assert_eq!(
         read["tags"],
-        serde_json::json!({"kind": "hypermerge.escalation"})
+        serde_json::json!({"kind": "example-ci.escalation"})
     );
     assert_eq!(read["body"], serde_json::json!({"candidate": "abc"}));
 
@@ -320,7 +320,7 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
         &[
             "status",
             "--as",
-            "h.hypermerge",
+            "h.example-ci",
             "--idempotency-key",
             "repair:42",
             "--json",
@@ -364,7 +364,7 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
     assert_eq!(second_reply["deduplicated"], true);
     assert_eq!(second_reply["filename"], first_reply["filename"]);
 
-    let principal_inbox = tmp.path().join("principals/h/hypermerge/resources/inbox");
+    let principal_inbox = tmp.path().join("principals/h/example-ci/resources/inbox");
     assert_eq!(st2::message::list_dir(&principal_inbox).unwrap().len(), 1);
 
     let replied = request(
@@ -372,7 +372,7 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
         &[
             "status",
             "--as",
-            "h.hypermerge",
+            "h.example-ci",
             "--idempotency-key",
             "repair:42",
             "--json",
@@ -402,7 +402,7 @@ fn typed_reply_routes_to_the_principal_and_status_is_a_tagged_json_union() {
 fn concurrent_replays_publish_exactly_one_request() {
     let tmp = tempfile::tempdir().unwrap();
     declare_agent(tmp.path(), "worker");
-    declare_principal(tmp.path(), "hypermerge");
+    declare_principal(tmp.path(), "example-ci");
     let root = tmp.path().to_path_buf();
 
     let threads: Vec<_> = (0..12)
@@ -415,7 +415,7 @@ fn concurrent_replays_publish_exactly_one_request() {
                         "send",
                         "h.worker",
                         "--as",
-                        "h.hypermerge",
+                        "h.example-ci",
                         "--idempotency-key",
                         "same",
                         "-m",
