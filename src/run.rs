@@ -1216,6 +1216,15 @@ fn execute_with_presentation_cursor(
         }
     }
 
+    // Uptime is what forgives a `mode = fail` budget, so every pass is closed, not only the ones
+    // that launched something. The cap is told what the pass PROVED alive (`plan.live`) rather than
+    // being left to infer it from what the pass did not launch: this plan may have been narrowed
+    // after reconcile (hook gating, flicker debouncing) or built from a reduced spec set (an owner
+    // that failed to materialize), and a task dropped that way is unobserved, not healthy. A pass
+    // that bailed before `execute` (lock failure, skipped) never gets here and credits nothing —
+    // the same safe direction.
+    cap.end_pass(Instant::now(), &plan.live);
+
     for td in &plan.teardown {
         for id in &td.pty_ids {
             match runner.kill(id) {
@@ -2270,6 +2279,163 @@ mod tests {
             exit_code: None,
             presentation: None,
         }
+    }
+
+    /// Records spawns and reports every launch as succeeding, so a pass can be driven repeatedly.
+    #[derive(Default)]
+    struct SpawnCountingRunner {
+        sessions: RefCell<Vec<Session>>,
+        spawned: RefCell<Vec<String>>,
+    }
+
+    impl Runner for SpawnCountingRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.borrow().clone())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            self.spawned.borrow_mut().push(target.pty_id.clone());
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `execute` must close every pass, or a task that recovers is never forgiven and eventually
+    /// parks even though it is healthy — the opposite of the crash-loop bug the cap exists for.
+    ///
+    /// The unit tests in `flapping.rs` call `end_pass` by hand, so they cannot catch it never being
+    /// called from a reconcile pass. This one drives the real `execute` path. `interval = 0s` makes
+    /// any survived pass count as recovery, keeping the test free of wall-clock sleeping.
+    #[test]
+    fn execute_closes_each_pass_so_a_recovered_task_regains_its_fail_budget() {
+        let mut spec = spec_fixture();
+        spec.restart = Some(agent_spec::spec::Restart {
+            attempts: 3,
+            interval: Duration::from_secs(0),
+            delay: Duration::from_secs(0),
+            mode: agent_spec::spec::RestartMode::Fail,
+        });
+        let runner = SpawnCountingRunner::default();
+        let mut cap = FlappingCap::default();
+
+        fn dying(spec: &AgentSpec) -> ReconcilePlan<'_> {
+            ReconcilePlan {
+                launch: vec![Launch {
+                    spec,
+                    tasks: vec![target("hetz.demo.agent", "x")],
+                    live_derived: Vec::new(),
+                }],
+                ..ReconcilePlan::default()
+            }
+        }
+
+        // Two failing passes: two of three launches spent.
+        for _ in 0..2 {
+            execute(&dying(&spec), &runner, &mut cap, &mut UpReport::default());
+        }
+        assert_eq!(runner.spawned.borrow().len(), 2, "two launches spent");
+
+        // A pass that launches nothing because it found the task alive. That observation — not the
+        // empty launch set — is what forgives the budget.
+        execute(
+            &ReconcilePlan {
+                live: vec!["hetz.demo.agent".to_string()],
+                ..ReconcilePlan::default()
+            },
+            &runner,
+            &mut cap,
+            &mut UpReport::default(),
+        );
+
+        // Having recovered, it gets the full budget back: three more launches, then parked. Without
+        // the pass being closed it would park after only one more.
+        let mut last = UpReport::default();
+        for _ in 0..4 {
+            last = UpReport::default();
+            execute(&dying(&spec), &runner, &mut cap, &mut last);
+        }
+        assert_eq!(
+            runner.spawned.borrow().len(),
+            5,
+            "recovery must restore the full `attempts` budget, not leave it partly spent"
+        );
+        assert_eq!(
+            last.flapping,
+            vec!["hetz.demo.agent".to_string()],
+            "and it still parks in the end"
+        );
+    }
+
+    /// A pass can execute a plan the task was never in: `up_once` drops an owner whose
+    /// materialization failed, `gate_codex_launches_on_hooks` strips gated launches, and
+    /// `defer_flickers` removes debounced ones — each after the pass is already committed to
+    /// running. Silence about a task is not evidence it is alive, and crediting uptime for it lets
+    /// a permanently-dead task refill its budget on every gated pass and never park. Identical to
+    /// the recovery test above except that the quiet pass does not report the task live.
+    #[test]
+    fn a_pass_that_omits_a_task_does_not_credit_it_with_uptime() {
+        let mut spec = spec_fixture();
+        spec.restart = Some(agent_spec::spec::Restart {
+            attempts: 3,
+            interval: Duration::from_secs(0),
+            delay: Duration::from_secs(0),
+            mode: agent_spec::spec::RestartMode::Fail,
+        });
+        let runner = SpawnCountingRunner::default();
+        let mut cap = FlappingCap::default();
+
+        fn dying(spec: &AgentSpec) -> ReconcilePlan<'_> {
+            ReconcilePlan {
+                launch: vec![Launch {
+                    spec,
+                    tasks: vec![target("hetz.demo.agent", "x")],
+                    live_derived: Vec::new(),
+                }],
+                ..ReconcilePlan::default()
+            }
+        }
+
+        // Two failing passes: two of three launches spent.
+        for _ in 0..2 {
+            execute(&dying(&spec), &runner, &mut cap, &mut UpReport::default());
+        }
+        assert_eq!(runner.spawned.borrow().len(), 2, "two launches spent");
+
+        // The task is dropped from this pass — not launched, and not observed alive either.
+        execute(
+            &ReconcilePlan::default(),
+            &runner,
+            &mut cap,
+            &mut UpReport::default(),
+        );
+
+        // The budget must be where the failures left it: one launch remains, then it parks.
+        let mut last = UpReport::default();
+        for _ in 0..4 {
+            last = UpReport::default();
+            execute(&dying(&spec), &runner, &mut cap, &mut last);
+        }
+        assert_eq!(
+            runner.spawned.borrow().len(),
+            3,
+            "an unobserved pass must not forgive the failure budget"
+        );
+        assert_eq!(
+            last.flapping,
+            vec!["hetz.demo.agent".to_string()],
+            "and the task must still park"
+        );
     }
 
     fn spec_fixture() -> AgentSpec {
