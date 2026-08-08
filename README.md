@@ -266,6 +266,72 @@ agent "<identity>" {
 }
 ```
 
+## Experimental read-only plans
+
+The experimental `st2 plan` surface implements only the inspectable file model from the
+[st2 plans sketch at revision `5c1d142`](https://gist.github.com/myobie/d5ecfac24cd3965e095a5031cd2e00cb/5c1d1427c0556d95d13890e5c5086cd85b25d994).
+The implemented agent integration uses the existing Resource envelope; plan truth stays only in the
+linked `plan.kdl`.
+An agent links a plan with the existing Agent Spec Resource envelope:
+
+```kdl
+agent "app-web" {
+  resource "receipt-report" _tag="plan" uri="file:plans/receipt-report/plan.kdl"
+}
+```
+
+The Resource name is the agent-local role. The `_tag` selects the experimental plan reader. The
+`uri` resolves from the agent KDL file and must remain inside the selected catalog. The Resource
+has no children and owns no plan fields. It may add the agent identity to `referencedBy`, but the
+target `plan.kdl` remains the only plan authority.
+
+A plan can keep version content in referenced Markdown files:
+
+```kdl
+plan "ship-remote-approvals" {
+  owner "app-web"
+  version "0000" content="file:versions/0000.md"
+  version "0001" content="file:versions/0001.md" {
+    parent "0000"
+    why "Browser proof exposed an approval race."
+  }
+}
+```
+
+Or a small plan can keep the complete version intent inline in `plan.kdl`:
+
+```kdl
+plan "review-follow-up" {
+  owner "reviewer"
+  version "0000" {
+    intent #"""
+Review the accepted corrections.
+
+Done means the corrections are present and independently verified.
+"""#
+  }
+}
+```
+
+Plan identity and owner are explicit in `plan.kdl`, never derived from a Resource name, directory,
+or referring agent. Each version has exactly one `content="file:..."` property or one inline
+`intent` child. Content references resolve from `plan.kdl` and remain inside the selected catalog.
+Revisions declare one or more `parent` links and a non-empty `why`; root versions have no parent.
+The frontier is every version with no child, so concurrent siblings remain visible. The experiment
+stores no digest or immutable history proof.
+
+```sh
+st2 plan validate --catalog examples/plans
+st2 plan list --catalog examples/plans
+st2 plan show ship-remote-approvals --catalog examples/plans
+st2 plan inspect ship-remote-approvals --catalog examples/plans --json
+```
+
+All four commands are read-only. They do not select a current version, write progress, emit events,
+execute a plan, reconcile agents, schedule work, interpret claims, or require CAS. Direct KDL and
+direct human-to-agent planning remain complete workflows; this experiment must earn any larger
+runtime.
+
 st2 provides `CATALOG`, flat native `ST_ROOT`, local `PTY_ROOT`, `ST_AGENT`, and `ST_HOOKS` to the
 task. The complete st2-managed overlay is also persisted in PTY metadata, so a manual `pty restart`
 retains those values. Declarations should not contain machine-specific install paths.
