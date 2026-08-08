@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
@@ -31,8 +31,8 @@ pub struct AgentRow {
     pub desired_state_reason: Option<String>,
     /// Typed Resource bindings declared directly by the agent.
     pub resources: Vec<Resource>,
-    /// Newest mtime (unix ms) across the agent's inbox, archive, and status file; `None` if nothing
-    /// has been touched. `--enrich` only.
+    /// Newest activity time across inbox, archive, and status. Version 1 status uses its embedded
+    /// writer timestamp; message files and legacy status use local mtime. `--enrich` only.
     pub last_activity_ms: Option<f64>,
     /// Count of canonical message files in the agent's inbox. `--enrich` only.
     pub inbox: usize,
@@ -62,7 +62,7 @@ pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentR
                 desired_state: s.desired_state.as_str().to_owned(),
                 desired_state_reason: s.desired_state.reason().map(str::to_owned),
                 resources: s.resources.clone(),
-                last_activity_ms: newest_mtime_ms(agent_dir),
+                last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
             })
         })
@@ -149,9 +149,9 @@ fn inbox_count(agent_dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Newest mtime (unix ms) across the agent's inbox files, archive files, and status file. `None` if
-/// none of those exist.
-fn newest_mtime_ms(agent_dir: &Path) -> Option<f64> {
+/// Newest activity time across status and message state. A version 1 status contributes its origin
+/// timestamp. Inbox, archive, and legacy status retain their local-mtime behavior.
+fn newest_activity_ms(agent_dir: &Path) -> Option<f64> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for dir in [
         message::inbox_dir(agent_dir),
@@ -161,20 +161,20 @@ fn newest_mtime_ms(agent_dir: &Path) -> Option<f64> {
             candidates.extend(rd.flatten().map(|e| e.path()));
         }
     }
-    candidates.push(status::status_path(agent_dir));
 
-    let mut newest: Option<SystemTime> = None;
+    let mut newest = status::activity_time_ms(&status::status_path(agent_dir));
     for p in candidates {
         if let Ok(m) = fs::metadata(&p)
             && let Ok(t) = m.modified()
-            && newest.is_none_or(|n| t > n)
+            && let Ok(duration) = t.duration_since(UNIX_EPOCH)
         {
-            newest = Some(t);
+            let timestamp = duration.as_secs_f64() * 1000.0;
+            if newest.is_none_or(|current| timestamp > current) {
+                newest = Some(timestamp);
+            }
         }
     }
     newest
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64() * 1000.0)
 }
 
 #[cfg(test)]
@@ -232,14 +232,7 @@ mod tests {
 
     #[test]
     fn agents_json_preserves_opaque_declared_resource_descriptors() {
-        let mut resource_row = row(
-            "hetz.worker",
-            State::Available,
-            None,
-            false,
-            None,
-            0,
-        );
+        let mut resource_row = row("hetz.worker", State::Available, None, false, None, 0);
         resource_row.resources.push(
             Resource::new(
                 "work".into(),

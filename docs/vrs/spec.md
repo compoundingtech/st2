@@ -629,6 +629,150 @@ atomic inbox file → DING attempt → agent reads → archive receipt
 - **R10:** Fleet identities are agents. General-purpose identity kinds are
   unsupported.
 
+### Presence record and freshness (R08)
+
+This section answers the presence part of DQ3. The version 1 implementation
+follows this contract.
+
+#### Version 1 record
+
+The presence record path is `<agent-dir>/status`.
+
+The status file uses this exact version 1 shape:
+
+```text
+available
+v1 1785802653486
+```
+
+Line one is one settable state: `offline`, `available`, `busy`, `away`, or
+`dnd`. `unknown` remains derived and is never written.
+
+Line two is `v1`, one ASCII space, and an unsigned base-10 timestamp. The
+timestamp counts milliseconds from the Unix epoch.
+
+The record ends with one newline. It has no other non-empty lines. Both lines
+form one atomic record.
+
+The state remains on line one for old readers. An old reader can ignore line
+two and continue to parse the state.
+
+#### Writers and atomicity
+
+`st2 status --set` writes the requested state with the current timestamp. A
+live DING sidecar refreshes valid non-DND records every five minutes.
+
+A missing record becomes `available` with the current timestamp. DING does not
+refresh `dnd`, `unknown`, or malformed records.
+
+Every new writer emits version 1. It writes a temporary sibling and atomically
+renames the complete record over the target.
+
+A healthy periodic refresh changes the timestamp bytes. Replication can order
+that content change without using the source file mtime.
+
+#### Clock, freshness, and skew
+
+The timestamp uses the writer's UTC wall clock. A monotonic clock cannot cross
+a process restart or a host boundary.
+
+Participating hosts must keep their UTC clocks within sixty seconds. A larger
+clock error makes cross-host presence unknown.
+
+The stale interval remains fifteen minutes. A valid record is fresh while its
+age is less than fifteen minutes.
+
+A record becomes `unknown` when its age reaches fifteen minutes. This rule
+applies to every settable state, including `offline` and `dnd`.
+
+A timestamp up to sixty seconds in the reader's future is allowed. The reader
+uses zero age for this bounded future value.
+
+A timestamp more than sixty seconds in the future produces `unknown`. The
+reader does not use file mtime as a fallback for malformed version 1.
+
+Current readers treat a future legacy status mtime as fresh because they cannot
+calculate its age. A sufficiently future `dnd` mtime can therefore suppress
+delivery until the reader's clock catches up. The version 1 skew rules close
+this defect. They clamp only bounded future time and map larger future time to
+`unknown`.
+
+An unrecognized state still produces `offline`. A literal `unknown` produces
+`unknown`. A valid state with a malformed version, timestamp, or extra line
+also produces `unknown`.
+
+The sixty-second allowance is smaller than the five-minute refresh margin. It
+can extend a fresh DND hold by no more than sixty seconds.
+
+#### Why readers use origin time
+
+st2 does not require one catalog transport. Fabric is preferred, and Git over
+SSH or a plain copy remains supported.
+
+Git does not preserve file modification times. A checkout gives files the
+checkout time. Therefore, presence freshness lives in record bytes. No
+supported transport must preserve file metadata.
+
+Replica arrival time measures transport delay, not agent activity. The
+embedded writer time protects presence freshness, DND expiry, and the status
+contribution to `lastActivity`.
+
+The same reason applies to the context boot freshness check. A replica arrival
+must not make old context appear fresh. This proposal does not change the
+context record.
+
+#### DND behavior
+
+A fresh `dnd` record suppresses DING delivery. The sidecar leaves its timestamp
+unchanged, so an abandoned hold ages out.
+
+A stale or invalid DND record does not suppress delivery. It reads as
+`unknown`, which preserves the existing fresh-DND rule.
+
+Replication delay cannot renew a DND hold. The reader uses the embedded write
+time, not the replica materialization time.
+
+#### Legacy rollout
+
+A legacy record contains one valid state line and no version line. The first
+version 1 reader release uses legacy file mtime for freshness.
+
+Version 1 writers never emit a legacy record. A live non-DND sidecar upgrades
+its legacy record at its next five-minute refresh.
+
+A version 1 sidecar upgrades a legacy DND record once. It uses the legacy mtime
+as the embedded timestamp, so the migration cannot renew the hold.
+
+After that migration, the sidecar does not refresh DND. If the legacy mtime is
+unavailable, the sidecar leaves the record unchanged.
+
+A malformed two-line record is not legacy. Readers must not hide a bad version
+1 record behind the legacy mtime fallback.
+
+Fallback removal is a separate reviewed change. Removal requires all three
+receipts below:
+
+1. Every supported deployed status writer emits version 1.
+2. Two fleet scans, separated by fifteen minutes, find no active legacy record.
+3. No supported or retained rollback binary can emit a legacy record.
+
+After removal, a one-line record produces `unknown`. No presence freshness
+decision then depends on status file mtime.
+
+#### `lastActivity`
+
+For a version 1 status record, `lastActivity` uses the embedded timestamp. It
+does not use the replica materialization mtime.
+
+The reader clamps an allowed future timestamp to its current time. It omits a
+malformed version 1 timestamp from the activity calculation.
+
+Inbox and archive entries continue to use their local file mtimes. During the
+legacy window, a one-line status record also contributes its file mtime.
+
+This choice reports when the agent wrote its heartbeat. A delayed replica
+cannot make an old heartbeat appear to be new agent activity.
+
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.
@@ -718,8 +862,8 @@ the resident supervisor continues to reconcile the complete local catalog.
   changes may defer delivery. Resolve the remaining gap with a stronger evented
   signal or other measured classifier; a small on-device model is an optional
   experiment, not a required architecture.
-- **DQ3 Catalog agent state:** Define the catalog paths, schemas, freshness
-  rules, and atomic update semantics for presence, activity status, current
-  plan, and current plan step. Prove that stale state is distinguishable and
-  that a supervisor can follow plan progress without inspecting a PTY before
-  adding the shape to `AGENT-SPEC.md`.
+- **DQ3 Remaining catalog agent state:** The R08 presence record above
+  defines the presence path, schema, freshness, and atomic update rules.
+  Activity status, current plan, and current plan step remain undefined. Prove
+  their stale-state and supervisor-following behavior before adding their shape
+  to `AGENT-SPEC.md`.
