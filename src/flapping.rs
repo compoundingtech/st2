@@ -333,4 +333,54 @@ mod tests {
         }
         panic!("slow flapper never parked: {launches} launches over 40 passes");
     }
+
+    /// A pass that does not observe a tracked task alive must drop its accrued uptime, not leave it
+    /// standing. This is the defense itself: without the `else` arm the `healthy_since` recorded by
+    /// an earlier pass outlives the blind spot, and the next `decide` measures uptime across a
+    /// stretch nobody looked at and hands the task a full budget back.
+    ///
+    /// `interval` is 0 deliberately. It is the most sensitive setting, not an obstacle: any surviving
+    /// `healthy_since` then satisfies the forgiveness check outright, so a stale entry forgives and a
+    /// dropped one cannot. The alive pass comes *after* a launching pass because `end_pass` only
+    /// walks `consecutive`, which `record` populates — before the first launch the task is untracked
+    /// and the omission would have nothing to leave stale.
+    #[test]
+    fn a_pass_that_does_not_observe_a_task_drops_its_uptime() {
+        let mut cap = FlappingCap::new();
+        let p = policy(3, 0, 0, RestartMode::Fail);
+        let t0 = Instant::now();
+        let alive = ["p".to_string()];
+
+        // 1. Dead: launch it, so it is tracked.
+        assert_eq!(cap.decide("p", t0, &p), RestartDecision::Allow);
+        cap.record("p", t0);
+        cap.end_pass(t0, &[]);
+
+        // 2. Observed alive: uptime starts accruing.
+        cap.end_pass(t0 + Duration::from_secs(1), &alive);
+
+        // 3. THE OMISSION: the pass ran but never considered this task — not decided, and not proved
+        //    alive. Its accrued uptime must not survive a pass that did not look at it.
+        cap.end_pass(t0 + Duration::from_secs(2), &[]);
+
+        // 4-5. Dead again, twice. Uptime dropped in 3, so nothing forgives the budget here.
+        for i in 3..5 {
+            let now = t0 + Duration::from_secs(i);
+            assert_eq!(
+                cap.decide("p", now, &p),
+                RestartDecision::Allow,
+                "pass {i} should still be inside the budget"
+            );
+            cap.record("p", now);
+            cap.end_pass(now, &[]);
+        }
+
+        // Three launches consumed, so `attempts` is spent. If the omission had left `healthy_since`
+        // standing, pass 4 would have been forgiven and this would still be `Allow`.
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(5), &p),
+            RestartDecision::GaveUp,
+            "uptime survived a pass that never observed the task, so the budget was forgiven"
+        );
+    }
 }
