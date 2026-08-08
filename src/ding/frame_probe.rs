@@ -13,8 +13,13 @@ mod probe {
 
     /// The `[id:<rand6>]` a staged notice carries. That id is the message filename's `<rand6>`, so
     /// it recovers the exact `Message` the sidecar staged and therefore the exact expected text.
+    ///
+    /// Take the LAST match, not the first. A pane may hold an older submitted notice in scrollback
+    /// above the live composer; the live composer is the lowest by construction, which is the same
+    /// positional rule the classifier itself uses. Reading the first match would recover the wrong
+    /// `expected` and manufacture a spurious `Unproven`.
     fn staged_poke_id(plain: &str) -> Option<String> {
-        let (_, rest) = plain.split_once("[DING] new st2 message: [id:")?;
+        let (_, rest) = plain.rsplit_once("[DING] new st2 message: [id:")?;
         let (id, _) = rest.split_once(']')?;
         (!id.is_empty() && id.chars().all(char::is_alphanumeric)).then(|| id.to_string())
     }
