@@ -473,6 +473,18 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   failing to restart the agent, or terminally parking it, suppresses companion
   launch and stops an exact generated companion proved live; explicitly
   authored sibling tasks remain independent.
+- **R32:** Bounded non-interactive helpers such as `pty list --json` and
+  `pty metadata patch` start in a fresh session whose leader PID is also its
+  process-group ID. Standard output and error use regular temporary files, so a
+  descendant inheriting those descriptors cannot hold a capture pipe open.
+  After spawn, an input setup or write failure or a deadline expiry sends
+  `SIGKILL` to the process group and explicitly terminates the direct child.
+  st2 waits for that child until the cleanup deadline; if it cannot finish the
+  wait synchronously, a background waiter takes ownership before the failure
+  returns. The process-group signal reaches a descendant that outlives the
+  direct child; terminating the direct child alone does not. [PR
+  #202](https://github.com/compoundingtech/st2/pull/202) provides
+  descendant-lifetime and direct-child-reap evidence for this contract.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent. Harness readiness
   that depends on a dynamically selected account belongs to that declared

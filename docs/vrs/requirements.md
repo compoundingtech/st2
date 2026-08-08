@@ -52,6 +52,12 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R32 Bounded helper teardown:** After st2 spawns a bounded non-interactive
+  helper, input delivery failure or deadline expiry targets the helper's entire
+  process group, not only its direct child, so teardown includes descendants
+  that outlive that child. st2 either reaps the direct child before returning or
+  transfers wait ownership to a background reaper; the failure remains bounded
+  and reports its originating input error or timeout.
 - **R22 Quiet coordination after events:** A network with minimal or default
   personas stays quiet while useful work continues. Agents coordinate only after
   an inbox DING, a durable failure, a real blocker, a completion or decision
