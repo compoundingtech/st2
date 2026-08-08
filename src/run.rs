@@ -2650,24 +2650,22 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("close-stdin");
-        let pidfile = temporary.path().join("child.pid");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nexec 0<&-\nsleep 60\n",
-        )
-        .unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nexec 0<&-\nsleep 60\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
-        let error = output_with_input_timeout(
-            Command::new(&executable).env("PIDFILE", &pidfile),
+        // The pid comes from the parent at spawn. Reading it from a file the child writes made the
+        // case depend on the child being scheduled inside the deadline: miss that and the read
+        // panics with `NotFound` before either assertion runs, naming neither the pipe nor the
+        // deadline. The `on_spawn` seam removes the dependency rather than widening the window.
+        let mut spawned = None;
+        let error = output_with_input_timeout_observed(
+            &mut Command::new(&executable),
             Duration::from_secs(1),
             Some(input),
+            |pid| spawned = Some(pid),
         )
         .unwrap_err();
-        let pid = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = spawned.expect("the child was spawned before the input write failed");
 
         assert!(
             format!("{error:#}").contains("Broken pipe"),
@@ -2676,6 +2674,61 @@ mod tests {
         assert!(
             !crate::host_lock::process_alive(pid),
             "failed metadata child {pid} was not terminated and reaped"
+        );
+    }
+
+    /// The process-group kill is the entire stated reason [`terminate_and_reap_before`] exists — its
+    /// docstring is about an escaped descendant that inherited stdout/stderr and would otherwise
+    /// block cleanup. Nothing constructed such a descendant, so `kill(-pid, SIGKILL)` was asserted
+    /// by no test: removing it alone left the suite green, because `child.kill()` already satisfies
+    /// every assertion that only looks at the direct child.
+    #[test]
+    fn the_group_kill_reaps_a_descendant_that_outlives_the_direct_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("spawn-descendant");
+        let descendant_pidfile = temporary.path().join("descendant.pid");
+        // The descendant inherits stdout/stderr and outlives the direct child, which is exactly the
+        // shape the docstring describes. `child.kill()` cannot reach it; only the group signal can.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nsh -c 'printf \"%s\" \"$$\" > \"$DESCENDANT_PIDFILE\"; sleep 60' &\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = output_with_timeout(
+            Command::new(&executable).env("DESCENDANT_PIDFILE", &descendant_pidfile),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+
+        // Unlike the deadline case, this test *requires* the child to have run — a descendant it
+        // never forked is nothing to reap — so reading the pid it recorded is sound here. Two
+        // seconds against a fork+exec is a wide margin, and the failure is named rather than a bare
+        // `NotFound`.
+        let descendant = std::fs::read_to_string(&descendant_pidfile)
+            .expect("the child never forked a descendant, so this case tested nothing")
+            .parse::<i32>()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::host_lock::process_alive(descendant) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = crate::host_lock::process_alive(descendant);
+        if survived {
+            // Do not leak a 60s sleeper into the test host when the assertion is about to fail.
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        assert!(
+            !survived,
+            "escaped descendant {descendant} survived cleanup: the process-group kill did not reach it"
         );
     }
 
