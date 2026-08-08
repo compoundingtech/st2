@@ -115,6 +115,7 @@ accepted.
 - **R17 Durable error propagation:** Lifecycle, harness/eval, provider-turn,
   task/exec/PTY, hook, and delivery errors are durably reported to the
   responsible supervisor with agent/task identity and actionable context.
+
 - **R19 Targeted reconciliation:** An exact agent/task selector resolves its
   identity and pinned host before mutation; unknown, ambiguous, and wrong-host
   targets refuse before writes, listing, or actions. Materialization, hook
@@ -134,6 +135,17 @@ accepted.
   inspection exposes every Resource binding without interpreting its type or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
+### Must remain safe through host partitions
+
+- **R18 Last-known-good local desired state:** During transport loss, each host
+  uses its last complete, validated catalog as local desired state. Missing,
+  partial, or invalid input cannot replace that state or authorize teardown.
+- **R28 Independent fleet convergence:** Hosts may use different catalog
+  versions during a partition. A host can accept only a complete, validated,
+  newer catalog. Each host converges its own work. Peer and source reachability
+  are facts, not health classifications. Their absence affects local work only
+  through an explicit local dependency.
+
 - **R27 Transactional catalog authoring:** One st2 publication operation admits
   exactly one canonical KDL Agent Spec, with explicit host and identity, against
   the complete prospective catalog. Publication is compare-and-swap, durable,

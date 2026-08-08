@@ -491,10 +491,10 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares
-  `NO_COLOR`, st2 removes it from the launch environment and records the removal
-  in the PTY launch definition. An explicit Agent Spec assignment takes
-  precedence. Isolation wrappers preserve both assignments and removals, so a
-  manual PTY restart under a different ambient environment reconstructs the
+  `NO_COLOR`, the reconciler removes it from the launch environment and records
+  the removal in the PTY launch definition. An explicit Agent Spec assignment
+  takes precedence. Isolation wrappers preserve both assignments and removals,
+  so a manual PTY restart under a different ambient environment reconstructs the
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
@@ -529,6 +529,16 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   A non-running agent desired state remains the separate explicit teardown
   path. Suspension and retirement never use task lifecycle as an implicit
   resume or replacement authority.
+
+- **Catalog liveness:** The
+  [Host-local supervision contract](03-host-local/requirements.md) separates
+  canonical-agent liveness from resident st2 process state. A running canonical
+  agent keeps its catalog live while the process is down. A DING sidecar does
+  not. An incomplete view cannot prove that a catalog is globally stopped. The
+  catalog root and PTY root remain at stable paths while the catalog is live or
+  the resident process runs. File edits and sync can continue. Root relocation
+  requires the coordinated operation in
+  [issue #85](https://github.com/compoundingtech/st2/issues/85).
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
   `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
@@ -599,6 +609,23 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   observation has a short outer deadline so a wedged client fails the pass
   closed instead of hanging reconciliation. The deadline is containment, not
   the mechanism for admitting a larger fleet.
+
+## Partition and catalog activation (R18, R28)
+
+- **R18:** Transport loss does not invalidate a host's locally applied desired
+  state. Missing, partial, or invalid incoming catalog state cannot replace the
+  last complete validated version or cause teardown.
+- **R28:** Hosts may temporarily apply different catalog versions and converge
+  independently. Peer or source absence is neutral unless a declared local
+  operation explicitly depends on it; reconnect is not itself evidence that a
+  candidate catalog is complete, valid, or newer.
+
+The [host-local sub-VRS](03-host-local/spec.md) maps these requirements to code
+and tests. A plain synced catalog folder and direct KDL remain complete inputs.
+Optional transaction or content-addressed tools cannot become prerequisites.
+Current transaction tools protect local publication. They do not identify and
+order complete versions from a partially synced folder. They also do not retain
+a durable last-known-good receipt for that case.
 
 ## Message lifecycle
 
