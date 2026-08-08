@@ -24,6 +24,7 @@ pub mod materialize;
 pub mod message;
 pub mod pretrust;
 pub mod reconcile;
+pub mod request;
 pub mod resource;
 pub mod run;
 pub mod service;
