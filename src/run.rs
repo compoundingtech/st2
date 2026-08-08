@@ -2021,6 +2021,24 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
 
+    #[cfg(target_os = "linux")]
+    fn linux_process_state(pid: i32) -> Option<char> {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()?
+            .rsplit_once(") ")?
+            .1
+            .chars()
+            .next()
+    }
+
+    fn process_can_retain_cleanup_resources(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        if linux_process_state(pid) == Some('Z') {
+            return false;
+        }
+        crate::host_lock::process_alive(pid)
+    }
+
     fn target(id: &str, cmd: &str) -> TaskTarget {
         TaskTarget {
             kind: TaskKind::Pty,
@@ -2884,10 +2902,10 @@ mod tests {
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::host_lock::process_alive(descendant) && Instant::now() < deadline {
+        while process_can_retain_cleanup_resources(descendant) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let survived = crate::host_lock::process_alive(descendant);
+        let survived = process_can_retain_cleanup_resources(descendant);
         if survived {
             // Do not leak a 60s sleeper into the test host when the assertion is about to fail.
             unsafe { libc::kill(descendant, libc::SIGKILL) };
@@ -2895,6 +2913,35 @@ mod tests {
         assert!(
             !survived,
             "escaped descendant {descendant} survived cleanup: the process-group kill did not reach it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_cannot_retain_cleanup_resources() {
+        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = None;
+        while Instant::now() < deadline {
+            state = linux_process_state(pid);
+            if state == Some('Z') {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let kill_probe_considered_alive = crate::host_lock::process_alive(pid);
+        let retained_cleanup_resources = process_can_retain_cleanup_resources(pid);
+        let _ = child.wait();
+
+        assert_eq!(state, Some('Z'), "child did not become a zombie");
+        assert!(
+            kill_probe_considered_alive,
+            "the fixture must expose kill(pid, 0) treating a zombie as alive"
+        );
+        assert!(
+            !retained_cleanup_resources,
+            "a terminated zombie cannot retain cleanup resources"
         );
     }
 
