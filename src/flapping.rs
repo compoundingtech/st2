@@ -78,12 +78,14 @@ impl FlappingCap {
     /// recovery. The rest goes with it because the operator's claim is "I fixed the cause": what
     /// follows is a first launch, not the continuation of a failed one.
     pub fn unpark(&mut self, id: &str) -> bool {
-        let was_parked = self.parked.remove(id);
+        if !self.parked.remove(id) {
+            return false;
+        }
         self.consecutive.remove(id);
         self.launches.remove(id);
         self.last_launch.remove(id);
         self.healthy_since.remove(id);
-        was_parked
+        true
     }
 
     /// Decide whether `id` may be (re)launched at `now` under `policy`. On `Allow` the caller should
@@ -317,17 +319,16 @@ mod tests {
         panic!("never parked after forgiveness: {launches} launches");
     }
 
-    /// An explicit operator unpark is the per-task exit from terminal parking, and it must hand back a
-    /// task that can actually run — not merely one whose flag is clear.
+    /// An explicit operator unpark is the per-task exit from terminal parking, and it must restore a
+    /// full failure budget — not merely permit one more launch.
     ///
-    /// The assertion that matters is `Allow`, not `!is_parked`. Clearing `parked` alone leaves
-    /// `consecutive` sitting at `attempts`, so the very next [`decide`](FlappingCap::decide) re-parks
-    /// and a `!is_parked` test still passes against a feature that does nothing. Surviving past
-    /// `interval` afterwards is the other half: recovery has to outlive the pass that performed it.
+    /// Immediate failures after the unpark make the remaining budget observable. A mutant that
+    /// leaves `consecutive = attempts - 1` permits the first launch, but parks on the second instead
+    /// of allowing exactly `attempts` fresh launches.
     #[test]
     fn unpark_restores_a_launchable_task_not_just_a_cleared_flag() {
         let mut cap = FlappingCap::new();
-        let p = policy(3, 60, 10, RestartMode::Fail);
+        let p = policy(3, 60, 0, RestartMode::Fail);
         let t0 = Instant::now();
 
         for i in 0..3 {
@@ -344,19 +345,26 @@ mod tests {
         assert!(cap.unpark("p"), "unpark reports that it cleared a parked task");
         assert!(!cap.is_parked("p"));
 
-        let retry = parked_at + Duration::from_secs(1);
-        assert_eq!(
-            cap.decide("p", retry, &p),
-            RestartDecision::Allow,
-            "unpark left the spent budget behind, so the task is unlaunchable despite a clear flag"
-        );
-        cap.record("p", retry);
-
-        // It comes back and stays up well past `interval`. Recovery is durable, not a single pass.
-        for pass in 1..=5 {
-            cap.end_pass(retry + Duration::from_secs(20 * pass), &["p".to_string()]);
+        let mut launches = 0;
+        for second in 1..=4 {
+            let now = parked_at + Duration::from_secs(second);
+            match cap.decide("p", now, &p) {
+                RestartDecision::Allow => {
+                    cap.record("p", now);
+                    cap.end_pass(now, &[]);
+                    launches += 1;
+                }
+                RestartDecision::GaveUp => {
+                    assert_eq!(
+                        launches, p.attempts,
+                        "unpark restored fewer than the full failure budget"
+                    );
+                    return;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
-        assert!(!cap.is_parked("p"), "a recovered task re-parked while it was up");
+        panic!("task did not park after {launches} immediate post-unpark failures");
     }
 
     /// Unparking is per task, exactly as parking is. Recovering one crash-looper must not hand a
@@ -381,6 +389,35 @@ mod tests {
         // `st2 unpark` can tell an operator it acted on nothing rather than claim a recovery.
         assert!(!cap.unpark("a"), "'a' was already unparked");
         assert!(!cap.unpark("never-seen"));
+    }
+
+    /// A request naming a task that has not parked reports a no-op, so it must also be a true no-op
+    /// on restart history. Otherwise repeated requests can keep refreshing a partly spent budget and
+    /// postpone terminal parking indefinitely while claiming they recovered nothing.
+    #[test]
+    fn unpark_of_a_non_parked_task_preserves_its_partial_failure_budget() {
+        let mut cap = FlappingCap::new();
+        let p = policy(3, 60, 0, RestartMode::Fail);
+        let t0 = Instant::now();
+
+        for second in 0..2 {
+            let now = t0 + Duration::from_secs(second);
+            assert_eq!(cap.decide("p", now, &p), RestartDecision::Allow);
+            cap.record("p", now);
+            cap.end_pass(now, &[]);
+        }
+
+        assert!(!cap.unpark("p"), "a non-parked task was reported as recovered");
+
+        let last_launch = t0 + Duration::from_secs(2);
+        assert_eq!(cap.decide("p", last_launch, &p), RestartDecision::Allow);
+        cap.record("p", last_launch);
+        cap.end_pass(last_launch, &[]);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(3), &p),
+            RestartDecision::GaveUp,
+            "a no-op unpark silently refreshed the partly spent failure budget"
+        );
     }
 
     /// Only *uninterrupted* uptime forgives. A task that survives a pass but dies again well inside

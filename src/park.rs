@@ -98,6 +98,23 @@ pub struct DirParkObserver {
     dir: PathBuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessStartTimeObservation {
+    Running(u64),
+    Gone,
+    Indeterminate(String),
+}
+
+fn observe_process_start_time(pid: i32) -> ProcessStartTimeObservation {
+    match crate::exec_backend::process_start_time_ticks(pid) {
+        Ok(start_time_ticks) => ProcessStartTimeObservation::Running(start_time_ticks),
+        Err(error) if crate::host_lock::process_alive(pid) => {
+            ProcessStartTimeObservation::Indeterminate(error.to_string())
+        }
+        Err(_) => ProcessStartTimeObservation::Gone,
+    }
+}
+
 impl DirParkObserver {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -106,16 +123,18 @@ impl DirParkObserver {
     pub fn for_host(host: &str) -> Self {
         Self::new(park_dir(host))
     }
-}
 
-impl ParkObserver for DirParkObserver {
-    fn observe(&self, desired: &[String]) -> ParkBatch {
+    fn observe_with(
+        &self,
+        desired: &[String],
+        observe_start_time: &dyn Fn(i32) -> ProcessStartTimeObservation,
+    ) -> ParkBatch {
         let mut batch = ParkBatch {
             complete: true,
             ..Default::default()
         };
         for runtime_id in desired {
-            let state = match read_marker(&self.dir, runtime_id) {
+            let state = match read_marker(&self.dir, runtime_id, observe_start_time) {
                 Ok(state) => state,
                 Err(error) => {
                     batch.complete = false;
@@ -127,6 +146,12 @@ impl ParkObserver for DirParkObserver {
             batch.states.insert(runtime_id.clone(), state);
         }
         batch
+    }
+}
+
+impl ParkObserver for DirParkObserver {
+    fn observe(&self, desired: &[String]) -> ParkBatch {
+        self.observe_with(desired, &observe_process_start_time)
     }
 }
 
@@ -151,7 +176,11 @@ fn marker_path(dir: &Path, runtime_id: &str) -> PathBuf {
     dir.join(format!("{runtime_id}.json"))
 }
 
-fn read_marker(dir: &Path, runtime_id: &str) -> anyhow::Result<ParkState> {
+fn read_marker(
+    dir: &Path,
+    runtime_id: &str,
+    observe_start_time: &dyn Fn(i32) -> ProcessStartTimeObservation,
+) -> anyhow::Result<ParkState> {
     let path = marker_path(dir, runtime_id);
     let raw = match fs::read(&path) {
         Ok(raw) => raw,
@@ -178,13 +207,26 @@ fn read_marker(dir: &Path, runtime_id: &str) -> anyhow::Result<ParkState> {
             record.runtime_id
         );
     }
-    if crate::exec_backend::process_start_time_ticks(record.supervisor_pid as i32).ok()
-        != Some(record.supervisor_start_time_ticks)
-    {
-        // The supervisor that parked it is gone. R31 scopes a park to one supervisor run, so this is
-        // a positive "not parked", not an unknown — and it keeps `st2 tasks` zero-exit on a host
-        // where st2 is not running at all.
-        return Ok(ParkState::NotParked);
+    let supervisor_pid = i32::try_from(record.supervisor_pid)
+        .context("park marker supervisor pid exceeds the process id range")?;
+    if supervisor_pid <= 0 {
+        anyhow::bail!("park marker supervisor pid must be positive");
+    }
+    if record.supervisor_start_time_ticks == 0 {
+        anyhow::bail!("park marker supervisor start time must be positive");
+    }
+    match observe_start_time(supervisor_pid) {
+        ProcessStartTimeObservation::Running(start_time_ticks)
+            if start_time_ticks == record.supervisor_start_time_ticks => {}
+        ProcessStartTimeObservation::Running(_) | ProcessStartTimeObservation::Gone => {
+            // The supervisor that parked it is gone. R31 scopes a park to one supervisor run, so
+            // this is a positive "not parked", not an unknown — and it keeps `st2 tasks` zero-exit
+            // on a host where st2 is not running at all.
+            return Ok(ParkState::NotParked);
+        }
+        ProcessStartTimeObservation::Indeterminate(error) => {
+            anyhow::bail!("observing supervisor process generation: {error}");
+        }
     }
     Ok(ParkState::Parked(record))
 }
@@ -438,6 +480,62 @@ mod tests {
         );
         assert!(batch.complete, "a stale marker is a positive absence, not an unknown");
         assert!(batch.errors.is_empty());
+    }
+
+    /// Failing to observe a still-live supervisor is not evidence that its park ended. The injected
+    /// observer makes this branch deterministic and kills the former `.ok()` collapse to
+    /// `NotParked` without depending on host `/proc` permissions or timing.
+    #[test]
+    fn a_supervisor_generation_observation_error_is_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = projection(dir.path());
+        assert!(projection.publish(&parked(&["a"]), "crash-looped").is_empty());
+
+        let observer = DirParkObserver::new(dir.path().to_path_buf());
+        let batch = observer.observe_with(&desired(&["a"]), &|_| {
+            ProcessStartTimeObservation::Indeterminate("injected observation failure".into())
+        });
+
+        assert!(!batch.complete);
+        assert!(matches!(batch.state("a"), ParkState::Indeterminate(_)));
+        assert_eq!(batch.errors.len(), 1);
+        assert!(batch.errors[0].contains("injected observation failure"));
+    }
+
+    /// Syntactically valid JSON can still carry an impossible process generation. Such evidence is
+    /// malformed, not proof that a formerly owning supervisor is gone.
+    #[test]
+    fn malformed_supervisor_generations_are_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("zero-pid", 0, 1),
+            ("oversized-pid", u32::MAX, 1),
+            ("zero-start-time", std::process::id(), 0),
+        ];
+
+        for (runtime_id, supervisor_pid, supervisor_start_time_ticks) in cases {
+            let record = ParkRecord {
+                schema: PARK_SCHEMA.to_string(),
+                runtime_id: runtime_id.to_string(),
+                supervisor_pid,
+                supervisor_start_time_ticks,
+                parked_at: "2026-08-09T10:00:00.000Z".to_string(),
+                reason: "crash-looped".to_string(),
+            };
+            write_json_atomically(&marker_path(dir.path(), runtime_id), &record, ".park.").unwrap();
+        }
+
+        let observer = DirParkObserver::new(dir.path().to_path_buf());
+        let desired = cases.map(|(runtime_id, _, _)| runtime_id.to_string());
+        let batch = observer.observe(&desired);
+        assert!(!batch.complete);
+        assert_eq!(batch.errors.len(), cases.len());
+        for (runtime_id, _, _) in cases {
+            assert!(
+                matches!(batch.state(runtime_id), ParkState::Indeterminate(_)),
+                "malformed generation for {runtime_id:?} was treated as a stale park"
+            );
+        }
     }
 
     /// A host that has never parked anything has no projection dir. That must read as "nothing is
