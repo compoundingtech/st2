@@ -1,0 +1,11 @@
+plan "review-follow-up" {
+  owner "reviewer"
+
+  version "0000" {
+    intent #"""
+Review the accepted corrections.
+
+Done means the corrections are present and independently verified.
+"""#
+  }
+}

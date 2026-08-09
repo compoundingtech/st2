@@ -629,6 +629,28 @@ atomic inbox file → DING attempt → agent reads → archive receipt
 - **R10:** Fleet identities are agents. General-purpose identity kinds are
   unsupported.
 
+### Experimental read-only plan inspection
+
+`st2 plan validate|list|show|inspect` is a non-executing probe for the
+[source plan sketch at revision `5c1d142`](https://gist.github.com/myobie/d5ecfac24cd3965e095a5031cd2e00cb/5c1d1427c0556d95d13890e5c5086cd85b25d994).
+The implemented agent integration uses the existing Resource envelope to link
+to plan-owned truth.
+It reads standalone plans and plans linked through a childless Agent Spec
+Resource whose `_tag` is `plan`. The Resource name is an agent-local role. The
+Resource can add `referencedBy`; it does not own plan identity, owner, version,
+parent, reason, or intent. Those fields remain in the referenced `plan.kdl`.
+Each version contains either source-relative Markdown `content` or complete
+inline `intent`. Resource URIs resolve from the agent KDL file. Content URIs
+resolve from `plan.kdl`. Both stay within the selected catalog. A derived
+frontier retains concurrent siblings. The experiment stores no content digest
+or immutable history proof.
+
+The parser is deliberately deny-by-default for plan fields beyond that model.
+It has no current pointer, controller, execution, scheduling, step graph,
+retry, claim, receipt, event, reconciliation, CAS, or mutation behavior. It
+does not yet fulfill R08 plan-progress observability or resolve DQ3; direct KDL
+and direct human-to-agent planning remain first-class.
+
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.
