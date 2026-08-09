@@ -416,6 +416,40 @@ intentional catalog-less fallback used by isolated folder evals. In a catalog-ba
 `st2 message ls` rejects an absent identity; recovery inspection of a deliberately orphaned flat
 box must be explicit with `st2 message ls <identity> --orphan` (and optionally `--archive`).
 
+Services use a separate declared request surface; they do not borrow an Agent
+Spec identity. Declare the endpoint without creating a task:
+
+```kdl
+// <catalog>/principals/host-a/example-ci/principal.kdl
+principal "example-ci" host="host-a"
+```
+
+Then publish once, let the addressed agent reply from its normal inbox, and
+observe the typed result. Bodies are JSON and `--tag` is a repeatable
+`key=value` map:
+
+```sh
+st2 request send host-a.repair-agent \
+  --as host-a.example-ci \
+  --idempotency-key 'escalate:repo#7:abc' \
+  --tag kind=example-ci.escalation \
+  -m '{"candidate":"abc"}' --json
+
+st2 request read <request-filename> --json
+
+st2 request reply <request-filename> \
+  --tag outcome=needs-human \
+  -m '{"outcome":"needs-human"}' --json
+
+st2 request status --as host-a.example-ci \
+  --idempotency-key 'escalate:repo#7:abc' --json
+```
+
+The key atomically reserves one message filename and exact envelope before
+publication. Exact retries return that filename with `deduplicated: true`; a
+different request under the same key fails. Replies route only to the declared
+principal's canonical `resources/inbox`, never a flat orphan mailbox.
+
 Adopters should cut directly to the native layout. Before launching a migrated identity, install and
 verify hooks, validate and materialize its hand-authored declaration, stop any predecessor transport,
 and decide how any unread predecessor backlog will be archived or forwarded. Never run predecessor
