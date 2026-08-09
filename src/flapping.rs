@@ -68,6 +68,24 @@ impl FlappingCap {
         self.parked.iter()
     }
 
+    /// Clear one task's park on an explicit operator request, returning whether it had in fact been
+    /// parked. Parking stays terminal — nothing here expires, ages out or forgives on its own; this is
+    /// the only exit short of a supervisor restart, and it is per task, so recovering one crash-looper
+    /// never hands a second one a fresh budget.
+    ///
+    /// It forgets the task's whole restart history, not just the flag. Leaving `consecutive` behind
+    /// would re-park it on the very next [`decide`](Self::decide), which is a clear flag and no
+    /// recovery. The rest goes with it because the operator's claim is "I fixed the cause": what
+    /// follows is a first launch, not the continuation of a failed one.
+    pub fn unpark(&mut self, id: &str) -> bool {
+        let was_parked = self.parked.remove(id);
+        self.consecutive.remove(id);
+        self.launches.remove(id);
+        self.last_launch.remove(id);
+        self.healthy_since.remove(id);
+        was_parked
+    }
+
     /// Decide whether `id` may be (re)launched at `now` under `policy`. On `Allow` the caller should
     /// spawn and then call [`record`](Self::record).
     pub fn decide(&mut self, id: &str, now: Instant, policy: &Restart) -> RestartDecision {
@@ -297,6 +315,72 @@ mod tests {
             }
         }
         panic!("never parked after forgiveness: {launches} launches");
+    }
+
+    /// An explicit operator unpark is the per-task exit from terminal parking, and it must hand back a
+    /// task that can actually run — not merely one whose flag is clear.
+    ///
+    /// The assertion that matters is `Allow`, not `!is_parked`. Clearing `parked` alone leaves
+    /// `consecutive` sitting at `attempts`, so the very next [`decide`](FlappingCap::decide) re-parks
+    /// and a `!is_parked` test still passes against a feature that does nothing. Surviving past
+    /// `interval` afterwards is the other half: recovery has to outlive the pass that performed it.
+    #[test]
+    fn unpark_restores_a_launchable_task_not_just_a_cleared_flag() {
+        let mut cap = FlappingCap::new();
+        let p = policy(3, 60, 10, RestartMode::Fail);
+        let t0 = Instant::now();
+
+        for i in 0..3 {
+            let now = t0 + Duration::from_secs(20 * i);
+            assert_eq!(cap.decide("p", now, &p), RestartDecision::Allow);
+            cap.record("p", now);
+            cap.end_pass(now, &[]);
+        }
+        let parked_at = t0 + Duration::from_secs(60);
+        assert_eq!(cap.decide("p", parked_at, &p), RestartDecision::GaveUp);
+        assert!(cap.is_parked("p"));
+
+        // The operator fixed the cause and cleared this one task's park.
+        assert!(cap.unpark("p"), "unpark reports that it cleared a parked task");
+        assert!(!cap.is_parked("p"));
+
+        let retry = parked_at + Duration::from_secs(1);
+        assert_eq!(
+            cap.decide("p", retry, &p),
+            RestartDecision::Allow,
+            "unpark left the spent budget behind, so the task is unlaunchable despite a clear flag"
+        );
+        cap.record("p", retry);
+
+        // It comes back and stays up well past `interval`. Recovery is durable, not a single pass.
+        for pass in 1..=5 {
+            cap.end_pass(retry + Duration::from_secs(20 * pass), &["p".to_string()]);
+        }
+        assert!(!cap.is_parked("p"), "a recovered task re-parked while it was up");
+    }
+
+    /// Unparking is per task, exactly as parking is. Recovering one crash-looper must not hand a
+    /// second, still-broken one a fresh budget — that would make the operator's targeted act a
+    /// host-wide restart by another name, which is the very thing #204 asks to avoid.
+    #[test]
+    fn unpark_is_per_task_and_reports_whether_it_changed_anything() {
+        let mut cap = FlappingCap::new();
+        let p = policy(1, 60, 0, RestartMode::Fail);
+        let t0 = Instant::now();
+
+        for id in ["a", "b"] {
+            cap.record(id, t0);
+            assert_eq!(cap.decide(id, t0 + Duration::from_secs(1), &p), RestartDecision::GaveUp);
+        }
+
+        assert!(cap.unpark("a"));
+        assert!(cap.is_parked("b"), "unparking 'a' also released the untouched 'b'");
+        assert_eq!(cap.decide("b", t0 + Duration::from_secs(2), &p), RestartDecision::GaveUp);
+
+        // Unparking something that was never parked is a no-op the caller can distinguish, so
+        // `st2 unpark` can tell an operator it acted on nothing rather than claim a recovery.
+        assert!(!cap.unpark("a"), "'a' was already unparked");
+        assert!(!cap.unpark("never-seen"));
     }
 
     /// Only *uninterrupted* uptime forgives. A task that survives a pass but dies again well inside
