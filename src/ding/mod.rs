@@ -106,11 +106,18 @@ fn resolve_spec<'a>(
     matches.next().is_none().then_some(resolved)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SupervisorChainError {
+    Cycle,
+    MissingSupervisor,
+    DepthLimit,
+}
+
 fn supervisor_chain(
     specs: &[crate::AgentSpec],
     start: &crate::AgentSpec,
     this_host: &str,
-) -> Option<Vec<String>> {
+) -> Result<Vec<String>, SupervisorChainError> {
     let mut chain = Vec::new();
     let mut visited = HashSet::new();
     let mut current = start;
@@ -118,16 +125,17 @@ fn supervisor_chain(
     for _ in 0..SUPERVISOR_CHAIN_LIMIT {
         let bus_id = current.bus_id(this_host);
         if !visited.insert(bus_id.clone()) {
-            return None;
+            return Err(SupervisorChainError::Cycle);
         }
         chain.push(bus_id);
         let Some(supervisor) = current.supervisor.as_deref() else {
-            return Some(chain);
+            return Ok(chain);
         };
-        current = resolve_spec(specs, supervisor, current.resolved_host(this_host))?;
+        current = resolve_spec(specs, supervisor, current.resolved_host(this_host))
+            .ok_or(SupervisorChainError::MissingSupervisor)?;
     }
 
-    None
+    Err(SupervisorChainError::DepthLimit)
 }
 
 struct RelationshipResolver {
@@ -135,14 +143,55 @@ struct RelationshipResolver {
     valid: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RELATIONSHIP_CATALOG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl RelationshipResolver {
     fn read(catalog_root: &Path) -> Self {
+        #[cfg(test)]
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(reads.get() + 1));
         let discovered = crate::discover_strict(catalog_root);
         Self {
             specs: discovered.specs,
-            valid: discovered.errors.is_empty(),
+            valid: discovered.errors.is_empty() && catalog_tree_is_fully_observed(catalog_root),
         }
     }
+}
+
+/// Relationship markers need a complete graph, while shared discovery deliberately ignores
+/// symlinks and other non-file entries. Keep that broader discovery contract unchanged, but make
+/// the DING claim unknown whenever declaration space contains an entry it did not classify.
+fn catalog_tree_is_fully_observed(root: &Path) -> bool {
+    fn visit(root: &Path, directory: &Path) -> bool {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => return directory == root && error.kind() == std::io::ErrorKind::NotFound,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let path = entry.path();
+            if !agent_spec::discovery::is_catalog_path(root, &path) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_dir() {
+                if !visit(root, &path) {
+                    return false;
+                }
+            } else if !file_type.is_file() {
+                return false;
+            }
+        }
+        true
+    }
+
+    visit(root, root)
 }
 
 fn relationship_marker(
@@ -161,14 +210,17 @@ fn relationship_marker(
     let Some(recipient) = resolve_spec(&resolver.specs, recipient, this_host) else {
         return "?".to_string();
     };
-    let Some(recipient_chain) = supervisor_chain(&resolver.specs, recipient, this_host) else {
-        return "?".to_string();
-    };
-    let Some(sender_chain) = supervisor_chain(&resolver.specs, sender, this_host) else {
-        return "?".to_string();
-    };
     let sender_id = sender.bus_id(this_host);
     let recipient_id = recipient.bus_id(this_host);
+    if sender_id == recipient_id {
+        return "?".to_string();
+    }
+    let Ok(recipient_chain) = supervisor_chain(&resolver.specs, recipient, this_host) else {
+        return "?".to_string();
+    };
+    let Ok(sender_chain) = supervisor_chain(&resolver.specs, sender, this_host) else {
+        return "?".to_string();
+    };
 
     if let Some(depth) = recipient_chain.iter().position(|id| id == &sender_id)
         && depth > 0
@@ -753,12 +805,19 @@ enum PendingNotice {
 }
 
 impl PendingNotice {
-    fn text(&self, resolver: &RelationshipResolver, this_host: &str, recipient: &str) -> String {
+    fn text(
+        &self,
+        context: DingContext<'_>,
+        resolver: &mut Option<RelationshipResolver>,
+    ) -> String {
         match self {
             Self::Recovery { .. } => RECOVERY_POKE.to_string(),
-            Self::Message { message, .. } => {
-                poke_text_with_resolver(resolver, this_host, recipient, message)
-            }
+            Self::Message { message, .. } => poke_text_with_resolver(
+                resolver.get_or_insert_with(|| RelationshipResolver::read(context.catalog_root)),
+                context.this_host,
+                context.recipient,
+                message,
+            ),
             Self::Adopted {
                 staged_text: Some(text),
             } => text.clone(),
@@ -1049,13 +1108,12 @@ fn flush_pending(
         return;
     }
 
-    let resolver = RelationshipResolver::read(context.catalog_root);
+    let mut resolver = None;
 
     while let Some(notice) = pending.front_mut() {
         let staged = notice.staged_text().map(str::to_string);
         let was_staged = staged.is_some();
-        let text =
-            staged.unwrap_or_else(|| notice.text(&resolver, context.this_host, context.recipient));
+        let text = staged.unwrap_or_else(|| notice.text(context, &mut resolver));
         let outcome = if was_staged {
             poker.retry_staged(&text)
         } else {
@@ -1186,9 +1244,12 @@ mod tests {
     fn notice_text_without_catalog(notice: &PendingNotice) -> String {
         let catalog = tempfile::tempdir().unwrap();
         notice.text(
-            &RelationshipResolver::read(catalog.path()),
-            "h",
-            "h.recipient",
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            &mut None,
         )
     }
 
@@ -1352,12 +1413,60 @@ mod tests {
     }
 
     #[test]
+    fn dangling_catalog_entry_makes_relationship_unknown() {
+        use std::os::unix::fs::symlink;
+
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+        symlink(
+            catalog.path().join("missing.kdl"),
+            catalog.path().join("dangling.kdl"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.root", Some("dangling"))
+            ),
+            "[DING] ? h.root: dangling [id:abc123]"
+        );
+    }
+
+    #[test]
+    fn self_addressed_message_is_unknown_pending_contract_decision() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.recipient", Some("self"))
+            ),
+            "[DING] ? h.recipient: self [id:abc123]"
+        );
+    }
+
+    #[test]
     fn supervisor_cycle_renders_unknown_and_still_delivers() {
         let catalog = tempfile::tempdir().unwrap();
         declare_agent(catalog.path(), "h", "recipient", Some("loop"));
         declare_agent(catalog.path(), "h", "loop", Some("recipient"));
         let message = msg("1785070000000-abc123.md", "h.loop", Some("cycle"));
         let expected = "[DING] ? h.loop: cycle [id:abc123]";
+        let resolver = RelationshipResolver::read(catalog.path());
+        let recipient = resolve_spec(&resolver.specs, "h.recipient", "h").unwrap();
+
+        assert_eq!(
+            supervisor_chain(&resolver.specs, recipient, "h"),
+            Err(SupervisorChainError::Cycle),
+            "cycle detection must be distinct from the independent depth limit"
+        );
 
         assert_eq!(
             poke_text(catalog.path(), "h", "h.recipient", &message),
@@ -1382,10 +1491,19 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_catalog_renders_unknown_and_still_delivers() {
-        let catalog = tempfile::NamedTempFile::new().unwrap();
+    fn malformed_catalog_with_resolvable_endpoints_renders_unknown_and_still_delivers() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+        let malformed = catalog.path().join("h/broken/agent.kdl");
+        std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+        std::fs::write(&malformed, "agent this is not valid KDL {").unwrap();
         let message = msg("1785070000000-abc123.md", "h.sender", Some("fallback"));
-        let expected = "[DING] ? h.sender: fallback [id:abc123]";
+        let message = Message {
+            from: Some("h.root".to_string()),
+            ..message
+        };
+        let expected = "[DING] ? h.root: fallback [id:abc123]";
         let mut pending = VecDeque::from([PendingNotice::message(message)]);
         let poker = RecordingPoker::live();
 
@@ -3049,6 +3167,85 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert_eq!(calls[0], calls[1], "the failed FIFO head retries first");
         assert!(calls[0].contains("second"));
         assert!(calls[2].contains("third"));
+    }
+
+    #[test]
+    fn staged_and_recovery_delivery_do_not_read_the_catalog() {
+        let catalog = tempfile::tempdir().unwrap();
+        let context = DingContext {
+            catalog_root: catalog.path(),
+            this_host: "h",
+            recipient: "h.recipient",
+        };
+
+        let mut staged =
+            PendingNotice::message(msg("1785070000000-abc123.md", "h.sender", Some("staged")));
+        staged.set_staged_text(Some("immutable staged notice".to_string()));
+        let mut pending = VecDeque::from([staged]);
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::new()),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Delivered])),
+        };
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        flush_pending(context, None, &mut pending, &poker);
+        assert_eq!(
+            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            0,
+            "immutable staged delivery must not depend on catalog traversal"
+        );
+
+        let mut pending = VecDeque::from([PendingNotice::Recovery {
+            startup: HashSet::from(["1785070000000-def456.md".to_string()]),
+            in_inbox: true,
+            staged_text: None,
+        }]);
+        let poker = RecordingPoker::live();
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        flush_pending(context, None, &mut pending, &poker);
+        assert_eq!(
+            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            0,
+            "generic recovery delivery must not depend on catalog traversal"
+        );
+        assert_eq!(poker.calls.lock().unwrap().as_slice(), [RECOVERY_POKE]);
+    }
+
+    #[test]
+    fn one_pending_batch_reads_the_catalog_once() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        let mut pending = (0..10)
+            .map(|index| {
+                PendingNotice::message(msg(
+                    &format!("17850700000{index:02}-abc{index:03}.md"),
+                    "h.sender",
+                    Some("batch"),
+                ))
+            })
+            .collect::<VecDeque<_>>();
+        let poker = RecordingPoker::live();
+
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        flush_pending(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            None,
+            &mut pending,
+            &poker,
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(poker.calls.lock().unwrap().len(), 10);
+        assert_eq!(
+            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            1,
+            "one pending batch must share one catalog observation"
+        );
     }
 
     #[test]
