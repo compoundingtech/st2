@@ -338,6 +338,20 @@ declared successful-launch budget is exhausted. A completed accounting pass
 that does not observe the task alive breaks accrued recovery uptime rather than
 forgiving failures through silence.
 
+A parked task is reported as parked by the typed task inventory, carrying when
+it was parked, why, and what clears it, alongside an unmodified runtime
+observation. The park is a supervisor decision about the runtime rather than an
+observation of it, so it never replaces the observed state and never makes the
+inventory envelope incomplete.
+
+Parking is terminal within a supervisor run, and its only per-task exit is an
+explicit operator request. Granting one clears exactly that task's park and its
+restart accounting, so the next launch spends a full budget; it never releases
+another parked task and never restarts a healthy one. A request naming a task
+that is not parked is reported as recovering nothing. A published park belongs
+to the supervisor run that made it: a projected park whose supervisor is gone is
+positively not parked.
+
 Authoring: [pinned complete declaration][evals-fields]. The
 [pinned explicit-task list][evals-task-fields] and st2 `9887b28` predate task
 `lifecycle`. Current st2 source:
