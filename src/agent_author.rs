@@ -580,10 +580,53 @@ fn edit_desired_state_declaration(
             format!("agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}", path.display()),
         ));
     }
-    let Some(replacement) = desired_state_edit(text, target, state, reason)? else {
+    let work_removed = if state == DesiredStateValue::Retired {
+        remove_work_resources(text, target).map_err(|error| {
+            AuthorError::new(
+                "unsafe-source-edit",
+                format!(
+                    "cannot remove the `resource \"work\"` node from {} for agent {expected_identity:?}: {error}; remove that node by hand and retry",
+                    path.display()
+                ),
+            )
+        })?
+    } else {
+        None
+    };
+    let replacement = if let Some(without_work) = work_removed {
+        let document = KdlDocument::parse(&without_work).map_err(|error| {
+            AuthorError::new(
+                "unsafe-source-edit",
+                format!(
+                    "removing the `resource \"work\"` node from {} for agent {expected_identity:?} did not produce valid KDL: {error}; remove that node by hand and retry",
+                    path.display()
+                ),
+            )
+        })?;
+        let target = exact_agent_node(
+            &document,
+            expected_identity,
+            expected_host,
+            expected_agent,
+        )
+        .map_err(|error| {
+            AuthorError::new(
+                "unsafe-source-edit",
+                format!(
+                    "cannot re-resolve agent {expected_identity:?} in {} after removing its `resource \"work\"` node: {error}; remove that node by hand and retry",
+                    path.display()
+                ),
+            )
+        })?;
+        desired_state_edit(&without_work, target, state, reason)?.or(Some(without_work))
+    } else {
+        desired_state_edit(text, target, state, reason)?
+    };
+    let Some(replacement) = replacement else {
         return Ok(AuthorOutcome::Unchanged);
     };
     verify_desired_state_candidate(
+        path,
         &replacement,
         expected_identity,
         expected_host,
@@ -603,6 +646,27 @@ fn edit_desired_state_declaration(
         before_commit,
     )?;
     Ok(AuthorOutcome::Changed)
+}
+
+fn remove_work_resources(text: &str, target: &KdlNode) -> Result<Option<String>, AuthorError> {
+    let mut work_resources = target
+        .children()
+        .into_iter()
+        .flat_map(|children| children.nodes())
+        .filter(|child| {
+            child.name().value() == "resource"
+                && child.get(0).and_then(|entry| entry.as_string()) == Some("work")
+        })
+        .collect::<Vec<_>>();
+    if work_resources.is_empty() {
+        return Ok(None);
+    }
+    work_resources.sort_by_key(|node| std::cmp::Reverse(node.span().offset()));
+    let mut replacement = text.to_owned();
+    for resource in work_resources {
+        replacement = remove_field(&replacement, resource)?;
+    }
+    Ok(Some(replacement))
 }
 
 fn desired_state_edit(
@@ -651,6 +715,7 @@ fn desired_state_edit(
 }
 
 fn verify_desired_state_candidate(
+    path: &Path,
     candidate: &str,
     expected_identity: &str,
     expected_host: &str,
@@ -668,21 +733,42 @@ fn verify_desired_state_candidate(
         .flat_map(|children| children.nodes())
         .filter(|child| matches!(child.name().value(), "desired-state" | "retired"))
         .collect::<Vec<_>>();
-    if state == DesiredStateValue::Running {
-        if lifecycle.is_empty() {
-            return Ok(());
-        }
+    let lifecycle_matches = if state == DesiredStateValue::Running {
+        lifecycle.is_empty()
     } else if let [node] = lifecycle.as_slice()
         && node.name().value() == "desired-state"
         && node.get(0).and_then(|entry| entry.as_string()) == Some(state.as_str())
         && node.get("reason").and_then(|entry| entry.as_string()) == reason
     {
-        return Ok(());
+        true
+    } else {
+        false
+    };
+    if !lifecycle_matches {
+        return Err(AuthorError::new(
+            "unsafe-source-edit",
+            "desired-state candidate did not read back as the authored intent",
+        ));
     }
-    Err(AuthorError::new(
-        "unsafe-source-edit",
-        "desired-state candidate did not read back as the authored intent",
-    ))
+    if state == DesiredStateValue::Retired
+        && target
+            .children()
+            .into_iter()
+            .flat_map(|children| children.nodes())
+            .any(|child| {
+                child.name().value() == "resource"
+                    && child.get(0).and_then(|entry| entry.as_string()) == Some("work")
+            })
+    {
+        return Err(AuthorError::new(
+            "unsafe-source-edit",
+            format!(
+                "retirement candidate {} for agent {expected_identity:?} still contains a `resource \"work\"` node; remove that node by hand and retry",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn exact_agent_node<'a>(
@@ -1444,5 +1530,35 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "agent \"worker\" { host \"h\"; command \"sleep 60\"; desired-state \"suspended\" reason=\"Waiting for capacity\" }\nagent { host \"h\"; command \"sleep 60\" }\n"
         );
+    }
+
+    #[test]
+    fn retired_work_verification_error_names_the_manual_recovery() {
+        let path = Path::new("catalog/agents/h/worker/agent.kdl");
+        let candidate = concat!(
+            "agent \"worker\" {\n",
+            "  host \"h\"\n",
+            "  desired-state \"retired\" reason=\"Mission complete\"\n",
+            "  resource \"work\" _tag=\"github-issue\" uri=\"github-issue://example/project/216\"\n",
+            "  command \"true\"\n",
+            "}\n",
+        );
+
+        let error = verify_desired_state_candidate(
+            path,
+            candidate,
+            "h.worker",
+            "h",
+            "worker",
+            DesiredStateValue::Retired,
+            Some("Mission complete"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "unsafe-source-edit");
+        let message = error.to_string();
+        assert!(message.contains("catalog/agents/h/worker/agent.kdl"));
+        assert!(message.contains("`resource \"work\"` node"));
+        assert!(message.contains("remove that node by hand and retry"));
     }
 }

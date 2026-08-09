@@ -76,6 +76,114 @@ fn target(catalog: &Path) -> PathBuf {
     catalog.join("agents/host/worker/agent.kdl")
 }
 
+fn assert_retired_work_refused(spec_text: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, spec_text).unwrap();
+
+    assert_eq!(source_digest("--spec", &spec), sha256(spec_text.as_bytes()));
+    let output = publish(&catalog, &spec, &["--expect-absent"]);
+    assert!(
+        !output.status.success(),
+        "retired declaration with work unexpectedly published: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cannot publish a retired declaration with a `resource \"work\"` binding"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!target(&catalog).exists());
+}
+
+#[test]
+fn publish_refuses_retired_with_work_legacy() {
+    assert_retired_work_refused(concat!(
+        "agent \"worker\" {\n",
+        "  host \"host\"\n",
+        "  retired #true\n",
+        "  resource \"work\" _tag=\"github-issue\" uri=\"github-issue://example/project/216\"\n",
+        "  argv \"true\"\n",
+        "}\n",
+    ));
+}
+
+#[test]
+fn publish_refuses_retired_with_work_typed() {
+    assert_retired_work_refused(concat!(
+        "agent \"worker\" {\n",
+        "  host \"host\"\n",
+        "  desired-state \"retired\" reason=\"Mission complete\"\n",
+        "  resource \"work\" _tag=\"github-issue\" uri=\"github-issue://example/project/216\"\n",
+        "  argv \"true\"\n",
+        "}\n",
+    ));
+}
+
+#[test]
+fn publish_admits_retired_without_work_and_nonretired_with_work() {
+    for (name, spec_text) in [
+        (
+            "legacy-retired-without-work",
+            concat!(
+                "agent \"worker\" {\n",
+                "  host \"host\"\n",
+                "  retired #true\n",
+                "  argv \"true\"\n",
+                "}\n",
+            ),
+        ),
+        (
+            "retired-without-work",
+            concat!(
+                "agent \"worker\" {\n",
+                "  host \"host\"\n",
+                "  desired-state \"retired\" reason=\"Mission complete\"\n",
+                "  argv \"true\"\n",
+                "}\n",
+            ),
+        ),
+        (
+            "running-with-work",
+            concat!(
+                "agent \"worker\" {\n",
+                "  host \"host\"\n",
+                "  resource \"work\" _tag=\"github-issue\" uri=\"github-issue://example/project/216\"\n",
+                "  argv \"true\"\n",
+                "}\n",
+            ),
+        ),
+        (
+            "suspended-with-work",
+            concat!(
+                "agent \"worker\" {\n",
+                "  host \"host\"\n",
+                "  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+                "  resource \"work\" _tag=\"github-issue\" uri=\"github-issue://example/project/216\"\n",
+                "  argv \"true\"\n",
+                "}\n",
+            ),
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        fs::create_dir(&catalog).unwrap();
+        let spec = temp.path().join(format!("{name}.kdl"));
+        fs::write(&spec, spec_text).unwrap();
+
+        let output = publish(&catalog, &spec, &["--expect-absent"]);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(target(&catalog)).unwrap(), spec_text);
+    }
+}
+
 #[test]
 fn spec_create_is_typed_and_idempotent() {
     let temp = tempfile::tempdir().unwrap();

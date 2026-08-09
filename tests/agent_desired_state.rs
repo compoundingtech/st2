@@ -82,6 +82,62 @@ fn cli_suspends_resumes_and_retires_without_rewriting_unrelated_source() {
 }
 
 #[test]
+fn cli_retirement_clears_work_without_rewriting_unrelated_source() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let initial = concat!(
+        "// published-by: axe agent launch\n",
+        "agent \"worker\" {\n",
+        "  host \"h\"\n",
+        "  name \"Retirement worker\"\n",
+        "  resource \"notes\" _tag=\"agent-notes\" uri=\"agent-notes://h/worker\"\n",
+        "  resource \"work\" _tag=\"github-issue\" uri=\"github-issue://example/project/216\"\n",
+        "  pty \"agent\" { argv \"agent\" \"run\" }\n",
+        "  meta { publisher \"axe\"; input-sha256 \"abc\" }\n",
+        "}\n",
+    );
+    write(root, "h/worker/agent.kdl", initial);
+
+    let retired = author(root, "retired", Some("Mission complete"));
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let retired_bytes = concat!(
+        "// published-by: axe agent launch\n",
+        "agent \"worker\" {\n",
+        "  host \"h\"\n",
+        "  name \"Retirement worker\"\n",
+        "  resource \"notes\" _tag=\"agent-notes\" uri=\"agent-notes://h/worker\"\n",
+        "  pty \"agent\" { argv \"agent\" \"run\" }\n",
+        "  meta { publisher \"axe\"; input-sha256 \"abc\" }\n",
+        "  desired-state \"retired\" reason=\"Mission complete\"\n",
+        "}\n",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        retired_bytes
+    );
+
+    let running = author(root, "running", None);
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let resumed_bytes = retired_bytes.replace(
+        "  desired-state \"retired\" reason=\"Mission complete\"\n",
+        "",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        resumed_bytes
+    );
+    assert!(!resumed_bytes.contains("resource \"work\""));
+}
+
+#[test]
 fn cli_resume_preserves_same_line_leading_comment() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

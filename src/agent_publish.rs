@@ -78,6 +78,7 @@ struct Candidate {
     host: String,
     identity: String,
     input_sha256: String,
+    retired_with_work: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -169,6 +170,20 @@ impl Candidate {
             "candidate must contain exactly one top-level `agent` node"
         );
         let declared = &document.agents[0];
+        let retired = declared
+            .field("retired")
+            .and_then(|field| field.argument(0))
+            .and_then(DeclaredValue::as_bool)
+            == Some(true)
+            || declared
+                .field("desired-state")
+                .and_then(|field| field.argument(0))
+                .and_then(DeclaredValue::as_str)
+                == Some("retired");
+        let has_work = declared
+            .fields_named("resource")
+            .any(|resource| resource.argument(0).and_then(DeclaredValue::as_str) == Some("work"));
+        let retired_with_work = retired && has_work;
         let host = declared
             .field("host")
             .and_then(|field| field.argument(0))
@@ -193,6 +208,7 @@ impl Candidate {
             host: host.to_string(),
             identity: identity.to_string(),
             input_sha256,
+            retired_with_work,
         })
     }
 
@@ -224,6 +240,10 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
     let lock = CatalogLock::exclusive(&catalog)?;
     let control = crate::catalog_transaction::retained_dir_path(lock.control())?;
     let candidate = Candidate::stage_in(&control, request.source)?;
+    anyhow::ensure!(
+        !candidate.retired_with_work,
+        "candidate cannot publish a retired declaration with a `resource \"work\"` binding; remove the work binding or retire the live agent with `st2 agent desired-state`"
+    );
     anyhow::ensure!(
         candidate.input_sha256 == request.input_sha256,
         "publication input precondition failed: expected sha256 {}, captured {}",
