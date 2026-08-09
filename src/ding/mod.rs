@@ -145,53 +145,19 @@ struct RelationshipResolver {
 
 #[cfg(test)]
 thread_local! {
-    static RELATIONSHIP_CATALOG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RELATIONSHIP_CATALOG_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl RelationshipResolver {
     fn read(catalog_root: &Path) -> Self {
         #[cfg(test)]
-        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(reads.get() + 1));
+        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(traversals.get() + 1));
         let discovered = crate::discover_strict(catalog_root);
         Self {
             specs: discovered.specs,
-            valid: discovered.errors.is_empty() && catalog_tree_is_fully_observed(catalog_root),
+            valid: discovered.errors.is_empty(),
         }
     }
-}
-
-/// Relationship markers need a complete graph, while shared discovery deliberately ignores
-/// symlinks and other non-file entries. Keep that broader discovery contract unchanged, but make
-/// the DING claim unknown whenever declaration space contains an entry it did not classify.
-fn catalog_tree_is_fully_observed(root: &Path) -> bool {
-    fn visit(root: &Path, directory: &Path) -> bool {
-        let entries = match std::fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) => return directory == root && error.kind() == std::io::ErrorKind::NotFound,
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return false;
-            };
-            let path = entry.path();
-            if !agent_spec::discovery::is_catalog_path(root, &path) {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                return false;
-            };
-            if file_type.is_dir() {
-                if !visit(root, &path) {
-                    return false;
-                }
-            } else if !file_type.is_file() {
-                return false;
-            }
-        }
-        true
-    }
-
-    visit(root, root)
 }
 
 fn relationship_marker(
@@ -3170,7 +3136,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn staged_and_recovery_delivery_do_not_read_the_catalog() {
+    fn staged_and_recovery_delivery_do_not_traverse_the_catalog() {
         let catalog = tempfile::tempdir().unwrap();
         let context = DingContext {
             catalog_root: catalog.path(),
@@ -3188,10 +3154,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             poke_outcomes: Mutex::new(VecDeque::new()),
             retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Delivered])),
         };
-        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(0));
         flush_pending(context, None, &mut pending, &poker);
         assert_eq!(
-            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            RELATIONSHIP_CATALOG_TRAVERSALS.with(std::cell::Cell::get),
             0,
             "immutable staged delivery must not depend on catalog traversal"
         );
@@ -3202,10 +3168,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             staged_text: None,
         }]);
         let poker = RecordingPoker::live();
-        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(0));
         flush_pending(context, None, &mut pending, &poker);
         assert_eq!(
-            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            RELATIONSHIP_CATALOG_TRAVERSALS.with(std::cell::Cell::get),
             0,
             "generic recovery delivery must not depend on catalog traversal"
         );
@@ -3213,7 +3179,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn one_pending_batch_reads_the_catalog_once() {
+    fn one_pending_batch_traverses_the_catalog_once() {
         let catalog = tempfile::tempdir().unwrap();
         declare_agent(catalog.path(), "h", "recipient", None);
         let mut pending = (0..10)
@@ -3227,7 +3193,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .collect::<VecDeque<_>>();
         let poker = RecordingPoker::live();
 
-        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(0));
         flush_pending(
             DingContext {
                 catalog_root: catalog.path(),
@@ -3242,7 +3208,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(pending.is_empty());
         assert_eq!(poker.calls.lock().unwrap().len(), 10);
         assert_eq!(
-            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            RELATIONSHIP_CATALOG_TRAVERSALS.with(std::cell::Cell::get),
             1,
             "one pending batch must share one catalog observation"
         );
