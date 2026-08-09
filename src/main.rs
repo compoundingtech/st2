@@ -1809,7 +1809,15 @@ fn ding_cmd(
         poll: Duration::from_millis(interval),
         ..Default::default()
     };
-    ding::serve(&inbox, &status_path, &session, &config)
+    ding::serve(
+        &catalog_root,
+        &this_host,
+        &id,
+        &inbox,
+        &status_path,
+        &session,
+        &config,
+    )
 }
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.

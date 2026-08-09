@@ -35,6 +35,7 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
+const SUPERVISOR_CHAIN_LIMIT: usize = 64;
 const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
 // Must exceed face607's bounded 0.5s delivery delay plus PTY/Node startup overhead; otherwise a
 // successful pane write is misreported as a timeout and retried, duplicating the owned payload.
@@ -92,14 +93,179 @@ fn normalize_field(value: Option<&str>, fallback: &str, max_chars: usize) -> Str
     }
 }
 
+fn resolve_spec<'a>(
+    specs: &'a [crate::AgentSpec],
+    identity: &str,
+    local_host: &str,
+) -> Option<&'a crate::AgentSpec> {
+    let mut matches = specs.iter().filter(|spec| {
+        spec.bus_id(local_host) == identity
+            || (spec.resolved_host(local_host) == local_host && spec.identity == identity)
+    });
+    let resolved = matches.next()?;
+    matches.next().is_none().then_some(resolved)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SupervisorChainError {
+    Cycle,
+    MissingSupervisor,
+    DepthLimit,
+}
+
+fn supervisor_chain(
+    specs: &[crate::AgentSpec],
+    start: &crate::AgentSpec,
+    this_host: &str,
+) -> Result<Vec<String>, SupervisorChainError> {
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = start;
+
+    for _ in 0..SUPERVISOR_CHAIN_LIMIT {
+        let bus_id = current.bus_id(this_host);
+        if !visited.insert(bus_id.clone()) {
+            return Err(SupervisorChainError::Cycle);
+        }
+        chain.push(bus_id);
+        let Some(supervisor) = current.supervisor.as_deref() else {
+            return Ok(chain);
+        };
+        current = resolve_spec(specs, supervisor, current.resolved_host(this_host))
+            .ok_or(SupervisorChainError::MissingSupervisor)?;
+    }
+
+    Err(SupervisorChainError::DepthLimit)
+}
+
+struct RelationshipResolver {
+    specs: Vec<crate::AgentSpec>,
+    valid: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELATIONSHIP_CATALOG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl RelationshipResolver {
+    fn read(catalog_root: &Path) -> Self {
+        #[cfg(test)]
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(reads.get() + 1));
+        let discovered = crate::discover_strict(catalog_root);
+        Self {
+            specs: discovered.specs,
+            valid: discovered.errors.is_empty() && catalog_tree_is_fully_observed(catalog_root),
+        }
+    }
+}
+
+/// Relationship markers need a complete graph, while shared discovery deliberately ignores
+/// symlinks and other non-file entries. Keep that broader discovery contract unchanged, but make
+/// the DING claim unknown whenever declaration space contains an entry it did not classify.
+fn catalog_tree_is_fully_observed(root: &Path) -> bool {
+    fn visit(root: &Path, directory: &Path) -> bool {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => return directory == root && error.kind() == std::io::ErrorKind::NotFound,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let path = entry.path();
+            if !agent_spec::discovery::is_catalog_path(root, &path) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_dir() {
+                if !visit(root, &path) {
+                    return false;
+                }
+            } else if !file_type.is_file() {
+                return false;
+            }
+        }
+        true
+    }
+
+    visit(root, root)
+}
+
+fn relationship_marker(
+    resolver: &RelationshipResolver,
+    this_host: &str,
+    recipient: &str,
+    claimed_sender: Option<&str>,
+) -> String {
+    if !resolver.valid {
+        return "?".to_string();
+    }
+    let Some(sender) = claimed_sender.and_then(|id| resolve_spec(&resolver.specs, id, this_host))
+    else {
+        return "?".to_string();
+    };
+    let Some(recipient) = resolve_spec(&resolver.specs, recipient, this_host) else {
+        return "?".to_string();
+    };
+    let sender_id = sender.bus_id(this_host);
+    let recipient_id = recipient.bus_id(this_host);
+    if sender_id == recipient_id {
+        return "?".to_string();
+    }
+    let Ok(recipient_chain) = supervisor_chain(&resolver.specs, recipient, this_host) else {
+        return "?".to_string();
+    };
+    let Ok(sender_chain) = supervisor_chain(&resolver.specs, sender, this_host) else {
+        return "?".to_string();
+    };
+
+    if let Some(depth) = recipient_chain.iter().position(|id| id == &sender_id)
+        && depth > 0
+    {
+        return "↓".repeat(depth);
+    }
+    if let Some(depth) = sender_chain.iter().position(|id| id == &recipient_id)
+        && depth > 0
+    {
+        return "↑".repeat(depth);
+    }
+    let recipient_ancestors = recipient_chain.iter().collect::<HashSet<_>>();
+    if sender_chain
+        .iter()
+        .any(|ancestor| recipient_ancestors.contains(ancestor))
+    {
+        return "←".to_string();
+    }
+    "?".to_string()
+}
+
 /// The `[DING] …` line an agent sees for one newly arrived message. Consumers must key on the
 /// prefix and stable id rather than descriptive words. Subject and sender are bounded, normalized
-/// untrusted fields; the stable id and inbox instruction are never truncated.
-pub fn poke_text(msg: &Message) -> String {
+/// untrusted fields. The marker describes the relationship implied by the claimed sender identity;
+/// it does not authenticate that identity.
+pub fn poke_text(catalog_root: &Path, this_host: &str, recipient: &str, msg: &Message) -> String {
+    poke_text_with_resolver(
+        &RelationshipResolver::read(catalog_root),
+        this_host,
+        recipient,
+        msg,
+    )
+}
+
+fn poke_text_with_resolver(
+    resolver: &RelationshipResolver,
+    this_host: &str,
+    recipient: &str,
+    msg: &Message,
+) -> String {
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
     let from = normalize_field(msg.from.as_deref(), "unknown", SENDER_MAX_CHARS);
+    let marker = relationship_marker(resolver, this_host, recipient, msg.from.as_deref());
     format!(
-        "[DING] new st2 message: [id:{}] {subject} (from {from}); check your inbox",
+        "[DING] {marker} {from}: {subject} [id:{}]",
         poke_id(&msg.filename)
     )
 }
@@ -639,10 +805,19 @@ enum PendingNotice {
 }
 
 impl PendingNotice {
-    fn text(&self) -> String {
+    fn text(
+        &self,
+        context: DingContext<'_>,
+        resolver: &mut Option<RelationshipResolver>,
+    ) -> String {
         match self {
             Self::Recovery { .. } => RECOVERY_POKE.to_string(),
-            Self::Message { message, .. } => poke_text(message),
+            Self::Message { message, .. } => poke_text_with_resolver(
+                resolver.get_or_insert_with(|| RelationshipResolver::read(context.catalog_root)),
+                context.this_host,
+                context.recipient,
+                message,
+            ),
             Self::Adopted {
                 staged_text: Some(text),
             } => text.clone(),
@@ -738,6 +913,17 @@ pub struct DingConfig {
     pub status_refresh: Duration,
 }
 
+/// Catalog coordinates needed to classify a claimed sender relative to the DING recipient.
+#[derive(Clone, Copy)]
+pub struct DingContext<'a> {
+    /// Catalog whose Agent Specs define the supervision graph.
+    pub catalog_root: &'a Path,
+    /// Local host used to resolve hostless specs and bare identities.
+    pub this_host: &'a str,
+    /// Identity whose inbox the sidecar watches.
+    pub recipient: &'a str,
+}
+
 impl Default for DingConfig {
     fn default() -> Self {
         Self {
@@ -753,6 +939,7 @@ impl Default for DingConfig {
 /// across fresh `dnd` status and transport failures; `busy` does not suppress delivery. Archive
 /// receipts prune queued work before delivery.
 pub fn run_ding(
+    context: DingContext<'_>,
     inbox_dir: &Path,
     status_path: Option<&Path>,
     poker: &dyn Poker,
@@ -771,8 +958,11 @@ pub fn run_ding(
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
     let mut startup_candidates = (!backlog.is_empty()).then(|| {
+        let resolver = RelationshipResolver::read(context.catalog_root);
         std::iter::once(RECOVERY_POKE.to_string())
-            .chain(backlog.iter().map(poke_text))
+            .chain(backlog.iter().map(|message| {
+                poke_text_with_resolver(&resolver, context.this_host, context.recipient, message)
+            }))
             .collect::<Vec<_>>()
     });
     let mut pending = VecDeque::new();
@@ -851,7 +1041,7 @@ pub fn run_ding(
                         }
                     }
                 }
-                flush_pending(status_path, &mut pending, poker);
+                flush_pending(context, status_path, &mut pending, poker);
                 next_delivery_attempt = (startup_candidates.is_some() || !pending.is_empty())
                     .then(|| Instant::now() + DELIVERY_RETRY_BACKOFF);
             }
@@ -909,6 +1099,7 @@ fn delivery_suppressed(status_path: Option<&Path>) -> bool {
 }
 
 fn flush_pending(
+    context: DingContext<'_>,
     status_path: Option<&Path>,
     pending: &mut VecDeque<PendingNotice>,
     poker: &dyn Poker,
@@ -917,10 +1108,12 @@ fn flush_pending(
         return;
     }
 
+    let mut resolver = None;
+
     while let Some(notice) = pending.front_mut() {
         let staged = notice.staged_text().map(str::to_string);
         let was_staged = staged.is_some();
-        let text = staged.unwrap_or_else(|| notice.text());
+        let text = staged.unwrap_or_else(|| notice.text(context, &mut resolver));
         let outcome = if was_staged {
             poker.retry_staged(&text)
         } else {
@@ -977,6 +1170,9 @@ fn install_signal_handler() {
 
 /// Boot and run the sidecar, refreshing presence while the target pty is alive.
 pub fn serve(
+    catalog_root: &Path,
+    this_host: &str,
+    recipient: &str,
     inbox_dir: &Path,
     status_path: &Path,
     session: &str,
@@ -985,6 +1181,11 @@ pub fn serve(
     probe_pty_on_path()?;
     install_signal_handler();
     run_ding(
+        DingContext {
+            catalog_root,
+            this_host,
+            recipient,
+        },
         inbox_dir,
         Some(status_path),
         &PtyPoker::new(session),
@@ -1018,6 +1219,56 @@ mod tests {
             priority: None,
             body: String::new(),
         }
+    }
+
+    fn declare_agent(root: &Path, host: &str, identity: &str, supervisor: Option<&str>) {
+        let directory = root.join(host).join(identity);
+        std::fs::create_dir_all(&directory).unwrap();
+        let supervisor = supervisor
+            .map(|value| format!("  supervisor {value:?}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            directory.join("agent.kdl"),
+            format!(
+                "agent {identity:?} {{\n  identity {identity:?}\n  host {host:?}\n{supervisor}  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn render_without_catalog(message: &Message) -> String {
+        let catalog = tempfile::tempdir().unwrap();
+        poke_text(catalog.path(), "h", "h.recipient", message)
+    }
+
+    fn notice_text_without_catalog(notice: &PendingNotice) -> String {
+        let catalog = tempfile::tempdir().unwrap();
+        notice.text(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            &mut None,
+        )
+    }
+
+    fn flush_without_catalog(
+        status_path: Option<&Path>,
+        pending: &mut VecDeque<PendingNotice>,
+        poker: &dyn Poker,
+    ) {
+        let catalog = tempfile::tempdir().unwrap();
+        flush_pending(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            status_path,
+            pending,
+            poker,
+        );
     }
 
     #[derive(Default)]
@@ -1098,28 +1349,223 @@ mod tests {
     }
 
     #[test]
-    fn poke_text_normalizes_and_bounds_untrusted_fields() {
+    fn ancestor_depth_is_encoded_in_the_marker_run() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "middle", Some("h.root"));
+        declare_agent(catalog.path(), "h", "recipient", Some("middle"));
+
         assert_eq!(
-            poke_text(&msg("1785070000000-abc123.md", "alice", Some("deploy?"))),
-            "[DING] new st2 message: [id:abc123] deploy? (from alice); check your inbox"
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.middle", Some("direct"))
+            ),
+            "[DING] ↓ h.middle: direct [id:abc123]"
         );
         assert_eq!(
-            poke_text(&Message {
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-def456.md", "h.root", Some("skip-level"))
+            ),
+            "[DING] ↓↓ h.root: skip-level [id:def456]"
+        );
+    }
+
+    #[test]
+    fn relationship_markers_cover_descendant_peer_and_missing_sender_spec() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+        declare_agent(catalog.path(), "h", "child", Some("recipient"));
+        declare_agent(catalog.path(), "h", "peer", Some("root"));
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.child", Some("report"))
+            ),
+            "[DING] ↑ h.child: report [id:abc123]"
+        );
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-def456.md", "h.peer", Some("note"))
+            ),
+            "[DING] ← h.peer: note [id:def456]"
+        );
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-ghi789.md", "nightly-timer", Some("check"))
+            ),
+            "[DING] ? nightly-timer: check [id:ghi789]"
+        );
+    }
+
+    #[test]
+    fn dangling_catalog_entry_makes_relationship_unknown() {
+        use std::os::unix::fs::symlink;
+
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+        symlink(
+            catalog.path().join("missing.kdl"),
+            catalog.path().join("dangling.kdl"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.root", Some("dangling"))
+            ),
+            "[DING] ? h.root: dangling [id:abc123]"
+        );
+    }
+
+    #[test]
+    fn self_addressed_message_is_unknown_pending_contract_decision() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.recipient", Some("self"))
+            ),
+            "[DING] ? h.recipient: self [id:abc123]"
+        );
+    }
+
+    #[test]
+    fn supervisor_cycle_renders_unknown_and_still_delivers() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", Some("loop"));
+        declare_agent(catalog.path(), "h", "loop", Some("recipient"));
+        let message = msg("1785070000000-abc123.md", "h.loop", Some("cycle"));
+        let expected = "[DING] ? h.loop: cycle [id:abc123]";
+        let resolver = RelationshipResolver::read(catalog.path());
+        let recipient = resolve_spec(&resolver.specs, "h.recipient", "h").unwrap();
+
+        assert_eq!(
+            supervisor_chain(&resolver.specs, recipient, "h"),
+            Err(SupervisorChainError::Cycle),
+            "cycle detection must be distinct from the independent depth limit"
+        );
+
+        assert_eq!(
+            poke_text(catalog.path(), "h", "h.recipient", &message),
+            expected
+        );
+
+        let mut pending = VecDeque::from([PendingNotice::message(message)]);
+        let poker = RecordingPoker::live();
+        flush_pending(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            None,
+            &mut pending,
+            &poker,
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(poker.calls.lock().unwrap().as_slice(), [expected]);
+    }
+
+    #[test]
+    fn malformed_catalog_with_resolvable_endpoints_renders_unknown_and_still_delivers() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+        let malformed = catalog.path().join("h/broken/agent.kdl");
+        std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+        std::fs::write(&malformed, "agent this is not valid KDL {").unwrap();
+        let message = msg("1785070000000-abc123.md", "h.sender", Some("fallback"));
+        let message = Message {
+            from: Some("h.root".to_string()),
+            ..message
+        };
+        let expected = "[DING] ? h.root: fallback [id:abc123]";
+        let mut pending = VecDeque::from([PendingNotice::message(message)]);
+        let poker = RecordingPoker::live();
+
+        flush_pending(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            None,
+            &mut pending,
+            &poker,
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(poker.calls.lock().unwrap().as_slice(), [expected]);
+    }
+
+    #[test]
+    fn supervisor_depth_limit_fails_soft() {
+        let catalog = tempfile::tempdir().unwrap();
+        for depth in 0..=SUPERVISOR_CHAIN_LIMIT {
+            let identity = format!("agent-{depth}");
+            let supervisor =
+                (depth < SUPERVISOR_CHAIN_LIMIT).then(|| format!("agent-{}", depth + 1));
+            declare_agent(catalog.path(), "h", &identity, supervisor.as_deref());
+        }
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.agent-0",
+                &msg("1785070000000-abc123.md", "h.agent-64", Some("too deep"))
+            ),
+            "[DING] ? h.agent-64: too deep [id:abc123]"
+        );
+    }
+
+    #[test]
+    fn poke_text_normalizes_and_bounds_untrusted_fields() {
+        assert_eq!(
+            render_without_catalog(&msg("1785070000000-abc123.md", "alice", Some("deploy?"))),
+            "[DING] ? alice: deploy? [id:abc123]"
+        );
+        assert_eq!(
+            render_without_catalog(&Message {
                 from: None,
                 subject: None,
                 ..msg("1785070000000-def456.md", "", None)
             }),
-            "[DING] new st2 message: [id:def456] (no subject) (from unknown); check your inbox"
+            "[DING] ? unknown: (no subject) [id:def456]"
         );
 
         let subject = format!("{}\nignored", "s".repeat(SUBJECT_MAX_CHARS + 20));
         let sender = format!("{}\tignored", "f".repeat(SENDER_MAX_CHARS + 20));
-        let text = poke_text(&msg("1785070000000-ghi789.md", &sender, Some(&subject)));
+        let text = render_without_catalog(&msg("1785070000000-ghi789.md", &sender, Some(&subject)));
         assert!(text.contains(&"s".repeat(SUBJECT_MAX_CHARS)));
         assert!(!text.contains(&"s".repeat(SUBJECT_MAX_CHARS + 1)));
         assert!(text.contains(&"f".repeat(SENDER_MAX_CHARS)));
         assert!(!text.contains(&"f".repeat(SENDER_MAX_CHARS + 1)));
-        assert!(text.ends_with("; check your inbox"));
+        assert!(text.ends_with("[id:ghi789]"));
         assert!(text.contains("[id:ghi789]"));
     }
 
@@ -1130,11 +1576,11 @@ mod tests {
             "attacker\x1b[201~\r\u{009b}2J",
             Some("line one\n\tline two\x1b[201~key:return"),
         );
-        let text = poke_text(&message);
+        let text = render_without_catalog(&message);
         assert!(!text.chars().any(char::is_control));
         assert!(!text.contains("  "));
         assert!(text.contains("[id:k0ygwh]"));
-        assert!(text.ends_with("; check your inbox"));
+        assert!(text.ends_with("[id:k0ygwh]"));
 
         let direct = format!("{text}\x1b[201~\nsecond line");
         let args = pty_stage_args("seat", &direct);
@@ -1213,13 +1659,11 @@ mod tests {
     }
 
     fn staged_wrapped_codex_screen() -> (&'static str, String) {
-        let text = "[DING] new st2 message: [id:abc123] a deliberately long synthetic notification with enough content to reach another renderer boundary before the final words; check your inbox";
+        let text = "[DING] ↓ supervisor: a deliberately long synthetic notification with enough content to reach another renderer boundary before the final words [id:abc123]";
         let composer = concat!(
-            "[DING] new st2 message: [id:abc123] a deliberately long synthetic notification",
+            "[DING] ↓ supervisor: a deliberately long synthetic notification with enough",
             "\x1b[3X\r\n",
-            "  with enough content to reach another renderer boundary before the final words; check",
-            "\x1b[2X\r\n",
-            "  your inbox",
+            "  content to reach another renderer boundary before the final words [id:abc123]",
         );
         (
             text,
@@ -1431,8 +1875,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     /// sits above every genuinely idle composer, so both directions are pinned here.
     #[test]
     fn an_in_flight_turn_blocks_return_but_a_finished_one_does_not() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
 
         for status in ACTIVE_TURN_STATUS {
             // Empty composer mid-turn: positively empty, but not safe.
@@ -1472,8 +1915,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn claude_question_form_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
 
         assert!(composer::looks_like_choice_menu(
             CAPTURED_CLAUDE_QUESTION_FORM
@@ -1501,8 +1943,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn codex_trust_selection_blocks_while_an_ordinary_idle_composer_stays_deliverable() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
 
         assert!(composer::looks_like_choice_menu(
             CAPTURED_CODEX_TRUST_SELECTION
@@ -1598,8 +2039,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn codex_latency_retry_notice_blocks_without_choice_menu_structure() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] latency control (from cos); check your inbox";
+        let expected = "[DING] ? cos: latency control [id:abc123]";
 
         assert!(!composer::looks_like_choice_menu(
             CODEX_LATENCY_RETRY_NOTICE
@@ -1618,8 +2058,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn claude_question_form_blocks_after_selection_moves_to_second_or_last_option() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
 
         for option in [2, 4] {
             let form = captured_claude_question_form_with_selection(option);
@@ -1640,8 +2079,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn two_option_claude_question_form_blocks_return() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
         let form = captured_two_option_claude_question_form();
 
         assert!(!form.contains("  3."));
@@ -1658,8 +2096,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn legacy_numbered_choice_menu_still_blocks_return() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
         let legacy_menu = "› 1. Continue\r\n  2. Cancel";
 
         assert!(composer::looks_like_choice_menu(legacy_menu));
@@ -1683,8 +2120,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     /// classify from a pasted draft instead of the real composer.
     #[test]
     fn composer_positions_are_compared_as_rows_not_raw_byte_offsets() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
         assert_eq!(
             classify_composer(&live_claude_below_escape_heavy_codex_transcript(), expected),
             ComposerState::EmptySafe
@@ -1715,8 +2151,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     /// "idle" or "already staged" is a wrong positive: it can type into, or submit, a human draft.
     #[test]
     fn transcript_composers_never_outrank_the_live_bottom_composer() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
 
         // The live Codex composer holds a human draft in both cases, so both must stay `Changed`.
         // An empty transcript row would otherwise read as positively-empty and allow the paste.
@@ -1754,8 +2189,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn maintained_composer_classifiers_require_exact_idle_state() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
         assert_eq!(
             classify_composer(&idle_codex_screen(), expected),
             ComposerState::EmptySafe
@@ -1850,8 +2284,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn maintained_codex_context_footers_are_narrow_and_position_bound() {
-        let expected =
-            "[DING] new st2 message: [id:abc123] exact observation (from cos); check your inbox";
+        let expected = "[DING] ? cos: exact observation [id:abc123]";
 
         for footer in [
             "gpt-5.6-sol xhigh · ding-fix · Context 73% left",
@@ -1954,7 +2387,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn codex_renderer_wraps_preserve_possible_inter_word_spaces() {
         let (expected, screen) = staged_wrapped_codex_screen();
-        let token_split = expected.replace("check your", "checkyour");
+        let token_split = expected.replace("enough content", "enoughcontent");
         let changed = expected.replace("synthetic", "different");
 
         assert_eq!(
@@ -2009,8 +2442,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn startup_adopts_only_an_exact_recovery_or_backlog_composer() {
         let recovery = RECOVERY_POKE.to_string();
-        let backlog =
-            "[DING] new st2 message: [id:abc123] seeded (from cos); check your inbox".to_string();
+        let backlog = "[DING] ? cos: seeded [id:abc123]".to_string();
         let candidates = vec![recovery.clone(), backlog.clone()];
         assert_eq!(
             exact_staged_candidate(&staged_codex_screen(&backlog), &candidates),
@@ -2030,7 +2462,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn paste_then_two_exact_observations_precede_return() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] ordered (from cos); check your inbox";
+        let text = "[DING] ? cos: ordered [id:abc123]";
         let screens = RefCell::new(VecDeque::from([
             idle_codex_screen(),
             staged_codex_screen(text),
@@ -2071,7 +2503,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn changed_modal_ambiguous_and_bounded_timeout_never_return() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] guarded (from cos); check your inbox";
+        let text = "[DING] ? cos: guarded [id:abc123]";
         for screen in [
             human_codex_screen(),
             format!("Create a plan?\r\n{}", staged_codex_screen(text)),
@@ -2131,7 +2563,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn final_observation_change_and_staged_retry_are_fail_closed() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] final race (from cos); check your inbox";
+        let text = "[DING] ? cos: final race [id:abc123]";
         let screens = RefCell::new(VecDeque::from([
             idle_codex_screen(),
             staged_codex_screen(text),
@@ -2185,7 +2617,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn successful_transport_with_retained_or_unproven_pixels_is_not_delivered() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
+        let text = "[DING] ? cos: receipt truth [id:abc123]";
         for screen in [
             staged_codex_screen(text),
             idle_codex_screen(),
@@ -2224,7 +2656,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn ambiguous_transport_receipt_and_retry_errors_retain_staged_ownership() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] error truth (from cos); check your inbox";
+        let text = "[DING] ? cos: error truth [id:abc123]";
 
         let actions = RefCell::new(Vec::new());
         assert_eq!(
@@ -2288,7 +2720,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn adapter_recognized_notice_with_an_empty_live_composer_is_a_positive_receipt() {
-        let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
+        let text = "[DING] ? cos: receipt truth [id:abc123]";
         assert_eq!(
             classify_receipt(&queued_codex_screen(text), text),
             ReceiptState::Accepted
@@ -2353,7 +2785,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
     #[test]
     fn unsupported_composer_wraps_are_unproven_receipts() {
-        let text = "[DING] new st2 message: [id:abc123] receipt truth (from cos); check your inbox";
+        let text = "[DING] ? cos: receipt truth [id:abc123]";
         let (first, continuation) = text.split_at(32);
         let codex = format!(
             "\x1b[1m›\x1b[1C\x1b[0m{first}\r\n  {continuation}\r\n\r\n\
@@ -2387,7 +2819,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn staged_retry_submits_only_retained_safe_and_requires_a_receipt() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] retry truth (from cos); check your inbox";
+        let text = "[DING] ? cos: retry truth [id:abc123]";
 
         let retained = RefCell::new(VecDeque::from([
             staged_codex_screen(text),
@@ -2464,7 +2896,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn staged_retry_keeps_unproven_and_retained_blocked_owned() {
         use std::cell::RefCell;
 
-        let text = "[DING] new st2 message: [id:abc123] retry truth (from cos); check your inbox";
+        let text = "[DING] ? cos: retry truth [id:abc123]";
         for screen in [
             "unknown renderer".to_string(),
             format!("Create a plan?\r\n{}", staged_codex_screen(text)),
@@ -2561,7 +2993,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let archive = archive_dir(agent.path());
         let filename = send_to_inbox(&inbox, "cos", Some("owned"), None, &[], "body").unwrap();
         let message = message::list_inbox(&inbox).unwrap().pop().unwrap();
-        let expected = poke_text(&message);
+        let expected = render_without_catalog(&message);
         let mut pending = VecDeque::from([PendingNotice::message(message)]);
         let poker = OwnershipPoker {
             pokes: Mutex::new(Vec::new()),
@@ -2573,7 +3005,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             ])),
         };
 
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].staged_text(), Some(expected.as_str()));
 
@@ -2585,9 +3017,9 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             "an already-started paste remains inspection-owned across archive"
         );
 
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
         assert_eq!(pending.len(), 1);
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
         assert!(pending.is_empty());
         assert_eq!(poker.pokes.lock().unwrap().as_slice(), [expected.as_str()]);
         assert_eq!(
@@ -2609,8 +3041,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .into_iter()
             .map(PendingNotice::message)
             .collect();
-        let first_text = pending[0].text();
-        let second_text = pending[1].text();
+        let first_text = notice_text_without_catalog(&pending[0]);
+        let second_text = notice_text_without_catalog(&pending[1]);
         let poker = OwnershipPoker {
             pokes: Mutex::new(Vec::new()),
             retries: Mutex::new(Vec::new()),
@@ -2621,10 +3053,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
         };
 
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
         archive_msg(&inbox, &archive, &first).unwrap();
         prune_archived_pending(&inbox, &mut pending);
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
 
         assert!(pending.is_empty());
         assert_eq!(
@@ -2648,7 +3080,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .into_iter()
             .map(PendingNotice::message)
             .collect();
-        let first_text = pending[0].text();
+        let first_text = notice_text_without_catalog(&pending[0]);
         let poker = OwnershipPoker {
             pokes: Mutex::new(Vec::new()),
             retries: Mutex::new(Vec::new()),
@@ -2659,8 +3091,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
         };
 
-        flush_pending(None, &mut pending, &poker);
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
 
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].staged_text(), Some(first_text.as_str()));
@@ -2702,9 +3134,9 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
 
         *poker.failures.lock().unwrap() = 1;
         status::set_state(&status_path, status::State::Busy).unwrap();
-        flush_pending(Some(&status_path), &mut pending, &poker);
+        flush_without_catalog(Some(&status_path), &mut pending, &poker);
         assert_eq!(pending.len(), 1, "a failed head remains queued");
-        flush_pending(Some(&status_path), &mut pending, &poker);
+        flush_without_catalog(Some(&status_path), &mut pending, &poker);
         assert!(pending.is_empty());
 
         let third = send_to_inbox(&inbox, "carol", Some("third"), None, &[], "three").unwrap();
@@ -2716,7 +3148,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 .map(PendingNotice::message),
         );
         status::set_state(&status_path, status::State::Dnd).unwrap();
-        flush_pending(Some(&status_path), &mut pending, &poker);
+        flush_without_catalog(Some(&status_path), &mut pending, &poker);
         assert_eq!(pending.len(), 1, "fresh dnd suppresses delivery");
 
         let stale = std::time::SystemTime::now() - status::STATUS_STALE - Duration::from_secs(1);
@@ -2724,7 +3156,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .unwrap()
             .set_modified(stale)
             .unwrap();
-        flush_pending(Some(&status_path), &mut pending, &poker);
+        flush_without_catalog(Some(&status_path), &mut pending, &poker);
         assert!(
             pending.is_empty(),
             "stale dnd reads unknown and no longer suppresses"
@@ -2738,6 +3170,85 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
+    fn staged_and_recovery_delivery_do_not_read_the_catalog() {
+        let catalog = tempfile::tempdir().unwrap();
+        let context = DingContext {
+            catalog_root: catalog.path(),
+            this_host: "h",
+            recipient: "h.recipient",
+        };
+
+        let mut staged =
+            PendingNotice::message(msg("1785070000000-abc123.md", "h.sender", Some("staged")));
+        staged.set_staged_text(Some("immutable staged notice".to_string()));
+        let mut pending = VecDeque::from([staged]);
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::new()),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Delivered])),
+        };
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        flush_pending(context, None, &mut pending, &poker);
+        assert_eq!(
+            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            0,
+            "immutable staged delivery must not depend on catalog traversal"
+        );
+
+        let mut pending = VecDeque::from([PendingNotice::Recovery {
+            startup: HashSet::from(["1785070000000-def456.md".to_string()]),
+            in_inbox: true,
+            staged_text: None,
+        }]);
+        let poker = RecordingPoker::live();
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        flush_pending(context, None, &mut pending, &poker);
+        assert_eq!(
+            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            0,
+            "generic recovery delivery must not depend on catalog traversal"
+        );
+        assert_eq!(poker.calls.lock().unwrap().as_slice(), [RECOVERY_POKE]);
+    }
+
+    #[test]
+    fn one_pending_batch_reads_the_catalog_once() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        let mut pending = (0..10)
+            .map(|index| {
+                PendingNotice::message(msg(
+                    &format!("17850700000{index:02}-abc{index:03}.md"),
+                    "h.sender",
+                    Some("batch"),
+                ))
+            })
+            .collect::<VecDeque<_>>();
+        let poker = RecordingPoker::live();
+
+        RELATIONSHIP_CATALOG_READS.with(|reads| reads.set(0));
+        flush_pending(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            None,
+            &mut pending,
+            &poker,
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(poker.calls.lock().unwrap().len(), 10);
+        assert_eq!(
+            RELATIONSHIP_CATALOG_READS.with(std::cell::Cell::get),
+            1,
+            "one pending batch must share one catalog observation"
+        );
+    }
+
+    #[test]
     fn startup_recovery_notice_retries_in_memory() {
         let poker = RecordingPoker::live();
         *poker.failures.lock().unwrap() = 1;
@@ -2747,9 +3258,9 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             staged_text: None,
         }]);
 
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
         assert_eq!(pending.len(), 1);
-        flush_pending(None, &mut pending, &poker);
+        flush_without_catalog(None, &mut pending, &poker);
         assert!(pending.is_empty());
 
         let calls = poker.calls.lock().unwrap();
@@ -2786,7 +3297,19 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 stop.store(true, Ordering::SeqCst);
             });
 
-            run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
+            run_ding(
+                DingContext {
+                    catalog_root: agent.path(),
+                    this_host: "h",
+                    recipient: "h.recipient",
+                },
+                &inbox,
+                Some(&status_path),
+                &poker,
+                &config,
+                &stop,
+            )
+            .unwrap();
         });
 
         let calls = poker.calls.lock().unwrap();
@@ -2817,7 +3340,19 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 std::thread::sleep(Duration::from_millis(250));
                 stop.store(true, Ordering::SeqCst);
             });
-            run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
+            run_ding(
+                DingContext {
+                    catalog_root: agent.path(),
+                    this_host: "h",
+                    recipient: "h.recipient",
+                },
+                &inbox,
+                Some(&status_path),
+                &poker,
+                &config,
+                &stop,
+            )
+            .unwrap();
         });
 
         assert_eq!(
@@ -2849,7 +3384,19 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 std::thread::sleep(Duration::from_millis(150));
                 stop.store(true, Ordering::SeqCst);
             });
-            run_ding(&inbox, Some(&status_path), &poker, &config, &stop).unwrap();
+            run_ding(
+                DingContext {
+                    catalog_root: agent.path(),
+                    this_host: "h",
+                    recipient: "h.recipient",
+                },
+                &inbox,
+                Some(&status_path),
+                &poker,
+                &config,
+                &stop,
+            )
+            .unwrap();
         });
 
         assert!(started.elapsed() >= Duration::from_millis(140));
