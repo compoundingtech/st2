@@ -143,15 +143,8 @@ struct RelationshipResolver {
     valid: bool,
 }
 
-#[cfg(test)]
-thread_local! {
-    static RELATIONSHIP_CATALOG_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 impl RelationshipResolver {
     fn read(catalog_root: &Path) -> Self {
-        #[cfg(test)]
-        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(traversals.get() + 1));
         let discovered = crate::discover_strict(catalog_root);
         Self {
             specs: discovered.specs,
@@ -3154,10 +3147,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             poke_outcomes: Mutex::new(VecDeque::new()),
             retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Delivered])),
         };
-        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(0));
+        crate::discovery::reset_discovery_walk_count_for_test();
         flush_pending(context, None, &mut pending, &poker);
         assert_eq!(
-            RELATIONSHIP_CATALOG_TRAVERSALS.with(std::cell::Cell::get),
+            crate::discovery::discovery_walk_count_for_test(),
             0,
             "immutable staged delivery must not depend on catalog traversal"
         );
@@ -3168,10 +3161,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             staged_text: None,
         }]);
         let poker = RecordingPoker::live();
-        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(0));
+        crate::discovery::reset_discovery_walk_count_for_test();
         flush_pending(context, None, &mut pending, &poker);
         assert_eq!(
-            RELATIONSHIP_CATALOG_TRAVERSALS.with(std::cell::Cell::get),
+            crate::discovery::discovery_walk_count_for_test(),
             0,
             "generic recovery delivery must not depend on catalog traversal"
         );
@@ -3193,7 +3186,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .collect::<VecDeque<_>>();
         let poker = RecordingPoker::live();
 
-        RELATIONSHIP_CATALOG_TRAVERSALS.with(|traversals| traversals.set(0));
+        crate::discovery::reset_discovery_walk_count_for_test();
         flush_pending(
             DingContext {
                 catalog_root: catalog.path(),
@@ -3208,7 +3201,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(pending.is_empty());
         assert_eq!(poker.calls.lock().unwrap().len(), 10);
         assert_eq!(
-            RELATIONSHIP_CATALOG_TRAVERSALS.with(std::cell::Cell::get),
+            crate::discovery::discovery_walk_count_for_test(),
             1,
             "one pending batch must share one catalog observation"
         );

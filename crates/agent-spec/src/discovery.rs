@@ -45,6 +45,22 @@ pub struct SpecError {
 /// Extensions discovery will attempt to parse as specs.
 const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 
+thread_local! {
+    static DISCOVERY_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the current thread's discovery-walk count for structural tests in dependent crates.
+#[doc(hidden)]
+pub fn reset_discovery_walk_count_for_test() {
+    DISCOVERY_WALK_COUNT.set(0);
+}
+
+/// Return the current thread's discovery-walk count for structural tests in dependent crates.
+#[doc(hidden)]
+pub fn discovery_walk_count_for_test() -> usize {
+    DISCOVERY_WALK_COUNT.get()
+}
+
 /// Walk `root` recursively and lower every agent spec found. Returns empty (no error) when `root`
 /// does not exist yet — a fresh, un-seeded folder is a valid state.
 pub fn discover(root: &Path) -> Discovered {
@@ -59,6 +75,7 @@ pub fn discover_strict(root: &Path) -> Discovered {
 }
 
 fn discover_impl(root: &Path, strict: bool) -> Discovered {
+    DISCOVERY_WALK_COUNT.set(DISCOVERY_WALK_COUNT.get() + 1);
     let mut out = Discovered::default();
     let mut files = Vec::new();
     collect_spec_files(root, root, &mut files, strict, &mut out.errors);
