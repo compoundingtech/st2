@@ -46,6 +46,8 @@ pub struct SpecError {
 const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 
 thread_local! {
+    /// This observer cannot see walks performed on another thread. If discovery gains a spawn
+    /// boundary, dependent structural tests can silently lose coverage and must be reassessed.
     static DISCOVERY_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
