@@ -1023,6 +1023,8 @@ pub struct UpReport {
     pub held: Vec<String>,
     /// pty ids the flapping-cap refused to (re)launch this pass (parked / crash-looping).
     pub flapping: Vec<String>,
+    /// pty ids released from a park this pass by an explicit operator request.
+    pub unparked: Vec<String>,
     /// Rich crash-loop records (a superset of `flapping`) — the source for supervisor surfacing.
     pub crash_loops: Vec<CrashLoop>,
     /// identities adopted (already fully present).
@@ -1047,6 +1049,7 @@ impl UpReport {
         self.deferred.append(&mut other.deferred);
         self.held.append(&mut other.held);
         self.flapping.append(&mut other.flapping);
+        self.unparked.append(&mut other.unparked);
         self.crash_loops.append(&mut other.crash_loops);
         self.adopted.append(&mut other.adopted);
         self.other_host.append(&mut other.other_host);
@@ -1063,8 +1066,88 @@ impl UpReport {
             || !self.torn_down.is_empty()
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
+            || !self.unparked.is_empty()
             || !self.warnings.is_empty()
             || !self.errors.is_empty()
+    }
+}
+
+/// Why a task is parked, in the operator's terms. Published with every marker so the fault reads on
+/// its own, without the reader having to already know what `mode = fail` means.
+pub const PARK_REASON: &str = "crash-looped past its restart{} policy (mode=fail)";
+
+/// Grant the operator's pending unpark requests into `cap`.
+///
+/// Call this *before* the pass plans anything, so a granted recovery relaunches in the same pass that
+/// granted it. Deferring it to the next pass would make the operator's targeted act take up to a full
+/// `--interval` to show any effect, which reads as "it did nothing" and invites a second attempt.
+///
+/// Only the long-lived supervisor loops may call it. A one-shot `up_once` builds a fresh
+/// [`FlappingCap`] with an empty parked set, so consuming a request there would silently discard it.
+pub fn grant_unpark_requests(cap: &mut FlappingCap, request_dir: &Path, report: &mut UpReport) {
+    let (ids, errors) = crate::park::take_unpark_requests(request_dir);
+    report.errors.extend(errors);
+    for id in ids {
+        if cap.unpark(&id) {
+            report.unparked.push(id);
+        } else {
+            report
+                .warnings
+                .push(format!("unpark '{id}': not parked; nothing to recover"));
+        }
+    }
+}
+
+/// Republish the parked projection to match `cap`.
+///
+/// Call this *after* the pass has executed, so a task parked by this very pass is already visible to
+/// the next `st2 tasks`. Republishing also retracts the marker of anything no longer parked, so a
+/// recovered task stops reporting a fault without anyone remembering to clean up.
+///
+/// Supervisor loops only, for the same reason as [`grant_unpark_requests`]: publishing an empty
+/// one-shot cap would wipe the running supervisor's projection and hide every live park.
+pub fn publish_parks(cap: &FlappingCap, projection: &crate::park::ParkProjection, report: &mut UpReport) {
+    let parked: std::collections::BTreeSet<String> = cap.parked_ids().cloned().collect();
+    report.errors.extend(projection.publish(&parked, PARK_REASON));
+}
+
+/// A supervisor loop's end of the park channel: the projection it publishes and the request dir it
+/// drains. Bundled because the two are only ever used together, and only by a loop that owns a
+/// long-lived [`FlappingCap`].
+///
+/// A supervisor that cannot identify its own process generation cannot write a believable marker, so
+/// it publishes nothing rather than something a reader would have to guess about. Parking itself is
+/// unaffected — it degrades to exactly the pre-#204 behaviour, loudly.
+pub struct ParkChannel {
+    projection: Option<crate::park::ParkProjection>,
+    request_dir: PathBuf,
+}
+
+impl ParkChannel {
+    pub fn for_host(host: &str) -> Self {
+        let projection = match crate::park::ParkProjection::for_host(host) {
+            Ok(projection) => Some(projection),
+            Err(error) => {
+                eprintln!(
+                    "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults on this host."
+                );
+                None
+            }
+        };
+        Self {
+            projection,
+            request_dir: crate::park::unpark_request_dir(host),
+        }
+    }
+
+    fn grant_requests(&self, cap: &mut FlappingCap, report: &mut UpReport) {
+        grant_unpark_requests(cap, &self.request_dir, report);
+    }
+
+    fn publish(&self, cap: &FlappingCap, report: &mut UpReport) {
+        if let Some(projection) = &self.projection {
+            publish_parks(cap, projection, report);
+        }
     }
 }
 
@@ -1730,8 +1813,11 @@ pub fn up_loop_specs(
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
     let mut reported_flapping: HashSet<String> = HashSet::new();
+    let park_channel = ParkChannel::for_host(this_host);
     loop {
-        let report = reconcile_pass_specs_with_cursor(
+        let mut pre = UpReport::default();
+        park_channel.grant_requests(&mut cap, &mut pre);
+        let mut report = reconcile_pass_specs_with_cursor(
             specs,
             this_host,
             runner,
@@ -1739,11 +1825,17 @@ pub fn up_loop_specs(
             &mut debounce,
             &mut presentation_cursor,
         );
+        pre.absorb(report);
+        report = pre;
+        for id in &report.unparked {
+            reported_flapping.remove(id);
+        }
+        park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
-                    "st2: GAVE UP on '{}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. Fix the cause, then restart st2.",
-                    cl.pty_id
+                    "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
+                    id = cl.pty_id
                 );
                 surface_crash_loop(root, this_host, cl);
             }
@@ -1899,9 +1991,12 @@ fn up_loop_until(
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
     let mut reported_flapping: HashSet<String> = HashSet::new();
+    let park_channel = ParkChannel::for_host(this_host);
 
     loop {
-        let report = reconcile_pass(
+        let mut pre = UpReport::default();
+        park_channel.grant_requests(&mut cap, &mut pre);
+        let mut report = reconcile_pass(
             root,
             this_host,
             &task_context,
@@ -1910,11 +2005,19 @@ fn up_loop_until(
             &mut debounce,
             &mut presentation_cursor,
         );
+        pre.absorb(report);
+        report = pre;
+        // A recovered task that crash-loops again is a new crash-loop, so it must be able to surface
+        // again. Leaving the id in the dedup set would make every park after the first one silent.
+        for id in &report.unparked {
+            reported_flapping.remove(id);
+        }
+        park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
                 eprintln!(
-                    "st2: GAVE UP on '{}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. Fix the cause, then restart st2.",
-                    cl.pty_id
+                    "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
+                    id = cl.pty_id
                 );
                 surface_crash_loop(root, this_host, cl);
             }
@@ -1974,10 +2077,11 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     };
     let subject = format!("crash-loop: {agent} parked");
     let body = format!(
-        "st2 gave up restarting task '{}' (agent {agent}) — it crash-looped past its restart{{}} \
-         policy (mode=fail) and is parked. Its last dead session is left as evidence. Investigate the \
-         cause, then restart st2 to unpark it.",
-        cl.pty_id
+        "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its restart{{}} \
+         policy (mode=fail) and is parked. Its last dead session is left as evidence, and `st2 tasks` \
+         reports the park. Investigate the cause, then `st2 unpark {id}` to recover just this task — \
+         restarting st2 is not required and would cold-boot every task on the host.",
+        id = cl.pty_id
     );
     let from = format!("st2.{this_host}"); // the runner is the sender
     let tags = ["crash-loop".to_string()];

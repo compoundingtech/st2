@@ -461,6 +461,8 @@ fn selected_one_shot_wrong_host_refuses_before_runner_list() {
     assert!(error.to_string().contains("did not resolve"));
     assert_refusal(&runner);
 }
+use st2::park::{DirParkObserver, ParkObserver, ParkProjection, ParkState};
+use st2::run::{grant_unpark_requests, publish_parks};
 use st2::{FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once};
 
 fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], host: &str) -> ReconcilePlan<'a> {
@@ -1411,6 +1413,168 @@ fn parked_compact_agent_does_not_relaunch_its_exited_derived_ding() {
             .borrow()
             .contains(&"hetz.demo.ding".to_string())
     );
+}
+
+/// #204 at the supervisor's own seam: a fail-mode task crash-loops into a terminal park, the park
+/// becomes legible, an operator clears exactly that task, and it comes back — with a healthy peer
+/// never touched, which is what "without restarting the supervisor" means in operations.
+///
+/// The peer is the negative control. A host-wide restart would have cold-booted it too, so the claim
+/// that recovery is targeted is exactly the claim that nothing in the runner's op log names it across
+/// either phase. That is a stronger check than comparing a pid, because it would also catch a kill
+/// followed by an identical relaunch.
+///
+/// One `FlappingCap` spans both phases deliberately. Parking is scoped to a supervisor run, so a test
+/// that built a fresh cap per phase would be testing the restart it is supposed to avoid — and
+/// `up_once` cannot be used here at all for the same reason: both single-pass entry points construct
+/// `FlappingCap::default()`, so a one-shot reconcile can never park anything.
+#[test]
+fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The projection and request dirs are temporaries, never this machine's real state dir: a test
+    // that reached the live path could clear a real operator's park.
+    let state = tempfile::tempdir().unwrap();
+    let projection = ParkProjection::current(state.path().join("parked")).unwrap();
+    let requests = state.path().join("unpark");
+
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_DING,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/peer/agent.kdl",
+        "agent \"peer\" {\n  host \"hetz\"\n  command \"serve\"\n}\n",
+    );
+    let found = discover(tmp.path());
+    let mut cap = FlappingCap::default();
+
+    // Phase 1 — the flapper dies before every pass; the peer is up and stays up.
+    let crashing = FakeRunner {
+        sessions: vec![
+            dead("hetz.demo"),
+            live("hetz.demo.ding"),
+            live("hetz.peer"),
+        ],
+        ..Default::default()
+    };
+    let mut parked_report = UpReport::default();
+    for _ in 0..4 {
+        let plan = reconcile(&found.specs, &crashing.sessions, "hetz");
+        parked_report = UpReport::default();
+        execute(&plan, &crashing, &mut cap, &mut parked_report);
+        publish_parks(&cap, &projection, &mut parked_report);
+    }
+    assert_eq!(parked_report.flapping, ["hetz.demo"]);
+    assert!(cap.is_parked("hetz.demo"));
+
+    // The park is legible to a separate reader — the entire point of #204.
+    let observer = DirParkObserver::new(state.path().join("parked"));
+    let batch = observer.observe(&["hetz.demo".to_string(), "hetz.peer".to_string()]);
+    assert!(batch.complete, "a park is a known fault, not missing evidence");
+    let ParkState::Parked(record) = batch.state("hetz.demo") else {
+        panic!("the parked task is not visible in the projection");
+    };
+    assert_eq!(record.reason, st2::run::PARK_REASON);
+    assert_eq!(batch.state("hetz.peer"), &ParkState::NotParked);
+
+    assert_eq!(
+        lifecycle_ops(&crashing, "hetz.peer"),
+        Vec::<String>::new(),
+        "the healthy peer was restarted while its neighbour crash-looped"
+    );
+
+    // The operator fixes the cause and clears this one task.
+    st2::park::request_unpark(&requests, "hetz.demo").unwrap();
+
+    // Phase 2 — same supervisor run, same cap. The fixed task now comes up and stays up.
+    let recovered = FakeRunner {
+        sessions: vec![dead("hetz.demo"), dead("hetz.demo.ding"), live("hetz.peer")],
+        ..Default::default()
+    };
+    let mut report = UpReport::default();
+    grant_unpark_requests(&mut cap, &requests, &mut report);
+    assert_eq!(report.unparked, ["hetz.demo"]);
+    let plan = reconcile(&found.specs, &recovered.sessions, "hetz");
+    execute(&plan, &recovered, &mut cap, &mut report);
+    publish_parks(&cap, &projection, &mut report);
+
+    assert!(
+        report.flapping.is_empty(),
+        "the granted task was still refused a launch"
+    );
+    let spawned = recovered.spawned.borrow().clone();
+    assert!(
+        spawned.contains(&"hetz.demo".to_string()),
+        "the recovery did not actually relaunch the task: {spawned:?}"
+    );
+    // A recovery that brings the agent back but leaves its DING dead would silently stop delivering
+    // that agent's messages — the derived companion is suppressed *because* the agent is parked, so
+    // clearing the park has to bring it back with the agent.
+    assert!(
+        spawned.contains(&"hetz.demo.ding".to_string()),
+        "the derived ding stayed dead after its agent recovered: {spawned:?}"
+    );
+    assert_eq!(
+        lifecycle_ops(&recovered, "hetz.peer"),
+        Vec::<String>::new(),
+        "recovering one task restarted the healthy peer, which is a host-wide restart by another name"
+    );
+
+    // The fault clears truthfully rather than lingering as a stale marker.
+    let batch = observer.observe(&["hetz.demo".to_string()]);
+    assert_eq!(batch.state("hetz.demo"), &ParkState::NotParked);
+    assert!(batch.complete);
+
+    // And it stays recovered past `interval` (60s here) rather than for one pass: uptime forgives the
+    // budget, so a task that genuinely came back is not one failure away from parking again.
+    let up = FakeRunner {
+        sessions: vec![live("hetz.demo"), live("hetz.demo.ding"), live("hetz.peer")],
+        ..Default::default()
+    };
+    for _ in 0..5 {
+        let plan = reconcile(&found.specs, &up.sessions, "hetz");
+        let mut report = UpReport::default();
+        execute(&plan, &up, &mut cap, &mut report);
+        publish_parks(&cap, &projection, &mut report);
+        assert!(report.flapping.is_empty());
+    }
+    assert!(!cap.is_parked("hetz.demo"));
+    assert!(
+        lifecycle_ops(&up, "hetz.").is_empty(),
+        "a settled fleet was churned: {:?}",
+        up.ops.borrow()
+    );
+}
+
+/// Spawns, kills, reaps and removals naming `id` — the ops that actually restart or destroy a task.
+/// Presentation patching is deliberately excluded: it re-labels a live session and is not a restart,
+/// so counting it would make an unrelated cosmetic write look like collateral damage.
+fn lifecycle_ops(runner: &FakeRunner, id: &str) -> Vec<String> {
+    runner
+        .ops
+        .borrow()
+        .iter()
+        .filter(|op| !op.starts_with("patch:") && op.contains(id))
+        .cloned()
+        .collect()
+}
+
+/// A granted unpark that names nothing parked must not be silently swallowed: an operator who typo'd
+/// a task id has to learn that nothing was recovered, or they will wait forever for a task to return.
+#[test]
+fn an_unpark_request_for_a_task_that_is_not_parked_says_so() {
+    let requests = tempfile::tempdir().unwrap();
+    st2::park::request_unpark(requests.path(), "hetz.typo").unwrap();
+
+    let mut cap = FlappingCap::default();
+    let mut report = UpReport::default();
+    grant_unpark_requests(&mut cap, requests.path(), &mut report);
+
+    assert!(report.unparked.is_empty());
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("hetz.typo"), "{:?}", report.warnings);
 }
 
 /// A parked crash-loop is surfaced to the agent's supervisor over the native bus: a `crash-loop`-tagged

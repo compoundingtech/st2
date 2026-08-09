@@ -261,6 +261,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Clear one task's park after fixing what crash-looped it. A task parked by its `restart{}`
+    /// policy (mode=fail) stays parked for the rest of the supervisor run, and this is its per-task
+    /// exit: the running supervisor relaunches exactly this task on its next pass, leaving every
+    /// other task on the host untouched. `st2 tasks --json` reports which tasks are parked.
+    Unpark {
+        /// The parked task's runtime id, exactly as `st2 tasks --json` reports it.
+        task: String,
+        /// Host whose supervisor should grant the request. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
@@ -957,6 +968,7 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             tasks_cmd(&catalog, host)
         }
+        Command::Unpark { task, host } => unpark_cmd(&task, host),
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
                 anyhow::bail!(
@@ -1520,6 +1532,23 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
     } else {
         anyhow::bail!("task inventory incomplete")
     }
+}
+
+/// Ask this host's supervisor to release one parked task.
+///
+/// The request is a file the supervisor drains at the top of its next pass, not a direct mutation:
+/// the parked set lives in the supervisor's memory, and it is the only writer. That also means this
+/// is best-effort by construction — with no supervisor running there is nothing to grant it, which is
+/// why the confirmation says "requested" rather than claiming the task is back.
+fn unpark_cmd(task: &str, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let dir = st2::park::unpark_request_dir(&host);
+    st2::park::request_unpark(&dir, task)?;
+    println!(
+        "unpark requested for '{task}' on {host}; the running supervisor grants it on its next \
+         reconcile pass. Confirm with `st2 tasks --json` — the task's `parked` field clears."
+    );
+    Ok(())
 }
 
 fn print_incomplete_tasks(catalog: PathBuf, host: String, detail: String) -> Result<()> {
@@ -2697,6 +2726,7 @@ fn print_report(report: &UpReport) {
     report_line("gc", &report.gc);
     report_line("held", &report.held);
     report_line("flapping", &report.flapping);
+    report_line("unparked", &report.unparked);
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);
     report_line("unrunnable", &report.unrunnable);
