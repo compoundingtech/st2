@@ -1503,7 +1503,8 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
         Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
     };
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
-    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    let parks = st2::park::DirParkObserver::for_host(&host);
+    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner, &parks);
     let after = discover(&catalog);
     if !st2::task_inventory::same_discovery(&found, &after) {
         inventory.mark_incomplete("catalog declarations changed during task observation");

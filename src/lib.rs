@@ -22,6 +22,7 @@ pub mod host_lock;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
+pub mod park;
 pub mod pretrust;
 pub mod reconcile;
 pub mod request;

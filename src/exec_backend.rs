@@ -806,7 +806,7 @@ fn generation_id(runtime_id: &str, pid: u32, created_at: &str, start_time_ticks:
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
+pub(crate) fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let after_comm = stat
         .rsplit_once(") ")
@@ -822,7 +822,7 @@ fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
+pub(crate) fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskallinfo>::zeroed();
     let expected = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
     let read = unsafe {
@@ -898,7 +898,7 @@ fn process_created_at(start_time_ticks: u64) -> anyhow::Result<SystemTime> {
     Ok(UNIX_EPOCH + Duration::from_micros(start_time_ticks))
 }
 
-fn rfc3339_utc(time: SystemTime) -> anyhow::Result<String> {
+pub(crate) fn rfc3339_utc(time: SystemTime) -> anyhow::Result<String> {
     let duration = time.duration_since(UNIX_EPOCH)?;
     let seconds = duration.as_secs() as libc::time_t;
     let millis = duration.subsec_millis();
