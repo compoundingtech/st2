@@ -213,7 +213,7 @@ fn relationship_marker(
     let sender_id = sender.bus_id(this_host);
     let recipient_id = recipient.bus_id(this_host);
     if sender_id == recipient_id {
-        return "?".to_string();
+        return "↺".to_string();
     }
     let Ok(recipient_chain) = supervisor_chain(&resolver.specs, recipient, this_host) else {
         return "?".to_string();
@@ -1437,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn self_addressed_message_is_unknown_pending_contract_decision() {
+    fn self_addressed_message_uses_identity_marker() {
         let catalog = tempfile::tempdir().unwrap();
         declare_agent(catalog.path(), "h", "recipient", None);
 
@@ -1448,7 +1448,7 @@ mod tests {
                 "h.recipient",
                 &msg("1785070000000-abc123.md", "h.recipient", Some("self"))
             ),
-            "[DING] ? h.recipient: self [id:abc123]"
+            "[DING] ↺ h.recipient: self [id:abc123]"
         );
     }
 
