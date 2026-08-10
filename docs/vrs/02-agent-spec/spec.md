@@ -320,6 +320,15 @@ Evidence: [spawn construction](../../../src/run.rs).
 
 <h3 id="f12">F12 Future policy (R31)</h3>
 
+```text
+canonical catalog folder + host = supervisor scope
+                            |
+                            v
+                      supervisor run
+                            |
+             park marker <--+--> unpark request
+```
+
 Agent or task `keep`, restart `attempts`, `interval`, `delay`, and `mode`, and
 task `lifecycle` are future policy. Adopt healthy work. `adopt-only` holds absent
 or dead work; `service` reconciles it normally. A generated companion follows
@@ -344,13 +353,21 @@ observation. The park is a supervisor decision about the runtime rather than an
 observation of it, so it never replaces the observed state and never makes the
 inventory envelope incomplete.
 
-Parking is terminal within a supervisor run, and its only per-task exit is an
-explicit operator request. Granting one clears exactly that task's park and its
-restart accounting, so the next launch spends a full budget; it never releases
-another parked task and never restarts a healthy one. A request naming a task
-that is not parked is reported as recovering nothing. A published park belongs
-to the supervisor run that made it: a projected park whose supervisor is gone is
-positively not parked.
+Parking is terminal within its owning supervisor run, and its only per-task exit
+is an explicit operator unpark request granted by that run. Granting one clears
+exactly that task's park and restart accounting, so the next launch spends a
+full budget; it never releases another parked task and never restarts a healthy
+one. A request naming a task that is not parked is reported as recovering
+nothing. A published park belongs to the supervisor run that made it: a
+projected park whose supervisor is gone is positively not parked.
+
+The park projection and unpark request channels share one supervisor scope: the
+exact canonical catalog folder plus host. Both marker publication/observation
+and request publication/consumption derive that scope identically. Supervisors
+for different catalog folders on the same host cannot see or delete each
+other's markers or consume each other's requests, including when the task IDs
+are identical. There is no host-only compatibility channel or task-specific
+namespace exception.
 
 Authoring: [pinned complete declaration][evals-fields]. The
 [pinned explicit-task list][evals-task-fields] and st2 `9887b28` predate task

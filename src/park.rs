@@ -8,41 +8,73 @@
 //!
 //! Two directions, one writer each. Conflating them is the tempting mistake:
 //!
-//! * The **projection** (`parked/`) is written by the supervisor and read by everyone. A missing or
-//!   absent marker means *not parked*. Nothing else may write here.
+//! * The **projection** (`parked/`) is written by the supervisor and read by observers in its scope.
+//!   A missing or absent marker means *not parked*. Nothing else may write here.
 //! * The **request** (`unpark/`) is written by `st2 unpark` and consumed by the supervisor. A missing
 //!   request means *nobody asked*.
 //!
 //! Were the projection also the request — "no marker, therefore unpark" — then a wiped state dir, a
 //! failed write, or a supervisor and CLI disagreeing about `XDG_STATE_HOME` would all silently mean
-//! *release every parked task on this host*. Each direction instead fails towards inaction.
+//! *release every parked task in that supervisor scope*. Each direction instead fails towards
+//! inaction. Both directions use the same scope: the canonical catalog folder plus host. Hashing that
+//! tuple keeps same-host supervisors from deleting each other's markers or consuming each other's
+//! requests, including when their task IDs collide.
 //!
 //! A marker is stamped with the generation of the supervisor that wrote it, and a marker whose
 //! supervisor is gone reads as **not parked**. That is not leniency: R31 scopes parking to one
-//! supervisor run, so no run means no park. It also keeps `st2 tasks` quiet and zero-exit on a host
-//! where st2 simply is not running. The generation is `(pid, start-time)` rather than a bare pid,
+//! supervisor run, so no run means no park. It also keeps `st2 tasks` quiet and zero-exit for a scope
+//! whose supervisor is not running. The generation is `(pid, start-time)` rather than a bare pid,
 //! because a recycled pid would otherwise resurrect a park from a supervisor that died days ago.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 /// Wire schema of one park marker.
 pub const PARK_SCHEMA: &str = "st2.park.v1";
 
-/// The machine-local park projection dir for a host: `$XDG_STATE_HOME/st2/<host>/parked`. A sibling
-/// of the exec runner state, and equally not synced — a park belongs to one host's supervisor run.
-pub fn park_dir(host: &str) -> PathBuf {
-    crate::run::exec_state_dir(host).with_file_name("parked")
+fn hash_scope_component(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
 }
 
-/// The operator's unpark request dir: `$XDG_STATE_HOME/st2/<host>/unpark`.
-pub fn unpark_request_dir(host: &str) -> PathBuf {
-    crate::run::exec_state_dir(host).with_file_name("unpark")
+/// The canonical machine-local ownership scope of one supervisor. The directory name is a stable
+/// SHA-256 of the length-framed canonical catalog path and host; there is no host-only fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorScope {
+    root: PathBuf,
+}
+
+impl SupervisorScope {
+    pub fn current(catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
+        Self::in_state_root(&crate::run::state_root(), catalog_root, host)
+    }
+
+    fn in_state_root(state_root: &Path, catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
+        let catalog_root = catalog_root
+            .canonicalize()
+            .with_context(|| format!("canonicalize supervisor catalog {}", catalog_root.display()))?;
+        let mut hash = Sha256::new();
+        hash.update(b"st2.supervisor-scope.v1");
+        hash_scope_component(&mut hash, catalog_root.as_os_str().as_bytes());
+        hash_scope_component(&mut hash, host.as_bytes());
+        let scope_id = format!("sha256-{:x}", hash.finalize());
+        Ok(Self { root: state_root.join("st2/supervisors").join(scope_id) })
+    }
+
+    pub fn park_dir(&self) -> PathBuf {
+        self.root.join("parked")
+    }
+
+    pub fn unpark_request_dir(&self) -> PathBuf {
+        self.root.join("unpark")
+    }
 }
 
 /// One parked task, as published by the supervisor that parked it.
@@ -92,7 +124,7 @@ pub trait ParkObserver {
     fn observe(&self, desired: &[String]) -> ParkBatch;
 }
 
-/// The real projection reader, rooted at a host's park dir.
+/// The real projection reader, rooted at one supervisor scope's park dir.
 #[derive(Debug, Clone)]
 pub struct DirParkObserver {
     dir: PathBuf,
@@ -120,8 +152,8 @@ impl DirParkObserver {
         Self { dir }
     }
 
-    pub fn for_host(host: &str) -> Self {
-        Self::new(park_dir(host))
+    pub fn for_supervisor(catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
+        Ok(Self::new(SupervisorScope::current(catalog_root, host)?.park_dir()))
     }
 
     fn observe_with(
@@ -254,8 +286,8 @@ impl ParkProjection {
         })
     }
 
-    pub fn for_host(host: &str) -> anyhow::Result<Self> {
-        Self::current(park_dir(host))
+    pub fn for_supervisor(catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
+        Self::current(SupervisorScope::current(catalog_root, host)?.park_dir())
     }
 
     /// Republish the projection to exactly `parked`, returning any non-fatal errors. Markers for ids
@@ -426,6 +458,55 @@ mod tests {
 
     fn desired(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn same_host_supervisors_isolate_markers_and_requests_by_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog_a = temp.path().join("catalog-a");
+        let catalog_b = temp.path().join("catalog-b");
+        fs::create_dir_all(&catalog_a).unwrap();
+        fs::create_dir_all(&catalog_b).unwrap();
+
+        let channel_a =
+            SupervisorScope::in_state_root(temp.path(), &catalog_a, "shared-host").unwrap();
+        let channel_b =
+            SupervisorScope::in_state_root(temp.path(), &catalog_b, "shared-host").unwrap();
+        let projection_a = projection(&channel_a.park_dir());
+        let projection_b = projection(&channel_b.park_dir());
+
+        projection_a.publish(&parked(&["same.task"]), "crash-looped");
+        projection_b.publish(&BTreeSet::new(), "crash-looped");
+        let marker_a =
+            DirParkObserver::new(channel_a.park_dir()).observe(&desired(&["same.task"]));
+
+        request_unpark(&channel_b.unpark_request_dir(), "same.task").unwrap();
+        let (taken_by_a, errors_a) = take_unpark_requests(&channel_a.unpark_request_dir());
+        let (taken_by_b, errors_b) = take_unpark_requests(&channel_b.unpark_request_dir());
+
+        assert!(errors_a.is_empty() && errors_b.is_empty());
+        assert!(
+            matches!(marker_a.state("same.task"), ParkState::Parked(_)),
+            "catalog B deleted catalog A's same-host marker"
+        );
+        assert!(taken_by_a.is_empty(), "catalog A consumed catalog B's request");
+        assert_eq!(taken_by_b, ["same.task"]);
+    }
+
+    #[test]
+    fn supervisor_scope_canonicalizes_catalog_aliases_and_includes_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        let alias = temp.path().join("catalog-alias");
+        fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&catalog, &alias).unwrap();
+
+        let direct = SupervisorScope::in_state_root(temp.path(), &catalog, "host-a").unwrap();
+        let through_alias = SupervisorScope::in_state_root(temp.path(), &alias, "host-a").unwrap();
+        let other_host = SupervisorScope::in_state_root(temp.path(), &catalog, "host-b").unwrap();
+
+        assert_eq!(direct, through_alias);
+        assert_ne!(direct, other_host);
     }
 
     #[test]

@@ -268,7 +268,7 @@ enum Command {
     Unpark {
         /// The parked task's runtime id, exactly as `st2 tasks --json` reports it.
         task: String,
-        /// Host whose supervisor should grant the request. Defaults to this host.
+        /// Host whose selected-catalog supervisor should grant the request. Defaults to this host.
         #[arg(long)]
         host: Option<String>,
     },
@@ -968,7 +968,10 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             tasks_cmd(&catalog, host)
         }
-        Command::Unpark { task, host } => unpark_cmd(&task, host),
+        Command::Unpark { task, host } => {
+            let catalog = catalog_arg(None)?;
+            unpark_cmd(&catalog, &task, host)
+        }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
                 anyhow::bail!(
@@ -1515,7 +1518,16 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
         Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
     };
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
-    let parks = st2::park::DirParkObserver::for_host(&host);
+    let parks = match st2::park::DirParkObserver::for_supervisor(&catalog, &host) {
+        Ok(parks) => parks,
+        Err(error) => {
+            return print_incomplete_tasks(
+                catalog,
+                host,
+                format!("open supervisor park projection: {error}"),
+            );
+        }
+    };
     let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner, &parks);
     let after = discover(&catalog);
     if !st2::task_inventory::same_discovery(&found, &after) {
@@ -1540,13 +1552,17 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
 /// the parked set lives in the supervisor's memory, and it is the only writer. That also means this
 /// is best-effort by construction — with no supervisor running there is nothing to grant it, which is
 /// why the confirmation says "requested" rather than claiming the task is back.
-fn unpark_cmd(task: &str, host: Option<String>) -> Result<()> {
+fn unpark_cmd(catalog: &Path, task: &str, host: Option<String>) -> Result<()> {
     let host = host.unwrap_or_else(detect_host);
-    let dir = st2::park::unpark_request_dir(&host);
+    let catalog = catalog.canonicalize().with_context(|| {
+        format!("canonicalize catalog {}", catalog.display())
+    })?;
+    let dir = st2::park::SupervisorScope::current(&catalog, &host)?.unpark_request_dir();
     st2::park::request_unpark(&dir, task)?;
     println!(
-        "unpark requested for '{task}' on {host}; the running supervisor grants it on its next \
-         reconcile pass. Confirm with `st2 tasks --json` — the task's `parked` field clears."
+        "unpark requested for '{task}' in catalog {} on {host}; that supervisor grants it on its \
+         next reconcile pass. Confirm with `st2 tasks --json` — the task's `parked` field clears.",
+        catalog.display()
     );
     Ok(())
 }

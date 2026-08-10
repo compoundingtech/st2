@@ -965,14 +965,18 @@ impl Runner for SystemRunner {
     }
 }
 
+/// The machine-local state root shared by host runtime state and supervisor-scoped channels.
+pub(crate) fn state_root() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// The machine-local runner-state dir for a host's exec tasks: `$XDG_STATE_HOME/st2/<host>/exec`
 /// (falling back to `~/.local/state`). Not synced — pids are host-local.
 pub fn exec_state_dir(host: &str) -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("st2").join(host).join("exec")
+    state_root().join("st2").join(host).join("exec")
 }
 
 /// A task st2 gave up restarting (crash-looped past its `restart{}` policy, mode=fail) — carries what
@@ -1120,28 +1124,36 @@ pub fn publish_parks(cap: &FlappingCap, projection: &crate::park::ParkProjection
 /// unaffected — it degrades to exactly the pre-#204 behaviour, loudly.
 pub struct ParkChannel {
     projection: Option<crate::park::ParkProjection>,
-    request_dir: PathBuf,
+    request_dir: Option<PathBuf>,
 }
 
 impl ParkChannel {
-    pub fn for_host(host: &str) -> Self {
-        let projection = match crate::park::ParkProjection::for_host(host) {
+    pub fn for_supervisor(catalog_root: &Path, host: &str) -> Self {
+        let scope = match crate::park::SupervisorScope::current(catalog_root, host) {
+            Ok(scope) => scope,
+            Err(error) => {
+                eprintln!(
+                    "st2: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
+                );
+                return Self { projection: None, request_dir: None };
+            }
+        };
+        let projection = match crate::park::ParkProjection::current(scope.park_dir()) {
             Ok(projection) => Some(projection),
             Err(error) => {
                 eprintln!(
-                    "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults on this host."
+                    "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults for this supervisor."
                 );
                 None
             }
         };
-        Self {
-            projection,
-            request_dir: crate::park::unpark_request_dir(host),
-        }
+        Self { projection, request_dir: Some(scope.unpark_request_dir()) }
     }
 
     fn grant_requests(&self, cap: &mut FlappingCap, report: &mut UpReport) {
-        grant_unpark_requests(cap, &self.request_dir, report);
+        if let Some(request_dir) = &self.request_dir {
+            grant_unpark_requests(cap, request_dir, report);
+        }
     }
 
     fn publish(&self, cap: &FlappingCap, report: &mut UpReport) {
@@ -1813,7 +1825,7 @@ pub fn up_loop_specs(
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
     let mut reported_flapping: HashSet<String> = HashSet::new();
-    let park_channel = ParkChannel::for_host(this_host);
+    let park_channel = ParkChannel::for_supervisor(root, this_host);
     loop {
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
@@ -1991,7 +2003,7 @@ fn up_loop_until(
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
     let mut reported_flapping: HashSet<String> = HashSet::new();
-    let park_channel = ParkChannel::for_host(this_host);
+    let park_channel = ParkChannel::for_supervisor(root, this_host);
 
     loop {
         let mut pre = UpReport::default();
