@@ -4,8 +4,10 @@
 //! starts a dedicated provider daemon, initializes an observer connection before the interactive
 //! client starts, and binds a typed start or successful-resume event to the exact wrapper process
 //! incarnation that owns the PTY launch. Its control watcher persists delivery-relevant thread and
-//! turn state. Message selection and delivery remain later layers.
+//! turn state. The native delivery layer selects one durable FIFO inbox head and submits typed
+//! input only when that state proves an idle or one exact regular active turn.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -23,15 +25,19 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use tungstenite::{Message, WebSocket};
+use tungstenite::{Message as WebSocketMessage, WebSocket};
+
+use crate::{ding, message, run, status};
 
 pub const SUPPORTED_CODEX_CLI_VERSION: &str = "codex-cli 0.145.0";
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
+const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
+const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
 const SOCKET_PATH_BUDGET: usize = 96;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +143,239 @@ pub struct CodexControlState {
     thread_id: String,
     subscribed: bool,
     observed: CodexObservedState,
+}
+
+#[derive(Debug, Clone)]
+struct CodexDeliveryConfig {
+    catalog_root: PathBuf,
+    agent_dir: PathBuf,
+    inbox: PathBuf,
+    identity: String,
+    this_host: String,
+}
+
+impl CodexDeliveryConfig {
+    fn resolve(catalog_root: &Path, identity: &str) -> Result<Self> {
+        let this_host = run::detect_host();
+        let agent_dir = message::resolve_agent_dir(catalog_root, identity, &this_host)?
+            .with_context(|| {
+                format!(
+                    "Codex native delivery agent '{identity}' is not declared in {}",
+                    catalog_root.display()
+                )
+            })?;
+        Ok(Self {
+            catalog_root: catalog_root.to_path_buf(),
+            inbox: message::inbox_dir(&agent_dir),
+            agent_dir,
+            identity: identity.to_string(),
+            this_host,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexDeliveryMethod {
+    Start,
+    Steer { turn_id: String },
+}
+
+#[derive(Debug, Clone)]
+struct PendingCodexDelivery {
+    request_id: u64,
+    filename: String,
+    method: CodexDeliveryMethod,
+}
+
+#[derive(Debug, Clone)]
+struct RejectedCodexDelivery {
+    filename: String,
+    observed: CodexObservedState,
+}
+
+struct CodexInboxDelivery {
+    config: CodexDeliveryConfig,
+    wake: Receiver<()>,
+    _watcher: Option<notify::RecommendedWatcher>,
+    next_refresh: Instant,
+    head: Option<message::Message>,
+    suppressed: bool,
+    /// Transport submissions in this process. Typed receipt reconciliation is a later adapter
+    /// layer; this set only prevents a successful JSON response from becoming a hot resend loop.
+    submitted_this_run: HashSet<String>,
+    pending: Option<PendingCodexDelivery>,
+    rejected: Option<RejectedCodexDelivery>,
+    next_request_id: u64,
+}
+
+impl CodexInboxDelivery {
+    fn new(config: CodexDeliveryConfig) -> Result<Self> {
+        fs::create_dir_all(&config.inbox).with_context(|| {
+            format!(
+                "creating Codex native delivery inbox {}",
+                config.inbox.display()
+            )
+        })?;
+        let (wake_tx, wake) = mpsc::channel();
+        let watcher = crate::watch::watch_recursive_mutations(&config.agent_dir, wake_tx);
+        Ok(Self {
+            config,
+            wake,
+            _watcher: watcher,
+            next_refresh: Instant::now(),
+            head: None,
+            suppressed: false,
+            submitted_this_run: HashSet::new(),
+            pending: None,
+            rejected: None,
+            next_request_id: FIRST_DELIVERY_REQUEST_ID,
+        })
+    }
+
+    fn refresh_if_due(&mut self) -> Result<()> {
+        let mut due = Instant::now() >= self.next_refresh;
+        while self.wake.try_recv().is_ok() {
+            due = true;
+        }
+        if !due {
+            return Ok(());
+        }
+        let unread = message::list_inbox(&self.config.inbox)?;
+        self.submitted_this_run
+            .retain(|filename| unread.iter().any(|message| message.filename == *filename));
+        if self.rejected.as_ref().is_some_and(|rejected| {
+            unread
+                .iter()
+                .all(|message| message.filename != rejected.filename)
+        }) {
+            self.rejected = None;
+        }
+        self.head = unread.into_iter().next();
+        self.suppressed =
+            status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
+        self.next_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
+        Ok(())
+    }
+
+    fn maybe_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
+        self.refresh_if_due()?;
+        if self.pending.is_some() || !state.subscribed || self.suppressed {
+            return Ok(None);
+        }
+        let Some(head) = self.head.as_ref() else {
+            return Ok(None);
+        };
+        if self.submitted_this_run.contains(&head.filename)
+            || self.rejected.as_ref().is_some_and(|rejected| {
+                rejected.filename == head.filename && rejected.observed == state.observed
+            })
+        {
+            return Ok(None);
+        }
+        let method = match &state.observed {
+            CodexObservedState::Idle => CodexDeliveryMethod::Start,
+            CodexObservedState::Active { turn_id } => CodexDeliveryMethod::Steer {
+                turn_id: turn_id.clone(),
+            },
+            CodexObservedState::AwaitingStatus | CodexObservedState::Held { .. } => {
+                return Ok(None);
+            }
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .context("Codex delivery request ID overflow")?;
+        let client_id =
+            stable_client_user_message_id(&self.config.identity, state.thread_id(), &head.filename);
+        let text = ding::poke_text(
+            &self.config.catalog_root,
+            &self.config.this_host,
+            &self.config.identity,
+            head,
+        );
+        let request =
+            codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
+        self.pending = Some(PendingCodexDelivery {
+            request_id,
+            filename: head.filename.clone(),
+            method,
+        });
+        Ok(Some(request))
+    }
+
+    fn accept_response(&mut self, message: &Value, observed: &CodexObservedState) -> Result<bool> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(false);
+        };
+        if message.get("method").is_some()
+            || message.get("id") != Some(&Value::from(pending.request_id))
+        {
+            return Ok(false);
+        }
+        let pending = self
+            .pending
+            .take()
+            .context("Codex delivery is not pending")?;
+        if message.get("error").is_some() {
+            self.rejected = Some(RejectedCodexDelivery {
+                filename: pending.filename,
+                observed: observed.clone(),
+            });
+            return Ok(true);
+        }
+        match &pending.method {
+            CodexDeliveryMethod::Start => {
+                required_string(message, "/result/turn/id", "turn/start response")?;
+            }
+            CodexDeliveryMethod::Steer { turn_id } => {
+                let returned = required_string(message, "/result/turnId", "turn/steer response")?;
+                anyhow::ensure!(
+                    returned == turn_id,
+                    "Codex turn/steer response returned a different turn"
+                );
+            }
+        }
+        self.rejected = None;
+        self.submitted_this_run.insert(pending.filename);
+        Ok(true)
+    }
+}
+
+fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"st2.codex-client-user-message.v1");
+    for value in [
+        recipient.as_bytes(),
+        thread_id.as_bytes(),
+        filename.as_bytes(),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    format!("st2:{:x}", hash.finalize())
+}
+
+fn codex_delivery_request(
+    request_id: u64,
+    thread_id: &str,
+    client_id: &str,
+    text: &str,
+    method: &CodexDeliveryMethod,
+) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "clientUserMessageId": client_id,
+        "input": [{ "type": "text", "text": text, "text_elements": [] }]
+    });
+    let method_name = match method {
+        CodexDeliveryMethod::Start => "turn/start",
+        CodexDeliveryMethod::Steer { turn_id } => {
+            params["expectedTurnId"] = Value::String(turn_id.clone());
+            "turn/steer"
+        }
+    };
+    json!({ "method": method_name, "id": request_id, "params": params })
 }
 
 enum SubscriptionAcceptance {
@@ -298,15 +537,15 @@ impl CodexControlState {
                 self.observed.clone()
             }
             CodexObservedState::Held {
-                reason: CodexHoldReason::Review | CodexHoldReason::Compaction,
-                turn_id: Some(current),
-            } if current == &turn_id => self.observed.clone(),
+                reason: reason @ (CodexHoldReason::Review | CodexHoldReason::Compaction),
+                ..
+            } => CodexObservedState::Held {
+                reason: *reason,
+                turn_id: Some(turn_id),
+            },
             CodexObservedState::Active { .. }
             | CodexObservedState::Held {
-                reason:
-                    CodexHoldReason::Review
-                    | CodexHoldReason::Compaction
-                    | CodexHoldReason::ConflictingTurn,
+                reason: CodexHoldReason::ConflictingTurn,
                 ..
             } => CodexObservedState::Held {
                 reason: CodexHoldReason::ConflictingTurn,
@@ -389,6 +628,7 @@ pub fn run_controlled(
         "Codex controlled launch argv is empty"
     );
     ensure_supported_version(&codex_argv[0])?;
+    let delivery = CodexDeliveryConfig::resolve(catalog_root, &identity)?;
 
     let state_dir = state_dir(catalog_root, &identity);
     secure_dir(&state_dir)?;
@@ -463,10 +703,10 @@ pub fn run_controlled(
         &mut server,
         &socket_path,
         &endpoint,
-        &state_dir,
         &runtime,
         &codex_argv,
         resume_thread.as_deref(),
+        delivery,
     );
     terminate_child(&mut server);
     let _ = fs::remove_file(&socket_path);
@@ -477,11 +717,12 @@ fn run_connected(
     server: &mut Child,
     socket_path: &Path,
     endpoint: &str,
-    state_dir: &Path,
     runtime: &CodexRuntime,
     codex_argv: &[String],
     resume_thread: Option<&str>,
+    delivery: CodexDeliveryConfig,
 ) -> Result<()> {
+    let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
     let tui_args = controlled_tui_args(endpoint, &codex_argv[1..], resume_thread)?;
     let expected_resume =
         expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
@@ -499,6 +740,7 @@ fn run_connected(
             &control_state_path,
             &runtime_for_reader,
             expected_resume.as_deref(),
+            Some(delivery),
             events_tx,
         )
     });
@@ -764,15 +1006,30 @@ fn pump_control(
     control_state_path: &Path,
     runtime: &CodexRuntime,
     expected_resume: Option<&str>,
+    delivery: Option<CodexDeliveryConfig>,
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
+        let mut delivery = delivery.map(CodexInboxDelivery::new).transpose()?;
+        websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
         loop {
-            let Some(message) = read_json_message(&mut websocket)? else {
-                let _ = events.send(ControlEvent::Closed);
-                return Ok(());
+            let message = match poll_json_message(&mut websocket)? {
+                ControlRead::Message(message) => Some(message),
+                ControlRead::Timeout => None,
+                ControlRead::Closed => {
+                    let _ = events.send(ControlEvent::Closed);
+                    return Ok(());
+                }
+            };
+            let Some(message) = message else {
+                if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut())
+                    && let Some(request) = delivery.maybe_request(state)?
+                {
+                    write_json_message(&mut websocket, &request)?;
+                }
+                continue;
             };
             if control_state.is_none() {
                 let Some(thread_id) = binding_candidate(&message, expected_resume)? else {
@@ -797,7 +1054,13 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
-            let changed = if message.get("method").is_none()
+            let delivery_response = match delivery.as_mut() {
+                Some(delivery) => delivery.accept_response(&message, &state.observed)?,
+                None => false,
+            };
+            let changed = if delivery_response {
+                false
+            } else if message.get("method").is_none()
                 && message.get("id") == Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
             {
                 anyhow::ensure!(
@@ -837,6 +1100,11 @@ fn pump_control(
                     }),
                 )?;
                 subscription_pending = true;
+            }
+            if let Some(delivery) = delivery.as_mut()
+                && let Some(request) = delivery.maybe_request(state)?
+            {
+                write_json_message(&mut websocket, &request)?;
             }
         }
     })();
@@ -1132,7 +1400,7 @@ fn random_token() -> Result<String> {
 }
 
 fn write_json_message(websocket: &mut WebSocket<UnixStream>, value: &Value) -> Result<()> {
-    websocket.send(Message::Text(value.to_string().into()))?;
+    websocket.send(WebSocketMessage::Text(value.to_string().into()))?;
     Ok(())
 }
 
@@ -1146,14 +1414,52 @@ fn read_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<Option<Val
             Err(error) => return Err(error.into()),
         };
         match message {
-            Message::Text(text) => {
+            WebSocketMessage::Text(text) => {
                 let value = serde_json::from_str(&text)
                     .context("decoding Codex app-server WebSocket JSON")?;
                 return Ok(Some(value));
             }
-            Message::Close(_) => return Ok(None),
-            Message::Ping(_) | Message::Pong(_) => continue,
-            Message::Binary(_) | Message::Frame(_) => {
+            WebSocketMessage::Close(_) => return Ok(None),
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => continue,
+            WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
+                anyhow::bail!("Codex app-server sent a non-text WebSocket message")
+            }
+        }
+    }
+}
+
+enum ControlRead {
+    Message(Value),
+    Timeout,
+    Closed,
+}
+
+fn poll_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<ControlRead> {
+    loop {
+        let message = match websocket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(ControlRead::Closed);
+            }
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(ControlRead::Timeout);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match message {
+            WebSocketMessage::Text(text) => {
+                let value = serde_json::from_str(&text)
+                    .context("decoding Codex app-server WebSocket JSON")?;
+                return Ok(ControlRead::Message(value));
+            }
+            WebSocketMessage::Close(_) => return Ok(ControlRead::Closed),
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => continue,
+            WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
                 anyhow::bail!("Codex app-server sent a non-text WebSocket message")
             }
         }
@@ -1174,6 +1480,300 @@ fn terminate_child(child: &mut Child) {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    fn delivery_config(root: &Path) -> CodexDeliveryConfig {
+        let agent_dir = root.join("agents/h/worker");
+        CodexDeliveryConfig {
+            catalog_root: root.to_path_buf(),
+            inbox: message::inbox_dir(&agent_dir),
+            agent_dir,
+            identity: "h.worker".into(),
+            this_host: "h".into(),
+        }
+    }
+
+    fn subscribed_state(observed: CodexObservedState) -> CodexControlState {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state.subscribed = true;
+        state.observed = observed;
+        state
+    }
+
+    #[test]
+    fn delivery_request_uses_typed_start_and_exact_turn_steer() {
+        let start = codex_delivery_request(
+            2,
+            "thread-main",
+            "st2:client",
+            "notice",
+            &CodexDeliveryMethod::Start,
+        );
+        assert_eq!(start["method"], "turn/start");
+        assert_eq!(start["params"]["threadId"], "thread-main");
+        assert_eq!(start["params"]["clientUserMessageId"], "st2:client");
+        assert_eq!(start["params"]["input"][0]["type"], "text");
+        assert_eq!(start["params"]["input"][0]["text"], "notice");
+        assert!(start["params"].get("expectedTurnId").is_none());
+
+        let steer = codex_delivery_request(
+            3,
+            "thread-main",
+            "st2:client",
+            "notice",
+            &CodexDeliveryMethod::Steer {
+                turn_id: "turn-current".into(),
+            },
+        );
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
+        assert!(steer["params"].get("model").is_none());
+        assert!(steer["params"].get("approvalPolicy").is_none());
+    }
+
+    #[test]
+    fn delivery_client_id_is_stable_and_binds_every_identity_component() {
+        let id =
+            stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
+        assert_eq!(
+            id,
+            stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md")
+        );
+        assert!(id.starts_with("st2:"));
+        assert_ne!(
+            id,
+            stable_client_user_message_id("h.other", "thread-main", "1786380000000-abc123.md")
+        );
+        assert_ne!(
+            id,
+            stable_client_user_message_id("h.worker", "thread-other", "1786380000000-abc123.md")
+        );
+        assert_ne!(
+            id,
+            stable_client_user_message_id("h.worker", "thread-main", "1786380000000-def456.md")
+        );
+    }
+
+    #[test]
+    fn review_compaction_and_dnd_hold_the_unread_fifo_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+                .unwrap();
+        let mut delivery = CodexInboxDelivery::new(config.clone()).unwrap();
+        for reason in [CodexHoldReason::Review, CodexHoldReason::Compaction] {
+            let state = subscribed_state(CodexObservedState::Held {
+                reason,
+                turn_id: Some("turn-current".into()),
+            });
+            assert_eq!(delivery.maybe_request(&state).unwrap(), None);
+            assert!(config.inbox.join(&filename).is_file());
+        }
+
+        status::set_state(&status::status_path(&config.agent_dir), status::State::Dnd).unwrap();
+        delivery.next_refresh = Instant::now();
+        assert_eq!(
+            delivery
+                .maybe_request(&subscribed_state(CodexObservedState::Idle))
+                .unwrap(),
+            None
+        );
+        assert_eq!(message::list_inbox(&config.inbox).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("retry"), None, &[], "body")
+                .unwrap();
+        let mut delivery = CodexInboxDelivery::new(config.clone()).unwrap();
+        let active = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-current".into(),
+        });
+        let steer = delivery.maybe_request(&active).unwrap().unwrap();
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
+        let request_id = steer["id"].clone();
+        let client_id = steer["params"]["clientUserMessageId"].clone();
+
+        assert!(
+            !delivery
+                .accept_response(
+                    &json!({
+                        "id": request_id,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {}
+                    }),
+                    active.observed(),
+                )
+                .unwrap()
+        );
+        assert!(delivery
+            .accept_response(
+                &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
+                active.observed(),
+            )
+            .unwrap());
+        assert_eq!(delivery.maybe_request(&active).unwrap(), None);
+        assert!(config.inbox.join(&filename).is_file());
+
+        let retry = delivery
+            .maybe_request(&subscribed_state(CodexObservedState::Idle))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry["method"], "turn/start");
+        assert_eq!(retry["params"]["clientUserMessageId"], client_id);
+        assert!(config.inbox.join(&filename).is_file());
+    }
+
+    #[test]
+    fn a_success_response_suppresses_resubmission_without_archiving_the_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename = message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("submitted"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let mut delivery = CodexInboxDelivery::new(config.clone()).unwrap();
+        let idle = subscribed_state(CodexObservedState::Idle);
+        let request = delivery.maybe_request(&idle).unwrap().unwrap();
+        assert!(
+            delivery
+                .accept_response(
+                    &json!({ "id": request["id"], "result": { "turn": { "id": "turn-new" } } }),
+                    idle.observed(),
+                )
+                .unwrap()
+        );
+        assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
+        assert!(config.inbox.join(&filename).is_file());
+    }
+
+    #[test]
+    fn subscribed_control_pump_delivers_the_real_fifo_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("wired"), None, &[], "body")
+                .unwrap();
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_filename = filename.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/status/changed",
+                    "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+                }),
+            )
+            .unwrap();
+            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(subscribe["method"], "thread/resume");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": { "id": "thread-main", "status": { "type": "idle" } }
+                    }
+                }),
+            )
+            .unwrap();
+            let delivery = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID);
+            assert_eq!(delivery["method"], "turn/start");
+            assert_eq!(delivery["params"]["threadId"], "thread-main");
+            assert_eq!(
+                delivery["params"]["input"][0]["text"],
+                "[DING] ? h.sender: wired [id:".to_owned()
+                    + server_filename
+                        .trim_end_matches(".md")
+                        .rsplit_once('-')
+                        .unwrap()
+                        .1
+                    + "]"
+            );
+            assert!(
+                delivery["params"]["clientUserMessageId"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("st2:")
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": FIRST_DELIVERY_REQUEST_ID,
+                    "result": { "turn": { "id": "turn-delivery" } }
+                }),
+            )
+            .unwrap();
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream).unwrap();
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let runtime_for_pump = runtime.clone();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime_for_pump,
+                None,
+                Some(config),
+                tx,
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ControlEvent::Bound
+        ));
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+        assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
+    }
 
     #[test]
     fn control_initializes_before_recording_the_first_thread_only() {
@@ -1268,6 +1868,7 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
+                None,
                 None,
                 tx,
             )
@@ -1378,6 +1979,7 @@ mod tests {
                 &control_state_for_pump,
                 &runtime_for_pump,
                 Some("thread-prior"),
+                None,
                 tx,
             )
         });
@@ -1549,8 +2151,8 @@ mod tests {
         assert_eq!(
             state.observed(),
             &CodexObservedState::Held {
-                reason: CodexHoldReason::ConflictingTurn,
-                turn_id: None,
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-2".into()),
             }
         );
 
