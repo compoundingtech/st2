@@ -35,11 +35,11 @@ if [[ -n "$context_block" ]]; then
   additional="${context_block}"$'\n\n'"${additional}"
 fi
 
-jq -n --arg text "$additional" '{
+printf '%s' "$additional" | jq -Rs '{
   continue: true,
   hookSpecificOutput: {
     hookEventName: "SessionStart",
-    additionalContext: $text
+    additionalContext: .
   }
 }'
 exit 0

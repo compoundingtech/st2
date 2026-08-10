@@ -128,6 +128,34 @@ fn session_start_delivers_context_on_the_supported_channel_and_never_on_stderr()
     assert!(additional.contains("set your status to busy"));
 }
 
+#[test]
+fn session_start_delivers_context_larger_than_the_platform_argument_limit() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Claude hook");
+        return;
+    }
+    let fixture = Fixture::new();
+    let large_context = "x".repeat(256 * 1024);
+    context::write_now(&fixture.context, &large_context).unwrap();
+
+    let output = fixture.run("claude-session-start.sh");
+
+    assert!(
+        output.status.success(),
+        "large durable context must not cross an argv boundary. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let additional = json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        additional.contains(&large_context),
+        "the complete durable context must reach Claude without truncation"
+    );
+}
+
 /// Missing durable state is an ordinary cold start: the ritual still has to reach the model, and the
 /// context envelope must be absent rather than empty.
 #[test]
