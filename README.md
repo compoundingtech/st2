@@ -220,9 +220,10 @@ resource "delivery" _tag="ding" uri="ding://host/agent"
 ```
 
 The envelope is intentionally only `name` + `_tag` + `uri`. It carries no required/optional,
-access, readiness, or lifecycle policy, and URI possession conveys no authority. Resource-only
-declaration edits do not stop, replace, or relaunch a live task. Resource types and resolvers remain
-opaque to st2; catalog readers use the public `agent-spec` crate to inspect the typed bindings.
+access, readiness, or lifecycle policy, and URI possession conveys no authority. A Resource URI may
+be referenced by any number of agent declarations. Resource-only declaration edits do not stop,
+replace, or relaunch a live task. Resource types and resolvers remain opaque to st2; catalog readers
+use the public `agent-spec` crate to inspect the typed bindings.
 
 The positional agent value is the stable automation identity. Optional `name` and `description`
 fields are presentation only; they never route messages, select tasks, or rename durable state.

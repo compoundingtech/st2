@@ -190,9 +190,10 @@ The positional name is an agent-local semantic role, `_tag` is the concrete
 type discriminator, and `uri` is the exact RFC 3986 absolute resource identity,
 preserved byte-for-byte without normalization.
 Declaration order has no meaning and binding names are unique within one
-agent. The public `agent-spec` read model preserves the bindings in name order
-across canonical KDL and the supported TOML/JSON forms. `st2 agents --json`
-projects the same descriptors for language-neutral inspection.
+agent. A Resource URI may be referenced by any number of agent declarations.
+The public `agent-spec` read model preserves the bindings in name order across
+canonical KDL and the supported TOML/JSON forms. `st2 agents --json` projects
+the same descriptors for language-neutral inspection.
 
 st2 validates only this portable envelope. It does not define downstream type
 schemas, resolve targets, infer authority from URI possession, or attach
