@@ -109,9 +109,11 @@ the same field-rules specification.
   scope's channel even when both contain the same task ID. Granting an unpark
   clears exactly that task's restart accounting without releasing another
   parked task or restarting a healthy task. Task inventory projects a
-  believable park and recovery action alongside the unmodified runtime
-  observation as a complete known fault; unbelievable marker evidence is
-  indeterminate and makes the envelope incomplete.
+  believable park and structured recovery argv alongside the unmodified runtime
+  observation as a complete known fault. The argv carries that observation's
+  exact canonical catalog folder and selected host rather than consulting
+  ambient defaults; unbelievable marker evidence is indeterminate and makes the
+  envelope incomplete.
 
 ## Evidence boundary
 

@@ -196,7 +196,17 @@ fn a_real_supervisor_parks_a_crash_looper_and_unpark_recovers_only_that_task() {
     );
     assert_eq!(
         parked["parked"]["recovery"],
-        format!("st2 unpark {FLAPPER}"),
+        serde_json::json!({
+            "argv": [
+                "st2",
+                "--catalog",
+                catalog.display().to_string(),
+                "unpark",
+                FLAPPER,
+                "--host",
+                HOST
+            ]
+        }),
         "the fault must carry its own remedy"
     );
 

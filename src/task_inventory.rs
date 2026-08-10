@@ -224,7 +224,12 @@ struct ParkedJson {
     /// What actually clears it. The whole complaint in #204 is that an operator could see a task that
     /// should be up, is not up, and had nothing visibly wrong with it — so the remedy travels with
     /// the fault rather than living in a journal line nobody knew to grep for.
-    recovery: String,
+    recovery: RecoveryAction,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryAction {
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -430,7 +435,17 @@ pub fn inventory(
                     since: record.parked_at,
                     reason: record.reason,
                     supervisor_pid: record.supervisor_pid,
-                    recovery: format!("st2 unpark {}", task.runtime_id),
+                    recovery: RecoveryAction {
+                        argv: vec![
+                            "st2".to_string(),
+                            "--catalog".to_string(),
+                            catalog.display().to_string(),
+                            "unpark".to_string(),
+                            task.runtime_id.clone(),
+                            "--host".to_string(),
+                            host.to_string(),
+                        ],
+                    },
                 }),
                 _ => None,
             };
@@ -705,7 +720,17 @@ mod tests {
                 "since": "2026-08-09T10:00:00.000Z",
                 "reason": "crash-looped past its restart{} policy (mode=fail)",
                 "supervisorPid": 4242,
-                "recovery": "st2 unpark h.flapper"
+                "recovery": {
+                    "argv": [
+                        "st2",
+                        "--catalog",
+                        tmp.path().display().to_string(),
+                        "unpark",
+                        "h.flapper",
+                        "--host",
+                        "h"
+                    ]
+                }
             }),
             "desiredState=running + nothing running + error=null is still the only visible signal"
         );

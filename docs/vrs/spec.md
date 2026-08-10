@@ -611,10 +611,13 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   A believable parked-task projection is a known supervisor fault, not a
   runtime state: the row retains its unmodified runtime observation and adds
   the park time, reason, and explicit per-task recovery action while the
-  envelope remains complete. An unreadable, malformed, wrong-generation, or
-  otherwise unbelievable park marker is indeterminate and makes the envelope
-  incomplete. The reader selects only the marker channel owned by the exact
-  canonical catalog folder and host it is observing.
+  envelope remains complete. That action is structured `argv` containing the
+  exact canonical catalog folder and selected host observed by the inventory;
+  executing it does not consult ambient defaults for either ownership axis. An
+  unreadable, malformed, wrong-generation, or otherwise unbelievable park
+  marker is indeterminate and makes the envelope incomplete. The reader selects
+  only the marker channel owned by the exact canonical catalog folder and host
+  it is observing.
 
 - **R27/R28:** Agent lifecycle intent is one closed declaration state:
   `running`, `suspended`, or `retired`. The KDL form is a direct child such as

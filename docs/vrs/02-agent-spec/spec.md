@@ -351,7 +351,10 @@ A parked task is reported as parked by the typed task inventory, carrying when
 it was parked, why, and what clears it, alongside an unmodified runtime
 observation. The park is a supervisor decision about the runtime rather than an
 observation of it, so it never replaces the observed state and never makes the
-inventory envelope incomplete.
+inventory envelope incomplete. Its recovery action is structured executable
+argv that carries the inventory's exact canonical catalog folder and selected
+host, so an operator can invoke it without ambient ownership defaults changing
+the target supervisor scope.
 
 Parking is terminal within its owning supervisor run, and its only per-task exit
 is an explicit operator unpark request granted by that run. Granting one clears

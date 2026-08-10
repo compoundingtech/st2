@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -74,6 +76,83 @@ fn real_tasks(catalog: &Path, state: &Path) -> Output {
         .env_remove("PTY_ROOT")
         .output()
         .unwrap()
+}
+
+fn seeded_supervisor_scope(catalog: &Path, host: Option<&str>, state: &Path) -> PathBuf {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    command.args(["unpark", "h.worker", "--catalog"]).arg(catalog);
+    if let Some(host) = host {
+        command.args(["--host", host]);
+    }
+    let output = command
+        .env("XDG_STATE_HOME", state)
+        .env_remove("CATALOG")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let supervisors = state.join("st2/supervisors");
+    let scope = fs::read_dir(&supervisors)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|scope| scope.join("unpark/h.worker").is_file())
+        .expect("unpark identifies its supervisor scope");
+    fs::remove_file(scope.join("unpark/h.worker")).unwrap();
+    scope
+}
+
+fn execute_recovery(action: &serde_json::Value, bin: &Path, ambient_catalog: &Path, state: &Path) {
+    let mut command = if let Some(shell) = action.as_str() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", shell]);
+        command
+    } else {
+        let argv = action["argv"].as_array().expect("recovery action carries argv");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        command.args(argv.iter().skip(1).map(|arg| arg.as_str().unwrap()));
+        command
+    };
+    let output = command
+        .env("PATH", bin)
+        .env("CATALOG", ambient_catalog)
+        .env("XDG_STATE_HOME", state)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn projected_recovery_targets_its_exact_catalog_and_host_despite_ambient_defaults() {
+    let (tmp, selected_catalog, bin) = fixture("[]");
+    symlink(env!("CARGO_BIN_EXE_st2"), bin.join("st2")).unwrap();
+    let ambient_catalog = tmp.path().join("ambient-catalog");
+    fs::create_dir(&ambient_catalog).unwrap();
+    let state = tmp.path().join("state");
+
+    let selected_scope = seeded_supervisor_scope(&selected_catalog, Some("h"), &state);
+    let ambient_scope = seeded_supervisor_scope(&ambient_catalog, None, &state);
+    assert_ne!(selected_scope, ambient_scope);
+    for scope in [&selected_scope, &ambient_scope] {
+        let projection = st2::park::ParkProjection::current(scope.join("parked")).unwrap();
+        assert!(projection
+            .publish(&BTreeSet::from(["h.worker".to_string()]), "same-id collision")
+            .is_empty());
+    }
+
+    let output = tasks(&selected_catalog, &bin, &state);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let inventory: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let recovery = &inventory["tasks"][0]["parked"]["recovery"];
+    execute_recovery(recovery, &bin, &ambient_catalog, &state);
+
+    let (selected, selected_errors) =
+        st2::park::take_unpark_requests(&selected_scope.join("unpark"));
+    let (ambient, ambient_errors) =
+        st2::park::take_unpark_requests(&ambient_scope.join("unpark"));
+    assert!(selected_errors.is_empty() && ambient_errors.is_empty());
+    assert_eq!(selected, ["h.worker"]);
+    assert!(ambient.is_empty(), "emitted recovery targeted the ambient supervisor scope");
 }
 
 #[test]

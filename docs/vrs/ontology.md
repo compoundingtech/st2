@@ -144,7 +144,10 @@ Authority: [R23 fail-closed task inventory and R31 reachable restart bounds](req
 ### operator action
 
 An explicit instruction from an operator that requests a named control-plane
-change. It is distinct from an automatic policy reaction.
+change. It is distinct from an automatic policy reaction. A projected recovery
+operator action is structured executable argv and carries its supervisor
+scope's exact canonical catalog folder and selected host; those axes do not
+come from ambient defaults at invocation time.
 
 Authority: [R31 reachable restart bounds](requirements.md)
 
@@ -246,6 +249,8 @@ explicit `unpark` recovery request.
 - Use **parked task** or **park decision** for the owning supervisor's policy
   decision. Do not use *parked* as a session state or replace the runtime
   observation with it.
+- Use **recovery action** for the structured argv projected with a parked task;
+  it names the exact supervisor scope rather than relying on ambient defaults.
 - Use [agent identity](../../crates/agent-spec/src/spec.rs#L24-L50) for the bare
   value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
   host-qualified address.

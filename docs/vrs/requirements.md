@@ -219,8 +219,11 @@ accepted.
   indeterminate and makes the versioned envelope incomplete and the command
   unsuccessful; it is never reported as absence. The command projects a
   supervisor's known park fault and per-task recovery action alongside the
-  unmodified runtime observation; a believable park remains complete, while an
-  unbelievable park marker fails closed like other unprovable evidence.
+  unmodified runtime observation. The action is structured executable argv
+  carrying the exact canonical catalog folder and selected host, so invoking it
+  never falls back to ambient catalog or host defaults. A believable park
+  remains complete, while an unbelievable park marker fails closed like other
+  unprovable evidence.
   Observation detects semantic declaration drift across its runtime probe,
   does not invoke a backend for a root positively absent at admission, and
   performs no reconciliation, cleanup, lifecycle change, or state rewrite. An
