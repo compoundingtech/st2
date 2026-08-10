@@ -672,9 +672,17 @@ screen transport unchanged. `deliver "mcp"` selects native Claude delivery.
 node has no delivery. The two node forms are mutually exclusive, multiple
 `deliver` nodes are invalid, and an unknown `deliver` value is invalid.
 
-The transport is explicit because an agent command is opaque. The native
-selector is a new node so an older binary rejects the declaration. It is not an
-argument to `ding`, which an older parser could accept as legacy delivery.
+The transport is explicit because an agent command is opaque. A binary released
+before this contract ignores the unknown `deliver` child. It lowers a valid
+`deliver`-only declaration with no delivery sidecar. The agent receives no DING
+instead of receiving a DING through the legacy screen transport. This is a
+visible delivery outage. A binary that supports `deliver` validates its value
+and its mutual exclusion with `ding`.
+
+Native delivery is not an argument to `ding`, which a pre-change parser would
+accept as legacy delivery and route through the wrong transport. Doctor reports
+an active agent that declares neither transport. The no-delivery form remains a
+valid opt-out and does not block the agent.
 
 Native delivery replaces rendered-screen inference for maintained Claude and
 Codex agents that select it. Each native adapter uses its provider's evented

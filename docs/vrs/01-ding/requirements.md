@@ -51,13 +51,16 @@ harness that declares a native `deliver` transport.
   `deliver` value is invalid.
 - **DING-R12 No transport inference:** st2 does not infer a native transport
   from an agent command or a screen. Native delivery uses the declared adapter.
-  A binary that does not know the `deliver` node rejects that declaration
-  instead of treating it as legacy delivery.
+  A binary that supports `deliver` validates its value and its mutual exclusion
+  with `ding`.
 - **DING-R13 Durable native delivery:** The inbox file remains the source of
   truth for native delivery. Only the adapter's declared success condition can
   complete a delivery attempt. A closed, unavailable, stale, or unknown native
   transport leaves the message unread and retryable. Archive precedence and
   restart recovery remain unchanged.
+- **DING-R14 Missing transport report:** Doctor reports an active agent that
+  declares neither `ding` nor `deliver`. The omission remains a valid opt-out
+  and does not block the agent. The report makes a no-delivery state visible.
 
 ### Must preserve legacy transport and gate every legacy retry
 
