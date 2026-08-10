@@ -159,6 +159,31 @@ fn desired_state_and_reason_have_distinct_secret_safe_semantic_addresses() {
 }
 
 #[test]
+fn declared_delivery_has_one_exact_semantic_address() {
+    let (_temp, catalog, prepared, root) = fixture();
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        r#"agent "worker" {
+  host "host"
+  deliver "app-server"
+  argv "tool" "arg"
+}
+"#,
+    )
+    .unwrap();
+
+    let receipt = parsed(&diff(&catalog, &prepared, &root));
+    let fields = agent_fields(&receipt);
+    assert_eq!(
+        fields
+            .iter()
+            .filter(|field| field.as_str() == "/agents/host/worker/delivery")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn effective_task_id_and_cwd_defaults_normalize_to_explicit_values() {
     let (_temp, catalog, prepared, _root) = fixture();
     fs::write(

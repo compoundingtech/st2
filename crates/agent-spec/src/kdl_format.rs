@@ -124,6 +124,23 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
             "command" => raw.command = arg_string(child),
             "argv" => raw.argv = Some(argv(child)?),
             "ding" => raw.ding = true,
+            "deliver" => {
+                anyhow::ensure!(
+                    raw.deliver.is_none(),
+                    "agent declares `deliver` more than once"
+                );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "agent `deliver` must contain exactly one positional string"
+                );
+                raw.deliver = Some(Some(
+                    arg_string(child)
+                        .ok_or_else(|| anyhow::anyhow!("agent `deliver` value must be a string"))?,
+                ));
+            }
             "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {

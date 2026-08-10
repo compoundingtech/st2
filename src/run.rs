@@ -2164,6 +2164,7 @@ mod tests {
             desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
+            delivery: None,
             resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
@@ -2213,6 +2214,7 @@ mod tests {
             desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
+            delivery: None,
             resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
@@ -2469,6 +2471,7 @@ mod tests {
             desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
+            delivery: None,
             resources: vec![],
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
