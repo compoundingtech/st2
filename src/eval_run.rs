@@ -16,7 +16,9 @@ use crate::eval_spec::{
 };
 use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
-use crate::reconcile::{TaskCompileContext, compile_generated_ding_tasks, reconcile};
+use crate::reconcile::{TaskCompileContext, compile_generated_tasks, reconcile};
+#[cfg(test)]
+use crate::reconcile::compile_generated_ding_tasks;
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
 use agent_spec::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
@@ -1094,7 +1096,7 @@ fn run_eval_inner(
                 .collect::<Vec<_>>();
             (specs, runtime_tasks, participants, None)
         };
-        compile_generated_ding_tasks(&mut specs, host, task_context)?;
+        compile_generated_tasks(&mut specs, host, task_context)?;
         let task_ids = runtime_tasks
             .iter()
             .map(|task| task.runtime_id.clone())
