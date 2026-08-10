@@ -52,6 +52,22 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R31 Reachable restart bounds:** Within one supervisor run, restart
+  accounting is per task and only successful launches spend the declared
+  budget. `delay` is the minimum launch spacing in either mode. In delay mode,
+  `attempts` limits launches over the sliding `interval` window without parking
+  the task. In fail mode, `attempts` is reachable independent of reconcile
+  cadence: a task that repeatedly launches and dies without being observed
+  alive on every completed accounting pass for a full `interval` is parked for
+  the remainder of the supervisor run after its successful-launch budget is
+  exhausted. A completed pass that does not observe the task alive breaks
+  accrued recovery uptime rather than forgiving failures through silence.
+- **R32 Bounded helper teardown:** After st2 spawns a bounded non-interactive
+  helper, input delivery failure or deadline expiry targets the helper's entire
+  process group, not only its direct child, so teardown includes descendants
+  that outlive that child. st2 either reaps the direct child before returning or
+  transfers wait ownership to a background reaper; the failure remains bounded
+  and reports its originating input error or timeout.
 - **R22 Quiet coordination after events:** A network with minimal or default
   personas stays quiet while useful work continues. Agents coordinate only after
   an inbox DING, a durable failure, a real blocker, a completion or decision
@@ -267,3 +283,17 @@ accepted.
   rationale. Its receipt proves the declaration edit, never runtime
   convergence. Human listing, roster JSON, task inventory, and Doctor expose
   desired state without conflating it with presence or observed liveness.
+- **R29 Visible, nondisruptive launch drift:** st2 derives a versioned desired
+  launch fingerprint from the minimal effective fields it already passes to a
+  task. Only an st2 launch records an observed fingerprint, bound to that
+  launch's exact runtime identity and creation incarnation. A missing or
+  mismatched binding reports `unknown`; otherwise inspection reports
+  `converged` or `drifted`. Healthy `drifted` and `unknown` tasks are adopted
+  without implicit restart.
+- **R30 Explicit replacement boundary:** An absent or dead active task launches
+  from the latest current declaration. Retirement stops live work and prevents
+  relaunch. Replacing live work is a separate, explicitly selected operation
+  fenced by catalog, host, effective PTY root, task set, and an exact runtime
+  identity recheck immediately before disruption. Renaming remains
+  retire-old/add-new. Every behavior remains complete with an ordinary catalog
+  folder and without CAS, captured generations, or replacement journals.

@@ -53,21 +53,21 @@ fn st2_eval_runs_a_benign_folder_to_a_pass_verdict() {
     std::fs::create_dir_all(fixture.join("worker")).unwrap();
 
     // Native-default topology: no authored ST_ROOT. The kickoff, polling agents, built-in bare dings,
-    // requester confirmation, and judges must all resolve the same flat catalog bus.
+    // requester confirmation, and judges must all resolve the same canonical actor namespace.
     std::fs::write(
         cell.join("cell.kdl"),
         r#"
+host "evalhost"
 env { PTY_ROOT "$CATALOG/pty" }
 team "t" {
   agent "sup" {
     workspace "./sup"
-    env { ST_AGENT "t.sup" }
     command "sh $CATALOG/scripts/sup.sh"
     ding
   }
   agent "worker" {
     workspace "./worker"
-    env { ST_AGENT "t.worker" }
+    supervisor "t.sup"
     command "sh $CATALOG/scripts/worker.sh"
     ding
   }
@@ -87,8 +87,8 @@ eval {
     judge "one native bus root" {
       exec "test \"$ST_ROOT\" = \"$CATALOG\" && test \"$(cat $CATALOG/sup/ST_ROOT)\" = \"$CATALOG\" && test \"$(cat $CATALOG/worker/ST_ROOT)\" = \"$CATALOG\""
     }
-    judge "no legacy split bus" {
-      exec "test ! -e $CATALOG/obsolete-bus/t.sup/inbox && test ! -e $CATALOG/obsolete-bus/t.worker/inbox && test ! -e $CATALOG/obsolete-bus/requester/inbox"
+    judge "one canonical actor namespace" {
+      exec "test \"$(cat $CATALOG/sup/ST_AGENT)\" = evalhost.t.sup && test \"$(cat $CATALOG/worker/ST_AGENT)\" = evalhost.t.worker && test \"$(cat $CATALOG/worker/ST_SUPERVISOR)\" = evalhost.t.sup && test -d $CATALOG/evalhost.t.sup/inbox && test ! -e $CATALOG/t.sup/inbox"
     }
   }
 }
@@ -103,9 +103,11 @@ eval {
 sleep 0.4
 mkdir -p "$CATALOG/worker"
 printf '%s\n' "$ST_ROOT" > "$CATALOG/worker/ST_ROOT"
+printf '%s\n' "$ST_AGENT" > "$CATALOG/worker/ST_AGENT"
+printf '%s\n' "$ST_SUPERVISOR" > "$CATALOG/worker/ST_SUPERVISOR"
 echo "resolved by t.worker" > "$CATALOG/worker/DONE"
 printf '%s\n' '{"text":"hello","ok":true,"count":7}' > "$CATALOG/worker/values.json"
-st2 message send t.sup --root "$ST_ROOT" --as t.worker -m "worker done" >/dev/null 2>&1
+st2 message send "$ST_SUPERVISOR" --root "$ST_ROOT" -m "worker done" >/dev/null 2>&1
 sleep 60
 "#,
     )
@@ -115,17 +117,18 @@ sleep 60
         fixture.join("scripts/sup.sh"),
         r#"#!/bin/sh
 printf '%s\n' "$ST_ROOT" > "$CATALOG/sup/ST_ROOT"
+printf '%s\n' "$ST_AGENT" > "$CATALOG/sup/ST_AGENT"
 for _ in $(seq 1 150); do
-  n=$(st2 message ls t.sup --root "$ST_ROOT" --from requester --count 2>/dev/null || echo 0)
+  n=$(st2 message ls --root "$ST_ROOT" --from requester --count 2>/dev/null || echo 0)
   [ "$n" -gt 0 ] && break
   sleep 0.2
 done
 for _ in $(seq 1 150); do
-  n=$(st2 message ls t.sup --root "$ST_ROOT" --from t.worker --count 2>/dev/null || echo 0)
+  n=$(st2 message ls --root "$ST_ROOT" --from evalhost.t.worker --count 2>/dev/null || echo 0)
   [ "$n" -gt 0 ] && break
   sleep 0.2
 done
-st2 message send requester --root "$ST_ROOT" --as t.sup -m "done + verified: worker relicensed, commit clean" >/dev/null 2>&1
+st2 message send requester --root "$ST_ROOT" -m "done + verified: worker relicensed, commit clean" >/dev/null 2>&1
 sleep 60
 "#,
     )
@@ -376,13 +379,15 @@ exec sleep 60
 }
 
 #[test]
-fn fixture_agent_specs_are_inert_without_canonical_agents_opt_in() {
+fn compact_agents_use_canonical_identity_while_fixture_agent_specs_stay_inert() {
     if !pty_available() {
         assert!(
             std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
             "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
         );
-        eprintln!("SKIP fixture_agent_specs_are_inert_without_canonical_agents_opt_in");
+        eprintln!(
+            "SKIP compact_agents_use_canonical_identity_while_fixture_agent_specs_stay_inert"
+        );
         return;
     }
     let bin = env!("CARGO_BIN_EXE_st2");
@@ -406,10 +411,14 @@ fn fixture_agent_specs_are_inert_without_canonical_agents_opt_in() {
         fixture.join("scripts/legacy.sh"),
         r#"#!/bin/sh
 for _ in $(seq 1 100); do
-  set -- "$ST_ROOT/legacy/inbox/"*.md
-  [ -e "$1" ] && : > "$CATALOG/SAW-FLAT-KICKOFF" && break
+  set -- "$ST_ROOT/evalhost.legacy/inbox/"*.md
+  if [ -e "$1" ] && [ "$ST_AGENT" = "evalhost.legacy" ]; then
+    printf '%s\n' "$ST_AGENT" > "$CATALOG/SAW-CANONICAL-KICKOFF"
+    break
+  fi
   sleep 0.05
 done
+printf '%s\n' compact-runtime-active
 exec sleep 60
 "#,
     )
@@ -419,7 +428,6 @@ exec sleep 60
         r#"
 host "evalhost"
 agent "legacy" {
-  env { ST_AGENT "legacy" }
   command "sh $CATALOG/scripts/legacy.sh"
 }
 eval {
@@ -427,8 +435,8 @@ eval {
   message { from "requester"; to "legacy"; content "go" }
   max-timeout "2s"
   judges {
-    judge "legacy flat authority stayed intact" {
-      exec "test -f $CATALOG/SAW-FLAT-KICKOFF && test ! -e $CATALOG/CANONICAL-SHOULD-NOT-LAUNCH && test ! -e $CATALOG/agents/evalhost/legacy/resources/inbox"
+    judge "compact identity is canonical and fixture authority stays inert" {
+      exec "test \"$(cat $CATALOG/SAW-CANONICAL-KICKOFF)\" = evalhost.legacy && test ! -e $CATALOG/CANONICAL-SHOULD-NOT-LAUNCH && test ! -e $CATALOG/agents/evalhost/legacy/resources/inbox"
     }
   }
 }
@@ -436,21 +444,31 @@ eval {
     )
     .unwrap();
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
-    let out = Command::new(bin)
-        .args(["eval", "--host", "evalhost"])
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
         .env("PATH", path)
         .env_remove("CATALOG")
         .env_remove("ST_ROOT")
         .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
         "colliding fixture Agent Spec changed legacy eval semantics:\n{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        catalog.join("logs/evalhost.legacy.log").exists()
+            && !catalog.join("logs/legacy.log").exists(),
+        "compact runtime did not use the canonical PTY identity"
     );
 }
 
@@ -931,7 +949,6 @@ eval {
 const RUNTIME_PEER_SPEC: &str = r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 agent "sup" {
-  env { ST_AGENT "sup" }
   command "sh -c 'pty run -d --id rtpeer -- sleep 100000; for _ in $(seq 1 100); do test -s $PTY_ROOT/rtpeer.pid && break; sleep 0.05; done; cat $PTY_ROOT/rtpeer.pid > $CATALOG/runtime-peer.pid; exec sleep 100000'"
 }
 eval {
@@ -958,7 +975,7 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
     // teardown must reap both the declared seat and the runtime peer. The proof below uses only this
     // invocation's root + exact pid; concurrent evals cannot be observed or killed.
     let spec_text = RUNTIME_PEER_SPEC;
-    assert_eq!(spec_text.len(), 459);
+    assert_eq!(spec_text.len(), 434);
     let sentinel = "judge \"trivial\" { exec \"exit 0\" }";
     assert_eq!(spec_text.matches(sentinel).count(), 1);
     std::fs::write(cell.join("cell.kdl"), spec_text.replace(sentinel, &format!("judge \"trivial\" {{ exec \"{judge_command}\" }}"))).unwrap();
@@ -1232,11 +1249,11 @@ fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
         r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
 team "cd" {
-  agent "gate"   { supervisor "cd.cos"; env { ST_AGENT "cd.gate" }; command "sh $CATALOG/scripts/gate.sh" }
-  agent "worker" { supervisor "cd.sup"; env { ST_AGENT "cd.worker" }; command "sh $CATALOG/scripts/worker.sh" }
-  agent "clean"  { supervisor "cd.cos"; env { ST_AGENT "cd.clean" }; command "sh $CATALOG/scripts/clean.sh" }
-  agent "sup"    { supervisor "cd.cos"; env { ST_AGENT "cd.sup" }; command "sh $CATALOG/scripts/sup.sh" }
-  agent "cos"    { env { ST_AGENT "cd.cos" }; command "sleep 100000" }
+  agent "gate"   { supervisor "cd.cos"; command "sh $CATALOG/scripts/gate.sh" }
+  agent "worker" { supervisor "cd.sup"; command "sh $CATALOG/scripts/worker.sh" }
+  agent "clean"  { supervisor "cd.cos"; command "sh $CATALOG/scripts/clean.sh" }
+  agent "sup"    { supervisor "cd.cos"; command "sh $CATALOG/scripts/sup.sh" }
+  agent "cos"    { command "sleep 100000" }
 }
 eval {
   copy "./fixture"
@@ -1255,7 +1272,7 @@ while [ ! -e "$CATALOG/release-gate-after-kickoff" ]; do sleep 0.05; done
 if mkdir "$CATALOG/gate-exited-once" 2>/dev/null; then
   exit 0
 fi
-st2 message send cd.sup --root "$ST_ROOT" --as cd.gate -m "supervise tick completed" >/dev/null 2>&1
+st2 message send evalhost.cd.sup --root "$ST_ROOT" --as "$ST_AGENT" -m "supervise tick completed" >/dev/null 2>&1
 sleep 100000
 "#,
     )
@@ -1267,7 +1284,7 @@ while [ ! -e "$CATALOG/release-after-supervise-tick" ]; do sleep 0.05; done
 if mkdir "$CATALOG/worker-exited-once" 2>/dev/null; then
   exit 1
 fi
-st2 message send cd.sup --root "$ST_ROOT" --as cd.worker -m "worker respawned after crash" >/dev/null 2>&1
+st2 message send evalhost.cd.sup --root "$ST_ROOT" --as "$ST_AGENT" -m "worker respawned after crash" >/dev/null 2>&1
 sleep 100000
 "#,
     )
@@ -1279,7 +1296,7 @@ while [ ! -e "$CATALOG/release-after-supervise-tick" ]; do sleep 0.05; done
 if mkdir "$CATALOG/clean-exited-once" 2>/dev/null; then
   exit 0
 fi
-st2 message send cd.sup --root "$ST_ROOT" --as cd.clean -m "clean seat respawned" >/dev/null 2>&1
+st2 message send evalhost.cd.sup --root "$ST_ROOT" --as "$ST_AGENT" -m "clean seat respawned" >/dev/null 2>&1
 sleep 100000
 "#,
     )
@@ -1290,7 +1307,7 @@ sleep 100000
 wait_from() {
   from=$1
   for _ in $(seq 1 160); do
-    count=$(st2 message ls cd.sup --root "$ST_ROOT" --from "$from" --count 2>/dev/null || echo 0)
+    count=$(st2 message ls "$ST_AGENT" --root "$ST_ROOT" --from "$from" --count 2>/dev/null || echo 0)
     [ "$count" -gt 0 ] 2>/dev/null && return 0
     sleep 0.05
   done
@@ -1299,27 +1316,32 @@ wait_from() {
 
 wait_from runner || exit 2
 : > "$CATALOG/release-gate-after-kickoff"
-wait_from cd.gate || exit 3
+wait_from evalhost.cd.gate || exit 3
 : > "$CATALOG/release-after-supervise-tick"
 wait_from st2 || exit 4
-wait_from cd.worker || exit 5
-wait_from cd.clean || exit 6
-st2 message send runner --root "$ST_ROOT" --as cd.sup -m "both supervised exits classified" >/dev/null 2>&1
+wait_from evalhost.cd.worker || exit 5
+wait_from evalhost.cd.clean || exit 6
+st2 message send runner --root "$ST_ROOT" --as "$ST_AGENT" -m "both supervised exits classified" >/dev/null 2>&1
 sleep 100000
 "#,
     )
     .unwrap();
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
-    let out = Command::new(bin)
-        .args(["eval"])
+    let child = Command::new(bin)
+        .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
         .env("PATH", path)
         .env_remove("CATALOG")
         .env_remove("ST_ROOT")
         .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _catalog_cleanup = RemoveDirOnDrop(catalog.clone());
+    let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1328,20 +1350,20 @@ sleep 100000
     );
     // (b) the crash escalates to BOTH the direct supervisor and the root cos.
     assert!(
-        stdout.contains("crash-ding: cd.worker → cd.sup"),
+        stdout.contains("crash-ding: evalhost.cd.worker → evalhost.cd.sup"),
         "crash didn't ding the supervisor:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
     assert!(
-        stdout.contains("crash-ding: cd.worker → cd.cos"),
+        stdout.contains("crash-ding: evalhost.cd.worker → evalhost.cd.cos"),
         "crash didn't reach the root cos:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
     // (c) the clean-exit seat produces NO ding.
     assert!(
-        !stdout.contains("crash-ding: cd.clean"),
+        !stdout.contains("crash-ding: evalhost.cd.clean"),
         "a clean exit (0) must NOT crash-ding:\n{stdout}"
     );
     assert!(
-        !stdout.contains("crash-ding: cd.gate"),
+        !stdout.contains("crash-ding: evalhost.cd.gate"),
         "the clean gate exit (0) must NOT crash-ding:\n{stdout}"
     );
 }
@@ -1366,7 +1388,7 @@ fn st2_eval_fails_fast_when_a_seat_exits_at_boot() {
         cell.join("cell.kdl"),
         r#"
 env { ST_ROOT "$CATALOG/custom-bus"; PTY_ROOT "$CATALOG/pty" }
-agent "bad" { env { ST_AGENT "bad" }; command "definitely-not-a-real-binary-xyz123" }
+agent "bad" { command "definitely-not-a-real-binary-xyz123" }
 eval {
   copy "./fixture"
   message { from "requester"; to "bad"; content "go" }

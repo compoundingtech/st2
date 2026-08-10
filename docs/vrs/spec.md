@@ -142,13 +142,41 @@ For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
 `pty metadata patch --id <task-id>` request. Every PTY receives the versioned
 st2-owned tags `agent.presentation.schema=1`,
 `agent.actor.path=<host>.<identity>`, and the optional
-`agent.presentation.description`. The primary task named `agent` additionally
-maps `name` to native `displayName`; secondary tasks retain their task-specific
-display convention. Name is not duplicated in tags. Clearing removes only the
-owned native value or tag, and unrelated PTY metadata is preserved. Repeating
-the same projection is a no-op. Failure is reported and retried by the ordinary
-loop, never converted into launch, teardown, garbage collection, replacement,
-or flapping authority.
+`agent.presentation.description`. The canonical PTY whose task is named `agent`
+and whose ID is `<host>.<identity>` additionally receives the compatibility tag
+`role=agent`, and maps `name` to native
+`displayName`. Secondary PTYs retain their task-specific display convention and
+clear that compatibility tag. Exec tasks receive no PTY presentation. Name is
+not duplicated in tags. Clearing removes only the owned native value or tag,
+and unrelated PTY metadata is preserved. Repeating the same projection is a
+no-op. Failure is reported and retried by the ordinary loop, never converted
+into launch, teardown, garbage collection, replacement, or flapping authority.
+## Service-principal request transport
+
+A non-agent service that needs bounded judgment work may declare only its bus
+endpoint at
+`principals/<host>/<identity>/principal.kdl`:
+
+```kdl
+principal "example-ci" host="host-a"
+```
+
+The declaration creates no task, presence, persona, or Agent Spec authority.
+Its content must exactly match its canonical path. `st2 request send` accepts
+only such a principal as the caller and only a discovered Agent Spec as the
+recipient, so a service neither impersonates an agent nor depends on the flat
+orphan-recovery layout.
+
+The caller supplies an idempotency key, a JSON body, and typed string tags.
+Before the native message is published, st2 atomically reserves one random
+canonical message filename and the exact request envelope under the
+principal's `resources/request-state/`. Replays finish that same publication;
+reuse of the key with different caller, recipient, body, or tags fails. An
+agent's `st2 request reply` similarly publishes at most one typed reply to the
+principal's canonical inbox. `st2 request status --json` returns the tagged
+union `pending | replied`, suitable for a durable workflow to observe between
+its own durable waits. st2 provides no wait loop or timer and does not turn the
+request into agent lifecycle authority.
 
 ## Resource bindings (R20-R21)
 
@@ -461,7 +489,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   claims fail every conflicting owner before the first workspace write.
   Targeted reconciliation checks the selected owner against the full fleet, so
   selection cannot bypass this ownership boundary.
-- **R04:** Each machine schedules and reconciles only its pinned work. The st2
+- **R04, R31:** Each machine schedules and reconciles only its pinned work. The st2
   loop is deterministic; exactly one declared root agent provides intelligent
   host-local supervision, bounded recovery, and escalation. Filesystem reads
   never wake reconciliation; only create, modify, rename, or remove events may
@@ -471,6 +499,27 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   failing to restart the agent, or terminally parking it, suppresses companion
   launch and stops an exact generated companion proved live; explicitly
   authored sibling tasks remain independent.
+  Restart accounting is per task and persists across reconcile passes. Only a
+  successful launch spends its declared budget. Each completed pass supplies
+  the exact task IDs it proved alive; uninterrupted observed liveness may
+  forgive a fail-mode budget according to the
+  [restart field contract](./02-agent-spec/spec.md#f12), while an unobserved task
+  loses accrued recovery uptime. A pass that exits before execution neither
+  supplies a liveness observation nor closes the accounting pass.
+  [PR #191](https://github.com/compoundingtech/st2/pull/191) provides cadence,
+  recovery, and unobserved-pass evidence for this accounting.
+- **R32:** Bounded non-interactive helpers such as `pty list --json` and
+  `pty metadata patch` start in a fresh session whose leader PID is also its
+  process-group ID. Standard output and error use regular temporary files, so a
+  descendant inheriting those descriptors cannot hold a capture pipe open.
+  After spawn, an input setup or write failure or a deadline expiry sends
+  `SIGKILL` to the process group and explicitly terminates the direct child.
+  st2 waits for that child until the cleanup deadline; if it cannot finish the
+  wait synchronously, a background waiter takes ownership before the failure
+  returns. The process-group signal reaches a descendant that outlives the
+  direct child; terminating the direct child alone does not. [PR
+  #202](https://github.com/compoundingtech/st2/pull/202) provides
+  descendant-lifetime and direct-child-reap evidence for this contract.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent. Harness readiness
   that depends on a dynamically selected account belongs to that declared
@@ -478,6 +527,14 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   before launch: the command may select an account-specific `CODEX_HOME` only
   after st2 starts it. `st2 pretrust` remains an explicit operator utility for
   commands that intentionally use the ambient Claude and Codex configs.
+
+  st2 owns `ST_AGENT` for every PTY and exec task, deriving the value as
+  `<resolved-host>.<identity>` on every reconciliation. An omitted value is
+  injected, an authored exact match is accepted, and a conflicting authored
+  value refuses the declaration before workspace materialization or runner
+  access. The derived value is part of the persisted launch environment, so
+  initial launch, supervised replay, and manual PTY restart preserve the same
+  identity.
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares
@@ -857,3 +914,83 @@ the resident supervisor continues to reconcile the complete local catalog.
   Activity status, current plan, and current plan step remain undefined. Prove
   their stale-state and supervisor-following behavior before adding their shape
   to `AGENT-SPEC.md`.
+- **DQ4 Relaunch boundary (R29-R30):** Preserve R11's nondisruptive adoption
+  while making launch drift visible. For each declared task, derive the desired
+  launch fingerprint from a deterministic, versioned encoding of only:
+  backend kind, lowered shell source or direct argv, resolved working directory,
+  and the st2-managed plus declared effective environment. Tags, descriptive
+  metadata, unrelated inherited environment, file contents, and other boot-time
+  snapshots are not part of this fingerprint.
+
+  As part of its own successful task launch, st2 records the observed
+  fingerprint together with that launch's exact runtime identity and creation
+  incarnation. The observed fingerprint is trustworthy only while the current
+  live runtime exactly matches that binding. Inspection then reports:
+
+  | State | Meaning | Healthy-task action |
+  | --- | --- | --- |
+  | `converged` | desired and bound observed fingerprints match | adopt |
+  | `drifted` | desired and bound observed fingerprints differ | adopt and report drift |
+  | `unknown` | the observed binding is missing or does not match the live runtime | adopt and report unknown |
+
+  `unknown` includes a healthy legacy or externally adopted runtime, as well as
+  a manual PTY restart or external child replacement whose runtime identity or
+  creation incarnation no longer matches st2's launch record. Stale observed
+  metadata is never reused for the new incarnation. Catalog publication,
+  supervisor restart, metadata edits, and launch-field edits do not implicitly
+  disrupt any healthy task.
+
+  Ordinary reconciliation remains sufficient after every interruption:
+
+  | Declaration | Process | Action |
+  | --- | --- | --- |
+  | active | absent or dead | reap stale state and launch the latest current desired contract |
+  | active | alive | adopt and report `converged`, `drifted`, or `unknown` |
+  | retired | alive | stop; do not relaunch |
+  | retired | absent or dead | do not launch |
+
+  Replacing live drifted work is a separate explicit operation. Its scope is
+  one selected catalog, pinned host, resolved effective PTY root, and selected
+  task set. A future interface may preview drifted tasks and select one, a
+  subset, or all of them; this contract does not reserve a command name. The
+  operation must re-read the selected task and recheck its exact live runtime
+  identity immediately before each stop. A missing, changed, wrong-host, or
+  wrong-root target refuses without disruption.
+
+  Replacement does not capture an old launch contract or boot inputs. If st2
+  stops after the identity check and is then interrupted, ordinary
+  absent/dead reconciliation launches the latest current desired contract.
+  There is no replay of an older generation, durable operation journal,
+  operation ID, phase machine, terminal receipt, or atomic old-to-new runtime
+  transition. A task rename is the explicit sequence retire old, then add new.
+
+  This entire lifecycle works from an ordinary copied or synchronized catalog
+  folder. CAS may later add publication, history, or storage optimization, but
+  fingerprinting, inspection, reconciliation, replacement, retirement,
+  recovery, and rename must neither require nor become incomplete without it.
+
+  Executable acceptance proves:
+
+  1. metadata, tags, and Resource-only edits preserve the fingerprint and live
+     runtime, while kind, launch, resolved-cwd, or effective-environment edits
+     report `drifted` without changing runtime identity;
+  2. a healthy legacy runtime reports `unknown` and remains unchanged, and a
+     manual or external restart with a changed runtime identity or creation
+     incarnation cannot reuse the prior observed fingerprint and reports
+     `unknown`;
+  3. natural exit or death launches once from the latest current declaration
+     and records that launch's observed fingerprint;
+  4. explicit replacement refuses stale identity or scope, and affects only
+     the selected drifted tasks;
+  5. interruption after stop heals through ordinary reconciliation to the
+     latest current desired contract, without old-state replay;
+  6. retirement stops and prevents relaunch, while rename works as
+     retire-old/add-new; and
+  7. the same proofs pass using only a plain local catalog folder with no CAS
+     service, CAS metadata, database, or network dependency.
+
+  The executable acceptance above resolves this open implementation design.
+   See [#40](https://github.com/compoundingtech/st2/issues/40),
+   [#41](https://github.com/compoundingtech/st2/issues/41),
+   [#44](https://github.com/compoundingtech/st2/issues/44), and
+   [#60](https://github.com/compoundingtech/st2/issues/60).

@@ -69,6 +69,9 @@ enum Command {
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
     #[command(subcommand)]
     Message(MessageCmd),
+    /// Idempotent JSON request/reply transport for declared non-agent service principals.
+    #[command(subcommand)]
+    Request(RequestCmd),
     /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
@@ -677,6 +680,62 @@ enum MessageCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum RequestCmd {
+    /// Publish one idempotent JSON request from a declared service principal to an agent.
+    Send {
+        /// Recipient agent: a bus id (`<host>.<identity>`) or a local bare identity.
+        to: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        /// Typed request tag as `key=value` (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// JSON body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        /// Emit the machine receipt as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Decode one typed request from an agent's inbox.
+    Read {
+        request_filename: String,
+        /// Emit the request envelope as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Reply once to a typed request in an agent's inbox.
+    Reply {
+        request_filename: String,
+        /// Typed reply tag as `key=value` (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// JSON body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        /// Emit the machine receipt as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Observe the typed reply for one previously published request.
+    Status {
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        /// Emit the tagged status union as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
 fn main() -> Result<()> {
     let Cli {
         catalog_path,
@@ -708,6 +767,7 @@ fn main() -> Result<()> {
             up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Request(cmd) => request_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
@@ -1749,7 +1809,15 @@ fn ding_cmd(
         poll: Duration::from_millis(interval),
         ..Default::default()
     };
-    ding::serve(&inbox, &status_path, &session, &config)
+    ding::serve(
+        &catalog_root,
+        &this_host,
+        &id,
+        &inbox,
+        &status_path,
+        &session,
+        &config,
+    )
 }
 
 /// Resolve the catalog root and local host from a message subcommand's shared context.
@@ -2015,6 +2083,132 @@ fn send_resolved_message(
     } else {
         message::send_to_resolved_inbox(root, to, host, from, subject, in_reply_to, tags, body)
     }
+}
+
+fn request_cmd(cmd: RequestCmd) -> Result<()> {
+    match cmd {
+        RequestCmd::Send {
+            to,
+            idempotency_key,
+            tags,
+            body,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let principal = acting_id(&ctx)?;
+            let body = parse_json_body(body)?;
+            let receipt = st2::request::publish(
+                &root,
+                &host,
+                &principal,
+                &to,
+                &idempotency_key,
+                parse_typed_tags(tags)?,
+                body,
+            )?;
+            print_publish_receipt(&receipt, json)
+        }
+        RequestCmd::Reply {
+            request_filename,
+            tags,
+            body,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let agent = acting_id(&ctx)?;
+            let body = parse_json_body(body)?;
+            let receipt = st2::request::reply(
+                &root,
+                &host,
+                &agent,
+                &request_filename,
+                parse_typed_tags(tags)?,
+                body,
+            )?;
+            print_publish_receipt(&receipt, json)
+        }
+        RequestCmd::Read {
+            request_filename,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let agent = acting_id(&ctx)?;
+            let request = st2::request::read(&root, &host, &agent, &request_filename)?;
+            if json {
+                println!("{}", serde_json::to_string(&request)?);
+            } else {
+                println!(
+                    "request {} from {} ({})",
+                    request.idempotency_key, request.from, request.request_filename
+                );
+            }
+            Ok(())
+        }
+        RequestCmd::Status {
+            idempotency_key,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let principal = acting_id(&ctx)?;
+            let status = st2::request::status(
+                &root,
+                &host,
+                &principal,
+                &idempotency_key,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                match status {
+                    st2::request::RequestStatus::Pending {
+                        idempotency_key,
+                        request_filename,
+                    } => println!("pending {idempotency_key} ({request_filename})"),
+                    st2::request::RequestStatus::Replied {
+                        idempotency_key,
+                        request_filename,
+                        from,
+                        ..
+                    } => println!("replied {idempotency_key} ({request_filename}) from {from}"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_json_body(body: Option<String>) -> Result<serde_json::Value> {
+    let body = body_or_stdin(body)?;
+    serde_json::from_str(&body).context("request body must be valid JSON")
+}
+
+fn parse_typed_tags(tags: Vec<String>) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut parsed = std::collections::BTreeMap::new();
+    for tag in tags {
+        let (key, value) = tag
+            .split_once('=')
+            .with_context(|| format!("typed tag must be `key=value`, got `{tag}`"))?;
+        if key.is_empty() || value.is_empty() {
+            anyhow::bail!("typed tag must have a non-empty key and value: `{tag}`");
+        }
+        if parsed.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("duplicate typed tag key `{key}`");
+        }
+    }
+    Ok(parsed)
+}
+
+fn print_publish_receipt(receipt: &st2::request::PublishReceipt, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(receipt)?);
+    } else {
+        println!("{}", receipt.filename);
+    }
+    Ok(())
 }
 
 /// `st2 message ls --json` row (stable st2 wire contract).
@@ -2305,10 +2499,12 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     let this_host = host
         .or_else(|| spec.host.clone())
         .unwrap_or_else(detect_host);
-    // Seats boot as fresh top-level agents (strip the launcher's agent identity) and their bare
-    // `st2 …` resolve to this binary (PATH prepend) — same prep `st2 eval` does.
-    st2::eval_run::prepare_spawn_env();
-    let specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
+    // Seats boot as fresh top-level agents. Authored bare `st2` commands use the PATH prepend while
+    // generated DING sidecars bind directly to the executable captured by this context.
+    let task_context = st2::reconcile::TaskCompileContext::current(root.clone())?;
+    st2::eval_run::prepare_spawn_env(task_context.st2_executable());
+    let mut specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
+    st2::reconcile::compile_generated_ding_tasks(&mut specs, &this_host, &task_context)?;
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
@@ -2456,7 +2652,7 @@ fn up(
             Some(selector) => {
                 st2::run::up_once_selected(&catalog_root, selector, &this_host, &runner)?
             }
-            None => up_once(root, &this_host, &runner)?,
+            None => up_once(&catalog_root, &this_host, &runner)?,
         };
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
@@ -2479,7 +2675,7 @@ fn up(
         root.display()
     );
     let result = up_loop(
-        root,
+        &catalog_root,
         &this_host,
         &runner,
         Duration::from_secs(interval),

@@ -9,7 +9,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::{TaskKind, TaskLifecycle};
-use agent_spec::{AgentDesiredState, AgentSpec, JobType, Resource, Task, discover};
+use agent_spec::{
+    AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
+};
 
 #[test]
 fn desired_state_is_typed_and_legacy_retirement_remains_readable() {
@@ -1396,6 +1398,91 @@ fn nonexistent_root_yields_empty_not_error() {
     let found = discover(Path::new("/no/such/catalog/anywhere"));
     assert!(found.specs.is_empty());
     assert!(found.errors.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_discovery_reports_unobservable_declaration_entries() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/live/agent.kdl",
+        r#"agent "live" { host "hetz"; command "x" }"#,
+    );
+    let dangling = tmp.path().join("dangling.kdl");
+    symlink(tmp.path().join("missing.kdl"), &dangling).unwrap();
+    let socket = tmp.path().join("socket.kdl");
+    let _listener = UnixListener::bind(&socket).unwrap();
+
+    let ordinary = discover(tmp.path());
+    assert_eq!(ordinary.specs.len(), 1);
+    assert!(ordinary.errors.is_empty(), "{:?}", ordinary.errors);
+
+    let strict = discover_strict(tmp.path());
+    assert_eq!(strict.specs.len(), 1);
+    assert_eq!(strict.errors.len(), 2, "{:?}", strict.errors);
+    assert!(strict.errors.iter().any(|error| error.path == dangling));
+    assert!(strict.errors.iter().any(|error| error.path == socket));
+    assert!(
+        strict
+            .errors
+            .iter()
+            .all(|error| error.message.contains("unobservable declaration entry"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_discovery_reports_a_directory_symlink_that_can_hide_declarations() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    write(
+        external.path(),
+        "nested/agent.kdl",
+        r#"agent "hidden" { host "hetz"; command "x" }"#,
+    );
+    let linked = tmp.path().join("linked-catalog");
+    symlink(external.path(), &linked).unwrap();
+
+    let ordinary = discover(tmp.path());
+    assert!(ordinary.specs.is_empty());
+    assert!(ordinary.errors.is_empty(), "{:?}", ordinary.errors);
+
+    let strict = discover_strict(tmp.path());
+    assert!(strict.specs.is_empty());
+    assert_eq!(strict.errors.len(), 1, "{:?}", strict.errors);
+    assert_eq!(strict.errors[0].path, linked);
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_discovery_allows_symlinks_that_cannot_hide_declarations() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join("python"), "binary").unwrap();
+    let venv = tmp.path().join("workspace/.venv");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::fs::create_dir_all(venv.join("lib")).unwrap();
+    symlink(external.path().join("python"), venv.join("bin/python")).unwrap();
+    symlink("lib", venv.join("lib64")).unwrap();
+    write(
+        tmp.path(),
+        "real/agent.kdl",
+        r#"agent "visible" { host "hetz"; command "x" }"#,
+    );
+    symlink("real", tmp.path().join("alias")).unwrap();
+
+    let strict = discover_strict(tmp.path());
+    assert!(strict.errors.is_empty(), "{:?}", strict.errors);
+    assert_eq!(strict.specs.len(), 1);
+    assert_eq!(strict.specs[0].identity, "visible");
 }
 
 #[test]

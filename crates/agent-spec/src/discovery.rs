@@ -45,19 +45,39 @@ pub struct SpecError {
 /// Extensions discovery will attempt to parse as specs.
 const SPEC_EXTS: [&str; 3] = ["toml", "json", "kdl"];
 
+thread_local! {
+    /// This observer cannot see walks performed on another thread. If discovery gains a spawn
+    /// boundary, dependent structural tests can silently lose coverage and must be reassessed.
+    static DISCOVERY_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the current thread's discovery-walk count for structural tests in dependent crates.
+#[doc(hidden)]
+pub fn reset_discovery_walk_count_for_test() {
+    DISCOVERY_WALK_COUNT.set(0);
+}
+
+/// Return the current thread's discovery-walk count for structural tests in dependent crates.
+#[doc(hidden)]
+pub fn discovery_walk_count_for_test() -> usize {
+    DISCOVERY_WALK_COUNT.get()
+}
+
 /// Walk `root` recursively and lower every agent spec found. Returns empty (no error) when `root`
 /// does not exist yet — a fresh, un-seeded folder is a valid state.
 pub fn discover(root: &Path) -> Discovered {
     discover_impl(root, false)
 }
 
-/// Discover a catalog while treating directory traversal failures as uncertainty. Consumers that
-/// must prove a global property such as identity uniqueness should use this mode.
+/// Discover a catalog while treating directory traversal failures and entries that could conceal
+/// declarations as uncertainty. Consumers that must prove a global property such as identity
+/// uniqueness should use this mode.
 pub fn discover_strict(root: &Path) -> Discovered {
     discover_impl(root, true)
 }
 
 fn discover_impl(root: &Path, strict: bool) -> Discovered {
+    DISCOVERY_WALK_COUNT.set(DISCOVERY_WALK_COUNT.get() + 1);
     let mut out = Discovered::default();
     let mut files = Vec::new();
     collect_spec_files(root, root, &mut files, strict, &mut out.errors);
@@ -227,13 +247,49 @@ fn collect_spec_files(
         };
         if ft.is_dir() {
             collect_spec_files(root, &path, acc, strict, errors);
-        } else if ft.is_file()
-            && let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && SPEC_EXTS.contains(&ext)
-        {
+        } else if ft.is_file() && has_spec_extension(&path) {
             acc.push(path);
+        } else if strict && unobservable_entry_may_hide_declaration(root, &path, ft) {
+            errors.push(SpecError {
+                path,
+                message: "unobservable declaration entry: neither a regular file nor an independently traversed catalog directory".to_string(),
+            });
         }
     }
+}
+
+fn has_spec_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| SPEC_EXTS.contains(&extension))
+}
+
+/// A directory symlink is safe only when its real target is already inside the catalog walk.
+/// Declaration-shaped special files and links whose targets cannot be proven independently
+/// observable keep strict consumers from claiming a complete catalog.
+fn unobservable_entry_may_hide_declaration(
+    root: &Path,
+    path: &Path,
+    file_type: fs::FileType,
+) -> bool {
+    if has_spec_extension(path) {
+        return true;
+    }
+    if !file_type.is_symlink() {
+        return false;
+    }
+
+    let Ok(target) = path.canonicalize() else {
+        return true;
+    };
+    if !target.is_dir() {
+        return false;
+    }
+
+    let Ok(canonical_root) = root.canonicalize() else {
+        return true;
+    };
+    !target.starts_with(&canonical_root) || !is_catalog_path(&canonical_root, &target)
 }
 
 /// What a declaration literally *says*, before lowering normalizes it away.

@@ -10,8 +10,117 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 
 use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
+
+/// Immutable inputs captured once before generated tasks are compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCompileContext {
+    catalog_root: PathBuf,
+    st2_executable: PathBuf,
+}
+
+impl TaskCompileContext {
+    pub fn new(catalog_root: PathBuf, st2_executable: PathBuf) -> Result<Self> {
+        anyhow::ensure!(
+            catalog_root.is_absolute(),
+            "task compilation catalog root is not absolute: {}",
+            catalog_root.display()
+        );
+        anyhow::ensure!(
+            st2_executable.is_absolute(),
+            "task compilation st2 executable is not absolute: {}",
+            st2_executable.display()
+        );
+        anyhow::ensure!(
+            st2_executable
+                .try_exists()
+                .with_context(|| format!("checking st2 executable {}", st2_executable.display()))?,
+            "task compilation st2 executable does not exist: {}",
+            st2_executable.display()
+        );
+        anyhow::ensure!(
+            st2_executable
+                .metadata()
+                .with_context(|| format!("reading st2 executable {}", st2_executable.display()))?
+                .is_file(),
+            "task compilation st2 executable is not a file: {}",
+            st2_executable.display()
+        );
+        Ok(Self {
+            catalog_root,
+            st2_executable,
+        })
+    }
+
+    pub fn current(catalog_root: PathBuf) -> Result<Self> {
+        let catalog_root = if catalog_root.is_absolute() {
+            catalog_root
+        } else {
+            std::env::current_dir()
+                .context("resolving the task compilation catalog root")?
+                .join(catalog_root)
+        };
+        let st2_executable =
+            std::env::current_exe().context("resolving the running st2 executable")?;
+        Self::new(catalog_root, st2_executable)
+    }
+
+    pub fn st2_executable(&self) -> &Path {
+        &self.st2_executable
+    }
+}
+
+/// Replace only runner-generated DING markers with exact direct argv. Authored tasks never carry
+/// `derived=true`, so source that happens to invoke `st2 ding` remains byte-for-byte unchanged.
+pub fn compile_generated_ding_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    let st2_executable = context
+        .st2_executable
+        .to_str()
+        .context("running st2 executable path is not UTF-8")?
+        .to_owned();
+    for spec in specs {
+        let bus_id = spec.bus_id(this_host);
+        for task in &mut spec.tasks {
+            if !task.derived {
+                continue;
+            }
+            anyhow::ensure!(
+                task.kind == TaskKind::Exec
+                    && (task.name == "ding" || task.name.ends_with(".ding")),
+                "unsupported derived task: {}",
+                task.name
+            );
+            let effective_root = task
+                .env
+                .get("ST_ROOT")
+                .map(|root| crate::expand::expand_catalog(root, &context.catalog_root))
+                .unwrap_or_else(|| context.catalog_root.display().to_string());
+            anyhow::ensure!(
+                Path::new(&effective_root).is_absolute(),
+                "derived DING root is not absolute: {effective_root}"
+            );
+            task.command = None;
+            task.argv = Some(vec![
+                st2_executable.clone(),
+                "ding".to_string(),
+                "--identity".to_string(),
+                bus_id.clone(),
+                "--root".to_string(),
+                effective_root,
+            ]);
+        }
+    }
+    Ok(())
+}
 
 /// ACTUAL state: one running/known task as st2 observes it (unioned across backends).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +186,76 @@ pub struct PtyPresentation {
 pub const AGENT_PRESENTATION_SCHEMA_TAG: &str = "agent.presentation.schema";
 pub const AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
 pub const AGENT_DESCRIPTION_TAG: &str = "agent.presentation.description";
+/// Compatibility role owned by st2 only on the canonical agent PTY.
+pub const COMPATIBILITY_ROLE_TAG: &str = "role";
+
+/// Fail-closed admission errors for runner-owned task identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskIdentityAdmissionError {
+    Conflict {
+        bus_id: String,
+        task: String,
+        declared: String,
+    },
+}
+
+impl fmt::Display for TaskIdentityAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict {
+                bus_id,
+                task,
+                declared,
+            } => write!(
+                formatter,
+                "agent '{bus_id}' task '{task}' declares conflicting ST_AGENT '{declared}'; expected runner-owned value '{bus_id}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaskIdentityAdmissionError {}
+
+/// Reject local active tasks whose authored identity conflicts with the runner-derived bus ID.
+pub fn validate_task_identities(
+    specs: &[AgentSpec],
+    this_host: &str,
+) -> Result<(), TaskIdentityAdmissionError> {
+    for spec in specs {
+        if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
+            continue;
+        }
+        let bus_id = spec.bus_id(this_host);
+        for task in &spec.tasks {
+            if let Some(declared) = task.env.get("ST_AGENT")
+                && declared != &bus_id
+            {
+                return Err(TaskIdentityAdmissionError::Conflict {
+                    bus_id,
+                    task: task.name.clone(),
+                    declared: declared.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Project runner-owned identity and the supervisor source of truth into one launch target.
+fn runner_task_env(
+    spec: &AgentSpec,
+    task: &crate::spec::Task,
+    bus_id: &str,
+) -> BTreeMap<String, String> {
+    let mut env = task.env.clone();
+    env.insert("ST_AGENT".to_owned(), bus_id.to_owned());
+    if let Some(supervisor) = &spec.supervisor {
+        env.insert("ST_SUPERVISOR".to_owned(), supervisor.clone());
+    } else {
+        env.remove("ST_SUPERVISOR");
+    }
+    env
+}
 
 fn pty_presentation(
     spec: &AgentSpec,
@@ -87,6 +266,7 @@ fn pty_presentation(
     if task.kind != TaskKind::Pty {
         return None;
     }
+    let canonical_agent = task.name == "agent" && pty_id == bus_id;
     Some(PtyPresentation {
         pty_id: pty_id.to_owned(),
         display_name: (task.name == "agent").then(|| match spec.name.as_ref() {
@@ -100,6 +280,10 @@ fn pty_presentation(
             ),
             (AGENT_ACTOR_PATH_TAG.to_owned(), Some(bus_id.to_owned())),
             (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
+            (
+                COMPATIBILITY_ROLE_TAG.to_owned(),
+                canonical_agent.then(|| "agent".to_owned()),
+            ),
         ]),
     })
 }
@@ -164,6 +348,12 @@ pub struct ReconcilePlan<'a> {
     pub held: Vec<String>,
     /// In-place presentation updates for healthy managed PTYs, independent of lifecycle actions.
     pub presentation: Vec<PtyPresentation>,
+    /// Declared task ids this pass PROVED alive in the inventory snapshot — the positive evidence
+    /// the restart cap needs. It is deliberately not "everything we did not launch": a task can be
+    /// missing from `launch` because it was never considered (its owner failed to materialize, its
+    /// launch was gated, its death was debounced as a flicker), and inferring liveness from that
+    /// silence credits uptime to a task nobody looked at. Excludes ids headed for `teardown`.
+    pub live: Vec<String>,
 }
 
 /// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
@@ -202,6 +392,7 @@ pub fn reconcile_selected<'a>(
     this_host: &str,
     selector: &str,
 ) -> anyhow::Result<ReconcilePlan<'a>> {
+    validate_task_identities(specs, this_host)?;
     let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
     let mut plan = ReconcilePlan::default();
     let actual = sessions.iter().find(|s| s.pty_id == runtime);
@@ -234,12 +425,7 @@ pub fn reconcile_selected<'a>(
         }
     };
     let bus_id = owner.bus_id(this_host);
-    let mut env = task.env.clone();
-    if let Some(supervisor) = &owner.supervisor {
-        env.insert("ST_SUPERVISOR".into(), supervisor.clone());
-    } else {
-        env.remove("ST_SUPERVISOR");
-    }
+    let env = runner_task_env(owner, task, &bus_id);
     let target = TaskTarget {
         kind: task.kind,
         pty_id: runtime.clone(),
@@ -264,6 +450,7 @@ pub fn reconcile_selected<'a>(
             {
                 plan.presentation.push(presentation);
             }
+            plan.live.push(runtime);
             plan.adopt.push(owner);
         }
         _ if task.lifecycle == TaskLifecycle::AdoptOnly => plan.held.push(runtime),
@@ -314,7 +501,8 @@ pub fn reconcile<'a>(
     specs: &'a [AgentSpec],
     sessions: &[Session],
     this_host: &str,
-) -> ReconcilePlan<'a> {
+) -> Result<ReconcilePlan<'a>, TaskIdentityAdmissionError> {
+    validate_task_identities(specs, this_host)?;
     let by_id: HashMap<&str, bool> = sessions
         .iter()
         .map(|s| (s.pty_id.as_str(), s.alive))
@@ -369,15 +557,7 @@ pub fn reconcile<'a>(
                         unreachable!("discovery rejects tasks carrying both command and argv")
                     }
                 };
-                // `supervisor` is the single source of truth. Hooks and harnesses consume the
-                // derived environment variable, but catalog authors/renderers never need to
-                // duplicate the relationship in env{} (and cannot accidentally make it disagree).
-                let mut env = t.env.clone();
-                if let Some(supervisor) = &spec.supervisor {
-                    env.insert("ST_SUPERVISOR".to_string(), supervisor.clone());
-                } else {
-                    env.remove("ST_SUPERVISOR");
-                }
+                let env = runner_task_env(spec, t, &bus_id);
                 let pty_id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
                 Some((
                     TaskTarget {
@@ -434,6 +614,7 @@ pub fn reconcile<'a>(
             }
             match state {
                 SessionState::Alive => {
+                    plan.live.push(target.pty_id.clone());
                     if target.derived {
                         live_derived.push(target.pty_id.clone());
                     }
@@ -479,5 +660,5 @@ pub fn reconcile<'a>(
             });
         }
     }
-    plan
+    Ok(plan)
 }

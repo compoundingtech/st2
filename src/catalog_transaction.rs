@@ -2709,14 +2709,39 @@ fn prepared_capture_checkpoint(point: &str) {
 #[cfg(not(debug_assertions))]
 fn prepared_capture_checkpoint(_point: &str) {}
 
+/// A path naming the directory `dir` is open on, which callers may **join a child component onto**.
+/// That last part is the contract — every call site appends to the result — and it is what makes the
+/// two platforms need different mechanisms rather than symmetrical-looking strings.
 pub(crate) fn retained_dir_path(dir: &File) -> Result<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        // A symlink to the pathname, so a child component resolves through it.
         Ok(PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())))
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(PathBuf::from(format!("/dev/fd/{}", dir.as_raw_fd())))
+        // `/dev/fd/N` looks like the Linux form but is not the same kind of thing: it names the open
+        // file itself, not a portal into the directory, so `/dev/fd/N/child` does not resolve and
+        // every caller that joins gets ENOENT. `F_GETPATH` is the macOS counterpart to reading the
+        // `/proc/self/fd` symlink — it recovers the descriptor's pathname, which can be joined onto.
+        //
+        // The pathname is resolved at call time rather than staying bound to the descriptor. That
+        // difference is only observable if the directory is renamed between the open and the join;
+        // the call site holding the result longest already `canonicalize()`s it, which discards the
+        // descriptor binding on Linux too.
+        let mut buffer = [0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: `buffer` is PATH_MAX bytes, which is what F_GETPATH requires, and `dir` owns a
+        // valid descriptor for the duration of the call.
+        let result = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error())
+                .context("resolve the pathname of a retained directory descriptor");
+        }
+        // SAFETY: on success F_GETPATH wrote a NUL-terminated pathname into `buffer`.
+        let path = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) };
+        Ok(PathBuf::from(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path.to_bytes()),
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
@@ -3173,6 +3198,27 @@ mod tests {
         assert_ne!(
             hash_projection(&files, &no_facts),
             hash_projection(&files, &facts)
+        );
+    }
+
+    /// Every caller of `retained_dir_path` appends a child component to the result, so returning a
+    /// path that merely *names* the directory is not enough — a child has to resolve through it.
+    /// The two platforms need different mechanisms to satisfy that, and nothing else in the suite
+    /// states the requirement: the callers that break reach it through a catalog lock and surface as
+    /// a lock error, which cannot distinguish "wrong path shape" from "lock genuinely unavailable".
+    #[test]
+    fn a_child_component_resolves_through_a_retained_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child"), b"payload").unwrap();
+        let handle = File::open(dir.path()).unwrap();
+
+        let joined = retained_dir_path(&handle).unwrap().join("child");
+
+        assert_eq!(
+            std::fs::read(&joined).unwrap_or_default(),
+            b"payload",
+            "a child component must resolve through {}",
+            joined.display()
         );
     }
 }

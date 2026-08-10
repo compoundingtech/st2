@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
 use crate::message;
-use crate::reconcile::{PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget};
+use crate::reconcile::{
+    PtyPresentation, ReconcilePlan, Session, TaskCompileContext, TaskLaunch, TaskTarget,
+    compile_generated_ding_tasks,
+};
 use crate::task_inventory::{
     DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
     RuntimeObserver, generation_id,
@@ -143,6 +146,19 @@ fn output_with_input_timeout(
     timeout: Duration,
     input: Option<Vec<u8>>,
 ) -> anyhow::Result<Output> {
+    output_with_input_timeout_observed(command, timeout, input, |_| {})
+}
+
+/// `on_spawn` observes the direct child's pid at the moment it exists. The child is `setsid`, so
+/// that pid is also its process group id — the group this function signals on every failure path.
+/// Tests need it to assert the child was reaped, and the child cannot supply it: a test whose
+/// deadline expires before the child is first scheduled would never see anything the child wrote.
+fn output_with_input_timeout_observed(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+    on_spawn: impl FnOnce(i32),
+) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -164,6 +180,7 @@ fn output_with_input_timeout(
     }
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
+    on_spawn(pid);
     let deadline = Instant::now() + timeout;
     if let Some(input) = input {
         let Some(stdin) = child.stdin.take() else {
@@ -1199,6 +1216,15 @@ fn execute_with_presentation_cursor(
         }
     }
 
+    // Uptime is what forgives a `mode = fail` budget, so every pass is closed, not only the ones
+    // that launched something. The cap is told what the pass PROVED alive (`plan.live`) rather than
+    // being left to infer it from what the pass did not launch: this plan may have been narrowed
+    // after reconcile (hook gating, flicker debouncing) or built from a reduced spec set (an owner
+    // that failed to materialize), and a task dropped that way is unobserved, not healthy. A pass
+    // that bailed before `execute` (lock failure, skipped) never gets here and credits nothing —
+    // the same safe direction.
+    cap.end_pass(Instant::now(), &plan.live);
+
     for td in &plan.teardown {
         for id in &td.pty_ids {
             match runner.kill(id) {
@@ -1319,6 +1345,7 @@ impl LivenessDebounce {
 fn reconcile_pass(
     root: &Path,
     this_host: &str,
+    task_context: &TaskCompileContext,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
@@ -1346,6 +1373,11 @@ fn reconcile_pass(
             .collect(),
         ..Default::default()
     };
+
+    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
+        report.errors.push(error.to_string());
+        return report;
+    }
 
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
@@ -1381,12 +1413,19 @@ fn reconcile_pass(
     );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
-    let eligible_specs: Vec<_> = found
+    let mut eligible_specs: Vec<_> = found
         .specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
         .collect();
+    if let Err(error) = compile_generated_ding_tasks(&mut eligible_specs, this_host, task_context) {
+        report.skipped = true;
+        report
+            .errors
+            .push(format!("compile generated DING tasks (pass skipped): {error:#}"));
+        return report;
+    }
 
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
@@ -1400,7 +1439,13 @@ fn reconcile_pass(
     };
     let now = Instant::now();
     debounce.observe(&sessions, now);
-    let mut plan = crate::reconcile(&eligible_specs, &sessions, this_host);
+    let mut plan = match crate::reconcile(&eligible_specs, &sessions, this_host) {
+        Ok(plan) => plan,
+        Err(error) => {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    };
     report.deferred = debounce.defer_flickers(&mut plan, now);
     gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
@@ -1453,10 +1498,12 @@ fn gate_codex_launches_on_hooks<'a, V>(
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     Ok(reconcile_pass(
         root,
         this_host,
+        &task_context,
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
@@ -1498,6 +1545,10 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let mut report = UpReport::default();
+    if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
+        report.errors.push(error.to_string());
+        return report;
+    }
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
         Err(e) => {
@@ -1535,7 +1586,13 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     let mut report = UpReport::default();
     let now = Instant::now();
     debounce.observe(sessions, now);
-    let mut plan = crate::reconcile(specs, sessions, this_host);
+    let mut plan = match crate::reconcile(specs, sessions, this_host) {
+        Ok(plan) => plan,
+        Err(error) => {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    };
     report.deferred = debounce.defer_flickers(&mut plan, now);
     execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     report
@@ -1591,6 +1648,10 @@ pub fn up_once_selected(
             .into_iter()
             .map(|e| format!("{}: {}", e.path.display(), e.message)),
     );
+    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
+        report.errors.push(error.to_string());
+        return Ok(report);
+    }
     let owner = owner.clone();
     if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
         && let Err(error) = crate::hooks::verify_installed()
@@ -1636,10 +1697,15 @@ where
     V: FnOnce() -> anyhow::Result<()>,
 {
     crate::reconcile::resolve_task(specs, selector, this_host)?;
+    crate::reconcile::validate_task_identities(specs, this_host)?;
+    let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?;
+    let mut compiled_specs = specs.to_vec();
+    compile_generated_ding_tasks(&mut compiled_specs, this_host, &task_context)?;
     let sessions = runner
         .list_sessions()
         .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
-    let mut plan = crate::reconcile::reconcile_selected(specs, &sessions, this_host, selector)?;
+    let mut plan =
+        crate::reconcile::reconcile_selected(&compiled_specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
     gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
     execute(&plan, runner, &mut FlappingCap::default(), &mut report);
@@ -1820,6 +1886,7 @@ fn up_loop_until(
     stop: &AtomicBool,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
     let _watcher = crate::watch::watch_catalog_declarations(root, tx);
     let mut cap = FlappingCap::default();
@@ -1837,6 +1904,7 @@ fn up_loop_until(
         let report = reconcile_pass(
             root,
             this_host,
+            &task_context,
             runner,
             &mut cap,
             &mut debounce,
@@ -1952,6 +2020,24 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_state(pid: i32) -> Option<char> {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()?
+            .rsplit_once(") ")?
+            .1
+            .chars()
+            .next()
+    }
+
+    fn process_can_retain_cleanup_resources(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        if linux_process_state(pid) == Some('Z') {
+            return false;
+        }
+        crate::host_lock::process_alive(pid)
+    }
 
     fn target(id: &str, cmd: &str) -> TaskTarget {
         TaskTarget {
@@ -2113,6 +2199,62 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn selected_identity_conflict_refuses_before_hook_verification_or_inventory() {
+        let mut spec = AgentSpec {
+            identity: "codex".into(),
+            name: None,
+            description: None,
+            host: None,
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            desired_state: crate::AgentDesiredState::Running,
+            keep: false,
+            restart: None,
+            resources: vec![],
+            tasks: vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: Some("test.codex.agent".into()),
+                command: None,
+                argv: Some(vec!["$CATALOG/bin/codex".into(), "--version".into()]),
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            }],
+            path: "/tmp/spec.kdl".into(),
+        };
+        spec.tasks[0]
+            .env
+            .insert("ST_AGENT".into(), "wrong.actor".into());
+        let runner = GateRunner {
+            list_calls: Cell::new(0),
+        };
+        let verify_calls = Cell::new(0);
+
+        let error = up_once_selected_specs_with_gates(
+            Path::new("/tmp"),
+            &[spec],
+            "test.codex.agent",
+            "test",
+            &runner,
+            || {
+                verify_calls.set(verify_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("conflicting ST_AGENT"));
+        assert_eq!(verify_calls.get(), 0);
+        assert_eq!(runner.list_calls.get(), 0);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn idle_supervisor_does_not_spin_on_its_own_catalog_reads() {
@@ -2155,6 +2297,163 @@ mod tests {
             exit_code: None,
             presentation: None,
         }
+    }
+
+    /// Records spawns and reports every launch as succeeding, so a pass can be driven repeatedly.
+    #[derive(Default)]
+    struct SpawnCountingRunner {
+        sessions: RefCell<Vec<Session>>,
+        spawned: RefCell<Vec<String>>,
+    }
+
+    impl Runner for SpawnCountingRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.borrow().clone())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            self.spawned.borrow_mut().push(target.pty_id.clone());
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `execute` must close every pass, or a task that recovers is never forgiven and eventually
+    /// parks even though it is healthy — the opposite of the crash-loop bug the cap exists for.
+    ///
+    /// The unit tests in `flapping.rs` call `end_pass` by hand, so they cannot catch it never being
+    /// called from a reconcile pass. This one drives the real `execute` path. `interval = 0s` makes
+    /// any survived pass count as recovery, keeping the test free of wall-clock sleeping.
+    #[test]
+    fn execute_closes_each_pass_so_a_recovered_task_regains_its_fail_budget() {
+        let mut spec = spec_fixture();
+        spec.restart = Some(agent_spec::spec::Restart {
+            attempts: 3,
+            interval: Duration::from_secs(0),
+            delay: Duration::from_secs(0),
+            mode: agent_spec::spec::RestartMode::Fail,
+        });
+        let runner = SpawnCountingRunner::default();
+        let mut cap = FlappingCap::default();
+
+        fn dying(spec: &AgentSpec) -> ReconcilePlan<'_> {
+            ReconcilePlan {
+                launch: vec![Launch {
+                    spec,
+                    tasks: vec![target("hetz.demo.agent", "x")],
+                    live_derived: Vec::new(),
+                }],
+                ..ReconcilePlan::default()
+            }
+        }
+
+        // Two failing passes: two of three launches spent.
+        for _ in 0..2 {
+            execute(&dying(&spec), &runner, &mut cap, &mut UpReport::default());
+        }
+        assert_eq!(runner.spawned.borrow().len(), 2, "two launches spent");
+
+        // A pass that launches nothing because it found the task alive. That observation — not the
+        // empty launch set — is what forgives the budget.
+        execute(
+            &ReconcilePlan {
+                live: vec!["hetz.demo.agent".to_string()],
+                ..ReconcilePlan::default()
+            },
+            &runner,
+            &mut cap,
+            &mut UpReport::default(),
+        );
+
+        // Having recovered, it gets the full budget back: three more launches, then parked. Without
+        // the pass being closed it would park after only one more.
+        let mut last = UpReport::default();
+        for _ in 0..4 {
+            last = UpReport::default();
+            execute(&dying(&spec), &runner, &mut cap, &mut last);
+        }
+        assert_eq!(
+            runner.spawned.borrow().len(),
+            5,
+            "recovery must restore the full `attempts` budget, not leave it partly spent"
+        );
+        assert_eq!(
+            last.flapping,
+            vec!["hetz.demo.agent".to_string()],
+            "and it still parks in the end"
+        );
+    }
+
+    /// A pass can execute a plan the task was never in: `up_once` drops an owner whose
+    /// materialization failed, `gate_codex_launches_on_hooks` strips gated launches, and
+    /// `defer_flickers` removes debounced ones — each after the pass is already committed to
+    /// running. Silence about a task is not evidence it is alive, and crediting uptime for it lets
+    /// a permanently-dead task refill its budget on every gated pass and never park. Identical to
+    /// the recovery test above except that the quiet pass does not report the task live.
+    #[test]
+    fn a_pass_that_omits_a_task_does_not_credit_it_with_uptime() {
+        let mut spec = spec_fixture();
+        spec.restart = Some(agent_spec::spec::Restart {
+            attempts: 3,
+            interval: Duration::from_secs(0),
+            delay: Duration::from_secs(0),
+            mode: agent_spec::spec::RestartMode::Fail,
+        });
+        let runner = SpawnCountingRunner::default();
+        let mut cap = FlappingCap::default();
+
+        fn dying(spec: &AgentSpec) -> ReconcilePlan<'_> {
+            ReconcilePlan {
+                launch: vec![Launch {
+                    spec,
+                    tasks: vec![target("hetz.demo.agent", "x")],
+                    live_derived: Vec::new(),
+                }],
+                ..ReconcilePlan::default()
+            }
+        }
+
+        // Two failing passes: two of three launches spent.
+        for _ in 0..2 {
+            execute(&dying(&spec), &runner, &mut cap, &mut UpReport::default());
+        }
+        assert_eq!(runner.spawned.borrow().len(), 2, "two launches spent");
+
+        // The task is dropped from this pass — not launched, and not observed alive either.
+        execute(
+            &ReconcilePlan::default(),
+            &runner,
+            &mut cap,
+            &mut UpReport::default(),
+        );
+
+        // The budget must be where the failures left it: one launch remains, then it parks.
+        let mut last = UpReport::default();
+        for _ in 0..4 {
+            last = UpReport::default();
+            execute(&dying(&spec), &runner, &mut cap, &mut last);
+        }
+        assert_eq!(
+            runner.spawned.borrow().len(),
+            3,
+            "an unobserved pass must not forgive the failure budget"
+        );
+        assert_eq!(
+            last.flapping,
+            vec!["hetz.demo.agent".to_string()],
+            "and the task must still park"
+        );
     }
 
     fn spec_fixture() -> AgentSpec {
@@ -2535,24 +2834,22 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("close-stdin");
-        let pidfile = temporary.path().join("child.pid");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nexec 0<&-\nsleep 60\n",
-        )
-        .unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nexec 0<&-\nsleep 60\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
-        let error = output_with_input_timeout(
-            Command::new(&executable).env("PIDFILE", &pidfile),
+        // The pid comes from the parent at spawn. Reading it from a file the child writes made the
+        // case depend on the child being scheduled inside the deadline: miss that and the read
+        // panics with `NotFound` before either assertion runs, naming neither the pipe nor the
+        // deadline. The `on_spawn` seam removes the dependency rather than widening the window.
+        let mut spawned = None;
+        let error = output_with_input_timeout_observed(
+            &mut Command::new(&executable),
             Duration::from_secs(1),
             Some(input),
+            |pid| spawned = Some(pid),
         )
         .unwrap_err();
-        let pid = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = spawned.expect("the child was spawned before the input write failed");
 
         assert!(
             format!("{error:#}").contains("Broken pipe"),
@@ -2564,31 +2861,114 @@ mod tests {
         );
     }
 
+    /// The process-group kill is the entire stated reason [`terminate_and_reap_before`] exists — its
+    /// docstring is about an escaped descendant that inherited stdout/stderr and would otherwise
+    /// block cleanup. Nothing constructed such a descendant, so `kill(-pid, SIGKILL)` was asserted
+    /// by no test: removing it alone left the suite green, because `child.kill()` already satisfies
+    /// every assertion that only looks at the direct child.
+    #[test]
+    fn the_group_kill_reaps_a_descendant_that_outlives_the_direct_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("spawn-descendant");
+        let descendant_pidfile = temporary.path().join("descendant.pid");
+        // The descendant inherits stdout/stderr and outlives the direct child, which is exactly the
+        // shape the docstring describes. `child.kill()` cannot reach it; only the group signal can.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nsh -c 'printf \"%s\" \"$$\" > \"$DESCENDANT_PIDFILE\"; sleep 60' &\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = output_with_timeout(
+            Command::new(&executable).env("DESCENDANT_PIDFILE", &descendant_pidfile),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+
+        // Unlike the deadline case, this test *requires* the child to have run — a descendant it
+        // never forked is nothing to reap — so reading the pid it recorded is sound here. Two
+        // seconds against a fork+exec is a wide margin, and the failure is named rather than a bare
+        // `NotFound`.
+        let descendant = std::fs::read_to_string(&descendant_pidfile)
+            .expect("the child never forked a descendant, so this case tested nothing")
+            .parse::<i32>()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_can_retain_cleanup_resources(descendant) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = process_can_retain_cleanup_resources(descendant);
+        if survived {
+            // Do not leak a 60s sleeper into the test host when the assertion is about to fail.
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        assert!(
+            !survived,
+            "escaped descendant {descendant} survived cleanup: the process-group kill did not reach it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_cannot_retain_cleanup_resources() {
+        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = None;
+        while Instant::now() < deadline {
+            state = linux_process_state(pid);
+            if state == Some('Z') {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let kill_probe_considered_alive = crate::host_lock::process_alive(pid);
+        let retained_cleanup_resources = process_can_retain_cleanup_resources(pid);
+        let _ = child.wait();
+
+        assert_eq!(state, Some('Z'), "child did not become a zombie");
+        assert!(
+            kill_probe_considered_alive,
+            "the fixture must expose kill(pid, 0) treating a zombie as alive"
+        );
+        assert!(
+            !retained_cleanup_resources,
+            "a terminated zombie cannot retain cleanup resources"
+        );
+    }
+
     #[test]
     fn input_write_obeys_the_child_deadline() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("ignore-stdin");
-        let pidfile = temporary.path().join("child.pid");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nsleep 60\n",
-        )
-        .unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
         let started = Instant::now();
-        let error = output_with_input_timeout(
-            Command::new(&executable).env("PIDFILE", &pidfile),
+        // The pid comes from the parent at spawn, not from the child. This case is precisely the one
+        // where the child may never be scheduled: the write blocks as soon as the pipe buffer fills,
+        // which needs no execution by the child at all, and the deadline then terminates the whole
+        // group. Anything the child was supposed to record would never be written, so a test that
+        // waits for it fails on exactly the condition it exists to cover.
+        let mut spawned = None;
+        let error = output_with_input_timeout_observed(
+            &mut Command::new(&executable),
             Duration::from_millis(100),
             Some(input),
+            |pid| spawned = Some(pid),
         )
         .unwrap_err();
-        let pid = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = spawned.expect("the child was spawned before the input deadline expired");
 
         assert!(
             format!("{error:#}").contains("timed out"),
