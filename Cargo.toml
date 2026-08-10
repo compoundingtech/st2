@@ -36,6 +36,7 @@ sha2 = "0.10"
 st2-wire = { path = "crates/st2-wire" }
 tempfile = "3"
 toml = "0.9"
+tungstenite = "0.30"
 
 [dev-dependencies]
 libc = "0.2"

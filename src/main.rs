@@ -112,6 +112,19 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         interval: u64,
     },
+    /// Internal controlled Codex launch. Generated only for `deliver "app-server"` tasks.
+    #[command(hide = true)]
+    CodexAppServer {
+        /// Exact agent bus identity that owns the controlled thread.
+        #[arg(long)]
+        identity: String,
+        /// Exact reconciled PTY task identity for this runtime.
+        #[arg(long)]
+        runtime_id: String,
+        /// Original structured Codex invocation, including its provider executable.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        codex_argv: Vec<String>,
+    },
     /// Get or set an agent's presence status. No `--set` prints the status; no identity means yours
     /// (`$ST_AGENT`). Settable: offline | available | busy | away | dnd (`unknown` is derived).
     Status {
@@ -818,6 +831,20 @@ fn main() -> Result<()> {
             host,
             interval,
         } => ding_cmd(session, identity, root, host, interval),
+        Command::CodexAppServer {
+            identity,
+            runtime_id,
+            codex_argv,
+        } => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::codex_app_server::run_controlled(
+                &catalog,
+                identity,
+                runtime_id,
+                codex_argv,
+            )
+        }
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
         Command::Describe(args) => {
@@ -2672,7 +2699,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     let task_context = st2::reconcile::TaskCompileContext::current(root.clone())?;
     st2::eval_run::prepare_spawn_env(task_context.st2_executable());
     let mut specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
-    st2::reconcile::compile_generated_ding_tasks(&mut specs, &this_host, &task_context)?;
+    st2::reconcile::compile_generated_tasks(&mut specs, &this_host, &task_context)?;
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use agent_spec::spec::{AgentSpec, TaskKind, TaskLifecycle};
+use agent_spec::spec::{AgentSpec, DeliveryTransport, TaskKind, TaskLifecycle};
 
 /// Immutable inputs captured once before generated tasks are compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +73,20 @@ impl TaskCompileContext {
     pub fn st2_executable(&self) -> &Path {
         &self.st2_executable
     }
+
+    pub fn catalog_root(&self) -> &Path {
+        &self.catalog_root
+    }
+}
+
+/// Compile every runner-owned launch marker into an exact invocation of this st2 binary.
+pub fn compile_generated_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    compile_generated_ding_tasks(specs, this_host, context)?;
+    compile_app_server_agent_tasks(specs, this_host, context)
 }
 
 /// Replace only runner-generated DING markers with exact direct argv. Authored tasks never carry
@@ -118,6 +132,87 @@ pub fn compile_generated_ding_tasks(
                 effective_root,
             ]);
         }
+    }
+    Ok(())
+}
+
+/// Route an explicitly selected Codex native transport through st2's controlled-launch wrapper.
+///
+/// The wrapper owns the provider daemon and its control connection, so it can complete the
+/// initialize handshake before the interactive client is allowed to create or resume a thread.
+/// App-server delivery therefore requires structured argv: rewriting opaque shell source would be
+/// unsound, and an already-remote launch would have two competing control owners.
+pub fn compile_app_server_agent_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    let st2_executable = context
+        .st2_executable
+        .to_str()
+        .context("running st2 executable path is not UTF-8")?
+        .to_owned();
+    let catalog_root = context
+        .catalog_root
+        .to_str()
+        .context("catalog root is not UTF-8")?
+        .to_owned();
+
+    for spec in specs {
+        if spec.delivery != Some(DeliveryTransport::AppServer) {
+            continue;
+        }
+        let bus_id = spec.bus_id(this_host);
+        let mut candidates = spec
+            .tasks
+            .iter_mut()
+            .filter(|task| !task.derived && task.name == "agent");
+        let task = candidates.next().with_context(|| {
+            format!(
+                "agent '{bus_id}' selects `deliver \"app-server\"` but has no canonical `agent` task"
+            )
+        })?;
+        anyhow::ensure!(
+            candidates.next().is_none(),
+            "agent '{bus_id}' selects `deliver \"app-server\"` with more than one canonical `agent` task"
+        );
+        anyhow::ensure!(
+            task.kind == TaskKind::Pty,
+            "agent '{bus_id}' selects `deliver \"app-server\"` for a non-PTY canonical task"
+        );
+        let authored = task.argv.clone().with_context(|| {
+            format!(
+                "agent '{bus_id}' selects `deliver \"app-server\"`; its canonical task must use structured `argv`, not shell `command`"
+            )
+        })?;
+        anyhow::ensure!(
+            !authored.is_empty(),
+            "agent '{bus_id}' selects `deliver \"app-server\"` with an empty canonical argv"
+        );
+        anyhow::ensure!(
+            !authored
+                .iter()
+                .any(|arg| arg == "--remote" || arg.starts_with("--remote=")),
+            "agent '{bus_id}' selects `deliver \"app-server\"` but its canonical argv already declares `--remote`"
+        );
+        let runtime_id = task
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+        let mut argv = vec![
+            st2_executable.clone(),
+            "--catalog".to_string(),
+            catalog_root.clone(),
+            "codex-app-server".to_string(),
+            "--identity".to_string(),
+            bus_id,
+            "--runtime-id".to_string(),
+            runtime_id,
+            "--".to_string(),
+        ];
+        argv.extend(authored);
+        task.command = None;
+        task.argv = Some(argv);
     }
     Ok(())
 }
