@@ -1,12 +1,145 @@
 # Codex harness specification
 
-The screen grammar by which DING recognizes a Codex composer. It realizes
-[`../requirements.md`](../requirements.md) through the mechanism in
-[`../spec.md`](../spec.md).
+This document defines native app-server delivery and the legacy Codex screen
+grammar. It realizes [`../requirements.md`](../requirements.md) through the
+selection and durability rules in [`../spec.md`](../spec.md).
 
 ## Status
 
 Active.
+
+## Native app-server transport
+
+`deliver "app-server"` selects this transport. st2 delivers through the Codex
+app-server control protocol. It does not inspect the rendered screen, write to
+the composer, or start the legacy `ding` sidecar.
+
+The native path uses typed user input only. It must never use
+`thread/inject_items`. Raw injection does not start an idle turn, does not have
+the typed user-message receipt below, and has different persistence behavior.
+
+### Controlled launch and thread identity
+
+st2 starts one app-server daemon for the declared agent on a host-local Unix
+socket. It opens and initializes its control connection before it starts the
+Codex TUI with `codex --remote unix://PATH`. The control client must be able to
+observe `thread/started` before the TUI can create a new thread.
+
+For a new session, st2 records the thread ID from `thread/started`. For a
+resumed session, st2 loads the recorded thread ID and calls `thread/resume`
+before it permits delivery. It does not infer ownership from `thread/list`, a
+working directory, a process, or a PTY. Those surfaces do not identify which
+TUI owns a thread.
+
+The thread binding is persistent runtime state. It includes the exact agent
+runtime incarnation that owns it. st2 rejects a binding from a prior
+incarnation. A missing, conflicting, or stale binding makes the native
+transport unavailable and leaves every message unread.
+
+The control client remains subscribed to these events for the bound thread:
+
+- `thread/status/changed`,
+- `turn/started`,
+- `turn/completed`, and
+- `item/started` and `item/completed`.
+
+`ThreadStatus` distinguishes idle and active states. It does not carry the
+active turn ID. Only the turn lifecycle supplies that ID.
+
+### Delivery state machine
+
+The adapter applies this rule to the bound thread and the FIFO inbox head:
+
+| Observed state | Request | Result |
+| --- | --- | --- |
+| Idle | `turn/start` with typed text | Start a turn and wake Codex |
+| Active regular turn with exact current ID | `turn/steer` with typed text and `expectedTurnId` | Queue input on that turn |
+| Review or manual compaction | None | Hold until a later idle state |
+| No active turn ID, conflicting events, or stale ID | None | Reconcile state and hold |
+
+Every `turn/start` and `turn/steer` request includes a stable
+`clientUserMessageId` derived from the recipient, thread binding, and message
+filename. The adapter sends no turn-level overrides with `turn/steer`.
+
+`turn/steer` must use the exact ID from the latest unmatched `turn/started`
+event. A `turn/completed` event clears that ID. A steering error for no active
+turn, a stale `expectedTurnId`, review, or compaction is a hold result. The
+adapter must not fall back to `turn/start` or `thread/inject_items` in the same
+attempt.
+
+The adapter marks review and compaction as non-steerable when
+`enteredReviewMode` or `contextCompaction` item events appear. The app server
+can reject a request before those events arrive. The same hold rule applies to
+that race.
+
+### Typed acceptance receipt
+
+A JSON-RPC success response is not a delivery receipt. A returned turn ID is
+not a delivery receipt. st2 completes the DING attempt only after this event:
+
+```text
+item/completed
+  item.type = "userMessage"
+  item.clientId = <the exact clientUserMessageId>
+  threadId = <the bound thread ID>
+```
+
+`item/completed` is the authoritative item state. An `item/started` event may
+show progress, but it does not complete delivery. An item for another client
+ID, thread, or runtime incarnation does not complete delivery.
+
+The adapter records submission state before it sends a request. If the control
+connection closes after submission and before the typed receipt, the attempt is
+ambiguous. On reconnect, st2 resumes the bound thread and reconciles its typed
+user-message history before it sends that client ID again.
+
+The app server does not promise duplicate rejection for
+`clientUserMessageId`. st2 therefore owns duplicate control. It persists one
+accepted receipt for the message and runtime binding. Watcher events, poll
+events, reconnects, and supervisor restarts consult that receipt before they
+send. Archive precedence removes obsolete receipt state.
+
+### Durable inbox and shutdown
+
+The selected catalog inbox remains authoritative. Native delivery does not
+archive or delete the message. The agent reads and archives it through normal
+message commands.
+
+Before each attempt, the adapter runs the normal message sweep. An archive
+record with the same filename wins. A held, rejected, disconnected, unknown,
+or ambiguous attempt leaves the message unread and retryable.
+
+Control transport close is a normal adapter stop. The adapter sends nothing
+after close. A restarted adapter must restore the exact thread binding and
+duplicate-control state before it attempts delivery.
+
+### Remote TUI evidence
+
+The native transport is not accepted until a live `codex --remote` test proves
+all of these results against the same app server and control client:
+
+- The normal TUI can start a new bound thread and resume that exact thread.
+- An idle inbox message produces one typed `turn/start` user message and
+  observable agent work.
+- A message during a regular active turn produces one typed `turn/steer` user
+  message without corrupting terminal input or the active turn.
+- Review, compaction, stale-turn, and no-active-turn states hold the message.
+- The inbox file remains until the agent reads and archives it.
+- A deliberate protocol or receipt break makes the test fail.
+
+The evidence must also record every user-visible difference between a local
+TUI and the remote TUI. Known protocol limits are not silently treated as
+parity.
+
+Codex app-server and its remote transport are provider experimental surfaces.
+The implementation pins its accepted protocol schema to a tested Codex
+version. An incompatible schema or event change makes delivery unavailable and
+leaves the inbox unread.
+
+## Legacy screen transport
+
+The remaining sections define the unchanged screen grammar selected by
+`ding`.
 
 ## Locating the composer
 
