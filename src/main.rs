@@ -1476,6 +1476,12 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             );
             continue;
         }
+        if !spec.has_delivery_transport() {
+            report_advisory(
+                &format!("{bus_id} delivery transport missing"),
+                "declare `ding` or `deliver`; agent receives no DING",
+            );
+        }
         for task in &spec.tasks {
             let id = task
                 .id
@@ -1618,6 +1624,10 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
             println!("  ✗ {label} — {detail}");
         }
     }
+}
+
+fn report_advisory(label: &str, detail: &str) {
+    println!("  ⚠ {label} — {detail}");
 }
 
 fn presentation_cmd(

@@ -5,9 +5,10 @@
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
 //! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
-//! `restart{}`, task lifecycle, Resource bindings (declaration metadata), and the tasks. Everything render-only
-//! (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`, `meta{}`) is baked into
-//! the tasks/commands by the render layer and ignored here.
+//! `restart{}`, `deliver`, task lifecycle, Resource bindings (declaration metadata), and the tasks.
+//! Everything render-only (`harness`, `model`, `persona`, `permissions`, legacy `transport`
+//! metadata, `strategy`, `meta{}`) is baked into the tasks/commands by the render layer and ignored
+//! here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -34,6 +35,32 @@ pub enum AgentDesiredState {
     Suspended { reason: String },
     /// `None` exists only for legacy `retired #true` declarations.
     Retired { reason: Option<String> },
+}
+
+/// One provider-native message delivery transport declared by an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryTransport {
+    Mcp,
+    AppServer,
+}
+
+impl DeliveryTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::AppServer => "app-server",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "mcp" => Ok(Self::Mcp),
+            "app-server" => Ok(Self::AppServer),
+            _ => anyhow::bail!(
+                "unsupported `deliver` value '{value}' (expected `mcp` or `app-server`)"
+            ),
+        }
+    }
 }
 
 impl AgentDesiredState {
@@ -91,6 +118,8 @@ pub struct AgentSpec {
     pub keep: bool,
     /// Crash/restart policy (§4). `None` → the runner's default policy.
     pub restart: Option<Restart>,
+    /// Provider-native delivery selected by `deliver`; `None` means legacy `ding` or no delivery.
+    pub delivery: Option<DeliveryTransport>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
@@ -327,6 +356,15 @@ impl AgentSpec {
             .any(|task| !task.derived && (task.command.is_some() || task.argv.is_some()))
     }
 
+    /// True when the declaration selected legacy screen delivery or one native transport.
+    pub fn has_delivery_transport(&self) -> bool {
+        self.delivery.is_some()
+            || self
+                .tasks
+                .iter()
+                .any(|task| task.derived && task.kind == TaskKind::Exec && task.name == "ding")
+    }
+
     /// The restart policy in effect (declared, else the runner default).
     pub fn restart_policy(&self) -> Restart {
         self.restart.clone().unwrap_or_default()
@@ -399,6 +437,9 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: include the built-in `st2 ding` sidecar.
     #[serde(default)]
     pub ding: bool,
+    /// Compact catalog form: select one provider-native delivery transport.
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub deliver: Option<Option<String>>,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
     pub lifecycle: Option<String>,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
@@ -750,6 +791,7 @@ impl RawSpec {
             || self.command.is_some()
             || self.argv.is_some()
             || self.ding
+            || self.deliver.is_some()
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -778,6 +820,15 @@ impl RawSpec {
             desired_state_value.as_deref(),
             desired_state_reason,
         )?;
+        let deliver = reject_explicit_null("deliver", self.deliver)?;
+        let delivery = deliver
+            .as_deref()
+            .map(DeliveryTransport::parse)
+            .transpose()?;
+        anyhow::ensure!(
+            !(self.ding && delivery.is_some()),
+            "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
+        );
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -850,6 +901,7 @@ impl RawSpec {
             desired_state,
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
+            delivery,
             resources,
             tasks,
             path,

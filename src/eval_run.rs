@@ -117,6 +117,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 desired_state: AgentDesiredState::Running,
                 keep: false,
                 restart: None,
+                delivery: None,
                 resources: Vec::new(),
                 tasks,
                 path: path.clone(),
