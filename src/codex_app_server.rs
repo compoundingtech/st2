@@ -600,6 +600,16 @@ impl CodexControlState {
             {
                 self.observed.clone()
             }
+            _ if matches!(
+                reason,
+                CodexHoldReason::Review | CodexHoldReason::Compaction
+            ) =>
+            {
+                CodexObservedState::Held {
+                    reason,
+                    turn_id: Some(turn_id.to_string()),
+                }
+            }
             _ => CodexObservedState::Held {
                 reason: CodexHoldReason::ConflictingTurn,
                 turn_id: None,
@@ -2203,6 +2213,51 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(state.observed(), &CodexObservedState::Idle);
+
+        // A real review can start its reviewer turn before Codex reports the preparatory turn's
+        // typed review item. The typed non-steerable event refines that generic conflict.
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-late-1" } }
+            }))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-late-2" } }
+            }))
+            .unwrap();
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                ..
+            }
+        ));
+        state
+            .observe(&json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-late-1",
+                    "item": { "type": "enteredReviewMode" }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-late-1".into()),
+            }
+        );
+        state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+            }))
+            .unwrap();
 
         state
             .observe(&json!({
