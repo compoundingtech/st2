@@ -25,10 +25,16 @@ Delivery is opt-in. An agent declaration selects one transport:
 invalid. Any other `deliver` value is invalid. st2 does not infer a transport
 from the agent command because command arguments are opaque.
 
-The native selector is a new `deliver` node. A binary that does not implement
-the node rejects the declaration. Native delivery must not be encoded as an
-argument to `ding`, because an older parser would accept that form as legacy
-`ding` and silently use the wrong transport.
+The native selector is a new `deliver` node. A binary released before this
+contract ignores that unknown agent child. It lowers a valid `deliver`-only
+agent with no delivery sidecar. The agent receives no DING. It does not silently
+use the legacy screen transport. This is a visible delivery outage.
+
+A binary that supports `deliver` validates its value and its mutual exclusion
+with `ding`. Native delivery must not be encoded as an argument to `ding`,
+because a pre-change parser would accept that form as legacy `ding` and use the
+wrong transport. Doctor reports an active agent that declares no transport. The
+report does not make the valid no-delivery opt-out an error.
 
 The durable inbox is the source of truth for every transport. An archive with
 the same message name wins. A native adapter completes delivery only after its
