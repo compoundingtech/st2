@@ -7,7 +7,6 @@
 //! turn state. The native delivery layer selects one durable FIFO inbox head and submits typed
 //! input only when that state proves an idle or one exact regular active turn.
 
-use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -33,6 +32,7 @@ pub const SUPPORTED_CODEX_CLI_VERSION: &str = "codex-cli 0.145.0";
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
+const DELIVERY_STATE_SCHEMA: &str = "st2.codex-delivery-state.v1";
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -187,6 +187,52 @@ struct PendingCodexDelivery {
     method: CodexDeliveryMethod,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CodexDeliveryPhase {
+    Attempted,
+    Accepted,
+}
+
+/// One durable FIFO delivery attempt.
+///
+/// `Attempted` is written before transport. A replacement control connection reconciles that
+/// ambiguous attempt against the resumed thread before it may send the client ID again. `Accepted`
+/// is written only after the exact completed typed user-message event and remains until normal
+/// message archive precedence removes the inbox entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexDeliveryState {
+    schema: String,
+    agent: String,
+    runtime_id: String,
+    runtime_incarnation: String,
+    thread_id: String,
+    filename: String,
+    client_id: String,
+    phase: CodexDeliveryPhase,
+}
+
+impl CodexDeliveryState {
+    fn attempted(
+        runtime: &CodexRuntime,
+        thread_id: String,
+        filename: String,
+        client_id: String,
+    ) -> Self {
+        Self {
+            schema: DELIVERY_STATE_SCHEMA.to_string(),
+            agent: runtime.agent.clone(),
+            runtime_id: runtime.runtime_id.clone(),
+            runtime_incarnation: runtime.incarnation.clone(),
+            thread_id,
+            filename,
+            client_id,
+            phase: CodexDeliveryPhase::Attempted,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RejectedCodexDelivery {
     filename: String,
@@ -195,21 +241,25 @@ struct RejectedCodexDelivery {
 
 struct CodexInboxDelivery {
     config: CodexDeliveryConfig,
+    state_path: PathBuf,
+    runtime: CodexRuntime,
     wake: Receiver<()>,
     _watcher: Option<notify::RecommendedWatcher>,
     next_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
-    /// Transport submissions in this process. Typed receipt reconciliation is a later adapter
-    /// layer; this set only prevents a successful JSON response from becoming a hot resend loop.
-    submitted_this_run: HashSet<String>,
+    state: Option<CodexDeliveryState>,
     pending: Option<PendingCodexDelivery>,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
 }
 
 impl CodexInboxDelivery {
-    fn new(config: CodexDeliveryConfig) -> Result<Self> {
+    fn new(
+        config: CodexDeliveryConfig,
+        state_path: PathBuf,
+        runtime: CodexRuntime,
+    ) -> Result<Self> {
         fs::create_dir_all(&config.inbox).with_context(|| {
             format!(
                 "creating Codex native delivery inbox {}",
@@ -218,18 +268,33 @@ impl CodexInboxDelivery {
         })?;
         let (wake_tx, wake) = mpsc::channel();
         let watcher = crate::watch::watch_recursive_mutations(&config.agent_dir, wake_tx);
+        let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
         Ok(Self {
             config,
+            state_path,
+            runtime,
             wake,
             _watcher: watcher,
             next_refresh: Instant::now(),
             head: None,
             suppressed: false,
-            submitted_this_run: HashSet::new(),
+            state,
             pending: None,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
         })
+    }
+
+    fn write_state(&mut self, state: CodexDeliveryState) -> Result<()> {
+        atomic_json(&self.state_path, &state)?;
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn clear_state(&mut self) -> Result<()> {
+        remove_state_file(&self.state_path)?;
+        self.state = None;
+        Ok(())
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
@@ -241,8 +306,13 @@ impl CodexInboxDelivery {
             return Ok(());
         }
         let unread = message::list_inbox(&self.config.inbox)?;
-        self.submitted_this_run
-            .retain(|filename| unread.iter().any(|message| message.filename == *filename));
+        if self.state.as_ref().is_some_and(|state| {
+            unread
+                .iter()
+                .all(|message| message.filename != state.filename)
+        }) {
+            self.clear_state()?;
+        }
         if self.rejected.as_ref().is_some_and(|rejected| {
             unread
                 .iter()
@@ -262,14 +332,20 @@ impl CodexInboxDelivery {
         if self.pending.is_some() || !state.subscribed || self.suppressed {
             return Ok(None);
         }
+        if let Some(delivery_state) = self.state.as_ref() {
+            if delivery_state.thread_id == state.thread_id {
+                return Ok(None);
+            }
+            // A newly selected thread is a different delivery binding. An old binding's receipt
+            // must neither suppress nor acknowledge delivery to this thread.
+            self.clear_state()?;
+        }
         let Some(head) = self.head.as_ref() else {
             return Ok(None);
         };
-        if self.submitted_this_run.contains(&head.filename)
-            || self.rejected.as_ref().is_some_and(|rejected| {
-                rejected.filename == head.filename && rejected.observed == state.observed
-            })
-        {
+        if self.rejected.as_ref().is_some_and(|rejected| {
+            rejected.filename == head.filename && rejected.observed == state.observed
+        }) {
             return Ok(None);
         }
         let method = match &state.observed {
@@ -288,6 +364,7 @@ impl CodexInboxDelivery {
             .context("Codex delivery request ID overflow")?;
         let client_id =
             stable_client_user_message_id(&self.config.identity, state.thread_id(), &head.filename);
+        let filename = head.filename.clone();
         let text = ding::poke_text(
             &self.config.catalog_root,
             &self.config.this_host,
@@ -296,9 +373,15 @@ impl CodexInboxDelivery {
         );
         let request =
             codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
+        self.write_state(CodexDeliveryState::attempted(
+            &self.runtime,
+            state.thread_id().to_string(),
+            filename.clone(),
+            client_id,
+        ))?;
         self.pending = Some(PendingCodexDelivery {
             request_id,
-            filename: head.filename.clone(),
+            filename,
             method,
         });
         Ok(Some(request))
@@ -318,6 +401,13 @@ impl CodexInboxDelivery {
             .take()
             .context("Codex delivery is not pending")?;
         if message.get("error").is_some() {
+            if !self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.phase == CodexDeliveryPhase::Accepted)
+            {
+                self.clear_state()?;
+            }
             self.rejected = Some(RejectedCodexDelivery {
                 filename: pending.filename,
                 observed: observed.clone(),
@@ -337,8 +427,122 @@ impl CodexInboxDelivery {
             }
         }
         self.rejected = None;
-        self.submitted_this_run.insert(pending.filename);
         Ok(true)
+    }
+
+    fn accept_typed_receipt(&mut self, message: &Value, state: &CodexControlState) -> Result<bool> {
+        if message.get("method").and_then(Value::as_str) != Some("item/completed")
+            || message.pointer("/params/item/type").and_then(Value::as_str) != Some("userMessage")
+        {
+            return Ok(false);
+        }
+        let Some(delivery_state) = self.state.as_ref() else {
+            return Ok(false);
+        };
+        if message.pointer("/params/threadId").and_then(Value::as_str) != Some(state.thread_id())
+            || delivery_state.thread_id != state.thread_id()
+            || delivery_state.runtime_incarnation != self.runtime.incarnation()
+            || state.runtime_incarnation != self.runtime.incarnation()
+            || message
+                .pointer("/params/item/clientId")
+                .and_then(Value::as_str)
+                != Some(delivery_state.client_id.as_str())
+        {
+            return Ok(false);
+        }
+        if delivery_state.phase == CodexDeliveryPhase::Accepted {
+            return Ok(true);
+        }
+        let mut accepted = delivery_state.clone();
+        accepted.phase = CodexDeliveryPhase::Accepted;
+        self.write_state(accepted)?;
+        Ok(true)
+    }
+
+    /// Reconcile a pre-crash attempt against the typed history returned by `thread/resume` before
+    /// the same client ID can be sent again.
+    fn reconcile_resume(&mut self, message: &Value, state: &CodexControlState) -> Result<()> {
+        if message.get("error").is_some() {
+            return Ok(());
+        }
+        let Some(delivery_state) = self.state.as_ref() else {
+            return Ok(());
+        };
+        if delivery_state.thread_id != state.thread_id()
+            || delivery_state.phase == CodexDeliveryPhase::Accepted
+        {
+            return Ok(());
+        }
+        let turns = message
+            .pointer("/result/thread/turns")
+            .and_then(Value::as_array)
+            .context(
+                "Codex thread/resume response has no typed turn history for delivery recovery",
+            )?;
+        let accepted = turns.iter().any(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("userMessage")
+                            && item.get("clientId").and_then(Value::as_str)
+                                == Some(delivery_state.client_id.as_str())
+                    })
+                })
+        });
+        if accepted {
+            let mut state = delivery_state.clone();
+            state.phase = CodexDeliveryPhase::Accepted;
+            self.write_state(state)
+        } else {
+            self.clear_state()
+        }
+    }
+}
+
+fn load_delivery_state(
+    path: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<Option<CodexDeliveryState>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let state: CodexDeliveryState = serde_json::from_slice(&bytes)
+        .with_context(|| format!("reading Codex delivery state {}", path.display()))?;
+    anyhow::ensure!(
+        state.schema == DELIVERY_STATE_SCHEMA,
+        "Codex delivery state has unsupported schema '{}'",
+        state.schema
+    );
+    anyhow::ensure!(
+        state.agent == identity && state.runtime_id == runtime_id,
+        "Codex delivery state belongs to a different runtime"
+    );
+    anyhow::ensure!(
+        !state.runtime_incarnation.is_empty()
+            && !state.thread_id.is_empty()
+            && message::is_message_filename(&state.filename),
+        "Codex delivery state has an invalid runtime binding or filename"
+    );
+    anyhow::ensure!(
+        state.client_id
+            == stable_client_user_message_id(identity, &state.thread_id, &state.filename),
+        "Codex delivery state client ID does not match its binding"
+    );
+    Ok(Some(state))
+}
+
+fn remove_state_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            File::open(path.parent().context("state file has no parent")?)?.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1022,7 +1226,12 @@ fn pump_control(
     let result = (|| -> Result<()> {
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
-        let mut delivery = delivery.map(CodexInboxDelivery::new).transpose()?;
+        let delivery_state_path = control_state_path.with_file_name("delivery-state.json");
+        let mut delivery = delivery
+            .map(|config| {
+                CodexInboxDelivery::new(config, delivery_state_path.clone(), runtime.clone())
+            })
+            .transpose()?;
         websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
         loop {
             let message = match poll_json_message(&mut websocket)? {
@@ -1065,7 +1274,10 @@ fn pump_control(
                 .as_mut()
                 .context("Codex control state is unbound")?;
             let delivery_response = match delivery.as_mut() {
-                Some(delivery) => delivery.accept_response(&message, &state.observed)?,
+                Some(delivery) => {
+                    delivery.accept_response(&message, &state.observed)?
+                        || delivery.accept_typed_receipt(&message, state)?
+                }
                 None => false,
             };
             let changed = if delivery_response {
@@ -1079,7 +1291,12 @@ fn pump_control(
                 );
                 subscription_pending = false;
                 match state.accept_subscription(&message)? {
-                    SubscriptionAcceptance::Accepted { changed } => changed,
+                    SubscriptionAcceptance::Accepted { changed } => {
+                        if let Some(delivery) = delivery.as_mut() {
+                            delivery.reconcile_resume(&message, state)?;
+                        }
+                        changed
+                    }
                     SubscriptionAcceptance::Deferred => false,
                 }
             } else {
@@ -1510,6 +1727,15 @@ mod tests {
         state
     }
 
+    fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDelivery {
+        CodexInboxDelivery::new(
+            config,
+            root.join("state/delivery-state.json"),
+            CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn delivery_request_uses_typed_start_and_exact_turn_steer() {
         let start = codex_delivery_request(
@@ -1571,7 +1797,7 @@ mod tests {
         let filename =
             message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
                 .unwrap();
-        let mut delivery = CodexInboxDelivery::new(config.clone()).unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
         for reason in [CodexHoldReason::Review, CodexHoldReason::Compaction] {
             let state = subscribed_state(CodexObservedState::Held {
                 reason,
@@ -1599,7 +1825,7 @@ mod tests {
         let filename =
             message::send_to_inbox(&config.inbox, "h.sender", Some("retry"), None, &[], "body")
                 .unwrap();
-        let mut delivery = CodexInboxDelivery::new(config.clone()).unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
         let active = subscribed_state(CodexObservedState::Active {
             turn_id: "turn-current".into(),
         });
@@ -1640,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn a_success_response_suppresses_resubmission_without_archiving_the_message() {
+    fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
         let filename = message::send_to_inbox(
@@ -1652,9 +1878,14 @@ mod tests {
             "body",
         )
         .unwrap();
-        let mut delivery = CodexInboxDelivery::new(config.clone()).unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
         let idle = subscribed_state(CodexObservedState::Idle);
         let request = delivery.maybe_request(&idle).unwrap().unwrap();
+        assert_eq!(
+            delivery.state.as_ref().unwrap().phase,
+            CodexDeliveryPhase::Attempted,
+            "submission ownership is durable before transport"
+        );
         assert!(
             delivery
                 .accept_response(
@@ -1663,8 +1894,220 @@ mod tests {
                 )
                 .unwrap()
         );
+        assert_eq!(
+            delivery.state.as_ref().unwrap().phase,
+            CodexDeliveryPhase::Attempted,
+            "JSON success is not typed acceptance"
+        );
         assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
         assert!(config.inbox.join(&filename).is_file());
+    }
+
+    #[test]
+    fn only_a_completed_matching_user_message_persists_acceptance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename = message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("receipt"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
+        let mut idle = CodexControlState::new(&delivery.runtime, "thread-main".into());
+        idle.subscribed = true;
+        idle.observed = CodexObservedState::Idle;
+        let request = delivery.maybe_request(&idle).unwrap().unwrap();
+        let client_id = request["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            !delivery
+                .accept_typed_receipt(
+                    &json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-delivery",
+                            "item": { "type": "userMessage", "clientId": client_id }
+                        }
+                    }),
+                    &idle,
+                )
+                .unwrap(),
+            "item/started is progress, not acceptance"
+        );
+        assert!(
+            !delivery
+                .accept_typed_receipt(
+                    &json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-other",
+                            "turnId": "turn-delivery",
+                            "item": { "type": "userMessage", "clientId": client_id }
+                        }
+                    }),
+                    &idle,
+                )
+                .unwrap(),
+            "another thread cannot acknowledge this delivery"
+        );
+        assert!(
+            delivery
+                .accept_typed_receipt(
+                    &json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-delivery",
+                            "item": { "type": "userMessage", "clientId": client_id }
+                        }
+                    }),
+                    &idle,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            load_delivery_state(&state_path, "h.worker", "h.worker")
+                .unwrap()
+                .unwrap()
+                .phase,
+            CodexDeliveryPhase::Accepted
+        );
+        assert!(config.inbox.join(&filename).is_file());
+
+        drop(delivery);
+        let mut replacement = inbox_delivery(tmp.path(), config.clone());
+        assert_eq!(
+            replacement.maybe_request(&idle).unwrap(),
+            None,
+            "a fresh runtime incarnation restores accepted duplicate control"
+        );
+
+        message::archive_msg(
+            &config.inbox,
+            &message::archive_dir(&config.agent_dir),
+            &filename,
+        )
+        .unwrap();
+        replacement.next_refresh = Instant::now();
+        assert_eq!(replacement.maybe_request(&idle).unwrap(), None);
+        assert!(
+            !state_path.exists(),
+            "archive precedence clears the receipt"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename = message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("reconcile"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let idle = subscribed_state(CodexObservedState::Idle);
+        let mut first = inbox_delivery(tmp.path(), config.clone());
+        let request = first.maybe_request(&idle).unwrap().unwrap();
+        let client_id = request["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(first);
+
+        let mut recovered = inbox_delivery(tmp.path(), config.clone());
+        assert_eq!(recovered.maybe_request(&idle).unwrap(), None);
+        recovered
+            .reconcile_resume(
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": {
+                            "id": "thread-main",
+                            "turns": [{
+                                "id": "turn-delivery",
+                                "items": [{
+                                    "type": "userMessage",
+                                    "id": "item-delivery",
+                                    "clientId": client_id,
+                                    "content": []
+                                }]
+                            }]
+                        }
+                    }
+                }),
+                &idle,
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.state.as_ref().unwrap().phase,
+            CodexDeliveryPhase::Accepted
+        );
+        assert_eq!(recovered.maybe_request(&idle).unwrap(), None);
+        assert!(config.inbox.join(&filename).is_file());
+
+        // An authoritative resumed history without the client ID proves that the pre-send record
+        // did not reach typed acceptance. Only then may the same stable ID be retried.
+        recovered.state.as_mut().unwrap().phase = CodexDeliveryPhase::Attempted;
+        atomic_json(
+            &tmp.path().join("state/delivery-state.json"),
+            recovered.state.as_ref().unwrap(),
+        )
+        .unwrap();
+        recovered
+            .reconcile_resume(
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": { "thread": { "id": "thread-main", "turns": [] } }
+                }),
+                &idle,
+            )
+            .unwrap();
+        assert!(recovered.state.is_none());
+        let retry = recovered.maybe_request(&idle).unwrap().unwrap();
+        assert_eq!(retry["params"]["clientUserMessageId"], client_id);
+    }
+
+    #[test]
+    fn malformed_delivery_state_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let state_path = tmp.path().join("state/delivery-state.json");
+        atomic_json(
+            &state_path,
+            &json!({
+                "schema": DELIVERY_STATE_SCHEMA,
+                "agent": "h.worker",
+                "runtimeId": "h.worker",
+                "runtimeIncarnation": "incarnation-test",
+                "threadId": "thread-main",
+                "filename": "1786380000000-abc123.md",
+                "clientId": "st2:tampered",
+                "phase": "attempted"
+            }),
+        )
+        .unwrap();
+        let error = match CodexInboxDelivery::new(
+            config,
+            state_path,
+            CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
+        ) {
+            Ok(_) => panic!("accepted malformed delivery state"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("client ID does not match"));
     }
 
     #[test]
@@ -1744,11 +2187,32 @@ mod tests {
                     .unwrap()
                     .starts_with("st2:")
             );
+            let client_id = delivery["params"]["clientUserMessageId"]
+                .as_str()
+                .unwrap()
+                .to_string();
             write_json_message(
                 &mut websocket,
                 &json!({
                     "id": FIRST_DELIVERY_REQUEST_ID,
                     "result": { "turn": { "id": "turn-delivery" } }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turnId": "turn-delivery",
+                        "item": {
+                            "type": "userMessage",
+                            "id": "item-delivery",
+                            "clientId": client_id,
+                            "content": []
+                        }
+                    }
                 }),
             )
             .unwrap();
@@ -1782,6 +2246,149 @@ mod tests {
         server.join().unwrap();
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
+        assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
+        assert_eq!(
+            load_delivery_state(
+                &tmp.path().join("state/delivery-state.json"),
+                "h.worker",
+                "h.worker",
+            )
+            .unwrap()
+            .unwrap()
+            .phase,
+            CodexDeliveryPhase::Accepted
+        );
+    }
+
+    #[test]
+    fn subscribed_control_pump_reconciles_an_ambiguous_attempt_without_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename = message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("recover"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let client_id = stable_client_user_message_id("h.worker", "thread-main", &filename);
+        let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let delivery_state_path = tmp.path().join("state/delivery-state.json");
+        atomic_json(
+            &delivery_state_path,
+            &CodexDeliveryState::attempted(
+                &prior_runtime,
+                "thread-main".into(),
+                filename.clone(),
+                client_id.clone(),
+            ),
+        )
+        .unwrap();
+
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_client_id = client_id.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/status/changed",
+                    "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+                }),
+            )
+            .unwrap();
+            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(subscribe["method"], "thread/resume");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": {
+                            "id": "thread-main",
+                            "status": { "type": "idle" },
+                            "turns": [{
+                                "id": "turn-delivery",
+                                "items": [{
+                                    "type": "userMessage",
+                                    "id": "item-delivery",
+                                    "clientId": server_client_id,
+                                    "content": []
+                                }]
+                            }]
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            assert!(matches!(
+                poll_json_message(&mut websocket).unwrap(),
+                ControlRead::Timeout
+            ));
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream).unwrap();
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let runtime_for_pump = runtime.clone();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime_for_pump,
+                None,
+                Some(config),
+                tx,
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ControlEvent::Bound
+        ));
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+
+        let recovered = load_delivery_state(&delivery_state_path, "h.worker", "h.worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.phase, CodexDeliveryPhase::Accepted);
+        assert_eq!(recovered.client_id, client_id);
         assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
     }
 
