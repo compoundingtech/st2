@@ -797,7 +797,9 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
-            let changed = if message.get("id") == Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID)) {
+            let changed = if message.get("method").is_none()
+                && message.get("id") == Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
+            {
                 anyhow::ensure!(
                     subscription_pending,
                     "Codex control received an unexpected thread/resume response"
@@ -1210,6 +1212,17 @@ mod tests {
             let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(subscribe["method"], "thread/resume");
             assert_eq!(subscribe["params"]["threadId"], "thread-main");
+            // JSON-RPC request IDs are per direction. A server request may reuse the client's
+            // subscription ID and must not be consumed as that client's response.
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {}
+                }),
+            )
+            .unwrap();
             write_json_message(
                 &mut websocket,
                 &json!({
