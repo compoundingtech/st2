@@ -20,10 +20,10 @@ is in [`spec.md`](./spec.md).
 
 ## Assumptions
 
-- **DING-A01 Rendered screens only:** The only available evidence about a
-  composer's state is a rendered terminal screen. No maintained harness exposes
-  an evented idle signal, so every precondition below is a measured heuristic
-  over text. `DQ2` in [`../spec.md`](../spec.md) tracks closing that gap.
+`DING-A01 Rendered screens only` is retired. Rendered-screen evidence is a
+limit of the legacy `ding` transport. It is not an assumption for a maintained
+harness that declares a native `deliver` transport.
+
 - **DING-A02 Cooperative human:** The human sharing a pane is not adversarial.
   A screen that deliberately imitates another harness's composer is a
   correctness concern, not a security boundary, consistent with `A02`.
@@ -41,21 +41,40 @@ is in [`spec.md`](./spec.md).
 
 ## Requirements
 
-### Must preserve initial transport and gate every retry
+### Must select one explicit transport
 
-- **DING-R01 Combined initial transport:** A fresh notice uses one bounded PTY
-  transaction containing the bracketed paste, the accepted 0.5 second delay,
-  and Return. Ownership is recorded before that command starts. Composer
-  heuristics do not split or suppress this initial transport.
-- **DING-R02 Two adjacent retained-safe retry observations:** A later bare
-  Return is permitted only for a transport-owned payload whose exact notice is
-  still the complete composer and is classified `RetainedSafe` in two
-  immediately adjacent inspections. The final observation is adjacent to the
-  Return itself. Any change, block, or uncertainty prevents retry submission.
-- **DING-R03 Fail-closed receipt and retry:** After the initial transport, a
-  changed composer, a human draft, an active turn, a modal, an unreadable
-  screen, an unrecognized harness, and a bounded observation timeout never
-  become `Delivered` and receive no retry input. Anything not positively
+- **DING-R11 Declared transport:** An agent selects at most one delivery
+  transport. `ding` selects the legacy screen transport. `deliver "mcp"`
+  selects the Claude native transport. `deliver "app-server"` selects the
+  Codex native transport. A declaration with neither node has no DING delivery.
+  A declaration with both nodes, multiple `deliver` nodes, or an unsupported
+  `deliver` value is invalid.
+- **DING-R12 No transport inference:** st2 does not infer a native transport
+  from an agent command or a screen. Native delivery uses the declared adapter.
+  A binary that does not know the `deliver` node rejects that declaration
+  instead of treating it as legacy delivery.
+- **DING-R13 Durable native delivery:** The inbox file remains the source of
+  truth for native delivery. Only the adapter's declared success condition can
+  complete a delivery attempt. A closed, unavailable, stale, or unknown native
+  transport leaves the message unread and retryable. Archive precedence and
+  restart recovery remain unchanged.
+
+### Must preserve legacy transport and gate every legacy retry
+
+- **DING-R01 Combined initial transport:** A fresh legacy notice uses one
+  bounded PTY transaction containing the bracketed paste, the accepted 0.5
+  second delay, and Return. Ownership is recorded before that command starts.
+  Composer heuristics do not split or suppress this initial transport.
+- **DING-R02 Two adjacent retained-safe retry observations:** A later legacy
+  bare Return is permitted only for a transport-owned payload whose exact
+  notice is still the complete composer and is classified `RetainedSafe` in
+  two immediately adjacent inspections. The final observation is adjacent to
+  the Return itself. Any change, block, or uncertainty prevents retry
+  submission.
+- **DING-R03 Fail-closed receipt and retry:** After the initial legacy
+  transport, a changed composer, a human draft, an active turn, a modal, an
+  unreadable screen, an unrecognized harness, and a bounded observation timeout
+  never become `Delivered` and receive no retry input. Anything not positively
   understood retains staged ownership. On an inspect-only staged retry, a
   maintained adapter may positively prove that the exact owned payload is no
   longer retained; that proof relinquishes ownership only when an archive

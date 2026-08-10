@@ -664,6 +664,26 @@ atomic inbox file → DING attempt → agent reads → archive receipt
   composer cannot create a short-lived PTY probe on every inbox poll. Inbox
   reads do not wake the sidecar; only mutations bypass its bounded poll cadence.
 
+### Declared native DING delivery (DQ2 resolution)
+
+An agent selects at most one delivery transport. `ding` keeps the legacy
+screen transport unchanged. `deliver "mcp"` selects native Claude delivery.
+`deliver "app-server"` selects native Codex delivery. An agent with neither
+node has no delivery. The two node forms are mutually exclusive, multiple
+`deliver` nodes are invalid, and an unknown `deliver` value is invalid.
+
+The transport is explicit because an agent command is opaque. The native
+selector is a new node so an older binary rejects the declaration. It is not an
+argument to `ding`, which an older parser could accept as legacy delivery.
+
+Native delivery replaces rendered-screen inference for maintained Claude and
+Codex agents that select it. Each native adapter uses its provider's evented
+control channel and its provider-specific success condition. A closed,
+unavailable, stale, or unknown channel sends no unsafe input. The durable inbox
+message remains unread and retryable. Archive precedence, suppression, and
+restart recovery remain the same for every transport. The legacy classifier
+remains available only for agents that select `ding`.
+
 ## State and scope
 
 - **R08:** Presence and activity status are separate signals. The catalog must
@@ -785,15 +805,6 @@ the resident supervisor continues to reconcile the complete local catalog.
   boundary, and execution receipts are not yet specified. A successful
   executable eval and Nathan's approval should resolve this before adding
   scheduler requirements.
-- **DQ2 Safe DING delivery:** Bounded observation now replaces the fixed
-  paste-to-Return delay: maintained Codex and Claude composers must be
-  positively empty before paste and show the exact staged notice twice before
-  a separate Return. Human, modal, active, changed, timed-out, and unknown
-  states fail closed, with staged-payload ownership preventing duplicate paste.
-  This measured screen heuristic is still not an evented proof and renderer
-  changes may defer delivery. Resolve the remaining gap with a stronger evented
-  signal or other measured classifier; a small on-device model is an optional
-  experiment, not a required architecture.
 - **DQ3 Catalog agent state:** Define the catalog paths, schemas, freshness
   rules, and atomic update semantics for presence, activity status, current
   plan, and current plan step. Prove that stale state is distinguishable and
