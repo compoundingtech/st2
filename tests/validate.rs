@@ -82,6 +82,57 @@ fn opaque_resource_bindings_are_structurally_valid() {
 }
 
 #[test]
+fn active_agents_may_share_an_opaque_resource_uri() {
+    let c = catalog(&[
+        (
+            "h/reviewer/agent.kdl",
+            r#"agent "reviewer" {
+  host "h"
+  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  command "true"
+}"#,
+        ),
+        (
+            "h/integrator/agent.kdl",
+            r#"agent "integrator" {
+  host "h"
+  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  command "true"
+}"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
+    assert_eq!(r.agents, 2);
+}
+
+#[test]
+fn duplicate_bus_ids_remain_an_error_when_resources_are_shared() {
+    let c = catalog(&[
+        (
+            "h/one/agent.kdl",
+            r#"agent "worker" {
+  host "h"
+  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  command "true"
+}"#,
+        ),
+        (
+            "h/two/agent.kdl",
+            r#"agent "worker" {
+  host "h"
+  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  command "true"
+}"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(has(&r, "dup-id", Severity::Error), "{:?}", r.issues);
+}
+
+#[test]
 fn an_invalid_resource_binding_is_a_parse_error() {
     let c = catalog(&[(
         "Silber/cos/agent.kdl",

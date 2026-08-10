@@ -190,9 +190,10 @@ The positional name is an agent-local semantic role, `_tag` is the concrete
 type discriminator, and `uri` is the exact RFC 3986 absolute resource identity,
 preserved byte-for-byte without normalization.
 Declaration order has no meaning and binding names are unique within one
-agent. The public `agent-spec` read model preserves the bindings in name order
-across canonical KDL and the supported TOML/JSON forms. `st2 agents --json`
-projects the same descriptors for language-neutral inspection.
+agent. A Resource URI may be referenced by any number of agent declarations.
+The public `agent-spec` read model preserves the bindings in name order across
+canonical KDL and the supported TOML/JSON forms. `st2 agents --json` projects
+the same descriptors for language-neutral inspection.
 
 st2 validates only this portable envelope. It does not define downstream type
 schemas, resolve targets, infer authority from URI possession, or attach
@@ -820,6 +821,34 @@ legacy window, a one-line status record also contributes its file mtime.
 This choice reports when the agent wrote its heartbeat. A delayed replica
 cannot make an old heartbeat appear to be new agent activity.
 
+## Provider session-start restoration (R07, R09, R17, R33)
+
+```text
+fresh durable context --\
+                         +--> compose text --> jq -Rs stdin --> provider JSON stdout
+boot ritual ------------/                         |
+                                                  `--> construction failure signal
+```
+
+The Claude SessionStart hook reads fresh context through `st2 context read`,
+wraps non-whitespace content in a source-and-agent envelope, appends the boot
+ritual, and streams the complete composed text into `jq`. `jq` raw-slurps stdin
+and emits `continue: true` plus
+`hookSpecificOutput { hookEventName: "SessionStart", additionalContext }` on
+stdout. Context bytes never occupy one process argument and are not truncated.
+
+Missing or stale context omits the envelope while retaining the ritual. A
+missing `jq` fails open with exit 0 and no output; a missing `st2` fails open
+with the ritual only. These are supported degraded starts, not evidence that
+context was delivered. Any other JSON-construction or delivery failure must be
+distinguishable from those cases and propagate durably under R17.
+
+Executable acceptance in `tests/claude_hooks.rs` covers the model-visible
+stdout envelope, empty stderr, missing and stale context, missing dependencies,
+and context larger than a platform argument limit without truncation. The open
+verification delta is recorded in
+[DELTA-001](./.delta/DELTA-001-session-start-hook-evidence.md).
+
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.
@@ -994,3 +1023,10 @@ the resident supervisor continues to reconcile the complete local catalog.
   [#41](https://github.com/compoundingtech/st2/issues/41),
   [#44](https://github.com/compoundingtech/st2/issues/44), and
   [#60](https://github.com/compoundingtech/st2/issues/60).
+- **DQ5 Session-start failure receipt (R17, R33):** The hook has explicit
+  fail-open results for missing enrichment dependencies, but an unexpected
+  `jq` construction failure can still leave the provider without context or a
+  durable supervisor-visible receipt. Resolve the gap by defining and proving
+  a failure signal that does not block provider startup, is distinguishable
+  from an ordinary cold start, and reaches the responsible supervisor under
+  R17.
