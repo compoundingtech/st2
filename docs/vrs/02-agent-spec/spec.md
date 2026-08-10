@@ -358,10 +358,13 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 
 <h3 id="f14">F14 Compact agent fields</h3>
 
-Compact `command`, `argv`, `env`, `lifecycle`, and `ding` convert to the
-generated agent PTY and derived sidecar. The tasks use F09, F11, and F12;
-`ding` carries the dependency on the generated agent task described there.
-Compact syntax adds no other behavior.
+Compact `command`, `argv`, `env`, and `lifecycle` define the generated agent
+PTY. Bare `ding` selects the derived legacy screen sidecar. `deliver "mcp"`
+selects native Claude delivery. `deliver "app-server"` selects native Codex
+delivery. The two selector nodes are mutually exclusive. More than one
+`deliver` node and any other value are invalid. Neither node means no delivery.
+Each generated transport depends on the generated agent task. The tasks use
+F09, F11, and F12. Compact syntax adds no other behavior.
 
 Authoring: [pinned compact tasks][evals-tasks]. That document and st2 `9887b28`
 predate compact `argv` and `lifecycle`. Current st2 source:
@@ -370,9 +373,10 @@ predate compact `argv` and `lifecycle`. Current st2 source:
 
 <h3 id="f15">F15 Provider and ignored fields</h3>
 
-Core st2 ignores `harness`, `model`, `persona`, `permissions`, `transport`,
-`strategy`, `meta`, and provider extensions. They do not change core equality,
-wake behavior, or actions. Providers may convert them into F05 through F14;
+Core st2 ignores `harness`, `model`, `persona`, `permissions`, the legacy
+render-only `transport` field, `strategy`, `meta`, and provider extensions.
+They do not change core equality, wake behavior, or actions. Providers may
+convert them into F05 through F14;
 core acts only on that concrete output.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:

@@ -154,9 +154,12 @@ Authority: [`message::Message`](../../src/message.rs#L26-L46)
 
 ### DING
 
-The terminal notification that makes an agent aware of unread messages.
+The delivery signal that makes an agent aware of unread messages. A declaration
+selects either the legacy terminal transport or one provider-native control
+transport.
 
-Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
+Authority: [DING specification](./01-ding/spec.md) and
+[DING module contract](../../src/ding/mod.rs#L1-L14)
 
 ## Collision rules
 
@@ -172,7 +175,7 @@ Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
   value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
   host-qualified address.
 - Use [message](../../src/message.rs#L26-L46) for the durable record and
-  [DING](../../src/ding/mod.rs#L1-L14) for its terminal notification.
+  [DING](./01-ding/spec.md) for its delivery signal.
 
 ## Avoid
 
