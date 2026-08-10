@@ -1308,15 +1308,7 @@ fn pump_control(
             }
             if !state.subscribed
                 && !subscription_pending
-                && message.get("method").and_then(Value::as_str) == Some("thread/status/changed")
-                && message.pointer("/params/threadId").and_then(Value::as_str)
-                    == Some(state.thread_id.as_str())
-                && matches!(
-                    message
-                        .pointer("/params/status/type")
-                        .and_then(Value::as_str),
-                    Some("idle" | "active")
-                )
+                && subscription_candidate(&message, state.thread_id())
             {
                 write_json_message(
                     &mut websocket,
@@ -1337,6 +1329,30 @@ fn pump_control(
     })();
     if let Err(error) = result {
         let _ = events.send(ControlEvent::Failed(format!("{error:#}")));
+    }
+}
+
+fn subscription_candidate(message: &Value, thread_id: &str) -> bool {
+    match message.get("method").and_then(Value::as_str) {
+        Some("thread/started") => {
+            message.pointer("/params/thread/id").and_then(Value::as_str) == Some(thread_id)
+                && matches!(
+                    message
+                        .pointer("/params/thread/status/type")
+                        .and_then(Value::as_str),
+                    Some("idle" | "active")
+                )
+        }
+        Some("thread/status/changed") => {
+            message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+                && matches!(
+                    message
+                        .pointer("/params/status/type")
+                        .and_then(Value::as_str),
+                    Some("idle" | "active")
+                )
+        }
+        _ => false,
     }
 }
 
@@ -2144,14 +2160,6 @@ mod tests {
                 &json!({
                     "method": "thread/started",
                     "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
-                }),
-            )
-            .unwrap();
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "method": "thread/status/changed",
-                    "params": { "threadId": "thread-main", "status": { "type": "idle" } }
                 }),
             )
             .unwrap();
