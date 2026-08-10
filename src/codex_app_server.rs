@@ -3,8 +3,8 @@
 //! Native delivery cannot infer a thread from cwd, process, PTY, or `thread/list`. This module
 //! starts a dedicated provider daemon, initializes an observer connection before the interactive
 //! client starts, and binds a typed start or successful-resume event to the exact wrapper process
-//! incarnation that owns the PTY launch. Message watching and delivery are deliberately later
-//! layers; this module establishes only the topology and identity boundary they consume.
+//! incarnation that owns the PTY launch. Its control watcher persists delivery-relevant thread and
+//! turn state. Message selection and delivery remain later layers.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
@@ -28,6 +28,8 @@ use tungstenite::{Message, WebSocket};
 pub const SUPPORTED_CODEX_CLI_VERSION: &str = "codex-cli 0.145.0";
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
+const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
+const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 const SOCKET_PATH_BUDGET: usize = 96;
@@ -92,6 +94,287 @@ impl CodexThreadBinding {
     pub fn runtime_incarnation(&self) -> &str {
         &self.runtime_incarnation
     }
+}
+
+/// The latest delivery-relevant state observed on the bound app-server control stream.
+///
+/// `Active` is the only state that permits `turn/steer`: its turn ID came from the latest
+/// unmatched `turn/started` event. Every other non-idle state is an explicit hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CodexObservedState {
+    AwaitingStatus,
+    Idle,
+    Active {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
+    Held {
+        reason: CodexHoldReason,
+        #[serde(rename = "turnId")]
+        turn_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexHoldReason {
+    ActiveWithoutTurn,
+    ConflictingTurn,
+    Review,
+    Compaction,
+    NotLoaded,
+    SystemError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexControlState {
+    schema: String,
+    agent: String,
+    runtime_id: String,
+    runtime_incarnation: String,
+    thread_id: String,
+    subscribed: bool,
+    observed: CodexObservedState,
+}
+
+enum SubscriptionAcceptance {
+    Accepted { changed: bool },
+    Deferred,
+}
+
+impl CodexControlState {
+    fn new(runtime: &CodexRuntime, thread_id: String) -> Self {
+        Self {
+            schema: CONTROL_STATE_SCHEMA.to_string(),
+            agent: runtime.agent.clone(),
+            runtime_id: runtime.runtime_id.clone(),
+            runtime_incarnation: runtime.incarnation.clone(),
+            thread_id,
+            subscribed: false,
+            observed: CodexObservedState::AwaitingStatus,
+        }
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub fn observed(&self) -> &CodexObservedState {
+        &self.observed
+    }
+
+    pub fn subscribed(&self) -> bool {
+        self.subscribed
+    }
+
+    fn accept_subscription(&mut self, message: &Value) -> Result<SubscriptionAcceptance> {
+        if let Some(error) = message.get("error") {
+            let code = error.get("code").and_then(Value::as_i64);
+            let detail = error.get("message").and_then(Value::as_str);
+            if code == Some(-32600)
+                && detail
+                    .is_some_and(|detail| detail.starts_with("no rollout found for thread id "))
+            {
+                return Ok(SubscriptionAcceptance::Deferred);
+            }
+            anyhow::bail!("Codex app-server rejected control thread/resume: {error}");
+        }
+        anyhow::ensure!(
+            message.get("result").is_some(),
+            "Codex control thread/resume response has no result"
+        );
+        let thread_id = required_string(message, "/result/thread/id", "thread/resume response")?;
+        anyhow::ensure!(
+            thread_id == self.thread_id,
+            "Codex control thread/resume returned a different thread"
+        );
+        let status = required_string(
+            message,
+            "/result/thread/status/type",
+            "thread/resume response",
+        )?;
+        let before = (self.subscribed, self.observed.clone());
+        self.subscribed = true;
+        self.observe_thread_status(status);
+        Ok(SubscriptionAcceptance::Accepted {
+            changed: (self.subscribed, self.observed.clone()) != before,
+        })
+    }
+
+    fn observe(&mut self, message: &Value) -> Result<bool> {
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let before = self.observed.clone();
+        match method {
+            "thread/started" => {
+                let thread_id = required_string(message, "/params/thread/id", method)?;
+                if thread_id != self.thread_id {
+                    return Ok(false);
+                }
+                let status = required_string(message, "/params/thread/status/type", method)?;
+                self.observe_thread_status(status);
+            }
+            "thread/status/changed" => {
+                let thread_id = required_string(message, "/params/threadId", method)?;
+                if thread_id != self.thread_id {
+                    return Ok(false);
+                }
+                let status = required_string(message, "/params/status/type", method)?;
+                self.observe_thread_status(status);
+            }
+            "turn/started" => {
+                let thread_id = required_string(message, "/params/threadId", method)?;
+                if thread_id != self.thread_id {
+                    return Ok(false);
+                }
+                let turn_id = required_string(message, "/params/turn/id", method)?.to_string();
+                self.observe_turn_started(turn_id);
+            }
+            "turn/completed" => {
+                let thread_id = required_string(message, "/params/threadId", method)?;
+                if thread_id != self.thread_id {
+                    return Ok(false);
+                }
+                let turn_id = required_string(message, "/params/turn/id", method)?;
+                self.observe_turn_completed(turn_id);
+            }
+            "item/started" | "item/completed" => {
+                let thread_id = required_string(message, "/params/threadId", method)?;
+                if thread_id != self.thread_id {
+                    return Ok(false);
+                }
+                let item_type = required_string(message, "/params/item/type", method)?;
+                let reason = match item_type {
+                    "enteredReviewMode" => CodexHoldReason::Review,
+                    "contextCompaction" => CodexHoldReason::Compaction,
+                    _ => return Ok(false),
+                };
+                let turn_id = required_string(message, "/params/turnId", method)?;
+                self.observe_non_steerable(turn_id, reason);
+            }
+            _ => return Ok(false),
+        }
+        Ok(self.observed != before)
+    }
+
+    fn observe_thread_status(&mut self, status: &str) {
+        self.observed = match status {
+            "idle" => CodexObservedState::Idle,
+            "active" => match &self.observed {
+                CodexObservedState::Active { .. }
+                | CodexObservedState::Held {
+                    reason:
+                        CodexHoldReason::Review
+                        | CodexHoldReason::Compaction
+                        | CodexHoldReason::ConflictingTurn,
+                    ..
+                } => self.observed.clone(),
+                _ => CodexObservedState::Held {
+                    reason: CodexHoldReason::ActiveWithoutTurn,
+                    turn_id: None,
+                },
+            },
+            "notLoaded" => CodexObservedState::Held {
+                reason: CodexHoldReason::NotLoaded,
+                turn_id: None,
+            },
+            "systemError" => CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                turn_id: None,
+            },
+            _ => CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                turn_id: None,
+            },
+        };
+    }
+
+    fn observe_turn_started(&mut self, turn_id: String) {
+        self.observed = match &self.observed {
+            CodexObservedState::Active { turn_id: current } if current == &turn_id => {
+                self.observed.clone()
+            }
+            CodexObservedState::Held {
+                reason: CodexHoldReason::Review | CodexHoldReason::Compaction,
+                turn_id: Some(current),
+            } if current == &turn_id => self.observed.clone(),
+            CodexObservedState::Active { .. }
+            | CodexObservedState::Held {
+                reason:
+                    CodexHoldReason::Review
+                    | CodexHoldReason::Compaction
+                    | CodexHoldReason::ConflictingTurn,
+                ..
+            } => CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                turn_id: None,
+            },
+            _ => CodexObservedState::Active { turn_id },
+        };
+    }
+
+    fn observe_turn_completed(&mut self, turn_id: &str) {
+        self.observed = match &self.observed {
+            CodexObservedState::Idle => CodexObservedState::Idle,
+            CodexObservedState::Active { turn_id: current } if current == turn_id => {
+                CodexObservedState::Idle
+            }
+            CodexObservedState::Held {
+                reason: CodexHoldReason::Review | CodexHoldReason::Compaction,
+                turn_id: Some(current),
+            } if current == turn_id => CodexObservedState::Idle,
+            CodexObservedState::AwaitingStatus
+            | CodexObservedState::Held {
+                reason: CodexHoldReason::ActiveWithoutTurn,
+                ..
+            } => CodexObservedState::Idle,
+            CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                ..
+            } => self.observed.clone(),
+            _ => CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                turn_id: None,
+            },
+        };
+    }
+
+    fn observe_non_steerable(&mut self, turn_id: &str, reason: CodexHoldReason) {
+        self.observed = match &self.observed {
+            CodexObservedState::Active { turn_id: current } if current == turn_id => {
+                CodexObservedState::Held {
+                    reason,
+                    turn_id: Some(turn_id.to_string()),
+                }
+            }
+            CodexObservedState::Held {
+                reason: current_reason,
+                turn_id: Some(current),
+            } if current == turn_id
+                && matches!(
+                    current_reason,
+                    CodexHoldReason::Review | CodexHoldReason::Compaction
+                ) =>
+            {
+                self.observed.clone()
+            }
+            _ => CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                turn_id: None,
+            },
+        };
+    }
+}
+
+fn required_string<'a>(message: &'a Value, pointer: &str, method: &str) -> Result<&'a str> {
+    message
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{method} has no non-empty {pointer}"))
 }
 
 /// Run one authored Codex argv behind a dedicated app server and initialized control connection.
@@ -199,17 +482,21 @@ fn run_connected(
     codex_argv: &[String],
     resume_thread: Option<&str>,
 ) -> Result<()> {
+    let tui_args = controlled_tui_args(endpoint, &codex_argv[1..], resume_thread)?;
+    let expected_resume =
+        expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
     let control = connect_control(server, socket_path, STARTUP_TIMEOUT)?;
     let shutdown = control.try_clone()?;
     let websocket = initialize_control(control)?;
     let (events_tx, events_rx) = mpsc::channel();
     let binding_path = state_dir.join("binding.json");
+    let control_state_path = state_dir.join("control-state.json");
     let runtime_for_reader = runtime.clone();
-    let expected_resume = resume_thread.map(str::to_owned);
     let event_thread = thread::spawn(move || {
         pump_control(
             websocket,
             &binding_path,
+            &control_state_path,
             &runtime_for_reader,
             expected_resume.as_deref(),
             events_tx,
@@ -220,11 +507,7 @@ fn run_connected(
     // thread/resume. Insert the remote endpoint as a global Codex option and preserve every authored
     // argument after the provider executable.
     let mut tui_command = Command::new(&codex_argv[0]);
-    tui_command.args(controlled_tui_args(
-        endpoint,
-        &codex_argv[1..],
-        resume_thread,
-    )?);
+    tui_command.args(tui_args);
     let mut tui = tui_command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -263,6 +546,22 @@ fn controlled_tui_args(
     args.push(thread_id.to_string());
     args.extend_from_slice(&authored_args[insertion..]);
     Ok(args)
+}
+
+/// A saved binding constrains the watcher only when st2 inserted that resume selection.
+///
+/// An authored `resume` or `fork` command owns its own selection. The watcher binds the first typed
+/// event from that command instead of rejecting it because it differs from an older saved binding.
+fn expected_resume_thread<'a>(
+    authored_args: &[String],
+    resume_thread: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    let Some(thread_id) = resume_thread else {
+        return Ok(None);
+    };
+    Ok(resume_insertion_index(authored_args)?
+        .is_some()
+        .then_some(thread_id))
 }
 
 /// Find where a pinned Codex 0.145.0 interactive argv begins its prompt or subcommand.
@@ -454,6 +753,7 @@ fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
 #[derive(Debug)]
 enum ControlEvent {
     Bound,
+    Observed,
     Closed,
     Failed(String),
 }
@@ -461,58 +761,108 @@ enum ControlEvent {
 fn pump_control(
     mut websocket: WebSocket<UnixStream>,
     binding_path: &Path,
+    control_state_path: &Path,
     runtime: &CodexRuntime,
     expected_resume: Option<&str>,
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
-        let mut bound_thread: Option<String> = None;
+        let mut control_state: Option<CodexControlState> = None;
+        let mut subscription_pending = false;
         loop {
             let Some(message) = read_json_message(&mut websocket)? else {
                 let _ = events.send(ControlEvent::Closed);
                 return Ok(());
             };
-            let thread_id = match message.get("method").and_then(Value::as_str) {
-                Some("thread/started") => message
-                    .pointer("/params/thread/id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .context("thread/started has no non-empty params.thread.id")?,
-                Some("thread/status/changed") if expected_resume.is_some() => {
-                    let thread_id = message
-                        .pointer("/params/threadId")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .context("thread/status/changed has no non-empty params.threadId")?;
-                    let status = message
-                        .pointer("/params/status/type")
-                        .and_then(Value::as_str)
-                        .context("thread/status/changed has no params.status.type")?;
-                    if Some(thread_id) != expected_resume || !matches!(status, "idle" | "active") {
-                        continue;
-                    }
-                    thread_id
-                }
-                _ => continue,
-            };
-            match bound_thread.as_deref() {
-                None => {
+            if control_state.is_none() {
+                let Some(thread_id) = binding_candidate(&message, expected_resume)? else {
+                    continue;
+                };
+                {
                     atomic_json(
                         binding_path,
                         &CodexThreadBinding::new(runtime, thread_id.to_string()),
                     )?;
-                    bound_thread = Some(thread_id.to_string());
+                    control_state = Some(CodexControlState::new(runtime, thread_id.to_string()));
+                    atomic_json(
+                        control_state_path,
+                        control_state
+                            .as_ref()
+                            .context("Codex control state is unbound")?,
+                    )?;
                     let _ = events.send(ControlEvent::Bound);
                 }
-                Some(bound) if bound == thread_id => {}
-                // A dedicated daemon can emit secondary thread starts for review/fork flows. The
-                // first TUI-owned thread remains the binding; never silently rebind it.
-                Some(_) => {}
+            }
+
+            let state = control_state
+                .as_mut()
+                .context("Codex control state is unbound")?;
+            let changed = if message.get("id") == Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID)) {
+                anyhow::ensure!(
+                    subscription_pending,
+                    "Codex control received an unexpected thread/resume response"
+                );
+                subscription_pending = false;
+                match state.accept_subscription(&message)? {
+                    SubscriptionAcceptance::Accepted { changed } => changed,
+                    SubscriptionAcceptance::Deferred => false,
+                }
+            } else {
+                state.observe(&message)?
+            };
+            if changed {
+                atomic_json(control_state_path, state)?;
+                let _ = events.send(ControlEvent::Observed);
+            }
+            if !state.subscribed
+                && !subscription_pending
+                && message.get("method").and_then(Value::as_str) == Some("thread/status/changed")
+                && message.pointer("/params/threadId").and_then(Value::as_str)
+                    == Some(state.thread_id.as_str())
+                && matches!(
+                    message
+                        .pointer("/params/status/type")
+                        .and_then(Value::as_str),
+                    Some("idle" | "active")
+                )
+            {
+                write_json_message(
+                    &mut websocket,
+                    &json!({
+                        "method": "thread/resume",
+                        "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                        "params": { "threadId": state.thread_id }
+                    }),
+                )?;
+                subscription_pending = true;
             }
         }
     })();
     if let Err(error) = result {
         let _ = events.send(ControlEvent::Failed(format!("{error:#}")));
+    }
+}
+
+fn binding_candidate<'a>(
+    message: &'a Value,
+    expected_resume: Option<&str>,
+) -> Result<Option<&'a str>> {
+    match message.get("method").and_then(Value::as_str) {
+        Some("thread/started") => {
+            let thread_id = required_string(message, "/params/thread/id", "thread/started")?;
+            Ok(expected_resume
+                .is_none_or(|expected| expected == thread_id)
+                .then_some(thread_id))
+        }
+        Some("thread/status/changed") if expected_resume.is_some() => {
+            let thread_id = required_string(message, "/params/threadId", "thread/status/changed")?;
+            let status = required_string(message, "/params/status/type", "thread/status/changed")?;
+            Ok(
+                (Some(thread_id) == expected_resume && matches!(status, "idle" | "active"))
+                    .then_some(thread_id),
+            )
+        }
+        _ => Ok(None),
     }
 }
 
@@ -537,6 +887,7 @@ fn wait_for_binding(
         }
         match events.recv_timeout(wait) {
             Ok(ControlEvent::Bound) => return Ok(()),
+            Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
                 anyhow::bail!("Codex control connection closed before thread binding")
             }
@@ -558,6 +909,7 @@ fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result
         }
         match events.recv_timeout(CONTROL_POLL) {
             Ok(ControlEvent::Bound) => {}
+            Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
                 anyhow::bail!("Codex control connection closed while the TUI was live")
             }
@@ -724,6 +1076,31 @@ pub fn load_current_binding(
     Ok(Some(binding))
 }
 
+pub fn load_current_control_state(
+    path: &Path,
+    runtime: &CodexRuntime,
+    binding: &CodexThreadBinding,
+) -> Result<Option<CodexControlState>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let state: CodexControlState = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        state.schema == CONTROL_STATE_SCHEMA,
+        "unsupported Codex control-state schema"
+    );
+    anyhow::ensure!(
+        state.agent == runtime.agent
+            && state.runtime_id == runtime.runtime_id
+            && state.runtime_incarnation == runtime.incarnation
+            && state.thread_id == binding.thread_id,
+        "Codex control state belongs to a different runtime binding"
+    );
+    Ok(Some(state))
+}
+
 fn load_resume_thread(path: &Path, agent: &str, runtime_id: &str) -> Result<Option<String>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -816,12 +1193,47 @@ mod tests {
             assert_eq!(initialized["method"], "initialized");
             write_json_message(
                 &mut websocket,
-                &json!({ "method": "thread/started", "params": { "thread": { "id": "thread-main" } } }),
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
+                }),
             )
             .unwrap();
             write_json_message(
                 &mut websocket,
-                &json!({ "method": "thread/started", "params": { "thread": { "id": "thread-review" } } }),
+                &json!({
+                    "method": "thread/status/changed",
+                    "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+                }),
+            )
+            .unwrap();
+            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(subscribe["method"], "thread/resume");
+            assert_eq!(subscribe["params"]["threadId"], "thread-main");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": { "id": "thread-main", "status": { "type": "idle" } }
+                    }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": "thread-review", "status": { "type": "idle" } } }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-main", "turn": { "id": "turn-main" } }
+                }),
             )
             .unwrap();
         });
@@ -831,12 +1243,21 @@ mod tests {
         let websocket = initialize_control(stream).unwrap();
         let state = tmp.path().join("state");
         let binding_path = state.join("binding.json");
+        let control_state_path = state.join("control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let (tx, rx) = mpsc::channel();
         let runtime_for_pump = runtime.clone();
         let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
         let pump = thread::spawn(move || {
-            pump_control(websocket, &binding_for_pump, &runtime_for_pump, None, tx)
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime_for_pump,
+                None,
+                tx,
+            )
         });
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -850,6 +1271,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.thread_id(), "thread-main");
+        let state =
+            load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-main".into()
+            }
+        );
+        assert!(state.subscribed());
     }
 
     #[test]
@@ -872,6 +1304,16 @@ mod tests {
             write_json_message(
                 &mut websocket,
                 &json!({
+                    "method": "thread/started",
+                    "params": {
+                        "thread": { "id": "thread-unrelated", "status": { "type": "idle" } }
+                    }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
                     "method": "thread/status/changed",
                     "params": {
                         "threadId": "thread-unrelated",
@@ -891,20 +1333,36 @@ mod tests {
                 }),
             )
             .unwrap();
+            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(subscribe["method"], "thread/resume");
+            assert_eq!(subscribe["params"]["threadId"], "thread-prior");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                    }
+                }),
+            )
+            .unwrap();
         });
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
         let websocket = initialize_control(stream).unwrap();
         let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let (tx, rx) = mpsc::channel();
         let runtime_for_pump = runtime.clone();
         let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
         let pump = thread::spawn(move || {
             pump_control(
                 websocket,
                 &binding_for_pump,
+                &control_state_for_pump,
                 &runtime_for_pump,
                 Some("thread-prior"),
                 tx,
@@ -922,6 +1380,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(binding.thread_id(), "thread-prior");
+        let state = load_current_control_state(&control_state_path, &runtime, &binding)
+            .unwrap()
+            .unwrap();
+        assert!(state.subscribed());
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
     }
 
     #[test]
@@ -942,6 +1405,221 @@ mod tests {
         );
         let error = load_current_binding(&path, &current).unwrap_err();
         assert!(error.to_string().contains("different runtime incarnation"));
+    }
+
+    #[test]
+    fn watcher_holds_without_an_exact_turn_and_tracks_one_unmatched_lifecycle() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "thread/status/changed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "status": { "type": "active", "activeFlags": [] }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::ActiveWithoutTurn,
+                turn_id: None,
+            }
+        );
+
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turn": { "id": "turn-1" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-1".into()
+            }
+        );
+
+        assert!(
+            !state
+                .observe(&json!({
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thread-other",
+                        "turn": { "id": "turn-other" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-1".into()
+            }
+        );
+
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turn": { "id": "turn-1" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
+
+    #[test]
+    fn watcher_holds_review_compaction_and_conflicting_turns_until_safe() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-1",
+                    "item": { "type": "enteredReviewMode" }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-1".into()),
+            }
+        );
+
+        state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-main",
+                    "status": { "type": "active", "activeFlags": [] }
+                }
+            }))
+            .unwrap();
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                ..
+            }
+        ));
+
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-2" } }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                turn_id: None,
+            }
+        );
+
+        state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+            }))
+            .unwrap();
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
+
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-3" } }
+            }))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-3",
+                    "item": { "type": "contextCompaction" }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Compaction,
+                turn_id: Some("turn-3".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn persisted_control_state_is_bound_to_the_exact_runtime_incarnation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let binding = CodexThreadBinding::new(&runtime, "thread-main".into());
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state.observed = CodexObservedState::Active {
+            turn_id: "turn-1".into(),
+        };
+        atomic_json(&path, &state).unwrap();
+        let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["observed"]["turnId"], "turn-1");
+        assert!(persisted["observed"].get("turn_id").is_none());
+
+        assert_eq!(
+            load_current_control_state(&path, &runtime, &binding)
+                .unwrap()
+                .unwrap(),
+            state
+        );
+
+        let replacement = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let replacement_binding = CodexThreadBinding::new(&replacement, "thread-main".into());
+        let error =
+            load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
+        assert!(error.to_string().contains("different runtime binding"));
+    }
+
+    #[test]
+    fn subscription_waits_for_a_rollout_without_claiming_success() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        let acceptance = state
+            .accept_subscription(&json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "error": {
+                    "code": -32600,
+                    "message": "no rollout found for thread id thread-main"
+                }
+            }))
+            .unwrap();
+
+        assert!(matches!(acceptance, SubscriptionAcceptance::Deferred));
+        assert!(!state.subscribed());
+        assert_eq!(state.observed(), &CodexObservedState::AwaitingStatus);
     }
 
     #[test]
@@ -983,6 +1661,14 @@ mod tests {
                 "thread-explicit"
             ]
         );
+        assert_eq!(
+            expected_resume_thread(
+                &["resume".into(), "thread-explicit".into()],
+                Some("thread-prior")
+            )
+            .unwrap(),
+            None
+        );
 
         let fork = vec![
             "--dangerously-bypass-hook-trust".into(),
@@ -998,6 +1684,14 @@ mod tests {
                 "fork",
                 "thread-explicit"
             ]
+        );
+        assert_eq!(
+            expected_resume_thread(&fork, Some("thread-prior")).unwrap(),
+            None
+        );
+        assert_eq!(
+            expected_resume_thread(&authored, Some("thread-prior")).unwrap(),
+            Some("thread-prior")
         );
     }
 
