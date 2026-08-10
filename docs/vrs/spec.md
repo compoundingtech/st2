@@ -990,7 +990,7 @@ the resident supervisor continues to reconcile the complete local catalog.
      service, CAS metadata, database, or network dependency.
 
   The executable acceptance above resolves this open implementation design.
-   See [#40](https://github.com/compoundingtech/st2/issues/40),
-   [#41](https://github.com/compoundingtech/st2/issues/41),
-   [#44](https://github.com/compoundingtech/st2/issues/44), and
-   [#60](https://github.com/compoundingtech/st2/issues/60).
+  See [#40](https://github.com/compoundingtech/st2/issues/40),
+  [#41](https://github.com/compoundingtech/st2/issues/41),
+  [#44](https://github.com/compoundingtech/st2/issues/44), and
+  [#60](https://github.com/compoundingtech/st2/issues/60).
