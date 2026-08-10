@@ -6,8 +6,8 @@ selection and durability rules in [`../spec.md`](../spec.md).
 
 ## Status
 
-Active. Native production acceptance is blocked until the provider approves a
-non-interactive channel enrollment for this integration.
+Active. Native production acceptance is blocked until provider or organization
+policy supplies a non-interactive channel enrollment for this integration.
 
 ## Native MCP transport
 
@@ -32,6 +32,10 @@ below proves that the maintained launch configuration accepts the channel.
 The maintained launch path must use a provider-approved channel enrollment.
 The provider's development-only channel override is observation and test
 equipment. It is not production acceptance.
+
+The bounded packaging and policy path is in
+[`packaging.md`](./packaging.md). That document does not authorize building the
+plugin.
 
 ### Notification
 
