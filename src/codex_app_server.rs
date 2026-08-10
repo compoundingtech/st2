@@ -563,8 +563,8 @@ impl CodexControlState {
             }
             CodexObservedState::Held {
                 reason: CodexHoldReason::Review | CodexHoldReason::Compaction,
-                turn_id: Some(current),
-            } if current == turn_id => CodexObservedState::Idle,
+                ..
+            } => self.observed.clone(),
             CodexObservedState::AwaitingStatus
             | CodexObservedState::Held {
                 reason: CodexHoldReason::ActiveWithoutTurn,
@@ -2156,6 +2156,24 @@ mod tests {
             }
         );
 
+        // Codex can complete the preparatory review turn after the reviewer turn starts. The
+        // review hold survives that stale completion and ends only when the thread is idle.
+        assert!(
+            !state
+                .observe(&json!({
+                    "method": "turn/completed",
+                    "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-2".into()),
+            }
+        );
+
         state
             .observe(&json!({
                 "method": "thread/status/changed",
@@ -2187,6 +2205,21 @@ mod tests {
                 turn_id: Some("turn-3".into()),
             }
         );
+        assert!(
+            !state
+                .observe(&json!({
+                    "method": "turn/completed",
+                    "params": { "threadId": "thread-main", "turn": { "id": "turn-3" } }
+                }))
+                .unwrap()
+        );
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::Compaction,
+                ..
+            }
+        ));
     }
 
     #[test]
