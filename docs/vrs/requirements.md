@@ -84,7 +84,10 @@ accepted.
 - **R05 DING/archive semantics:** Inbox delivery, archive precedence, retries,
   suppression, and restart recovery are deterministic and tested. DING may
   interrupt agent work, but it must not alter or submit a human's active draft;
-  an unknown interaction state defers delivery.
+  an unknown interaction state defers delivery. A declaration selects either
+  the legacy screen transport or one supported native transport. st2 does not
+  infer a native transport from an opaque command. A failed or unavailable
+  transport leaves the inbox message unread and retryable.
 - **R06 Restartable launch definitions:** A restarted PTY or exec receives the
   complete effective launch definition, including environment and supported
   launch fields.

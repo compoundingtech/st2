@@ -10,6 +10,36 @@ specified in [`01-claude/spec.md`](./01-claude/spec.md) and
 Active. A map to the implementation and its evidence, not a replacement for the
 tests.
 
+## Delivery selection
+
+Delivery is opt-in. An agent declaration selects one transport:
+
+| Declaration | Transport |
+| --- | --- |
+| `ding` | Legacy screen transport |
+| `deliver "mcp"` | Claude native MCP transport |
+| `deliver "app-server"` | Codex native app-server transport |
+| Neither node | No delivery |
+
+`ding` and `deliver` are mutually exclusive. More than one `deliver` node is
+invalid. Any other `deliver` value is invalid. st2 does not infer a transport
+from the agent command because command arguments are opaque.
+
+The native selector is a new `deliver` node. A binary that does not implement
+the node rejects the declaration. Native delivery must not be encoded as an
+argument to `ding`, because an older parser would accept that form as legacy
+`ding` and silently use the wrong transport.
+
+The durable inbox is the source of truth for every transport. An archive with
+the same message name wins. A native adapter completes delivery only after its
+declared provider-specific success condition. If the adapter is closed,
+unavailable, stale, or in an unknown state, it sends no unsafe input and leaves
+the inbox message unread for retry. Native adapters do not use the
+rendered-screen classifier.
+
+The rest of this document defines the unchanged legacy screen transport. The
+native wire contracts are in each maintained harness specification.
+
 ## Composer states
 
 One inspection of a rendered screen, evaluated against one exact expected
@@ -45,11 +75,11 @@ staged retry ─► receipt ─┬─ Accepted ───────────
                          └─ RetainedBlocked / Unproven ─────────────► Staged
 ```
 
-Fresh delivery preserves the production transport: one bounded PTY transaction
-contains a bracketed paste, a 0.5 second delay, and Return (`DING-R01`).
-Ownership is recorded immediately before that transaction. The production path
-does not inspect the composer first and does not use the separate staging
-helper.
+Fresh legacy delivery preserves the production transport: one bounded PTY
+transaction contains a bracketed paste, a 0.5 second delay, and Return
+(`DING-R01`). Ownership is recorded immediately before that transaction. The
+production path does not inspect the composer first and does not use the
+separate staging helper.
 
 Every failure of that terminal command or of the following receipt observation
 resolves to `Staged` (`DING-R07`): the paste and Return may already have reached
@@ -148,10 +178,11 @@ Declared `busy` never suppresses delivery; only fresh `dnd` defers it
 
 ## Known limits
 
-- Idle proof depends on footer chrome that a harness may render differently
-  across permission or approval modes. A harness whose footer is not recognized
-  in a given mode defers indefinitely rather than delivering. This is an
-  explicit limit per `T01`, and each harness spec states which modes it proves.
-- The classifier is a measured heuristic over rendered text, not an evented
-  signal, so a renderer change can defer delivery until the grammar is updated.
-  Tracked as `DQ2` in [`../spec.md`](../spec.md).
+- Legacy idle proof depends on footer chrome that a harness may render
+  differently across permission or approval modes. A harness whose footer is
+  not recognized in a given mode defers indefinitely rather than delivering.
+  This is an explicit limit per `T01`, and each harness spec states which modes
+  it proves.
+- The legacy classifier is a measured heuristic over rendered text, not an
+  evented signal, so a renderer change can defer legacy delivery until the
+  grammar is updated. Maintained native transports do not use this classifier.
