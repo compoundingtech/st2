@@ -591,10 +591,10 @@ impl CodexControlState {
             }
             CodexObservedState::Held {
                 reason: current_reason,
-                turn_id: Some(current),
-            } if current == turn_id
+                ..
+            } if current_reason == &reason
                 && matches!(
-                    current_reason,
+                    reason,
                     CodexHoldReason::Review | CodexHoldReason::Compaction
                 ) =>
             {
@@ -2156,8 +2156,30 @@ mod tests {
             }
         );
 
-        // Codex can complete the preparatory review turn after the reviewer turn starts. The
-        // review hold survives that stale completion and ends only when the thread is idle.
+        // Codex can complete the preparatory review item after the reviewer turn starts. That
+        // duplicate review event keeps the typed hold bound to the newer turn.
+        assert!(
+            !state
+                .observe(&json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turnId": "turn-1",
+                        "item": { "type": "enteredReviewMode" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-2".into()),
+            }
+        );
+
+        // The review hold also survives the stale turn completion. Only an idle thread releases
+        // it.
         assert!(
             !state
                 .observe(&json!({
