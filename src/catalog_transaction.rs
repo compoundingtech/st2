@@ -629,6 +629,12 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         spec.desired_state.reason(),
     );
     insert_default_bool(&mut fields, &format!("{base}/keep"), spec.keep, false);
+    insert_optional(
+        &mut fields,
+        &format!("{base}/delivery"),
+        SemanticType::String,
+        spec.delivery.map(|delivery| delivery.as_str()),
+    );
 
     let restart = spec.restart_policy();
     let default_restart = Restart::default();
