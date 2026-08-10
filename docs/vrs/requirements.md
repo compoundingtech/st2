@@ -96,6 +96,14 @@ accepted.
   invalidate another running binary's previously installed immutable set. Hook
   interpreters and runtime dependencies are portable and explicit on every
   supported package environment.
+- **R33 Provider-visible session restoration:** A shipped session-start hook
+  restores fresh, non-empty durable context and its boot ritual through the
+  provider's supported model-visible output contract. The complete context is
+  preserved without truncation or an argument-size boundary. Missing or stale
+  context is an ordinary cold start, and unavailable enrichment dependencies
+  fail open without blocking provider startup. Any other construction or
+  delivery failure is distinguishable from an ordinary cold start and follows
+  R17's durable error-propagation contract.
 - **R11 Control-plane replacement safety:** Stopping or killing `st2 up` must
   not stop, restart, or replace any agent it launched. st2 can be reinstalled
   and restarted while running agents continue unchanged; the replacement

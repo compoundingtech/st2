@@ -677,6 +677,34 @@ atomic inbox file → DING attempt → agent reads → archive receipt
 - **R10:** Fleet identities are agents. General-purpose identity kinds are
   unsupported.
 
+## Provider session-start restoration (R07, R09, R17, R33)
+
+```text
+fresh durable context --\
+                         +--> compose text --> jq -Rs stdin --> provider JSON stdout
+boot ritual ------------/                         |
+                                                  `--> construction failure signal
+```
+
+The Claude SessionStart hook reads fresh context through `st2 context read`,
+wraps non-whitespace content in a source-and-agent envelope, appends the boot
+ritual, and streams the complete composed text into `jq`. `jq` raw-slurps stdin
+and emits `continue: true` plus
+`hookSpecificOutput { hookEventName: "SessionStart", additionalContext }` on
+stdout. Context bytes never occupy one process argument and are not truncated.
+
+Missing or stale context omits the envelope while retaining the ritual. A
+missing `jq` fails open with exit 0 and no output; a missing `st2` fails open
+with the ritual only. These are supported degraded starts, not evidence that
+context was delivered. Any other JSON-construction or delivery failure must be
+distinguishable from those cases and propagate durably under R17.
+
+Executable acceptance in `tests/claude_hooks.rs` covers the model-visible
+stdout envelope, empty stderr, missing and stale context, missing dependencies,
+and context larger than a platform argument limit without truncation. The open
+verification delta is recorded in
+[DELTA-001](./.delta/DELTA-001-session-start-hook-evidence.md).
+
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.
@@ -851,3 +879,10 @@ the resident supervisor continues to reconcile the complete local catalog.
   [#41](https://github.com/compoundingtech/st2/issues/41),
   [#44](https://github.com/compoundingtech/st2/issues/44), and
   [#60](https://github.com/compoundingtech/st2/issues/60).
+- **DQ5 Session-start failure receipt (R17, R33):** The hook has explicit
+  fail-open results for missing enrichment dependencies, but an unexpected
+  `jq` construction failure can still leave the provider without context or a
+  durable supervisor-visible receipt. Resolve the gap by defining and proving
+  a failure signal that does not block provider startup, is distinguishable
+  from an ordinary cold start, and reaches the responsible supervisor under
+  R17.
