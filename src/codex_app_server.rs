@@ -1259,7 +1259,14 @@ fn pump_control(
                         binding_path,
                         &CodexThreadBinding::new(runtime, thread_id.to_string()),
                     )?;
-                    control_state = Some(CodexControlState::new(runtime, thread_id.to_string()));
+                    let mut bound = CodexControlState::new(runtime, thread_id.to_string());
+                    // A fresh control client that observes the owning TUI's `thread/started`
+                    // notification already receives that thread's broadcasts. Before its first
+                    // turn there is no rollout for `thread/resume` to load. Saved bindings still
+                    // require resume so their typed history can be reconciled before delivery.
+                    bound.subscribed = expected_resume.is_none()
+                        && message.get("method").and_then(Value::as_str) == Some("thread/started");
+                    control_state = Some(bound);
                     atomic_json(
                         control_state_path,
                         control_state
@@ -2163,18 +2170,6 @@ mod tests {
                 }),
             )
             .unwrap();
-            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
-            assert_eq!(subscribe["method"], "thread/resume");
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
-                    "result": {
-                        "thread": { "id": "thread-main", "status": { "type": "idle" } }
-                    }
-                }),
-            )
-            .unwrap();
             let delivery = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID);
             assert_eq!(delivery["method"], "turn/start");
@@ -2379,7 +2374,7 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
-                None,
+                Some("thread-main"),
                 Some(config),
                 tx,
             )
@@ -2434,27 +2429,14 @@ mod tests {
                 }),
             )
             .unwrap();
-            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
-            assert_eq!(subscribe["method"], "thread/resume");
-            assert_eq!(subscribe["params"]["threadId"], "thread-main");
             // JSON-RPC request IDs are per direction. A server request may reuse the client's
-            // subscription ID and must not be consumed as that client's response.
+            // subscription ID and must not be consumed as a client response.
             write_json_message(
                 &mut websocket,
                 &json!({
                     "id": CONTROL_SUBSCRIBE_REQUEST_ID,
                     "method": "item/commandExecution/requestApproval",
                     "params": {}
-                }),
-            )
-            .unwrap();
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
-                    "result": {
-                        "thread": { "id": "thread-main", "status": { "type": "idle" } }
-                    }
                 }),
             )
             .unwrap();
