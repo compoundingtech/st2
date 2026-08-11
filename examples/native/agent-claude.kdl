@@ -34,6 +34,16 @@ agent "<identity>" {
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-user-prompt-submit.sh"
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [

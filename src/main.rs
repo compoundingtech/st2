@@ -651,6 +651,13 @@ enum MessageCmd {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Render the bounded body-bearing FIFO view used by maintained provider adapters.
+    Delivery {
+        /// Whose inbox — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
+        identity: Option<String>,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
     /// Read one message. With a leading identity, read from that agent's box; otherwise your own.
     Read {
         /// Either the message filename, or an identity followed by a filename.
@@ -2022,6 +2029,18 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 let from = m.from.as_deref().unwrap_or("<unknown>");
                 let subj = m.subject.as_deref().unwrap_or("(no subject)");
                 println!("{}  from {from}  {subj}", m.filename);
+            }
+            Ok(())
+        }
+        MessageCmd::Delivery { identity, ctx } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = match identity {
+                Some(id) => id,
+                None => acting_id(&ctx)?,
+            };
+            let inbox = resolve_message_inbox(&root, &id, &host)?;
+            if let Some(delivery) = st2::inbox_delivery::render(&message::list_inbox(&inbox)?) {
+                println!("{}", delivery.text);
             }
             Ok(())
         }

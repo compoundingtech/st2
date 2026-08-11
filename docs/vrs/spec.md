@@ -664,6 +664,26 @@ atomic inbox file → DING attempt → agent reads → archive receipt
   composer cannot create a short-lived PTY probe on every inbox poll. Inbox
   reads do not wake the sidecar; only mutations bypass its bounded poll cadence.
 
+### Bounded maintained-provider inbox view
+
+Maintained provider boundaries render an ordered FIFO prefix with complete
+message bodies before the model decides how to handle it. The provider-neutral
+`st2.inbox-delivery.v1` JSON envelope is capped at 16 messages and 16 KiB.
+Bodies are never truncated. An oversized head is identified without exposing a
+partial body, and overflow stays unread behind the head for a later delivery.
+
+Codex native app-server delivery sends this envelope in its existing typed user
+message. Claude SessionStart and UserPromptSubmit hooks attach the same envelope
+on the provider-supported additional-context channel. Unknown or custom
+transports keep the short metadata DING and may obtain the view read-only with
+`st2 message delivery`.
+
+Delivery does not claim, settle, archive, or otherwise mutate a message. The
+agent uses the existing exact `message reply` and `message archive` operations,
+whose archive receipts remain the only durable handled authority. This contract
+is provider-neutral so the driver extraction tracked by issue #162 can move the
+thin Codex and Claude consumers without changing its schema, bounds, or tests.
+
 ## State and scope
 
 - **R08:** Presence and activity status are separate signals. The catalog must

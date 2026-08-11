@@ -18,6 +18,7 @@ const CODEX_SESSION_START: &[u8] = include_bytes!("../hooks/codex-session-start.
 const CODEX_PRE_COMPACT: &[u8] = include_bytes!("../hooks/codex-pre-compact.sh");
 const CODEX_STOP: &[u8] = include_bytes!("../hooks/codex-stop.sh");
 const CLAUDE_SESSION_START: &[u8] = include_bytes!("../hooks/claude-session-start.sh");
+const CLAUDE_USER_PROMPT_SUBMIT: &[u8] = include_bytes!("../hooks/claude-user-prompt-submit.sh");
 const CLAUDE_PRE_COMPACT: &[u8] = include_bytes!("../hooks/claude-pre-compact.sh");
 const CLAUDE_STOP_FAILURE: &[u8] = include_bytes!("../hooks/claude-stop-failure.sh");
 
@@ -25,11 +26,12 @@ const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
-const HOOKS: [(&str, &[u8]); 6] = [
+const HOOKS: [(&str, &[u8]); 7] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
     ("codex-stop.sh", CODEX_STOP),
     ("claude-session-start.sh", CLAUDE_SESSION_START),
+    ("claude-user-prompt-submit.sh", CLAUDE_USER_PROMPT_SUBMIT),
     ("claude-pre-compact.sh", CLAUDE_PRE_COMPACT),
     ("claude-stop-failure.sh", CLAUDE_STOP_FAILURE),
 ];
