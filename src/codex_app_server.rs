@@ -1668,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn subscribed_control_pump_delivers_the_real_fifo_head() {
+    fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
         let filename =
@@ -1728,21 +1728,21 @@ mod tests {
             assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID);
             assert_eq!(delivery["method"], "turn/start");
             assert_eq!(delivery["params"]["threadId"], "thread-main");
-            assert_eq!(
-                delivery["params"]["input"][0]["text"],
-                "[DING] ? h.sender: wired [id:".to_owned()
-                    + server_filename
-                        .trim_end_matches(".md")
-                        .rsplit_once('-')
-                        .unwrap()
-                        .1
-                    + "]"
-            );
+            let head_id = server_filename
+                .trim_end_matches(".md")
+                .rsplit_once('-')
+                .unwrap()
+                .1;
             assert!(
-                delivery["params"]["clientUserMessageId"]
+                delivery["params"]["input"][0]["text"]
                     .as_str()
                     .unwrap()
-                    .starts_with("st2:")
+                    .contains(head_id),
+                "the transport payload must identify the actionable FIFO head"
+            );
+            assert_eq!(
+                delivery["params"]["clientUserMessageId"],
+                stable_client_user_message_id("h.worker", "thread-main", &server_filename)
             );
             write_json_message(
                 &mut websocket,
