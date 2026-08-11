@@ -38,7 +38,9 @@ resumed session, st2 starts the TUI with the recorded thread ID. Its initialized
 control client calls `thread/loaded/list` until the result contains that exact
 ID. This typed result must arrive before the control client calls
 `thread/resume`. A started TUI process or a connected control socket does not
-prove that the TUI loaded the thread.
+prove that the TUI loaded the thread. The loaded-thread wait must expire before
+the outer thread-binding wait, so its specific provider error reaches the
+wrapper trace.
 
 After this observation, the control client calls `thread/resume` for the exact
 ID. st2 binds the new runtime incarnation only from the successful response. It
