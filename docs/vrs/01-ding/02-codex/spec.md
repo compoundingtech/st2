@@ -35,13 +35,18 @@ configuration error.
 
 For a new session, st2 records the thread ID from `thread/started`. For a
 resumed session, st2 starts the TUI with the recorded thread ID. Its initialized
-control client then calls `thread/resume` for that exact ID and binds the new
-runtime incarnation only from the successful response. It must not wait for a
-new `thread/started` notification or an unchanged status notification on the
-control connection. A resume error or a different returned thread ID leaves
-the prior binding non-current and every message unread. st2 does not infer
-ownership from `thread/list`, a working directory, a process, or a PTY. Those
-surfaces do not identify which TUI owns a thread.
+control client calls `thread/loaded/list` until the result contains that exact
+ID. This typed result must arrive before the control client calls
+`thread/resume`. A started TUI process or a connected control socket does not
+prove that the TUI loaded the thread.
+
+After this observation, the control client calls `thread/resume` for the exact
+ID. st2 binds the new runtime incarnation only from the successful response. It
+must not wait for a new `thread/started` notification or an unchanged status
+notification on the control connection. A timeout, resume error, or different
+returned thread ID leaves the prior binding non-current and every message
+unread. st2 does not infer ownership from `thread/list`, a working directory, a
+process, or a PTY. Those surfaces do not identify which TUI owns a thread.
 
 The thread binding is persistent runtime state. It includes the exact agent
 runtime incarnation that owns it. st2 rejects a binding from a prior
@@ -166,6 +171,11 @@ The native transport is not accepted until a live `codex --remote` test proves
 all of these results against the same app server and control client:
 
 - The normal TUI can start a new bound thread and resume that exact thread.
+- On resume, `thread/loaded/list` contains the preserved thread before the
+  control client calls `thread/resume`.
+- The resumed TUI consumes its authored initial prompt and runs its
+  `SessionStart` resume hook. A started process or a successful control resume
+  is not sufficient evidence.
 - An idle inbox message produces one typed `turn/start` user message and
   observable agent work.
 - A message during a regular active turn produces one typed `turn/steer` user
