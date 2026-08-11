@@ -125,6 +125,21 @@ Control transport close is a normal adapter stop. The adapter sends nothing
 after close. A restarted adapter must restore the exact thread binding and
 duplicate-control state before it attempts delivery.
 
+### Post-settlement observability
+
+Version 1 is not a delivery audit log. Its accepted delivery state exists to
+prevent duplicate transport while the identifying inbox head remains unread.
+Archive precedence removes that state after the agent archives the head. The
+archive proves agent settlement. After that removal, st2 cannot prove which
+transport method, turn ID, client ID, or acceptance time delivered the message.
+It must not make that historical claim.
+
+**Codex-DQ1 Post-settlement audit:** Decide whether a later contract should
+retain a bounded transport audit after archive. That contract must define the
+retained fields, privacy and redaction rules, retention and resource bounds,
+and failure behavior before implementation. Version 1 deliberately defines no
+duration, size, or pass threshold and retains no post-settlement audit record.
+
 ### Remote TUI evidence
 
 The native transport is not accepted until a live `codex --remote` test proves
