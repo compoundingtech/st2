@@ -1008,17 +1008,19 @@ fn run_controlled_owned(
         .stderr(log)
         .spawn()
         .with_context(|| format!("starting {} app-server", codex_argv[0]))?;
-    diagnostics.record("appServerStarted", json!({ "pid": server.id() }))?;
-
-    let result = run_connected(
-        &mut server,
-        &socket_path,
-        &runtime,
-        &codex_argv,
-        resume_thread.as_deref(),
-        delivery,
-        diagnostics,
-    );
+    let result = diagnostics
+        .record("appServerStarted", json!({ "pid": server.id() }))
+        .and_then(|_| {
+            run_connected(
+                &mut server,
+                &socket_path,
+                &runtime,
+                &codex_argv,
+                resume_thread.as_deref(),
+                delivery,
+                diagnostics,
+            )
+        });
     terminate_child(&mut server);
     let _ = fs::remove_file(&socket_path);
     result
@@ -1071,13 +1073,14 @@ fn run_connected(
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("starting controlled {} TUI", codex_argv[0]))?;
-    diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
-
-    diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-    let result = wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT).and_then(|_| {
-        diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-        monitor_bound_tui(&mut tui, &events_rx)
-    });
+    let result = (|| -> Result<()> {
+        diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
+        diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
+        wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT).and_then(|_| {
+            diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+            monitor_bound_tui(&mut tui, &events_rx)
+        })
+    })();
     if result.is_err() {
         terminate_child(&mut tui);
     }
