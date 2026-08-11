@@ -28,6 +28,9 @@ use tungstenite::{Message as WebSocketMessage, WebSocket};
 
 use crate::{ding, message, run, status};
 
+/// Every admitted version has a delivery-critical schema comparison and live remote-TUI evidence.
+/// A later version stays rejected until both checks are repeated; semantic-version proximity is
+/// not compatibility evidence for this experimental provider surface.
 pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &["codex-cli 0.145.0", "codex-cli 0.146.0"];
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
