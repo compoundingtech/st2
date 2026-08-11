@@ -1,16 +1,17 @@
 # st2 bus instructions
 
-You are connected to the st2 bus. Bus ops go through the `st2` CLI. Inbound messages arrive as `[DING]`
-pokes in your terminal; confirm the actual message via `st2 message ls` + `st2 message read` before
-acting on a new one (each poke carries a stable `[id:<rand6>]` so you can dedup re-pokes at a glance —
-see below).
+You are connected to the st2 bus. Bus ops go through the `st2` CLI. Maintained providers attach a
+bounded FIFO batch with complete message bodies. A short `[DING]` metadata poke remains the generic
+fallback for unknown/custom providers.
 
 ## Boot ritual (on cold start or /clear)
 
 1. `st2 status $ST_AGENT --set available` — set your status so peers see you as active.
-2. Drain your inbox backlog: `st2 message ls` to enumerate filenames, then for each: `st2 message read
-   <filename>`, `st2 message reply <filename> -m "<your reply>"` if a response is warranted, and
-   `st2 message archive <filename>` to clear. Don't leave inbox items unaddressed.
+2. Drain your inbox backlog: use the body-bearing batch already delivered by a maintained provider,
+   or run `st2 message delivery` once. Handle every included message, then run all warranted
+   `st2 message reply` and `st2 message archive` commands together in one tool invocation. A bounded
+   overflow is delivered as the next batch; an exceptional oversized head explicitly tells you to
+   use `st2 message read <filename>`. Don't leave handled inbox items unarchived.
 3. `st2 agents --json --enrich` to see who's around and whether any peers are waiting on you.
 4. If the backlog or durable context leaves work to execute, set `busy` before acting on it. Return
    to `available` only when yielding or ready for new work.
@@ -45,13 +46,11 @@ handle this?" first — only act on genuinely new ones.
 
 ## Inbound message handling ([DING] pokes)
 
-New peer messages surface as `[DING] new st2 message: [id:<rand6>] <subject> (from <sender>); check
-your inbox` lines. Key only on the `[DING]` prefix and stable `[id:<rand6>]`; descriptive text is not
-an API. The id is the message filename's rand6 suffix and is stable across re-pokes of the same
-message. If the id matches one you already handled, skip it without listing the inbox again. Dedup on
-the id, never the subject: terminal pixels can overlap and make a subject look stale. For a new id,
-`st2 message ls` to find the filename, `st2 message read <filename>`, reply if warranted, then
-`st2 message archive <filename>` immediately. Set `busy` before executing the message's work.
+When a maintained provider attaches a `[DING] st2 inbox batch`, handle that FIFO prefix directly,
+then batch the existing reply/archive commands in one tool invocation. A short
+`[DING] ... [id:<rand6>]` without bodies is the generic fallback: run
+`st2 message delivery` once instead of listing and reading files one by one. The id is
+stable across re-pokes; dedup on it, never the subject. Set `busy` before executing message work.
 
 ## Threads stay on the bus
 
@@ -82,7 +81,8 @@ not add agents; surface the need to your supervisor.
 Bus ops:
 - `st2 message send <to> [-m <body>] [--subject S] [--in-reply-to F] [--tags T,T]`  *(no `--priority` yet)*
 - `st2 message reply <filename> -m <body> [--subject S]`
-- `st2 message ls [<identity>] [--archive] [--count | --json] [--from ID]`
+- `st2 message ls [<identity>] [--archive] [--count | --json [--include-body]] [--from ID]`
+- `st2 message delivery [<identity>]` (read-only bounded body-bearing FIFO view)
 - `st2 message read [<identity>] <filename> [--raw | --json] [--archive]`
 - `st2 message archive [<identity>] <filename>`
 - `st2 message thread [<identity>] <filename> [--tree]`

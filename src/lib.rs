@@ -20,6 +20,7 @@ pub mod expand;
 pub mod flapping;
 pub mod hooks;
 pub mod host_lock;
+pub mod inbox_delivery;
 pub mod isolate;
 pub mod materialize;
 pub mod message;

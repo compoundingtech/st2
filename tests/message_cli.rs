@@ -41,6 +41,30 @@ fn list(root: &Path, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn delivery_is_a_read_only_bounded_body_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("bob/inbox");
+    write_message(&inbox, 1_700_000_000_000, "aaaaaa", "alice");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "delivery", "bob", "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("st2.inbox-delivery.v1"));
+    assert!(text.contains("1700000000000-aaaaaa.md"));
+    assert!(text.contains(r#""body":"body\n""#));
+    assert!(inbox.join("1700000000000-aaaaaa.md").is_file());
+}
+
+#[test]
 fn since_is_strict_and_composes_with_other_list_filters() {
     let tmp = tempfile::tempdir().unwrap();
     let inbox = tmp.path().join("bob/inbox");

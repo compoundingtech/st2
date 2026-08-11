@@ -221,6 +221,7 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
             serde_json::from_slice::<serde_json::Value>(&claude_settings).unwrap(),
             vec![
                 "claude-session-start.sh",
+                "claude-user-prompt-submit.sh",
                 "claude-pre-compact.sh",
                 "claude-stop-failure.sh",
             ],

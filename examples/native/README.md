@@ -3,7 +3,8 @@
 These maintained, hand-authored declarations are the canonical starting points:
 
 - [`agent-claude.kdl`](agent-claude.kdl) uses Claude Code's rules loader and
-  native `SessionStart`, `PreCompact`, and `StopFailure` hooks.
+  native `SessionStart`, `UserPromptSubmit`, `PreCompact`, and `StopFailure` hooks. The prompt hook
+  attaches the bounded inbox view to the same inference as a generic DING.
 - [`agent-codex.kdl`](agent-codex.kdl) composes the persona and bus contract
   into `AGENTS.md` and uses Codex's native `SessionStart`, `PreCompact`, and
   `Stop` hooks.

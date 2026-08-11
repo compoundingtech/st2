@@ -10,7 +10,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use st2::context;
+use st2::{context, message};
 
 fn bash() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -30,6 +30,7 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     catalog: PathBuf,
     context: PathBuf,
+    inbox: PathBuf,
     bin: PathBuf,
     state: PathBuf,
 }
@@ -40,7 +41,9 @@ impl Fixture {
         let catalog = tmp.path().join("catalog");
         let agent = catalog.join("agents/Silber/cos");
         let context = context::context_dir(&agent);
+        let inbox = message::inbox_dir(&agent);
         fs::create_dir_all(&context).unwrap();
+        fs::create_dir_all(&inbox).unwrap();
         fs::write(
             agent.join("agent.kdl"),
             r#"agent "cos" {
@@ -61,6 +64,7 @@ impl Fixture {
             _tmp: tmp,
             catalog,
             context,
+            inbox,
             bin,
             state,
         }
@@ -103,6 +107,15 @@ fn session_start_delivers_context_on_the_supported_channel_and_never_on_stderr()
     }
     let fixture = Fixture::new();
     context::write_now(&fixture.context, "rehydration canary PELICAN-7742\n").unwrap();
+    let filename = message::send_to_inbox(
+        &fixture.inbox,
+        "Silber.worker",
+        Some("body-bearing canary"),
+        None,
+        &[],
+        "complete inbox body ORIOLE-9921",
+    )
+    .unwrap();
 
     let output = fixture.run("claude-session-start.sh");
 
@@ -126,6 +139,9 @@ fn session_start_delivers_context_on_the_supported_channel_and_never_on_stderr()
     assert!(additional.contains(r#"<context source="st2/context/now.md" agent="Silber.cos">"#));
     assert!(additional.contains("Run the st2 boot ritual"));
     assert!(additional.contains("set your status to busy"));
+    assert!(additional.contains("st2.inbox-delivery.v1"));
+    assert!(additional.contains(&filename));
+    assert!(additional.contains("complete inbox body ORIOLE-9921"));
 }
 
 #[test]
@@ -154,6 +170,40 @@ fn session_start_delivers_context_larger_than_the_platform_argument_limit() {
         additional.contains(&large_context),
         "the complete durable context must reach Claude without truncation"
     );
+}
+
+#[test]
+fn user_prompt_submit_attaches_unread_bodies_to_the_current_inference() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Claude hook");
+        return;
+    }
+    let fixture = Fixture::new();
+    let filename = message::send_to_inbox(
+        &fixture.inbox,
+        "Silber.worker",
+        Some("live DING"),
+        None,
+        &[],
+        "live body SWIFT-4182",
+    )
+    .unwrap();
+
+    let output = fixture.run("claude-user-prompt-submit.sh");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["hookSpecificOutput"]["hookEventName"],
+        "UserPromptSubmit"
+    );
+    let additional = json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(additional.contains("st2.inbox-delivery.v1"));
+    assert!(additional.contains(&filename));
+    assert!(additional.contains("live body SWIFT-4182"));
+    assert!(fixture.inbox.join(filename).is_file());
 }
 
 /// Missing durable state is an ordinary cold start: the ritual still has to reach the model, and the

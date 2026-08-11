@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, message, run, status};
+use crate::{inbox_delivery, message, run, status};
 
 pub const SUPPORTED_CODEX_CLI_VERSION: &str = "codex-cli 0.145.0";
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
@@ -151,7 +151,6 @@ struct CodexDeliveryConfig {
     agent_dir: PathBuf,
     inbox: PathBuf,
     identity: String,
-    this_host: String,
 }
 
 impl CodexDeliveryConfig {
@@ -169,7 +168,6 @@ impl CodexDeliveryConfig {
             inbox: message::inbox_dir(&agent_dir),
             agent_dir,
             identity: identity.to_string(),
-            this_host,
         })
     }
 }
@@ -246,7 +244,7 @@ struct CodexInboxDelivery {
     wake: Receiver<()>,
     _watcher: Option<notify::RecommendedWatcher>,
     next_refresh: Instant,
-    head: Option<message::Message>,
+    unread: Vec<message::Message>,
     suppressed: bool,
     state: Option<CodexDeliveryState>,
     pending: Option<PendingCodexDelivery>,
@@ -276,7 +274,7 @@ impl CodexInboxDelivery {
             wake,
             _watcher: watcher,
             next_refresh: Instant::now(),
-            head: None,
+            unread: Vec::new(),
             suppressed: false,
             state,
             pending: None,
@@ -320,7 +318,7 @@ impl CodexInboxDelivery {
         }) {
             self.rejected = None;
         }
-        self.head = unread.into_iter().next();
+        self.unread = unread;
         self.suppressed =
             status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
         self.next_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
@@ -340,7 +338,7 @@ impl CodexInboxDelivery {
             // must neither suppress nor acknowledge delivery to this thread.
             self.clear_state()?;
         }
-        let Some(head) = self.head.as_ref() else {
+        let Some(head) = self.unread.first() else {
             return Ok(None);
         };
         if self.rejected.as_ref().is_some_and(|rejected| {
@@ -365,12 +363,11 @@ impl CodexInboxDelivery {
         let client_id =
             stable_client_user_message_id(&self.config.identity, state.thread_id(), &head.filename);
         let filename = head.filename.clone();
-        let text = ding::poke_text(
-            &self.config.catalog_root,
-            &self.config.this_host,
-            &self.config.identity,
-            head,
-        );
+        // Temporary adapter seam: issue #162 can transplant this provider consumer while retaining
+        // the provider-neutral bounded payload contract in `inbox_delivery`.
+        let text = inbox_delivery::render(&self.unread)
+            .context("rendering maintained-provider inbox delivery")?
+            .text;
         let request =
             codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
         self.write_state(CodexDeliveryState::attempted(
@@ -1738,7 +1735,6 @@ mod tests {
             inbox: message::inbox_dir(&agent_dir),
             agent_dir,
             identity: "h.worker".into(),
-            this_host: "h".into(),
         }
     }
 
@@ -1924,6 +1920,95 @@ mod tests {
         );
         assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
         assert!(config.inbox.join(&filename).is_file());
+    }
+
+    #[test]
+    fn archiving_a_delivered_batch_releases_overflow_and_post_batch_arrivals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        for index in 0..=inbox_delivery::MAX_DELIVERY_MESSAGES {
+            message::send_to_inbox(
+                &config.inbox,
+                "h.sender",
+                Some(&format!("burst {index}")),
+                None,
+                &[],
+                &format!("body {index}"),
+            )
+            .unwrap();
+        }
+        let ordered = message::list_inbox(&config.inbox).unwrap();
+        let first_batch = ordered[..inbox_delivery::MAX_DELIVERY_MESSAGES]
+            .iter()
+            .map(|message| message.filename.clone())
+            .collect::<Vec<_>>();
+        let overflow = ordered[inbox_delivery::MAX_DELIVERY_MESSAGES]
+            .filename
+            .clone();
+
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
+        let mut idle = CodexControlState::new(&delivery.runtime, "thread-main".into());
+        idle.subscribed = true;
+        idle.observed = CodexObservedState::Idle;
+        let request = delivery.maybe_request(&idle).unwrap().unwrap();
+        let text = request["params"]["input"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&first_batch[0]));
+        assert!(text.contains(first_batch.last().unwrap()));
+        assert!(!text.contains(&overflow));
+
+        assert!(
+            delivery
+                .accept_response(
+                    &json!({ "id": request["id"], "result": { "turn": { "id": "turn-batch" } } }),
+                    idle.observed(),
+                )
+                .unwrap()
+        );
+        let client_id = request["params"]["clientUserMessageId"].as_str().unwrap();
+        assert!(
+            delivery
+                .accept_typed_receipt(
+                    &json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-batch",
+                            "item": { "type": "userMessage", "clientId": client_id }
+                        }
+                    }),
+                    &idle,
+                )
+                .unwrap()
+        );
+
+        for filename in &first_batch {
+            message::archive_msg(
+                &config.inbox,
+                &message::archive_dir(&config.agent_dir),
+                filename,
+            )
+            .unwrap();
+        }
+        let post_batch = message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("post batch"),
+            None,
+            &[],
+            "post batch body",
+        )
+        .unwrap();
+
+        delivery.next_refresh = Instant::now();
+        let next = delivery.maybe_request(&idle).unwrap().unwrap();
+        let next_text = next["params"]["input"][0]["text"].as_str().unwrap();
+        assert!(next_text.contains(&overflow));
+        assert!(next_text.contains(&post_batch));
+        assert!(
+            first_batch
+                .iter()
+                .all(|filename| !next_text.contains(filename))
+        );
     }
 
     #[test]
@@ -2174,16 +2259,11 @@ mod tests {
             assert_eq!(delivery["id"], FIRST_DELIVERY_REQUEST_ID);
             assert_eq!(delivery["method"], "turn/start");
             assert_eq!(delivery["params"]["threadId"], "thread-main");
-            assert_eq!(
-                delivery["params"]["input"][0]["text"],
-                "[DING] ? h.sender: wired [id:".to_owned()
-                    + server_filename
-                        .trim_end_matches(".md")
-                        .rsplit_once('-')
-                        .unwrap()
-                        .1
-                    + "]"
-            );
+            let text = delivery["params"]["input"][0]["text"].as_str().unwrap();
+            assert!(text.contains("st2.inbox-delivery.v1"));
+            assert!(text.contains(&server_filename));
+            let payload: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+            assert_eq!(payload["messages"][0]["body"], "body\n");
             assert!(
                 delivery["params"]["clientUserMessageId"]
                     .as_str()
