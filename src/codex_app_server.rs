@@ -908,8 +908,9 @@ pub fn run_controlled(
         .mode(0o600)
         .open(state_dir.join("app-server.log"))?;
     let endpoint = format!("unix://{}", socket_path.display());
+    let server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
     let mut server = Command::new(&codex_argv[0])
-        .args(["app-server", "--listen", &endpoint])
+        .args(server_args)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -984,6 +985,73 @@ fn run_connected(
     result
 }
 
+/// Start app-server with the authored global configuration inputs that its CLI supports.
+///
+/// Project trust, strict parsing, and feature selection affect config and hook loading in the
+/// server process. Passing them only to the remote TUI silently creates two different effective
+/// configurations. TUI-only policy, model, workspace, authentication, and prompt arguments stay
+/// on the TUI command.
+fn controlled_app_server_args(endpoint: &str, authored_args: &[String]) -> Result<Vec<String>> {
+    let boundary = interactive_root_prefix_end(authored_args)?;
+    let mut args = vec!["app-server".to_string()];
+    let mut index = 0;
+    while index < boundary {
+        let argument = authored_args[index].as_str();
+        if matches!(argument, "-c" | "--config" | "--enable" | "--disable") {
+            args.push(argument.to_string());
+            args.push(authored_args[index + 1].clone());
+            index += 2;
+            continue;
+        }
+        if argument == "--strict-config"
+            || argument.starts_with("--config=")
+            || argument.starts_with("--enable=")
+            || argument.starts_with("--disable=")
+            || (argument.starts_with("-c") && argument.len() > 2)
+        {
+            args.push(argument.to_string());
+            index += 1;
+            continue;
+        }
+        if matches!(
+            argument,
+            "--oss"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+                | "--search"
+                | "--no-alt-screen"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(argument, "-i" | "--image")
+            || argument.starts_with("-i=")
+            || argument.starts_with("--image=")
+        {
+            break;
+        }
+        let exact_value_option = matches!(
+            argument,
+            "--remote-auth-token-env"
+                | "-m"
+                | "--model"
+                | "--local-provider"
+                | "-p"
+                | "--profile"
+                | "-s"
+                | "--sandbox"
+                | "-C"
+                | "--cd"
+                | "--add-dir"
+                | "-a"
+                | "--ask-for-approval"
+        );
+        index += if exact_value_option { 2 } else { 1 };
+    }
+    args.extend(["--listen".to_string(), endpoint.to_string()]);
+    Ok(args)
+}
+
 fn controlled_tui_args(
     endpoint: &str,
     authored_args: &[String],
@@ -1030,19 +1098,27 @@ fn expected_resume_thread<'a>(
 /// prompt into a session selector. `--image` is variadic, so automatic resume requires an explicit
 /// `--` boundary when that option is present.
 fn resume_insertion_index(authored_args: &[String]) -> Result<Option<usize>> {
+    let insertion = interactive_root_prefix_end(authored_args)?;
+    if authored_args
+        .get(insertion)
+        .is_some_and(|argument| matches!(argument.as_str(), "resume" | "fork"))
+    {
+        Ok(None)
+    } else {
+        Ok(Some(insertion))
+    }
+}
+
+fn interactive_root_prefix_end(authored_args: &[String]) -> Result<usize> {
     let delimiter = authored_args.iter().position(|arg| arg == "--");
     let mut index = 0;
     while index < authored_args.len() {
         let argument = authored_args[index].as_str();
         if argument == "--" {
-            return Ok(Some(index));
+            return Ok(index);
         }
         if !argument.starts_with('-') || argument == "-" {
-            return if matches!(argument, "resume" | "fork") {
-                Ok(None)
-            } else {
-                Ok(Some(index))
-            };
+            return Ok(index);
         }
 
         if matches!(
@@ -1096,7 +1172,7 @@ fn resume_insertion_index(authored_args: &[String]) -> Result<Option<usize>> {
             let boundary = delimiter.context(
                 "automatic Codex resume with variadic --image requires an explicit `--` prompt boundary",
             )?;
-            return Ok(Some(boundary));
+            return Ok(boundary);
         }
 
         let long_value = [
@@ -1123,7 +1199,7 @@ fn resume_insertion_index(authored_args: &[String]) -> Result<Option<usize>> {
         );
         index += 1;
     }
-    Ok(Some(authored_args.len()))
+    Ok(authored_args.len())
 }
 
 fn connect_control(
@@ -2976,6 +3052,70 @@ mod tests {
         assert!(matches!(acceptance, SubscriptionAcceptance::Deferred));
         assert!(!state.subscribed());
         assert_eq!(state.observed(), &CodexObservedState::AwaitingStatus);
+    }
+
+    #[test]
+    fn app_server_receives_only_its_supported_global_configuration() {
+        let authored = vec![
+            "-c".into(),
+            "projects={\"/workspace\"={trust_level=\"trusted\"}}".into(),
+            "--model".into(),
+            "gpt-test".into(),
+            "--enable".into(),
+            "one".into(),
+            "--disable=two".into(),
+            "--strict-config".into(),
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "--dangerously-bypass-hook-trust".into(),
+            "boot".into(),
+        ];
+
+        assert_eq!(
+            controlled_app_server_args("unix:///server.sock", &authored).unwrap(),
+            [
+                "app-server",
+                "-c",
+                "projects={\"/workspace\"={trust_level=\"trusted\"}}",
+                "--enable",
+                "one",
+                "--disable=two",
+                "--strict-config",
+                "--listen",
+                "unix:///server.sock",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_configuration_extraction_fails_closed_at_ambiguous_boundaries() {
+        let missing =
+            controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
+        assert!(missing.to_string().contains("has no value"));
+
+        let unknown = controlled_app_server_args(
+            "unix:///server.sock",
+            &["--future-option".into(), "value".into(), "boot".into()],
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("unknown Codex option"));
+
+        assert_eq!(
+            controlled_app_server_args(
+                "unix:///server.sock",
+                &[
+                    "--config=projects.x.trust_level=\"trusted\"".into(),
+                    "resume".into(),
+                    "thread-explicit".into(),
+                ],
+            )
+            .unwrap(),
+            [
+                "app-server",
+                "--config=projects.x.trust_level=\"trusted\"",
+                "--listen",
+                "unix:///server.sock",
+            ]
+        );
     }
 
     #[test]
