@@ -28,7 +28,7 @@ use tungstenite::{Message as WebSocketMessage, WebSocket};
 
 use crate::{ding, message, run, status};
 
-pub const SUPPORTED_CODEX_CLI_VERSION: &str = "codex-cli 0.145.0";
+pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &["codex-cli 0.145.0", "codex-cli 0.146.0"];
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
@@ -1020,7 +1020,7 @@ fn expected_resume_thread<'a>(
         .then_some(thread_id))
 }
 
-/// Find where a pinned Codex 0.145.0 interactive argv begins its prompt or subcommand.
+/// Find where a supported Codex interactive argv begins its prompt or subcommand.
 ///
 /// Automatic resume must insert `resume <thread>` after global options and before the authored
 /// prompt. Unknown options fail closed because guessing can turn an option value into a prompt or a
@@ -1467,8 +1467,9 @@ fn ensure_supported_version(codex: &str) -> Result<()> {
         .trim()
         .to_string();
     anyhow::ensure!(
-        actual == SUPPORTED_CODEX_CLI_VERSION,
-        "unsupported Codex app-server protocol version '{actual}' (expected '{SUPPORTED_CODEX_CLI_VERSION}')"
+        SUPPORTED_CODEX_CLI_VERSIONS.contains(&actual.as_str()),
+        "unsupported Codex app-server protocol version '{actual}' (expected one of: {})",
+        SUPPORTED_CODEX_CLI_VERSIONS.join(", ")
     );
     Ok(())
 }
@@ -1729,7 +1730,37 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn protocol_version_gate_accepts_only_the_exact_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write_version = |name: &str, version: &str| {
+            let path = tmp.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        for (name, version) in [
+            ("codex-0145", "codex-cli 0.145.0"),
+            ("codex-0146", "codex-cli 0.146.0"),
+        ] {
+            ensure_supported_version(write_version(name, version).to_str().unwrap()).unwrap();
+        }
+        let error = ensure_supported_version(
+            write_version("codex-0147", "codex-cli 0.147.0")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("codex-cli 0.147.0"));
+        assert!(
+            error
+                .to_string()
+                .contains("codex-cli 0.145.0, codex-cli 0.146.0")
+        );
+    }
 
     fn delivery_config(root: &Path) -> CodexDeliveryConfig {
         let agent_dir = root.join("agents/h/worker");
