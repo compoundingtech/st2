@@ -48,7 +48,11 @@ active turn ID. Only the turn lifecycle supplies that ID.
 
 ### Delivery state machine
 
-The adapter applies this rule to the bound thread and the FIFO inbox head:
+The adapter applies this rule to the bound thread and a bounded body-bearing
+FIFO inbox view. The view contains the largest complete prefix that fits 16
+messages and 16 KiB. It never truncates a body. If the head does not fit, the
+view identifies that message without its body, and all later messages remain
+unread behind it.
 
 | Observed state | Request | Result |
 | --- | --- | --- |
@@ -58,8 +62,10 @@ The adapter applies this rule to the bound thread and the FIFO inbox head:
 | No active turn ID, conflicting events, or stale ID | None | Reconcile state and hold |
 
 Every `turn/start` and `turn/steer` request includes a stable
-`clientUserMessageId` derived from the recipient, thread binding, and message
-filename. The adapter sends no turn-level overrides with `turn/steer`.
+`clientUserMessageId` derived from the recipient, thread binding, and FIFO head
+filename. The identifier controls duplicate transport for the delivered view;
+it does not settle any included message. The adapter sends no turn-level
+overrides with `turn/steer`.
 
 `turn/steer` must use the exact ID from the latest unmatched `turn/started`
 event. A `turn/completed` event clears that ID. A steering error for no active
@@ -95,19 +101,20 @@ user-message history before it sends that client ID again.
 
 The app server does not promise duplicate rejection for
 `clientUserMessageId`. st2 therefore owns duplicate control. It persists one
-accepted receipt for the message and runtime binding. Watcher events, poll
-events, reconnects, and supervisor restarts consult that receipt before they
-send. Archive precedence removes obsolete receipt state.
+accepted receipt for the FIFO head that identifies the delivered view and its
+runtime binding. Watcher events, poll events, reconnects, and supervisor
+restarts consult that receipt before they send. Archive precedence removes
+obsolete receipt state.
 
 ### Durable inbox and shutdown
 
 The selected catalog inbox remains authoritative. Native delivery does not
-archive or delete the message. The agent reads and archives it through normal
-message commands.
+archive or delete any included message. The agent handles and archives each
+message through normal message commands.
 
 Before each attempt, the adapter runs the normal message sweep. An archive
-record with the same filename wins. A held, rejected, disconnected, unknown,
-or ambiguous attempt leaves the message unread and retryable.
+record for the identifying FIFO head wins. A held, rejected, disconnected,
+unknown, or ambiguous attempt leaves every message unread and retryable.
 
 Control transport close is a normal adapter stop. The adapter sends nothing
 after close. A restarted adapter must restore the exact thread binding and
