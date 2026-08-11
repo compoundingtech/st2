@@ -25,6 +25,14 @@ socket. It opens and initializes its control connection before it starts the
 Codex TUI with `codex --remote unix://PATH`. The control client must be able to
 observe `thread/started` before the TUI can create a new thread.
 
+The app server and remote TUI must load one effective authored configuration.
+st2 forwards the app-server-supported global `config`, `enable`, `disable`, and
+`strict-config` arguments to the server. It keeps TUI-only model, policy,
+workspace, authentication, and prompt arguments on the TUI command. In
+particular, an authored project-trust override must reach the server that loads
+project-local config and hooks; forwarding it only to the TUI is a delivery
+configuration error.
+
 For a new session, st2 records the thread ID from `thread/started`. For a
 resumed session, st2 loads the recorded thread ID and calls `thread/resume`
 before it permits delivery. It does not infer ownership from `thread/list`, a
