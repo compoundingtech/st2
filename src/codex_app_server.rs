@@ -42,6 +42,8 @@ const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
+// The inner provider result must reach the wrapper before the outer ownership wait expires.
+const TUI_LOADED_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
@@ -1060,12 +1062,20 @@ fn run_connected(
         (None, None)
     };
     let event_thread = thread::spawn(move || {
+        let resume = expected_resume
+            .as_deref()
+            .zip(resume_ready_rx)
+            .map(|(thread_id, ready)| ControlResume {
+                thread_id,
+                ready,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+            });
         pump_control(
             websocket,
             &binding_path,
             &control_state_path,
             &runtime_for_reader,
-            expected_resume.as_deref().zip(resume_ready_rx),
+            resume,
             Some(delivery),
             events_tx,
         )
@@ -1505,19 +1515,29 @@ enum ControlEvent {
     Failed(String),
 }
 
+struct ControlResume<'a> {
+    thread_id: &'a str,
+    ready: Receiver<()>,
+    tui_loaded_timeout: Duration,
+}
+
 fn pump_control(
     mut websocket: WebSocket<UnixStream>,
     binding_path: &Path,
     control_state_path: &Path,
     runtime: &CodexRuntime,
-    resume: Option<(&str, Receiver<()>)>,
+    resume: Option<ControlResume<'_>>,
     delivery: Option<CodexDeliveryConfig>,
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
-        let (expected_resume, resume_ready) = match resume {
-            Some((thread_id, ready)) => (Some(thread_id), Some(ready)),
-            None => (None, None),
+        let (expected_resume, resume_ready, tui_loaded_timeout) = match resume {
+            Some(resume) => (
+                Some(resume.thread_id),
+                Some(resume.ready),
+                resume.tui_loaded_timeout,
+            ),
+            None => (None, None, TUI_LOADED_TIMEOUT),
         };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
@@ -1533,7 +1553,7 @@ fn pump_control(
                 .context("saved Codex binding has no TUI-start gate")?
                 .recv()
                 .context("controlled Codex TUI ended before control resume")?;
-            wait_for_tui_loaded_thread(&mut websocket, thread_id, STARTUP_TIMEOUT)?;
+            wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)?;
             let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
             events
                 .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
@@ -2096,6 +2116,11 @@ mod tests {
                 .to_string()
                 .contains("codex-cli 0.145.0, codex-cli 0.146.0")
         );
+    }
+
+    #[test]
+    fn tui_loaded_deadline_precedes_the_outer_binding_deadline() {
+        assert!(TUI_LOADED_TIMEOUT < STARTUP_TIMEOUT);
     }
 
     fn delivery_config(root: &Path) -> CodexDeliveryConfig {
@@ -2747,7 +2772,11 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
-                Some(("thread-main", resume_ready_rx)),
+                Some(ControlResume {
+                    thread_id: "thread-main",
+                    ready: resume_ready_rx,
+                    tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                }),
                 Some(config),
                 tx,
             )
@@ -2983,7 +3012,11 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
-                Some(("thread-prior", resume_ready_rx)),
+                Some(ControlResume {
+                    thread_id: "thread-prior",
+                    ready: resume_ready_rx,
+                    tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                }),
                 None,
                 tx,
             )
@@ -3010,6 +3043,79 @@ mod tests {
             .unwrap();
         assert!(state.subscribed());
         assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
+
+    #[test]
+    fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": [] }
+                }),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream).unwrap();
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_path,
+                &control_state_path,
+                &runtime,
+                Some(ControlResume {
+                    thread_id: "thread-prior",
+                    ready: resume_ready_rx,
+                    tui_loaded_timeout: Duration::from_millis(50),
+                }),
+                None,
+                tx,
+            )
+        });
+        resume_ready_tx.send(()).unwrap();
+        let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("inner TUI-loaded deadline did not report its specific failure");
+        };
+        assert!(
+            error.contains(
+                "controlled Codex TUI did not load preserved thread thread-prior before control resume"
+            ),
+            "unexpected control failure: {error}"
+        );
+
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -3080,7 +3186,11 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
-                Some(("thread-prior", resume_ready_rx)),
+                Some(ControlResume {
+                    thread_id: "thread-prior",
+                    ready: resume_ready_rx,
+                    tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                }),
                 None,
                 tx,
             )
