@@ -34,10 +34,14 @@ project-local config and hooks; forwarding it only to the TUI is a delivery
 configuration error.
 
 For a new session, st2 records the thread ID from `thread/started`. For a
-resumed session, st2 loads the recorded thread ID and calls `thread/resume`
-before it permits delivery. It does not infer ownership from `thread/list`, a
-working directory, a process, or a PTY. Those surfaces do not identify which
-TUI owns a thread.
+resumed session, st2 starts the TUI with the recorded thread ID. Its initialized
+control client then calls `thread/resume` for that exact ID and binds the new
+runtime incarnation only from the successful response. It must not wait for a
+new `thread/started` notification or an unchanged status notification on the
+control connection. A resume error or a different returned thread ID leaves
+the prior binding non-current and every message unread. st2 does not infer
+ownership from `thread/list`, a working directory, a process, or a PTY. Those
+surfaces do not identify which TUI owns a thread.
 
 The thread binding is persistent runtime state. It includes the exact agent
 runtime incarnation that owns it. st2 rejects a binding from a prior
