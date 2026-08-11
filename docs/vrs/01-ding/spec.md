@@ -21,6 +21,14 @@ Delivery is opt-in. An agent declaration selects one transport:
 | `deliver "app-server"` | Codex native app-server transport |
 | Neither node | No delivery |
 
+The selector table defines the transport contract, not current implementation
+parity. Current st2 implements the Codex app-server adapter. It does not
+implement the production Claude MCP adapter. The parser accepts `deliver
+"mcp"`, leaves the authored Claude launch unchanged, and derives no legacy
+`ding` sidecar. A Claude agent that selects it therefore receives no DING. Do
+not deploy that selector until the production adapter exists. The Claude
+channel specification and standalone probe are not that adapter.
+
 `ding` and `deliver` are mutually exclusive. More than one `deliver` node is
 invalid. Any other `deliver` value is invalid. st2 does not infer a transport
 from the agent command because command arguments are opaque.
