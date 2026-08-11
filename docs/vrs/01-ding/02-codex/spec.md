@@ -133,6 +133,14 @@ Control transport close is a normal adapter stop. The adapter sends nothing
 after close. A restarted adapter must restore the exact thread binding and
 duplicate-control state before it attempts delivery.
 
+The wrapper must keep a diagnostic trace for its current run. It creates the
+trace only after it holds the exclusive runtime-owner lock. The trace records
+startup stages and the full terminal error chain. It must not record authored
+argument values, prompts, or message bodies. The next exclusive owner
+truncates the file before it starts, so the trace has a fixed one-run retention
+bound. A failed launch must leave enough trace data to distinguish
+server-socket setup from TUI thread binding.
+
 ### Post-settlement observability
 
 Version 1 is not a delivery audit log. Its accepted delivery state exists to
