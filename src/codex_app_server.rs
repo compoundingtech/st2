@@ -2,10 +2,11 @@
 //!
 //! Native delivery cannot infer a thread from cwd, process, PTY, or `thread/list`. This module
 //! starts a dedicated provider daemon, initializes an observer connection before the interactive
-//! client starts, and binds a typed start or successful-resume event to the exact wrapper process
-//! incarnation that owns the PTY launch. Its control watcher persists delivery-relevant thread and
-//! turn state. The native delivery layer selects one durable FIFO inbox head and submits typed
-//! input only when that state proves an idle or one exact regular active turn.
+//! client starts, and binds a typed start notification or successful resume response to the exact
+//! wrapper process incarnation that owns the PTY launch. Its control watcher persists
+//! delivery-relevant thread and turn state. The native delivery layer selects one durable FIFO
+//! inbox head and submits typed input only when that state proves an idle or one exact regular
+//! active turn.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
@@ -1050,31 +1051,53 @@ fn run_connected(
     let binding_path = state_dir.join("binding.json");
     let control_state_path = state_dir.join("control-state.json");
     let runtime_for_reader = runtime.clone();
+    let (mut resume_ready_tx, resume_ready_rx) = if expected_resume.is_some() {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let event_thread = thread::spawn(move || {
         pump_control(
             websocket,
             &binding_path,
             &control_state_path,
             &runtime_for_reader,
-            expected_resume.as_deref(),
+            expected_resume.as_deref().zip(resume_ready_rx),
             Some(delivery),
             events_tx,
         )
     });
 
-    // The initialized observer is already reading before this child can issue thread/start or
-    // thread/resume. Insert the remote endpoint as a global Codex option and preserve every authored
-    // argument after the provider executable.
+    // A fresh initialized observer reads before this child can issue thread/start. A resumed
+    // observer waits on the gate below: app-server does not promise a new start or unchanged-status
+    // notification on resume, so the control client sends its own resume only after the TUI exists.
+    // Insert the remote endpoint as a global Codex option and preserve every authored argument
+    // after the provider executable.
     let mut tui_command = Command::new(&codex_argv[0]);
     tui_command.args(tui_args);
-    let mut tui = tui_command
+    let mut tui = match tui_command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("starting controlled {} TUI", codex_argv[0]))?;
+    {
+        Ok(tui) => tui,
+        Err(error) => {
+            drop(resume_ready_tx);
+            let _ = shutdown.shutdown(Shutdown::Both);
+            let _ = event_thread.join();
+            return Err(error)
+                .with_context(|| format!("starting controlled {} TUI", codex_argv[0]));
+        }
+    };
     let result = (|| -> Result<()> {
         diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
+        if let Some(ready) = resume_ready_tx.take() {
+            ready
+                .send(())
+                .context("starting Codex control resume after the TUI launched")?;
+        }
         diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
         wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT).and_then(|_| {
             diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
@@ -1084,6 +1107,7 @@ fn run_connected(
     if result.is_err() {
         terminate_child(&mut tui);
     }
+    drop(resume_ready_tx);
     let _ = shutdown.shutdown(Shutdown::Both);
     let _ = event_thread.join();
     result
@@ -1413,11 +1437,15 @@ fn pump_control(
     binding_path: &Path,
     control_state_path: &Path,
     runtime: &CodexRuntime,
-    expected_resume: Option<&str>,
+    resume: Option<(&str, Receiver<()>)>,
     delivery: Option<CodexDeliveryConfig>,
     events: Sender<ControlEvent>,
 ) {
     let result = (|| -> Result<()> {
+        let (expected_resume, resume_ready) = match resume {
+            Some((thread_id, ready)) => (Some(thread_id), Some(ready)),
+            None => (None, None),
+        };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let delivery_state_path = control_state_path.with_file_name("delivery-state.json");
@@ -1426,6 +1454,21 @@ fn pump_control(
                 CodexInboxDelivery::new(config, delivery_state_path.clone(), runtime.clone())
             })
             .transpose()?;
+        if let Some(thread_id) = expected_resume {
+            resume_ready
+                .context("saved Codex binding has no TUI-start gate")?
+                .recv()
+                .context("controlled Codex TUI ended before control resume")?;
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/resume",
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "params": { "threadId": thread_id }
+                }),
+            )?;
+            subscription_pending = true;
+        }
         websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
         loop {
             let message = match poll_json_message(&mut websocket)? {
@@ -1445,30 +1488,53 @@ fn pump_control(
                 continue;
             };
             if control_state.is_none() {
-                let Some(thread_id) = binding_candidate(&message, expected_resume)? else {
-                    continue;
-                };
-                {
+                if let Some(thread_id) = expected_resume {
+                    if message.get("method").is_some()
+                        || message.get("id") != Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
+                    {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        subscription_pending,
+                        "Codex control received an unexpected initial thread/resume response"
+                    );
+                    subscription_pending = false;
+                    let mut bound = CodexControlState::new(runtime, thread_id.to_string());
+                    match bound.accept_subscription(&message)? {
+                        SubscriptionAcceptance::Accepted { .. } => {
+                            if let Some(delivery) = delivery.as_mut() {
+                                delivery.reconcile_resume(&message, &bound)?;
+                            }
+                        }
+                        SubscriptionAcceptance::Deferred => anyhow::bail!(
+                            "saved Codex resume binding has no persisted rollout for thread {thread_id}"
+                        ),
+                    }
                     atomic_json(
                         binding_path,
                         &CodexThreadBinding::new(runtime, thread_id.to_string()),
                     )?;
-                    let mut bound = CodexControlState::new(runtime, thread_id.to_string());
-                    // A fresh control client that observes the owning TUI's `thread/started`
-                    // notification already receives that thread's broadcasts. Before its first
-                    // turn there is no rollout for `thread/resume` to load. Saved bindings still
-                    // require resume so their typed history can be reconciled before delivery.
-                    bound.subscribed = expected_resume.is_none()
-                        && message.get("method").and_then(Value::as_str) == Some("thread/started");
+                    atomic_json(control_state_path, &bound)?;
                     control_state = Some(bound);
-                    atomic_json(
-                        control_state_path,
-                        control_state
-                            .as_ref()
-                            .context("Codex control state is unbound")?,
-                    )?;
                     let _ = events.send(ControlEvent::Bound);
+                    continue;
                 }
+
+                let Some(thread_id) = binding_candidate(&message)? else {
+                    continue;
+                };
+                atomic_json(
+                    binding_path,
+                    &CodexThreadBinding::new(runtime, thread_id.to_string()),
+                )?;
+                let mut bound = CodexControlState::new(runtime, thread_id.to_string());
+                // A fresh control client that observes the owning TUI's `thread/started`
+                // notification is already subscribed to that thread's broadcasts. Before its
+                // first turn there is no persisted rollout for a redundant `thread/resume`.
+                bound.subscribed = true;
+                atomic_json(control_state_path, &bound)?;
+                control_state = Some(bound);
+                let _ = events.send(ControlEvent::Bound);
             }
 
             let state = control_state
@@ -1557,24 +1623,11 @@ fn subscription_candidate(message: &Value, thread_id: &str) -> bool {
     }
 }
 
-fn binding_candidate<'a>(
-    message: &'a Value,
-    expected_resume: Option<&str>,
-) -> Result<Option<&'a str>> {
+fn binding_candidate(message: &Value) -> Result<Option<&str>> {
     match message.get("method").and_then(Value::as_str) {
         Some("thread/started") => {
             let thread_id = required_string(message, "/params/thread/id", "thread/started")?;
-            Ok(expected_resume
-                .is_none_or(|expected| expected == thread_id)
-                .then_some(thread_id))
-        }
-        Some("thread/status/changed") if expected_resume.is_some() => {
-            let thread_id = required_string(message, "/params/threadId", "thread/status/changed")?;
-            let status = required_string(message, "/params/status/type", "thread/status/changed")?;
-            Ok(
-                (Some(thread_id) == expected_resume && matches!(status, "idle" | "active"))
-                    .then_some(thread_id),
-            )
+            Ok(Some(thread_id))
         }
         _ => Ok(None),
     }
@@ -2537,22 +2590,6 @@ mod tests {
                 read_json_message(&mut websocket).unwrap().unwrap()["method"],
                 "initialized"
             );
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "method": "thread/started",
-                    "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
-                }),
-            )
-            .unwrap();
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "method": "thread/status/changed",
-                    "params": { "threadId": "thread-main", "status": { "type": "idle" } }
-                }),
-            )
-            .unwrap();
             let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(subscribe["method"], "thread/resume");
             write_json_message(
@@ -2590,6 +2627,8 @@ mod tests {
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let (tx, rx) = mpsc::channel();
+        let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+        resume_ready_tx.send(()).unwrap();
         let runtime_for_pump = runtime.clone();
         let binding_for_pump = binding_path.clone();
         let control_state_for_pump = control_state_path.clone();
@@ -2599,7 +2638,7 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
-                Some("thread-main"),
+                Some(("thread-main", resume_ready_rx)),
                 Some(config),
                 tx,
             )
@@ -2731,12 +2770,16 @@ mod tests {
     }
 
     #[test]
-    fn a_successfully_loaded_expected_resume_is_bound_to_the_new_incarnation() {
+    fn expected_resume_waits_for_tui_gate_and_binds_from_control_response() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        let (pre_gate_checked_tx, pre_gate_checked_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
             let mut websocket = tungstenite::accept(stream).unwrap();
             let initialize = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(initialize["method"], "initialize");
@@ -2747,6 +2790,11 @@ mod tests {
             .unwrap();
             let initialized = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(initialized["method"], "initialized");
+            assert!(matches!(
+                poll_json_message(&mut websocket).unwrap(),
+                ControlRead::Timeout
+            ));
+            pre_gate_checked_tx.send(()).unwrap();
             write_json_message(
                 &mut websocket,
                 &json!({
@@ -2764,17 +2812,6 @@ mod tests {
                     "params": {
                         "threadId": "thread-unrelated",
                         "status": { "type": "active", "activeFlags": [] }
-                    }
-                }),
-            )
-            .unwrap();
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "method": "thread/status/changed",
-                    "params": {
-                        "threadId": "thread-prior",
-                        "status": { "type": "idle" }
                     }
                 }),
             )
@@ -2801,6 +2838,7 @@ mod tests {
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let (tx, rx) = mpsc::channel();
+        let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
         let runtime_for_pump = runtime.clone();
         let binding_for_pump = binding_path.clone();
         let control_state_for_pump = control_state_path.clone();
@@ -2810,11 +2848,15 @@ mod tests {
                 &binding_for_pump,
                 &control_state_for_pump,
                 &runtime_for_pump,
-                Some("thread-prior"),
+                Some(("thread-prior", resume_ready_rx)),
                 None,
                 tx,
             )
         });
+        pre_gate_checked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        resume_ready_tx.send(()).unwrap();
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             ControlEvent::Bound
@@ -2832,6 +2874,86 @@ mod tests {
             .unwrap();
         assert!(state.subscribed());
         assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
+
+    #[test]
+    fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let prior_binding = CodexThreadBinding::new(&prior_runtime, "thread-prior".into());
+        atomic_json(&binding_path, &prior_binding).unwrap();
+
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            let resume = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(resume["method"], "thread/resume");
+            assert_eq!(resume["params"]["threadId"], "thread-prior");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "error": {
+                        "code": -32600,
+                        "message": "no rollout found for thread id thread-prior"
+                    }
+                }),
+            )
+            .unwrap();
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream).unwrap();
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+        let runtime_for_pump = runtime.clone();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime_for_pump,
+                Some(("thread-prior", resume_ready_rx)),
+                None,
+                tx,
+            )
+        });
+        resume_ready_tx.send(()).unwrap();
+        let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("missing saved rollout did not fail closed");
+        };
+        assert!(error.contains("saved Codex resume binding has no persisted rollout"));
+
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap())
+                .unwrap(),
+            prior_binding
+        );
+        assert!(!control_state_path.exists());
     }
 
     #[test]
