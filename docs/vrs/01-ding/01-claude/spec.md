@@ -6,8 +6,10 @@ selection and durability rules in [`../spec.md`](../spec.md).
 
 ## Status
 
-Active. Native production acceptance is blocked until provider or organization
-policy supplies a non-interactive channel enrollment for this integration.
+Active. Live Claude Code 2.1.226 and 2.1.227 observations prove idle wake,
+active-turn delivery, and queued delivery through a directly declared MCP
+server. The maintained private-fleet path uses one bounded provider confirmation
+when the Claude process starts. It does not classify the screen for each DING.
 
 ## Native MCP transport
 
@@ -18,24 +20,45 @@ legacy `ding` sidecar.
 
 ### Provider enablement
 
-The launched Claude session must enable the MCP server as a channel source.
-An MCP connection alone is not sufficient. Claude can connect to a server,
-list its tools, and still discard every channel notification when the server
-is not enabled as a channel.
+The launched Claude session must enable the MCP server as a channel source. An
+MCP connection alone is not sufficient. Claude can connect to a server, list
+its tools, and still discard every channel notification when the server is not
+enabled as a channel.
 
-The server advertises the `experimental.claude/channel` capability. The st2
-launch configuration must select that server as a channel. The MCP wire does
-not return a channel-acceptance receipt to the server, so the adapter must not
-claim that it detects provider acceptance at runtime. The provider evidence
-below proves that the maintained launch configuration accepts the channel.
+The server advertises the `experimental.claude/channel` capability. During the
+provider's research preview, the maintained direct-server launch uses this
+selector:
 
-The maintained launch path must use a provider-approved channel enrollment.
-The provider's development-only channel override is observation and test
-equipment. It is not production acceptance.
+```text
+--dangerously-load-development-channels server:<server-name>
+```
 
-The bounded packaging and policy path is in
-[`packaging.md`](./packaging.md). That document does not authorize building the
-plugin.
+`--channels server:<server-name>` is not sufficient for a directly declared
+server. Claude can connect that server and then reject its notifications because
+the server is not on the approved channel allowlist.
+
+The development selector presents one confirmation when each Claude process
+starts. st2 owns the startup PTY. It may confirm only the exact development
+channel warning that names the expected server selector. An unrelated prompt,
+a different selector, or an untrusted workspace blocks startup and receives no
+input. This bounded startup action is not the legacy per-message DING screen
+classifier.
+
+If an organization deploys managed settings, that policy must permit channels
+with `channelsEnabled: true`. A deployment with no managed policy does not need
+to create a managed settings file: live Claude Code 2.1.226 accepted the direct
+development selector with no such file. A managed plugin allowlist can remove
+the startup confirmation; [`packaging.md`](./packaging.md) defines that optional
+path.
+
+The MCP wire does not return a channel-acceptance receipt to the server, so the
+adapter must not claim that it detects provider acceptance at runtime. The
+provider evidence below proves that the maintained launch configuration accepts
+the channel.
+
+The direct-server selector is permitted only for the locally built and pinned
+st2 server. It must not approve an arbitrary downloaded server. The bounded
+plugin and policy alternative is in [`packaging.md`](./packaging.md).
 
 ### Notification
 
@@ -66,9 +89,16 @@ it is `messageFilename`. The adapter does not invent sender, thread, or
 recipient values from display text.
 
 Claude presents an accepted notification as an inbound channel item. When the
-session is idle, the item starts a turn without terminal input from st2. This
-provider behavior is the native wake receipt. The adapter does not parse the
-rendered inbound line and does not wait for a model response.
+session is idle, the item starts a turn without terminal input from st2. If a
+turn is active, Claude queues the item. More than one waiting item can be
+coalesced into the next turn. The adapter must not assume one provider turn for
+each notification.
+
+Claude treats channel content as untrusted input. The model may report or refuse
+an instruction in that content. Native DING proves that the item was presented
+and woke the session; it does not prove that the model obeyed the content or
+produced a particular reply. The adapter does not parse the rendered inbound
+line and does not wait for a model response.
 
 ### Durable inbox and retry
 
@@ -119,9 +149,29 @@ native adapter is accepted:
 - The inbound item starts observable work without a user keystroke.
 - A message sent during active work does not corrupt user input or terminal
   state.
+- Several messages sent during active work remain queued without loss. The
+  provider may coalesce them into one later turn.
 - The inbox file remains until the agent reads and archives it.
 - A deliberately broken notification or disabled transport makes the test
   fail.
+
+The repository-owned probe in [`tools/channel-probe/`](../../../../tools/channel-probe/)
+registers no tools and sends only channel notifications. The 2026-08-11 live
+matrix produced these results:
+
+- Claude Code 2.1.226, with no managed policy file, accepted the direct
+  development selector. One idle notification started a turn with no user input
+  after the bounded startup confirmation.
+- Claude Code 2.1.227 started turn 1 for notification A. Notifications B and C
+  arrived 0.1 seconds apart while turn 1 was running. After turn 1 ended, Claude
+  started turn 2 and presented both waiting items together. All three distinct
+  identifiers were present.
+- The model refused the probe's embedded output instruction because channel
+  content is untrusted. The refusal does not make delivery fail: the provider
+  debug events and spontaneous turns prove presentation and wake.
+- Claude Code 2.1.226 connected the same class of directly declared server but
+  rejected channel notifications when the required development selector was
+  omitted. A connected MCP transport alone is therefore not acceptance.
 
 ## Legacy screen transport
 

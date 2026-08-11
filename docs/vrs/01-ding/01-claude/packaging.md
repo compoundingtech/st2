@@ -1,7 +1,20 @@
 # Claude channel packaging boundary
 
-This page defines the work needed to make `st2 claude-mcp` an approved Claude
-Code channel. It is a decision aid, not build authority.
+This page defines the optional work needed to make `st2 claude-mcp` a managed
+Claude Code channel plugin. It is a decision aid, not build authority.
+
+## Decision
+
+Do not package the plugin yet. The maintained private-fleet path owns the st2
+binary and its startup PTY. It can accept the provider's exact direct-server
+warning once per Claude process. This is bounded startup control, not screen
+classification for each message.
+
+The plugin is worth building when a deployment requires zero-interaction
+startup, a centrally managed allowlist, or distribution of the channel metadata
+independently from st2. Until then it adds a marketplace, installation, and
+organization-policy surface without changing the MCP transport or durable inbox
+contract.
 
 ## Plugin shape
 
@@ -37,8 +50,8 @@ at user or managed scope, and start each Claude agent with this selector:
 ```
 
 The selector is required for every session. Installation alone does not enable
-the channel. A private marketplace also does not approve the channel during
-the provider's research preview.
+the channel. The plugin manifest selects the MCP server named by its `channels`
+entry; the command-line selector names the plugin and marketplace.
 
 ## Organization policy
 
@@ -59,24 +72,31 @@ policy like this:
 must therefore include every channel plugin that the organization still wants
 to permit. Users cannot override it.
 
-This control is available to claude.ai Team and Enterprise organizations and
-to qualifying Console organizations that deploy managed settings. Enabling it
-in the claude.ai Admin console requires the Owner role. A personal Pro or Max
-subscription cannot add a private plugin to this organization allowlist. Under
-that subscription, the choices are Anthropic marketplace approval or a move to
-an eligible organization and authentication path.
+This policy is needed only when the deployment uses managed settings. A host
+with no managed policy can accept a locally declared server through the
+development selector. A host whose managed policy disables channels rejects the
+development selector too.
 
 The provider documents these rules under
 [Enterprise controls](https://code.claude.com/docs/en/channels#enterprise-controls)
 and
 [Research preview](https://code.claude.com/docs/en/channels#research-preview).
 
-## Current acceptance boundary
+## Direct-server acceptance boundary
 
-The development-only override asks for interactive confirmation on every
-Claude process start. It cannot support an unattended st2 agent. st2 must not
-emit that flag in a maintained launcher.
+The current maintained path starts the locally built and pinned st2 MCP server
+with this selector:
 
-The MCP server, watcher, poll backstop, and durable inbox boundary can be built
-and tested without this package. Production launch acceptance waits for one of
-the approved paths above.
+```text
+--dangerously-load-development-channels server:<server-name>
+```
+
+Claude asks for one confirmation on every process start. The launcher may send
+Return only after it recognizes the exact warning and exact expected selector.
+It must not answer a workspace trust question or another startup prompt on that
+basis. After this startup gate, native DING uses only MCP notifications and no
+terminal input.
+
+This path is not permission to run arbitrary downloaded channel servers. If the
+server is no longer a locally owned st2 artifact, or if the deployment requires
+no startup confirmation, build and validate the plugin path above.
