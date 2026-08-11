@@ -144,9 +144,12 @@ TUI and the remote TUI. Known protocol limits are not silently treated as
 parity.
 
 Codex app-server and its remote transport are provider experimental surfaces.
-The implementation pins its accepted protocol schema to a tested Codex
-version. An incompatible schema or event change makes delivery unavailable and
-leaves the inbox unread.
+The implementation pins its accepted protocol schema to a finite set of exact,
+tested Codex versions. Adding a version requires a schema comparison for every
+request, response, and event path used by this adapter plus the live remote TUI
+acceptance above. The current set is Codex CLI 0.145.0 and 0.146.0. Any other
+version, or an incompatible schema or event change, makes delivery unavailable
+and leaves the inbox unread.
 
 ## Legacy screen transport
 
