@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -36,12 +36,56 @@ const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
 const DELIVERY_STATE_SCHEMA: &str = "st2.codex-delivery-state.v1";
+const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
 const SOCKET_PATH_BUDGET: usize = 96;
+
+struct WrapperDiagnostics {
+    file: File,
+    agent: String,
+    runtime_id: String,
+}
+
+impl WrapperDiagnostics {
+    fn open(state_dir: &Path, agent: &str, runtime_id: &str) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(state_dir.join("wrapper.log"))?;
+        Ok(Self {
+            file,
+            agent: agent.to_string(),
+            runtime_id: runtime_id.to_string(),
+        })
+    }
+
+    fn record(&mut self, stage: &str, detail: Value) -> Result<()> {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_millis();
+        serde_json::to_writer(
+            &mut self.file,
+            &json!({
+                "schema": WRAPPER_DIAGNOSTIC_SCHEMA,
+                "unixMs": unix_ms,
+                "agent": self.agent,
+                "runtimeId": self.runtime_id,
+                "stage": stage,
+                "detail": detail,
+            }),
+        )?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -850,6 +894,46 @@ pub fn run_controlled(
     let state_dir = state_dir(catalog_root, &identity);
     secure_dir(&state_dir)?;
     let _owner_lock = acquire_owner_lock(&state_dir)?;
+    let mut diagnostics = WrapperDiagnostics::open(&state_dir, &identity, &runtime_id)?;
+    diagnostics.record("ownerAcquired", json!({}))?;
+
+    let result = run_controlled_owned(
+        catalog_root,
+        &state_dir,
+        identity,
+        runtime_id,
+        codex_argv,
+        delivery,
+        &mut diagnostics,
+    );
+    match result {
+        Ok(()) => {
+            diagnostics.record("completed", json!({}))?;
+            Ok(())
+        }
+        Err(error) => {
+            let error_text = format!("{error:#}");
+            if let Err(diagnostic_error) =
+                diagnostics.record("failed", json!({ "error": error_text }))
+            {
+                return Err(error).context(format!(
+                    "persisting Codex wrapper failure diagnostic: {diagnostic_error:#}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn run_controlled_owned(
+    catalog_root: &Path,
+    state_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+    delivery: CodexDeliveryConfig,
+    diagnostics: &mut WrapperDiagnostics,
+) -> Result<()> {
     let binding_path = state_dir.join("binding.json");
     let resume_thread = load_resume_thread(&binding_path, &identity, &runtime_id)?;
 
@@ -901,6 +985,13 @@ pub fn run_controlled(
     // older daemon is live. A rejected second owner must not invalidate the first owner's binding.
     let runtime = CodexRuntime::fresh(identity, runtime_id)?;
     atomic_json(&state_dir.join("runtime.json"), &runtime)?;
+    diagnostics.record(
+        "runtimePublished",
+        json!({
+            "runtimeIncarnation": runtime.incarnation(),
+            "resumeSelected": resume_thread.is_some(),
+        }),
+    )?;
 
     let log = OpenOptions::new()
         .create(true)
@@ -909,6 +1000,7 @@ pub fn run_controlled(
         .open(state_dir.join("app-server.log"))?;
     let endpoint = format!("unix://{}", socket_path.display());
     let server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
+    diagnostics.record("appServerStarting", json!({}))?;
     let mut server = Command::new(&codex_argv[0])
         .args(server_args)
         .stdin(Stdio::null())
@@ -916,15 +1008,16 @@ pub fn run_controlled(
         .stderr(log)
         .spawn()
         .with_context(|| format!("starting {} app-server", codex_argv[0]))?;
+    diagnostics.record("appServerStarted", json!({ "pid": server.id() }))?;
 
     let result = run_connected(
         &mut server,
         &socket_path,
-        &endpoint,
         &runtime,
         &codex_argv,
         resume_thread.as_deref(),
         delivery,
+        diagnostics,
     );
     terminate_child(&mut server);
     let _ = fs::remove_file(&socket_path);
@@ -934,19 +1027,23 @@ pub fn run_controlled(
 fn run_connected(
     server: &mut Child,
     socket_path: &Path,
-    endpoint: &str,
     runtime: &CodexRuntime,
     codex_argv: &[String],
     resume_thread: Option<&str>,
     delivery: CodexDeliveryConfig,
+    diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
-    let tui_args = controlled_tui_args(endpoint, &codex_argv[1..], resume_thread)?;
+    let endpoint = format!("unix://{}", socket_path.display());
+    let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
     let expected_resume =
         expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
+    diagnostics.record("waitingForControlSocket", json!({ "pid": server.id() }))?;
     let control = connect_control(server, socket_path, STARTUP_TIMEOUT)?;
+    diagnostics.record("controlSocketConnected", json!({}))?;
     let shutdown = control.try_clone()?;
     let websocket = initialize_control(control)?;
+    diagnostics.record("controlInitialized", json!({}))?;
     let (events_tx, events_rx) = mpsc::channel();
     let binding_path = state_dir.join("binding.json");
     let control_state_path = state_dir.join("control-state.json");
@@ -974,9 +1071,13 @@ fn run_connected(
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("starting controlled {} TUI", codex_argv[0]))?;
+    diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
 
-    let result = wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT)
-        .and_then(|_| monitor_bound_tui(&mut tui, &events_rx));
+    diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
+    let result = wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT).and_then(|_| {
+        diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+        monitor_bound_tui(&mut tui, &events_rx)
+    });
     if result.is_err() {
         terminate_child(&mut tui);
     }
@@ -1195,11 +1296,22 @@ fn interactive_root_prefix_end(authored_args: &[String]) -> Result<usize> {
             .any(|prefix| argument.starts_with(prefix) && argument.len() > prefix.len());
         anyhow::ensure!(
             long_value || short_value,
-            "cannot automatically resume through unknown Codex option '{argument}'"
+            "cannot automatically resume through unknown Codex option '{}'",
+            diagnostic_option_name(argument)
         );
         index += 1;
     }
     Ok(authored_args.len())
+}
+
+fn diagnostic_option_name(argument: &str) -> String {
+    if let Some((name, _)) = argument.split_once('=') {
+        return name.to_string();
+    }
+    if argument.starts_with("--") {
+        return argument.to_string();
+    }
+    argument.chars().take(2).collect()
 }
 
 fn connect_control(
@@ -3099,6 +3211,14 @@ mod tests {
         .unwrap_err();
         assert!(unknown.to_string().contains("unknown Codex option"));
 
+        let sensitive = controlled_app_server_args(
+            "unix:///server.sock",
+            &["--future-token=do-not-log-this".into(), "boot".into()],
+        )
+        .unwrap_err();
+        assert!(sensitive.to_string().contains("--future-token"));
+        assert!(!sensitive.to_string().contains("do-not-log-this"));
+
         assert_eq!(
             controlled_app_server_args(
                 "unix:///server.sock",
@@ -3243,6 +3363,45 @@ mod tests {
         assert!(first.starts_with("/state/st2/codex"));
         assert!(!first.display().to_string().contains("worker"));
         assert!(!first.display().to_string().contains("catalog/a"));
+    }
+
+    #[test]
+    fn wrapper_diagnostics_keep_one_bounded_run_without_authored_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        secure_dir(&state).unwrap();
+
+        {
+            let mut diagnostics = WrapperDiagnostics::open(&state, "h.worker", "h.worker").unwrap();
+            diagnostics.record("ownerAcquired", json!({})).unwrap();
+            diagnostics
+                .record("failed", json!({ "error": "control socket was not ready" }))
+                .unwrap();
+        }
+        let path = state.join("wrapper.log");
+        let first = fs::read_to_string(&path).unwrap();
+        let entries = first
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["schema"], WRAPPER_DIAGNOSTIC_SCHEMA);
+        assert_eq!(entries[0]["agent"], "h.worker");
+        assert_eq!(entries[1]["stage"], "failed");
+        assert!(first.contains("control socket was not ready"));
+        assert!(!first.contains("prompt"));
+
+        {
+            let mut replacement = WrapperDiagnostics::open(&state, "h.worker", "h.worker").unwrap();
+            replacement.record("ownerAcquired", json!({})).unwrap();
+        }
+        let replacement = fs::read_to_string(&path).unwrap();
+        assert_eq!(replacement.lines().count(), 1);
+        assert!(!replacement.contains("control socket was not ready"));
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
