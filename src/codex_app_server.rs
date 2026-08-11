@@ -1101,7 +1101,7 @@ fn run_connected(
                 .context("starting Codex control resume after the TUI launched")?;
         }
         diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-        wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT).and_then(|_| {
+        wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics).and_then(|_| {
             diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
             monitor_bound_tui(&mut tui, &events_rx)
         })
@@ -1498,6 +1498,7 @@ fn wait_for_tui_loaded_thread(
 
 #[derive(Debug)]
 enum ControlEvent {
+    TuiThreadLoaded(Sender<()>),
     Bound,
     Observed,
     Closed,
@@ -1533,6 +1534,13 @@ fn pump_control(
                 .recv()
                 .context("controlled Codex TUI ended before control resume")?;
             wait_for_tui_loaded_thread(&mut websocket, thread_id, STARTUP_TIMEOUT)?;
+            let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
+            events
+                .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
+                .context("recording that the Codex TUI loaded the preserved thread")?;
+            diagnostic_rx
+                .recv()
+                .context("waiting for the Codex TUI-loaded diagnostic before control resume")?;
             write_json_message(
                 &mut websocket,
                 &json!({
@@ -1710,6 +1718,7 @@ fn wait_for_binding(
     tui: &mut Child,
     events: &Receiver<ControlEvent>,
     timeout: Duration,
+    diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1726,6 +1735,10 @@ fn wait_for_binding(
             );
         }
         match events.recv_timeout(wait) {
+            Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
+                diagnostics.record("tuiThreadLoaded", json!({ "pid": tui.id() }))?;
+                let _ = acknowledge.send(());
+            }
             Ok(ControlEvent::Bound) => return Ok(()),
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
@@ -1748,6 +1761,9 @@ fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result
             return completed_tui(status);
         }
         match events.recv_timeout(CONTROL_POLL) {
+            Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
+                let _ = acknowledge.send(());
+            }
             Ok(ControlEvent::Bound) => {}
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
@@ -2108,6 +2124,15 @@ mod tests {
             CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
         )
         .unwrap()
+    }
+
+    fn acknowledge_tui_thread_loaded(events: &Receiver<ControlEvent>) {
+        let ControlEvent::TuiThreadLoaded(acknowledge) =
+            events.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("control did not report the TUI-loaded gate");
+        };
+        acknowledge.send(()).unwrap();
     }
 
     #[test]
@@ -2727,6 +2752,7 @@ mod tests {
                 tx,
             )
         });
+        acknowledge_tui_thread_loaded(&rx);
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             ControlEvent::Bound
@@ -2966,6 +2992,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         resume_ready_tx.send(()).unwrap();
+        acknowledge_tui_thread_loaded(&rx);
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             ControlEvent::Bound
@@ -3059,6 +3086,7 @@ mod tests {
             )
         });
         resume_ready_tx.send(()).unwrap();
+        acknowledge_tui_thread_loaded(&rx);
         let ControlEvent::Failed(error) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
             panic!("missing saved rollout did not fail closed");
         };
