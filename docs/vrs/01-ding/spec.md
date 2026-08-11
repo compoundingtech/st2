@@ -43,6 +43,35 @@ unavailable, stale, or in an unknown state, it sends no unsafe input and leaves
 the inbox message unread for retry. Native adapters do not use the
 rendered-screen classifier.
 
+## Efficiency accounting
+
+Delivery efficiency is measured per delivered inbox message, not per provider
+turn or session (`DING-R15`). The denominator is the exact number of messages
+covered by a positive receipt: one FIFO head for legacy delivery, or the
+complete messages in one accepted native view. A held or failed attempt, a
+retry, overflow, and an oversized-head metadata fallback have a denominator of
+zero. Correctness evidence reports those outcomes separately; it does not hide
+them inside a cost average.
+
+Each experiment reports these values separately (`DING-R16`, `DING-R17`):
+
+| Metric | Current requirement status |
+| --- | --- |
+| Model inferences per delivered message | Unmeasured; no pass threshold |
+| Model tool-boundary crossings per delivered message | Unmeasured; no pass threshold |
+| Input tokens per delivered message | Unmeasured; no pass threshold |
+| Output tokens per delivered message | Unmeasured; no pass threshold |
+| Cache-read input tokens per delivered message | Unmeasured; no pass threshold |
+| Cache-creation input tokens per delivered message | Unmeasured; no pass threshold |
+
+A provider turn is not evidence of one inference or a fixed number of tool
+crossings. Counts must come from the provider's authoritative event or usage
+surface. If a provider omits a requested count, the result is `unknown`. If the
+experiment cannot isolate the target messages or expose comparable counts for
+both transports, that metric is incomparable rather than zero or improved
+(`DING-R18`). Accepted evaluation evidence can fill the baseline and threshold;
+the specification does not invent either value.
+
 The rest of this document defines the unchanged legacy screen transport. The
 native wire contracts are in each maintained harness specification.
 

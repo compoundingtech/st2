@@ -123,6 +123,27 @@ harness that declares a native `deliver` transport.
   archived staged head. Unread, unreadable, unrecognized, and ambiguous attempts
   retain staged ownership and retry by inspection without re-pasting.
 
+### Must make delivery efficiency measurable
+
+- **DING-R15 Delivered-message cost unit:** Every efficiency result uses one
+  delivered inbox message as its cost unit. A positive legacy receipt counts its
+  exact FIFO head. A positive native receipt counts each complete inbox message
+  in its accepted view. Held attempts, retries, overflow, and an oversized-head
+  metadata fallback do not increase the delivered-message count. Results do not
+  use turns, sessions, requests, or attempts as the cost unit.
+- **DING-R16 Inference and tool-crossing cost:** Evidence reports model
+  inferences per delivered message and model tool-boundary crossings per
+  delivered message as separate values. It does not infer either value from a
+  provider turn count.
+- **DING-R17 Token cost classes:** Evidence reports input, output, cache-read
+  input, and cache-creation input tokens per delivered message as separate
+  values. An unavailable token class is `unknown`, not zero.
+- **DING-R18 Comparable evidence:** A transport comparison is valid only when
+  the provider exposes the requested counts and the experiment attributes them
+  to the same isolated target messages. A transport that cannot be measured for
+  a requested metric is incomparable for that metric. No numeric pass threshold
+  exists until accepted evaluation evidence establishes it.
+
 ## Evidence
 
 Each guarantee above is pinned by a named test in

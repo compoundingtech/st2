@@ -54,6 +54,11 @@ messages and 16 KiB. It never truncates a body. If the head does not fit, the
 view identifies that message without its body, and all later messages remain
 unread behind it.
 
+The byte limit bounds inbox input handed to one model inference. The message
+limit bounds the action set created by a burst of small messages. These values
+are transport bounds, not efficiency thresholds. Their token and inference cost
+remains unmeasured under `DING-R15` through `DING-R18`.
+
 | Observed state | Request | Result |
 | --- | --- | --- |
 | Idle | `turn/start` with typed text | Start a turn and wake Codex |
