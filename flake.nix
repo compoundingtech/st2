@@ -161,6 +161,24 @@
           ];
         });
 
+        # The parked-task recovery episode against the real binary and real processes. It is a
+        # dedicated derivation because it needs a long-running supervisor: both single-pass entry
+        # points build a fresh `FlappingCap`, so `up --once` can never park anything, and the
+        # package's own test boundary would never reach this path.
+        st2ParkedRecovery = st2.overrideAttrs (old: {
+          pname = "st2-parked-recovery-check";
+          # The supervisor snapshots pty sessions on every pass even for an exec-only catalog, so the
+          # real producer has to be on PATH — without it the pass refuses to reconcile at all and no
+          # task ever reaches the park this check exists to observe.
+          nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
+            pty.packages.${system}.default
+          ];
+          cargoTestFlags = [
+            "--test"
+            "parked_recovery"
+          ];
+        });
+
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
           chmod -R u+w $out
@@ -195,6 +213,7 @@
         checks.st2 = st2;
         checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
         checks.catalog-bootstrap = st2CatalogBootstrap;
+        checks.parked-recovery = st2ParkedRecovery;
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed

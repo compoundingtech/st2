@@ -11,6 +11,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::Discovered;
+use crate::park::{ParkObserver, ParkState};
 
 pub const TASK_INVENTORY_SCHEMA: &str = "st2.task-inventory.v1";
 
@@ -207,6 +208,28 @@ struct TaskRow {
     agent_desired_state: String,
     agent_desired_state_reason: Option<String>,
     runtime: RuntimeJson,
+    /// The supervisor's park decision, when it has parked this task. Deliberately its own field
+    /// rather than a `runtime.state` variant: `runtime` is a closed *observation* of the process, and
+    /// the park path keeps the corpse on purpose, so whether a parked task reads `exited` or `absent`
+    /// is real evidence that a `"parked"` state would have overwritten.
+    parked: Option<ParkedJson>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ParkedJson {
+    since: String,
+    reason: String,
+    supervisor_pid: u32,
+    /// What actually clears it. The whole complaint in #204 is that an operator could see a task that
+    /// should be up, is not up, and had nothing visibly wrong with it — so the remedy travels with
+    /// the fault rather than living in a journal line nobody knew to grep for.
+    recovery: RecoveryAction,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryAction {
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -248,6 +271,7 @@ pub fn inventory(
     host: &str,
     found: &Discovered,
     observer: &dyn RuntimeObserver,
+    parks: &dyn ParkObserver,
 ) -> TaskInventory {
     let mut errors = found
         .errors
@@ -354,6 +378,22 @@ pub fn inventory(
     }
 
     let observation_complete = observed.complete && observed.errors.is_empty();
+
+    // The park projection is joined on the same declared ids. A parked task is a *known* fault, so it
+    // never makes the envelope incomplete — only a marker that cannot be believed does.
+    let mut parks = parks.observe(
+        &desired_runtimes
+            .iter()
+            .map(|runtime| runtime.runtime_id.clone())
+            .collect::<Vec<_>>(),
+    );
+    for error in &parks.errors {
+        push_error(&mut errors, error.clone());
+    }
+    if !parks.complete && parks.errors.is_empty() {
+        push_error(&mut errors, "park projection reported an incomplete batch".into());
+    }
+
     desired.sort_by(|a, b| {
         (&a.agent, &a.task, &a.runtime_id).cmp(&(&b.agent, &b.task, &b.runtime_id))
     });
@@ -390,6 +430,25 @@ pub fn inventory(
                     ("indeterminate", None, None, None, Some(error))
                 }
             };
+            let parked = match parks.states.remove(&task.runtime_id) {
+                Some(ParkState::Parked(record)) => Some(ParkedJson {
+                    since: record.parked_at,
+                    reason: record.reason,
+                    supervisor_pid: record.supervisor_pid,
+                    recovery: RecoveryAction {
+                        argv: vec![
+                            "st2".to_string(),
+                            "--catalog".to_string(),
+                            catalog.display().to_string(),
+                            "unpark".to_string(),
+                            task.runtime_id.clone(),
+                            "--host".to_string(),
+                            host.to_string(),
+                        ],
+                    },
+                }),
+                _ => None,
+            };
             TaskRow {
                 agent: task.agent,
                 task: task.task,
@@ -417,6 +476,7 @@ pub fn inventory(
                     generation_id,
                     error,
                 },
+                parked,
             }
         })
         .collect();
@@ -464,10 +524,52 @@ mod tests {
         .unwrap();
     }
 
+    #[derive(Clone, Default)]
+    struct FixedParks(crate::park::ParkBatch);
+
+    impl ParkObserver for FixedParks {
+        fn observe(&self, _desired: &[String]) -> crate::park::ParkBatch {
+            self.0.clone()
+        }
+    }
+
     fn json(catalog: &Path, host: &str, observer: ObservationBatch) -> serde_json::Value {
+        json_with_parks(catalog, host, observer, crate::park::NoParks)
+    }
+
+    fn json_with_parks(
+        catalog: &Path,
+        host: &str,
+        observer: ObservationBatch,
+        parks: impl ParkObserver,
+    ) -> serde_json::Value {
         let found = crate::discover(catalog);
-        serde_json::from_str(&inventory(catalog, host, &found, &FixedObserver(observer)).to_json())
-            .unwrap()
+        serde_json::from_str(
+            &inventory(catalog, host, &found, &FixedObserver(observer), &parks).to_json(),
+        )
+        .unwrap()
+    }
+
+    fn park_batch(complete: bool, states: &[(&str, ParkState)], errors: &[&str]) -> FixedParks {
+        FixedParks(crate::park::ParkBatch {
+            complete,
+            states: states
+                .iter()
+                .map(|(id, state)| ((*id).to_string(), state.clone()))
+                .collect(),
+            errors: errors.iter().map(|error| (*error).to_string()).collect(),
+        })
+    }
+
+    fn park_record(runtime_id: &str) -> ParkState {
+        ParkState::Parked(crate::park::ParkRecord {
+            schema: crate::park::PARK_SCHEMA.to_string(),
+            runtime_id: runtime_id.to_string(),
+            supervisor_pid: 4242,
+            supervisor_start_time_ticks: 99,
+            parked_at: "2026-08-09T10:00:00.000Z".into(),
+            reason: "crash-looped past its restart{} policy (mode=fail)".into(),
+        })
     }
 
     fn running(id: &str, pid: u32) -> RuntimeObservation {
@@ -539,7 +641,8 @@ mod tests {
                     "createdAt": "2026-07-31T10:00:00.000Z",
                     "generationId": "sha256:g-11",
                     "error": null
-                }
+                },
+                "parked": null
             })
         );
         assert_eq!(value["tasks"][1]["runtimeId"], "h.worker.ding");
@@ -551,6 +654,133 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|row| row["agent"] != "other.foreign")
+        );
+    }
+
+    /// The whole operational complaint in #204: a parked task reported `desiredState: running`,
+    /// nothing running, and `error: null`, so an operator saw a task that should be up, was not up,
+    /// and had nothing visibly wrong with it. The only record of the fault was a supervisor journal
+    /// line you had to already know to grep for.
+    ///
+    /// The park rides alongside a *truthful* runtime observation rather than replacing it. The park
+    /// path keeps the dead session on purpose ("leaving it parked and its last session for
+    /// inspection"), so `exited` versus `absent` distinguishes a corpse left as evidence from a task
+    /// that never got that far — evidence a `"parked"` runtime state would have destroyed.
+    #[test]
+    fn a_parked_task_reports_its_fault_alongside_a_truthful_runtime_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "flapper",
+            r#"pty "agent" { id "h.flapper"; argv "agent-bin" }"#,
+        );
+        write_agent(
+            tmp.path(),
+            "h",
+            "healthy",
+            r#"pty "agent" { id "h.healthy"; argv "agent-bin" }"#,
+        );
+
+        let value = json_with_parks(
+            tmp.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![
+                    RuntimeObservation {
+                        runtime_id: "h.flapper".into(),
+                        state: ObservedState::Exited,
+                    },
+                    running("h.healthy", 77),
+                ],
+                errors: vec![],
+            },
+            park_batch(
+                true,
+                &[
+                    ("h.flapper", park_record("h.flapper")),
+                    ("h.healthy", ParkState::NotParked),
+                ],
+                &[],
+            ),
+        );
+
+        let flapper = &value["tasks"][0];
+        assert_eq!(flapper["runtimeId"], "h.flapper");
+        assert_eq!(flapper["desiredState"], "running");
+        assert_eq!(
+            flapper["runtime"]["state"], "exited",
+            "the retained corpse is evidence; the park must not overwrite it"
+        );
+        assert_eq!(flapper["runtime"]["error"], Value::Null);
+        assert_eq!(
+            flapper["parked"],
+            serde_json::json!({
+                "since": "2026-08-09T10:00:00.000Z",
+                "reason": "crash-looped past its restart{} policy (mode=fail)",
+                "supervisorPid": 4242,
+                "recovery": {
+                    "argv": [
+                        "st2",
+                        "--catalog",
+                        tmp.path().display().to_string(),
+                        "unpark",
+                        "h.flapper",
+                        "--host",
+                        "h"
+                    ]
+                }
+            }),
+            "desiredState=running + nothing running + error=null is still the only visible signal"
+        );
+
+        assert_eq!(value["tasks"][1]["runtimeId"], "h.healthy");
+        assert_eq!(value["tasks"][1]["parked"], Value::Null);
+
+        // A park is a KNOWN fault. Making it incomplete would conflate "st2 decided to stop
+        // restarting this" with "st2 could not tell what is going on", and would make `st2 tasks`
+        // exit non-zero for the entire time a crash-looper sits parked.
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["errors"], Value::Array(vec![]));
+    }
+
+    /// A marker that cannot be believed is different from a task that is not parked. Unreadable
+    /// evidence follows the rest of this surface and fails closed.
+    #[test]
+    fn an_unbelievable_park_marker_makes_the_envelope_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "worker",
+            r#"pty "agent" { id "h.worker"; argv "agent-bin" }"#,
+        );
+
+        let value = json_with_parks(
+            tmp.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![running("h.worker", 11)],
+                errors: vec![],
+            },
+            park_batch(
+                false,
+                &[(
+                    "h.worker",
+                    ParkState::Indeterminate("park marker for \"h.worker\": bad".into()),
+                )],
+                &["park marker for \"h.worker\": bad"],
+            ),
+        );
+
+        assert_eq!(value["complete"], false);
+        assert_eq!(value["errors"][0], "park marker for \"h.worker\": bad");
+        assert_eq!(
+            value["tasks"][0]["parked"],
+            Value::Null,
+            "an unreadable marker must not be reported as a confirmed park"
         );
     }
 

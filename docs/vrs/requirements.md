@@ -59,9 +59,13 @@ accepted.
   the task. In fail mode, `attempts` is reachable independent of reconcile
   cadence: a task that repeatedly launches and dies without being observed
   alive on every completed accounting pass for a full `interval` is parked for
-  the remainder of the supervisor run after its successful-launch budget is
-  exhausted. A completed pass that does not observe the task alive breaks
-  accrued recovery uptime rather than forgiving failures through silence.
+  the remainder of its owning supervisor run after its successful-launch
+  budget is exhausted, unless that run grants an explicit per-task unpark
+  request. Granting the request clears exactly that task's park decision and
+  restart accounting; it does not release another parked task or perturb a
+  healthy task, including an identically named task owned by another supervisor
+  scope. A completed pass that does not observe the task alive breaks accrued
+  recovery uptime rather than forgiving failures through silence.
 - **R32 Bounded helper teardown:** After st2 spawns a bounded non-interactive
   helper, input delivery failure or deadline expiry targets the helper's entire
   process group, not only its direct child, so teardown includes descendants
@@ -221,10 +225,17 @@ accepted.
   time, and opaque runtime-generation id. Unknown, duplicate, malformed,
   unreadable, timed-out, PID-reused, or otherwise unprovable evidence is
   indeterminate and makes the versioned envelope incomplete and the command
-  unsuccessful; it is never reported as absence. Observation detects semantic
-  declaration drift across its runtime probe, does not invoke a backend for a
-  root positively absent at admission, and performs no reconciliation, cleanup,
-  lifecycle change, or state rewrite. An admitted PTY root that changes
+  unsuccessful; it is never reported as absence. The command projects a
+  supervisor's known park fault and per-task recovery action alongside the
+  unmodified runtime observation. The action is structured executable argv
+  carrying the exact canonical catalog folder and selected host, so invoking it
+  never falls back to ambient catalog or host defaults. A believable park
+  remains complete, while an unbelievable park marker fails closed like other
+  unprovable evidence.
+  Observation detects semantic declaration drift across its runtime probe,
+  does not invoke a backend for a root positively absent at admission, and
+  performs no reconciliation, cleanup, lifecycle change, or state rewrite. An
+  admitted PTY root that changes
   filesystem identity during the backend probe makes the observation
   incomplete; the external backend may already have recreated a concurrently
   removed registry. This diagnostic boundary is not transactionally serialized

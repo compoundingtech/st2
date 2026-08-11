@@ -261,6 +261,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Clear one task's park after fixing what crash-looped it. A task parked by its `restart{}`
+    /// policy (mode=fail) stays parked for the rest of the supervisor run, and this is its per-task
+    /// exit: the running supervisor relaunches exactly this task on its next pass, leaving every
+    /// other task on the host untouched. `st2 tasks --json` reports which tasks are parked.
+    Unpark {
+        /// The parked task's runtime id, exactly as `st2 tasks --json` reports it.
+        task: String,
+        /// Host whose selected-catalog supervisor should grant the request. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Print a shell completion script for `st2` to stdout (`st2 completions <bash|zsh|fish|…>`).
     /// Generated from the live command tree, so it never drifts from the actual flags.
     Completions {
@@ -957,6 +968,10 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             tasks_cmd(&catalog, host)
         }
+        Command::Unpark { task, host } => {
+            let catalog = catalog_arg(None)?;
+            unpark_cmd(&catalog, &task, host)
+        }
         Command::Down { root, host } => {
             if root.is_none() && catalog_path.is_none() {
                 anyhow::bail!(
@@ -1503,7 +1518,17 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
         Err(error) => return print_incomplete_tasks(catalog, host, error.to_string()),
     };
     let runner = SystemRunner::new(catalog.clone(), exec_state_dir(&host));
-    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner);
+    let parks = match st2::park::DirParkObserver::for_supervisor(&catalog, &host) {
+        Ok(parks) => parks,
+        Err(error) => {
+            return print_incomplete_tasks(
+                catalog,
+                host,
+                format!("open supervisor park projection: {error}"),
+            );
+        }
+    };
+    let mut inventory = st2::task_inventory::inventory(&catalog, &host, &found, &runner, &parks);
     let after = discover(&catalog);
     if !st2::task_inventory::same_discovery(&found, &after) {
         inventory.mark_incomplete("catalog declarations changed during task observation");
@@ -1519,6 +1544,27 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
     } else {
         anyhow::bail!("task inventory incomplete")
     }
+}
+
+/// Ask this host's supervisor to release one parked task.
+///
+/// The request is a file the supervisor drains at the top of its next pass, not a direct mutation:
+/// the parked set lives in the supervisor's memory, and it is the only writer. That also means this
+/// is best-effort by construction — with no supervisor running there is nothing to grant it, which is
+/// why the confirmation says "requested" rather than claiming the task is back.
+fn unpark_cmd(catalog: &Path, task: &str, host: Option<String>) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let catalog = catalog.canonicalize().with_context(|| {
+        format!("canonicalize catalog {}", catalog.display())
+    })?;
+    let dir = st2::park::SupervisorScope::current(&catalog, &host)?.unpark_request_dir();
+    st2::park::request_unpark(&dir, task)?;
+    println!(
+        "unpark requested for '{task}' in catalog {} on {host}; that supervisor grants it on its \
+         next reconcile pass. Confirm with `st2 tasks --json` — the task's `parked` field clears.",
+        catalog.display()
+    );
+    Ok(())
 }
 
 fn print_incomplete_tasks(catalog: PathBuf, host: String, detail: String) -> Result<()> {
@@ -2696,6 +2742,7 @@ fn print_report(report: &UpReport) {
     report_line("gc", &report.gc);
     report_line("held", &report.held);
     report_line("flapping", &report.flapping);
+    report_line("unparked", &report.unparked);
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);
     report_line("unrunnable", &report.unrunnable);

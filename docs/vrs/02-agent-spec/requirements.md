@@ -13,7 +13,7 @@ the Agent Spec. General field-change behavior that the canonical specification
 does not yet define is proposed until a matching evals specification and proof
 change adopts it.
 
-This work supports root [R01, R06, R11, R13 through R19, R24 through R26, and
+This work supports root [R01, R06, R11, R13 through R19, R23 through R26, and
 R31](../requirements.md).
 It applies to every st2 tool that runs an agent or test. A valid local catalog
 and host-local runtime state are sufficient. It requires no compare-and-swap
@@ -100,6 +100,20 @@ the same field-rules specification.
   event or roll back the commit. Do not notify for unchanged, failed,
   rolled-back, periodic, new, replaced, or retired work. A notification cannot
   restart work or cause another notification.
+
+- **SPEC-R07 Keep park and recovery ownership exact.** A fail-mode restart
+  budget exhausted within one supervisor run produces a terminal per-task park
+  decision until that same run grants an explicit unpark request. Park markers
+  and unpark requests are isolated by the exact canonical catalog folder and
+  host, so a supervisor cannot observe, clear, or consume another supervisor
+  scope's channel even when both contain the same task ID. Granting an unpark
+  clears exactly that task's restart accounting without releasing another
+  parked task or restarting a healthy task. Task inventory projects a
+  believable park and structured recovery argv alongside the unmodified runtime
+  observation as a complete known fault. The argv carries that observation's
+  exact canonical catalog folder and selected host rather than consulting
+  ambient defaults; unbelievable marker evidence is indeterminate and makes the
+  envelope incomplete.
 
 ## Evidence boundary
 

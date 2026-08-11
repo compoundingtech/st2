@@ -66,6 +66,15 @@ The filesystem path selected as the catalog for a command.
 
 Authority: [catalog path resolution](../../src/main.rs#L867-L927)
 
+### supervisor scope
+
+The ownership boundary formed by one canonical catalog folder and one host. A
+supervisor run owns policy decisions and recovery requests only within this
+scope.
+
+Authority: [R31 reachable restart bounds](requirements.md);
+[F12 future policy](02-agent-spec/spec.md)
+
 ### root agent
 
 The agent assigned host-local health observation, recovery, and escalation.
@@ -79,6 +88,14 @@ The replaceable `st2 up` process that reconciles host-local work.
 
 Authority: [R11 control-plane replacement safety](requirements.md#L83-L88);
 [`up_loop`](../../src/run.rs#L1440-L1452)
+
+### supervisor run
+
+One live incarnation of the control plane supervising one supervisor scope. It
+owns the restart accounting and park decisions made during that incarnation.
+
+Authority: [R31 reachable restart bounds](requirements.md);
+[F12 future policy](02-agent-spec/spec.md)
 
 ### declared supervisor
 
@@ -99,6 +116,48 @@ Authority: [`status::State`](../../src/status.rs#L24-L45);
 st2's runtime observation of whether a task record is alive.
 
 Authority: [`reconcile::Session`](../../src/reconcile.rs#L16-L26)
+
+### restart policy
+
+The declared rules that bound when and how an agent task may be relaunched
+after it stops.
+
+Authority: [R31 reachable restart bounds](requirements.md);
+[F12 future policy](02-agent-spec/spec.md)
+
+### restart budget
+
+The launches available to an agent task under its restart policy before the
+policy delays or parks it.
+
+Authority: [R31 reachable restart bounds](requirements.md);
+[F12 future policy](02-agent-spec/spec.md)
+
+### parked task
+
+An agent task whose owning supervisor run has decided not to relaunch it after
+its fail-mode restart budget was exhausted. Parking is a supervisor decision,
+not a session state or runtime observation.
+
+Authority: [R23 fail-closed task inventory and R31 reachable restart bounds](requirements.md)
+
+### operator action
+
+An explicit instruction from an operator that requests a named control-plane
+change. It is distinct from an automatic policy reaction. A projected recovery
+operator action is structured executable argv and carries its supervisor
+scope's exact canonical catalog folder and selected host; those axes do not
+come from ambient defaults at invocation time.
+
+Authority: [R31 reachable restart bounds](requirements.md)
+
+### unpark request
+
+An operator action asking the owning supervisor run to clear one parked task's
+park decision and restart accounting.
+
+Authority: [R31 reachable restart bounds](requirements.md);
+[F12 future policy](02-agent-spec/spec.md)
 
 ### agent desired state
 
@@ -158,6 +217,22 @@ The terminal notification that makes an agent aware of unread messages.
 
 Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
 
+## Structure
+
+```text
+supervisor scope
+`-- supervisor run
+    `-- applies restart policy to agent task
+        `-- spends restart budget
+            `-- may decide parked task
+
+operator action --creates--> unpark request --targets--> owning supervisor run
+```
+
+`supervisor` is the leitwort for the ownership family. `restart` is the
+leitwort for policy and budget; `park` links the terminal decision to its
+explicit `unpark` recovery request.
+
 ## Collision rules
 
 - Qualify **root** as [root agent](requirements.md#L51-L54) or
@@ -165,9 +240,17 @@ Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
   which concept is meant.
 - Qualify **supervisor** as [control plane](requirements.md#L83-L88) or
   [declared supervisor](../../crates/agent-spec/src/spec.rs#L24-L50).
+- Use **supervisor run** for one live control-plane incarnation and
+  **declared supervisor** for the agent reference used in supervisory routing.
+  **Control plane** names the replaceable process concept, not an owning run.
 - Use [presence](../../src/status.rs#L24-L45) for the agent-authored signal and
   [session state](../../src/reconcile.rs#L16-L26) for runtime liveness. Avoid
   bare *agent status* when either could be meant.
+- Use **parked task** or **park decision** for the owning supervisor's policy
+  decision. Do not use *parked* as a session state or replace the runtime
+  observation with it.
+- Use **recovery action** for the structured argv projected with a parked task;
+  it names the exact supervisor scope rather than relying on ambient defaults.
 - Use [agent identity](../../crates/agent-spec/src/spec.rs#L24-L50) for the bare
   value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
   host-qualified address.
