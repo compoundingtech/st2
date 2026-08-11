@@ -3,7 +3,8 @@
 //! Native delivery cannot infer a thread from cwd, process, PTY, or `thread/list`. This module
 //! starts a dedicated provider daemon, initializes an observer connection before the interactive
 //! client starts, and binds a typed start notification or successful resume response to the exact
-//! wrapper process incarnation that owns the PTY launch. Its control watcher persists
+//! wrapper process incarnation that owns the PTY launch. On resume, the owning TUI must first make
+//! the preserved thread visible in the provider's loaded-thread inventory. Its control watcher persists
 //! delivery-relevant thread and turn state. The native delivery layer selects one durable FIFO
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
@@ -38,6 +39,7 @@ const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
 const DELIVERY_STATE_SCHEMA: &str = "st2.codex-delivery-state.v1";
 const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
+const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1070,8 +1072,8 @@ fn run_connected(
     });
 
     // A fresh initialized observer reads before this child can issue thread/start. A resumed
-    // observer waits on the gate below: app-server does not promise a new start or unchanged-status
-    // notification on resume, so the control client sends its own resume only after the TUI exists.
+    // observer waits on the gate below, then proves through thread/loaded/list that the TUI issued
+    // its own resume. Only after that typed observation may control send its redundant resume.
     // Insert the remote endpoint as a global Codex option and preserve every authored argument
     // after the provider executable.
     let mut tui_command = Command::new(&codex_argv[0]);
@@ -1424,6 +1426,76 @@ fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
     Ok(websocket)
 }
 
+/// Wait until the owning TUI has loaded the preserved thread before this control connection
+/// subscribes with its own `thread/resume` request.
+///
+/// Process creation is not ownership evidence. If control resumes immediately after spawn, it can
+/// win the cold resume and create the session before the TUI has attached, so a successful control
+/// response would not prove that the TUI consumed its authored prompt. `thread/loaded/list` is a
+/// typed observation of the TUI's progress and is available in every admitted Codex version.
+fn wait_for_tui_loaded_thread(
+    websocket: &mut WebSocket<UnixStream>,
+    expected_thread_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        write_json_message(
+            websocket,
+            &json!({
+                "method": "thread/loaded/list",
+                "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                "params": {},
+            }),
+        )?;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "controlled Codex TUI did not load preserved thread {expected_thread_id} before control resume"
+            );
+            websocket
+                .get_ref()
+                .set_read_timeout(Some(remaining.min(CONTROL_POLL)))?;
+            let message = match poll_json_message(websocket)? {
+                ControlRead::Message(message) => message,
+                ControlRead::Timeout => continue,
+                ControlRead::Closed => anyhow::bail!(
+                    "Codex app-server closed the control connection while waiting for the TUI to load preserved thread {expected_thread_id}"
+                ),
+            };
+            if message.get("id") != Some(&Value::from(CONTROL_TUI_LOADED_REQUEST_ID)) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                anyhow::bail!("Codex app-server rejected thread/loaded/list: {error}");
+            }
+            let loaded = message
+                .pointer("/result/data")
+                .and_then(Value::as_array)
+                .context("Codex thread/loaded/list response has no typed data")?;
+            let contains_expected = loaded.iter().try_fold(false, |found, thread_id| {
+                let thread_id = thread_id
+                    .as_str()
+                    .context("Codex thread/loaded/list returned a non-string thread id")?;
+                Ok::<_, anyhow::Error>(found || thread_id == expected_thread_id)
+            })?;
+            if contains_expected {
+                return Ok(());
+            }
+            break;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "controlled Codex TUI did not load preserved thread {expected_thread_id} before control resume"
+        );
+        thread::sleep(remaining.min(CONTROL_POLL));
+    }
+}
+
 #[derive(Debug)]
 enum ControlEvent {
     Bound,
@@ -1454,11 +1526,13 @@ fn pump_control(
                 CodexInboxDelivery::new(config, delivery_state_path.clone(), runtime.clone())
             })
             .transpose()?;
+        websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
         if let Some(thread_id) = expected_resume {
             resume_ready
                 .context("saved Codex binding has no TUI-start gate")?
                 .recv()
                 .context("controlled Codex TUI ended before control resume")?;
+            wait_for_tui_loaded_thread(&mut websocket, thread_id, STARTUP_TIMEOUT)?;
             write_json_message(
                 &mut websocket,
                 &json!({
@@ -1469,7 +1543,6 @@ fn pump_control(
             )?;
             subscription_pending = true;
         }
-        websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
         loop {
             let message = match poll_json_message(&mut websocket)? {
                 ControlRead::Message(message) => Some(message),
@@ -2590,6 +2663,17 @@ mod tests {
                 read_json_message(&mut websocket).unwrap().unwrap()["method"],
                 "initialized"
             );
+            let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            assert_eq!(loaded["id"], CONTROL_TUI_LOADED_REQUEST_ID);
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": ["thread-main"] }
+                }),
+            )
+            .unwrap();
             let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(subscribe["method"], "thread/resume");
             write_json_message(
@@ -2770,7 +2854,7 @@ mod tests {
     }
 
     #[test]
-    fn expected_resume_waits_for_tui_gate_and_binds_from_control_response() {
+    fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2795,6 +2879,10 @@ mod tests {
                 ControlRead::Timeout
             ));
             pre_gate_checked_tx.send(()).unwrap();
+            websocket
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
             write_json_message(
                 &mut websocket,
                 &json!({
@@ -2813,6 +2901,27 @@ mod tests {
                         "threadId": "thread-unrelated",
                         "status": { "type": "active", "activeFlags": [] }
                     }
+                }),
+            )
+            .unwrap();
+            let first_loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(first_loaded["method"], "thread/loaded/list");
+            assert_eq!(first_loaded["id"], CONTROL_TUI_LOADED_REQUEST_ID);
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": ["thread-unrelated"] }
+                }),
+            )
+            .unwrap();
+            let second_loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(second_loaded["method"], "thread/loaded/list");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": ["thread-unrelated", "thread-prior"] }
                 }),
             )
             .unwrap();
@@ -2903,6 +3012,16 @@ mod tests {
                 read_json_message(&mut websocket).unwrap().unwrap()["method"],
                 "initialized"
             );
+            let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": ["thread-prior"] }
+                }),
+            )
+            .unwrap();
             let resume = read_json_message(&mut websocket).unwrap().unwrap();
             assert_eq!(resume["method"], "thread/resume");
             assert_eq!(resume["params"]["threadId"], "thread-prior");
