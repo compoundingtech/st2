@@ -35,11 +35,12 @@ impl SoftWrapCandidates {
 
 /// Enumerate the two logical strings possible at each renderer-shaped soft-wrap row: the TUI either
 /// discarded one inter-word space or split a token. Current 80-column Codex/Claude composers wrap
-/// long DING rows at 70+ content cells and indent continuations by exactly two cells. Short or
-/// unfamiliar multiline input is unsupported rather than positive mismatch evidence.
+/// long DING rows and indent continuations by exactly two cells. The caller supplies the minimum
+/// width that proves a wrap boundary for its renderer. Short or unfamiliar multiline input is
+/// unsupported rather than positive mismatch evidence.
 pub(super) fn logical_soft_wrap_candidates(
     input: &str,
-    minimum_first_content_chars: usize,
+    minimum_previous_content_chars: usize,
 ) -> SoftWrapCandidates {
     let rows: Vec<&str> = input.lines().collect();
     let Some(first) = rows.first() else {
@@ -51,7 +52,7 @@ pub(super) fn logical_soft_wrap_candidates(
     let mut candidates = vec![(*first).to_string()];
     let mut previous = *first;
     for (index, row) in rows[1..].iter().enumerate() {
-        let required_previous_width = minimum_first_content_chars + usize::from(index > 0) * 2;
+        let required_previous_width = minimum_previous_content_chars + usize::from(index > 0) * 2;
         if previous.chars().count() < required_previous_width
             || !row.starts_with("  ")
             || row.trim().is_empty()

@@ -121,7 +121,9 @@ fn located_bottom_claude_composer(plain: &str) -> Option<(usize, SoftWrapCandida
         .chain(rows[1..].iter().map(|row| row.trim_end()))
         .collect::<Vec<_>>()
         .join("\n");
-    let candidates = logical_soft_wrap_candidates(&input, 70);
+    // Claude word-wraps before the next word when it does not fit, so the preceding row may be
+    // short. The two-cell continuation indent and non-empty content prove each wrap boundary.
+    let candidates = logical_soft_wrap_candidates(&input, 1);
     let footer = lines[bottom + 1..].join("\n");
     // `top + 1` is the composer's first row, which is what the router compares against the Codex
     // composer's row to find the lower — and therefore live — of the two.

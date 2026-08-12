@@ -59,6 +59,15 @@ differently from typed input, so recognizing it relies on a text grammar a human
 could in principle type; an empty composer cannot be confused with a human
 draft, because a draft is not empty.
 
+## Composer contents
+
+Claude word-wraps before a word that does not fit, so the row before a
+continuation can be shorter than the composer width. Each non-empty continuation
+starts with the renderer's two-cell indent. The adapter treats that indent as a
+wrap boundary and enumerates the logical strings described in
+[`../spec.md`](../spec.md). Exact comparison against the expected notice remains
+the positive proof; an unfamiliar continuation shape remains unsupported.
+
 ## Post-submit receipt
 
 The exact notice as the complete lowest live composer is `RetainedSafe` only
