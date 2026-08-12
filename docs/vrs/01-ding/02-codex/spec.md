@@ -33,6 +33,25 @@ particular, an authored project-trust override must reach the server that loads
 project-local config and hooks; forwarding it only to the TUI is a delivery
 configuration error.
 
+Codex 0.145.0 and 0.146.0 do not apply
+`--dangerously-bypass-hook-trust` to the startup review of a persistent remote
+resume. When that flag is authored for a resumed session, st2 must use a
+bounded hook-trust preflight before it starts the TUI. The preflight starts the
+same exact app-server binary with the same effective authored configuration. It
+calls typed `hooks/list` for the controlled workspace and reads the exact hook
+key, current hash, managed state, and trust state. It then stops only that owned
+preflight process.
+
+The final app server receives a session-only `hooks.state` projection for each
+hook that the provider reports as `untrusted` or `modified`. The projection
+contains only the provider key and its exact current hash. It does not persist
+hook trust or change user configuration. Hooks that are already `trusted` or
+`managed` are not projected. A rejected request, a different working
+directory, an unknown trust state, a missing typed field, or conflicting hashes
+must stop launch before the TUI starts. The wrapper trace records the preflight
+stages and projected hook count, but it must not record hook keys, commands, or
+hashes. Without the authored bypass flag, st2 must not create this projection.
+
 For a new session, st2 records the thread ID from `thread/started`. For a
 resumed session, st2 starts the TUI with the recorded thread ID. Its initialized
 control client calls `thread/loaded/list` until the result contains that exact
@@ -178,6 +197,10 @@ all of these results against the same app server and control client:
 - The resumed TUI consumes its authored initial prompt and runs its
   `SessionStart` resume hook. A started process or a successful control resume
   is not sufficient evidence.
+- For a resumed session with authored hook-trust bypass, a typed preflight
+  projects the exact current hook hashes for that invocation. The TUI does not
+  stop at hook review, the hooks run, and the user configuration remains
+  byte-identical.
 - An idle inbox message produces one typed `turn/start` user message and
   observable agent work.
 - A message during a regular active turn produces one typed `turn/steer` user
