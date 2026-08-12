@@ -86,7 +86,11 @@ pub fn compile_generated_tasks(
     context: &TaskCompileContext,
 ) -> Result<()> {
     compile_generated_ding_tasks(specs, this_host, context)?;
-    compile_app_server_agent_tasks(specs, this_host, context)
+    compile_app_server_agent_tasks(specs, this_host, context)?;
+    // Claude's MCP server is declared to Claude itself.  It must not be lowered
+    // to an st2-owned companion task: that would give the supervisor a second
+    // lifetime to manage and break session ownership across restart.
+    Ok(())
 }
 
 /// Replace only runner-generated DING markers with exact direct argv. Authored tasks never carry
