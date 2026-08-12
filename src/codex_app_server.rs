@@ -359,6 +359,9 @@ impl CodexInboxDelivery {
         if !due {
             return Ok(());
         }
+        // Native delivery owns the live provider session, so it also owns the
+        // presence lease. Preserve busy/available and let dnd age out.
+        let _ = status::refresh(&status::status_path(&self.config.agent_dir));
         let unread = message::list_inbox(&self.config.inbox)?;
         if self.state.as_ref().is_some_and(|state| {
             unread
