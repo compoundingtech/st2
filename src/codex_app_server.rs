@@ -9,6 +9,7 @@
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -42,6 +43,7 @@ const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
+const HOOK_TRUST_PREFLIGHT_REQUEST_ID: u64 = 1;
 // The inner provider result must reach the wrapper before the outer ownership wait expires.
 const TUI_LOADED_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1004,7 +1006,20 @@ fn run_controlled_owned(
         .mode(0o600)
         .open(state_dir.join("app-server.log"))?;
     let endpoint = format!("unix://{}", socket_path.display());
-    let server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
+    let mut server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
+    if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..]) {
+        let hook_cwd = controlled_hook_cwd(&codex_argv[1..])?;
+        if let Some(projection) = preflight_hook_trust(
+            &codex_argv[0],
+            &server_args,
+            &socket_path,
+            &hook_cwd,
+            &log,
+            diagnostics,
+        )? {
+            insert_app_server_config_override(&mut server_args, projection.override_value)?;
+        }
+    }
     diagnostics.record("appServerStarting", json!({}))?;
     let mut server = Command::new(&codex_argv[0])
         .args(server_args)
@@ -1190,6 +1205,228 @@ fn controlled_app_server_args(endpoint: &str, authored_args: &[String]) -> Resul
     }
     args.extend(["--listen".to_string(), endpoint.to_string()]);
     Ok(args)
+}
+
+fn authored_bypasses_hook_trust(authored_args: &[String]) -> bool {
+    authored_args
+        .iter()
+        .any(|argument| argument == "--dangerously-bypass-hook-trust")
+}
+
+/// Resolve the workspace whose non-managed hooks the remote TUI reviews before a resume.
+///
+/// st2 starts the wrapper in the declared workspace. An explicit Codex `--cd`/`-C` overrides it,
+/// and the last occurrence wins just as the provider CLI does. The path must already exist because
+/// both project-layer discovery and remote resume require a real directory.
+fn controlled_hook_cwd(authored_args: &[String]) -> Result<PathBuf> {
+    let boundary = interactive_root_prefix_end(authored_args)?;
+    let mut selected = std::env::current_dir().context("reading controlled Codex workspace")?;
+    let mut index = 0;
+    while index < boundary {
+        let argument = authored_args[index].as_str();
+        if matches!(argument, "-C" | "--cd") {
+            selected = PathBuf::from(&authored_args[index + 1]);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--cd=") {
+            selected = PathBuf::from(value);
+        } else if let Some(value) = argument.strip_prefix("-C")
+            && !value.is_empty()
+        {
+            selected = PathBuf::from(value);
+        }
+        index += if matches!(
+            argument,
+            "-c" | "--config"
+                | "--enable"
+                | "--disable"
+                | "--remote-auth-token-env"
+                | "-m"
+                | "--model"
+                | "--local-provider"
+                | "-p"
+                | "--profile"
+                | "-s"
+                | "--sandbox"
+                | "--add-dir"
+                | "-a"
+                | "--ask-for-approval"
+        ) {
+            2
+        } else {
+            1
+        };
+    }
+    if selected.is_relative() {
+        selected = std::env::current_dir()
+            .context("reading controlled Codex workspace")?
+            .join(selected);
+    }
+    fs::canonicalize(&selected).with_context(|| {
+        format!(
+            "resolving controlled Codex workspace {}",
+            selected.display()
+        )
+    })
+}
+
+#[derive(Debug)]
+struct HookTrustProjection {
+    override_value: String,
+    count: usize,
+}
+
+/// Codex 0.145/0.146 deliberately ignores the hook-trust bypass for startup review on every
+/// persistent remote resume. Before the owning TUI starts, ask the same exact provider binary for
+/// its typed hook keys and hashes, then project those hashes into the final app-server's session
+/// flags. This implements the authored one-invocation bypass without writing persisted trust.
+fn preflight_hook_trust(
+    codex: &str,
+    server_args: &[String],
+    socket_path: &Path,
+    cwd: &Path,
+    log: &File,
+    diagnostics: &mut WrapperDiagnostics,
+) -> Result<Option<HookTrustProjection>> {
+    diagnostics.record("hookTrustPreflightStarting", json!({}))?;
+    let mut server = Command::new(codex)
+        .args(server_args)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log.try_clone()?)
+        .spawn()
+        .with_context(|| format!("starting {codex} hook-trust preflight app-server"))?;
+    let result = diagnostics
+        .record("hookTrustPreflightStarted", json!({ "pid": server.id() }))
+        .and_then(|_| {
+            let control = connect_control(&mut server, socket_path, STARTUP_TIMEOUT)?;
+            let mut websocket = initialize_control(control)?;
+            query_hook_trust_projection(&mut websocket, cwd)
+        });
+    terminate_child(&mut server);
+    let _ = fs::remove_file(socket_path);
+    let projection = result?;
+    diagnostics.record(
+        "hookTrustPreflightComplete",
+        json!({ "projectedHookCount": projection.as_ref().map_or(0, |value| value.count) }),
+    )?;
+    Ok(projection)
+}
+
+fn query_hook_trust_projection(
+    websocket: &mut WebSocket<UnixStream>,
+    cwd: &Path,
+) -> Result<Option<HookTrustProjection>> {
+    write_json_message(
+        websocket,
+        &json!({
+            "method": "hooks/list",
+            "id": HOOK_TRUST_PREFLIGHT_REQUEST_ID,
+            "params": { "cwds": [cwd.to_string_lossy()] },
+        }),
+    )?;
+    websocket
+        .get_ref()
+        .set_read_timeout(Some(STARTUP_TIMEOUT))?;
+    let response = loop {
+        let message = read_json_message(websocket)?
+            .context("Codex app-server closed during hook-trust preflight")?;
+        if message.get("id") == Some(&Value::from(HOOK_TRUST_PREFLIGHT_REQUEST_ID)) {
+            break message;
+        }
+    };
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("Codex app-server rejected hooks/list preflight: {error}");
+    }
+    hook_trust_projection_from_response(&response, cwd)
+}
+
+fn hook_trust_projection_from_response(
+    response: &Value,
+    cwd: &Path,
+) -> Result<Option<HookTrustProjection>> {
+    let data = response
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .context("Codex hooks/list preflight response has no typed data")?;
+    anyhow::ensure!(
+        data.len() == 1,
+        "Codex hooks/list preflight returned {} cwd entries instead of one",
+        data.len()
+    );
+    let entry = &data[0];
+    anyhow::ensure!(
+        entry.get("cwd").and_then(Value::as_str) == Some(cwd.to_string_lossy().as_ref()),
+        "Codex hooks/list preflight returned a different cwd"
+    );
+    let hooks = entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .context("Codex hooks/list preflight cwd entry has no typed hooks")?;
+    let mut projected = BTreeMap::new();
+    for hook in hooks {
+        let status = hook
+            .get("trustStatus")
+            .and_then(Value::as_str)
+            .context("Codex hooks/list preflight hook has no trustStatus")?;
+        match status {
+            "trusted" | "managed" => continue,
+            "untrusted" | "modified" => {}
+            other => {
+                anyhow::bail!("Codex hooks/list preflight returned unknown trustStatus '{other}'")
+            }
+        }
+        anyhow::ensure!(
+            hook.get("isManaged").and_then(Value::as_bool) == Some(false),
+            "Codex hooks/list preflight returned a managed hook requiring trust"
+        );
+        let key = hook
+            .get("key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("Codex hooks/list preflight hook has no non-empty key")?;
+        let current_hash = hook
+            .get("currentHash")
+            .and_then(Value::as_str)
+            .filter(|value| value.starts_with("sha256:") && value.len() > "sha256:".len())
+            .context("Codex hooks/list preflight hook has no typed currentHash")?;
+        if let Some(previous) = projected.insert(key.to_string(), current_hash.to_string()) {
+            anyhow::ensure!(
+                previous == current_hash,
+                "Codex hooks/list preflight returned conflicting hashes for one hook key"
+            );
+        }
+    }
+    if projected.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = toml::Table::new();
+    for (key, current_hash) in projected {
+        let mut trust = toml::Table::new();
+        trust.insert(
+            "trusted_hash".to_string(),
+            toml::Value::String(current_hash),
+        );
+        state.insert(key, toml::Value::Table(trust));
+    }
+    Ok(Some(HookTrustProjection {
+        count: state.len(),
+        override_value: format!("hooks.state={}", toml::Value::Table(state)),
+    }))
+}
+
+fn insert_app_server_config_override(
+    server_args: &mut Vec<String>,
+    override_value: String,
+) -> Result<()> {
+    let listen = server_args
+        .iter()
+        .position(|argument| argument == "--listen")
+        .context("controlled Codex app-server argv has no --listen boundary")?;
+    server_args.splice(listen..listen, ["-c".to_string(), override_value]);
+    Ok(())
 }
 
 fn controlled_tui_args(
@@ -3578,6 +3815,142 @@ mod tests {
                 "unix:///server.sock",
             ]
         );
+    }
+
+    #[test]
+    fn remote_resume_projects_exact_hook_hashes_without_persisted_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let source = cwd.join(".codex/hooks.json");
+        let untrusted_key = format!("{}:session_start:0:0", source.display());
+        let modified_key = format!("{}:stop:1:0", source.display());
+        let response = json!({
+            "id": HOOK_TRUST_PREFLIGHT_REQUEST_ID,
+            "result": {
+                "data": [{
+                    "cwd": cwd,
+                    "hooks": [
+                        {
+                            "key": untrusted_key,
+                            "currentHash": "sha256:one",
+                            "trustStatus": "untrusted",
+                            "isManaged": false,
+                            "enabled": true
+                        },
+                        {
+                            "key": modified_key,
+                            "currentHash": "sha256:two",
+                            "trustStatus": "modified",
+                            "isManaged": false,
+                            "enabled": false
+                        },
+                        {
+                            "key": "already-trusted",
+                            "currentHash": "sha256:three",
+                            "trustStatus": "trusted",
+                            "isManaged": false,
+                            "enabled": true
+                        },
+                        {
+                            "key": "managed",
+                            "currentHash": "sha256:four",
+                            "trustStatus": "managed",
+                            "isManaged": true,
+                            "enabled": true
+                        }
+                    ]
+                }]
+            }
+        });
+
+        let projection = hook_trust_projection_from_response(&response, &cwd)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.count, 2);
+        let parsed: toml::Value = toml::from_str(&projection.override_value).unwrap();
+        let state = parsed
+            .get("hooks")
+            .and_then(|hooks| hooks.get("state"))
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        assert_eq!(
+            state[&untrusted_key]["trusted_hash"].as_str(),
+            Some("sha256:one")
+        );
+        assert_eq!(
+            state[&modified_key]["trusted_hash"].as_str(),
+            Some("sha256:two")
+        );
+        assert!(!state.contains_key("already-trusted"));
+        assert!(!state.contains_key("managed"));
+
+        let mut args = controlled_app_server_args(
+            "unix:///server.sock",
+            &["--dangerously-bypass-hook-trust".into(), "boot".into()],
+        )
+        .unwrap();
+        insert_app_server_config_override(&mut args, projection.override_value).unwrap();
+        assert_eq!(args[args.len() - 4], "-c");
+        assert!(args[args.len() - 3].starts_with("hooks.state="));
+        assert_eq!(&args[args.len() - 2..], ["--listen", "unix:///server.sock"]);
+    }
+
+    #[test]
+    fn hook_trust_projection_fails_closed_on_provider_shape_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let response = json!({
+            "result": {
+                "data": [{
+                    "cwd": cwd,
+                    "hooks": [{
+                        "key": "hook",
+                        "currentHash": "not-a-provider-hash",
+                        "trustStatus": "untrusted",
+                        "isManaged": false
+                    }]
+                }]
+            }
+        });
+        let error = hook_trust_projection_from_response(&response, &cwd).unwrap_err();
+        assert!(error.to_string().contains("typed currentHash"));
+
+        let response = json!({
+            "result": {
+                "data": [{
+                    "cwd": cwd,
+                    "hooks": [{
+                        "key": "hook",
+                        "currentHash": "sha256:value",
+                        "trustStatus": "future-status",
+                        "isManaged": false
+                    }]
+                }]
+            }
+        });
+        let error = hook_trust_projection_from_response(&response, &cwd).unwrap_err();
+        assert!(error.to_string().contains("unknown trustStatus"));
+    }
+
+    #[test]
+    fn hook_preflight_uses_the_explicit_controlled_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let explicit = tmp.path().join("workspace");
+        fs::create_dir(&explicit).unwrap();
+        assert_eq!(
+            controlled_hook_cwd(&[
+                "--dangerously-bypass-hook-trust".into(),
+                "--cd".into(),
+                explicit.display().to_string(),
+                "boot".into(),
+            ])
+            .unwrap(),
+            fs::canonicalize(explicit).unwrap()
+        );
+        assert!(authored_bypasses_hook_trust(&[
+            "--dangerously-bypass-hook-trust".into(),
+            "boot".into()
+        ]));
     }
 
     #[test]
