@@ -1,5 +1,9 @@
 # Codex harness specification
 
+This document describes the transport as implemented today. The intended destination is that st2
+writes inbox files and a watcher owned by the session pushes them into the provider channel, as
+specified for Claude. The control protocol described below is expected to be replaced by that shape.
+
 The screen grammar by which DING recognizes a Codex composer. It realizes
 [`../requirements.md`](../requirements.md) through the mechanism in
 [`../spec.md`](../spec.md).
