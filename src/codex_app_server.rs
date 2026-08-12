@@ -1007,7 +1007,7 @@ fn run_controlled_owned(
         .open(state_dir.join("app-server.log"))?;
     let endpoint = format!("unix://{}", socket_path.display());
     let mut server_args = controlled_app_server_args(&endpoint, &codex_argv[1..])?;
-    if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..]) {
+    if resume_thread.is_some() && authored_bypasses_hook_trust(&codex_argv[1..])? {
         let hook_cwd = controlled_hook_cwd(&codex_argv[1..])?;
         if let Some(projection) = preflight_hook_trust(
             &codex_argv[0],
@@ -1207,10 +1207,11 @@ fn controlled_app_server_args(endpoint: &str, authored_args: &[String]) -> Resul
     Ok(args)
 }
 
-fn authored_bypasses_hook_trust(authored_args: &[String]) -> bool {
-    authored_args
+fn authored_bypasses_hook_trust(authored_args: &[String]) -> Result<bool> {
+    let boundary = interactive_root_prefix_end(authored_args)?;
+    Ok(authored_args[..boundary]
         .iter()
-        .any(|argument| argument == "--dangerously-bypass-hook-trust")
+        .any(|argument| argument == "--dangerously-bypass-hook-trust"))
 }
 
 /// Resolve the workspace whose non-managed hooks the remote TUI reviews before a resume.
@@ -3947,10 +3948,17 @@ mod tests {
             .unwrap(),
             fs::canonicalize(explicit).unwrap()
         );
-        assert!(authored_bypasses_hook_trust(&[
-            "--dangerously-bypass-hook-trust".into(),
-            "boot".into()
-        ]));
+        assert!(
+            authored_bypasses_hook_trust(&[
+                "--dangerously-bypass-hook-trust".into(),
+                "boot".into()
+            ])
+            .unwrap()
+        );
+        assert!(
+            !authored_bypasses_hook_trust(&["--".into(), "--dangerously-bypass-hook-trust".into()])
+                .unwrap()
+        );
     }
 
     #[test]
