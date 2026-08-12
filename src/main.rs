@@ -125,6 +125,12 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         codex_argv: Vec<String>,
     },
+    /// Internal Claude MCP channel server started by Claude from its rendered project declaration.
+    #[command(hide = true)]
+    ClaudeMcp {
+        #[arg(long)]
+        identity: String,
+    },
     /// Get or set an agent's presence status. No `--set` prints the status; no identity means yours
     /// (`$ST_AGENT`). Settable: offline | available | busy | away | dnd (`unknown` is derived).
     Status {
@@ -844,6 +850,11 @@ fn main() -> Result<()> {
                 runtime_id,
                 codex_argv,
             )
+        }
+        Command::ClaudeMcp { identity } => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
         }
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
