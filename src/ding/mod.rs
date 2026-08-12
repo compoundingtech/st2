@@ -2369,6 +2369,49 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
+    fn claude_word_wraps_preserve_short_rows_before_continuations() {
+        let expected = "[DING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the composer word wrapping behavior (from dev3.dotfiles.st2.main.orchestration); check your inbox [id:abc123]";
+        let rule = claude_rule();
+        let screen = format!(
+            "Claude Code v2.1.220\r\n{rule}\r\n\
+             ❯\u{00a0}[DING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the\r\n  \
+             composer word wrapping behavior (from\r\n  \
+             dev3.dotfiles.st2.main.orchestration); check your inbox\r\n  \
+             [id:abc123]\r\n{rule}\r\n\
+             ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+
+        assert_eq!(
+            classify_composer(&screen, expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_receipt(&screen, expected),
+            ReceiptState::RetainedSafe
+        );
+
+        let human_draft = screen.replace("composer word", "human draft");
+        assert_eq!(
+            classify_composer(&human_draft, expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_receipt(&human_draft, expected),
+            ReceiptState::NotRetained
+        );
+
+        let unfamiliar_shape = screen.replace("\r\n  composer", "\r\ncomposer");
+        assert_eq!(
+            classify_composer(&unfamiliar_shape, expected),
+            ComposerState::Ambiguous
+        );
+        assert_eq!(
+            classify_receipt(&unfamiliar_shape, expected),
+            ReceiptState::Unproven
+        );
+    }
+
+    #[test]
     fn preserved_clean_codex_context_footer_is_idle() {
         // Composer-to-end slice of clean zero-turn capture bb1eddba2725672287e4a73b0aaf50652250611566d9826977dc3c6639d70360.
         let screen = "\x1b[1m›\x1b[22m \x1b[2mImprove documentation in @filename\r\n\x1b[22m \r\n\x1b[0m\x1b[2X\x1b[2C\x1b[38;2;246;226;183mgpt-5.6-sol low\x1b[39;2m · \x1b[38;2;242;181;144;22mContext 0% used\x1b[45X\x1b[2A\x1b[33D\x1b[0m\x1b[?2004h\x1b[?1004h\x1b[?1049l\x1b[?1l\x1b[?7h\x1b[?6l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?25h\x1b[?2004l\x1b[4l\x1b[r\x1b[0m\x1b[0 q\x1b>\x1b(B\x1b[<99u\x1b[999;1H\n";
@@ -2743,7 +2786,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn unsupported_composer_wraps_are_unproven_receipts() {
+    fn renderer_specific_wrap_proofs_keep_unfamiliar_codex_rows_unproven() {
         let text = "[DING] ? cos: receipt truth [id:abc123]";
         let (first, continuation) = text.split_at(32);
         let codex = format!(
@@ -2761,8 +2804,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 classify_receipt(&codex, text),
                 classify_receipt(&claude, text),
             ),
-            (ReceiptState::Unproven, ReceiptState::Unproven),
-            "unsupported wraps cannot prove that the notice disappeared"
+            (ReceiptState::Unproven, ReceiptState::RetainedSafe),
+            "Claude word-wraps at short rows, while Codex requires its full-width boundary"
         );
         assert_eq!(
             classify_receipt(&human_codex_screen(), text),
