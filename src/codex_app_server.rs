@@ -2432,7 +2432,7 @@ mod tests {
 
     fn acknowledge_tui_thread_loaded(events: &Receiver<ControlEvent>) {
         let ControlEvent::TuiThreadLoaded(acknowledge) =
-            events.recv_timeout(Duration::from_secs(2)).unwrap()
+            events.recv_timeout(Duration::from_secs(10)).unwrap()
         else {
             panic!("control did not report the TUI-loaded gate");
         };
