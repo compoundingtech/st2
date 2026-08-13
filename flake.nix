@@ -123,6 +123,8 @@
             "hooks"
             "--test"
             "run"
+            "--test"
+            "message_cli"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
