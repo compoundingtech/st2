@@ -580,6 +580,29 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     assert!(output.stdout.is_empty());
     let retry = send_message(tmp.path(), "sender", "recipient", "committed", &[]);
     assert!(!retry.status.success(), "recovery must not commit the same row twice");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    assert!(send_message(tmp.path(), "sender", "recipient", "older", &[])
+        .status
+        .success());
+    assert!(send_message(tmp.path(), "sender", "recipient", "newer", &[])
+        .status
+        .success());
+    let messages = tmp.path().join("h/sender/resources/sent/messages");
+    let mut rows = fs::read_dir(&messages)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    rows.sort();
+    let pending = tmp.path().join("h/sender/resources/sent/pending");
+    fs::copy(&rows[0], pending.join(rows[0].file_name().unwrap())).unwrap();
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(!output.status.success(), "older committed row cannot become pending again");
+    assert!(output.stdout.is_empty());
+    let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
+    assert!(!retry.status.success(), "recovery must not recommit an older row");
 }
 
 #[test]

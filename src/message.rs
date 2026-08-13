@@ -520,7 +520,7 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         && let [record] = pending.as_slice()
     {
         anyhow::ensure!(
-            !head_tip_commits(root, &head, &record.filename)?,
+            !sent_record_exists(root, &record.filename)?,
             "committed pending intent is missing its active marker"
         );
     }
@@ -1550,7 +1550,7 @@ fn recover_active(
         (None, []) => return Ok(Vec::new()),
         (None, [record]) => {
             anyhow::ensure!(
-                !head_tip_commits(root, head, &record.filename)?,
+                !sent_record_exists(root, &record.filename)?,
                 "committed pending intent is missing its active marker"
             );
             publish_active(root, record)?;
@@ -1644,6 +1644,21 @@ fn read_sent_record(root: &Path, filename: &str) -> anyhow::Result<SentRecord> {
     anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
     anyhow::ensure!(record.filename == filename, "sent record filename does not match payload");
     Ok(record)
+}
+
+fn sent_record_exists(root: &Path, filename: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(is_message_filename(filename), "invalid sent record filename");
+    let path = root
+        .join(SENT_MESSAGES)
+        .join(sent_record_name(filename));
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(metadata.is_file(), "sent record path is not a file");
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::Result<()> {
