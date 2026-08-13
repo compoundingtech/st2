@@ -3139,10 +3139,8 @@ mod tests {
                 tx,
             )
         });
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            ControlEvent::Bound
-        ));
+        let first_event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(first_event, ControlEvent::Bound), "first control event: {first_event:?}");
         server.join().unwrap();
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
