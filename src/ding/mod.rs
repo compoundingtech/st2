@@ -2369,6 +2369,58 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
+    fn codex_word_wraps_preserve_short_rows_before_continuations() {
+        let expected = "[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source consistency complete (from dev3.compoundingtech.st2.message-sent.orchestration); check your inbox";
+        let screen = "\x1b[1m›\x1b[1C\x1b[0m[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source\r\n  consistency complete (from dev3.compoundingtech.st2.message-\r\n  sent.orchestration); check your inbox\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace";
+
+        assert_eq!(
+            classify_composer(screen, expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_receipt(screen, expected),
+            ReceiptState::RetainedSafe
+        );
+
+        let human_draft = screen.replace("light-work receipt", "human draft");
+        assert_eq!(
+            classify_composer(&human_draft, expected),
+            ComposerState::Changed
+        );
+        assert_eq!(
+            classify_receipt(&human_draft, expected),
+            ReceiptState::NotRetained
+        );
+
+        let unfamiliar_shape = screen.replace("\r\n  consistency", "\r\nconsistency");
+        assert_eq!(
+            classify_composer(&unfamiliar_shape, expected),
+            ComposerState::Ambiguous
+        );
+        assert_eq!(
+            classify_receipt(&unfamiliar_shape, expected),
+            ReceiptState::Unproven
+        );
+    }
+
+    #[test]
+    fn codex_hard_newline_shape_is_knowingly_admitted_until_issue_250() {
+        let expected = "[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source consistency complete (from dev3.compoundingtech.st2.message-sent.orchestration); check your inbox";
+        // A buffer containing hard newlines plus two literal spaces renders identically to this
+        // soft wrap. The screen-only ambiguity is accepted until https://github.com/compoundingtech/st2/issues/250.
+        let screen = "\x1b[1m›\x1b[1C\x1b[0m[DING] new st2 message: [id:7j8b6n] re: Q97 light-work receipt: VRS/source\r\n  consistency complete (from dev3.compoundingtech.st2.message-\r\n  sent.orchestration); check your inbox\r\n\r\n\x1b[2C\x1b[0mgpt-5.6-sol xhigh · /workspace";
+
+        assert_eq!(
+            classify_composer(screen, expected),
+            ComposerState::ExactSafe
+        );
+        assert_eq!(
+            classify_receipt(screen, expected),
+            ReceiptState::RetainedSafe
+        );
+    }
+
+    #[test]
     fn claude_word_wraps_preserve_short_rows_before_continuations() {
         let expected = "[DING] ? dev3.dotfiles.st2.claude-composer.worker: inspect the composer word wrapping behavior (from dev3.dotfiles.st2.main.orchestration); check your inbox [id:abc123]";
         let rule = claude_rule();
@@ -2786,7 +2838,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn renderer_specific_wrap_proofs_keep_unfamiliar_codex_rows_unproven() {
+    fn soft_wrap_proofs_accept_short_known_continuations() {
         let text = "[DING] ? cos: receipt truth [id:abc123]";
         let (first, continuation) = text.split_at(32);
         let codex = format!(
@@ -2804,8 +2856,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
                 classify_receipt(&codex, text),
                 classify_receipt(&claude, text),
             ),
-            (ReceiptState::Unproven, ReceiptState::RetainedSafe),
-            "Claude word-wraps at short rows, while Codex requires its full-width boundary"
+            (ReceiptState::RetainedSafe, ReceiptState::RetainedSafe),
+            "both maintained composers prove short rows with their two-cell continuation indent"
         );
         assert_eq!(
             classify_receipt(&human_codex_screen(), text),

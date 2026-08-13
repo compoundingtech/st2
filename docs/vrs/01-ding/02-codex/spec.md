@@ -46,7 +46,14 @@ input. An empty composer proves emptiness directly from the empty-composer
 markers rather than by inspecting recovered text.
 
 Comparison against the expected notice uses the shared soft-wrap candidate
-enumeration in [`../spec.md`](../spec.md).
+enumeration in [`../spec.md`](../spec.md). Codex can wrap after a hyphen when
+the next chunk does not fit, so the row before a continuation can be shorter
+than the composer width. Each non-empty continuation starts with the renderer's
+two-cell indent. The adapter treats that indent as a wrap boundary, although
+screen pixels cannot distinguish it from a hard newline followed by two literal
+spaces. This knowingly admitted ambiguity is tracked in
+[#250](https://github.com/compoundingtech/st2/issues/250). An unfamiliar
+continuation shape remains unsupported.
 
 ## Post-submit receipt
 
