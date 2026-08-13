@@ -2253,11 +2253,24 @@ fn write_json_message(websocket: &mut WebSocket<UnixStream>, value: &Value) -> R
 }
 
 fn read_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<Option<Value>> {
+    // Darwin reports a timed Unix-socket read as EAGAIN/EWOULDBLOCK.  During
+    // handshake the peer may briefly be descheduled; treat that transient as
+    // retryable instead of turning scheduler timing into a protocol failure.
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let message = match websocket.read() {
             Ok(message) => message,
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                 return Ok(None);
+            }
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+                continue;
             }
             Err(error) => return Err(error.into()),
         };
