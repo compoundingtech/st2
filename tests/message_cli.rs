@@ -204,6 +204,73 @@ fn replies_are_indexed_with_the_canonical_recipient_and_thread_relation() {
 }
 
 #[test]
+fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+
+    let original = send_message(tmp.path(), "recipient", "sender", "question", &[]);
+    assert!(original.status.success());
+    let original = String::from_utf8(original.stdout).unwrap().trim().to_string();
+    let first = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "reply", &original, "--root"])
+        .arg(tmp.path())
+        .args([
+            "--host",
+            "h",
+            "--as",
+            "sender",
+            "--idempotency-key",
+            "answer-once",
+            "-m",
+            "answer",
+        ])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "active-cleanup")
+        .output()
+        .unwrap();
+    assert!(!first.status.success(), "first reply must simulate lost output");
+    let recipient_inbox = tmp.path().join("h/recipient/resources/inbox");
+    let reply_filename = fs::read_dir(&recipient_inbox)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
+
+    let archived = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "archive", &original, "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender"])
+        .output()
+        .unwrap();
+    assert!(archived.status.success());
+    let retry = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "reply", &original, "--root"])
+        .arg(tmp.path())
+        .args([
+            "--host",
+            "h",
+            "--as",
+            "sender",
+            "--idempotency-key",
+            "answer-once",
+            "-m",
+            "answer",
+        ])
+        .output()
+        .unwrap();
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    assert_eq!(String::from_utf8_lossy(&retry.stdout).trim(), reply_filename);
+    assert_eq!(fs::read_dir(recipient_inbox).unwrap().count(), 1);
+    assert_eq!(
+        String::from_utf8_lossy(&sent(tmp.path(), "sender", &["--count"]).stdout).trim(),
+        "1"
+    );
+}
+
+#[test]
 fn keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates() {
     for crash_after in [
         "coverage",
@@ -375,7 +442,9 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         let node = fs::read_dir(&commits).unwrap().next().unwrap().unwrap().path();
         match mutate {
             "missing-node" => fs::remove_file(&node).unwrap(),
-            "extra-node" => fs::copy(&node, commits.join("extra.json")).unwrap(),
+            "extra-node" => {
+                fs::copy(&node, commits.join("extra.json")).unwrap();
+            }
             "unexpected-node-entry" => fs::write(commits.join("unexpected"), "junk").unwrap(),
             "corrupt-node" => fs::write(&node, "not json").unwrap(),
             "unreadable-node" => {

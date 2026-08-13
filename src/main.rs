@@ -1992,6 +1992,13 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             let from = acting_id(&ctx)?;
             let my_inbox = resolve_message_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
+                .or_else(|inbox_error| {
+                    if my_inbox.join(&filename).try_exists()? {
+                        return Err(inbox_error);
+                    }
+                    let my_archive = message::resolve_archive(&root, &from, &host)?;
+                    message::read_msg(&my_archive, &filename)
+                })
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
                 .from
