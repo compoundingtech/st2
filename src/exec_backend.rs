@@ -898,7 +898,7 @@ fn process_created_at(start_time_ticks: u64) -> anyhow::Result<SystemTime> {
     Ok(UNIX_EPOCH + Duration::from_micros(start_time_ticks))
 }
 
-pub(crate) fn rfc3339_utc(time: SystemTime) -> anyhow::Result<String> {
+pub fn rfc3339_utc(time: SystemTime) -> anyhow::Result<String> {
     let duration = time.duration_since(UNIX_EPOCH)?;
     let seconds = duration.as_secs() as libc::time_t;
     let millis = duration.subsec_millis();

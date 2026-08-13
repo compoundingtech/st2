@@ -261,6 +261,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Emit a short-lived, fail-closed snapshot of runtime activity for Agent Spec workspaces.
+    /// This is read-only evidence for external cleanup planners, never deletion authority.
+    WorkspaceActivity {
+        /// Host whose declared workspaces and task generations to inspect. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Snapshot lifetime in seconds (1..=300). Consumers must reject a snapshot after
+        /// `expiresAt`.
+        #[arg(long, default_value_t = 60)]
+        ttl: u64,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Clear one task's park after fixing what crash-looped it. A task parked by its `restart{}`
     /// policy (mode=fail) stays parked for the rest of the supervisor run, and this is its per-task
     /// exit: the running supervisor relaunches exactly this task on its next pass, leaving every
@@ -996,6 +1010,13 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             tasks_cmd(&catalog, host)
         }
+        Command::WorkspaceActivity { host, ttl, json } => {
+            if !json {
+                anyhow::bail!("`st2 workspace-activity` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            workspace_activity_cmd(&catalog, host, ttl)
+        }
         Command::Unpark { task, host } => {
             let catalog = catalog_arg(None)?;
             unpark_cmd(&catalog, &task, host)
@@ -1571,6 +1592,17 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("task inventory incomplete")
+    }
+}
+
+fn workspace_activity_cmd(root: &Path, host: Option<String>, ttl: u64) -> Result<()> {
+    let host = host.unwrap_or_else(detect_host);
+    let snapshot = st2::workspace_activity::snapshot(root, &host, Duration::from_secs(ttl));
+    println!("{}", snapshot.to_json());
+    if snapshot.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("workspace activity snapshot incomplete")
     }
 }
 
