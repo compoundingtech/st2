@@ -1787,14 +1787,19 @@ fn pump_control(
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_state_path.clone(), runtime.clone())
             })
-            .transpose()?;
-        websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
+            .transpose()
+            .context("initializing Codex inbox delivery")?;
+        websocket
+            .get_ref()
+            .set_read_timeout(Some(CONTROL_POLL))
+            .context("setting Codex control poll timeout")?;
         if let Some(thread_id) = expected_resume {
             resume_ready
                 .context("saved Codex binding has no TUI-start gate")?
                 .recv()
                 .context("controlled Codex TUI ended before control resume")?;
-            wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)?;
+            wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)
+                .context("waiting for Codex TUI thread load")?;
             let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
             events
                 .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
@@ -1809,11 +1814,12 @@ fn pump_control(
                     "id": CONTROL_SUBSCRIBE_REQUEST_ID,
                     "params": { "threadId": thread_id }
                 }),
-            )?;
+            )
+            .context("sending Codex thread resume request")?;
             subscription_pending = true;
         }
         loop {
-            let message = match poll_json_message(&mut websocket)? {
+            let message = match poll_json_message(&mut websocket).context("polling Codex control socket")? {
                 ControlRead::Message(message) => Some(message),
                 ControlRead::Timeout => None,
                 ControlRead::Closed => {
@@ -1825,7 +1831,8 @@ fn pump_control(
                 if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut())
                     && let Some(request) = delivery.maybe_request(state)?
                 {
-                    write_json_message(&mut websocket, &request)?;
+                    write_json_message(&mut websocket, &request)
+                        .context("sending Codex delivery request")?;
                 }
                 continue;
             };
@@ -1842,10 +1849,10 @@ fn pump_control(
                     );
                     subscription_pending = false;
                     let mut bound = CodexControlState::new(runtime, thread_id.to_string());
-                    match bound.accept_subscription(&message)? {
+                    match bound.accept_subscription(&message).context("accepting Codex resume subscription")? {
                         SubscriptionAcceptance::Accepted { .. } => {
                             if let Some(delivery) = delivery.as_mut() {
-                                delivery.reconcile_resume(&message, &bound)?;
+                                delivery.reconcile_resume(&message, &bound).context("reconciling Codex resume delivery")?;
                             }
                         }
                         SubscriptionAcceptance::Deferred => anyhow::bail!(
@@ -1855,26 +1862,28 @@ fn pump_control(
                     atomic_json(
                         binding_path,
                         &CodexThreadBinding::new(runtime, thread_id.to_string()),
-                    )?;
-                    atomic_json(control_state_path, &bound)?;
+                    )
+                    .context("persisting Codex resume binding")?;
+                    atomic_json(control_state_path, &bound).context("persisting Codex control state")?;
                     control_state = Some(bound);
                     let _ = events.send(ControlEvent::Bound);
                     continue;
                 }
 
-                let Some(thread_id) = binding_candidate(&message)? else {
+                let Some(thread_id) = binding_candidate(&message).context("reading Codex thread binding candidate")? else {
                     continue;
                 };
                 atomic_json(
                     binding_path,
                     &CodexThreadBinding::new(runtime, thread_id.to_string()),
-                )?;
+                )
+                .context("persisting Codex fresh binding")?;
                 let mut bound = CodexControlState::new(runtime, thread_id.to_string());
                 // A fresh control client that observes the owning TUI's `thread/started`
                 // notification is already subscribed to that thread's broadcasts. Before its
                 // first turn there is no persisted rollout for a redundant `thread/resume`.
                 bound.subscribed = true;
-                atomic_json(control_state_path, &bound)?;
+                atomic_json(control_state_path, &bound).context("persisting Codex fresh control state")?;
                 control_state = Some(bound);
                 let _ = events.send(ControlEvent::Bound);
             }
@@ -1884,8 +1893,8 @@ fn pump_control(
                 .context("Codex control state is unbound")?;
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
-                    delivery.accept_response(&message, &state.observed)?
-                        || delivery.accept_typed_receipt(&message, state)?
+                    delivery.accept_response(&message, &state.observed).context("accepting Codex delivery response")?
+                        || delivery.accept_typed_receipt(&message, state).context("accepting Codex typed receipt")?
                 }
                 None => false,
             };
@@ -1899,20 +1908,20 @@ fn pump_control(
                     "Codex control received an unexpected thread/resume response"
                 );
                 subscription_pending = false;
-                match state.accept_subscription(&message)? {
+                match state.accept_subscription(&message).context("accepting Codex subscription")? {
                     SubscriptionAcceptance::Accepted { changed } => {
                         if let Some(delivery) = delivery.as_mut() {
-                            delivery.reconcile_resume(&message, state)?;
+                            delivery.reconcile_resume(&message, state).context("reconciling Codex subscription delivery")?;
                         }
                         changed
                     }
                     SubscriptionAcceptance::Deferred => false,
                 }
             } else {
-                state.observe(&message)?
+                state.observe(&message).context("observing Codex control event")?
             };
             if changed {
-                atomic_json(control_state_path, state)?;
+                atomic_json(control_state_path, state).context("persisting Codex observed control state")?;
                 let _ = events.send(ControlEvent::Observed);
             }
             if !state.subscribed
@@ -1926,13 +1935,15 @@ fn pump_control(
                         "id": CONTROL_SUBSCRIBE_REQUEST_ID,
                         "params": { "threadId": state.thread_id }
                     }),
-                )?;
+                )
+                .context("sending Codex subscription request")?;
                 subscription_pending = true;
             }
             if let Some(delivery) = delivery.as_mut()
                 && let Some(request) = delivery.maybe_request(state)?
             {
-                write_json_message(&mut websocket, &request)?;
+                write_json_message(&mut websocket, &request)
+                    .context("sending Codex delivery request")?;
             }
         }
     })();
