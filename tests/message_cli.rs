@@ -525,6 +525,51 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender", "-m", "original pending"])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "pending")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    let pending = tmp.path().join("h/sender/resources/sent/pending");
+    let pending_record = fs::read_dir(&pending).unwrap().next().unwrap().unwrap().path();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pending_record).unwrap()).unwrap();
+    value["body"] = "substituted pending\n".into();
+    value["renderedMessage"] = "---\nfrom: h.sender\n---\nsubstituted pending\n".into();
+    fs::write(&pending_record, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(!output.status.success(), "substituted pending intent must fail closed");
+    assert!(output.stdout.is_empty());
+    let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
+    assert!(!retry.status.success(), "next sender operation must reject substituted pending");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender", "-m", "original row"])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "row")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    let messages = tmp.path().join("h/sender/resources/sent/messages");
+    let row = fs::read_dir(&messages).unwrap().next().unwrap().unwrap().path();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&row).unwrap()).unwrap();
+    value["body"] = "substituted row\n".into();
+    value["renderedMessage"] = "---\nfrom: h.sender\n---\nsubstituted row\n".into();
+    fs::write(row, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(!output.status.success(), "active-owned substituted row must fail closed");
+    assert!(output.stdout.is_empty());
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(tmp.path())
         .args(["--host", "h", "--as", "sender", "-m", "pending"])
         .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "active")
         .output()
@@ -597,7 +642,8 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         .collect::<Vec<_>>();
     rows.sort();
     let pending = tmp.path().join("h/sender/resources/sent/pending");
-    fs::copy(&rows[0], pending.join(rows[0].file_name().unwrap())).unwrap();
+    let older: serde_json::Value = serde_json::from_slice(&fs::read(&rows[0]).unwrap()).unwrap();
+    fs::copy(&rows[0], pending.join(format!("{}.json", json_digest(&older)))).unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
     assert!(!output.status.success(), "older committed row cannot become pending again");
     assert!(output.stdout.is_empty());

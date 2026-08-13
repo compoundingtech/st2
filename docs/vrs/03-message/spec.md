@@ -22,7 +22,7 @@ sender resources/sent/                 recipient resources/
   index.json                             inbox/<filename>.md
   active.json                            archive/<filename>.md
   .lock
-  pending/<filename>.md.json
+  pending/<sha256>.json
   messages/<filename>.md.json
   commits/<sha256>.json
   keys/<sha256>.json
@@ -77,9 +77,11 @@ The version-1 record is:
 }
 ```
 
-Record filenames append `.json` to the canonical message filename. Commit filenames are the SHA-256
-digest of their canonical JSON content. Temporary siblings do not match either suffix and are
-invisible to readers. A complete read follows exactly `count` nodes from `tip` to genesis, verifies
+Committed record filenames append `.json` to the canonical message filename. Pending and commit
+filenames are the SHA-256 digest of their canonical JSON content plus `.json`. A pending filename
+therefore binds its content before `active.json` exists. Temporary siblings use the reserved
+`.message.tmp-` prefix and are invisible to readers. A complete read follows exactly `count` nodes
+from `tip` to genesis, verifies
 each content digest, ordinal, predecessor, row digest, and payload/filename relation, then compares
 the exact reachable node and row sets with both directories. Only an active intent may explain an
 otherwise unreachable row or commit node. Missing, extra, substituted, corrupt, unreadable, or

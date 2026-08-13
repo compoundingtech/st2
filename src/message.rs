@@ -489,7 +489,7 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             anyhow::ensure!(
                 read_sent_active(root)?.is_none()
-                    && read_sent_records(&root.join(SENT_PENDING))?.is_empty()
+                    && read_pending_records(&root.join(SENT_PENDING))?.is_empty()
                     && read_sent_records(&root.join(SENT_MESSAGES))?.is_empty()
                     && read_sent_commits(&root.join(SENT_COMMITS))?.is_empty()
                     && read_sent_keys(&root.join(SENT_KEYS))?.is_empty(),
@@ -503,7 +503,7 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         Err(error) => return Err(error.into()),
     };
     validate_sent_head(&head)?;
-    let pending = read_sent_records(&root.join(SENT_PENDING))?;
+    let pending = read_pending_records(&root.join(SENT_PENDING))?;
     anyhow::ensure!(pending.len() <= 1, "multiple pending sent intents");
     let active = read_sent_active(root)?;
     match (active.as_ref(), pending.as_slice()) {
@@ -573,6 +573,15 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         rows.get(&active.filename)
             .filter(|_| !reachable_rows.contains(&active.filename))
     });
+    if let Some(row) = active_row {
+        let active = active
+            .as_ref()
+            .context("uncommitted sent row has no active intent")?;
+        anyhow::ensure!(
+            active.record_digest == digest_json(row)?,
+            "active sent intent differs from uncommitted row"
+        );
+    }
     let explained_node = match active_row {
         Some(row) => Some(digest_json(&sent_commit(&head, row)?)?),
         None => None,
@@ -657,6 +666,37 @@ fn read_sent_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
             sent_record_name(&record.filename) == name,
             "sent record filename does not match its payload"
         );
+        records.push(record);
+    }
+    records.sort_by(|left, right| left.filename.cmp(&right.filename));
+    Ok(records)
+}
+
+fn read_pending_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            anyhow::bail!("pending sent record filename is not UTF-8");
+        };
+        if name.starts_with(".message.tmp-") {
+            continue;
+        }
+        let digest = name
+            .strip_suffix(".json")
+            .context("unexpected pending sent record entry")?;
+        anyhow::ensure!(is_sha256(digest), "invalid pending sent record digest");
+        let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
+            .with_context(|| format!("reading pending sent record {}", entry.path().display()))?;
+        anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
+        anyhow::ensure!(is_message_filename(&record.filename), "invalid sent record filename");
+        anyhow::ensure!(digest_json(&record)? == digest, "pending sent record digest mismatch");
         records.push(record);
     }
     records.sort_by(|left, right| left.filename.cmp(&right.filename));
@@ -1447,7 +1487,7 @@ fn send_with_ledger(
 
     let pending = root
         .join(SENT_PENDING)
-        .join(sent_record_name(&candidate.filename));
+        .join(pending_record_name(&candidate)?);
     anyhow::ensure!(
         atomic_create_file(&pending, &serde_json::to_vec(&candidate)?)?,
         "new send intent already exists"
@@ -1525,7 +1565,7 @@ fn recover_active(
     root: &Path,
     head: &mut SentHead,
 ) -> anyhow::Result<Vec<SentRecord>> {
-    let pending = read_sent_records(&root.join(SENT_PENDING))?;
+    let pending = read_pending_records(&root.join(SENT_PENDING))?;
     anyhow::ensure!(pending.len() <= 1, "multiple pending sent intents");
     let active = read_sent_active(root)?;
     if let Some(active) = &active
@@ -1541,7 +1581,7 @@ fn recover_active(
         remove_if_exists(
             &root
                 .join(SENT_PENDING)
-                .join(sent_record_name(&record.filename)),
+                .join(pending_record_name(&record)?),
         )?;
         remove_if_exists(&root.join(SENT_ACTIVE))?;
         return Ok(Vec::new());
@@ -1578,7 +1618,7 @@ fn recover_active(
     remove_if_exists(
         &root
             .join(SENT_PENDING)
-            .join(sent_record_name(&record.filename)),
+            .join(pending_record_name(&record)?),
     )?;
     remove_if_exists(&root.join(SENT_ACTIVE))?;
     Ok(vec![record])
@@ -1596,6 +1636,10 @@ fn publish_active(root: &Path, record: &SentRecord) -> anyhow::Result<()> {
         anyhow::ensure!(fs::read(&path)? == bytes, "active sent intent collision");
     }
     Ok(())
+}
+
+fn pending_record_name(record: &SentRecord) -> anyhow::Result<String> {
+    Ok(format!("{}.json", digest_json(record)?))
 }
 
 fn sent_commit(head: &SentHead, record: &SentRecord) -> anyhow::Result<SentCommit> {
