@@ -2801,7 +2801,9 @@ mod tests {
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                // Parallel Darwin test runs can deschedule the in-process peer
+                // for longer than the Linux-oriented two-second budget.
+                .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut websocket = tungstenite::accept(stream).unwrap();
             assert_eq!(
@@ -2898,7 +2900,7 @@ mod tests {
             )
         });
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
             ControlEvent::Bound
         ));
         server.join().unwrap();
@@ -3037,7 +3039,7 @@ mod tests {
         });
         acknowledge_tui_thread_loaded(&rx);
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
             ControlEvent::Bound
         ));
         server.join().unwrap();
