@@ -1691,6 +1691,7 @@ fn wait_for_tui_loaded_thread(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
+        eprintln!("codex control: requesting TUI-loaded thread list");
         write_json_message(
             websocket,
             &json!({
@@ -1709,7 +1710,9 @@ fn wait_for_tui_loaded_thread(
             websocket
                 .get_ref()
                 .set_read_timeout(Some(remaining.min(CONTROL_POLL)))?;
-            let message = match poll_json_message(websocket)? {
+            let message = match poll_json_message(websocket)
+                .context("polling Codex TUI-loaded response")?
+            {
                 ControlRead::Message(message) => message,
                 ControlRead::Timeout => continue,
                 ControlRead::Closed => anyhow::bail!(
@@ -1798,6 +1801,7 @@ fn pump_control(
             wait_for_tui_loaded_thread(&mut websocket, thread_id, tui_loaded_timeout)
                 .context("waiting for Codex TUI thread load")?;
             let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
+            eprintln!("codex control: emitting TuiThreadLoaded");
             events
                 .send(ControlEvent::TuiThreadLoaded(diagnostic_tx))
                 .context("recording that the Codex TUI loaded the preserved thread")?;
