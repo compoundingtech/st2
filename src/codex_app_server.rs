@@ -1703,7 +1703,7 @@ fn wait_for_tui_loaded_thread(
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
-                !remaining.is_zero(),
+                remaining >= Duration::from_millis(1),
                 "controlled Codex TUI did not load preserved thread {expected_thread_id} before control resume"
             );
             websocket
