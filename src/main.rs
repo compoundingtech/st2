@@ -86,6 +86,9 @@ enum Command {
     /// or refresh hooks.
     #[command(subcommand)]
     Hooks(HooksCmd),
+    /// Provider-native harness drivers. These commands preserve the current native launch paths.
+    #[command(subcommand)]
+    Driver(DriverCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
     /// message. Busy does not suppress delivery; only fresh dnd defers FIFO. A startup backlog is
     /// coalesced into one recovery notice. Long-running — st2 keeps it alive as a task alongside the
@@ -296,6 +299,24 @@ enum Command {
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverCmd {
+    /// Run the existing controlled Codex app-server path.
+    Codex {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Run the existing Claude session-owned MCP server over stdio.
+    Claude {
+        #[arg(long)]
+        identity: String,
     },
 }
 
@@ -852,6 +873,16 @@ fn main() -> Result<()> {
             )
         }
         Command::ClaudeMcp { identity } => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::Codex { identity, runtime_id, argv }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+        }
+        Command::Driver(DriverCmd::Claude { identity }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)
