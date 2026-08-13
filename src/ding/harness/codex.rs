@@ -34,7 +34,9 @@ impl Harness for Codex {
             }
             CodexComposer::Empty => ReceiptState::NotRetained,
             CodexComposer::Typed(input) => {
-                let candidates = logical_soft_wrap_candidates(&input, 70);
+                // Codex may wrap after a hyphen and leave a short preceding row. The two-cell
+                // continuation indent and non-empty content prove each wrap boundary.
+                let candidates = logical_soft_wrap_candidates(&input, 1);
                 let Some(candidates) = candidates.proven() else {
                     return ReceiptState::Unproven;
                 };
@@ -79,7 +81,9 @@ fn classify_codex_composer(screen: &str, plain: &str, expected: &str) -> Compose
         CodexComposer::Empty if !blocked && idle_footer => ComposerState::EmptySafe,
         CodexComposer::Empty => ComposerState::Ambiguous,
         CodexComposer::Typed(input) => {
-            let candidates = logical_soft_wrap_candidates(&input, 70);
+            // Codex may wrap after a hyphen and leave a short preceding row. The two-cell
+            // continuation indent and non-empty content prove each wrap boundary.
+            let candidates = logical_soft_wrap_candidates(&input, 1);
             let Some(candidates) = candidates.proven() else {
                 return ComposerState::Ambiguous;
             };
