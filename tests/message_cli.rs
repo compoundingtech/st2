@@ -111,6 +111,7 @@ fn send_persists_canonical_sender_history_independent_of_every_recipient_box() {
     for identity in ["sender", "recipient", "unrelated"] {
         write_agent(tmp.path(), identity);
     }
+    assert!(!tmp.path().join("h/sender/resources").exists());
 
     let output = send_message(
         tmp.path(),

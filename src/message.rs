@@ -1402,13 +1402,13 @@ pub fn send_to_resolved_inbox(
         let (inbox, _) = recipient.boxes()?;
         return send_to_inbox(&inbox, canonical_from, subject, in_reply_to, tags, body);
     }
-    let (canonical_from, sender_root) = match sender {
+    let (canonical_from, sender_root) = match sender.as_ref() {
         Some(agent) => {
             let path = match agent.capability.as_ref() {
                 Some(capability) => crate::catalog_transaction::retained_dir_path(capability)?,
                 None => agent.path.clone(),
             };
-            (agent.bus_id, path)
+            (agent.bus_id.clone(), path)
         }
         None if catalogless(catalog_root) => (from.to_string(), catalog_root.join(from)),
         None => anyhow::bail!("no agent '{from}' found in catalog {}", catalog_root.display()),
