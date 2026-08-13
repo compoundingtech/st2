@@ -8,7 +8,11 @@ use std::process::{Command, Stdio};
 use sha2::{Digest as _, Sha256};
 
 fn json_digest(value: &serde_json::Value) -> String {
-    Sha256::digest(serde_json::to_vec(value).unwrap())
+    bytes_digest(&serde_json::to_vec(value).unwrap())
+}
+
+fn bytes_digest(value: &[u8]) -> String {
+    Sha256::digest(value)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -642,13 +646,21 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         .collect::<Vec<_>>();
     rows.sort();
     let pending = tmp.path().join("h/sender/resources/sent/pending");
-    let older: serde_json::Value = serde_json::from_slice(&fs::read(&rows[0]).unwrap()).unwrap();
-    fs::copy(&rows[0], pending.join(format!("{}.json", json_digest(&older)))).unwrap();
+    let older = fs::read(&rows[0]).unwrap();
+    fs::write(pending.join(format!("{}.json", bytes_digest(&older))), older).unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
     assert!(!output.status.success(), "older committed row cannot become pending again");
     assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("committed pending intent is missing its active marker")
+    );
     let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
     assert!(!retry.status.success(), "recovery must not recommit an older row");
+    assert!(
+        String::from_utf8_lossy(&retry.stderr)
+            .contains("committed pending intent is missing its active marker")
+    );
 }
 
 #[test]
