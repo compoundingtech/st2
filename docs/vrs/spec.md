@@ -662,8 +662,9 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 ## Message lifecycle
 
 ```text
-atomic inbox file → DING attempt → agent reads → archive receipt
-       └──────── archive with same filename wins ────────┘
+sender intent → atomic inbox file → sender row → DING attempt → agent reads → archive receipt
+      │            └── pending/keyed retry reuses filename ──┘       │
+      └──────────── explicit partial coverage ───────────────────────┘
 ```
 
 - **R05:** A matching archive filename makes an inbox copy handled; stale
@@ -674,6 +675,10 @@ atomic inbox file → DING attempt → agent reads → archive receipt
   left untouched. Unsafe delivery retries use a bounded backoff so an active
   composer cannot create a short-lived PTY probe on every inbox poll. Inbox
   reads do not wake the sidecar; only mutations bypass its bounded poll cadence.
+- Sender-owned publication, crash recovery, coverage, and `message sent` are specified in
+  [`03-message/spec.md`](./03-message/spec.md). Recipient publication precedes a completed sender
+  row; the two directories do not share one atomic commit. Pending unkeyed intent resumes, but exact
+  replay after the intent clears requires a caller-supplied idempotency key.
 
 ## State and scope
 

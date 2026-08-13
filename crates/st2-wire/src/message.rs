@@ -33,6 +33,9 @@ pub struct MessageRow {
     #[serde(default)]
     pub tags: Vec<String>,
     pub priority: Option<String>,
+    /// The caller's optional operation identity for exact retry semantics.
+    #[serde(rename = "idempotencyKey", default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// The markdown body.
     ///
     /// Absent — the key omitted entirely, not `null` — from a `ls --json` row unless
@@ -41,6 +44,44 @@ pub struct MessageRow {
     /// treat "no body" as "not asked for", never as "the message is empty".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+}
+
+/// How much sender history st2 can prove is represented by [`SentMessages`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "kebab-case")]
+pub enum SentCoverage {
+    /// This sender has no index marker, so an empty row set says nothing about earlier sends.
+    Unavailable,
+    /// Every successful send at or after `since` is represented.
+    Since { since: u64 },
+    /// One or more durable send intents have not reached a terminal sender-owned state.
+    Partial { since: u64, pending: usize },
+}
+
+/// One sender-owned message row. The sender is the selected index owner; `to` is the directional
+/// field that varies between rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentMessageRow {
+    pub filename: String,
+    pub ts: u64,
+    pub to: String,
+    pub subject: Option<String>,
+    #[serde(rename = "inReplyTo")]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub priority: Option<String>,
+    #[serde(rename = "idempotencyKey", default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+/// The stable `st2 message sent --json` envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentMessages {
+    pub coverage: SentCoverage,
+    pub messages: Vec<SentMessageRow>,
 }
 
 #[cfg(test)]
@@ -56,6 +97,7 @@ mod tests {
             in_reply_to: None,
             tags: Vec::new(),
             priority: None,
+            idempotency_key: None,
             body: None,
         }
     }
@@ -146,5 +188,39 @@ mod tests {
             "subject":null,"inReplyTo":null,"tags":[],"priority":null,"somethingAddedLater":42}"#;
         let parsed = serde_json::from_str::<MessageRow>(json).expect("unknown fields are ignored");
         assert_eq!(parsed.filename, "1785000000000-abcdef.md");
+    }
+
+    #[test]
+    fn sent_rows_carry_to_and_coverage_never_collapses_unavailable_into_empty() {
+        let unavailable = SentMessages {
+            coverage: SentCoverage::Unavailable,
+            messages: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&unavailable).unwrap(),
+            serde_json::json!({
+                "coverage": { "_tag": "unavailable" },
+                "messages": [],
+            })
+        );
+
+        let indexed = SentMessages {
+            coverage: SentCoverage::Since { since: 1_785_000_000_000 },
+            messages: vec![SentMessageRow {
+                filename: "1785000000000-abcdef.md".to_string(),
+                ts: 1_785_000_000_000,
+                to: "h.recipient".to_string(),
+                subject: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                priority: None,
+                idempotency_key: None,
+                body: None,
+            }],
+        };
+        let json = serde_json::to_value(indexed).unwrap();
+        assert_eq!(json["messages"][0]["to"], "h.recipient");
+        assert!(json["messages"][0].get("from").is_none());
+        assert!(json["messages"][0].get("body").is_none());
     }
 }

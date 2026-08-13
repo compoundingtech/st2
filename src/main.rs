@@ -605,6 +605,9 @@ enum MessageCmd {
         /// Comma-separated tags.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Reuse one sender-owned operation result across exact retries.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -618,6 +621,9 @@ enum MessageCmd {
         /// Override the subject (defaults to `re: <original subject>`).
         #[arg(long)]
         subject: Option<String>,
+        /// Reuse one sender-owned operation result across exact retries.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -644,6 +650,28 @@ enum MessageCmd {
         #[arg(long)]
         since: Option<u64>,
         /// Machine-readable JSON array.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// List sender-owned durable message history. Defaults to your own index.
+    Sent {
+        /// Whose sent index — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
+        identity: Option<String>,
+        /// Print only the indexed message count. Refuses unavailable or partial coverage.
+        #[arg(long)]
+        count: bool,
+        /// Include full message bodies in JSON output.
+        #[arg(long)]
+        include_body: bool,
+        /// Show only messages addressed to this canonical recipient.
+        #[arg(long = "to")]
+        to: Option<String>,
+        /// Show only messages sent after this unix-millisecond timestamp.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Machine-readable coverage envelope and rows.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -1933,6 +1961,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             subject,
             in_reply_to,
             tags,
+            idempotency_key,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
@@ -1947,6 +1976,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 in_reply_to.as_deref(),
                 &tags,
                 &body,
+                idempotency_key.as_deref(),
             )?;
             println!("{filename}");
             Ok(())
@@ -1955,12 +1985,20 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             filename,
             body,
             subject,
+            idempotency_key,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let from = acting_id(&ctx)?;
             let my_inbox = resolve_message_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
+                .or_else(|inbox_error| {
+                    if my_inbox.join(&filename).try_exists()? {
+                        return Err(inbox_error);
+                    }
+                    let my_archive = message::resolve_archive(&root, &from, &host)?;
+                    message::read_msg(&my_archive, &filename)
+                })
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
             let to = original
                 .from
@@ -1977,8 +2015,65 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(&filename),
                 &[],
                 &body,
+                idempotency_key.as_deref(),
             )?;
             println!("{sent}");
+            Ok(())
+        }
+        MessageCmd::Sent {
+            identity,
+            count,
+            include_body,
+            to,
+            since,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let id = identity.unwrap_or(acting_id(&ctx)?);
+            let mut view = message::with_resolved_agent_dir(&root, &id, &host, |agent_dir| {
+                message::list_sent(agent_dir, include_body)
+            })?;
+            if let Some(recipient) = &to {
+                view.messages.retain(|message| message.to == *recipient);
+            }
+            if let Some(cursor) = since {
+                view.messages.retain(|message| message.ts > cursor);
+            }
+            if count {
+                match view.coverage {
+                    st2_wire::message::SentCoverage::Since { .. } => {
+                        println!("{}", view.messages.len());
+                        return Ok(());
+                    }
+                    st2_wire::message::SentCoverage::Unavailable => {
+                        anyhow::bail!("sent-message coverage is unavailable")
+                    }
+                    st2_wire::message::SentCoverage::Partial { pending, .. } => {
+                        anyhow::bail!("sent-message coverage is partial ({pending} pending)")
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string(&view)?);
+                return Ok(());
+            }
+            let coverage = match view.coverage {
+                st2_wire::message::SentCoverage::Unavailable => "unavailable".to_string(),
+                st2_wire::message::SentCoverage::Since { since } => format!("since {since}"),
+                st2_wire::message::SentCoverage::Partial { since, pending } => {
+                    format!("partial since {since}; {pending} pending")
+                }
+            };
+            println!(
+                "# {} sent message{} for {id} ({coverage})",
+                view.messages.len(),
+                plural(view.messages.len())
+            );
+            for message in &view.messages {
+                let subject = message.subject.as_deref().unwrap_or("(no subject)");
+                println!("{}  to {}  {subject}", message.filename, message.to);
+            }
             Ok(())
         }
         MessageCmd::Ls {
@@ -2122,13 +2217,24 @@ fn send_resolved_message(
     in_reply_to: Option<&str>,
     tags: &[String],
     body: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<String> {
-    if std::env::var("ST2_EVAL_REQUESTER").as_deref() == Ok(to) {
-        let inbox = resolve_message_inbox(root, to, host)?;
-        message::send_to_inbox(&inbox, from, subject, in_reply_to, tags, body)
-    } else {
-        message::send_to_resolved_inbox(root, to, host, from, subject, in_reply_to, tags, body)
-    }
+    let external = std::env::var("ST2_EVAL_REQUESTER")
+        .ok()
+        .map(|identity| message::ExternalInbox::new(root, &identity))
+        .transpose()?;
+    message::send_to_resolved_inbox(
+        root,
+        to,
+        host,
+        from,
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        idempotency_key,
+        external.as_ref(),
+    )
 }
 
 fn request_cmd(cmd: RequestCmd) -> Result<()> {
@@ -2268,6 +2374,8 @@ struct LsItemJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
 }
@@ -2282,6 +2390,7 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            idempotency_key: m.idempotency_key.as_deref(),
             body: None,
         }
     }
@@ -2308,6 +2417,8 @@ struct MessageJson<'a> {
     in_reply_to: Option<&'a str>,
     tags: &'a [String],
     priority: Option<&'a str>,
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a str>,
     body: &'a str,
 }
 
@@ -2321,6 +2432,7 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
             in_reply_to: m.in_reply_to.as_deref(),
             tags: &m.tags,
             priority: m.priority.as_deref(),
+            idempotency_key: m.idempotency_key.as_deref(),
             body: &m.body,
         }
     }
