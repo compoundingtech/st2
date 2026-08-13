@@ -1789,10 +1789,15 @@ fn pump_control(
             })
             .transpose()
             .context("initializing Codex inbox delivery")?;
-        websocket
-            .get_ref()
-            .set_read_timeout(Some(CONTROL_POLL))
-            .context("setting Codex control poll timeout")?;
+            if let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL)) {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    // Darwin can reject setsockopt after the peer has closed the
+                    // Unix socket. Treat that race as the normal closed path.
+                    let _ = events.send(ControlEvent::Closed);
+                    return Ok(());
+                }
+                return Err(error).context("setting Codex control poll timeout");
+            }
         if let Some(thread_id) = expected_resume {
             resume_ready
                 .context("saved Codex binding has no TUI-start gate")?
