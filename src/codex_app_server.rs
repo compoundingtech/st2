@@ -1782,6 +1782,7 @@ fn pump_control(
         };
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
+        let mut peer_closed = false;
         let delivery_state_path = control_state_path.with_file_name("delivery-state.json");
         let mut delivery = delivery
             .map(|config| {
@@ -1789,15 +1790,6 @@ fn pump_control(
             })
             .transpose()
             .context("initializing Codex inbox delivery")?;
-            if let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL)) {
-                if error.kind() == std::io::ErrorKind::InvalidInput {
-                    // Darwin can reject setsockopt after the peer has closed the
-                    // Unix socket. Treat that race as the normal closed path.
-                    let _ = events.send(ControlEvent::Closed);
-                    return Ok(());
-                }
-                return Err(error).context("setting Codex control poll timeout");
-            }
         if let Some(thread_id) = expected_resume {
             resume_ready
                 .context("saved Codex binding has no TUI-start gate")?
@@ -1824,6 +1816,19 @@ fn pump_control(
             subscription_pending = true;
         }
         loop {
+            if !peer_closed {
+                if let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL)) {
+                    if error.kind() == std::io::ErrorKind::InvalidInput {
+                        // Darwin can reject setsockopt after the peer has closed
+                        // the Unix socket. Keep reading: buffered WebSocket
+                        // frames must be processed before EOF is reported.
+                        peer_closed = true;
+                        let _ = websocket.get_ref().set_read_timeout(None);
+                    } else {
+                        return Err(error).context("setting Codex control poll timeout");
+                    }
+                }
+            }
             let message = match poll_json_message(&mut websocket).context("polling Codex control socket")? {
                 ControlRead::Message(message) => Some(message),
                 ControlRead::Timeout => None,
