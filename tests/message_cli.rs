@@ -562,6 +562,24 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let output = sent(tmp.path(), "sender", &["--json"]);
     assert!(!output.status.success(), "substituted active digest must fail closed");
     assert!(output.stdout.is_empty());
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender", "-m", "committed"])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "head")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    fs::remove_file(tmp.path().join("h/sender/resources/sent/active.json")).unwrap();
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(!output.status.success(), "committed pending without active must fail closed");
+    assert!(output.stdout.is_empty());
+    let retry = send_message(tmp.path(), "sender", "recipient", "committed", &[]);
+    assert!(!retry.status.success(), "recovery must not commit the same row twice");
 }
 
 #[test]
@@ -597,24 +615,27 @@ fn idempotency_key_scope_is_independent_across_senders_and_recipients() {
 
 #[test]
 fn unkeyed_retry_after_committed_response_loss_publishes_again() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_agent(tmp.path(), "sender");
-    write_agent(tmp.path(), "recipient");
+    for crash_after in ["head", "pending-cleanup", "active-cleanup"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "sender");
+        write_agent(tmp.path(), "recipient");
 
-    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
-        .args(["message", "send", "recipient", "--root"])
-        .arg(tmp.path())
-        .args(["--host", "h", "--as", "sender", "-m", "at least once"])
-        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "active-cleanup")
-        .output()
-        .unwrap();
-    assert!(!failed.status.success());
-    let retry = send_message(tmp.path(), "sender", "recipient", "at least once", &[]);
-    assert!(retry.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&sent(tmp.path(), "sender", &["--count"]).stdout).trim(),
-        "2"
-    );
+        let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["message", "send", "recipient", "--root"])
+            .arg(tmp.path())
+            .args(["--host", "h", "--as", "sender", "-m", "at least once"])
+            .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", crash_after)
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        let retry = send_message(tmp.path(), "sender", "recipient", "at least once", &[]);
+        assert!(retry.status.success(), "{crash_after}");
+        assert_eq!(
+            String::from_utf8_lossy(&sent(tmp.path(), "sender", &["--count"]).stdout).trim(),
+            "2",
+            "{crash_after} must preserve unkeyed response ambiguity"
+        );
+    }
 }
 
 #[test]

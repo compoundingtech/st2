@@ -516,6 +516,14 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         (Some(_), []) => {}
         _ => unreachable!(),
     }
+    if active.is_none()
+        && let [record] = pending.as_slice()
+    {
+        anyhow::ensure!(
+            !head_tip_commits(root, &head, &record.filename)?,
+            "committed pending intent is missing its active marker"
+        );
+    }
 
     let rows = read_sent_records(&root.join(SENT_MESSAGES))?
         .into_iter()
@@ -533,8 +541,11 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         anyhow::ensure!(node.ordinal == ordinal, "sent commit ordinal mismatch");
         let row = rows.get(&node.filename).context("missing committed sent record")?;
         anyhow::ensure!(digest_json(row)? == node.row_digest, "sent row digest mismatch");
-        reachable_nodes.insert(current);
-        reachable_rows.insert(node.filename.clone());
+        anyhow::ensure!(reachable_nodes.insert(current), "sent commit chain contains a cycle");
+        anyhow::ensure!(
+            reachable_rows.insert(node.filename.clone()),
+            "sent commit chain references one row more than once"
+        );
         messages.push(row.row(include_body));
         digest = node.previous.clone();
         ordinal = ordinal
@@ -1520,9 +1531,7 @@ fn recover_active(
     if let Some(active) = &active
         && head_tip_commits(root, head, &active.filename)?
     {
-        let record = read_sent_records(&root.join(SENT_MESSAGES))?
-            .into_iter()
-            .find(|record| record.filename == active.filename)
+        let record = read_sent_record(root, &active.filename)
             .context("committed active intent has no sender row")?;
         anyhow::ensure!(
             digest_json(&record)? == active.record_digest,
@@ -1535,11 +1544,15 @@ fn recover_active(
                 .join(sent_record_name(&record.filename)),
         )?;
         remove_if_exists(&root.join(SENT_ACTIVE))?;
-        return Ok(vec![record]);
+        return Ok(Vec::new());
     }
     let record = match (active, pending.as_slice()) {
         (None, []) => return Ok(Vec::new()),
         (None, [record]) => {
+            anyhow::ensure!(
+                !head_tip_commits(root, head, &record.filename)?,
+                "committed pending intent is missing its active marker"
+            );
             publish_active(root, record)?;
             record.clone()
         }
@@ -1619,6 +1632,18 @@ fn publish_sent_record(root: &Path, record: &SentRecord) -> anyhow::Result<()> {
         anyhow::ensure!(fs::read(&path)? == bytes, "sent record collision");
     }
     Ok(())
+}
+
+fn read_sent_record(root: &Path, filename: &str) -> anyhow::Result<SentRecord> {
+    anyhow::ensure!(is_message_filename(filename), "invalid sent record filename");
+    let path = root
+        .join(SENT_MESSAGES)
+        .join(sent_record_name(filename));
+    let record: SentRecord = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("reading sent record {}", path.display()))?;
+    anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
+    anyhow::ensure!(record.filename == filename, "sent record filename does not match payload");
+    Ok(record)
 }
 
 fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::Result<()> {
