@@ -5,6 +5,15 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use sha2::{Digest as _, Sha256};
+
+fn json_digest(value: &serde_json::Value) -> String {
+    Sha256::digest(serde_json::to_vec(value).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn write_message(inbox: &Path, ts_ms: u64, suffix: &str, from: &str) {
     fs::create_dir_all(inbox).unwrap();
     fs::write(
@@ -38,6 +47,641 @@ fn list_identity(root: &Path, identity: &str, extra: &[&str]) -> std::process::O
 
 fn list(root: &Path, extra: &[&str]) -> std::process::Output {
     list_identity(root, "bob", extra)
+}
+
+fn send_message(
+    root: &Path,
+    from: &str,
+    to: &str,
+    body: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", to, "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", from, "-m", body])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "sent", identity, "--root"])
+        .arg(root)
+        .args(["--host", "h"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn uninitialized_sent_history_is_explicitly_unavailable_not_a_complete_empty_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+
+    let output = sent(tmp.path(), "h.sender", &["--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "coverage": { "_tag": "unavailable" },
+            "messages": [],
+        })
+    );
+    assert!(tmp.path().join("h/sender/resources/sent/.lock").is_file());
+
+    let count = sent(tmp.path(), "h.sender", &["--count"]);
+    assert!(!count.status.success());
+    assert!(count.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&count.stderr).contains("coverage is unavailable"));
+}
+
+#[test]
+fn send_persists_canonical_sender_history_independent_of_every_recipient_box() {
+    let tmp = tempfile::tempdir().unwrap();
+    for identity in ["sender", "recipient", "unrelated"] {
+        write_agent(tmp.path(), identity);
+    }
+
+    let output = send_message(
+        tmp.path(),
+        "sender",
+        "recipient",
+        "durable body",
+        &["--subject", "indexed"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let filename = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let delivered = st2::message::read_msg(
+        &tmp.path().join("h/recipient/resources/inbox"),
+        &filename,
+    )
+    .unwrap();
+    assert_eq!(delivered.from.as_deref(), Some("h.sender"));
+
+    fs::remove_file(
+        tmp.path()
+            .join("h/recipient/resources/inbox")
+            .join(&filename),
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("h/unrelated/resources")).unwrap();
+    fs::write(
+        tmp.path().join("h/unrelated/resources/inbox"),
+        "not a directory",
+    )
+    .unwrap();
+
+    let output = sent(
+        tmp.path(),
+        "sender",
+        &["--to", "h.recipient", "--include-body", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["coverage"]["_tag"], "since");
+    assert!(value["coverage"]["since"].as_u64().is_some());
+    assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(value["messages"][0]["filename"], filename);
+    assert_eq!(value["messages"][0]["to"], "h.recipient");
+    assert_eq!(value["messages"][0]["body"], "durable body\n");
+    assert!(value["messages"][0].get("from").is_none());
+}
+
+#[test]
+fn replies_are_indexed_with_the_canonical_recipient_and_thread_relation() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+
+    let original = send_message(tmp.path(), "recipient", "sender", "question", &[]);
+    assert!(original.status.success());
+    let original = String::from_utf8(original.stdout).unwrap().trim().to_string();
+    let reply = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "reply", &original, "--root"])
+        .arg(tmp.path())
+        .args([
+            "--host",
+            "h",
+            "--as",
+            "sender",
+            "--idempotency-key",
+            "answer-once",
+            "-m",
+            "answer",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reply.stderr)
+    );
+
+    let output = sent(tmp.path(), "sender", &["--include-body", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(value["messages"][0]["to"], "h.recipient");
+    assert_eq!(value["messages"][0]["inReplyTo"], original);
+    assert_eq!(value["messages"][0]["idempotencyKey"], "answer-once");
+}
+
+#[test]
+fn keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates() {
+    for crash_after in [
+        "coverage",
+        "pending",
+        "active",
+        "recipient",
+        "row",
+        "node",
+        "head",
+        "pending-cleanup",
+        "active-cleanup",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "sender");
+        write_agent(tmp.path(), "recipient");
+
+        let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["message", "send", "recipient", "--root"])
+            .arg(tmp.path())
+            .args([
+                "--host",
+                "h",
+                "--as",
+                "sender",
+                "--idempotency-key",
+                "retry-key",
+                "-m",
+                "one semantic message",
+            ])
+            .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", crash_after)
+            .output()
+            .unwrap();
+        assert!(!failed.status.success(), "{crash_after} must inject failure");
+
+        let interrupted = sent(tmp.path(), "sender", &["--json"]);
+        assert!(interrupted.status.success());
+        let interrupted: serde_json::Value =
+            serde_json::from_slice(&interrupted.stdout).unwrap();
+        assert_ne!(interrupted["coverage"]["_tag"], "unavailable");
+        if matches!(
+            crash_after,
+            "pending" | "active" | "recipient" | "row" | "node" | "head" | "pending-cleanup"
+        ) {
+            assert_eq!(interrupted["coverage"]["_tag"], "partial");
+        }
+        if crash_after == "recipient" {
+            assert!(interrupted["messages"].as_array().unwrap().is_empty());
+            assert_eq!(
+                fs::read_dir(tmp.path().join("h/recipient/resources/inbox"))
+                    .unwrap()
+                    .count(),
+                1,
+                "the partial view must not hide recipient-only delivery"
+            );
+        }
+
+        let first_retry = send_message(
+            tmp.path(),
+            "sender",
+            "recipient",
+            "one semantic message",
+            &["--idempotency-key", "retry-key"],
+        );
+        assert!(
+            first_retry.status.success(),
+            "{crash_after}: {}",
+            String::from_utf8_lossy(&first_retry.stderr)
+        );
+        let second_retry = send_message(
+            tmp.path(),
+            "sender",
+            "recipient",
+            "one semantic message",
+            &["--idempotency-key", "retry-key"],
+        );
+        assert!(second_retry.status.success());
+        assert_eq!(first_retry.stdout, second_retry.stdout);
+        assert_eq!(
+            fs::read_dir(tmp.path().join("h/recipient/resources/inbox"))
+                .unwrap()
+                .count(),
+            1,
+            "{crash_after} created duplicate recipient messages"
+        );
+
+        let recovered = sent(tmp.path(), "sender", &["--json"]);
+        let recovered: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+        assert_eq!(recovered["coverage"]["_tag"], "since");
+        assert_eq!(recovered["messages"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_invalid() {
+    let prepare = || {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "sender");
+        write_agent(tmp.path(), "recipient");
+        let output = send_message(tmp.path(), "sender", "recipient", "durable", &[]);
+        assert!(output.status.success());
+        tmp
+    };
+
+    for mutate in [
+        "missing-directory",
+        "missing-row",
+        "extra-row",
+        "unexpected-row-entry",
+        "payload-filename",
+        "corrupt-row",
+        "unreadable-row",
+        "row-version",
+    ] {
+        let tmp = prepare();
+        let messages = tmp.path().join("h/sender/resources/sent/messages");
+        let row = fs::read_dir(&messages).unwrap().next().unwrap().unwrap().path();
+        match mutate {
+            "missing-directory" => fs::remove_dir_all(&messages).unwrap(),
+            "missing-row" => fs::remove_file(&row).unwrap(),
+            "extra-row" => {
+                let extra = messages.join("1700000000000-aaaaaa.md.json");
+                let value = fs::read_to_string(&row)
+                    .unwrap()
+                    .replace(
+                        serde_json::from_slice::<serde_json::Value>(&fs::read(&row).unwrap())
+                            .unwrap()["filename"]
+                            .as_str()
+                            .unwrap(),
+                        "1700000000000-aaaaaa.md",
+                    );
+                fs::write(extra, value).unwrap();
+            }
+            "unexpected-row-entry" => fs::write(messages.join("unexpected"), "junk").unwrap(),
+            "payload-filename" => {
+                fs::rename(&row, messages.join("1700000000000-aaaaaa.md.json")).unwrap();
+            }
+            "corrupt-row" => fs::write(&row, "not json").unwrap(),
+            "unreadable-row" => {
+                fs::remove_file(&row).unwrap();
+                fs::create_dir(&row).unwrap();
+            }
+            "row-version" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&row).unwrap()).unwrap();
+                value["version"] = 2.into();
+                fs::write(&row, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = sent(tmp.path(), "sender", &["--json"]);
+        assert!(!output.status.success(), "{mutate} must fail closed");
+        assert!(output.stdout.is_empty());
+    }
+
+    for mutate in [
+        "missing-node",
+        "extra-node",
+        "unexpected-node-entry",
+        "corrupt-node",
+        "unreadable-node",
+        "node-version",
+        "node-filename",
+        "predecessor",
+        "ordinal",
+        "genesis",
+    ] {
+        let tmp = prepare();
+        let commits = tmp.path().join("h/sender/resources/sent/commits");
+        let node = fs::read_dir(&commits).unwrap().next().unwrap().unwrap().path();
+        match mutate {
+            "missing-node" => fs::remove_file(&node).unwrap(),
+            "extra-node" => fs::copy(&node, commits.join("extra.json")).unwrap(),
+            "unexpected-node-entry" => fs::write(commits.join("unexpected"), "junk").unwrap(),
+            "corrupt-node" => fs::write(&node, "not json").unwrap(),
+            "unreadable-node" => {
+                fs::remove_file(&node).unwrap();
+                fs::create_dir(&node).unwrap();
+            }
+            "node-version" | "node-filename" | "predecessor" | "ordinal" | "genesis" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&node).unwrap()).unwrap();
+                match mutate {
+                    "node-version" => value["version"] = 2.into(),
+                    "node-filename" => value["filename"] = "../index".into(),
+                    "predecessor" => value["previous"] = "substituted".into(),
+                    "ordinal" => value["ordinal"] = 2.into(),
+                    "genesis" => value["previous"] = "missing-genesis".into(),
+                    _ => unreachable!(),
+                }
+                let digest = json_digest(&value);
+                fs::remove_file(&node).unwrap();
+                fs::write(commits.join(format!("{digest}.json")), serde_json::to_vec(&value).unwrap())
+                    .unwrap();
+                let head = tmp.path().join("h/sender/resources/sent/index.json");
+                let mut head_value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&head).unwrap()).unwrap();
+                head_value["tip"] = digest.into();
+                fs::write(head, serde_json::to_vec(&head_value).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = sent(tmp.path(), "sender", &["--json"]);
+        assert!(!output.status.success(), "{mutate} must fail closed");
+        assert!(output.stdout.is_empty());
+    }
+
+    for mutate in [
+        "missing-index",
+        "corrupt-index",
+        "index-version",
+        "unreadable-index",
+        "tip-format",
+        "count-mismatch",
+        "rollback-head",
+    ] {
+        let tmp = prepare();
+        let index = tmp.path().join("h/sender/resources/sent/index.json");
+        match mutate {
+            "missing-index" => fs::remove_file(&index).unwrap(),
+            "corrupt-index" => fs::write(&index, "not json").unwrap(),
+            "index-version" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+                value["version"] = 2.into();
+                fs::write(&index, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "unreadable-index" => {
+                fs::remove_file(&index).unwrap();
+                fs::create_dir(&index).unwrap();
+            }
+            "tip-format" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+                value["tip"] = "../outside".into();
+                fs::write(&index, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "count-mismatch" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+                value["count"] = 2.into();
+                fs::write(&index, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "rollback-head" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+                value["count"] = 0.into();
+                value["tip"] = serde_json::Value::Null;
+                fs::write(&index, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = sent(tmp.path(), "sender", &["--json"]);
+        assert!(!output.status.success(), "{mutate} must fail closed");
+        assert!(output.stdout.is_empty());
+        if mutate == "tip-format" {
+            let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
+            assert!(!retry.status.success(), "invalid tip must fail before node lookup");
+        }
+    }
+
+    for mutate in [
+        "missing-key",
+        "extra-key",
+        "corrupt-key",
+        "key-filename",
+        "unexpected-key-entry",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "sender");
+        write_agent(tmp.path(), "recipient");
+        let output = send_message(
+            tmp.path(),
+            "sender",
+            "recipient",
+            "durable",
+            &["--idempotency-key", "stable"],
+        );
+        assert!(output.status.success());
+        let keys = tmp.path().join("h/sender/resources/sent/keys");
+        let key = fs::read_dir(&keys).unwrap().next().unwrap().unwrap().path();
+        match mutate {
+            "missing-key" => fs::remove_file(&key).unwrap(),
+            "extra-key" => {
+                fs::copy(&key, keys.join("extra.json")).unwrap();
+            }
+            "corrupt-key" => fs::write(&key, "not json").unwrap(),
+            "key-filename" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&key).unwrap()).unwrap();
+                value["filename"] = "../index".into();
+                fs::write(&key, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "unexpected-key-entry" => fs::write(keys.join("unexpected"), "junk").unwrap(),
+            _ => unreachable!(),
+        }
+        let output = sent(tmp.path(), "sender", &["--json"]);
+        assert!(!output.status.success(), "{mutate} must fail closed");
+        assert!(output.stdout.is_empty());
+        if mutate == "key-filename" {
+            let retry = send_message(
+                tmp.path(),
+                "sender",
+                "recipient",
+                "durable",
+                &["--idempotency-key", "stable"],
+            );
+            assert!(!retry.status.success(), "key filename must fail before row lookup");
+        }
+    }
+
+    let tmp = prepare();
+    for directory in ["pending", "messages", "commits", "keys"] {
+        let path = tmp.path().join("h/sender/resources/sent").join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(".message.tmp-999-0"), "interrupted atomic write").unwrap();
+    }
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(output.status.success(), "atomic-write temporary siblings stay invisible");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender", "-m", "pending"])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "active")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    let pending = tmp.path().join("h/sender/resources/sent/pending");
+    fs::remove_file(
+        fs::read_dir(pending)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(!output.status.success(), "missing pending intent must fail closed");
+    assert!(output.stdout.is_empty());
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender", "-m", "committed"])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "pending-cleanup")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    let active = tmp.path().join("h/sender/resources/sent/active.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&active).unwrap()).unwrap();
+    value["recordDigest"] = "substituted".into();
+    fs::write(active, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(!output.status.success(), "substituted active digest must fail closed");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn idempotency_key_scope_is_independent_across_senders_and_recipients() {
+    let tmp = tempfile::tempdir().unwrap();
+    for identity in ["sender-a", "sender-b", "recipient-a", "recipient-b"] {
+        write_agent(tmp.path(), identity);
+    }
+
+    for (sender, recipient) in [
+        ("sender-a", "recipient-a"),
+        ("sender-a", "recipient-b"),
+        ("sender-b", "recipient-a"),
+    ] {
+        let output = send_message(
+            tmp.path(),
+            sender,
+            recipient,
+            "same scoped operation",
+            &["--idempotency-key", "shared"],
+        );
+        assert!(output.status.success(), "{sender} -> {recipient}");
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&sent(tmp.path(), "sender-a", &["--count"]).stdout).trim(),
+        "2"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&sent(tmp.path(), "sender-b", &["--count"]).stdout).trim(),
+        "1"
+    );
+}
+
+#[test]
+fn unkeyed_retry_after_committed_response_loss_publishes_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+
+    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--as", "sender", "-m", "at least once"])
+        .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "active-cleanup")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let retry = send_message(tmp.path(), "sender", "recipient", "at least once", &[]);
+    assert!(retry.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&sent(tmp.path(), "sender", &["--count"]).stdout).trim(),
+        "2"
+    );
+}
+
+#[test]
+fn idempotency_keys_reject_changed_content_while_unkeyed_identical_sends_stay_distinct() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+
+    let first = send_message(tmp.path(), "sender", "recipient", "same", &[]);
+    let second = send_message(tmp.path(), "sender", "recipient", "same", &[]);
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_ne!(first.stdout, second.stdout);
+
+    let keyed = send_message(
+        tmp.path(),
+        "sender",
+        "recipient",
+        "original",
+        &["--idempotency-key", "stable"],
+    );
+    assert!(keyed.status.success());
+    let conflict = send_message(
+        tmp.path(),
+        "sender",
+        "recipient",
+        "different",
+        &["--idempotency-key", "stable"],
+    );
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("reused with different content"));
+
+    let count = sent(tmp.path(), "sender", &["--to", "h.recipient", "--count"]);
+    assert!(count.status.success());
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "3");
+    let after = sent(
+        tmp.path(),
+        "sender",
+        &["--since", &u64::MAX.to_string(), "--count"],
+    );
+    assert!(after.status.success());
+    assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "0");
+}
+
+#[test]
+fn external_eval_capability_bypasses_ordinary_sent_history_at_either_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    fs::create_dir_all(tmp.path().join("requester/inbox")).unwrap();
+
+    for (from, to) in [("sender", "requester"), ("requester", "recipient")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["message", "send", to, "--root"])
+            .arg(tmp.path())
+            .args(["--host", "h", "--as", from, "-m", "eval traffic"])
+            .env("ST2_EVAL_REQUESTER", "requester")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{from} -> {to}");
+    }
+
+    let history = sent(tmp.path(), "sender", &["--json"]);
+    assert!(history.status.success());
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history["coverage"]["_tag"], "unavailable");
+    assert!(history["messages"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -215,6 +859,7 @@ fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bu
 
     let catalog = tempfile::tempdir().unwrap();
     write_agent(catalog.path(), "worker");
+    write_agent(catalog.path(), "sender");
     let declaration = catalog.path().join("h/worker/agent.kdl");
     fs::write(
         &declaration,

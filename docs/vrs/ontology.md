@@ -209,7 +209,51 @@ Authority: [`materialize_catalog`](../../src/materialize.rs#L837-L850)
 
 A durable addressed record in an agent inbox or archive.
 
-Authority: [`message::Message`](../../src/message.rs#L26-L46)
+Authority: [`message::Message`](../../src/message.rs)
+
+### sent message
+
+One completed ordinary Agent send or reply represented by a sender-owned row. The selected sender
+is implicit and the row's directional peer is `to`.
+
+Authority: [MESSAGE-R01 and MESSAGE-R02](03-message/requirements.md);
+[`SentMessageRow`](../../crates/st2-wire/src/message.rs)
+
+### sender history
+
+The durable sender-owned sequence enumerated by `message sent`. Recipient inboxes, archives, and
+typed service-principal request state do not supply its rows.
+
+Authority: [MESSAGE-R01 and MESSAGE-R11](03-message/requirements.md);
+[message specification](03-message/spec.md);
+[`list_sent`](../../src/message.rs)
+
+### sender history coverage
+
+The explicit proof boundary attached to sender history: `unavailable`, `since`, or `partial`. An
+empty row sequence is a complete empty result only with `since` coverage.
+
+Authority: [MESSAGE-R03](03-message/requirements.md);
+[`SentCoverage`](../../crates/st2-wire/src/message.rs)
+
+### sent commit ledger
+
+The sender-owned immutable chain that commits each completed Sent row. One constant-size atomic head
+names the chain tip and count; complete reads verify the chain to genesis and its exact reachable
+sender-row set.
+
+Authority: [MESSAGE-R03 and MESSAGE-R08](03-message/requirements.md);
+[state ownership](03-message/spec.md#state-ownership)
+
+### idempotency key
+
+An optional caller-supplied operation identity scoped by canonical sender, canonical recipient, and
+key. It makes an exact send or reply retry return the original filename; it is not inferred from
+message content.
+
+Authority: [MESSAGE-R07 and MESSAGE-R08](03-message/requirements.md);
+[retry identity](03-message/spec.md#retry-identity);
+[`send_to_resolved_inbox`](../../src/message.rs)
 
 ### DING
 

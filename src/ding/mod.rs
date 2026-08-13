@@ -1176,6 +1176,7 @@ mod tests {
             in_reply_to: None,
             tags: vec![],
             priority: None,
+            idempotency_key: None,
             body: String::new(),
         }
     }
