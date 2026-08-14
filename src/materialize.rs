@@ -235,6 +235,47 @@ pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
     }
 }
 
+/// Append render operations from the same pure driver expansion used by the print command.
+fn parse_plan_with_driver(spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
+    let mut plan = parse_plan(spec)?;
+    if spec.driver.is_none() {
+        return Ok(plan);
+    }
+    let expansion = crate::driver::expand_driver(spec, this_host)?;
+    for render in expansion
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == "render")
+    {
+        plan.ops
+            .extend(parse_render_node(render, &spec.identity)?.ops);
+    }
+    Ok(plan)
+}
+
+/// Add either the typed driver render or the unchanged legacy delivery render.
+fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
+    let mut plan = parse_plan_with_driver(spec, this_host)?;
+    if spec.driver.is_none()
+        && spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp)
+    {
+        let executable = std::env::current_exe()
+            .context("resolving st2 executable for Claude MCP declaration")?;
+        let content = serde_json::json!({
+            "mcpServers": {"st2": {
+                "type": "stdio",
+                "command": executable.to_string_lossy(),
+                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", spec.bus_id(this_host)]
+            }}
+        }).to_string();
+        plan.ops.push(RenderOp::JsonUpsert {
+            destination: ".mcp.json".into(),
+            content,
+        });
+    }
+    Ok(plan)
+}
+
 /// Catalog-owned files read by this agent's `render { copy ... }` operations.
 ///
 /// Absolute/external sources are deliberately absent: a declaration snapshot owns catalog bytes,
@@ -245,30 +286,7 @@ pub(crate) fn catalog_owned_render_inputs(
     spec: &AgentSpec,
     this_host: &str,
 ) -> Result<Vec<PathBuf>> {
-    let mut plan = parse_plan(spec)?;
-    if spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp) {
-        // Claude owns this child: the project MCP declaration is rendered into
-        // the workspace and Claude starts the stdio server from it.  st2 never
-        // reconciles or supervises the watcher as a sibling task.
-        let executable = std::env::current_exe()
-            .context("resolving st2 executable for Claude MCP declaration")?;
-        let catalog = root.display().to_string();
-        let identity = spec.bus_id(this_host);
-        let content = serde_json::json!({
-            "mcpServers": {
-                "st2": {
-                    "type": "stdio",
-                    "command": executable.to_string_lossy(),
-                    "args": ["--catalog", catalog, "claude-mcp", "--identity", identity]
-                }
-            }
-        })
-        .to_string();
-        plan.ops.push(RenderOp::JsonUpsert {
-            destination: ".mcp.json".into(),
-            content,
-        });
-    }
+    let plan = effective_plan(root, spec, this_host)?;
     let env = render_env(root, spec, this_host);
     let spec_dir = spec.path.parent().unwrap_or(root);
     let mut inputs = BTreeSet::new();
@@ -529,19 +547,7 @@ fn claims_for_agent(
     spec: &AgentSpec,
     this_host: &str,
 ) -> Result<BTreeMap<PathBuf, Vec<RenderClaim>>> {
-    let mut plan = parse_plan(spec)?;
-    if spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp) {
-        let executable = std::env::current_exe()
-            .context("resolving st2 executable for Claude MCP declaration")?;
-        let content = serde_json::json!({
-            "mcpServers": {"st2": {
-                "type": "stdio",
-                "command": executable.to_string_lossy(),
-                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", spec.bus_id(this_host)]
-            }}
-        }).to_string();
-        plan.ops.push(RenderOp::JsonUpsert { destination: ".mcp.json".into(), content });
-    }
+    let plan = effective_plan(root, spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -653,19 +659,7 @@ pub fn render_ownership_conflicts(
 /// Execute one agent's render plan in declaration order.
 pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
     crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
-    let mut plan = parse_plan(spec)?;
-    if spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp) {
-        let executable = std::env::current_exe()
-            .context("resolving st2 executable for Claude MCP declaration")?;
-        let content = serde_json::json!({
-            "mcpServers": {"st2": {
-                "type": "stdio",
-                "command": executable.to_string_lossy(),
-                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", spec.bus_id(this_host)]
-            }}
-        }).to_string();
-        plan.ops.push(RenderOp::JsonUpsert { destination: ".mcp.json".into(), content });
-    }
+    let plan = effective_plan(root, spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(Vec::new());
     }
@@ -869,7 +863,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
 /// Validate an agent's render declaration and all catalog-owned inputs without writing its workspace.
 pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<()> {
     crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
-    let plan = parse_plan(spec)?;
+    let plan = parse_plan_with_driver(spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(());
     }
