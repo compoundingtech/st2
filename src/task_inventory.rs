@@ -280,8 +280,17 @@ pub fn inventory(
         .collect::<Vec<_>>();
     let mut desired = Vec::new();
     let mut runtime_owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut compiled_specs = found.specs.clone();
+    let compilation = crate::reconcile::TaskCompileContext::current(catalog.to_path_buf())
+        .and_then(|context| {
+            crate::reconcile::compile_generated_tasks(&mut compiled_specs, host, &context)
+        });
+    if let Err(error) = compilation {
+        push_error(&mut errors, format!("compile desired tasks: {error:#}"));
+        compiled_specs.clear();
+    }
 
-    for spec in &found.specs {
+    for spec in &compiled_specs {
         if spec.resolved_host(host) != host {
             continue;
         }

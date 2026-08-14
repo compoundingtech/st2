@@ -200,6 +200,52 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
 }
 
 #[test]
+fn driver_and_deliver_have_identical_end_to_end_inventory() {
+    let (tmp, catalog, bin) = fixture("[]");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let legacy = r#"
+agent "worker" {
+  host "h"
+  deliver "mcp"
+  argv "claude" "--model" "opus" "--effort" "xhigh" "boot"
+}
+"#;
+    let driver = r#"
+agent "worker" {
+  host "h"
+  claude {
+    model "opus"
+    effort "xhigh"
+    prompt "boot"
+  }
+}
+"#;
+    fs::write(&declaration, legacy).unwrap();
+    let legacy = tasks(&catalog, &bin, &tmp.path().join("state"));
+    assert!(
+        legacy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    fs::write(&declaration, driver).unwrap();
+    let driver = tasks(&catalog, &bin, &tmp.path().join("state"));
+    assert!(
+        driver.status.success(),
+        "{}",
+        String::from_utf8_lossy(&driver.stderr)
+    );
+
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    let driver: serde_json::Value = serde_json::from_slice(&driver.stdout).unwrap();
+    assert_eq!(driver, legacy);
+    assert_eq!(driver["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(driver["tasks"][0]["agent"], "h.worker");
+    assert_eq!(driver["tasks"][0]["task"], "agent");
+    assert_eq!(driver["tasks"][0]["kind"], "pty");
+    assert_eq!(driver["tasks"][0]["lifecycle"], "service");
+}
+
+#[test]
 fn suspended_agent_projects_task_absence_and_agent_rationale_separately() {
     let (tmp, catalog, bin) = fixture("[]");
     let declaration = catalog.join("agents/h/worker/agent.kdl");
