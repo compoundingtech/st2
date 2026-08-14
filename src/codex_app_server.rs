@@ -17,6 +17,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1024,12 +1025,13 @@ fn run_controlled_owned(
         }
     }
     diagnostics.record("appServerStarting", json!({}))?;
-    let mut server = Command::new(&codex_argv[0])
+    let mut server_command = Command::new(&codex_argv[0]);
+    server_command
         .args(server_args)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
+        .stderr(log);
+    let mut server = spawn_process_group(&mut server_command)
         .with_context(|| format!("starting {} app-server", codex_argv[0]))?;
     let result = diagnostics
         .record("appServerStarted", json!({ "pid": server.id() }))
@@ -1044,7 +1046,7 @@ fn run_controlled_owned(
                 diagnostics,
             )
         });
-    terminate_child(&mut server);
+    terminate_process_group(&mut server);
     let _ = fs::remove_file(&socket_path);
     result
 }
@@ -1294,12 +1296,13 @@ fn preflight_hook_trust(
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<Option<HookTrustProjection>> {
     diagnostics.record("hookTrustPreflightStarting", json!({}))?;
-    let mut server = Command::new(codex)
+    let mut server_command = Command::new(codex);
+    server_command
         .args(server_args)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log.try_clone()?)
-        .spawn()
+        .stderr(log.try_clone()?);
+    let mut server = spawn_process_group(&mut server_command)
         .with_context(|| format!("starting {codex} hook-trust preflight app-server"))?;
     let result = diagnostics
         .record("hookTrustPreflightStarted", json!({ "pid": server.id() }))
@@ -1308,7 +1311,7 @@ fn preflight_hook_trust(
             let mut websocket = initialize_control(control)?;
             query_hook_trust_projection(&mut websocket, cwd)
         });
-    terminate_child(&mut server);
+    terminate_process_group(&mut server);
     let _ = fs::remove_file(socket_path);
     let projection = result?;
     diagnostics.record(
@@ -2352,6 +2355,30 @@ fn poll_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<ControlRea
     }
 }
 
+/// Spawn a non-interactive provider launcher as the leader of an isolated process group.
+/// Its native descendants inherit this group, so cleanup cannot strand a listening process.
+fn spawn_process_group(command: &mut Command) -> std::io::Result<Child> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn()
+}
+
+fn terminate_process_group(child: &mut Child) {
+    let process_group = child.id() as i32;
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn terminate_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
@@ -2367,6 +2394,24 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_state(pid: i32) -> Option<char> {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()?
+            .rsplit_once(") ")?
+            .1
+            .chars()
+            .next()
+    }
+
+    fn process_can_retain_cleanup_resources(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        if linux_process_state(pid) == Some('Z') {
+            return false;
+        }
+        crate::host_lock::process_alive(pid)
+    }
 
     #[test]
     fn protocol_version_gate_accepts_only_the_exact_allowlist() {
@@ -3999,6 +4044,51 @@ mod tests {
         assert!(
             !authored_bypasses_hook_trust(&["--".into(), "--dangerously-bypass-hook-trust".into()])
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn process_group_cleanup_reaps_a_native_launcher_descendant() {
+        let temporary = tempfile::tempdir().unwrap();
+        let descendant_pidfile = temporary.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"sh -c 'printf "%s" "$$" > "$DESCENDANT_PIDFILE"; exec sleep 60' & sleep 60"#,
+            )
+            .env("DESCENDANT_PIDFILE", &descendant_pidfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut launcher = spawn_process_group(&mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !descendant_pidfile.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant = std::fs::read_to_string(&descendant_pidfile)
+            .expect("the launcher did not create its native descendant")
+            .parse::<i32>()
+            .unwrap();
+        assert!(
+            process_can_retain_cleanup_resources(descendant),
+            "the native descendant was not alive before cleanup"
+        );
+
+        terminate_process_group(&mut launcher);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_can_retain_cleanup_resources(descendant) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = process_can_retain_cleanup_resources(descendant);
+        if survived {
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !survived,
+            "native descendant {descendant} survived process-group cleanup"
         );
     }
 
