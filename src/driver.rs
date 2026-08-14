@@ -11,6 +11,16 @@ const ST2: &str = "st2";
 const CATALOG: &str = "$CATALOG";
 const CLAUDE_SERVER: &str = "st2";
 
+/// Reject two launch sources before expansion, task compilation, or workspace writes.
+pub(crate) fn ensure_single_source(spec: &AgentSpec) -> Result<()> {
+    anyhow::ensure!(
+        spec.driver.is_none() || spec.delivery.is_none(),
+        "agent '{}' declares both a driver block and `deliver`; choose one launch source",
+        spec.identity
+    );
+    Ok(())
+}
+
 /// Expand one typed driver into KDL nodes that can be written inside an `agent {}` block.
 pub fn expand_driver(spec: &AgentSpec, this_host: &str) -> Result<KdlDocument> {
     let driver = spec

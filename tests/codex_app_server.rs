@@ -92,6 +92,11 @@ fn codex_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
     let mut legacy = legacy.into_iter().next().unwrap();
     let mut driver = driver.into_iter().next().unwrap();
     let compile_context = context(tmp.path());
+    assert!(st2::hooks::required_by_codex_agent(
+        &driver,
+        "h",
+        tmp.path()
+    ));
 
     compile_generated_tasks(
         std::slice::from_mut(&mut legacy),

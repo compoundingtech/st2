@@ -116,6 +116,11 @@ fn claude_driver_matches_deliver_after_normalizing_only_resolution_and_the_alias
     let (driver, _) = st2::discover_file(&catalog, &driver_path).unwrap();
     let mut legacy = legacy.into_iter().next().unwrap();
     let mut driver = driver.into_iter().next().unwrap();
+    assert!(!st2::hooks::required_by_codex_agent(
+        &driver,
+        "h",
+        &catalog
+    ));
     let executable = catalog.join("bin/st2");
     fs::create_dir_all(executable.parent().unwrap()).unwrap();
     fs::write(&executable, "test binary").unwrap();
@@ -150,4 +155,47 @@ fn claude_driver_matches_deliver_after_normalizing_only_resolution_and_the_alias
     assert_eq!(&args[2..4], ["driver", "claude"]);
     args.splice(2..4, [serde_json::Value::String("claude-mcp".into())]);
     assert_eq!(driver_mcp, legacy_mcp);
+}
+
+#[test]
+fn ambiguous_driver_source_neither_compiles_nor_materializes() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(
+        &path,
+        format!(
+            r#"agent "worker" {{
+  host "h"
+  workspace "{}"
+  deliver "mcp"
+  claude {{ prompt "boot" }}
+}}
+"#,
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    let (specs, _) = st2::discover_file(&catalog, &path).unwrap();
+    let mut spec = specs.into_iter().next().unwrap();
+    let before = spec.clone();
+    let executable = catalog.join("bin/st2");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "test binary").unwrap();
+    let context = TaskCompileContext::new(catalog.clone(), executable).unwrap();
+
+    let compile_error =
+        compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap_err();
+    assert!(compile_error.to_string().contains("choose one launch source"));
+    assert_eq!(spec, before);
+    let materialize_error = materialize_agent(&catalog, &spec, "h").unwrap_err();
+    assert!(
+        materialize_error
+            .to_string()
+            .contains("choose one launch source")
+    );
+    assert!(!workspace.join(".mcp.json").exists());
 }

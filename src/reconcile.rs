@@ -86,6 +86,9 @@ pub fn compile_generated_tasks(
     this_host: &str,
     context: &TaskCompileContext,
 ) -> Result<()> {
+    for spec in specs.iter() {
+        crate::driver::ensure_single_source(spec)?;
+    }
     compile_driver_agent_tasks(specs, this_host, context)?;
     compile_generated_ding_tasks(specs, this_host, context)?;
     compile_app_server_agent_tasks(specs, this_host, context)?;

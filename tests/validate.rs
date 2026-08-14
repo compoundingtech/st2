@@ -198,7 +198,7 @@ fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
     assert_eq!(issue.severity, Severity::Error);
     assert_eq!(
         issue.message,
-        "agent declares both a driver block and `deliver`; choose one launch source"
+        "agent 'worker' declares both a driver block and `deliver`; choose one launch source"
     );
 }
 

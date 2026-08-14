@@ -255,6 +255,7 @@ fn parse_plan_with_driver(spec: &AgentSpec, this_host: &str) -> Result<RenderPla
 
 /// Add either the typed driver render or the unchanged legacy delivery render.
 fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
+    crate::driver::ensure_single_source(spec)?;
     let mut plan = parse_plan_with_driver(spec, this_host)?;
     if spec.driver.is_none()
         && spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp)

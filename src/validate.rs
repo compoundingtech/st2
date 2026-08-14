@@ -220,13 +220,12 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             ));
         }
 
-        if s.driver.is_some() && s.delivery.is_some() {
+        if let Err(error) = crate::driver::ensure_single_source(s) {
             issues.push(Issue::error(
                 "driver-deliver-conflict",
                 rp.clone(),
                 ag.clone(),
-                "agent declares both a driver block and `deliver`; choose one launch source"
-                    .to_string(),
+                error.to_string(),
             ));
         }
 
