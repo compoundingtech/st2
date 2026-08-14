@@ -3042,11 +3042,15 @@ fn ls(root: &Path) -> Result<()> {
     let _catalog_lock = st2::CatalogLock::shared(root)
         .context("acquire shared catalog-authoring lock for catalog listing")?;
     let found = discover(root);
+    let mut specs = found.specs.clone();
+    let task_context = st2::reconcile::TaskCompileContext::current(root.to_path_buf())?;
+    st2::reconcile::compile_generated_tasks(&mut specs, &detect_host(), &task_context)
+        .context("compile generated tasks for catalog listing")?;
 
-    if found.specs.is_empty() {
+    if specs.is_empty() {
         println!("no specs found under {}", root.display());
     }
-    for spec in &found.specs {
+    for spec in &specs {
         let host = spec.host.as_deref().unwrap_or("<this-host>");
         let kind = match spec.job_type {
             st2::JobType::Service => "service",

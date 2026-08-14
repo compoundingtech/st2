@@ -132,7 +132,6 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
 #[derive(Debug)]
 struct CanonicalEvalTeam {
     specs: Vec<AgentSpec>,
-    runtime_tasks: Vec<EvalRuntimeTask>,
     routes: BTreeMap<String, CanonicalRoute>,
 }
 
@@ -166,6 +165,25 @@ fn task_runtime_id(spec: &AgentSpec, task: &Task, host: &str) -> String {
 
 fn task_is_launchable(task: &Task) -> bool {
     task.command.is_some() || task.argv.is_some()
+}
+
+/// Project runtime inventory only after generated launch tasks are compiled.
+fn eval_runtime_tasks(specs: &[AgentSpec], host: &str) -> Vec<EvalRuntimeTask> {
+    let mut tasks = specs
+        .iter()
+        .flat_map(|spec| {
+            spec.tasks
+                .iter()
+                .filter(|task| task_is_launchable(task))
+                .map(|task| EvalRuntimeTask {
+                    agent_id: spec.bus_id(host),
+                    runtime_id: task_runtime_id(spec, task, host),
+                    is_pty: task.kind == TaskKind::Pty,
+                })
+        })
+        .collect::<Vec<_>>();
+    tasks.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
+    tasks
 }
 
 /// Discover the sole declaration authority for a `canonical-agents` eval after its fixture and run
@@ -228,7 +246,6 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
 
     let mut bus_ids = HashSet::new();
     let mut runtime_ids = BTreeMap::<String, String>::new();
-    let mut runtime_tasks = Vec::new();
     let mut routes = BTreeMap::new();
     for spec in &local_specs {
         let bus_id = spec.bus_id(host);
@@ -240,9 +257,6 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
                 "canonical-agents refuses non-running Agent Spec `{bus_id}` ({})",
                 spec.desired_state.as_str()
             );
-        }
-        if !spec.is_runnable() {
-            anyhow::bail!("canonical-agents Agent Spec `{bus_id}` is not runnable");
         }
         for task in &spec.tasks {
             for root in ["CATALOG", "ST_ROOT", "PTY_ROOT", "ST2_EVAL_REQUESTER"] {
@@ -266,13 +280,6 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
                     "canonical-agents found duplicate runtime task id `{runtime_id}` in `{previous}` and `{bus_id}`"
                 );
             }
-            if task_is_launchable(task) {
-                runtime_tasks.push(EvalRuntimeTask {
-                    agent_id: bus_id.clone(),
-                    runtime_id,
-                    is_pty: task.kind == TaskKind::Pty,
-                });
-            }
         }
         let agent_dir = spec
             .path
@@ -295,8 +302,6 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             }
         }
     }
-    runtime_tasks.sort_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
-
     let materialized =
         crate::materialize::materialize_catalog(catalog, &local_specs, host);
     if !materialized.errors.is_empty() {
@@ -313,7 +318,6 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
     }
     Ok(CanonicalEvalTeam {
         specs: local_specs,
-        runtime_tasks,
         routes,
     })
 }
@@ -1056,7 +1060,7 @@ fn run_eval_inner(
         }
         (true, Vec::new(), Vec::new())
     } else {
-        let (mut specs, runtime_tasks, participant_ids, canonical_routes) = if eval.canonical_agents {
+        let (mut specs, participant_ids, canonical_routes) = if eval.canonical_agents {
             if bus != catalog {
                 anyhow::bail!(
                     "canonical-agents requires the native flat ST_ROOT `{}`, got `{}`",
@@ -1072,32 +1076,19 @@ fn run_eval_inner(
                 .collect::<Vec<_>>();
             (
                 team.specs,
-                team.runtime_tasks,
                 participants,
                 Some(team.routes),
             )
         } else {
             let specs = spec_to_agent_specs(&compact_agents, host, catalog);
-            let runtime_tasks = specs
-                .iter()
-                .flat_map(|spec| {
-                    spec.tasks
-                        .iter()
-                        .filter(|task| task_is_launchable(task))
-                        .map(|task| EvalRuntimeTask {
-                            agent_id: spec.bus_id(host),
-                            runtime_id: task_runtime_id(spec, task, host),
-                            is_pty: task.kind == TaskKind::Pty,
-                        })
-                })
-                .collect::<Vec<_>>();
             let participants = specs
                 .iter()
                 .map(|spec| spec.bus_id(host))
                 .collect::<Vec<_>>();
-            (specs, runtime_tasks, participants, None)
+            (specs, participants, None)
         };
         compile_generated_tasks(&mut specs, host, task_context)?;
+        let runtime_tasks = eval_runtime_tasks(&specs, host);
         let task_ids = runtime_tasks
             .iter()
             .map(|task| task.runtime_id.clone())
@@ -1558,14 +1549,49 @@ mod tests {
 
         let team = load_canonical_eval_team(catalog.path(), "evalhost").unwrap();
         assert_eq!(team.specs.len(), 2);
+        let context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let mut compiled = team.specs.clone();
+        compile_generated_tasks(&mut compiled, "evalhost", &context).unwrap();
         assert_eq!(
-            team.runtime_tasks
+            eval_runtime_tasks(&compiled, "evalhost")
                 .iter()
                 .map(|task| task.runtime_id.as_str())
                 .collect::<Vec<_>>(),
             ["evalhost.sup", "evalhost.worker"]
         );
         assert!(team.specs.iter().all(|spec| spec.path.ends_with("agent.kdl")));
+    }
+
+    #[test]
+    fn canonical_eval_runtime_inventory_compiles_driver_launches() {
+        let catalog = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(catalog.path().join("worker")).unwrap();
+        write_eval_agent(
+            catalog.path(),
+            "agents/evalhost/worker/agent.kdl",
+            r#"agent "worker" {
+  host "evalhost"
+  workspace "$CATALOG/worker"
+  claude { prompt "Start the assigned work." }
+}
+"#,
+        );
+
+        let team = load_canonical_eval_team(catalog.path(), "evalhost").unwrap();
+        assert!(!team.specs[0].is_runnable());
+        let context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let mut compiled = team.specs.clone();
+        compile_generated_tasks(&mut compiled, "evalhost", &context).unwrap();
+
+        assert!(compiled[0].is_runnable());
+        assert_eq!(
+            eval_runtime_tasks(&compiled, "evalhost"),
+            [EvalRuntimeTask {
+                agent_id: "evalhost.worker".into(),
+                runtime_id: "evalhost.worker".into(),
+                is_pty: true,
+            }]
+        );
     }
 
     #[test]
@@ -1600,7 +1626,12 @@ mod tests {
             ["evalhost.local"]
         );
         assert_eq!(
-            team.runtime_tasks,
+            {
+                let context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+                let mut compiled = team.specs.clone();
+                compile_generated_tasks(&mut compiled, "evalhost", &context).unwrap();
+                eval_runtime_tasks(&compiled, "evalhost")
+            },
             [
                 EvalRuntimeTask {
                     agent_id: "evalhost.local".into(),

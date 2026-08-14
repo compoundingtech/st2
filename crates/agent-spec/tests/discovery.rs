@@ -638,7 +638,9 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
         args: vec!["--permission-mode".into(), "bypassPermissions".into()],
     });
     for identity in ["claude-kdl", "claude-toml", "claude-json"] {
-        assert_eq!(find(&found.specs, identity).driver.as_ref(), Some(&claude));
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.driver.as_ref(), Some(&claude));
+        assert!(!spec.is_runnable());
     }
     let codex = Driver::Codex(CodexDriver {
         model: Some("gpt-5.6-sol".into()),
@@ -647,7 +649,9 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
         args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
     });
     for identity in ["codex-kdl", "codex-toml", "codex-json"] {
-        assert_eq!(find(&found.specs, identity).driver.as_ref(), Some(&codex));
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.driver.as_ref(), Some(&codex));
+        assert!(!spec.is_runnable());
     }
 }
 

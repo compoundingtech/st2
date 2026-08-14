@@ -392,14 +392,13 @@ impl AgentSpec {
         self.host.as_deref().unwrap_or(this_host)
     }
 
-    /// True when a driver can compile the launch or an authored task already contains one.
+    /// True when a compiled or authored task contains a launch.
+    /// Callers that accept driver blocks must compile generated tasks before this check.
     /// A generated sidecar cannot make an otherwise-empty job runnable.
     pub fn is_runnable(&self) -> bool {
-        self.driver.is_some()
-            || self
-                .tasks
-                .iter()
-                .any(|task| !task.derived && (task.command.is_some() || task.argv.is_some()))
+        self.tasks
+            .iter()
+            .any(|task| !task.derived && (task.command.is_some() || task.argv.is_some()))
     }
 
     /// True when the declaration selected legacy screen delivery or one native transport.

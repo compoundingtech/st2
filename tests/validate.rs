@@ -417,6 +417,44 @@ fn an_unrendered_service_is_not_runnable() {
 }
 
 #[test]
+fn fleet_validation_compiles_remote_driver_launches() {
+    let c = catalog(&[(
+        "Silber/worker/agent.kdl",
+        r#"agent "worker" {
+  host "Silber"
+  workspace "/tmp"
+  claude { prompt "boot" }
+}"#,
+    )]);
+    let found = st2::discover(c.path());
+    assert!(!found.specs[0].is_runnable());
+
+    for report in [validate(c.path()), validate_for_host(c.path(), "droppy")] {
+        assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
+        assert_eq!(report.warnings(), 0, "unexpected issues: {:?}", report.issues);
+    }
+}
+
+#[test]
+fn validation_reports_shared_task_compiler_errors() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  workspace "/tmp"
+  command "codex"
+  deliver "app-server"
+}"#,
+    )]);
+
+    assert!(has(
+        &validate_for_host(c.path(), "h"),
+        "launch-compile-error",
+        Severity::Error
+    ));
+}
+
+#[test]
 fn a_generated_ding_sidecar_is_not_authored_runnable_work() {
     let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; ding }"#)]);
     assert!(has(&validate(c.path()), "not-runnable", Severity::Error));
@@ -437,6 +475,28 @@ fn ls_marks_a_generated_ding_only_agent_as_unrendered() {
         "stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+#[test]
+fn ls_compiles_driver_launches_before_display() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" { host "h"; claude { prompt "boot" } }"#,
+    )]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(c.path())
+        .arg("ls")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("UNRENDERED"), "{stdout}");
+    assert!(stdout.contains(r#"argv ["claude", "boot"]"#), "{stdout}");
 }
 
 #[test]
