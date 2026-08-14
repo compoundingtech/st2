@@ -2567,6 +2567,25 @@ mod tests {
     }
 
     #[test]
+    fn idle_session_refreshes_stale_presence_without_inbox_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let presence = status::status_path(&config.agent_dir);
+        status::set_state(&presence, status::State::Available).unwrap();
+        std::fs::File::open(&presence)
+            .unwrap()
+            .set_modified(SystemTime::now() - status::STATUS_STALE - Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status::read_state(&presence), status::State::Unknown);
+
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        delivery.refresh_if_due().unwrap();
+
+        assert_eq!(status::read_state(&presence), status::State::Available);
+        assert!(delivery.head.is_none());
+    }
+
+    #[test]
     fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
