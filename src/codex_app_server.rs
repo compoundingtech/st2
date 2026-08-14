@@ -300,7 +300,8 @@ struct CodexInboxDelivery {
     runtime: CodexRuntime,
     wake: Receiver<()>,
     _watcher: Option<notify::RecommendedWatcher>,
-    next_refresh: Instant,
+    next_inbox_refresh: Instant,
+    next_presence_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
     state: Option<CodexDeliveryState>,
@@ -330,7 +331,8 @@ impl CodexInboxDelivery {
             runtime,
             wake,
             _watcher: watcher,
-            next_refresh: Instant::now(),
+            next_inbox_refresh: Instant::now(),
+            next_presence_refresh: Instant::now(),
             head: None,
             suppressed: false,
             state,
@@ -353,16 +355,20 @@ impl CodexInboxDelivery {
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
-        let mut due = Instant::now() >= self.next_refresh;
+        let now = Instant::now();
+        if now >= self.next_presence_refresh {
+            // This wrapper owns the live provider session. It therefore owns the presence lease.
+            // Preserve busy or available, and let dnd age out.
+            let _ = status::refresh(&status::status_path(&self.config.agent_dir));
+            self.next_presence_refresh = now + status::STATUS_REFRESH;
+        }
+        let mut due = now >= self.next_inbox_refresh;
         while self.wake.try_recv().is_ok() {
             due = true;
         }
         if !due {
             return Ok(());
         }
-        // Native delivery owns the live provider session, so it also owns the
-        // presence lease. Preserve busy/available and let dnd age out.
-        let _ = status::refresh(&status::status_path(&self.config.agent_dir));
         let unread = message::list_inbox(&self.config.inbox)?;
         if self.state.as_ref().is_some_and(|state| {
             unread
@@ -381,7 +387,7 @@ impl CodexInboxDelivery {
         self.head = unread.into_iter().next();
         self.suppressed =
             status::read_state(&status::status_path(&self.config.agent_dir)) == status::State::Dnd;
-        self.next_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
+        self.next_inbox_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
         Ok(())
     }
 
@@ -2556,7 +2562,7 @@ mod tests {
         }
 
         status::set_state(&status::status_path(&config.agent_dir), status::State::Dnd).unwrap();
-        delivery.next_refresh = Instant::now();
+        delivery.next_inbox_refresh = Instant::now();
         assert_eq!(
             delivery
                 .maybe_request(&subscribed_state(CodexObservedState::Idle))
@@ -2571,7 +2577,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
         let presence = status::status_path(&config.agent_dir);
-        status::set_state(&presence, status::State::Available).unwrap();
+        std::fs::create_dir_all(&config.agent_dir).unwrap();
+        std::fs::write(&presence, "available\n").unwrap();
         std::fs::File::open(&presence)
             .unwrap()
             .set_modified(SystemTime::now() - status::STATUS_STALE - Duration::from_secs(1))
@@ -2582,7 +2589,28 @@ mod tests {
         delivery.refresh_if_due().unwrap();
 
         assert_eq!(status::read_state(&presence), status::State::Available);
+        assert!(
+            std::fs::read_to_string(&presence)
+                .unwrap()
+                .contains("updated-at-unix-ms ")
+        );
         assert!(delivery.head.is_none());
+    }
+
+    #[test]
+    fn inbox_fallback_does_not_write_a_fifteen_second_presence_heartbeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let presence = status::status_path(&config.agent_dir);
+        status::set_state(&presence, status::State::Available).unwrap();
+        let before = std::fs::read_to_string(&presence).unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        delivery.next_inbox_refresh = Instant::now();
+        delivery.next_presence_refresh = Instant::now() + status::STATUS_REFRESH;
+
+        delivery.refresh_if_due().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&presence).unwrap(), before);
     }
 
     #[test]
@@ -2764,7 +2792,7 @@ mod tests {
             &filename,
         )
         .unwrap();
-        replacement.next_refresh = Instant::now();
+        replacement.next_inbox_refresh = Instant::now();
         assert_eq!(replacement.maybe_request(&idle).unwrap(), None);
         assert!(
             !state_path.exists(),

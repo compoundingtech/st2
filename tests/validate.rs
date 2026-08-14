@@ -496,7 +496,11 @@ fn ls_compiles_driver_launches_before_display() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("UNRENDERED"), "{stdout}");
-    assert!(stdout.contains(r#"argv ["claude", "boot"]"#), "{stdout}");
+    assert!(
+        stdout.contains(r#""driver", "claude-session""#)
+            && stdout.contains(r#""--", "claude", "boot"]"#),
+        "{stdout}"
+    );
 }
 
 #[test]

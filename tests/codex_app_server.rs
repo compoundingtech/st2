@@ -164,14 +164,35 @@ fn app_server_selector_rejects_shell_and_pre_remote_launches_without_mutating_th
 }
 
 #[test]
-fn mcp_selector_does_not_rewrite_the_authored_launch() {
+fn mcp_selector_wraps_the_authored_claude_launch_with_session_ownership() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         &tmp.path().join("agents/h/worker/agent.kdl"),
         r#"agent "worker" { host "h"; deliver "mcp"; argv "claude" "boot" }"#,
     );
     let mut found = st2::discover(tmp.path());
-    let before = found.specs.clone();
     compile_generated_tasks(&mut found.specs, "h", &context(tmp.path())).unwrap();
-    assert_eq!(found.specs, before);
+
+    let task = &found.specs[0].tasks[0];
+    assert_eq!(task.command, None);
+    assert_eq!(
+        task.argv.as_deref(),
+        Some(
+            [
+                tmp.path().join("bin/st2").display().to_string(),
+                "--catalog".into(),
+                tmp.path().display().to_string(),
+                "driver".into(),
+                "claude-session".into(),
+                "--identity".into(),
+                "h.worker".into(),
+                "--runtime-id".into(),
+                "h.worker".into(),
+                "--".into(),
+                "claude".into(),
+                "boot".into(),
+            ]
+            .as_slice()
+        )
+    );
 }

@@ -124,7 +124,7 @@ fn claude_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
     let executable = catalog.join("bin/st2");
     fs::create_dir_all(executable.parent().unwrap()).unwrap();
     fs::write(&executable, "test binary").unwrap();
-    let context = TaskCompileContext::new(catalog.clone(), executable).unwrap();
+    let context = TaskCompileContext::new(catalog.clone(), executable.clone()).unwrap();
 
     compile_generated_tasks(std::slice::from_mut(&mut legacy), "h", &context).unwrap();
     compile_generated_tasks(std::slice::from_mut(&mut driver), "h", &context).unwrap();
@@ -138,6 +138,23 @@ fn claude_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
         .iter()
         .find(|task| task.name == "agent")
         .unwrap();
+    let executable_string = executable.to_string_lossy().into_owned();
+    let catalog_string = catalog.to_string_lossy().into_owned();
+    assert_eq!(
+        &driver_task.argv.as_ref().unwrap()[..10],
+        [
+            executable_string.as_str(),
+            "--catalog",
+            catalog_string.as_str(),
+            "driver",
+            "claude-session",
+            "--identity",
+            "h.worker",
+            "--runtime-id",
+            "h.worker",
+            "--",
+        ]
+    );
     assert_eq!(driver_task, legacy_task);
 
     materialize_agent(&catalog, &legacy, "h").unwrap();
@@ -156,6 +173,46 @@ fn claude_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
     assert_eq!(&args[2..4], ["driver", "claude"]);
     args.splice(2..4, [serde_json::Value::String("claude-mcp".into())]);
     assert_eq!(driver_mcp, legacy_mcp);
+}
+
+#[test]
+fn legacy_claude_shell_launch_keeps_its_source_under_the_session_wrapper() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(
+        &path,
+        r#"agent "worker" {
+  host "h"
+  deliver "mcp"
+  command "exec claude boot"
+}
+"#,
+    )
+    .unwrap();
+    let (mut specs, _) = st2::discover_file(&catalog, &path).unwrap();
+    let executable = catalog.join("bin/st2");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "test binary").unwrap();
+    let context = TaskCompileContext::new(catalog, executable).unwrap();
+
+    compile_generated_tasks(&mut specs, "h", &context).unwrap();
+
+    let argv = specs[0].tasks[0].argv.as_ref().unwrap();
+    assert_eq!(
+        &argv[3..10],
+        [
+            "driver",
+            "claude-session",
+            "--identity",
+            "h.worker",
+            "--runtime-id",
+            "h.worker",
+            "--",
+        ]
+    );
+    assert_eq!(&argv[10..], ["sh", "-c", "exec claude boot"]);
 }
 
 #[test]

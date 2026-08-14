@@ -96,18 +96,32 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
         vec![".mcp.json".to_string(), mcp],
     )]));
 
-    let mut argv = vec!["claude".to_string()];
+    let mut provider = vec!["claude".to_string()];
     if let Some(model) = &driver.model {
-        argv.extend(["--model".to_string(), model.clone()]);
+        provider.extend(["--model".to_string(), model.clone()]);
     }
     if let Some(effort) = &driver.effort {
-        argv.extend(["--effort".to_string(), effort.clone()]);
+        provider.extend(["--effort".to_string(), effort.clone()]);
     }
     if driver.dev_channels {
-        argv.push("--dangerously-load-development-channels=server:st2".to_string());
+        provider.push("--dangerously-load-development-channels=server:st2".to_string());
     }
-    argv.extend(driver.args.iter().cloned());
-    argv.push(driver.prompt.clone());
+    provider.extend(driver.args.iter().cloned());
+    provider.push(driver.prompt.clone());
+
+    let mut argv = vec![
+        ST2.to_string(),
+        "--catalog".to_string(),
+        CATALOG.to_string(),
+        "driver".to_string(),
+        "claude-session".to_string(),
+        "--identity".to_string(),
+        bus_id.to_string(),
+        "--runtime-id".to_string(),
+        bus_id.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(provider);
     Ok(document([render, node("argv", argv)]))
 }
 
@@ -204,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_expands_to_plain_render_and_argv_primitives() {
+    fn claude_expands_to_a_channel_render_and_session_owned_launch() {
         let output = expand_driver(
             &spec(Driver::Claude(ClaudeDriver {
                 model: Some("opus".into()),
@@ -239,6 +253,16 @@ mod tests {
         assert_eq!(
             strings(output.get("argv").unwrap()),
             [
+                "st2",
+                "--catalog",
+                "$CATALOG",
+                "driver",
+                "claude-session",
+                "--identity",
+                "host.worker",
+                "--runtime-id",
+                "host.worker",
+                "--",
                 "claude",
                 "--model",
                 "opus",

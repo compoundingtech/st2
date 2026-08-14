@@ -329,6 +329,15 @@ enum DriverCmd {
         #[arg(long)]
         identity: String,
     },
+    /// Run Claude under the session-owned presence wrapper.
+    ClaudeSession {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -897,6 +906,15 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::ClaudeSession {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_session::run(&catalog, identity, runtime_id, argv)
         }
         Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
             let catalog = catalog_arg(None)?;
@@ -1622,7 +1640,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     &mut problems,
                     false,
                     &format!("{bus_id} presence missing"),
-                    "no status file — is its ding refreshing?",
+                    "no status file — is its session owner refreshing presence?",
                 );
             } else {
                 let state = st2::status::read_state(&path);
@@ -1630,7 +1648,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     &mut problems,
                     state != st2::status::State::Unknown,
                     &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
-                    "rotted to `unknown` — is its ding refreshing?",
+                    "rotted to `unknown` — is its session owner refreshing presence?",
                 );
             }
         }

@@ -1,25 +1,25 @@
 //! Native per-agent presence status.
 //!
-//! A `status` file (sibling of `agent.kdl` in the agent's dir) holds exactly one word: one of the
-//! settable states. `unknown` is DERIVED, never written — a status whose mtime is older than
-//! [`STATUS_STALE`] reads as `unknown` regardless of its contents, so a crashed/gone agent stops
-//! reading as its last set value. Reads are permissive (missing → `offline`, corrupt → `offline`).
-//! Writes are atomic (tmp + rename) so a concurrent reader never sees a partial file. The ding
-//! periodically re-writes an agent's own non-DND status to bump the mtime *preserving the value* so
-//! a healthy-but-idle agent never rots to `unknown` (the failure that read the whole fleet `unknown`
-//! for 45 min). `dnd` is intentionally not refreshed: an abandoned hold ages to `unknown` after the
-//! same stale window. The vocabulary, stale window, and file semantics are stable.
+//! A `status` file is a sibling of `agent.kdl` in the agent directory. The first line holds one
+//! settable state. The optional second line holds `updated-at-unix-ms <timestamp>`. Old readers use
+//! the first line and file mtime. New readers use the content timestamp when present and accept the
+//! old bare state during a mixed-fleet upgrade. Thus, each heartbeat changes the replicated bytes.
+//! `unknown` is derived and is never written. Reads are permissive: missing and corrupt files become
+//! `offline`. Writes are atomic, so a reader never sees a partial file. A live session refreshes its
+//! non-DND status. `dnd` is not refreshed, so an abandoned hold ages to `unknown`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// A status file older than this reads as `unknown` no matter its contents.
+/// A status record older than this reads as `unknown` no matter which state it contains.
 pub const STATUS_STALE: Duration = Duration::from_secs(15 * 60);
-/// How often a live agent's status should be refreshed to stay inside the stale window — 5 min gives
-/// a 3× safety margin (two missed refreshes before `unknown`).
+/// A live session refreshes presence every five minutes. This permits two missed writes before the
+/// 15-minute stale limit and produces 288 replicated writes each day.
 pub const STATUS_REFRESH: Duration = Duration::from_secs(5 * 60);
+
+const UPDATED_AT_PREFIX: &str = "updated-at-unix-ms ";
 
 /// Presence state. `Unknown` is derived from staleness and is never written to disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,38 +72,92 @@ pub fn status_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("status")
 }
 
-/// Read an agent's effective presence. Order matters: missing file → `offline`;
-/// mtime older than [`STATUS_STALE`] → `unknown` (regardless of contents); unreadable → `offline`;
-/// else the first line's word if valid, else `offline` (never trust a corrupt file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusRecord {
+    state: State,
+    updated_at_unix_ms: Option<u128>,
+}
+
+/// Read an agent's effective presence. A timestamped record uses its content timestamp. A legacy
+/// bare state uses mtime. Missing, unreadable, and corrupt files read as `offline`.
 pub fn read_state(status_path: &Path) -> State {
+    read_state_at(status_path, SystemTime::now())
+}
+
+fn read_state_at(status_path: &Path, now: SystemTime) -> State {
     let meta = match fs::metadata(status_path) {
         Ok(m) => m,
         Err(_) => return State::Offline, // missing
     };
-    if let Ok(mtime) = meta.modified()
-        && let Ok(age) = SystemTime::now().duration_since(mtime)
-        && age >= STATUS_STALE
-    {
-        return State::Unknown; // stale → not trustworthy
-    }
     let raw = match fs::read_to_string(status_path) {
         Ok(r) => r,
         Err(_) => return State::Offline,
     };
-    let first = raw.lines().next().unwrap_or("").trim();
-    State::parse_any(first).unwrap_or(State::Offline)
+    let Some(record) = parse_record(&raw) else {
+        return State::Offline;
+    };
+    let stale = match record.updated_at_unix_ms {
+        Some(updated_at) => content_timestamp_is_stale(now, updated_at),
+        None => meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age >= STATUS_STALE),
+    };
+    if stale { State::Unknown } else { record.state }
 }
 
-/// Set an agent's presence to a settable `state`, atomically (tmp sibling + rename), writing
-/// `<state>\n`. Creates the agent dir if missing.
+fn parse_record(raw: &str) -> Option<StatusRecord> {
+    let mut lines = raw.lines();
+    let state = State::parse_any(lines.next().unwrap_or("").trim())?;
+    let updated_at_unix_ms = match lines.next() {
+        None => None,
+        Some(line) => {
+            let value = line.trim().strip_prefix(UPDATED_AT_PREFIX)?;
+            Some(value.parse().ok()?)
+        }
+    };
+    if lines.next().is_some() {
+        return None;
+    }
+    Some(StatusRecord {
+        state,
+        updated_at_unix_ms,
+    })
+}
+
+fn content_timestamp_is_stale(now: SystemTime, updated_at_unix_ms: u128) -> bool {
+    now.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_millis().checked_sub(updated_at_unix_ms))
+        .is_some_and(|age_ms| age_ms >= STATUS_STALE.as_millis())
+}
+
+/// Set an agent's presence atomically. The first line remains compatible with old readers. The
+/// second line gives content-based synchronizers a changed value and gives new readers freshness.
 pub fn set_state(status_path: &Path, state: State) -> anyhow::Result<()> {
-    write_atomic(status_path, state.as_str())
+    set_state_at(status_path, state, SystemTime::now())
+}
+
+fn set_state_at(status_path: &Path, state: State, now: SystemTime) -> anyhow::Result<()> {
+    write_atomic(status_path, &encode_record(state, now)?)
+}
+
+fn encode_record(state: State, now: SystemTime) -> anyhow::Result<String> {
+    let updated_at_unix_ms = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("presence timestamp is before the Unix epoch"))?
+        .as_millis();
+    Ok(format!(
+        "{}\n{UPDATED_AT_PREFIX}{updated_at_unix_ms}\n",
+        state.as_str()
+    ))
 }
 
 /// Outcome of a [`refresh`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
-    /// File present + a valid settable state → re-wrote the same value, mtime bumped.
+    /// A valid settable state received a new content timestamp.
     Refreshed,
     /// File recorded `dnd` → left untouched so an abandoned hold ages out.
     LeftDnd,
@@ -117,12 +171,15 @@ pub enum RefreshOutcome {
     Error,
 }
 
-/// Bump an agent's status mtime so a live-but-idle agent never rots to `unknown`, preserving the
-/// recorded value. Missing → write `available`. A valid non-DND value → re-write the same value.
-/// `dnd`, `unknown`, or corrupt → leave untouched (never renew a hold or invent a value). Atomic.
+/// Write a new content timestamp while preserving the state. Missing becomes `available`. `dnd`,
+/// `unknown`, and corrupt records stay unchanged. The write is atomic.
 pub fn refresh(status_path: &Path) -> RefreshOutcome {
+    refresh_at(status_path, SystemTime::now())
+}
+
+fn refresh_at(status_path: &Path, now: SystemTime) -> RefreshOutcome {
     if !status_path.exists() {
-        return match write_atomic(status_path, State::Available.as_str()) {
+        return match set_state_at(status_path, State::Available, now) {
             Ok(()) => RefreshOutcome::WroteDefault,
             Err(_) => RefreshOutcome::Error,
         };
@@ -131,19 +188,18 @@ pub fn refresh(status_path: &Path) -> RefreshOutcome {
         Ok(r) => r,
         Err(_) => return RefreshOutcome::Error,
     };
-    let first = raw.lines().next().unwrap_or("").trim();
-    if first == "unknown" {
+    let Some(record) = parse_record(&raw) else {
+        return RefreshOutcome::LeftCorrupt;
+    };
+    if record.state == State::Unknown {
         return RefreshOutcome::LeftUnknown;
     }
-    if first == "dnd" {
+    if record.state == State::Dnd {
         return RefreshOutcome::LeftDnd;
     }
-    match State::parse_settable(first) {
-        Some(s) => match write_atomic(status_path, s.as_str()) {
-            Ok(()) => RefreshOutcome::Refreshed,
-            Err(_) => RefreshOutcome::Error,
-        },
-        None => RefreshOutcome::LeftCorrupt,
+    match set_state_at(status_path, record.state, now) {
+        Ok(()) => RefreshOutcome::Refreshed,
+        Err(_) => RefreshOutcome::Error,
     }
 }
 
@@ -153,7 +209,7 @@ fn write_atomic(path: &Path, value: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     let tmp = dir.join(tmp_name());
-    fs::write(&tmp, format!("{value}\n"))?;
+    fs::write(&tmp, value)?;
     // rename over the target — atomic on the same filesystem.
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp); // best-effort cleanup
@@ -179,6 +235,10 @@ mod tests {
     use super::*;
     use std::time::Duration as Dur;
 
+    fn at(unix_ms: u64) -> SystemTime {
+        UNIX_EPOCH + Dur::from_millis(unix_ms)
+    }
+
     #[test]
     fn missing_is_offline() {
         let tmp = tempfile::tempdir().unwrap();
@@ -189,6 +249,7 @@ mod tests {
     fn set_then_read_roundtrips_each_settable_state() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
+        let written_at = 1_786_741_730_761;
         for st in [
             State::Offline,
             State::Available,
@@ -196,14 +257,27 @@ mod tests {
             State::Away,
             State::Dnd,
         ] {
-            set_state(&sp, st).unwrap();
-            assert_eq!(read_state(&sp), st);
-            // file content is exactly `<state>\n` (wire format).
+            set_state_at(&sp, st, at(written_at)).unwrap();
+            assert_eq!(read_state_at(&sp, at(written_at + 1)), st);
             assert_eq!(
                 fs::read_to_string(&sp).unwrap(),
-                format!("{}\n", st.as_str())
+                format!("{}\nupdated-at-unix-ms {written_at}\n", st.as_str())
             );
         }
+    }
+
+    #[test]
+    fn timestamped_status_keeps_the_old_reader_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        set_state_at(&sp, State::Available, at(1_786_741_730_761)).unwrap();
+
+        let raw = fs::read_to_string(&sp).unwrap();
+        assert_eq!(raw.lines().next(), Some("available"));
+        assert_eq!(
+            State::parse_any(raw.lines().next().unwrap()),
+            Some(State::Available)
+        );
     }
 
     #[test]
@@ -219,14 +293,16 @@ mod tests {
         let sp = status_path(tmp.path());
         fs::write(&sp, "garbage\n").unwrap();
         assert_eq!(read_state(&sp), State::Offline);
+
+        fs::write(&sp, "available\nupdated-at-unix-ms nope\n").unwrap();
+        assert_eq!(read_state(&sp), State::Offline);
     }
 
     #[test]
-    fn stale_mtime_reads_as_unknown_regardless_of_contents() {
+    fn legacy_bare_word_uses_mtime_during_a_mixed_fleet_upgrade() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        set_state(&sp, State::Busy).unwrap();
-        // Backdate the mtime past the stale window.
+        fs::write(&sp, "busy\n").unwrap();
         let old = SystemTime::now() - STATUS_STALE - Dur::from_secs(60);
         let f = fs::File::open(&sp).unwrap();
         f.set_modified(old).unwrap();
@@ -234,38 +310,100 @@ mod tests {
     }
 
     #[test]
-    fn refresh_preserves_value_and_bumps_mtime() {
+    fn timestamped_content_controls_freshness_after_replication() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        set_state(&sp, State::Busy).unwrap();
-        // Backdate → would read unknown…
+        let now = SystemTime::now();
         let old = SystemTime::now() - STATUS_STALE - Dur::from_secs(60);
+
+        set_state_at(&sp, State::Available, now).unwrap();
         fs::File::open(&sp).unwrap().set_modified(old).unwrap();
+        assert_eq!(read_state(&sp), State::Available);
+
+        set_state_at(&sp, State::Busy, old).unwrap();
+        fs::File::open(&sp)
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
         assert_eq!(read_state(&sp), State::Unknown);
-        // …refresh keeps `busy` but bumps mtime, so it reads busy again.
-        assert_eq!(refresh(&sp), RefreshOutcome::Refreshed);
-        assert_eq!(read_state(&sp), State::Busy);
+    }
+
+    #[test]
+    fn refresh_preserves_value_and_changes_the_replicated_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        let first = at(1_786_741_000_000);
+        let second = first + STATUS_REFRESH;
+        set_state_at(&sp, State::Busy, first).unwrap();
+        let before = fs::read_to_string(&sp).unwrap();
+
+        assert_eq!(refresh_at(&sp, second), RefreshOutcome::Refreshed);
+
+        let after = fs::read_to_string(&sp).unwrap();
+        assert_ne!(after, before);
+        assert_eq!(
+            parse_record(&after).unwrap().updated_at_unix_ms,
+            Some(1_786_741_300_000)
+        );
+        assert_eq!(read_state_at(&sp, second), State::Busy);
+    }
+
+    #[test]
+    fn writer_and_replica_carry_the_same_fresh_timestamp_while_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = tmp.path().join("writer-status");
+        let replica = tmp.path().join("replica-status");
+        let first = at(1_786_741_000_000);
+        let second = first + STATUS_REFRESH;
+        set_state_at(&writer, State::Available, first).unwrap();
+        fs::write(&replica, fs::read(&writer).unwrap()).unwrap();
+
+        assert_eq!(refresh_at(&writer, second), RefreshOutcome::Refreshed);
+        fs::write(&replica, fs::read(&writer).unwrap()).unwrap();
+
+        let writer_raw = fs::read_to_string(&writer).unwrap();
+        let replica_raw = fs::read_to_string(&replica).unwrap();
+        assert_eq!(replica_raw, writer_raw);
+        assert_eq!(
+            parse_record(&writer_raw).unwrap().updated_at_unix_ms,
+            Some(1_786_741_300_000)
+        );
+        let observed = second + STATUS_REFRESH - Dur::from_millis(1);
+        assert_eq!(read_state_at(&writer, observed), State::Available);
+        assert_eq!(read_state_at(&replica, observed), State::Available);
     }
 
     #[test]
     fn refresh_missing_writes_available_default() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        assert_eq!(refresh(&sp), RefreshOutcome::WroteDefault);
-        assert_eq!(read_state(&sp), State::Available);
+        let now = at(1_786_741_730_761);
+        assert_eq!(refresh_at(&sp, now), RefreshOutcome::WroteDefault);
+        assert_eq!(read_state_at(&sp, now), State::Available);
+        assert_eq!(
+            fs::read_to_string(&sp).unwrap(),
+            "available\nupdated-at-unix-ms 1786741730761\n"
+        );
     }
 
     #[test]
     fn refresh_leaves_dnd_to_age_out() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        set_state(&sp, State::Dnd).unwrap();
-        let before = fs::metadata(&sp).unwrap().modified().unwrap();
-        std::thread::sleep(Dur::from_millis(5));
+        let written_at = at(1_786_741_000_000);
+        set_state_at(&sp, State::Dnd, written_at).unwrap();
+        let before = fs::read_to_string(&sp).unwrap();
 
-        assert_eq!(refresh(&sp), RefreshOutcome::LeftDnd);
-        assert_eq!(fs::metadata(&sp).unwrap().modified().unwrap(), before);
-        assert_eq!(read_state(&sp), State::Dnd);
+        assert_eq!(
+            refresh_at(&sp, written_at + STATUS_REFRESH),
+            RefreshOutcome::LeftDnd
+        );
+        assert_eq!(fs::read_to_string(&sp).unwrap(), before);
+        assert_eq!(read_state_at(&sp, written_at), State::Dnd);
+        assert_eq!(
+            read_state_at(&sp, written_at + STATUS_STALE),
+            State::Unknown
+        );
     }
 
     #[test]

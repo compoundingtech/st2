@@ -438,19 +438,19 @@ agent "two" {
     assert_eq!(selected[0]["name"], "Second Agent Spec");
 }
 
-/// A status file older than the stale window projects as `unknown` in the roster, no matter its value.
+/// A legacy status file older than the stale window projects as `unknown` in the roster.
 #[test]
 fn roster_derives_unknown_from_a_stale_status() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(root, "hetz/idle/agent.kdl", &agent_kdl("idle", "hetz"));
     let sp = status_path(&root.join("hetz/idle"));
-    set_state(&sp, State::Available).unwrap();
+    fs::write(&sp, "available\n").unwrap();
 
     // Fresh → available.
     assert_eq!(roster(root, "hetz")[0].status, State::Available);
 
-    // Backdate the status file past the stale window → unknown.
+    // Backdate the legacy status file past the stale window → unknown.
     let old = SystemTime::now() - st2::status::STATUS_STALE - Duration::from_secs(60);
     fs::File::open(&sp).unwrap().set_modified(old).unwrap();
     assert_eq!(roster(root, "hetz")[0].status, State::Unknown);

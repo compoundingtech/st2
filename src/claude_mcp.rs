@@ -1,14 +1,15 @@
 //! Minimal Claude channel watcher.
 //!
 //! The inbox is the durable source of truth. This process keeps only an ephemeral set of
-//! filenames delivered during its current lifetime; a restart scans the inbox again.
+//! filenames delivered during its current lifetime; a restart scans the inbox again. The outer
+//! Claude session wrapper owns presence because Claude can close this child before the session ends.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
@@ -28,7 +29,6 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude MCP agent '{identity}' is not declared"))?;
     let inbox = message::inbox_dir(&agent_dir);
-    let status_path = crate::status::status_path(&agent_dir);
     let (input_tx, input_rx) = mpsc::channel();
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
@@ -40,12 +40,7 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut delivered = HashSet::new();
     let mut initialized = false;
-    let mut next_status_refresh = Instant::now();
     loop {
-        if Instant::now() >= next_status_refresh {
-            let _ = crate::status::refresh(&status_path);
-            next_status_refresh = Instant::now() + crate::status::STATUS_REFRESH;
-        }
         match input_rx.recv_timeout(POLL) {
             Ok(line) => {
                 let line = line.context("reading Claude MCP input")?;

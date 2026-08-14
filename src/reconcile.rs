@@ -90,11 +90,11 @@ pub fn compile_generated_tasks(
         crate::driver::ensure_single_source(spec)?;
     }
     compile_driver_agent_tasks(specs, this_host, context)?;
+    compile_claude_session_agent_tasks(specs, this_host, context)?;
     compile_generated_ding_tasks(specs, this_host, context)?;
     compile_app_server_agent_tasks(specs, this_host, context)?;
-    // Claude's MCP server is declared to Claude itself.  It must not be lowered
-    // to an st2-owned companion task: that would give the supervisor a second
-    // lifetime to manage and break session ownership across restart.
+    // Claude's MCP server remains declared to Claude itself. The canonical task wrapper owns only
+    // the provider lifetime and its presence lease. It does not add a supervisor-owned companion.
     Ok(())
 }
 
@@ -152,18 +152,20 @@ pub fn compile_driver_agent_tasks(
             "agent '{bus_id}' driver expansion produced an empty argv"
         );
 
-        if matches!(driver, Driver::Codex(_)) {
-            anyhow::ensure!(
-                argv.first().map(String::as_str) == Some("st2")
-                    && argv.get(1).map(String::as_str) == Some("--catalog")
-                    && argv.get(2).map(String::as_str) == Some("$CATALOG")
-                    && argv.get(3).map(String::as_str) == Some("driver")
-                    && argv.get(4).map(String::as_str) == Some("codex"),
-                "agent '{bus_id}' Codex driver expansion has an unexpected wrapper prefix"
-            );
-            argv[0] = st2_executable.clone();
-            argv[2] = catalog_root.clone();
-        }
+        let wrapper = match driver {
+            Driver::Codex(_) => "codex",
+            Driver::Claude(_) => "claude-session",
+        };
+        anyhow::ensure!(
+            argv.first().map(String::as_str) == Some("st2")
+                && argv.get(1).map(String::as_str) == Some("--catalog")
+                && argv.get(2).map(String::as_str) == Some("$CATALOG")
+                && argv.get(3).map(String::as_str) == Some("driver")
+                && argv.get(4).map(String::as_str) == Some(wrapper),
+            "agent '{bus_id}' driver expansion has an unexpected {wrapper} wrapper prefix"
+        );
+        argv[0] = st2_executable.clone();
+        argv[2] = catalog_root.clone();
 
         let mut candidates = spec
             .tasks
@@ -180,6 +182,82 @@ pub fn compile_driver_agent_tasks(
             task.kind == TaskKind::Pty,
             "agent '{bus_id}' driver canonical task is not a PTY"
         );
+        task.command = None;
+        task.argv = Some(argv);
+    }
+    Ok(())
+}
+
+/// Route legacy MCP delivery through the same Claude session wrapper as a typed driver.
+pub fn compile_claude_session_agent_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    let st2_executable = context
+        .st2_executable
+        .to_str()
+        .context("running st2 executable path is not UTF-8")?
+        .to_owned();
+    let catalog_root = context
+        .catalog_root
+        .to_str()
+        .context("catalog root is not UTF-8")?
+        .to_owned();
+
+    for spec in specs {
+        if spec.driver.is_some() || spec.delivery != Some(DeliveryTransport::Mcp) {
+            continue;
+        }
+        let bus_id = spec.bus_id(this_host);
+        let mut candidates = spec
+            .tasks
+            .iter_mut()
+            .filter(|task| !task.derived && task.name == "agent");
+        let task = candidates.next().with_context(|| {
+            format!(
+                "agent '{bus_id}' selects `deliver \"mcp\"` but has no canonical `agent` task"
+            )
+        })?;
+        anyhow::ensure!(
+            candidates.next().is_none(),
+            "agent '{bus_id}' selects `deliver \"mcp\"` with more than one canonical `agent` task"
+        );
+        anyhow::ensure!(
+            task.kind == TaskKind::Pty,
+            "agent '{bus_id}' selects `deliver \"mcp\"` for a non-PTY canonical task"
+        );
+        let provider = match (&task.command, &task.argv) {
+            (None, Some(argv)) => argv.clone(),
+            (Some(command), None) => {
+                vec!["sh".to_string(), "-c".to_string(), command.clone()]
+            }
+            (None, None) => Vec::new(),
+            (Some(_), Some(_)) => {
+                unreachable!("discovery rejects tasks carrying both command and argv")
+            }
+        };
+        anyhow::ensure!(
+            !provider.is_empty(),
+            "agent '{bus_id}' selects `deliver \"mcp\"` with an empty canonical argv"
+        );
+        let runtime_id = task
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+        let mut argv = vec![
+            st2_executable.clone(),
+            "--catalog".to_string(),
+            catalog_root.clone(),
+            "driver".to_string(),
+            "claude-session".to_string(),
+            "--identity".to_string(),
+            bus_id,
+            "--runtime-id".to_string(),
+            runtime_id,
+            "--".to_string(),
+        ];
+        argv.extend(provider);
         task.command = None;
         task.argv = Some(argv);
     }
