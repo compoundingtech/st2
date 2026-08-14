@@ -14,6 +14,7 @@ pub mod claude_mcp;
 pub mod codex_app_server;
 pub mod context;
 pub mod ding;
+pub mod driver;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod exec_backend;
