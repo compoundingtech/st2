@@ -2193,7 +2193,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
             .is_some()
     );
     let presence = fs::read_to_string(old.join("status")).unwrap();
-    assert!(presence.starts_with("busy\nupdated-at-unix-ms "));
+    assert!(presence.starts_with("busy\nv1 "));
     assert_eq!(presence.lines().count(), 2);
 
     let phantom = send(&catalog, "host.new", "too early");
@@ -2460,7 +2460,7 @@ fn marker_time_status_write_remains_bound_to_its_retained_agent_capability() {
         String::from_utf8_lossy(&state.stderr)
     );
     let presence = fs::read_to_string(retained_host.join("old/status")).unwrap();
-    assert!(presence.starts_with("busy\nupdated-at-unix-ms "));
+    assert!(presence.starts_with("busy\nv1 "));
     assert_eq!(presence.lines().count(), 2);
     assert!(!outside.join("old/status").exists());
     fs::remove_file(catalog.join("agents/host")).unwrap();

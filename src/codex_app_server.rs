@@ -2592,7 +2592,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&presence)
                 .unwrap()
-                .contains("updated-at-unix-ms ")
+                .contains("\nv1 ")
         );
         assert!(delivery.head.is_none());
     }

@@ -475,12 +475,14 @@ contract; renderer changes can defer delivery and remain an explicit design gap.
 
 Agents must declare `busy` before actively executing work and return to `available` only when
 yielding or ready for new work, but `busy` never suppresses DING. Fresh `dnd` is the only delivery
-hold. Each status record keeps the state on its first line. New writers add
-`updated-at-unix-ms <timestamp>` on the second line. New readers use that timestamp and accept a
-legacy bare state. Old readers keep using the first line and file mtime. A live session owner
-refreshes non-DND presence every five minutes. This changes the replicated bytes and stays below the
-15-minute stale limit. A session owner does not refresh `dnd`, so an abandoned hold becomes stale
-and delivery resumes. New arrivals remain FIFO. Same-filename archive receipts shadow and clean
+hold. Each status record keeps the state on its first line. Version 1 writers add `v1 <unix-ms>` on
+the second line. New readers use that origin timestamp and accept a legacy bare state. Old readers
+keep using the first line and file mtime. A live session owner refreshes non-DND presence every five
+minutes. This changes the replicated bytes and stays below the 15-minute stale limit. A legacy
+`dnd` upgrades once with its existing mtime, then remains unchanged. A malformed versioned record or
+a timestamp more than 60 seconds in the future reads as `unknown` without an mtime fallback. Version
+1 status contributes its origin timestamp to `lastActivity`. New arrivals remain FIFO.
+Same-filename archive receipts shadow and clean
 restored inbox duplicates. Failed or uncertain PTY operations retain the notice for safe retry. Unsafe
 delivery retries use a bounded backoff, so an active composer cannot make the sidecar spawn a fresh
 PTY probe on every inbox poll. On start

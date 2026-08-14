@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use st2::agents::roster;
 use st2::message::send_to_inbox;
@@ -304,11 +304,7 @@ fn exact_identity_rejects_duplicates_before_status_filtering() {
         "declarations/two/agent.kdl",
         &agent_kdl("worker", "h"),
     );
-    set_state(
-        &status_path(&root.join("declarations/one")),
-        State::Busy,
-    )
-    .unwrap();
+    set_state(&status_path(&root.join("declarations/one")), State::Busy).unwrap();
     set_state(
         &status_path(&root.join("declarations/two")),
         State::Available,
@@ -438,20 +434,82 @@ agent "two" {
     assert_eq!(selected[0]["name"], "Second Agent Spec");
 }
 
-/// A legacy status file older than the stale window projects as `unknown` in the roster.
+/// A version 1 heartbeat older than the stale window projects as `unknown` in the roster.
 #[test]
-fn roster_derives_unknown_from_a_stale_status() {
+fn roster_derives_unknown_from_a_stale_version_1_heartbeat() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(root, "hetz/idle/agent.kdl", &agent_kdl("idle", "hetz"));
     let sp = status_path(&root.join("hetz/idle"));
-    fs::write(&sp, "available\n").unwrap();
+    set_state(&sp, State::Available).unwrap();
 
     // Fresh → available.
     assert_eq!(roster(root, "hetz")[0].status, State::Available);
 
-    // Backdate the legacy status file past the stale window → unknown.
-    let old = SystemTime::now() - st2::status::STATUS_STALE - Duration::from_secs(60);
-    fs::File::open(&sp).unwrap().set_modified(old).unwrap();
+    // Backdate the embedded heartbeat past the stale window → unknown.
+    let stale_ms = st2::message::now_ms()
+        - u64::try_from((st2::status::STATUS_STALE + Duration::from_secs(60)).as_millis()).unwrap();
+    fs::write(&sp, format!("available\nv1 {stale_ms}\n")).unwrap();
     assert_eq!(roster(root, "hetz")[0].status, State::Unknown);
+}
+
+#[test]
+fn roster_uses_version_1_origin_time_for_last_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "hetz/idle/agent.kdl", &agent_kdl("idle", "hetz"));
+    let sp = status_path(&root.join("hetz/idle"));
+    let heartbeat_ms = st2::message::now_ms() - 1_000;
+    fs::write(&sp, format!("available\nv1 {heartbeat_ms}\n")).unwrap();
+
+    let row = &roster(root, "hetz")[0];
+    assert_eq!(row.status, State::Available);
+    assert_eq!(row.last_activity_ms, Some(heartbeat_ms as f64));
+}
+
+#[test]
+fn status_cli_writes_and_reads_the_version_1_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "h/worker/agent.kdl", &agent_kdl("worker", "h"));
+    let before = st2::message::now_ms();
+
+    let set = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["status", "h.worker", "--set", "busy", "--root"])
+        .arg(root)
+        .args(["--host", "h"])
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert_eq!(String::from_utf8(set.stdout).unwrap(), "status: busy\n");
+
+    let after = st2::message::now_ms();
+    let raw = fs::read_to_string(status_path(&root.join("h/worker"))).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "busy");
+    let timestamp = lines[1]
+        .strip_prefix("v1 ")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((before..=after).contains(&timestamp));
+    assert!(raw.ends_with('\n'));
+
+    let get = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["status", "h.worker", "--root"])
+        .arg(root)
+        .args(["--host", "h"])
+        .output()
+        .unwrap();
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    assert_eq!(String::from_utf8(get.stdout).unwrap(), "busy\n");
 }

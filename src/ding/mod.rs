@@ -3213,7 +3213,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .as_millis();
         std::fs::write(
             &status_path,
-            format!("dnd\nupdated-at-unix-ms {stale_ms}\n"),
+            format!("dnd\nv1 {stale_ms}\n"),
         )
         .unwrap();
         flush_without_catalog(Some(&status_path), &mut pending, &poker);

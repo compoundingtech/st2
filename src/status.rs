@@ -1,25 +1,29 @@
 //! Native per-agent presence status.
 //!
-//! A `status` file is a sibling of `agent.kdl` in the agent directory. The first line holds one
-//! settable state. The optional second line holds `updated-at-unix-ms <timestamp>`. Old readers use
-//! the first line and file mtime. New readers use the content timestamp when present and accept the
-//! old bare state during a mixed-fleet upgrade. Thus, each heartbeat changes the replicated bytes.
-//! `unknown` is derived and is never written. Reads are permissive: missing and corrupt files become
-//! `offline`. Writes are atomic, so a reader never sees a partial file. A live session refreshes its
-//! non-DND status. `dnd` is not refreshed, so an abandoned hold ages to `unknown`.
+//! A `status` file (sibling of `agent.kdl` in the agent's dir) stores a settable state and an
+//! embedded Unix-millisecond heartbeat. `unknown` is DERIVED, never written. A heartbeat older than
+//! [`STATUS_STALE`] reads as `unknown`, so a crashed agent stops reading as its last set value.
+//! Writes are atomic (tmp + rename), and the live session owner refreshes valid non-DND records
+//! every [`STATUS_REFRESH`]. Legacy one-line records use mtime during the bounded migration. New writers
+//! always emit version 1, whose freshness survives transports that do not preserve file metadata.
+//! `dnd` is not refreshed after migration, so an abandoned hold ages to `unknown`.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
-/// A status record older than this reads as `unknown` no matter which state it contains.
+/// A valid status heartbeat at least this old reads as `unknown`.
 pub const STATUS_STALE: Duration = Duration::from_secs(15 * 60);
-/// A live session refreshes presence every five minutes. This permits two missed writes before the
-/// 15-minute stale limit and produces 288 replicated writes each day.
+/// How often a live agent's status should be refreshed to stay inside the stale window — 5 min gives
+/// a 3× safety margin (two missed refreshes before `unknown`).
 pub const STATUS_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Maximum accepted positive difference between a writer's UTC clock and the reader's clock.
+pub const STATUS_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
-const UPDATED_AT_PREFIX: &str = "updated-at-unix-ms ";
+const RECORD_VERSION: &str = "v1";
+const RECORD_PREFIX: &str = "v1 ";
 
 /// Presence state. `Unknown` is derived from staleness and is never written to disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +35,6 @@ pub enum State {
     Dnd,
     Unknown,
 }
-
 impl State {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -73,91 +76,44 @@ pub fn status_path(agent_dir: &Path) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StatusRecord {
-    state: State,
-    updated_at_unix_ms: Option<u128>,
+enum ParsedRecord {
+    Legacy(State),
+    Version1 { state: State, written_at_ms: u64 },
+    LiteralUnknown,
+    InvalidState,
+    Malformed,
 }
 
-/// Read an agent's effective presence. A timestamped record uses its content timestamp. A legacy
-/// bare state uses mtime. Missing, unreadable, and corrupt files read as `offline`.
+/// Read an agent's effective presence. Missing or unreadable files produce `offline`. Version 1
+/// uses its embedded timestamp. A valid legacy line uses file mtime during migration. Malformed
+/// versioned records fail closed to `unknown` and never fall back to mtime.
 pub fn read_state(status_path: &Path) -> State {
-    read_state_at(status_path, SystemTime::now())
-}
-
-fn read_state_at(status_path: &Path, now: SystemTime) -> State {
-    let meta = match fs::metadata(status_path) {
-        Ok(m) => m,
-        Err(_) => return State::Offline, // missing
-    };
-    let raw = match fs::read_to_string(status_path) {
-        Ok(r) => r,
+    let (record, legacy_mtime_ms) = match read_record(status_path) {
+        Ok(record) => record,
         Err(_) => return State::Offline,
     };
-    let Some(record) = parse_record(&raw) else {
-        return State::Offline;
-    };
-    let stale = match record.updated_at_unix_ms {
-        Some(updated_at) => content_timestamp_is_stale(now, updated_at),
-        None => meta
-            .modified()
-            .ok()
-            .and_then(|mtime| now.duration_since(mtime).ok())
-            .is_some_and(|age| age >= STATUS_STALE),
-    };
-    if stale { State::Unknown } else { record.state }
+    read_parsed_at(record, legacy_mtime_ms, crate::message::now_ms())
 }
 
-fn parse_record(raw: &str) -> Option<StatusRecord> {
-    let mut lines = raw.lines();
-    let state = State::parse_any(lines.next().unwrap_or("").trim())?;
-    let updated_at_unix_ms = match lines.next() {
-        None => None,
-        Some(line) => {
-            let value = line.trim().strip_prefix(UPDATED_AT_PREFIX)?;
-            Some(value.parse().ok()?)
-        }
-    };
-    if lines.next().is_some() {
-        return None;
-    }
-    Some(StatusRecord {
-        state,
-        updated_at_unix_ms,
-    })
-}
-
-fn content_timestamp_is_stale(now: SystemTime, updated_at_unix_ms: u128) -> bool {
-    now.duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| duration.as_millis().checked_sub(updated_at_unix_ms))
-        .is_some_and(|age_ms| age_ms >= STATUS_STALE.as_millis())
-}
-
-/// Set an agent's presence atomically. The first line remains compatible with old readers. The
-/// second line gives content-based synchronizers a changed value and gives new readers freshness.
+/// Set an agent's presence to a version 1 record with the current timestamp. The write is atomic
+/// (temporary sibling + rename) and creates the agent directory when needed.
 pub fn set_state(status_path: &Path, state: State) -> anyhow::Result<()> {
-    set_state_at(status_path, state, SystemTime::now())
+    write_record(status_path, state, crate::message::now_ms())
 }
 
-fn set_state_at(status_path: &Path, state: State, now: SystemTime) -> anyhow::Result<()> {
-    write_atomic(status_path, &encode_record(state, now)?)
-}
-
-fn encode_record(state: State, now: SystemTime) -> anyhow::Result<String> {
-    let updated_at_unix_ms = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| anyhow::anyhow!("presence timestamp is before the Unix epoch"))?
-        .as_millis();
-    Ok(format!(
-        "{}\n{UPDATED_AT_PREFIX}{updated_at_unix_ms}\n",
-        state.as_str()
-    ))
+/// Timestamp contributed by the status record to `agents --enrich`. Version 1 returns its embedded
+/// writer time, clamped to the reader's current time within the allowed future skew. Legacy records
+/// return mtime during migration. Invalid records and excessive future skew contribute nothing.
+pub fn activity_time_ms(status_path: &Path) -> Option<f64> {
+    let (record, legacy_mtime_ms) = read_record(status_path).ok()?;
+    activity_time_at(record, legacy_mtime_ms, crate::message::now_ms())
+        .map(|timestamp| timestamp as f64)
 }
 
 /// Outcome of a [`refresh`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
-    /// A valid settable state received a new content timestamp.
+    /// A valid record received a new heartbeat or completed its one-time legacy upgrade.
     Refreshed,
     /// File recorded `dnd` → left untouched so an abandoned hold ages out.
     LeftDnd,
@@ -171,45 +127,171 @@ pub enum RefreshOutcome {
     Error,
 }
 
-/// Write a new content timestamp while preserving the state. Missing becomes `available`. `dnd`,
-/// `unknown`, and corrupt records stay unchanged. The write is atomic.
+/// Refresh the embedded heartbeat for a live agent while preserving its state. Missing writes
+/// `available`. A legacy non-DND record upgrades with the current time. A legacy DND record upgrades
+/// once with its old mtime. Version 1 DND, `unknown`, and malformed records remain untouched.
 pub fn refresh(status_path: &Path) -> RefreshOutcome {
-    refresh_at(status_path, SystemTime::now())
-}
-
-fn refresh_at(status_path: &Path, now: SystemTime) -> RefreshOutcome {
-    if !status_path.exists() {
-        return match set_state_at(status_path, State::Available, now) {
-            Ok(()) => RefreshOutcome::WroteDefault,
-            Err(_) => RefreshOutcome::Error,
-        };
-    }
-    let raw = match fs::read_to_string(status_path) {
-        Ok(r) => r,
+    let (record, legacy_mtime_ms) = match read_record(status_path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match write_record(status_path, State::Available, crate::message::now_ms()) {
+                Ok(()) => RefreshOutcome::WroteDefault,
+                Err(_) => RefreshOutcome::Error,
+            };
+        }
         Err(_) => return RefreshOutcome::Error,
     };
-    let Some(record) = parse_record(&raw) else {
-        return RefreshOutcome::LeftCorrupt;
+    match record {
+        ParsedRecord::Version1 {
+            state: State::Dnd, ..
+        } => RefreshOutcome::LeftDnd,
+        ParsedRecord::Version1 { state, .. } => {
+            match write_record(status_path, state, crate::message::now_ms()) {
+                Ok(()) => RefreshOutcome::Refreshed,
+                Err(_) => RefreshOutcome::Error,
+            }
+        }
+        ParsedRecord::Legacy(State::Dnd) => {
+            let Some(written_at_ms) = legacy_mtime_ms else {
+                return RefreshOutcome::LeftDnd;
+            };
+            match write_record(status_path, State::Dnd, written_at_ms) {
+                Ok(()) => RefreshOutcome::Refreshed,
+                Err(_) => RefreshOutcome::Error,
+            }
+        }
+        ParsedRecord::Legacy(state) => {
+            match write_record(status_path, state, crate::message::now_ms()) {
+                Ok(()) => RefreshOutcome::Refreshed,
+                Err(_) => RefreshOutcome::Error,
+            }
+        }
+        ParsedRecord::LiteralUnknown => RefreshOutcome::LeftUnknown,
+        ParsedRecord::InvalidState | ParsedRecord::Malformed => RefreshOutcome::LeftCorrupt,
+    }
+}
+
+fn read_record(path: &Path) -> std::io::Result<(ParsedRecord, Option<u64>)> {
+    let mut file = fs::File::open(path)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    let record = parse_record(&raw);
+    let legacy_mtime_ms = matches!(record, ParsedRecord::Legacy(_))
+        .then(|| file_mtime_ms(&file))
+        .flatten();
+    Ok((record, legacy_mtime_ms))
+}
+
+fn parse_record(raw: &str) -> ParsedRecord {
+    let has_final_newline = raw.ends_with('\n');
+    let body = raw.strip_suffix('\n').unwrap_or(raw);
+    let mut lines = body.split('\n');
+    let state = match State::parse_any(lines.next().unwrap_or("")) {
+        Some(State::Unknown) => return ParsedRecord::LiteralUnknown,
+        Some(state) => state,
+        None => return ParsedRecord::InvalidState,
     };
-    if record.state == State::Unknown {
-        return RefreshOutcome::LeftUnknown;
+    let Some(version_line) = lines.next() else {
+        return ParsedRecord::Legacy(state);
+    };
+    if !has_final_newline || lines.next().is_some() {
+        return ParsedRecord::Malformed;
     }
-    if record.state == State::Dnd {
-        return RefreshOutcome::LeftDnd;
+    let Some(timestamp) = version_line.strip_prefix(RECORD_PREFIX) else {
+        return ParsedRecord::Malformed;
+    };
+    if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return ParsedRecord::Malformed;
     }
-    match set_state_at(status_path, record.state, now) {
-        Ok(()) => RefreshOutcome::Refreshed,
-        Err(_) => RefreshOutcome::Error,
+    match timestamp.parse::<u64>() {
+        Ok(written_at_ms) => ParsedRecord::Version1 {
+            state,
+            written_at_ms,
+        },
+        Err(_) => ParsedRecord::Malformed,
     }
+}
+
+fn read_parsed_at(record: ParsedRecord, legacy_mtime_ms: Option<u64>, now_ms: u64) -> State {
+    match record {
+        ParsedRecord::Legacy(state) => legacy_mtime_ms.map_or(State::Unknown, |written_at_ms| {
+            effective_state_at(state, written_at_ms, now_ms)
+        }),
+        ParsedRecord::Version1 {
+            state,
+            written_at_ms,
+        } => effective_state_at(state, written_at_ms, now_ms),
+        ParsedRecord::LiteralUnknown | ParsedRecord::Malformed => State::Unknown,
+        ParsedRecord::InvalidState => State::Offline,
+    }
+}
+
+fn effective_state_at(state: State, written_at_ms: u64, now_ms: u64) -> State {
+    if written_at_ms > now_ms {
+        return if written_at_ms - now_ms <= duration_ms(STATUS_FUTURE_SKEW) {
+            state
+        } else {
+            State::Unknown
+        };
+    }
+    if now_ms - written_at_ms >= duration_ms(STATUS_STALE) {
+        State::Unknown
+    } else {
+        state
+    }
+}
+
+fn activity_time_at(
+    record: ParsedRecord,
+    legacy_mtime_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<u64> {
+    let written_at_ms = match record {
+        ParsedRecord::Legacy(_) => legacy_mtime_ms?,
+        ParsedRecord::Version1 { written_at_ms, .. } => written_at_ms,
+        ParsedRecord::LiteralUnknown | ParsedRecord::InvalidState | ParsedRecord::Malformed => {
+            return None;
+        }
+    };
+    if written_at_ms > now_ms {
+        (written_at_ms - now_ms <= duration_ms(STATUS_FUTURE_SKEW)).then_some(now_ms)
+    } else {
+        Some(written_at_ms)
+    }
+}
+
+fn file_mtime_ms(file: &fs::File) -> Option<u64> {
+    file.metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn write_record(path: &Path, state: State, written_at_ms: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        state != State::Unknown,
+        "unknown is derived and cannot be written"
+    );
+    write_atomic(
+        path,
+        &format!("{}\n{RECORD_VERSION} {written_at_ms}\n", state.as_str()),
+    )
 }
 
 /// Atomic write: a temp sibling + rename, so a concurrent reader sees either the old bytes or the new
 /// bytes, never a partial file.
-fn write_atomic(path: &Path, value: &str) -> anyhow::Result<()> {
+fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     let tmp = dir.join(tmp_name());
-    fs::write(&tmp, value)?;
+    fs::write(&tmp, content)?;
     // rename over the target — atomic on the same filesystem.
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp); // best-effort cleanup
@@ -233,11 +315,7 @@ fn tmp_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration as Dur;
-
-    fn at(unix_ms: u64) -> SystemTime {
-        UNIX_EPOCH + Dur::from_millis(unix_ms)
-    }
+    use std::time::{Duration as Dur, SystemTime};
 
     #[test]
     fn missing_is_offline() {
@@ -249,7 +327,6 @@ mod tests {
     fn set_then_read_roundtrips_each_settable_state() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        let written_at = 1_786_741_730_761;
         for st in [
             State::Offline,
             State::Available,
@@ -257,27 +334,22 @@ mod tests {
             State::Away,
             State::Dnd,
         ] {
-            set_state_at(&sp, st, at(written_at)).unwrap();
-            assert_eq!(read_state_at(&sp, at(written_at + 1)), st);
-            assert_eq!(
-                fs::read_to_string(&sp).unwrap(),
-                format!("{}\nupdated-at-unix-ms {written_at}\n", st.as_str())
-            );
+            let before = crate::message::now_ms();
+            set_state(&sp, st).unwrap();
+            let after = crate::message::now_ms();
+            assert_eq!(read_state(&sp), st);
+            let raw = fs::read_to_string(&sp).unwrap();
+            let ParsedRecord::Version1 {
+                state,
+                written_at_ms,
+            } = parse_record(&raw)
+            else {
+                panic!("new writer did not emit version 1: {raw:?}");
+            };
+            assert_eq!(state, st);
+            assert!((before..=after).contains(&written_at_ms));
+            assert_eq!(raw, format!("{}\nv1 {written_at_ms}\n", st.as_str()));
         }
-    }
-
-    #[test]
-    fn timestamped_status_keeps_the_old_reader_first_line() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sp = status_path(tmp.path());
-        set_state_at(&sp, State::Available, at(1_786_741_730_761)).unwrap();
-
-        let raw = fs::read_to_string(&sp).unwrap();
-        assert_eq!(raw.lines().next(), Some("available"));
-        assert_eq!(
-            State::parse_any(raw.lines().next().unwrap()),
-            Some(State::Available)
-        );
     }
 
     #[test]
@@ -285,6 +357,9 @@ mod tests {
         assert!(State::parse_settable("unknown").is_none());
         assert!(State::parse_settable("available").is_some());
         assert!(State::parse_settable("bogus").is_none());
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(set_state(&status_path(tmp.path()), State::Unknown).is_err());
     }
 
     #[test]
@@ -293,125 +368,219 @@ mod tests {
         let sp = status_path(tmp.path());
         fs::write(&sp, "garbage\n").unwrap();
         assert_eq!(read_state(&sp), State::Offline);
-
-        fs::write(&sp, "available\nupdated-at-unix-ms nope\n").unwrap();
-        assert_eq!(read_state(&sp), State::Offline);
     }
 
     #[test]
-    fn legacy_bare_word_uses_mtime_during_a_mixed_fleet_upgrade() {
+    fn malformed_versioned_record_is_unknown_without_mtime_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        fs::write(&sp, "busy\n").unwrap();
-        let old = SystemTime::now() - STATUS_STALE - Dur::from_secs(60);
-        let f = fs::File::open(&sp).unwrap();
-        f.set_modified(old).unwrap();
+        for raw in [
+            "available\nv2 100\n",
+            "available\nv1 nope\n",
+            "available\nv1 100",
+            "available\nv1 100\nextra\n",
+            "available\n\n",
+        ] {
+            fs::write(&sp, raw).unwrap();
+            fs::File::open(&sp)
+                .unwrap()
+                .set_modified(SystemTime::now())
+                .unwrap();
+            assert_eq!(read_state(&sp), State::Unknown, "raw: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn literal_unknown_remains_derived_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        fs::write(&sp, "unknown\n").unwrap();
         assert_eq!(read_state(&sp), State::Unknown);
     }
 
     #[test]
-    fn timestamped_content_controls_freshness_after_replication() {
+    fn version_1_uses_embedded_time_instead_of_file_mtime() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        let now = SystemTime::now();
-        let old = SystemTime::now() - STATUS_STALE - Dur::from_secs(60);
-
-        set_state_at(&sp, State::Available, now).unwrap();
-        fs::File::open(&sp).unwrap().set_modified(old).unwrap();
-        assert_eq!(read_state(&sp), State::Available);
-
-        set_state_at(&sp, State::Busy, old).unwrap();
+        let now_ms = crate::message::now_ms();
+        write_record(&sp, State::Busy, now_ms).unwrap();
         fs::File::open(&sp)
             .unwrap()
-            .set_modified(SystemTime::now())
+            .set_modified(SystemTime::now() - STATUS_STALE - Dur::from_secs(60))
+            .unwrap();
+        assert_eq!(read_state(&sp), State::Busy);
+    }
+
+    #[test]
+    fn version_1_staleness_and_future_skew_are_bounded() {
+        let now_ms = 2_000_000_u64;
+        let stale_ms = duration_ms(STATUS_STALE);
+        let skew_ms = duration_ms(STATUS_FUTURE_SKEW);
+
+        for (written_at_ms, expected) in [
+            (now_ms - stale_ms + 1, State::Away),
+            (now_ms - stale_ms, State::Unknown),
+            (now_ms + skew_ms, State::Away),
+            (now_ms + skew_ms + 1, State::Unknown),
+        ] {
+            let record = ParsedRecord::Version1 {
+                state: State::Away,
+                written_at_ms,
+            };
+            assert_eq!(read_parsed_at(record, None, now_ms), expected);
+        }
+    }
+
+    #[test]
+    fn legacy_record_uses_mtime_with_the_same_skew_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        fs::write(&sp, "busy\n").unwrap();
+
+        fs::File::open(&sp)
+            .unwrap()
+            .set_modified(SystemTime::now() - STATUS_STALE - Dur::from_secs(60))
+            .unwrap();
+        assert_eq!(read_state(&sp), State::Unknown);
+
+        fs::File::open(&sp)
+            .unwrap()
+            .set_modified(SystemTime::now() + STATUS_FUTURE_SKEW + Dur::from_secs(60))
             .unwrap();
         assert_eq!(read_state(&sp), State::Unknown);
     }
 
     #[test]
-    fn refresh_preserves_value_and_changes_the_replicated_bytes() {
+    fn refresh_preserves_value_and_changes_heartbeat_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        let first = at(1_786_741_000_000);
-        let second = first + STATUS_REFRESH;
-        set_state_at(&sp, State::Busy, first).unwrap();
-        let before = fs::read_to_string(&sp).unwrap();
-
-        assert_eq!(refresh_at(&sp, second), RefreshOutcome::Refreshed);
-
-        let after = fs::read_to_string(&sp).unwrap();
-        assert_ne!(after, before);
-        assert_eq!(
-            parse_record(&after).unwrap().updated_at_unix_ms,
-            Some(1_786_741_300_000)
-        );
-        assert_eq!(read_state_at(&sp, second), State::Busy);
-    }
-
-    #[test]
-    fn writer_and_replica_carry_the_same_fresh_timestamp_while_idle() {
-        let tmp = tempfile::tempdir().unwrap();
-        let writer = tmp.path().join("writer-status");
-        let replica = tmp.path().join("replica-status");
-        let first = at(1_786_741_000_000);
-        let second = first + STATUS_REFRESH;
-        set_state_at(&writer, State::Available, first).unwrap();
-        fs::write(&replica, fs::read(&writer).unwrap()).unwrap();
-
-        assert_eq!(refresh_at(&writer, second), RefreshOutcome::Refreshed);
-        fs::write(&replica, fs::read(&writer).unwrap()).unwrap();
-
-        let writer_raw = fs::read_to_string(&writer).unwrap();
-        let replica_raw = fs::read_to_string(&replica).unwrap();
-        assert_eq!(replica_raw, writer_raw);
-        assert_eq!(
-            parse_record(&writer_raw).unwrap().updated_at_unix_ms,
-            Some(1_786_741_300_000)
-        );
-        let observed = second + STATUS_REFRESH - Dur::from_millis(1);
-        assert_eq!(read_state_at(&writer, observed), State::Available);
-        assert_eq!(read_state_at(&replica, observed), State::Available);
+        write_record(&sp, State::Busy, 1).unwrap();
+        assert_eq!(refresh(&sp), RefreshOutcome::Refreshed);
+        assert_eq!(read_state(&sp), State::Busy);
+        let ParsedRecord::Version1 {
+            state,
+            written_at_ms,
+        } = parse_record(&fs::read_to_string(&sp).unwrap())
+        else {
+            panic!("refreshed record is not version 1");
+        };
+        assert_eq!(state, State::Busy);
+        assert!(written_at_ms > 1);
     }
 
     #[test]
     fn refresh_missing_writes_available_default() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        let now = at(1_786_741_730_761);
-        assert_eq!(refresh_at(&sp, now), RefreshOutcome::WroteDefault);
-        assert_eq!(read_state_at(&sp, now), State::Available);
-        assert_eq!(
-            fs::read_to_string(&sp).unwrap(),
-            "available\nupdated-at-unix-ms 1786741730761\n"
-        );
+        assert_eq!(refresh(&sp), RefreshOutcome::WroteDefault);
+        assert_eq!(read_state(&sp), State::Available);
+        assert!(matches!(
+            parse_record(&fs::read_to_string(&sp).unwrap()),
+            ParsedRecord::Version1 {
+                state: State::Available,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn refresh_leaves_dnd_to_age_out() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        let written_at = at(1_786_741_000_000);
-        set_state_at(&sp, State::Dnd, written_at).unwrap();
-        let before = fs::read_to_string(&sp).unwrap();
+        set_state(&sp, State::Dnd).unwrap();
+        let before = fs::metadata(&sp).unwrap().modified().unwrap();
+        std::thread::sleep(Dur::from_millis(5));
 
+        assert_eq!(refresh(&sp), RefreshOutcome::LeftDnd);
+        assert_eq!(fs::metadata(&sp).unwrap().modified().unwrap(), before);
+        assert_eq!(read_state(&sp), State::Dnd);
+    }
+
+    #[test]
+    fn refresh_upgrades_legacy_non_dnd_with_current_heartbeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        fs::write(&sp, "away\n").unwrap();
+
+        let before = crate::message::now_ms();
+        assert_eq!(refresh(&sp), RefreshOutcome::Refreshed);
+        let after = crate::message::now_ms();
+        let ParsedRecord::Version1 {
+            state,
+            written_at_ms,
+        } = parse_record(&fs::read_to_string(&sp).unwrap())
+        else {
+            panic!("legacy record was not upgraded");
+        };
+        assert_eq!(state, State::Away);
+        assert!((before..=after).contains(&written_at_ms));
+    }
+
+    #[test]
+    fn refresh_upgrades_legacy_dnd_without_renewing_the_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = status_path(tmp.path());
+        fs::write(&sp, "dnd\n").unwrap();
+        fs::File::open(&sp)
+            .unwrap()
+            .set_modified(SystemTime::now() - STATUS_STALE - Dur::from_secs(60))
+            .unwrap();
+        let legacy_timestamp = file_mtime_ms(&fs::File::open(&sp).unwrap()).unwrap();
+
+        assert_eq!(refresh(&sp), RefreshOutcome::Refreshed);
+        let raw = fs::read_to_string(&sp).unwrap();
         assert_eq!(
-            refresh_at(&sp, written_at + STATUS_REFRESH),
-            RefreshOutcome::LeftDnd
+            parse_record(&raw),
+            ParsedRecord::Version1 {
+                state: State::Dnd,
+                written_at_ms: legacy_timestamp,
+            }
         );
-        assert_eq!(fs::read_to_string(&sp).unwrap(), before);
-        assert_eq!(read_state_at(&sp, written_at), State::Dnd);
-        assert_eq!(
-            read_state_at(&sp, written_at + STATUS_STALE),
-            State::Unknown
-        );
+        assert_eq!(read_state(&sp), State::Unknown);
+        assert_eq!(refresh(&sp), RefreshOutcome::LeftDnd);
+        assert_eq!(fs::read_to_string(&sp).unwrap(), raw);
     }
 
     #[test]
     fn refresh_leaves_corrupt_untouched() {
         let tmp = tempfile::tempdir().unwrap();
         let sp = status_path(tmp.path());
-        fs::write(&sp, "garbage\n").unwrap();
-        assert_eq!(refresh(&sp), RefreshOutcome::LeftCorrupt);
-        assert_eq!(fs::read_to_string(&sp).unwrap(), "garbage\n"); // untouched
+        for raw in ["garbage\n", "available\nv1 nope\n"] {
+            fs::write(&sp, raw).unwrap();
+            assert_eq!(refresh(&sp), RefreshOutcome::LeftCorrupt);
+            assert_eq!(fs::read_to_string(&sp).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn activity_uses_origin_time_and_clamps_only_allowed_future_skew() {
+        let now_ms = 2_000_000_u64;
+        let skew_ms = duration_ms(STATUS_FUTURE_SKEW);
+
+        let record = ParsedRecord::Version1 {
+            state: State::Available,
+            written_at_ms: 1234,
+        };
+        assert_eq!(activity_time_at(record, None, now_ms), Some(1234));
+        assert_eq!(
+            activity_time_at(ParsedRecord::Legacy(State::Busy), Some(1234), now_ms),
+            Some(1234)
+        );
+
+        let bounded_future = ParsedRecord::Version1 {
+            state: State::Available,
+            written_at_ms: now_ms + skew_ms,
+        };
+        assert_eq!(activity_time_at(bounded_future, None, now_ms), Some(now_ms));
+
+        let excessive_future = ParsedRecord::Version1 {
+            state: State::Available,
+            written_at_ms: now_ms + skew_ms + 1,
+        };
+        assert_eq!(activity_time_at(excessive_future, None, now_ms), None);
+        assert_eq!(
+            activity_time_at(ParsedRecord::Malformed, None, now_ms),
+            None
+        );
     }
 }
