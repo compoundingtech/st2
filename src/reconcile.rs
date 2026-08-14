@@ -154,7 +154,7 @@ pub fn compile_driver_agent_tasks(
 
         if matches!(driver, Driver::Codex(_)) {
             anyhow::ensure!(
-                argv.get(0).map(String::as_str) == Some("st2")
+                argv.first().map(String::as_str) == Some("st2")
                     && argv.get(1).map(String::as_str) == Some("--catalog")
                     && argv.get(2).map(String::as_str) == Some("$CATALOG")
                     && argv.get(3).map(String::as_str) == Some("driver")
