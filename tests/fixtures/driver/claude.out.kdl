@@ -1,0 +1,4 @@
+render {
+    json-upsert .mcp.json "{\n  \"mcpServers\": {\n    \"st2\": {\n      \"args\": [\n        \"--catalog\",\n        \"$CATALOG\",\n        \"driver\",\n        \"claude\",\n        \"--identity\",\n        \"host.worker\"\n      ],\n      \"command\": \"st2\",\n      \"type\": \"stdio\"\n    }\n  }\n}"
+}
+argv claude --model opus --effort xhigh "--dangerously-load-development-channels=server:st2" --permission-mode bypassPermissions --model override "Start the assigned work."
