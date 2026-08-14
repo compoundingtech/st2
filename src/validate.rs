@@ -220,6 +220,16 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             ));
         }
 
+        if s.driver.is_some() && s.delivery.is_some() {
+            issues.push(Issue::error(
+                "driver-deliver-conflict",
+                rp.clone(),
+                ag.clone(),
+                "agent declares both a driver block and `deliver`; choose one launch source"
+                    .to_string(),
+            ));
+        }
+
         // An explicit identity+host pair is authoritative regardless of folder names. When either
         // field is omitted, path defaults remain part of placement and mismatches stay advisory.
         let explicit_placement = s.host.as_ref().is_some_and(|host| {

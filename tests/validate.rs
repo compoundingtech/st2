@@ -178,6 +178,31 @@ fn shared_workspace_render_conflict_is_an_error() {
 // ---- errors ----------------------------------------------------------------------------------
 
 #[test]
+fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  deliver "app-server"
+  claude { prompt "Start work." }
+  argv "claude" "Start work."
+}"#,
+    )]);
+
+    let report = validate(c.path());
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "driver-deliver-conflict")
+        .unwrap();
+    assert_eq!(issue.severity, Severity::Error);
+    assert_eq!(
+        issue.message,
+        "agent declares both a driver block and `deliver`; choose one launch source"
+    );
+}
+
+#[test]
 fn type_batch_is_retired_and_flagged_unknown() {
     // `type = batch` is retired (native `st2 eval` replaces it) — a lingering batch spec is now an
     // unknown type, not a silently-accepted service.
