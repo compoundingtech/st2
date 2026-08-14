@@ -123,8 +123,6 @@
             "hooks"
             "--test"
             "run"
-            "--test"
-            "message_cli"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
@@ -160,6 +158,18 @@
             "--test"
             "catalog_apply"
             "bootstrap_"
+          ];
+        });
+
+        # Message CLI crash/recovery controls are compiled only with debug assertions. Keep the
+        # package's release-mode test boundary unchanged and gate the complete integration target
+        # in a dedicated derivation.
+        st2MessageCli = st2.overrideAttrs (_: {
+          pname = "st2-message-cli-check";
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
+          cargoTestFlags = [
+            "--test"
+            "message_cli"
           ];
         });
 
@@ -215,6 +225,7 @@
         checks.st2 = st2;
         checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
         checks.catalog-bootstrap = st2CatalogBootstrap;
+        checks.message-cli = st2MessageCli;
         checks.parked-recovery = st2ParkedRecovery;
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
