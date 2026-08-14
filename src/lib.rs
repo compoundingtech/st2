@@ -44,8 +44,8 @@ pub use agent_spec::{discovery, spec};
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_strict};
 pub use agent_spec::spec::{
-    AgentDesiredState, AgentSpec, DeliveryTransport, JobType, Resource, Restart, RestartMode, Task,
-    TaskKind, TaskLifecycle, parse_duration,
+    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
+    Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

@@ -5,10 +5,10 @@
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
 //! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
-//! `restart{}`, `deliver`, task lifecycle, Resource bindings (declaration metadata), and the tasks.
-//! Everything render-only (`harness`, `model`, `persona`, `permissions`, legacy `transport`
-//! metadata, `strategy`, `meta{}`) is baked into the tasks/commands by the render layer and ignored
-//! here.
+//! `restart{}`, `deliver`, typed harness drivers, task lifecycle, Resource bindings (declaration
+//! metadata), and the tasks. Everything else that is render-only (`harness`, `model`, `persona`,
+//! `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked into the
+//! tasks/commands by the render layer and ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -61,6 +61,49 @@ impl DeliveryTransport {
             ),
         }
     }
+}
+
+/// One typed harness driver declaration.
+///
+/// The runner preserves this additive declaration field but does not execute or expand it. The st2
+/// command layer owns inspectable expansion into ordinary Agent Spec KDL primitives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Driver {
+    Claude(ClaudeDriver),
+    Codex(CodexDriver),
+}
+
+impl Driver {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Claude(_) => "claude",
+            Self::Codex(_) => "codex",
+        }
+    }
+}
+
+/// Typed fields accepted by a `claude {}` driver block.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ClaudeDriver {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub dev_channels: bool,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Typed fields accepted by a `codex {}` driver block.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CodexDriver {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 impl AgentDesiredState {
@@ -120,6 +163,8 @@ pub struct AgentSpec {
     pub restart: Option<Restart>,
     /// Provider-native delivery selected by `deliver`; `None` means legacy `ding` or no delivery.
     pub delivery: Option<DeliveryTransport>,
+    /// Additive typed harness declaration. Runtime paths do not read this field yet.
+    pub driver: Option<Driver>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
@@ -440,6 +485,9 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: select one provider-native delivery transport.
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub deliver: Option<Option<String>>,
+    /// Direct `claude {}` or `codex {}` provider block.
+    #[serde(flatten)]
+    pub driver: RawDriver,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
     pub lifecycle: Option<String>,
     /// `pty "<name>" {}` / `[pty.<name>]` — interactive tasks.
@@ -448,6 +496,26 @@ pub(crate) struct RawSpec {
     /// `exec "<name>" {}` / `[exec.<name>]` — terminal-free tasks.
     #[serde(default)]
     pub exec: BTreeMap<String, RawTask>,
+}
+
+/// The permissive raw envelope keeps the provider name at the same level in KDL, TOML, and JSON.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawDriver {
+    pub(crate) claude: Option<ClaudeDriver>,
+    pub(crate) codex: Option<CodexDriver>,
+}
+
+impl RawDriver {
+    fn lower(self, identity: &str) -> anyhow::Result<Option<Driver>> {
+        match (self.claude, self.codex) {
+            (None, None) => Ok(None),
+            (Some(driver), None) => Ok(Some(Driver::Claude(driver))),
+            (None, Some(driver)) => Ok(Some(Driver::Codex(driver))),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "agent '{identity}' declares both `claude` and `codex`; choose one driver"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -792,6 +860,8 @@ impl RawSpec {
             || self.argv.is_some()
             || self.ding
             || self.deliver.is_some()
+            || self.driver.claude.is_some()
+            || self.driver.codex.is_some()
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -825,6 +895,7 @@ impl RawSpec {
             .as_deref()
             .map(DeliveryTransport::parse)
             .transpose()?;
+        let driver = self.driver.lower(&identity)?;
         anyhow::ensure!(
             !(self.ding && delivery.is_some()),
             "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
@@ -902,6 +973,7 @@ impl RawSpec {
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             delivery,
+            driver,
             resources,
             tasks,
             path,

@@ -8,7 +8,7 @@
 //! ignored.
 
 use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
-use crate::spec::{RawResource, RawRestart, RawSpec, RawTask};
+use crate::spec::{ClaudeDriver, CodexDriver, RawResource, RawRestart, RawSpec, RawTask};
 
 /// Lower an already parsed declaration document into the runner's raw representation.
 pub(crate) fn lower_declared_document(document: &DeclaredDocument) -> anyhow::Result<Vec<RawSpec>> {
@@ -141,6 +141,20 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                         .ok_or_else(|| anyhow::anyhow!("agent `deliver` value must be a string"))?,
                 ));
             }
+            "claude" => {
+                anyhow::ensure!(
+                    raw.driver.claude.is_none(),
+                    "agent declares `claude` more than once"
+                );
+                raw.driver.claude = Some(claude_driver_node_to_raw(child)?);
+            }
+            "codex" => {
+                anyhow::ensure!(
+                    raw.driver.codex.is_none(),
+                    "agent declares `codex` more than once"
+                );
+                raw.driver.codex = Some(codex_driver_node_to_raw(child)?);
+            }
             "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {
@@ -163,6 +177,134 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
         );
     }
     Ok(raw)
+}
+
+fn driver_string(node: &DeclaredNode, provider: &str, field: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        node.type_name.is_none()
+            && node.children.is_empty()
+            && node.entries.len() == 1
+            && node.entries[0].name.is_none(),
+        "agent `{provider}.{field}` must contain exactly one positional string"
+    );
+    node.argument(0)
+        .and_then(DeclaredValue::as_str)
+        .map(String::from)
+        .ok_or_else(|| {
+            anyhow::anyhow!("agent `{provider}.{field}` must contain exactly one positional string")
+        })
+}
+
+fn driver_args(node: &DeclaredNode, provider: &str) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        node.type_name.is_none()
+            && node.children.is_empty()
+            && node.entries.iter().all(|entry| entry.name.is_none()),
+        "agent `{provider}.args` must contain only positional strings"
+    );
+    node.arguments()
+        .map(|value| {
+            value.as_str().map(String::from).ok_or_else(|| {
+                anyhow::anyhow!("agent `{provider}.args` must contain only positional strings")
+            })
+        })
+        .collect()
+}
+
+fn driver_bool(node: &DeclaredNode, provider: &str, field: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        node.type_name.is_none()
+            && node.children.is_empty()
+            && node.entries.len() == 1
+            && node.entries[0].name.is_none(),
+        "agent `{provider}.{field}` must contain exactly one positional bool"
+    );
+    node.argument(0)
+        .and_then(DeclaredValue::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!("agent `{provider}.{field}` must contain exactly one positional bool")
+        })
+}
+
+type CommonDriverFields = (Option<String>, Option<String>, bool, String, Vec<String>);
+
+fn common_driver_fields(
+    node: &DeclaredNode,
+    provider: &str,
+    allow_dev_channels: bool,
+) -> anyhow::Result<CommonDriverFields> {
+    anyhow::ensure!(
+        node.type_name.is_none() && node.entries.is_empty(),
+        "agent `{provider}` must be a child block without entries"
+    );
+    let mut model = None;
+    let mut effort = None;
+    let mut dev_channels = None;
+    let mut prompt = None;
+    let mut args = None;
+    for child in &node.children {
+        match child.name.as_str() {
+            "model" => {
+                anyhow::ensure!(model.is_none(), "agent `{provider}` has duplicate `model`");
+                model = Some(driver_string(child, provider, "model")?);
+            }
+            "effort" => {
+                anyhow::ensure!(
+                    effort.is_none(),
+                    "agent `{provider}` has duplicate `effort`"
+                );
+                effort = Some(driver_string(child, provider, "effort")?);
+            }
+            "dev-channels" if allow_dev_channels => {
+                anyhow::ensure!(
+                    dev_channels.is_none(),
+                    "agent `{provider}` has duplicate `dev-channels`"
+                );
+                dev_channels = Some(driver_bool(child, provider, "dev-channels")?);
+            }
+            "prompt" => {
+                anyhow::ensure!(
+                    prompt.is_none(),
+                    "agent `{provider}` has duplicate `prompt`"
+                );
+                prompt = Some(driver_string(child, provider, "prompt")?);
+            }
+            "args" => {
+                anyhow::ensure!(args.is_none(), "agent `{provider}` has duplicate `args`");
+                args = Some(driver_args(child, provider)?);
+            }
+            other => anyhow::bail!("agent `{provider}` has unsupported field `{other}`"),
+        }
+    }
+    Ok((
+        model,
+        effort,
+        dev_channels.unwrap_or(false),
+        prompt.ok_or_else(|| anyhow::anyhow!("agent `{provider}` requires `prompt`"))?,
+        args.unwrap_or_default(),
+    ))
+}
+
+fn claude_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<ClaudeDriver> {
+    let (model, effort, dev_channels, prompt, args) =
+        common_driver_fields(node, "claude", true)?;
+    Ok(ClaudeDriver {
+        model,
+        effort,
+        dev_channels,
+        prompt,
+        args,
+    })
+}
+
+fn codex_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<CodexDriver> {
+    let (model, effort, _, prompt, args) = common_driver_fields(node, "codex", false)?;
+    Ok(CodexDriver {
+        model,
+        effort,
+        prompt,
+        args,
+    })
 }
 
 fn parse_presentation(

@@ -8,7 +8,9 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use agent_spec::spec::{DeliveryTransport, TaskKind, TaskLifecycle};
+use agent_spec::spec::{
+    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, TaskKind, TaskLifecycle,
+};
 use agent_spec::{
     AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
 };
@@ -543,6 +545,134 @@ argv = ["claude", "--resume", "session id"]
         argv(&find(&found.specs, "json").tasks[0]),
         ["codex", "resume", "abc"]
     );
+}
+
+#[test]
+fn typed_driver_blocks_lower_with_kdl_toml_and_json_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/claude-kdl/agent.kdl",
+        r#"agent "claude-kdl" {
+  claude {
+    model "opus"
+    effort "xhigh"
+    dev-channels #true
+    prompt "Start the assigned work."
+    args "--permission-mode" "bypassPermissions"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/claude-toml/agent.toml",
+        r#"identity = "claude-toml"
+
+[claude]
+model = "opus"
+effort = "xhigh"
+dev-channels = true
+prompt = "Start the assigned work."
+args = ["--permission-mode", "bypassPermissions"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/claude-json/agent.json",
+        r#"{
+  "identity": "claude-json",
+  "claude": {
+    "model": "opus",
+    "effort": "xhigh",
+    "dev-channels": true,
+    "prompt": "Start the assigned work.",
+    "args": ["--permission-mode", "bypassPermissions"]
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-kdl/agent.kdl",
+        r#"agent "codex-kdl" {
+  codex {
+    model "gpt-5.6-sol"
+    effort "xhigh"
+    prompt "Start the assigned work."
+    args "--dangerously-bypass-approvals-and-sandbox"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-toml/agent.toml",
+        r#"identity = "codex-toml"
+
+[codex]
+model = "gpt-5.6-sol"
+effort = "xhigh"
+prompt = "Start the assigned work."
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-json/agent.json",
+        r#"{
+  "identity": "codex-json",
+  "codex": {
+    "model": "gpt-5.6-sol",
+    "effort": "xhigh",
+    "prompt": "Start the assigned work.",
+    "args": ["--dangerously-bypass-approvals-and-sandbox"]
+  }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let claude = Driver::Claude(ClaudeDriver {
+        model: Some("opus".into()),
+        effort: Some("xhigh".into()),
+        dev_channels: true,
+        prompt: "Start the assigned work.".into(),
+        args: vec!["--permission-mode".into(), "bypassPermissions".into()],
+    });
+    for identity in ["claude-kdl", "claude-toml", "claude-json"] {
+        assert_eq!(find(&found.specs, identity).driver.as_ref(), Some(&claude));
+    }
+    let codex = Driver::Codex(CodexDriver {
+        model: Some("gpt-5.6-sol".into()),
+        effort: Some("xhigh".into()),
+        prompt: "Start the assigned work.".into(),
+        args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+    });
+    for identity in ["codex-kdl", "codex-toml", "codex-json"] {
+        assert_eq!(find(&found.specs, identity).driver.as_ref(), Some(&codex));
+    }
+}
+
+#[test]
+fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
+    for (name, body) in [
+        (
+            "both",
+            r#"claude { prompt "go" }; codex { prompt "go" }"#,
+        ),
+        ("missing-prompt", r#"claude { model "opus" }"#),
+        ("wrong-bool", r#"claude { dev-channels "yes"; prompt "go" }"#),
+        ("codex-dev", r#"codex { dev-channels #true; prompt "go" }"#),
+        ("unknown", r#"claude { presence #true; prompt "go" }"#),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!("agent \"{name}\" {{ {body} }}"),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "accepted {name}");
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+    }
 }
 
 #[test]

@@ -399,6 +399,7 @@ fn spec(
         keep: false,
         restart: None,
         delivery: None,
+        driver: None,
         resources: Vec::new(),
         tasks,
         path: PathBuf::from(format!(

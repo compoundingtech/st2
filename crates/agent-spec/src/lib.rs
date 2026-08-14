@@ -43,6 +43,7 @@ pub use discovery::{
     path_defaults,
 };
 pub use spec::{
-    AgentDesiredState, AgentSpec, DeliveryTransport, JobType, Resource, Restart, RestartMode, Task,
-    TaskKind, TaskLifecycle, parse_duration, validate_desired_state_reason,
+    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
+    Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,
+    validate_desired_state_reason,
 };

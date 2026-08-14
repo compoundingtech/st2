@@ -2281,6 +2281,7 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            driver: None,
             resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
@@ -2331,6 +2332,7 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            driver: None,
             resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
@@ -2588,6 +2590,7 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            driver: None,
             resources: vec![],
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
