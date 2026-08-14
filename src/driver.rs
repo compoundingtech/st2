@@ -1,7 +1,7 @@
 //! Pure typed-driver expansion into ordinary hand-authorable Agent Spec KDL primitives.
 //!
 //! Expansion does not read files, inspect a harness, mutate a declaration, or execute a process.
-//! Reconcile and materialization do not call this module.
+//! Print, reconcile, and materialization use this same expansion.
 
 use agent_spec::spec::{AgentSpec, ClaudeDriver, CodexDriver, Driver};
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ pub(crate) fn ensure_single_source(spec: &AgentSpec) -> Result<()> {
 
 /// Expand one typed driver into KDL nodes that can be written inside an `agent {}` block.
 pub fn expand_driver(spec: &AgentSpec, this_host: &str) -> Result<KdlDocument> {
+    ensure_single_source(spec)?;
     let driver = spec
         .driver
         .as_ref()

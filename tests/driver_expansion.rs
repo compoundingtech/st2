@@ -69,7 +69,7 @@ fn cli_prints_each_snapshot_without_changing_its_input() {
 }
 
 #[test]
-fn claude_driver_matches_deliver_after_normalizing_only_resolution_and_the_alias() {
+fn claude_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     let legacy_workspace = temp.path().join("legacy-workspace");
@@ -146,9 +146,10 @@ fn claude_driver_matches_deliver_after_normalizing_only_resolution_and_the_alias
         serde_json::from_slice(&fs::read(legacy_workspace.join(".mcp.json")).unwrap()).unwrap();
     let mut driver_mcp: serde_json::Value =
         serde_json::from_slice(&fs::read(driver_workspace.join(".mcp.json")).unwrap()).unwrap();
-    assert_eq!(driver_mcp["mcpServers"]["st2"]["command"], "st2");
-    driver_mcp["mcpServers"]["st2"]["command"] =
-        legacy_mcp["mcpServers"]["st2"]["command"].clone();
+    assert_eq!(
+        driver_mcp["mcpServers"]["st2"]["command"],
+        legacy_mcp["mcpServers"]["st2"]["command"]
+    );
     let args = driver_mcp["mcpServers"]["st2"]["args"]
         .as_array_mut()
         .unwrap();

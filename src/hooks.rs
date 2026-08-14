@@ -136,7 +136,7 @@ pub fn required_by_codex(
         .any(|spec| required_by_codex_agent(spec, this_host, catalog_root))
 }
 
-/// Whether one local declaration owns a Codex agent task.
+/// Whether one local declaration owns a Codex agent launch.
 pub fn required_by_codex_agent(
     spec: &agent_spec::spec::AgentSpec,
     this_host: &str,

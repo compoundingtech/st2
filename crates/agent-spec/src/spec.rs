@@ -65,8 +65,7 @@ impl DeliveryTransport {
 
 /// One typed harness driver declaration.
 ///
-/// The runner preserves this additive declaration field but does not execute or expand it. The st2
-/// command layer owns inspectable expansion into ordinary Agent Spec KDL primitives.
+/// st2 expands this field into inspectable Agent Spec KDL before task and render compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Driver {
     Claude(ClaudeDriver),
@@ -163,7 +162,7 @@ pub struct AgentSpec {
     pub restart: Option<Restart>,
     /// Provider-native delivery selected by `deliver`; `None` means legacy `ding` or no delivery.
     pub delivery: Option<DeliveryTransport>,
-    /// Additive typed harness declaration. Runtime paths do not read this field yet.
+    /// Typed harness declaration used by task and render compilation.
     pub driver: Option<Driver>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.

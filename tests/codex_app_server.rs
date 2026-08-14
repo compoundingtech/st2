@@ -69,6 +69,8 @@ fn codex_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
         &legacy_path,
         r#"agent "worker" {
   host "h"
+  lifecycle "adopt-only"
+  env { CODEX_HOME "$CATALOG/codex" }
   deliver "app-server"
   argv "codex" "--model" "gpt-test" "-c" "model_reasoning_effort=xhigh" "--model" "override" "boot"
 }
@@ -78,6 +80,8 @@ fn codex_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
         &driver_path,
         r#"agent "worker" {
   host "h"
+  lifecycle "adopt-only"
+  env { CODEX_HOME "$CATALOG/codex" }
   codex {
     model "gpt-test"
     effort "xhigh"

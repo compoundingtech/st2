@@ -1518,7 +1518,7 @@ fn reconcile_pass(
         report.skipped = true;
         report
             .errors
-            .push(format!("compile generated DING tasks (pass skipped): {error:#}"));
+            .push(format!("compile generated tasks (pass skipped): {error:#}"));
         return report;
     }
 
