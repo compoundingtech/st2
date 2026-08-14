@@ -39,8 +39,8 @@ pub use declared::{
     parse_declared_document, parse_declared_file,
 };
 pub use discovery::{
-    Declared, Discovered, SpecError, discover, discover_strict, is_catalog_path, parse_declared,
-    path_defaults,
+    Declared, Discovered, SpecError, discover, discover_file, discover_strict, is_catalog_path,
+    parse_declared, path_defaults,
 };
 pub use spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,

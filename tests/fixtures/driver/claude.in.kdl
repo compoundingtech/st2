@@ -1,5 +1,5 @@
-agent "worker" {
-  host "host"
+agent "fabric" {
+  host "Silber"
   workspace "/work"
   claude {
     model "opus"

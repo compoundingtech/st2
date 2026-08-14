@@ -86,7 +86,7 @@ enum Command {
     /// or refresh hooks.
     #[command(subcommand)]
     Hooks(HooksCmd),
-    /// Provider-native harness drivers. These commands preserve the current native launch paths.
+    /// Provider-native harness drivers and read-only typed-block expansion.
     #[command(subcommand)]
     Driver(DriverCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
@@ -304,6 +304,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DriverCmd {
+    /// Print one typed driver block as plain Agent Spec KDL without running it.
+    Expand {
+        /// KDL declaration that contains the typed driver block.
+        spec: PathBuf,
+        /// Select one local or fully qualified identity when the file contains multiple agents.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Host fallback when neither the declaration nor its catalog path supplies one.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Run the existing controlled Codex app-server path.
     Codex {
         #[arg(long)]
@@ -887,6 +898,10 @@ fn main() -> Result<()> {
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)
         }
+        Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
+            let catalog = catalog_arg(None)?;
+            driver_expand_cmd(&catalog, &spec, agent.as_deref(), host.as_deref())
+        }
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
         Command::Describe(args) => {
@@ -1116,6 +1131,43 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn driver_expand_cmd(
+    catalog: &Path,
+    path: &Path,
+    agent: Option<&str>,
+    host: Option<&str>,
+) -> Result<()> {
+    let (mut specs, warnings) = st2::discover_file(catalog, path)
+        .with_context(|| format!("reading driver declaration {}", path.display()))?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(agent) = agent {
+        specs.retain(|spec| {
+            spec.identity == agent || spec.bus_id(host.unwrap_or("")) == agent
+        });
+    }
+    anyhow::ensure!(
+        specs.len() == 1,
+        if agent.is_some() {
+            format!(
+                "{} contains {} matching agent blocks; expected exactly one",
+                path.display(),
+                specs.len()
+            )
+        } else {
+            format!(
+                "{} contains {} agent blocks; use --agent when it contains more than one",
+                path.display(),
+                specs.len()
+            )
+        }
+    );
+    let output = st2::driver::expand_driver(&specs[0], host.unwrap_or(""))?;
+    print!("{output}");
+    Ok(())
 }
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
