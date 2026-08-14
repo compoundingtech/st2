@@ -1600,7 +1600,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
         if !spec.has_delivery_transport() {
             report_advisory(
                 &format!("{bus_id} delivery transport missing"),
-                "declare `ding` or `deliver`; agent receives no DING",
+                "declare `ding`, `deliver`, or a driver block; agent receives no DING",
             );
         }
         for task in &spec.tasks {

@@ -405,7 +405,8 @@ impl AgentSpec {
 
     /// True when the declaration selected legacy screen delivery or one native transport.
     pub fn has_delivery_transport(&self) -> bool {
-        self.delivery.is_some()
+        self.driver.is_some()
+            || self.delivery.is_some()
             || self
                 .tasks
                 .iter()

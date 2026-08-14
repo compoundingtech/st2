@@ -390,7 +390,7 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
     );
     assert!(
         stdout.contains(
-            "⚠ h.worker delivery transport missing — declare `ding` or `deliver`; agent receives no DING"
+            "⚠ h.worker delivery transport missing — declare `ding`, `deliver`, or a driver block; agent receives no DING"
         ),
         "{stdout}"
     );
@@ -403,6 +403,16 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
     let declared = doctor(&catalog, &bin, &tmp.path().join("state"));
     let stdout = String::from_utf8_lossy(&declared.stdout);
     assert!(declared.status.success(), "{stdout}");
+    assert!(!stdout.contains("delivery transport missing"), "{stdout}");
+
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; claude { prompt "Start work." } }"#,
+    )
+    .unwrap();
+    let driver = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&driver.stdout);
+    assert!(driver.status.success(), "{stdout}");
     assert!(!stdout.contains("delivery transport missing"), "{stdout}");
 
     fs::write(
