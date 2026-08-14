@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use agent_spec::spec::{AgentSpec, DeliveryTransport, TaskKind, TaskLifecycle};
+use agent_spec::spec::{AgentSpec, DeliveryTransport, Driver, TaskKind, TaskLifecycle};
+use kdl::KdlValue;
 
 /// Immutable inputs captured once before generated tasks are compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,11 +86,100 @@ pub fn compile_generated_tasks(
     this_host: &str,
     context: &TaskCompileContext,
 ) -> Result<()> {
+    compile_driver_agent_tasks(specs, this_host, context)?;
     compile_generated_ding_tasks(specs, this_host, context)?;
     compile_app_server_agent_tasks(specs, this_host, context)?;
     // Claude's MCP server is declared to Claude itself.  It must not be lowered
     // to an st2-owned companion task: that would give the supervisor a second
     // lifetime to manage and break session ownership across restart.
+    Ok(())
+}
+
+/// Compile the shared printed driver expansion into the canonical agent task.
+pub fn compile_driver_agent_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    let st2_executable = context
+        .st2_executable
+        .to_str()
+        .context("running st2 executable path is not UTF-8")?
+        .to_owned();
+    let catalog_root = context
+        .catalog_root
+        .to_str()
+        .context("catalog root is not UTF-8")?
+        .to_owned();
+
+    for spec in specs {
+        let Some(driver) = spec.driver.as_ref() else {
+            continue;
+        };
+        let bus_id = spec.bus_id(this_host);
+        let expansion = crate::driver::expand_driver(spec, this_host)?;
+        let argv_nodes = expansion
+            .nodes()
+            .iter()
+            .filter(|node| node.name().value() == "argv")
+            .collect::<Vec<_>>();
+        let [argv_node] = argv_nodes.as_slice() else {
+            anyhow::bail!(
+                "agent '{bus_id}' driver expansion produced {} argv nodes; expected exactly one",
+                argv_nodes.len()
+            );
+        };
+        anyhow::ensure!(
+            argv_node.children().is_none()
+                && argv_node.entries().iter().all(|entry| {
+                    entry.name().is_none() && matches!(entry.value(), KdlValue::String(_))
+                }),
+            "agent '{bus_id}' driver expansion produced a non-string argv"
+        );
+        let mut argv = argv_node
+            .entries()
+            .iter()
+            .map(|entry| match entry.value() {
+                KdlValue::String(value) => value.clone(),
+                _ => unreachable!("the argv shape check accepts only strings"),
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !argv.is_empty(),
+            "agent '{bus_id}' driver expansion produced an empty argv"
+        );
+
+        if matches!(driver, Driver::Codex(_)) {
+            anyhow::ensure!(
+                argv.get(0).map(String::as_str) == Some("st2")
+                    && argv.get(1).map(String::as_str) == Some("--catalog")
+                    && argv.get(2).map(String::as_str) == Some("$CATALOG")
+                    && argv.get(3).map(String::as_str) == Some("driver")
+                    && argv.get(4).map(String::as_str) == Some("codex"),
+                "agent '{bus_id}' Codex driver expansion has an unexpected wrapper prefix"
+            );
+            argv[0] = st2_executable.clone();
+            argv[2] = catalog_root.clone();
+        }
+
+        let mut candidates = spec
+            .tasks
+            .iter_mut()
+            .filter(|task| !task.derived && task.name == "agent");
+        let task = candidates.next().with_context(|| {
+            format!("agent '{bus_id}' driver has no canonical `agent` task")
+        })?;
+        anyhow::ensure!(
+            candidates.next().is_none(),
+            "agent '{bus_id}' driver has more than one canonical `agent` task"
+        );
+        anyhow::ensure!(
+            task.kind == TaskKind::Pty,
+            "agent '{bus_id}' driver canonical task is not a PTY"
+        );
+        task.command = None;
+        task.argv = Some(argv);
+    }
     Ok(())
 }
 
@@ -163,6 +253,9 @@ pub fn compile_app_server_agent_tasks(
         .to_owned();
 
     for spec in specs {
+        if spec.driver.is_some() {
+            continue;
+        }
         if spec.delivery != Some(DeliveryTransport::AppServer) {
             continue;
         }

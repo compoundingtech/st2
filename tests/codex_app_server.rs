@@ -61,6 +61,71 @@ fn app_server_selector_wraps_the_canonical_argv_with_exact_owner_inputs() {
 }
 
 #[test]
+fn codex_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let legacy_path = tmp.path().join("legacy.kdl");
+    let driver_path = tmp.path().join("driver.kdl");
+    write(
+        &legacy_path,
+        r#"agent "worker" {
+  host "h"
+  deliver "app-server"
+  argv "codex" "--model" "gpt-test" "-c" "model_reasoning_effort=xhigh" "--model" "override" "boot"
+}
+"#,
+    );
+    write(
+        &driver_path,
+        r#"agent "worker" {
+  host "h"
+  codex {
+    model "gpt-test"
+    effort "xhigh"
+    prompt "boot"
+    args "--model" "override"
+  }
+}
+"#,
+    );
+    let (legacy, _) = st2::discover_file(tmp.path(), &legacy_path).unwrap();
+    let (driver, _) = st2::discover_file(tmp.path(), &driver_path).unwrap();
+    let mut legacy = legacy.into_iter().next().unwrap();
+    let mut driver = driver.into_iter().next().unwrap();
+    let compile_context = context(tmp.path());
+
+    compile_generated_tasks(
+        std::slice::from_mut(&mut legacy),
+        "h",
+        &compile_context,
+    )
+    .unwrap();
+    compile_generated_tasks(
+        std::slice::from_mut(&mut driver),
+        "h",
+        &compile_context,
+    )
+    .unwrap();
+
+    let legacy_task = legacy
+        .tasks
+        .iter()
+        .find(|task| task.name == "agent")
+        .unwrap()
+        .clone();
+    let mut driver_task = driver
+        .tasks
+        .iter()
+        .find(|task| task.name == "agent")
+        .unwrap()
+        .clone();
+    let argv = driver_task.argv.as_mut().unwrap();
+    assert_eq!(&argv[3..5], ["driver", "codex"]);
+    argv.splice(3..5, ["codex-app-server".to_string()]);
+
+    assert_eq!(driver_task, legacy_task);
+}
+
+#[test]
 fn app_server_selector_rejects_shell_and_pre_remote_launches_without_mutating_them() {
     for (name, launch, expected) in [
         (

@@ -393,12 +393,14 @@ impl AgentSpec {
         self.host.as_deref().unwrap_or(this_host)
     }
 
-    /// True once at least one authored task carries an explicit shell command or direct argv (i.e.
-    /// the job was rendered). A generated sidecar cannot make an otherwise-empty job runnable.
+    /// True when a driver can compile the launch or an authored task already contains one.
+    /// A generated sidecar cannot make an otherwise-empty job runnable.
     pub fn is_runnable(&self) -> bool {
-        self.tasks
-            .iter()
-            .any(|task| !task.derived && (task.command.is_some() || task.argv.is_some()))
+        self.driver.is_some()
+            || self
+                .tasks
+                .iter()
+                .any(|task| !task.derived && (task.command.is_some() || task.argv.is_some()))
     }
 
     /// True when the declaration selected legacy screen delivery or one native transport.
@@ -896,6 +898,7 @@ impl RawSpec {
             .map(DeliveryTransport::parse)
             .transpose()?;
         let driver = self.driver.lower(&identity)?;
+        let has_driver = driver.is_some();
         anyhow::ensure!(
             !(self.ding && delivery.is_some()),
             "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
@@ -906,7 +909,9 @@ impl RawSpec {
             self.argv.as_ref(),
             "compact task",
         )?;
-        if (self.command.is_some() || self.argv.is_some()) && self.pty.contains_key("agent") {
+        if (self.command.is_some() || self.argv.is_some() || has_driver)
+            && self.pty.contains_key("agent")
+        {
             anyhow::bail!(
                 "agent '{identity}' declares both a compact launch and `pty \"agent\"`; choose one form"
             );
@@ -921,7 +926,7 @@ impl RawSpec {
         for (name, t) in self.exec {
             tasks.push(t.lower(&identity, TaskKind::Exec, name, &self.env)?);
         }
-        if self.command.is_some() || self.argv.is_some() {
+        if self.command.is_some() || self.argv.is_some() || has_driver {
             let lifecycle =
                 parse_task_lifecycle(&identity, "compact task", self.lifecycle.as_deref())?;
             tasks.push(Task {
