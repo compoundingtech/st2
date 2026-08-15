@@ -73,7 +73,7 @@ fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["message", "sent", identity, "--root"])
         .arg(root)
-        .args(["--host", "h"])
+        .args(["--host", "h", "--as", identity])
         .args(extra)
         .output()
         .unwrap()

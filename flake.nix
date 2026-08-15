@@ -161,6 +161,18 @@
           ];
         });
 
+        # Message CLI crash/recovery controls are compiled only with debug assertions. Keep the
+        # package's release-mode test boundary unchanged and gate the complete integration target
+        # in a dedicated derivation.
+        st2MessageCli = st2.overrideAttrs (_: {
+          pname = "st2-message-cli-check";
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
+          cargoTestFlags = [
+            "--test"
+            "message_cli"
+          ];
+        });
+
         # The parked-task recovery episode against the real binary and real processes. It is a
         # dedicated derivation because it needs a long-running supervisor: both single-pass entry
         # points build a fresh `FlappingCap`, so `up --once` can never park anything, and the
@@ -213,6 +225,7 @@
         checks.st2 = st2;
         checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
         checks.catalog-bootstrap = st2CatalogBootstrap;
+        checks.message-cli = st2MessageCli;
         checks.parked-recovery = st2ParkedRecovery;
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
