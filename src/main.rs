@@ -325,9 +325,14 @@ enum DriverCmd {
         argv: Vec<String>,
     },
     /// Run the Claude session-owned MCP server over stdio.
-    // Keep the hidden alias until old Claude sessions can no longer restart their MCP child.
-    #[command(name = "claude-mcp", alias = "claude")]
     ClaudeMcp {
+        #[arg(long)]
+        identity: String,
+    },
+    /// Deprecated name for the Claude MCP server.
+    // Keep this hidden command until no rendered configuration uses the old name.
+    #[command(hide = true)]
+    Claude {
         #[arg(long)]
         identity: String,
     },
@@ -905,6 +910,12 @@ fn main() -> Result<()> {
             st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
         }
         Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::Claude { identity }) => {
+            eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)

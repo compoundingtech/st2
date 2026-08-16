@@ -204,6 +204,25 @@ fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    let temp = tempfile::tempdir().unwrap();
+    let old = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(temp.path())
+        .args(["driver", "claude", "--identity", "missing"])
+        .output()
+        .unwrap();
+    let old_error = String::from_utf8(old.stderr).unwrap();
+    assert!(old_error.contains("`st2 driver claude` is deprecated"));
+
+    let current = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(temp.path())
+        .args(["driver", "claude-mcp", "--identity", "missing"])
+        .output()
+        .unwrap();
+    let current_error = String::from_utf8(current.stderr).unwrap();
+    assert!(!current_error.contains("deprecated"));
 }
 
 #[test]
