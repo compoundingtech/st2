@@ -787,8 +787,8 @@ context record.
 
 #### DND behavior
 
-A fresh `dnd` record suppresses DING delivery. The sidecar leaves its timestamp
-unchanged, so an abandoned hold ages out.
+A fresh `dnd` record suppresses DING delivery. The session owner leaves its
+timestamp unchanged, so an abandoned hold ages out.
 
 A stale or invalid DND record does not suppress delivery. It reads as
 `unknown`, which preserves the existing fresh-DND rule.
@@ -807,8 +807,8 @@ upgrades its legacy record at its next five-minute refresh.
 A version 1 session owner upgrades a legacy DND record once. It uses the legacy
 mtime as the embedded timestamp, so the migration cannot renew the hold.
 
-After that migration, the sidecar does not refresh DND. If the legacy mtime is
-unavailable, the sidecar leaves the record unchanged.
+After that migration, the session owner does not refresh DND. If the legacy
+mtime is unavailable, the session owner leaves the record unchanged.
 
 A malformed two-line record is not legacy. Readers must not hide a bad version
 1 record behind the legacy mtime fallback.
