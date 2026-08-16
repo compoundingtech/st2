@@ -82,7 +82,7 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
                     "--catalog",
                     CATALOG,
                     "driver",
-                    "claude",
+                    "claude-mcp",
                     "--identity",
                     bus_id
                 ]
@@ -245,7 +245,7 @@ mod tests {
                 "--catalog",
                 "$CATALOG",
                 "driver",
-                "claude",
+                "claude-mcp",
                 "--identity",
                 "host.worker"
             ])

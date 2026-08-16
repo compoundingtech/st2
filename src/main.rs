@@ -324,8 +324,10 @@ enum DriverCmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// Run the existing Claude session-owned MCP server over stdio.
-    Claude {
+    /// Run the Claude session-owned MCP server over stdio.
+    // Keep the hidden alias until old Claude sessions can no longer restart their MCP child.
+    #[command(name = "claude-mcp", alias = "claude")]
+    ClaudeMcp {
         #[arg(long)]
         identity: String,
     },
@@ -902,7 +904,7 @@ fn main() -> Result<()> {
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
         }
-        Command::Driver(DriverCmd::Claude { identity }) => {
+        Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)

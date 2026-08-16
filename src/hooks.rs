@@ -490,7 +490,7 @@ mod tests {
                 "--catalog".into(),
                 "/catalog".into(),
                 "driver".into(),
-                "claude".into(),
+                "claude-mcp".into(),
             ],
             root
         ));

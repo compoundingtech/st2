@@ -69,7 +69,7 @@ fn cli_prints_each_snapshot_without_changing_its_input() {
 }
 
 #[test]
-fn claude_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
+fn claude_driver_matches_deliver_after_normalizing_the_legacy_command_namespace() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     let legacy_workspace = temp.path().join("legacy-workspace");
@@ -170,9 +170,40 @@ fn claude_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
     let args = driver_mcp["mcpServers"]["st2"]["args"]
         .as_array_mut()
         .unwrap();
-    assert_eq!(&args[2..4], ["driver", "claude"]);
+    assert_eq!(&args[2..4], ["driver", "claude-mcp"]);
     args.splice(2..4, [serde_json::Value::String("claude-mcp".into())]);
     assert_eq!(driver_mcp, legacy_mcp);
+}
+
+#[test]
+fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
+    let help = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["driver", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("claude-mcp "))
+    );
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("claude "))
+    );
+
+    for command in ["claude-mcp", "claude"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["driver", command, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
