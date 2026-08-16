@@ -86,6 +86,9 @@ enum Command {
     /// or refresh hooks.
     #[command(subcommand)]
     Hooks(HooksCmd),
+    /// Provider-native harness drivers and read-only typed-block expansion.
+    #[command(subcommand)]
+    Driver(DriverCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
     /// message. Busy does not suppress delivery; only fresh dnd defers FIFO. A startup backlog is
     /// coalesced into one recovery notice. Long-running — st2 keeps it alive as a task alongside the
@@ -111,6 +114,25 @@ enum Command {
         /// Poll/liveness cadence in milliseconds (folder changes poke immediately regardless).
         #[arg(long, default_value_t = 1000)]
         interval: u64,
+    },
+    /// Internal controlled Codex launch. Generated only for `deliver "app-server"` tasks.
+    #[command(hide = true)]
+    CodexAppServer {
+        /// Exact agent bus identity that owns the controlled thread.
+        #[arg(long)]
+        identity: String,
+        /// Exact reconciled PTY task identity for this runtime.
+        #[arg(long)]
+        runtime_id: String,
+        /// Original structured Codex invocation, including its provider executable.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        codex_argv: Vec<String>,
+    },
+    /// Internal Claude MCP channel server started by Claude from its rendered project declaration.
+    #[command(hide = true)]
+    ClaudeMcp {
+        #[arg(long)]
+        identity: String,
     },
     /// Get or set an agent's presence status. No `--set` prints the status; no identity means yours
     /// (`$ST_AGENT`). Settable: offline | available | busy | away | dnd (`unknown` is derived).
@@ -277,6 +299,51 @@ enum Command {
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverCmd {
+    /// Print one typed driver block as plain Agent Spec KDL without running it.
+    Expand {
+        /// KDL declaration that contains the typed driver block.
+        spec: PathBuf,
+        /// Select one local or fully qualified identity when the file contains multiple agents.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Host fallback when neither the declaration nor its catalog path supplies one.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Run the existing controlled Codex app-server path.
+    Codex {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Run the Claude session-owned MCP server over stdio.
+    ClaudeMcp {
+        #[arg(long)]
+        identity: String,
+    },
+    /// Deprecated name for the Claude MCP server.
+    // Keep this hidden command until no rendered configuration uses the old name.
+    #[command(hide = true)]
+    Claude {
+        #[arg(long)]
+        identity: String,
+    },
+    /// Run Claude under the session-owned presence wrapper.
+    ClaudeSession {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -818,6 +885,54 @@ fn main() -> Result<()> {
             host,
             interval,
         } => ding_cmd(session, identity, root, host, interval),
+        Command::CodexAppServer {
+            identity,
+            runtime_id,
+            codex_argv,
+        } => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::codex_app_server::run_controlled(
+                &catalog,
+                identity,
+                runtime_id,
+                codex_argv,
+            )
+        }
+        Command::ClaudeMcp { identity } => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::Codex { identity, runtime_id, argv }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+        }
+        Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::Claude { identity }) => {
+            eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::ClaudeSession {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_session::run(&catalog, identity, runtime_id, argv)
+        }
+        Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
+            let catalog = catalog_arg(None)?;
+            driver_expand_cmd(&catalog, &spec, agent.as_deref(), host.as_deref())
+        }
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
         Command::Describe(args) => {
@@ -1047,6 +1162,43 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn driver_expand_cmd(
+    catalog: &Path,
+    path: &Path,
+    agent: Option<&str>,
+    host: Option<&str>,
+) -> Result<()> {
+    let (mut specs, warnings) = st2::discover_file(catalog, path)
+        .with_context(|| format!("reading driver declaration {}", path.display()))?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(agent) = agent {
+        specs.retain(|spec| {
+            spec.identity == agent || spec.bus_id(host.unwrap_or("")) == agent
+        });
+    }
+    anyhow::ensure!(
+        specs.len() == 1,
+        if agent.is_some() {
+            format!(
+                "{} contains {} matching agent blocks; expected exactly one",
+                path.display(),
+                specs.len()
+            )
+        } else {
+            format!(
+                "{} contains {} agent blocks; use --agent when it contains more than one",
+                path.display(),
+                specs.len()
+            )
+        }
+    );
+    let output = st2::driver::expand_driver(&specs[0], host.unwrap_or(""))?;
+    print!("{output}");
+    Ok(())
 }
 
 fn hooks_cmd(command: HooksCmd) -> Result<()> {
@@ -1476,6 +1628,12 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             );
             continue;
         }
+        if !spec.has_delivery_transport() {
+            report_advisory(
+                &format!("{bus_id} delivery transport missing"),
+                "declare `ding`, `deliver`, or a driver block; agent receives no DING",
+            );
+        }
         for task in &spec.tasks {
             let id = task
                 .id
@@ -1495,7 +1653,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     &mut problems,
                     false,
                     &format!("{bus_id} presence missing"),
-                    "no status file — is its ding refreshing?",
+                    "no status file — is its session owner refreshing presence?",
                 );
             } else {
                 let state = st2::status::read_state(&path);
@@ -1503,7 +1661,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     &mut problems,
                     state != st2::status::State::Unknown,
                     &format!("{bus_id} presence fresh (is `{}`)", state.as_str()),
-                    "rotted to `unknown` — is its ding refreshing?",
+                    "rotted to `unknown` — is its session owner refreshing presence?",
                 );
             }
         }
@@ -1618,6 +1776,10 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
             println!("  ✗ {label} — {detail}");
         }
     }
+}
+
+fn report_advisory(label: &str, detail: &str) {
+    println!("  ⚠ {label} — {detail}");
 }
 
 fn presentation_cmd(
@@ -2662,7 +2824,7 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
     let task_context = st2::reconcile::TaskCompileContext::current(root.clone())?;
     st2::eval_run::prepare_spawn_env(task_context.st2_executable());
     let mut specs = st2::eval_run::spec_to_agent_specs(&spec.agents, &this_host, &root);
-    st2::reconcile::compile_generated_ding_tasks(&mut specs, &this_host, &task_context)?;
+    st2::reconcile::compile_generated_tasks(&mut specs, &this_host, &task_context)?;
     let runner = SystemRunner::new(root.clone(), exec_state_dir(&this_host));
 
     // One supervisor per (spec dir, host) — the same host-lock discipline as the catalog path.
@@ -2911,11 +3073,15 @@ fn ls(root: &Path) -> Result<()> {
     let _catalog_lock = st2::CatalogLock::shared(root)
         .context("acquire shared catalog-authoring lock for catalog listing")?;
     let found = discover(root);
+    let mut specs = found.specs.clone();
+    let task_context = st2::reconcile::TaskCompileContext::current(root.to_path_buf())?;
+    st2::reconcile::compile_generated_tasks(&mut specs, &detect_host(), &task_context)
+        .context("compile generated tasks for catalog listing")?;
 
-    if found.specs.is_empty() {
+    if specs.is_empty() {
         println!("no specs found under {}", root.display());
     }
-    for spec in &found.specs {
+    for spec in &specs {
         let host = spec.host.as_deref().unwrap_or("<this-host>");
         let kind = match spec.job_type {
             st2::JobType::Service => "service",

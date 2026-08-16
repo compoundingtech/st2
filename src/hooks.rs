@@ -136,21 +136,24 @@ pub fn required_by_codex(
         .any(|spec| required_by_codex_agent(spec, this_host, catalog_root))
 }
 
-/// Whether one local declaration owns a Codex agent task.
+/// Whether one local declaration owns a Codex agent launch.
 pub fn required_by_codex_agent(
     spec: &agent_spec::spec::AgentSpec,
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
     spec.host.as_deref().is_none_or(|host| host == this_host)
-        && spec.tasks.iter().any(|task| {
+        && (matches!(
+            spec.driver.as_ref(),
+            Some(agent_spec::spec::Driver::Codex(_))
+        ) || spec.tasks.iter().any(|task| {
             task.name == "agent"
                 && (task.command.as_deref().is_some_and(command_invokes_codex)
                     || task
                         .argv
                         .as_deref()
                         .is_some_and(|argv| argv_invokes_codex(argv, catalog_root)))
-        })
+        }))
 }
 
 pub(crate) fn launch_invokes_codex(
@@ -170,12 +173,21 @@ fn argv_invokes_codex(argv: &[String], catalog_root: &Path) -> bool {
 }
 
 fn argv_invokes_codex_with(argv: &[String], expand: impl FnOnce(&str) -> String) -> bool {
-    argv.first().is_some_and(|program| {
-        let program = expand(program);
-        Path::new(&program)
-            .file_name()
-            .is_some_and(|name| name == "codex")
-    })
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let program = expand(program);
+    let Some(program) = Path::new(&program).file_name() else {
+        return false;
+    };
+    if program == "codex" {
+        return true;
+    }
+    program == "st2"
+        && argv.get(1).map(String::as_str) == Some("--catalog")
+        && (argv.get(3).map(String::as_str) == Some("codex-app-server")
+            || (argv.get(3).map(String::as_str) == Some("driver")
+                && argv.get(4).map(String::as_str) == Some("codex")))
 }
 
 /// Recognize the exact command shape emitted for Codex agents while accepting an absolute binary
@@ -451,8 +463,37 @@ mod tests {
             &["$CODEX_BIN".into(), "resume".into()],
             |_| "/opt/bin/codex".into()
         ));
+        assert!(argv_invokes_codex(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "codex-app-server".into(),
+            ],
+            root
+        ));
+        assert!(argv_invokes_codex(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "driver".into(),
+                "codex".into(),
+            ],
+            root
+        ));
         assert!(!argv_invokes_codex(&[], root));
         assert!(!argv_invokes_codex(&["codex-wrapper".into()], root));
+        assert!(!argv_invokes_codex(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "driver".into(),
+                "claude-mcp".into(),
+            ],
+            root
+        ));
     }
 
     #[test]

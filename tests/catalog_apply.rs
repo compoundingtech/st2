@@ -2064,6 +2064,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     write_agent(&catalog, "old", false);
+    write_agent(&catalog, "sender", false);
     let old = agent_dir(&catalog, "old");
     fs::create_dir_all(old.join("resources/inbox")).unwrap();
     write_agent(&catalog, "mix.sup", false);
@@ -2191,7 +2192,9 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
             .next()
             .is_some()
     );
-    assert_eq!(fs::read_to_string(old.join("status")).unwrap(), "busy\n");
+    let presence = fs::read_to_string(old.join("status")).unwrap();
+    assert!(presence.starts_with("busy\nv1 "));
+    assert_eq!(presence.lines().count(), 2);
 
     let phantom = send(&catalog, "host.new", "too early");
     assert!(!phantom.status.success());
@@ -2208,6 +2211,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
     assert!(agent_dir(&catalog, "new").join("agent.kdl").is_file());
 
     let dotted = temp.path().join("dotted-catalog");
+    write_agent(&dotted, "sender", false);
     for path in [
         "agents/a/b.c/resources/inbox",
         "agents/a.b/c/resources/inbox",
@@ -2221,6 +2225,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
             "agents/a/b.c/agent.kdl",
             "agents/a.b/c/agent.kdl",
             "agents/a.b/only/agent.kdl",
+            "agents/host/sender/agent.kdl",
         ],
     );
     let ambiguous_qualified = send(&dotted, "a.b.c", "ambiguous qualified");
@@ -2246,6 +2251,7 @@ fn state_remains_addressable_after_its_spec_is_deleted_mid_apply() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     write_agent(&catalog, "old", false);
+    write_agent(&catalog, "sender", false);
     let old = agent_dir(&catalog, "old");
     fs::create_dir_all(old.join("resources/inbox")).unwrap();
     let prepared = temp.path().join("prepared");
@@ -2314,6 +2320,7 @@ fn marker_time_message_write_remains_bound_to_its_retained_agent_capability() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     write_agent(&catalog, "old", false);
+    write_agent(&catalog, "sender", false);
     fs::create_dir_all(agent_dir(&catalog, "old").join("resources/inbox")).unwrap();
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);
@@ -2452,10 +2459,9 @@ fn marker_time_status_write_remains_bound_to_its_retained_agent_capability() {
         "{}",
         String::from_utf8_lossy(&state.stderr)
     );
-    assert_eq!(
-        fs::read_to_string(retained_host.join("old/status")).unwrap(),
-        "busy\n"
-    );
+    let presence = fs::read_to_string(retained_host.join("old/status")).unwrap();
+    assert!(presence.starts_with("busy\nv1 "));
+    assert_eq!(presence.lines().count(), 2);
     assert!(!outside.join("old/status").exists());
     fs::remove_file(catalog.join("agents/host")).unwrap();
     fs::rename(&retained_host, catalog.join("agents/host")).unwrap();

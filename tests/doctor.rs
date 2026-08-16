@@ -361,3 +361,67 @@ fn suspended_declaration_distinguishes_live_dead_keep_and_dead_nonkeep() {
         assert!(!stdout.contains("h.idle presence"), "{stdout}");
     }
 }
+
+#[test]
+fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; command "true" }"#,
+    )
+    .unwrap();
+    fs::write(declaration.parent().unwrap().join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    let missing = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&missing.stdout);
+    assert!(
+        missing.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "⚠ h.worker delivery transport missing — declare `ding`, `deliver`, or a driver block; agent receives no DING"
+        ),
+        "{stdout}"
+    );
+
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; command "true"; deliver "mcp" }"#,
+    )
+    .unwrap();
+    let declared = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&declared.stdout);
+    assert!(declared.status.success(), "{stdout}");
+    assert!(!stdout.contains("delivery transport missing"), "{stdout}");
+
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; claude { prompt "Start work." } }"#,
+    )
+    .unwrap();
+    let driver = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&driver.stdout);
+    assert!(driver.status.success(), "{stdout}");
+    assert!(!stdout.contains("delivery transport missing"), "{stdout}");
+
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; command "true"; deliver "mpc" }"#,
+    )
+    .unwrap();
+    let invalid = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&invalid.stdout);
+    assert!(!invalid.status.success(), "{stdout}");
+    assert!(stdout.contains("unsupported `deliver` value 'mpc'"), "{stdout}");
+}

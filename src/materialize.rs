@@ -235,6 +235,86 @@ pub fn parse_plan(spec: &AgentSpec) -> Result<RenderPlan> {
     }
 }
 
+/// Append render operations from the same pure driver expansion used by the print command.
+fn parse_plan_with_driver(spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
+    let mut plan = parse_plan(spec)?;
+    if spec.driver.is_none() {
+        return Ok(plan);
+    }
+    let expansion = crate::driver::expand_driver(spec, this_host)?;
+    let mut generated = RenderPlan::default();
+    for render in expansion
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == "render")
+    {
+        generated
+            .ops
+            .extend(parse_render_node(render, &spec.identity)?.ops);
+    }
+    resolve_driver_render_executable(&mut generated, &spec.identity)?;
+    plan.ops.extend(generated.ops);
+    Ok(plan)
+}
+
+fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Result<()> {
+    if plan.ops.is_empty() {
+        return Ok(());
+    }
+    let executable = std::env::current_exe()
+        .context("resolving st2 executable for driver materialization")?;
+    for operation in &mut plan.ops {
+        let RenderOp::JsonUpsert {
+            destination,
+            content,
+        } = operation
+        else {
+            continue;
+        };
+        anyhow::ensure!(
+            destination == ".mcp.json",
+            "agent '{agent}' driver expansion produced an unexpected JSON destination"
+        );
+        let mut patch: serde_json::Value = serde_json::from_str(content)?;
+        let command = patch
+            .pointer_mut("/mcpServers/st2/command")
+            .with_context(|| {
+                format!("agent '{agent}' driver expansion has no st2 MCP command")
+            })?;
+        anyhow::ensure!(
+            command.as_str() == Some("st2"),
+            "agent '{agent}' driver expansion has an unexpected st2 MCP command"
+        );
+        *command = serde_json::Value::String(executable.to_string_lossy().into_owned());
+        *content = serde_json::to_string(&patch)?;
+    }
+    Ok(())
+}
+
+/// Add either the typed driver render or the unchanged legacy delivery render.
+fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
+    crate::driver::ensure_single_source(spec)?;
+    let mut plan = parse_plan_with_driver(spec, this_host)?;
+    if spec.driver.is_none()
+        && spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp)
+    {
+        let executable = std::env::current_exe()
+            .context("resolving st2 executable for Claude MCP declaration")?;
+        let content = serde_json::json!({
+            "mcpServers": {"st2": {
+                "type": "stdio",
+                "command": executable.to_string_lossy(),
+                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", spec.bus_id(this_host)]
+            }}
+        }).to_string();
+        plan.ops.push(RenderOp::JsonUpsert {
+            destination: ".mcp.json".into(),
+            content,
+        });
+    }
+    Ok(plan)
+}
+
 /// Catalog-owned files read by this agent's `render { copy ... }` operations.
 ///
 /// Absolute/external sources are deliberately absent: a declaration snapshot owns catalog bytes,
@@ -245,7 +325,7 @@ pub(crate) fn catalog_owned_render_inputs(
     spec: &AgentSpec,
     this_host: &str,
 ) -> Result<Vec<PathBuf>> {
-    let plan = parse_plan(spec)?;
+    let plan = effective_plan(root, spec, this_host)?;
     let env = render_env(root, spec, this_host);
     let spec_dir = spec.path.parent().unwrap_or(root);
     let mut inputs = BTreeSet::new();
@@ -506,7 +586,7 @@ fn claims_for_agent(
     spec: &AgentSpec,
     this_host: &str,
 ) -> Result<BTreeMap<PathBuf, Vec<RenderClaim>>> {
-    let plan = parse_plan(spec)?;
+    let plan = effective_plan(root, spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -618,7 +698,7 @@ pub fn render_ownership_conflicts(
 /// Execute one agent's render plan in declaration order.
 pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
     crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
-    let plan = parse_plan(spec)?;
+    let plan = effective_plan(root, spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(Vec::new());
     }
@@ -822,7 +902,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
 /// Validate an agent's render declaration and all catalog-owned inputs without writing its workspace.
 pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<()> {
     crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
-    let plan = parse_plan(spec)?;
+    let plan = parse_plan_with_driver(spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(());
     }

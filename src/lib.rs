@@ -10,8 +10,12 @@ pub mod agents;
 pub mod catalog;
 pub mod catalog_lock;
 pub mod catalog_transaction;
+pub mod claude_mcp;
+pub mod claude_session;
+pub mod codex_app_server;
 pub mod context;
 pub mod ding;
+pub mod driver;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod exec_backend;
@@ -40,10 +44,12 @@ mod watch;
 // `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
 pub use agent_spec::{discovery, spec};
 
-pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_strict};
+pub use agent_spec::discovery::{
+    Discovered, SpecError, discover, discover_file, discover_strict,
+};
 pub use agent_spec::spec::{
-    AgentDesiredState, AgentSpec, JobType, Resource, Restart, RestartMode, Task, TaskKind,
-    TaskLifecycle, parse_duration,
+    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
+    Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

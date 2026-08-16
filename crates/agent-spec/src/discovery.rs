@@ -76,6 +76,18 @@ pub fn discover_strict(root: &Path) -> Discovered {
     discover_impl(root, true)
 }
 
+/// Parse and lower one declaration file without walking its surrounding catalog.
+///
+/// `root` supplies the same path defaults as [`discover`]. The returned warnings describe only
+/// this file.
+pub fn discover_file(
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
+    let raws = parse_raw_file(path)?;
+    load_specs(root, path, raws)
+}
+
 fn discover_impl(root: &Path, strict: bool) -> Discovered {
     DISCOVERY_WALK_COUNT.set(DISCOVERY_WALK_COUNT.get() + 1);
     let mut out = Discovered::default();

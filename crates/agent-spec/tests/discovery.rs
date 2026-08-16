@@ -8,7 +8,9 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use agent_spec::spec::{TaskKind, TaskLifecycle};
+use agent_spec::spec::{
+    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, TaskKind, TaskLifecycle,
+};
 use agent_spec::{
     AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
 };
@@ -139,10 +141,11 @@ fn lifecycle_fields_make_path_placed_files_agent_candidates() {
 }
 
 #[test]
-fn explicit_json_null_lifecycle_fields_are_rejected_instead_of_granting_running_intent() {
+fn explicit_json_null_fields_are_rejected_instead_of_granting_default_behavior() {
     for (name, lifecycle) in [
         ("null-retired", r#""retired":null"#),
         ("null-state", r#""desired_state":null"#),
+        ("null-deliver", r#""deliver":null"#),
         (
             "null-reason",
             r#""desired_state":"suspended","desired_state_reason":null"#,
@@ -328,6 +331,88 @@ agent "cos" {
         ding.env.get("ST_AGENT").map(String::as_str),
         Some("Silber.cos")
     );
+    assert!(spec.delivery.is_none());
+    assert!(spec.has_delivery_transport());
+}
+
+#[test]
+fn deliver_is_typed_without_lowering_to_the_legacy_ding_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/claude/agent.kdl",
+        r#"agent "claude" { host "h"; command "claude"; deliver "mcp" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex/agent.kdl",
+        r#"agent "codex" { host "h"; command "codex"; deliver "app-server" }"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let claude = find(&found.specs, "claude");
+    let codex = find(&found.specs, "codex");
+    assert_eq!(claude.delivery, Some(DeliveryTransport::Mcp));
+    assert_eq!(codex.delivery, Some(DeliveryTransport::AppServer));
+    assert_eq!(claude.delivery.unwrap().as_str(), "mcp");
+    assert_eq!(codex.delivery.unwrap().as_str(), "app-server");
+    for spec in [claude, codex] {
+        assert!(spec.has_delivery_transport());
+        assert_eq!(spec.tasks.len(), 1);
+        assert!(spec.tasks.iter().all(|task| !task.derived));
+    }
+}
+
+#[test]
+fn deliver_rejects_unknown_duplicate_mixed_and_malformed_declarations() {
+    for (name, declaration, expected) in [
+        (
+            "unknown",
+            r#"agent "worker" { command "true"; deliver "socket" }"#,
+            "unsupported `deliver` value 'socket'",
+        ),
+        (
+            "duplicate",
+            r#"agent "worker" { command "true"; deliver "mcp"; deliver "app-server" }"#,
+            "declares `deliver` more than once",
+        ),
+        (
+            "mixed",
+            r#"agent "worker" { command "true"; ding; deliver "mcp" }"#,
+            "declares both `ding` and `deliver`",
+        ),
+        (
+            "missing",
+            r#"agent "worker" { command "true"; deliver }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "non-string",
+            r#"agent "worker" { command "true"; deliver #true }"#,
+            "value must be a string",
+        ),
+        (
+            "property",
+            r#"agent "worker" { command "true"; deliver "mcp" mode="extra" }"#,
+            "must contain exactly one positional string",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            declaration,
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: expected {expected:?}, got {:?}",
+            found.errors[0]
+        );
+    }
 }
 
 #[test]
@@ -460,6 +545,138 @@ argv = ["claude", "--resume", "session id"]
         argv(&find(&found.specs, "json").tasks[0]),
         ["codex", "resume", "abc"]
     );
+}
+
+#[test]
+fn typed_driver_blocks_lower_with_kdl_toml_and_json_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/claude-kdl/agent.kdl",
+        r#"agent "claude-kdl" {
+  claude {
+    model "opus"
+    effort "xhigh"
+    dev-channels #true
+    prompt "Start the assigned work."
+    args "--permission-mode" "bypassPermissions"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/claude-toml/agent.toml",
+        r#"identity = "claude-toml"
+
+[claude]
+model = "opus"
+effort = "xhigh"
+dev-channels = true
+prompt = "Start the assigned work."
+args = ["--permission-mode", "bypassPermissions"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/claude-json/agent.json",
+        r#"{
+  "identity": "claude-json",
+  "claude": {
+    "model": "opus",
+    "effort": "xhigh",
+    "dev-channels": true,
+    "prompt": "Start the assigned work.",
+    "args": ["--permission-mode", "bypassPermissions"]
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-kdl/agent.kdl",
+        r#"agent "codex-kdl" {
+  codex {
+    model "gpt-5.6-sol"
+    effort "xhigh"
+    prompt "Start the assigned work."
+    args "--dangerously-bypass-approvals-and-sandbox"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-toml/agent.toml",
+        r#"identity = "codex-toml"
+
+[codex]
+model = "gpt-5.6-sol"
+effort = "xhigh"
+prompt = "Start the assigned work."
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-json/agent.json",
+        r#"{
+  "identity": "codex-json",
+  "codex": {
+    "model": "gpt-5.6-sol",
+    "effort": "xhigh",
+    "prompt": "Start the assigned work.",
+    "args": ["--dangerously-bypass-approvals-and-sandbox"]
+  }
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let claude = Driver::Claude(ClaudeDriver {
+        model: Some("opus".into()),
+        effort: Some("xhigh".into()),
+        dev_channels: true,
+        prompt: "Start the assigned work.".into(),
+        args: vec!["--permission-mode".into(), "bypassPermissions".into()],
+    });
+    for identity in ["claude-kdl", "claude-toml", "claude-json"] {
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.driver.as_ref(), Some(&claude));
+        assert!(!spec.is_runnable());
+    }
+    let codex = Driver::Codex(CodexDriver {
+        model: Some("gpt-5.6-sol".into()),
+        effort: Some("xhigh".into()),
+        prompt: "Start the assigned work.".into(),
+        args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+    });
+    for identity in ["codex-kdl", "codex-toml", "codex-json"] {
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.driver.as_ref(), Some(&codex));
+        assert!(!spec.is_runnable());
+    }
+}
+
+#[test]
+fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
+    for (name, body) in [
+        (
+            "both",
+            r#"claude { prompt "go" }; codex { prompt "go" }"#,
+        ),
+        ("missing-prompt", r#"claude { model "opus" }"#),
+        ("wrong-bool", r#"claude { dev-channels "yes"; prompt "go" }"#),
+        ("codex-dev", r#"codex { dev-channels #true; prompt "go" }"#),
+        ("unknown", r#"claude { presence #true; prompt "go" }"#),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!("agent \"{name}\" {{ {body} }}"),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "accepted {name}");
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+    }
 }
 
 #[test]

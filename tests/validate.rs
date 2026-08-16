@@ -178,6 +178,31 @@ fn shared_workspace_render_conflict_is_an_error() {
 // ---- errors ----------------------------------------------------------------------------------
 
 #[test]
+fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  deliver "app-server"
+  claude { prompt "Start work." }
+  argv "claude" "Start work."
+}"#,
+    )]);
+
+    let report = validate(c.path());
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "driver-deliver-conflict")
+        .unwrap();
+    assert_eq!(issue.severity, Severity::Error);
+    assert_eq!(
+        issue.message,
+        "agent 'worker' declares both a driver block and `deliver`; choose one launch source"
+    );
+}
+
+#[test]
 fn type_batch_is_retired_and_flagged_unknown() {
     // `type = batch` is retired (native `st2 eval` replaces it) — a lingering batch spec is now an
     // unknown type, not a silently-accepted service.
@@ -392,6 +417,44 @@ fn an_unrendered_service_is_not_runnable() {
 }
 
 #[test]
+fn fleet_validation_compiles_remote_driver_launches() {
+    let c = catalog(&[(
+        "Silber/worker/agent.kdl",
+        r#"agent "worker" {
+  host "Silber"
+  workspace "/tmp"
+  claude { prompt "boot" }
+}"#,
+    )]);
+    let found = st2::discover(c.path());
+    assert!(!found.specs[0].is_runnable());
+
+    for report in [validate(c.path()), validate_for_host(c.path(), "droppy")] {
+        assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
+        assert_eq!(report.warnings(), 0, "unexpected issues: {:?}", report.issues);
+    }
+}
+
+#[test]
+fn validation_reports_shared_task_compiler_errors() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  workspace "/tmp"
+  command "codex"
+  deliver "app-server"
+}"#,
+    )]);
+
+    assert!(has(
+        &validate_for_host(c.path(), "h"),
+        "launch-compile-error",
+        Severity::Error
+    ));
+}
+
+#[test]
 fn a_generated_ding_sidecar_is_not_authored_runnable_work() {
     let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; ding }"#)]);
     assert!(has(&validate(c.path()), "not-runnable", Severity::Error));
@@ -411,6 +474,32 @@ fn ls_marks_a_generated_ding_only_agent_as_unrendered() {
         String::from_utf8_lossy(&output.stdout).contains("[UNRENDERED: no task launch]"),
         "stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn ls_compiles_driver_launches_before_display() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" { host "h"; claude { prompt "boot" } }"#,
+    )]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(c.path())
+        .arg("ls")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("UNRENDERED"), "{stdout}");
+    assert!(
+        stdout.contains(r#""driver", "claude-session""#)
+            && stdout.contains(r#""--", "claude", "boot"]"#),
+        "{stdout}"
     );
 }
 

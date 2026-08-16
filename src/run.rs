@@ -32,7 +32,7 @@ use crate::flapping::FlappingCap;
 use crate::message;
 use crate::reconcile::{
     PtyPresentation, ReconcilePlan, Session, TaskCompileContext, TaskLaunch, TaskTarget,
-    compile_generated_ding_tasks,
+    compile_generated_tasks,
 };
 use crate::task_inventory::{
     DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
@@ -1514,11 +1514,11 @@ fn reconcile_pass(
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
         .collect();
-    if let Err(error) = compile_generated_ding_tasks(&mut eligible_specs, this_host, task_context) {
+    if let Err(error) = compile_generated_tasks(&mut eligible_specs, this_host, task_context) {
         report.skipped = true;
         report
             .errors
-            .push(format!("compile generated DING tasks (pass skipped): {error:#}"));
+            .push(format!("compile generated tasks (pass skipped): {error:#}"));
         return report;
     }
 
@@ -1795,7 +1795,7 @@ where
     crate::reconcile::validate_task_identities(specs, this_host)?;
     let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?;
     let mut compiled_specs = specs.to_vec();
-    compile_generated_ding_tasks(&mut compiled_specs, this_host, &task_context)?;
+    compile_generated_tasks(&mut compiled_specs, this_host, &task_context)?;
     let sessions = runner
         .list_sessions()
         .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
@@ -2280,6 +2280,8 @@ mod tests {
             desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
+            delivery: None,
+            driver: None,
             resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
@@ -2329,6 +2331,8 @@ mod tests {
             desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
+            delivery: None,
+            driver: None,
             resources: vec![],
             tasks: vec![Task {
                 kind: TaskKind::Pty,
@@ -2585,6 +2589,8 @@ mod tests {
             desired_state: crate::AgentDesiredState::Running,
             keep: false,
             restart: None,
+            delivery: None,
+            driver: None,
             resources: vec![],
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),

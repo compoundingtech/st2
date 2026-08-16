@@ -868,7 +868,7 @@ impl SessionWatch {
 pub struct DingConfig {
     /// Fallback poll cadence and liveness-check cadence.
     pub poll: Duration,
-    /// Presence mtime refresh cadence while the target session is alive.
+    /// Presence refresh cadence while the target session is alive.
     pub status_refresh: Duration,
 }
 
@@ -3207,10 +3207,15 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert_eq!(pending.len(), 1, "fresh dnd suppresses delivery");
 
         let stale = std::time::SystemTime::now() - status::STATUS_STALE - Duration::from_secs(1);
-        std::fs::File::open(&status_path)
+        let stale_ms = stale
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .set_modified(stale)
-            .unwrap();
+            .as_millis();
+        std::fs::write(
+            &status_path,
+            format!("dnd\nv1 {stale_ms}\n"),
+        )
+        .unwrap();
         flush_without_catalog(Some(&status_path), &mut pending, &poker);
         assert!(
             pending.is_empty(),

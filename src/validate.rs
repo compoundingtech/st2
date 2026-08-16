@@ -124,6 +124,18 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let d = discover(root);
     let mut issues = Vec::new();
+    let task_context = match crate::reconcile::TaskCompileContext::current(root.to_path_buf()) {
+        Ok(context) => Some(context),
+        Err(error) => {
+            issues.push(Issue::error(
+                "launch-compile-error",
+                ".".to_string(),
+                None,
+                format!("cannot prepare generated task compilation: {error:#}"),
+            ));
+            None
+        }
+    };
 
     // 1. Files that looked like specs but did not parse/resolve — discovery already caught these.
     for e in &d.errors {
@@ -204,6 +216,17 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
             Some(host) => s.resolved_host(host) == host,
             None => true,
         };
+        let compiled = task_context.as_ref().map(|context| {
+            let mut compiled = s.clone();
+            let compile_host = this_host.or(s.host.as_deref()).unwrap_or("");
+            crate::reconcile::compile_generated_tasks(
+                std::slice::from_mut(&mut compiled),
+                compile_host,
+                context,
+            )
+            .map(|()| compiled)
+            .map_err(|error| format!("{error:#}"))
+        });
 
         // Duplicate bus id — the runner cannot run two agents under one <host>.<identity>.
         let bid = s.bus_id(collision_host);
@@ -218,6 +241,15 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
                     rel(root, &prev)
                 ),
             ));
+        }
+
+        if let Some(Err(error)) = &compiled {
+            let code = if s.driver.is_some() && s.delivery.is_some() {
+                "driver-deliver-conflict"
+            } else {
+                "launch-compile-error"
+            };
+            issues.push(Issue::error(code, rp.clone(), ag.clone(), error.clone()));
         }
 
         // An explicit identity+host pair is authoritative regardless of folder names. When either
@@ -254,7 +286,10 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
 
         // A rendered service agent must be runnable. Batch jobs legitimately carry no pty/exec tasks
         // (their work is in stages/run) — never flag them here.
-        if s.job_type == JobType::Service && !s.is_runnable() {
+        if let Some(Ok(compiled)) = &compiled
+            && s.job_type == JobType::Service
+            && !compiled.is_runnable()
+        {
             issues.push(Issue::error(
                 "not-runnable",
                 rp.clone(),
