@@ -235,7 +235,6 @@ mod tests {
         resource_row.resources.push(
             Resource::new(
                 "work".into(),
-                "vendor-specific-type".into(),
                 "vendor+thing://authority/exact%20identity".into(),
             )
             .unwrap(),
@@ -243,7 +242,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","_tag":"vendor-specific-type","uri":"vendor+thing://authority/exact%20identity"}],"desiredState":"running","desiredStateReason":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity"}],"desiredState":"running","desiredStateReason":null}]"#
         );
     }
 }

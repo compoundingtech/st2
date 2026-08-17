@@ -713,7 +713,6 @@ fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
     spec.resources.push(
         Resource::new(
             "work".into(),
-            "github-issue".into(),
             "github-issue://example/project/41".into(),
         )
         .unwrap(),

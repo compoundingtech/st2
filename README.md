@@ -151,7 +151,7 @@ The compact declaration shape is:
 agent "<identity>" {
   host "<host>"
   workspace "<workspace>"
-  resource "work" _tag="github-issue" uri="github-issue://example/project/123"
+  resource "work" uri="github-issue://example/project/123"
   // Optional metadata:
   // role "worker"
   // supervisor "<supervisor-bus-id>"
@@ -208,22 +208,22 @@ derived DING without deleting its declaration, inbox, context, or Resources.
 Resume uses ordinary `service`, `adopt-only`, and `keep` behavior. Nix-owned
 declarations must be changed at their Nix source.
 
-`resource` binds an agent-local semantic name to an exact RFC 3986 absolute URI. `_tag` selects a
-concrete resource contract understood by downstream readers; st2 preserves arbitrary non-empty tags
-and URI bytes without normalization. It neither owns their schemas nor resolves their targets.
+`resource` binds an agent-local semantic name to an exact RFC 3986 absolute URI. The URI scheme
+selects an open, downstream-owned Resource profile; st2 preserves URI bytes without normalization.
+It neither registers schemes, owns profile schemas, nor resolves targets.
 Binding order is irrelevant and names must be unique within the agent:
 
 ```kdl
-resource "work" _tag="github-issue" uri="github-issue://example/project/123"
-resource "source" _tag="worktree" uri="worktree://github.com/example/project/change"
-resource "delivery" _tag="ding" uri="ding://host/agent"
+resource "work" uri="github-issue://example/project/123"
+resource "source" uri="worktree://github.com/example/project/change"
+resource "delivery" uri="ding://host/agent"
 ```
 
-The envelope is intentionally only `name` + `_tag` + `uri`. It carries no required/optional,
+The envelope is intentionally only `name` + `uri`. It carries no required/optional,
 access, readiness, or lifecycle policy, and URI possession conveys no authority. A Resource URI may
 be referenced by any number of agent declarations. Resource-only declaration edits do not stop,
-replace, or relaunch a live task. Resource types and resolvers remain opaque to st2; catalog readers
-use the public `agent-spec` crate to inspect the typed bindings.
+replace, or relaunch a live task. Resource profiles and resolvers remain opaque to st2; catalog
+readers use the public `agent-spec` crate to inspect the bindings.
 
 The positional agent value is the stable automation identity. Optional `name` and `description`
 fields are presentation only; they never route messages, select tasks, or rename durable state.

@@ -250,9 +250,9 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::workspace`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [`cwd` resolution](../../../src/run.rs).
 
-<h3 id="f07">F07 Resource <code>name</code>, <code>_tag</code>, or <code>uri</code></h3>
+<h3 id="f07">F07 Resource <code>name</code> or <code>uri</code></h3>
 
-Update typed Resource data without changing the launch fingerprint. Notify a
+Update Resource data without changing the launch fingerprint. Notify a
 survivor once after commit. New or replaced work reads the latest state at boot
 and gets no change notification.
 

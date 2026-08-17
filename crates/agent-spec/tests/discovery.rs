@@ -822,15 +822,15 @@ fn presentation_parser_rejects_unicode_line_and_paragraph_separators() {
 }
 
 #[test]
-fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
+fn named_resource_bindings_are_uri_identities_and_order_independent() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
         "agents/h/kdl/agent.kdl",
         r#"agent "kdl" {
   host "h"
-  resource "source" _tag="worktree" uri="worktree://github.com/example/project/main" relation="uses" reason="Primary checkout."
-  resource "work" _tag="github-issue" uri="github-issue://example/project/41" relation="current-work" reason="Current implementation task."
+  resource "source" uri="worktree://github.com/example/project/main" relation="uses" reason="Primary checkout."
+  resource "work" uri="github-issue://example/project/41" relation="current-work" reason="Current implementation task."
   command "true"
 }"#,
     );
@@ -841,8 +841,8 @@ fn named_resource_bindings_are_typed_uri_identities_and_order_independent() {
   "identity": "json",
   "host": "h",
   "resource": {
-    "work": {"_tag": "github-issue", "uri": "github-issue://example/project/41", "relation": "current-work", "reason": "Current implementation task."},
-    "source": {"_tag": "worktree", "uri": "worktree://github.com/example/project/main", "relation": "uses", "reason": "Primary checkout."}
+    "work": {"uri": "github-issue://example/project/41", "relation": "current-work", "reason": "Current implementation task."},
+    "source": {"uri": "worktree://github.com/example/project/main", "relation": "uses", "reason": "Primary checkout."}
   },
   "command": "true"
 }"#,
@@ -855,13 +855,11 @@ host = "h"
 command = "true"
 
 [resource.work]
-_tag = "github-issue"
 uri = "github-issue://example/project/41"
 relation = "current-work"
 reason = "Current implementation task."
 
 [resource.source]
-_tag = "worktree"
 uri = "worktree://github.com/example/project/main"
 relation = "uses"
 reason = "Primary checkout."
@@ -873,7 +871,6 @@ reason = "Primary checkout."
     let expected = vec![
         Resource::new_with_relation_reason(
             "source".into(),
-            "worktree".into(),
             "worktree://github.com/example/project/main".into(),
             "uses".into(),
             "Primary checkout.".into(),
@@ -881,7 +878,6 @@ reason = "Primary checkout."
         .unwrap(),
         Resource::new_with_relation_reason(
             "work".into(),
-            "github-issue".into(),
             "github-issue://example/project/41".into(),
             "current-work".into(),
             "Current implementation task.".into(),
@@ -895,7 +891,7 @@ reason = "Primary checkout."
     let json = serde_json::to_string(&expected).unwrap();
     assert_eq!(
         json,
-        r#"[{"name":"source","_tag":"worktree","uri":"worktree://github.com/example/project/main","relation":"uses","reason":"Primary checkout."},{"name":"work","_tag":"github-issue","uri":"github-issue://example/project/41","relation":"current-work","reason":"Current implementation task."}]"#
+        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","relation":"uses","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","relation":"current-work","reason":"Current implementation task."}]"#
     );
     assert_eq!(
         serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
@@ -904,23 +900,18 @@ reason = "Primary checkout."
 }
 
 #[test]
-fn legacy_resources_remain_compatible_and_relation_reason_are_an_optional_pair() {
-    let legacy = Resource::new(
-        "source".into(),
-        "worktree".into(),
-        "worktree://example/project".into(),
-    )
-    .unwrap();
-    assert_eq!(legacy.relation(), None);
-    assert_eq!(legacy.reason(), None);
+fn resources_without_context_remain_valid_and_relation_reason_are_an_optional_pair() {
+    let resource = Resource::new("source".into(), "worktree://example/project".into()).unwrap();
+    assert_eq!(resource.relation(), None);
+    assert_eq!(resource.reason(), None);
     assert_eq!(
-        serde_json::to_string(&legacy).unwrap(),
-        r#"{"name":"source","_tag":"worktree","uri":"worktree://example/project"}"#
+        serde_json::to_string(&resource).unwrap(),
+        r#"{"name":"source","uri":"worktree://example/project"}"#
     );
 
     for descriptor in [
-        r#"{"name":"work","_tag":"issue","uri":"issue://one","relation":"uses"}"#,
-        r#"{"name":"work","_tag":"issue","uri":"issue://one","reason":"Needed here."}"#,
+        r#"{"name":"work","uri":"issue://one","relation":"uses"}"#,
+        r#"{"name":"work","uri":"issue://one","reason":"Needed here."}"#,
     ] {
         assert!(
             serde_json::from_str::<Resource>(descriptor).is_err(),
@@ -960,7 +951,7 @@ fn malformed_relation_and_reason_values_are_rejected_causally() {
             tmp.path(),
             &format!("agents/h/{identity}/agent.kdl"),
             &format!(
-                "agent \"{identity}\" {{\n  host \"h\"\n  resource \"work\" _tag=\"issue\" uri=\"issue://one\"{relation}{reason}\n  command \"true\"\n}}"
+                "agent \"{identity}\" {{\n  host \"h\"\n  resource \"work\" uri=\"issue://one\"{relation}{reason}\n  command \"true\"\n}}"
             ),
         );
     }
@@ -1005,7 +996,6 @@ fn relation_and_reason_byte_bounds_are_enforced() {
     assert!(
         Resource::new_with_relation_reason(
             "work".into(),
-            "issue".into(),
             "issue://one".into(),
             valid_relation,
             valid_reason,
@@ -1015,7 +1005,6 @@ fn relation_and_reason_byte_bounds_are_enforced() {
     assert!(
         Resource::new_with_relation_reason(
             "work".into(),
-            "issue".into(),
             "issue://one".into(),
             too_long_relation,
             "Needed here.".into(),
@@ -1025,7 +1014,6 @@ fn relation_and_reason_byte_bounds_are_enforced() {
     assert!(
         Resource::new_with_relation_reason(
             "work".into(),
-            "issue".into(),
             "issue://one".into(),
             "uses".into(),
             multibyte_too_long_reason,
@@ -1040,22 +1028,25 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
     for (identity, resource) in [
         (
             "duplicate",
-            r#"resource "work" _tag="issue" uri="issue://one"
-  resource "work" _tag="pull-request" uri="pull-request://two""#,
+            r#"resource "work" uri="issue://one"
+  resource "work" uri="pull-request://two""#,
         ),
-        ("missing-tag", r#"resource "work" uri="issue://example/1""#),
-        ("missing-uri", r#"resource "work" _tag="issue""#),
+        (
+            "unexpected-tag",
+            r#"resource "work" _tag="issue" uri="issue://example/1""#,
+        ),
+        ("missing-uri", r#"resource "work""#),
         (
             "relative-uri",
-            r#"resource "work" _tag="issue" uri="./issue/1""#,
+            r#"resource "work" uri="./issue/1""#,
         ),
         (
             "policy",
-            r#"resource "work" _tag="issue" uri="issue://example/1" required=#true"#,
+            r#"resource "work" uri="issue://example/1" required=#true"#,
         ),
         (
             "payload",
-            r#"resource "work" _tag="issue" uri="issue://example/1" { token "secret" }"#,
+            r#"resource "work" uri="issue://example/1" { token "secret" }"#,
         ),
     ] {
         write(
@@ -1081,7 +1072,7 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("needs string `_tag`"))
+            .any(|error| error.contains("unsupported property `_tag`"))
     );
     assert!(
         errors
@@ -1111,8 +1102,8 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
   "identity": "dup",
   "command": "true",
   "resource": {
-    "work": {"_tag": "issue", "uri": "issue://one"},
-    "work": {"_tag": "issue", "uri": "issue://two"}
+    "work": {"uri": "issue://one"},
+    "work": {"uri": "issue://two"}
   }
 }"#,
     );
@@ -1129,10 +1120,10 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
 #[test]
 fn public_resource_json_deserialization_enforces_the_catalog_invariants() {
     for descriptor in [
-        r#"{"name":"","_tag":"issue","uri":"issue://one"}"#,
-        r#"{"name":"work","_tag":"","uri":"issue://one"}"#,
-        r#"{"name":"work","_tag":"issue","uri":"./relative"}"#,
-        r#"{"name":"work","_tag":"issue","uri":"issue://one","required":true}"#,
+        r#"{"name":"","uri":"issue://one"}"#,
+        r#"{"name":"work","uri":"./relative"}"#,
+        r#"{"name":"work","uri":"issue://one","_tag":"issue"}"#,
+        r#"{"name":"work","uri":"issue://one","required":true}"#,
     ] {
         assert!(
             serde_json::from_str::<Resource>(descriptor).is_err(),
@@ -1149,7 +1140,7 @@ fn forbidden_raw_uri_characters_are_rejected_across_declaration_formats() {
         "agents/h/kdl/agent.kdl",
         r##"agent "kdl" {
   command "true"
-  resource "work" _tag="opaque" uri=#"thing://bad\slash"#
+  resource "work" uri=#"thing://bad\slash"#
 }"##,
     );
     write(
@@ -1158,7 +1149,7 @@ fn forbidden_raw_uri_characters_are_rejected_across_declaration_formats() {
         r#"{
   "identity": "json",
   "command": "true",
-  "resource": {"work": {"_tag": "opaque", "uri": "thing://bad<left"}}
+  "resource": {"work": {"uri": "thing://bad<left"}}
 }"#,
     );
     write(
@@ -1168,7 +1159,6 @@ fn forbidden_raw_uri_characters_are_rejected_across_declaration_formats() {
 command = "true"
 
 [resource.work]
-_tag = "opaque"
 uri = 'thing://bad"quote'
 "#,
     );

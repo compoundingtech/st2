@@ -72,7 +72,7 @@ fn opaque_resource_bindings_are_structurally_valid() {
         "Silber/cos/agent.kdl",
         r#"agent "cos" {
   host "Silber"
-  resource "work" _tag="vendor-specific-type" uri="vendor+thing://authority/exact%20identity"
+  resource "work" uri="vendor+thing://authority/exact%20identity"
   command "codex"
 }"#,
     )]);
@@ -88,7 +88,7 @@ fn active_agents_may_share_an_opaque_resource_uri() {
             "h/reviewer/agent.kdl",
             r#"agent "reviewer" {
   host "h"
-  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  resource "subject" uri="git-commit://github.com/example/project/0123456789abcdef"
   command "true"
 }"#,
         ),
@@ -96,7 +96,7 @@ fn active_agents_may_share_an_opaque_resource_uri() {
             "h/integrator/agent.kdl",
             r#"agent "integrator" {
   host "h"
-  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  resource "subject" uri="git-commit://github.com/example/project/0123456789abcdef"
   command "true"
 }"#,
         ),
@@ -114,7 +114,7 @@ fn duplicate_bus_ids_remain_an_error_when_resources_are_shared() {
             "h/one/agent.kdl",
             r#"agent "worker" {
   host "h"
-  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  resource "subject" uri="git-commit://github.com/example/project/0123456789abcdef"
   command "true"
 }"#,
         ),
@@ -122,7 +122,7 @@ fn duplicate_bus_ids_remain_an_error_when_resources_are_shared() {
             "h/two/agent.kdl",
             r#"agent "worker" {
   host "h"
-  resource "subject" _tag="git-commit" uri="git-commit://github.com/example/project/0123456789abcdef"
+  resource "subject" uri="git-commit://github.com/example/project/0123456789abcdef"
   command "true"
 }"#,
         ),
@@ -138,7 +138,7 @@ fn an_invalid_resource_binding_is_a_parse_error() {
         "Silber/cos/agent.kdl",
         r#"agent "cos" {
   host "Silber"
-  resource "work" _tag="github-issue" uri="not-an-absolute-uri"
+  resource "work" uri="not-an-absolute-uri"
   command "codex"
 }"#,
     )]);
