@@ -175,13 +175,12 @@ pub struct AgentSpec {
 
 /// One agent-local semantic binding to an externally identified resource.
 ///
-/// `name` is the role the resource plays for this agent, `tag` selects the downstream resource
-/// contract, and `uri` is the exact absolute identity. The envelope deliberately carries no policy.
+/// `name` is the role the resource plays for this agent and `uri` is the exact absolute identity.
+/// The URI scheme selects the downstream resource profile. The envelope deliberately carries no
+/// policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Resource {
     name: String,
-    #[serde(rename = "_tag")]
-    tag: String,
     uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     relation: Option<String>,
@@ -193,8 +192,6 @@ pub struct Resource {
 #[serde(deny_unknown_fields)]
 struct ResourceDescriptor {
     name: String,
-    #[serde(rename = "_tag")]
-    tag: String,
     uri: String,
     relation: Option<String>,
     reason: Option<String>,
@@ -202,19 +199,15 @@ struct ResourceDescriptor {
 
 impl Resource {
     /// Construct a descriptor after enforcing the same invariants as catalog parsing.
-    pub fn new(name: String, tag: String, uri: String) -> Result<Self, String> {
+    pub fn new(name: String, uri: String) -> Result<Self, String> {
         if name.is_empty() {
             return Err("resource binding name cannot be empty".into());
-        }
-        if tag.is_empty() {
-            return Err(format!("resource binding '{name}' has an empty `_tag`"));
         }
         validate_absolute_uri(&uri).map_err(|reason| {
             format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
         })?;
         Ok(Self {
             name,
-            tag,
             uri,
             relation: None,
             reason: None,
@@ -224,12 +217,11 @@ impl Resource {
     /// Construct a descriptor with an explicit semantic relation and human-facing rationale.
     pub fn new_with_relation_reason(
         name: String,
-        tag: String,
         uri: String,
         relation: String,
         reason: String,
     ) -> Result<Self, String> {
-        let mut resource = Self::new(name, tag, uri)?;
+        let mut resource = Self::new(name, uri)?;
         validate_relation_reason(&resource.name, &relation, &reason)?;
         resource.relation = Some(relation);
         resource.reason = Some(reason);
@@ -238,10 +230,6 @@ impl Resource {
 
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    pub fn tag(&self) -> &str {
-        &self.tag
     }
 
     pub fn uri(&self) -> &str {
@@ -264,10 +252,9 @@ impl<'de> Deserialize<'de> for Resource {
     {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
         let resource = match (descriptor.relation, descriptor.reason) {
-            (None, None) => Self::new(descriptor.name, descriptor.tag, descriptor.uri),
+            (None, None) => Self::new(descriptor.name, descriptor.uri),
             (Some(relation), Some(reason)) => Self::new_with_relation_reason(
                 descriptor.name,
-                descriptor.tag,
                 descriptor.uri,
                 relation,
                 reason,
@@ -525,8 +512,6 @@ pub(crate) struct RawResources(BTreeMap<String, RawResource>);
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawResource {
-    #[serde(rename = "_tag")]
-    pub(crate) tag: String,
     pub(crate) uri: String,
     pub(crate) relation: Option<String>,
     pub(crate) reason: Option<String>,
@@ -590,9 +575,9 @@ impl RawResources {
             .into_iter()
             .map(|(name, resource)| {
                 match (resource.relation, resource.reason) {
-                    (None, None) => Resource::new(name, resource.tag, resource.uri),
+                    (None, None) => Resource::new(name, resource.uri),
                     (Some(relation), Some(reason)) => Resource::new_with_relation_reason(
-                        name, resource.tag, resource.uri, relation, reason,
+                        name, resource.uri, relation, reason,
                     ),
                     (Some(_), None) => Err(format!(
                         "resource binding '{name}' with `relation` must also declare string `reason`"

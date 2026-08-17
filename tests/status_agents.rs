@@ -23,7 +23,7 @@ fn write(root: &Path, rel: &str, contents: &str) {
 fn agent_kdl(identity: &str, host: &str) -> String {
     format!(
         "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{host}\"\n  \
-         type \"service\"\n  resource \"work\" _tag=\"vendor-specific\" uri=\"issue://example/{identity}\"\n  \
+         type \"service\"\n  resource \"work\" uri=\"issue://example/{identity}\"\n  \
          pty \"agent\" {{ command \"exec claude boot\" }}\n}}\n"
     )
 }
@@ -218,7 +218,6 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         rows[0]["resources"],
         serde_json::json!([{
             "name": "work",
-            "_tag": "vendor-specific",
             "uri": "issue://example/live"
         }])
     );

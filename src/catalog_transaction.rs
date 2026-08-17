@@ -675,12 +675,6 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         let root = format!("{base}/resources/{}", pointer_segment(resource.name()));
         insert_value(
             &mut fields,
-            &format!("{root}/_tag"),
-            SemanticType::String,
-            resource.tag(),
-        );
-        insert_value(
-            &mut fields,
             &format!("{root}/uri"),
             SemanticType::String,
             resource.uri(),

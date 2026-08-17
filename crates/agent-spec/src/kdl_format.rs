@@ -334,7 +334,6 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
     }
 
     let mut name = None;
-    let mut tag = None;
     let mut uri = None;
     let mut relation = None;
     let mut reason = None;
@@ -352,15 +351,6 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
 
         let value = entry.value.as_str().map(String::from);
         match property {
-            "_tag" => {
-                if tag.is_some() {
-                    anyhow::bail!("resource binding has duplicate `_tag`");
-                }
-                tag = value;
-                if tag.is_none() {
-                    anyhow::bail!("resource binding needs string `_tag`");
-                }
-            }
             "uri" => {
                 if uri.is_some() {
                     anyhow::bail!("resource binding has duplicate `uri`");
@@ -395,7 +385,6 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
     Ok((
         name.ok_or_else(|| anyhow::anyhow!("resource binding needs a string name"))?,
         RawResource {
-            tag: tag.ok_or_else(|| anyhow::anyhow!("resource binding needs string `_tag`"))?,
             uri: uri.ok_or_else(|| anyhow::anyhow!("resource binding needs string `uri`"))?,
             relation,
             reason,
