@@ -1,0 +1,19 @@
+[   0.001] spawned: claude --permission-mode bypassPermissions (hook log at 0 lines)
+[   1.654] SCREEN bypassPermissions warning -> accepting (option 2)
+[   3.455] HOOK SessionStart source="startup"
+[   5.110] SCREEN composer ready (footer seen) -> submitting prompt
+[   5.110] PROMPT: Use the Bash tool to run exactly: curl -sS https://example.com/st2-probe
+[   5.981] HOOK UserPromptSubmit
+[   5.991] SCREEN spinner ON (turn in flight)
+[   8.125] HOOK PreToolUse tool_name="Bash"
+[   8.238] HOOK MessageDisplay
+[   8.382] HOOK PostToolUse tool_name="Bash"
+[   8.554] HOOK PostToolBatch
+[  10.665] HOOK MessageDisplay
+[  11.383] HOOK MessageDisplay
+[  11.411] HOOK Stop
+[  13.151] HOOK SubagentStop
+[  71.499] HOOK Notification message="Claude is waiting for your input" notification_type="idle_prompt"
+[  95.040] === driver finished main loop; sending /exit ===
+[  95.750] HOOK SessionEnd reason="prompt_input_exit"
+[  97.874] done

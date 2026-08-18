@@ -1,0 +1,21 @@
+[   0.001] spawned: claude --permission-mode manual (hook log at 0 lines)
+[   0.765] HOOK SessionStart source="startup"
+[   5.057] SCREEN composer ready (footer seen) -> submitting prompt
+[   5.057] PROMPT: Use the Bash tool to run exactly: curl -sS https://example.com/st2-probe
+[   5.892] HOOK UserPromptSubmit
+[   5.897] SCREEN spinner ON (turn in flight)
+[   8.061] HOOK PreToolUse tool_name="Bash"
+[   8.067] HOOK PermissionRequest tool_name="Bash"
+[   8.067] HOOK MessageDisplay
+[   8.068] *** SCREEN: PERMISSION PROMPT VISIBLE — Claude is BLOCKED ON A HUMAN ***
+[   8.068] *** sitting here 30.0s WITHOUT answering; watching for any hook ***
+[  14.097] HOOK Notification message="Claude needs your permission" notification_type="permission_prompt"
+[  38.176] *** 30.0s blocked, no answer given. Now answering: option 2 (deny) ***
+[  38.576] HOOK PostToolUse tool_name="Bash"
+[  38.576] HOOK PostToolBatch
+[  40.626] HOOK MessageDisplay
+[  40.626] HOOK Stop
+[  42.314] HOOK SubagentStop
+[  63.082] === driver finished main loop; sending /exit ===
+[  63.787] HOOK SessionEnd reason="prompt_input_exit"
+[  65.864] done

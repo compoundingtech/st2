@@ -1,0 +1,17 @@
+[   0.001] spawned: claude --permission-mode auto (hook log at 0 lines)
+[   0.788] HOOK SessionStart source="startup"
+[   5.082] SCREEN composer ready (footer seen) -> submitting prompt
+[   5.082] PROMPT: Use the Bash tool to run exactly: curl -sS https://example.com/st2-probe
+[   5.936] SCREEN spinner ON (turn in flight)
+[   6.056] HOOK UserPromptSubmit
+[   8.791] HOOK PreToolUse tool_name="Bash"
+[   8.802] HOOK MessageDisplay
+[   8.939] HOOK PostToolUse tool_name="Bash"
+[   8.969] HOOK PostToolBatch
+[  11.582] HOOK MessageDisplay
+[  11.582] HOOK Stop
+[  14.432] HOOK SubagentStop
+[  71.655] HOOK Notification message="Claude is waiting for your input" notification_type="idle_prompt"
+[ 140.020] === driver finished main loop; sending /exit ===
+[ 140.727] HOOK SessionEnd reason="prompt_input_exit"
+[ 142.784] done

@@ -1,0 +1,22 @@
+{
+ "state": "ended",
+ "history": [
+  {
+   "at": 0.419,
+   "to": "idle",
+   "cause": "SessionStart"
+  },
+  {
+   "at": 1.105,
+   "to": "active",
+   "cause": "UserPromptSubmit"
+  },
+  {
+   "at": 8.279,
+   "from": "active",
+   "to": "ended",
+   "cause": "wrapper_observed_provider_exit/-9"
+  }
+ ],
+ "lease_mtime": 1786984682.0164769
+}

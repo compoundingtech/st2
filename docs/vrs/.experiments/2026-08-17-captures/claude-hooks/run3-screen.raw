@@ -1,0 +1,281 @@
+7[r8[?25h[?25l[?2004h[?1004h[?2031h[<u[>1u[>4;2m[>0q[c
+[38;5;211m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m[1mWARNING:[12GClaude[19GCode[24Grunning[32Gin[35GBypass[42GPermissions[54Gmode[22m[39m
+
+[3GIn[6GBypass[13GPermissions[25Gmode,[31GClaude[38GCode[43Gwill[48Gnot[52Gask[56Gfor[60Gyour[65Gapproval[74Gbefore[81Grunning[89Gpotentially[101Gdangerous
+[3Gcommands.
+[3GThis[8Gmode[13Gshould[20Gonly[25Gbe[28Gused[33Gin[36Ga[38Gsandboxed[48Gcontainer/VM[61Gthat[66Ghas[70Grestricted[81Ginternet[90Gaccess[97Gand[101Gcan[105Geasily[112Gbe
+[3Grestored[12Gif[15Gdamaged.
+
+[3GBy[6Gproceeding,[18Gyou[22Gaccept[29Gall[33Gresponsibility[48Gfor[52Gactions[60Gtaken[66Gwhile[72Grunning[80Gin[83GBypass[90GPermissions[102Gmode.
+
+[3G]8;id=zaxmda;https://code.claude.com/docs/en/securityhttps://code.claude.com/docs/en/security]8;;
+
+[3G[38;5;153m❯[5G[38;5;246m1.[8G[38;5;153mNo,[12Gexit[39m
+[5G[38;5;246m2.[8G[39mYes,[13GI[15Gaccept
+
+[3G[38;5;246m[3mEnter[9Gto[12Gconfirm[20G·[22GEsc[26Gto[29Gcancel[23m[39m
+[2C[4A]0;✳ Claude Code[2D[4B[2K[1A[2K[1A[2K[G[1A[14A[38;5;174m ▐[48;5;16m▛███▜[49m▌[12G[39m[1mClaude Code[24G[22m[38;5;246mv2.1.231[1B[38;5;174m▝▜[48;5;16m█████[49m▛▘[39m  [38;5;246mOpus 5 (1M context) · Claude Max[39m[K[1B[38;5;174m  ▘▘ ▝▝  [39m  [38;5;246m/…/b7178fd6-43b2-4fc3-9632-e88398ea323c/scratchpad/lab/proj[1C[2B[38;5;174m▎[39m [38;5;174mFable 5 is now a standard part of your Max plan[52G[39m[K[1C[1B[38;5;174m▎[39m You can use[16Gup[19Gto[22G50%[26Gof[29Gyour[34Gweekly[41Gusage[47Glimit[53Gon[56GFable[62G5.[65GIf[68Gyou[72Ghit[76Gyour[81Glimit,[88Gyou[92Gcan[96Gcontinue[105Gon[108GFable[114G5[116Gwith[1C[1B[38;5;174m▎[39m usage credits. Fab[23Ge[25G5 draws[33Gdown[38Gusage faster [52Gha[55G Opus[61G5. Run /model and select Fable to use it. Learn more:[1C[1B[38;5;174m▎[39m ]8;id=1iz7s2z;https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access[94mhttps://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access]8;;[3C[1B[38;5;246m+1 more · /status[2C[1B[39m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[1B[39m❯ [2mTry "write a test for <filepath>"[22m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[2C[1B[38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · ← for agents[103G● high · /effort[1B[39m[K[1B[K[1B[K[2A[2C[3A[?25h[?25l[2D[3B[2C[3A[K
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[3AUse[7Gthe[11GBash[16Gtool[21Gto[24Grun[28Gexactly:[37Gcurl[42G-sS[46Ghttps://example.com/st2-probe[47C[2B               
+[74C[3A[?25h]0;◐ Claude Code[?25l[74D[3B[4A[48;5;237m[38;5;239m❯ [38;5;231mUse the Bash tool to run exactly: curl -sS https://example.com/st2-probe[39m                                              [1B[49m[K[1B[38;5;174m*[39m [38;5;174mBooping… [39m[K[2C[1B[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51Gesc[55Gto[58Ginterrupt[68G·[70G←[72Gfor[76Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m·[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;174mHerd[39m
+
+
+
+
+
+[2C[3A[?25h]0;◐ Run st2-probe curl command]0;◑ Run st2-probe curl command[?25l[2D[3B[6A[38;5;174m✶[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✽[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[11C[6A[38;5;246m(1s · ↓[20G2 tokens)[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[20G[38;5;246m3[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✶[20G[38;5;246m5[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[20G[38;5;246m6[39m
+
+
+
+
+
+[2C[3A[?25h]0;◐ Run st2-probe curl command[?25l[2D[3B[9C[6A[38;5;216m…[13G[38;5;246m2[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;246m●[3G[39m[1mBash[22m(curl -sS https://example.com/st2-probe)[1B[38;5;246m  ⎿  Running…[1B[39m[K[1B[38;5;174m*[39m [38;5;174mHerding… [38;5;246m(2s · ↓[20G6 tokens)[1B[39m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51Gesc[55Gto[58Ginterrupt[68G·[70G←[72Gfor[76Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[20G[38;5;246m14 tokens)[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m·[3G[38;5;180mHerding…[21G[38;5;246m8[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[9A[38;5;231m●[3G[39mI'll r[10Gn that[17Gcommand.[K[1B[K[1B[38;5;246m●[3G[39m[1mBash[22m(curl[13G-sS[17Ghttps://example.com/st2-probe)[1B[38;5;246m  ⎿  Running…[39m[K[2B[38;5;174m·[39m [38;5;180mHerding…[38;5;174m [38;5;246m(2s · ↓[39m [38;5;246m18 tokens)[39m[K[1B[K[2B[38;5;246m❯ [39m[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51Gesc[55Gto[58Ginterrupt[68G·[70G←[72Gfor[76Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[9A[38;5;246m [39m
+
+
+
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[9A[38;5;114m●[5C[1B[39m<!doctype[16Ghtml><html[27Glang="en"><head><title>Example[58GDomain</title><link[78Grel="icon"[89Ghref="data:,"><meta[109Gname="v[5C[1Biewport"[15Gcontent="width=device-width,[44Ginitial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh[112Gauto[1B [3G   ;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></hea[5C[1B[2m… +3 lines (ctrl+o to expand)[1B[22m[K[1B[38;5;174m·[39m [38;5;180mHerding…[38;5;174m [38;5;246m(2s · ↓[20G55 tokens)[1B[39m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51Gesc[55Gto[58Ginterrupt[68G·[70G←[72Gfor[76Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[19C[6A[38;5;246m74[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;216mHerding…[20G[38;5;246m83[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[20G[38;5;246m90[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[21G[38;5;246m2[39m
+
+
+
+
+
+[2C[3A[?25h]0;◑ Run st2-probe curl command[?25l[2D[3B[6A[38;5;174m✶[21G[38;5;246m4[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[12C[6A[38;5;246m3[21G5[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[21G[38;5;246m7[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;174mHe[8Gng…[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✽[4G[38;5;216me[7G[38;5;174mi[21G[38;5;246m8[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[19C[6A[38;5;246m101 tokens)[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;216mH[6G[38;5;174md[22G[38;5;246m2[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[21C[6A[38;5;246m4[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[5Gr[22G[38;5;246m5[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✶[4Ge[22G[38;5;246m7[39m
+
+
+
+
+
+[2C[3A[?25h]0;◐ Run st2-probe curl command[?25l[2D[3B[6A[38;5;174m*[22G[38;5;246m8[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[3GH[13G[38;5;246m4[21G17[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[20C[6A[38;5;246m23[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m·[22G[38;5;246m6[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[21C[6A[38;5;246m7[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[21C[6A[38;5;246m9[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[20C[6A[38;5;246m30[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;231m●[3G[39mThe command ran.[20G[38;5;153mexample.com[32G[39mdoesn't[40Ghave[45Gan[48G[38;5;153m/st2-probe[59G[39mpath[64G—[66Git[69Gserved[76Gits[80Gstandard[89G"Example[98GDomain"[106Gplaceholder[2C[1Bpage[8Ginstead[16G(curl[22Gwas[26Gsilent[33Gabout[39Gstatus,[47Gso[50Gthis[55Gis[58Gjust[63Gthe[67Gdefault[75Gcatch-all[85Gresponse,[95Glikely[102Gwith[107Ga[109G404[113Gor[116G200[1B  depending on their config).[K[1B[K[2B[38;5;246m❯ [39m[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51Gesc[55Gto[58Ginterrupt[68G·[70G←[72Gfor[76Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h]0;◑ Run st2-probe curl command[?25l[2D[3B[4A[38;5;174m✻[39m [38;5;174mHerding… [38;5;246m(5s · ↓[39m [38;5;246m206 tokens)[39m[K[1B[K[2B[38;5;246m❯ [39m[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51Gesc[55Gto[58Ginterrupt[68G·[70G←[72Gfor[76Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h]0;✳ Run st2-probe curl command[?25l[2D[3B[6A[38;5;246m✻[3GBaked for [15G[39m[K[3B❯ [50C[2B[38;5;246m← for agents[39m                   
+[2C[3A[?25h[?25l[2D[3B[6A [3GIf you want to[18Gsee[22Gthe[26Gactual[33Gstatus[40Gcode,[46G[38;5;153mcurl -sS -o /dev/null -w '%{http_code}\n' https://example.com/st2-probe[2C[1B[39mwould[9Gshow[14Git.[1B[K[1B[38;5;246m✻[39m [38;5;246mBaked for 5s[1B[39m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;211m⏵⏵[6Gbypass[13Gpermissions[25Gon[38;5;246m (shift+tab[39Gto[42Gcycle)[49G·[51G←[53Gfor[57Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[102C[1A[K
+[2C[3A[?25h[?25l[2D[3B[2C[3A[2mshow me the status code[22m
+
+
+[2C[3A[?25h(B[<u[>1u[>4;2m[?1006l[?1003l[?1002l[?1000l[2D[3B(B[>4m[<u[?1004l[?2031l[?2004l[?25h7[r8]0;[2m[22m
+[2mResume this session with:[22m
+[2mclaude --resume 32a87a7e-4dbd-41fe-891f-86bb387e67e1[22m
+[2m[22m

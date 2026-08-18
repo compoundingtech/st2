@@ -1,0 +1,266 @@
+7[r8[?25h[?25l[?2004h[?1004h[?2031h[<u[>1u[>4;2m[>0q[c]0;✳ Claude Code[38;5;174m ▐[48;5;16m▛███▜[49m▌[12G[39m[1mClaude[19GCode[24G[22m[38;5;246mv2.1.231[39m
+[38;5;174m▝▜[48;5;16m█████[49m▛▘[12G[38;5;246mOpus[17G5[19G(1M[23Gcontext)[32G·[34GClaude[41GMax[39m
+[38;5;174m [3G▘▘[6G▝▝[12G[38;5;246m/…/b7178fd6-43b2-4fc3-9632-e88398ea323c/scratchpad/lab/proj[39m
+
+[2G[38;5;174m▎[4GFable[10G5[12Gis[15Gnow[19Ga[21Gstandard[30Gpart[35Gof[38Gyour[43GMax[47Gplan[39m
+[2G[38;5;174m▎[4G[39mYou[8Gcan[12Guse[16Gup[19Gto[22G50%[26Gof[29Gyour[34Gweekly[41Gusage[47Glimit[53Gon[56GFable[62G5.[65GIf[68Gyou[72Ghit[76Gyour[81Glimit,[88Gyou[92Gcan[96Gcontinue[105Gon[108GFable[114G5[116Gwith
+[2G[38;5;174m▎[4G[39musage[10Gcredits.[19GFable[25G5[27Gdraws[33Gdown[38Gusage[44Gfaster[51Gthan[56GOpus[61G5.[64GRun[68G/model[75Gand[79Gselect[86GFable[92Gto[95Guse[99Git.[103GLearn[109Gmore:
+[2G[38;5;174m▎[4G]8;id=1iz7s2z;https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access[94mhttps://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access[39m]8;;
+[4G[38;5;246m+1[7Gmore[12G·[14G/status[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+❯ [2mTry[7G"edit[13G<filepath>[24Gto..."[22m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246m⏸[5Gmanual[12Gmode[17Gon[20G·[22G?[24Gfor[28Gshortcuts[38G·[40G←[42Gfor[46Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[2C[3A[K
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[3AUse[7Gthe[11GBash[16Gtool[21Gto[24Grun[28Gexactly:[37Gcurl[42G-sS[46Ghttps://example.com/st2-probe[18C[2B                                 
+[74C[3A[?25h]0;◐ Claude Code[?25l[74D[3B[4A[48;5;237m[38;5;239m❯ [38;5;231mUse the Bash tool to run exactly: curl -sS https://example.com/st2-probe[39m                                              [1B[49m[K[1B[38;5;174m✶[39m [38;5;174mHyperspacing… [39m[K[2C[1B[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246m⏸[5Gmanual[12Gmode[17Gon[20G·[22Gesc[26Gto[29Ginterrupt[39G·[41G←[43Gfor[47Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m·[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;174mScampering… [39m[K
+
+
+
+
+
+[2C[3A[?25h]0;◐ Run probe endpoint request]0;◑ Run probe endpoint request[?25l[2D[3B[6A[38;5;174m✶[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✽[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[15G[38;5;246m(1s · ↓[23G2 tokens)[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✶[23G[38;5;246m4[39m
+
+
+
+
+
+[2C[3A[?25h]0;◐ Run probe endpoint request[?25l[2D[3B[6A[38;5;174m*[23G[38;5;246m5[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[15C[6A[38;5;246m2[23G6[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[39m
+
+
+
+
+
+[2C[3A[?25h]0;✳ Run probe endpoint request[?25l[2D[3B[6A[38;5;246m●[3G[39m[1mBash[22m(curl -sS https://example.com/st2-probe)[1B[38;5;246m  ⎿  Waiting…[1B[39m[K[1B[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[1B[39m [38;5;153m[1mBash command[22m[39m[K[2C[1B[K
+[4Gcurl[9G-sS[13Ghttps://example.com/st2-probe
+[4G[38;5;246mFetch[10Gst2-probe[20Gendpoint[29Gfrom[34Gexample.com[39m
+
+[2GThis[7Gcommand[15Grequires[24Gapproval
+
+[2GDo[5Gyou[9Gwant[14Gto[17Gproceed?
+[2G[38;5;153m❯[4G[38;5;246m1.[7G[38;5;153mYes[39m
+[4G[38;5;246m2.[7G[39mYes,[12Gand[16Gdon’t[22Gask[26Gagain[32Gfor:[37Gcurl[42G*
+[4G[38;5;246m3.[7G[39mNo
+
+[2G[38;5;246mEsc[6Gto[9Gcancel[16G·[18GTab[22Gto[25Gamend[31G·[33Gctrl+e[40Gto[43Gexplain[39m
+[1C[5A[1D[5B[17A[38;5;231m●[3G[39mI'll r[10Gn that[17Gcommand.[K[1B[K[1B[38;5;246m●[3G[39m[1mBash[22m(curl[13G-sS[17Ghttps://example.com/st2-probe)[1B[38;5;246m  ⎿  Waiting…[39m[K[1C[1B[K[1B[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[1C[1B[1mBash command[22m[39m[K[3C[1B[K[3C[1Bcurl[9G-sS[13Ghttps://example.com/st2-probe[1C[1B  [38;5;246mFetch st2-probe endpoint from example.com[1C[2B[39mThis command requir[22Gs approval[1C[1B[K[1C[1BDo you want to proceed?[26G[K[1C[1B[38;5;153m❯[4G[38;5;246m1[7G[38;5;153mYes[3C[1B[38;5;246m2. [39mYes,[12Gand[16Gdon’t[22Gask[26Gagain[32Gfor:[37Gcurl[42G*[1C[1B  [38;5;246m3. [39mNo[K
+
+[2G[38;5;246mEsc[6Gto[9Gcancel[16G·[18GTab[22Gto[25Gamend[31G·[33Gctrl+e[40Gto[43Gexplain[39m
+[1C[5A(B[<u[>1u[>4;2m]0;◐ Run probe endpoint request[1D[5B[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G[1A[5C[8A[38;5;246mRunn[2B[38;5;174m·[39m [38;5;180mScampering…[38;5;174m [38;5;246m(2s · ↓[39m [38;5;246m34 tokens)[39m[K[1C[1B[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[1B[38;5;246m❯ [4G[39m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[2C[1B[38;5;246m⏸ manual mode on · esc to interrupt · ← for agents[103G● high · /effort[1B[39m[K[1B[K[1B[K[1B[K[1B[K[1B[K[1B[K[1B[K[7A[2C[3A[?25h[?25l[2D[3B[9A[38;5;114m●[5C[1B[39m<!doctype[16Ghtml><html[27Glang="en"><head><title>Example[58GDomain</title><link[78Grel="icon"[89Ghref="data:,"><meta[109Gname="v[5C[1Biewport"[15Gcontent="width=device-width,[44Ginitial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh[112Gauto[1B [3G   ;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></hea[5C[1B[2m… +3 lines (ctrl+o to expand)[1B[22m[K[1B[38;5;174m·[39m [38;5;180mScampering…[38;5;174m [38;5;246m(2s · ↓[23G34 tokens)[1B[39m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246m⏸[5Gmanual[12Gmode[17Gon[20G·[22Gesc[26Gto[29Ginterrupt[39G·[41G←[43Gfor[47Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[22C[6A[38;5;246m59[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;216mScampering…[23G[38;5;246m73[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[23G[38;5;246m82[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[23G[38;5;246m9[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✶[24G[38;5;246m4[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[24G[38;5;246m5[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[15C[6A[38;5;246m3[24G7[39m
+
+
+
+
+
+[2C[3A[?25h]0;◑ Run probe endpoint request[?25l[2D[3B[6A[38;5;174m✽[24G[38;5;246m9[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[2C[6A[38;5;174mScampering…[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[22C[6A[38;5;246m100 tokens)[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[24C[6A[38;5;246m2[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[12C[6A[38;5;216m…[25G[38;5;246m3[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✻[25G[38;5;246m6[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✶[12G[38;5;216mg[25G[38;5;246m7[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m*[25G[38;5;246m8[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[11G[38;5;216mn[24G[38;5;246m21[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[15C[6A[38;5;246m4[24G33[39m
+
+
+
+
+
+[2C[3A[?25h]0;◐ Run probe endpoint request[?25l[2D[3B[6A[38;5;174m·[10G[38;5;216mi[13G[38;5;174m…[25G[38;5;246m7[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[24C[6A[38;5;246m8[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[8C[6A[38;5;216mr[12G[38;5;174mg[24G[38;5;246m40[39m
+
+
+
+
+
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;174m✢[8G[38;5;216me[11G[38;5;174mn[25G[38;5;246m2[39m
+
+
+
+
+
+[2C[3A[?25h]0;✳ Run probe endpoint request[?25l[2D[3B[6A[38;5;246m✻[3GCogitated for 4s[39m[K[3B❯ [21C[2B[38;5;246m? for shortcuts · ← for agents[39m 
+[2C[3A[?25h[?25l[2D[3B[6A[38;5;231m●[3G[39mThe command ran successfully.[33GThe[37Gresponse[46Gis[49Gjust[54Gthe[58Gstandard[67GExample[75GDomain[82Gplaceholder[94Gpage[99G—[101G[38;5;153mexample.com[113G[39mserves[2C[1Bthat[8Gsame[13GHTML[18Gfor[22Gany[26Gpath,[32Gso[35Gthere's[43Gno[46Gactual[53G[38;5;153m/st2-probe[64G[39mendpoint[73Gcontent.[82GHTTP[87Grequest[95Gsucceeded[105G(no[109Gerror[115Gfrom[1B  [38;5;153mcurl -sS[39m), but the payload is the generic boilerplate, not a probe response.[K[1B[K[1B[38;5;246m✻[39m [38;5;246mCogitated for 4s[39m[K[2C[1B[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246m⏸[5Gmanual[12Gmode[17Gon[20G·[22G?[24Gfor[28Gshortcuts[38G·[40G←[42Gfor[46Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[?25h[?25l[2D[3B[2C[3A[2mtry it with -i to see the headers[22m
+
+
+[2C[3A[?25h[?25l[2D[3B[102C[1A[K
+[2C[3A[?25h(B[<u[>1u[>4;2m[?1006l[?1003l[?1002l[?1000l[2D[3B(B[>4m[<u[?1004l[?2031l[?2004l[?25h7[r8]0;[2m[22m
+[2mResume this session with:[22m
+[2mclaude --resume 7a6c39b6-6995-4dcf-88ed-4ee50a0c36d2[22m
+[2m[22m

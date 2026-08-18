@@ -1,0 +1,16 @@
+{
+ "state": "active",
+ "history": [
+  {
+   "at": 0.419,
+   "to": "idle",
+   "cause": "SessionStart"
+  },
+  {
+   "at": 1.105,
+   "to": "active",
+   "cause": "UserPromptSubmit"
+  }
+ ],
+ "lease_mtime": 1786984682.0164323
+}
