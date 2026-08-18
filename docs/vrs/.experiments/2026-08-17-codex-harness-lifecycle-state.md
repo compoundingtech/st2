@@ -65,7 +65,10 @@ review ended mid-flight.
 All 20 of 20 notifications carry `emittedAtMs`, but **frames within a burst share one value** —
 `thread/status/changed`, `error`, and `turn/completed` were all stamped 1786982519409 — so `emittedAtMs`
 cannot order a history by itself. The installed and measured version, 0.147.0, is rejected by
-`SUPPORTED_CODEX_CLI_VERSIONS` (`:38`), which admits only 0.145.0 and 0.146.0.
+`SUPPORTED_CODEX_CLI_VERSIONS` (`:38`), which admits only 0.145.0 and 0.146.0. Corrected after this
+experiment ran: schemas generated from 0.145.0 and 0.146.0 binaries carry `ActiveThreadStatus` with
+`required: ["activeFlags","type"]` and the same two-value `ThreadActiveFlag`, so no finding here about
+`activeFlags` depends on admitting 0.147.0.
 
 ## Resolved decisions
 
@@ -102,6 +105,7 @@ server-request method, the active flag, the turn id, the hold reason, and the te
 transition-history record keyed by `emittedAtMs` and a monotone sequence. It changes the observed-state
 requirements around `turn/completed`, which must retain `TurnStatus` and error rather than collapsing every
 outcome to idle; it touches the steerability invariant at `src/codex_app_server.rs:162` pending the
-blocked-axis decision; and it requires admitting codex-cli 0.147.0, since `activeFlags` is verified only
-there. It does not change the vision or the agent-declared presence model, which remains an independent
+blocked-axis decision. It does **not** require admitting codex-cli 0.147.0: `activeFlags` was later
+verified present and `required`, with an identical `ThreadActiveFlag` enum, on 0.145.0 and 0.146.0 — both
+already admitted — so the field is available on a supported version today. It does not change the vision or the agent-declared presence model, which remains an independent
 last-observed value.
