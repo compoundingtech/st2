@@ -37,6 +37,16 @@ fn write_agent_for_host(catalog: &Path, host: &str, identity: &str, retired: boo
     .unwrap();
 }
 
+fn write_invalid_agent(catalog: &Path, identity: &str) {
+    write_agent(catalog, identity, false);
+    let path = agent_dir(catalog, identity).join("agent.kdl");
+    let invalid = fs::read_to_string(&path).unwrap().replace(
+        "  retired #false\n",
+        "  desired-state \"running\" because=\"unsupported\"\n",
+    );
+    fs::write(path, invalid).unwrap();
+}
+
 fn ensure_external_pty_config(catalog: &Path) {
     let config = catalog.join("catalog.kdl");
     if !config.exists() {
@@ -70,6 +80,23 @@ fn snapshot(catalog: &Path, output: &Path) -> Value {
     serde_json::from_slice(&result.stdout).unwrap()
 }
 
+fn raw_snapshot(catalog: &Path, output: &Path) -> Output {
+    ensure_external_pty_config(catalog);
+    st2()
+        .args([
+            "catalog",
+            "snapshot",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--raw-preimage",
+            "--json",
+        ])
+        .output()
+        .unwrap()
+}
+
 fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
     st2()
         .args([
@@ -81,6 +108,24 @@ fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
             prepared.to_str().unwrap(),
             "--expect-sha256",
             expected,
+            "--json",
+        ])
+        .output()
+        .unwrap()
+}
+
+fn raw_apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
+    st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            expected,
+            "--raw-preimage",
             "--json",
         ])
         .output()
@@ -119,11 +164,17 @@ fn resume(catalog: &Path) -> Output {
 }
 
 #[test]
-fn catalog_apply_cli_exposes_exactly_the_two_closed_modes() {
+fn catalog_apply_cli_exposes_exactly_the_three_closed_modes() {
     let help = st2().args(["catalog", "apply", "--help"]).output().unwrap();
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    for flag in ["--prepared", "--expect-sha256", "--resume", "--json"] {
+    for flag in [
+        "--prepared",
+        "--expect-sha256",
+        "--raw-preimage",
+        "--resume",
+        "--json",
+    ] {
         assert!(help.contains(flag), "catalog apply help omitted {flag}");
     }
     assert!(!help.contains("--expect-absent"));
@@ -145,6 +196,7 @@ fn catalog_apply_cli_exposes_exactly_the_two_closed_modes() {
             "--expect-sha256",
             "0000000000000000000000000000000000000000000000000000000000000000",
         ],
+        vec!["catalog", "apply", "--resume", "--raw-preimage"],
     ] {
         let rejected = st2().args(args).output().unwrap();
         assert!(
@@ -935,6 +987,272 @@ fn snapshot_is_typed_deterministic_and_excludes_state_and_workspaces() {
     let second = snapshot(&catalog, &output);
     assert_eq!(second["status"], "unchanged");
     assert_eq!(second["rootSha256"], first["rootSha256"]);
+}
+
+#[test]
+fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_invalid_agent(&catalog, "worker");
+    ensure_external_pty_config(&catalog);
+    let dir = agent_dir(&catalog, "worker");
+    fs::create_dir_all(dir.join("resources/inbox")).unwrap();
+    fs::write(
+        dir.join("resources/inbox/message.md"),
+        "keep resource state",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("archive")).unwrap();
+    fs::write(dir.join("archive/old.md"), "keep archive state").unwrap();
+    fs::write(dir.join("status"), "busy").unwrap();
+
+    let strict_snapshot = st2()
+        .args([
+            "catalog",
+            "snapshot",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--output",
+            temp.path().join("strict-invalid").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!strict_snapshot.status.success());
+
+    let raw_capture_dir = temp.path().join("raw-capture");
+    let raw_capture = raw_snapshot(&catalog, &raw_capture_dir);
+    assert!(
+        raw_capture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw_capture.stderr)
+    );
+    let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+    assert_eq!(
+        raw_capture["schema"],
+        "st2.catalog-raw-preimage-snapshot.v1"
+    );
+    assert!(
+        !raw_capture_dir
+            .join("agents/host/worker/resources")
+            .exists()
+    );
+    assert!(!raw_capture_dir.join("agents/host/worker/archive").exists());
+    assert!(!raw_capture_dir.join("agents/host/worker/status").exists());
+
+    let desired_source = temp.path().join("desired-source");
+    write_agent(&desired_source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    snapshot(&desired_source, &prepared);
+
+    let strict = apply(
+        &catalog,
+        &prepared,
+        raw_capture["rootSha256"].as_str().unwrap(),
+    );
+    assert!(!strict.status.success());
+    assert!(
+        fs::read_to_string(dir.join("agent.kdl"))
+            .unwrap()
+            .contains("because=\"unsupported\"")
+    );
+
+    let repaired = raw_apply(
+        &catalog,
+        &prepared,
+        raw_capture["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let repaired: Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(repaired["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(repaired["status"], "applied");
+    assert_eq!(repaired["beforeSha256"], raw_capture["rootSha256"]);
+    assert_eq!(
+        fs::read_to_string(dir.join("resources/inbox/message.md")).unwrap(),
+        "keep resource state"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("archive/old.md")).unwrap(),
+        "keep archive state"
+    );
+    assert_eq!(fs::read_to_string(dir.join("status")).unwrap(), "busy");
+    assert!(
+        !fs::read_to_string(dir.join("agent.kdl"))
+            .unwrap()
+            .contains("because=\"unsupported\"")
+    );
+}
+
+#[test]
+fn raw_preimage_refuses_valid_catalogs_and_wrong_cas_without_declaration_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let valid = temp.path().join("valid");
+    write_agent(&valid, "worker", false);
+    let valid_prepared = temp.path().join("valid-prepared");
+    let valid_snapshot = snapshot(&valid, &valid_prepared);
+    let valid_raw_snapshot = raw_snapshot(&valid, &temp.path().join("valid-raw"));
+    assert!(!valid_raw_snapshot.status.success());
+    assert!(
+        String::from_utf8_lossy(&valid_raw_snapshot.stderr)
+            .contains("refuses an already-valid catalog")
+    );
+    let valid_raw_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(!valid_raw_apply.status.success());
+    assert!(
+        String::from_utf8_lossy(&valid_raw_apply.stderr)
+            .contains("refuses an already-valid catalog")
+    );
+
+    let invalid = temp.path().join("invalid");
+    write_invalid_agent(&invalid, "worker");
+    ensure_external_pty_config(&invalid);
+    let declaration = agent_dir(&invalid, "worker").join("agent.kdl");
+    let context = agent_dir(&invalid, "worker").join("resources/context/now.md");
+    fs::create_dir_all(context.parent().unwrap()).unwrap();
+    fs::write(&context, "state before wrong CAS").unwrap();
+    let writer_temporary = agent_dir(&invalid, "worker").join(".agent.kdl.publish-test");
+    fs::write(&writer_temporary, "unfinished writer bytes").unwrap();
+    let before = fs::read(&declaration).unwrap();
+    let wrong = raw_apply(
+        &invalid,
+        &valid_prepared,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("precondition failed"));
+    assert_eq!(fs::read(&declaration).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(&context).unwrap(),
+        "state before wrong CAS"
+    );
+    assert_eq!(
+        fs::read_to_string(&writer_temporary).unwrap(),
+        "unfinished writer bytes"
+    );
+    assert!(!invalid.join(".st2/catalog-apply-incomplete").exists());
+    assert!(fs::read_dir(invalid.join(".st2"))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("catalog-apply-stage-")));
+}
+
+#[test]
+fn raw_preimage_rejects_hard_linked_declarations() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_invalid_agent(&catalog, "worker");
+    ensure_external_pty_config(&catalog);
+    let declaration = agent_dir(&catalog, "worker").join("agent.kdl");
+    fs::hard_link(&declaration, temp.path().join("alias.kdl")).unwrap();
+    let rejected = raw_snapshot(&catalog, &temp.path().join("capture"));
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("hard-linked"));
+}
+
+#[test]
+fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let malformed_envelope = temp.path().join("malformed-envelope");
+    write_invalid_agent(&malformed_envelope, "worker");
+    fs::write(malformed_envelope.join("catalog.kdl"), "catalog {").unwrap();
+    let rejected = raw_snapshot(
+        &malformed_envelope,
+        &temp.path().join("malformed-capture"),
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("requires a valid incumbent catalog envelope"));
+
+    let catalog = temp.path().join("catalog");
+    write_invalid_agent(&catalog, "worker");
+    ensure_external_pty_config(&catalog);
+    let raw_capture = raw_snapshot(&catalog, &temp.path().join("raw-capture"));
+    assert!(raw_capture.status.success());
+    let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+
+    let desired_source = temp.path().join("desired-source");
+    write_agent(&desired_source, "worker", false);
+    fs::write(
+        desired_source.join("catalog.kdl"),
+        "catalog { pty-root \"/tmp/st2-catalog-transaction-other-pty\" }\n",
+    )
+    .unwrap();
+    let prepared = temp.path().join("prepared");
+    snapshot(&desired_source, &prepared);
+    let declaration = fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap();
+    let rejected = raw_apply(
+        &catalog,
+        &prepared,
+        raw_capture["rootSha256"].as_str().unwrap(),
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("refuses an effective pty-root change"));
+    assert_eq!(
+        fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+        declaration
+    );
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+}
+
+#[test]
+fn raw_preimage_resume_uses_the_durable_validated_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_invalid_agent(&catalog, "worker");
+    ensure_external_pty_config(&catalog);
+    let raw_capture = raw_snapshot(&catalog, &temp.path().join("raw-capture"));
+    assert!(raw_capture.status.success());
+    let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+
+    let desired_source = temp.path().join("desired-source");
+    write_agent(&desired_source, "worker", false);
+    let prepared = temp.path().join("prepared");
+    snapshot(&desired_source, &prepared);
+    let interrupted = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            raw_capture["rootSha256"].as_str().unwrap(),
+            "--raw-preimage",
+            "--json",
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_CRASH_AT", "marker-created")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+
+    fs::remove_dir_all(&prepared).unwrap();
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(recovered["recovered"], true);
+    assert!(
+        !fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl"))
+            .unwrap()
+            .contains("because=\"unsupported\"")
+    );
 }
 
 #[test]

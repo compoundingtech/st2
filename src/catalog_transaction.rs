@@ -21,7 +21,11 @@ const DIFF_SCHEMA: &str = "st2.catalog-diff.v1";
 const BOOTSTRAP_SCHEMA: &str = "st2.catalog-bootstrap.v1";
 const APPLY_SCHEMA: &str = "st2.catalog-apply.v1";
 const MARKER_SCHEMA: &str = "st2.catalog-apply-incomplete.v1";
+const RAW_SNAPSHOT_SCHEMA: &str = "st2.catalog-raw-preimage-snapshot.v1";
+const RAW_APPLY_SCHEMA: &str = "st2.catalog-raw-preimage-apply.v1";
+const RAW_MARKER_SCHEMA: &str = "st2.catalog-raw-preimage-apply-incomplete.v1";
 const HASH_DOMAIN: &[u8] = b"st2.catalog-declaration-root.v1\0";
+const RAW_HASH_DOMAIN: &[u8] = b"st2.catalog-raw-preimage-root.v1\0";
 const STAGE_PREFIX: &str = "catalog-apply-stage-";
 const WRITER_TEMP_PREFIXES: [&str; 3] = [
     ".agent.kdl.presentation-",
@@ -37,6 +41,7 @@ const TEMPLATE_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 pub struct SnapshotRequest {
     pub catalog: PathBuf,
     pub output: PathBuf,
+    pub raw_preimage: bool,
 }
 
 #[derive(Debug)]
@@ -188,6 +193,10 @@ pub struct ApplyRequest {
 #[derive(Debug)]
 pub enum ApplyMode {
     Prepared {
+        prepared: PathBuf,
+        expect_sha256: String,
+    },
+    RawPreimage {
         prepared: PathBuf,
         expect_sha256: String,
     },
@@ -1015,8 +1024,22 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
     );
 
     let _lock = CatalogLock::shared(&catalog)?;
-    let projection = project(&catalog, ProjectionSource::Current, &catalog)?;
-    validate_live_workspace_facts(&catalog, &projection.workspace_dirs)?;
+    let projection = if request.raw_preimage {
+        anyhow::ensure!(
+            !catalog_is_strictly_valid(&catalog),
+            "raw-preimage snapshot refuses an already-valid catalog"
+        );
+        let incumbent_config = crate::catalog::load(&catalog)
+            .context("raw-preimage snapshot requires a valid incumbent catalog envelope")?;
+        validate_external_pty_root(&catalog, &incumbent_config, "raw-preimage snapshot v1")?;
+        let projection = project_raw_current(&catalog)?;
+        validate_projection_link_counts(&catalog, &projection, "raw live catalog")?;
+        projection
+    } else {
+        let projection = project(&catalog, ProjectionSource::Current, &catalog)?;
+        validate_live_workspace_facts(&catalog, &projection.workspace_dirs)?;
+        projection
+    };
     match fs::symlink_metadata(&output) {
         Ok(metadata) => {
             anyhow::ensure!(
@@ -1024,7 +1047,13 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
                 "snapshot output is not a real directory: {}",
                 output.display()
             );
-            let existing = project(&output, ProjectionSource::Prepared, &catalog)?;
+            let existing = if request.raw_preimage {
+                let existing = project_raw_current(&output)?;
+                validate_projection_link_counts(&output, &existing, "raw snapshot output")?;
+                existing
+            } else {
+                project(&output, ProjectionSource::Prepared, &catalog)?
+            };
             anyhow::ensure!(
                 existing.root_sha256 == projection.root_sha256,
                 "snapshot output already exists with root sha256 {}, expected {}",
@@ -1032,7 +1061,11 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
                 projection.root_sha256
             );
             return Ok(SnapshotResult {
-                schema: SNAPSHOT_SCHEMA,
+                schema: if request.raw_preimage {
+                    RAW_SNAPSHOT_SCHEMA
+                } else {
+                    SNAPSHOT_SCHEMA
+                },
                 status: SnapshotStatus::Unchanged,
                 catalog,
                 output,
@@ -1057,7 +1090,11 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
     sync_dir(&parent)?;
 
     Ok(SnapshotResult {
-        schema: SNAPSHOT_SCHEMA,
+        schema: if request.raw_preimage {
+            RAW_SNAPSHOT_SCHEMA
+        } else {
+            SNAPSHOT_SCHEMA
+        },
         status: SnapshotStatus::Created,
         catalog,
         output,
@@ -1336,45 +1373,70 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
             let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
             capture_prepared_catalog(&prepared, captured.path())?;
             let desired = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
-            Some((prepared, expect_sha256, desired))
+            Some((prepared, expect_sha256, desired, false))
+        }
+        ApplyMode::RawPreimage {
+            prepared,
+            expect_sha256,
+        } => {
+            validate_sha256(&expect_sha256)?;
+            let prepared = canonical_real_dir_no_alias(&prepared, "prepared catalog")?;
+            anyhow::ensure!(
+                !prepared.starts_with(&catalog),
+                "prepared catalog must be outside the live catalog: {}",
+                prepared.display()
+            );
+            let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
+            capture_prepared_catalog(&prepared, captured.path())?;
+            let desired = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
+            Some((prepared, expect_sha256, desired, true))
         }
         ApplyMode::Resume => None,
     };
 
     let lock = CatalogLock::exclusive_for_catalog_apply(&catalog)?;
     let control = retained_dir_path(lock.control())?;
-    cleanup_writer_temporaries(&catalog)?;
     let marker_path = control.join(APPLY_MARKER);
     let existing_marker = read_marker_optional(&marker_path)?;
     let recovered = existing_marker.is_some();
-    let (prepared, expect_sha256, desired, marker) = match (prepared_input, existing_marker) {
-        (Some(_), Some(_)) => {
-            anyhow::bail!("catalog apply is incomplete; recover only with `catalog apply --resume`")
-        }
-        (Some((prepared, expect_sha256, desired)), None) => {
-            (Some(prepared), expect_sha256, desired, None)
-        }
-        (None, Some(marker)) => {
-            validate_marker(&marker)?;
-            let stage_path = control.join(&marker.stage_name);
-            let staged = project(&stage_path, ProjectionSource::Prepared, &catalog)
-                .context("validate durable recovery stage")?;
-            anyhow::ensure!(
-                staged.root_sha256 == marker.prepared_root_sha256,
-                "durable recovery stage hash mismatch: expected {}, found {}",
-                marker.prepared_root_sha256,
-                staged.root_sha256
-            );
-            (
-                None,
-                marker.expected_root_sha256.clone(),
-                staged,
-                Some(marker),
-            )
-        }
-        (None, None) => anyhow::bail!("catalog apply --resume requires an incomplete apply marker"),
-    };
+    let (prepared, expect_sha256, desired, marker, raw_preimage) =
+        match (prepared_input, existing_marker) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "catalog apply is incomplete; recover only with `catalog apply --resume`"
+                )
+            }
+            (Some((prepared, expect_sha256, desired, raw_preimage)), None) => {
+                (Some(prepared), expect_sha256, desired, None, raw_preimage)
+            }
+            (None, Some(marker)) => {
+                validate_marker(&marker)?;
+                let stage_path = control.join(&marker.stage_name);
+                let staged = project(&stage_path, ProjectionSource::Prepared, &catalog)
+                    .context("validate durable recovery stage")?;
+                anyhow::ensure!(
+                    staged.root_sha256 == marker.prepared_root_sha256,
+                    "durable recovery stage hash mismatch: expected {}, found {}",
+                    marker.prepared_root_sha256,
+                    staged.root_sha256
+                );
+                let raw_preimage = marker.schema == RAW_MARKER_SCHEMA;
+                (
+                    None,
+                    marker.expected_root_sha256.clone(),
+                    staged,
+                    Some(marker),
+                    raw_preimage,
+                )
+            }
+            (None, None) => {
+                anyhow::bail!("catalog apply --resume requires an incomplete apply marker")
+            }
+        };
 
+    if recovered {
+        cleanup_writer_temporaries(&catalog)?;
+    }
     validate_live_workspace_facts(&catalog, &desired.workspace_dirs)?;
     // Admission reads exact durable/captured declaration bytes. Catalog-contained workspace facts
     // are mirrored as empty directories; their live content is never copied or hashed.
@@ -1393,18 +1455,42 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         );
         (expect_sha256.clone(), marker.original_paths, None)
     } else {
-        let current = project_excluding(
-            &catalog,
-            ProjectionSource::Current,
-            &catalog,
-            &desired.workspace_dirs,
-        )?;
-        let live_config = crate::catalog::load(&catalog)?;
+        if raw_preimage {
+            anyhow::ensure!(
+                !catalog_is_strictly_valid(&catalog),
+                "raw-preimage apply refuses an already-valid catalog"
+            );
+        }
+        let live_config = if raw_preimage {
+            crate::catalog::load(&catalog)
+                .context("raw-preimage apply requires a valid incumbent catalog envelope")?
+        } else {
+            crate::catalog::load(&catalog)?
+        };
         let same_pty_root = effective_pty_root(&catalog, &live_config)
             == effective_pty_root(&catalog, &desired_config);
+        if !raw_preimage {
+            cleanup_writer_temporaries(&catalog)?;
+        }
+        let current = if raw_preimage {
+            let current = project_raw_current(&catalog)?;
+            validate_projection_link_counts(&catalog, &current, "raw live catalog")?;
+            current
+        } else {
+            project_excluding(
+                &catalog,
+                ProjectionSource::Current,
+                &catalog,
+                &desired.workspace_dirs,
+            )?
+        };
         if current.root_sha256 == desired.root_sha256 && same_pty_root {
             return Ok(ApplyResult {
-                schema: APPLY_SCHEMA,
+                schema: if raw_preimage {
+                    RAW_APPLY_SCHEMA
+                } else {
+                    APPLY_SCHEMA
+                },
                 status: ApplyStatus::Unchanged,
                 catalog,
                 prepared,
@@ -1424,12 +1510,20 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
             expect_sha256,
             current.root_sha256
         );
+        if raw_preimage {
+            cleanup_writer_temporaries(&catalog)?;
+        }
         let original_paths = current.files.keys().cloned().collect::<Vec<_>>();
         ensure_durable_stage(lock.control(), &catalog, &stage_name, &desired)?;
         write_marker(
             lock.control(),
             &ApplyMarker {
-                schema: MARKER_SCHEMA.to_string(),
+                schema: if raw_preimage {
+                    RAW_MARKER_SCHEMA
+                } else {
+                    MARKER_SCHEMA
+                }
+                .to_string(),
                 stage_name: stage_name.clone(),
                 expected_root_sha256: expect_sha256.clone(),
                 prepared_root_sha256: desired.root_sha256.clone(),
@@ -1468,7 +1562,11 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     let _ = lock.control().sync_all();
 
     Ok(ApplyResult {
-        schema: APPLY_SCHEMA,
+        schema: if raw_preimage {
+            RAW_APPLY_SCHEMA
+        } else {
+            APPLY_SCHEMA
+        },
         status: ApplyStatus::Applied,
         catalog,
         prepared,
@@ -1519,6 +1617,76 @@ pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
 
 fn format_issue(issue: &crate::validate::Issue) -> String {
     format!("{} [{}]: {}", issue.path, issue.code, issue.message)
+}
+
+fn catalog_is_strictly_valid(root: &Path) -> bool {
+    project(root, ProjectionSource::Current, root)
+        .and_then(|projection| {
+            validate_live_workspace_facts(root, &projection.workspace_dirs)?;
+            validate_full_catalog(root)
+        })
+        .is_ok()
+}
+
+/// Project the declaration plane without interpreting declaration bytes.
+///
+/// This exists solely to bind a repair transaction to the exact bytes of an invalid current
+/// catalog. It deliberately has no policy for why those bytes are invalid. Mutable agent state is
+/// excluded by the same structural boundaries as the strict projection; a prospective catalog is
+/// never admitted through this path.
+fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
+    let metadata = fs::symlink_metadata(root)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "raw projection root is not a real directory: {}",
+        root.display()
+    );
+    let mut files = BTreeMap::new();
+    add_optional_regular(root, &root.join(crate::catalog::CONFIG_FILE), &mut files)?;
+    let spec_paths = collect_canonical_specs(root, ProjectionSource::Current, &mut files)?;
+    let workspace_dirs = raw_workspace_dirs(root, &spec_paths)?;
+    for spec in &spec_paths {
+        let bundle = spec.parent().context("canonical spec has no bundle")?;
+        collect_bundle_files(
+            root,
+            bundle,
+            bundle,
+            ProjectionSource::Current,
+            &workspace_dirs,
+            &mut files,
+        )?;
+    }
+    collect_templates(root, ProjectionSource::Current, &mut files)?;
+    let root_sha256 = hash_raw_projection(&files, &workspace_dirs);
+    Ok(DeclarationProjection {
+        files,
+        workspace_dirs,
+        root_sha256,
+    })
+}
+
+fn raw_workspace_dirs(root: &Path, spec_paths: &[PathBuf]) -> Result<BTreeSet<String>> {
+    let mut workspace_dirs = BTreeSet::new();
+    for spec in spec_paths {
+        let bundle = spec.parent().context("canonical spec has no bundle")?;
+        let workspace = bundle.join(".workspace");
+        match fs::symlink_metadata(&workspace) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "canonical workspace fact is not a real directory: {}",
+                    workspace.display()
+                );
+                workspace_dirs.insert(normalized_relative(root, &workspace)?);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect workspace fact {}", workspace.display()));
+            }
+        }
+    }
+    Ok(workspace_dirs)
 }
 
 fn project(
@@ -2019,6 +2187,28 @@ fn hash_projection(
     format!("{:x}", hasher.finalize())
 }
 
+fn hash_raw_projection(
+    files: &BTreeMap<String, ProjectedFile>,
+    workspace_dirs: &BTreeSet<String>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(RAW_HASH_DOMAIN);
+    for (path, file) in files {
+        hasher.update([1]);
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update([u8::from(file.executable)]);
+        hasher.update((file.bytes.len() as u64).to_be_bytes());
+        hasher.update(&file.bytes);
+    }
+    for path in workspace_dirs {
+        hasher.update([2]);
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn materialize_projection(projection: &DeclarationProjection, root: &Path) -> Result<()> {
     for (relative, file) in &projection.files {
         let target = root.join(relative);
@@ -2359,7 +2549,7 @@ fn read_marker_optional(path: &Path) -> Result<Option<ApplyMarker>> {
 
 fn validate_marker(marker: &ApplyMarker) -> Result<()> {
     anyhow::ensure!(
-        marker.schema == MARKER_SCHEMA,
+        matches!(marker.schema.as_str(), MARKER_SCHEMA | RAW_MARKER_SCHEMA),
         "unsupported catalog apply marker schema '{}'",
         marker.schema
     );

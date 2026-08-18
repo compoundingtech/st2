@@ -125,6 +125,23 @@ st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
   --expect-sha256 <rootSha256> --json
 ```
 
+If the incumbent Agent Specs cannot be parsed, bind a one-time repair to their
+exact structural declaration bytes instead:
+
+```sh
+st2 catalog snapshot --catalog "$CATALOG" --output ./invalid-preimage \
+  --raw-preimage --json
+# Produce a fully valid ./prepared directory from that capture.
+st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
+  --expect-sha256 <raw-rootSha256> --raw-preimage --json
+```
+
+Raw-preimage mode has its own hash and receipt schemas. It refuses a
+strictly-valid incumbent, still fully validates the prepared and applied
+catalogs, and requires a readable external PTY-root declaration that remains
+unchanged. It is a generic invalid-preimage transaction, not a validation
+bypass or migration-policy engine.
+
 To publish that exact snapshot as a new, absent catalog:
 
 ```sh
@@ -580,7 +597,7 @@ evals retain their flat bus and completion semantics.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) --input-sha256 HEX
 (--expect-absent | --expect-sha256 HEX)` is the single-agent declaration writer.
 `st2 catalog apply --catalog ROOT
-(--prepared DIR --expect-sha256 ROOT_HEX | --resume)` is the complete
+(--prepared DIR --expect-sha256 ROOT_HEX [--raw-preimage] | --resume)` is the complete
 declaration-plane writer. Each admits the complete prospective catalog under a
 compare-and-swap lock before making one atomic change.
 `st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 ROOT_HEX`

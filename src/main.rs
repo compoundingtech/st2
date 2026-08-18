@@ -461,6 +461,10 @@ enum CatalogCmd {
         /// Destination directory. It must be outside the live catalog.
         #[arg(long, value_name = "DIR")]
         output: PathBuf,
+        /// Hash and capture the declaration plane without parsing it. Only for repairing an
+        /// invalid catalog; the captured directory remains unvalidated.
+        #[arg(long)]
+        raw_preimage: bool,
         /// Emit the typed snapshot receipt as JSON.
         #[arg(long)]
         json: bool,
@@ -483,6 +487,10 @@ enum CatalogCmd {
             conflicts_with = "resume"
         )]
         expect_sha256: Option<String>,
+        /// Match the current declaration plane without parsing it. The prepared catalog is still
+        /// fully validated, and this mode refuses an already-valid current catalog.
+        #[arg(long, conflicts_with = "resume")]
+        raw_preimage: bool,
         /// Resume the durable incomplete marker and internal stage without the original source.
         #[arg(long, conflicts_with_all = ["prepared", "expect_sha256"])]
         resume: bool,
@@ -1040,11 +1048,16 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
-        Command::Catalog(CatalogCmd::Snapshot { output, json }) => {
+        Command::Catalog(CatalogCmd::Snapshot {
+            output,
+            raw_preimage,
+            json,
+        }) => {
             let result =
                 st2::catalog_transaction::snapshot(st2::catalog_transaction::SnapshotRequest {
                     catalog: catalog_arg(None)?,
                     output,
+                    raw_preimage,
                 })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1064,6 +1077,7 @@ fn main() -> Result<()> {
         Command::Catalog(CatalogCmd::Apply {
             prepared,
             expect_sha256,
+            raw_preimage,
             resume,
             json,
         }) => {
@@ -1073,9 +1087,16 @@ fn main() -> Result<()> {
                 let prepared = prepared.context("clap requires --prepared unless --resume")?;
                 let expect_sha256 =
                     expect_sha256.context("clap requires --expect-sha256 unless --resume")?;
-                st2::catalog_transaction::ApplyMode::Prepared {
-                    prepared,
-                    expect_sha256,
+                if raw_preimage {
+                    st2::catalog_transaction::ApplyMode::RawPreimage {
+                        prepared,
+                        expect_sha256,
+                    }
+                } else {
+                    st2::catalog_transaction::ApplyMode::Prepared {
+                        prepared,
+                        expect_sha256,
+                    }
                 }
             };
             let result = st2::catalog_transaction::apply(st2::catalog_transaction::ApplyRequest {
