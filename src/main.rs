@@ -345,6 +345,20 @@ enum DriverCmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
+    /// Run pi under the session-owned presence wrapper.
+    PiSession {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Run the pi native message channel over stdio, owned by the shipped pi extension.
+    PiChannel {
+        #[arg(long)]
+        identity: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -921,6 +935,20 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::PiChannel { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::pi_channel::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::PiSession {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::pi_session::run(&catalog, identity, runtime_id, argv)
         }
         Command::Driver(DriverCmd::Claude { identity }) => {
             eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");

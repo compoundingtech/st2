@@ -37,9 +37,102 @@ fn codex_kdl_expansion_matches_snapshot() {
 }
 
 #[test]
+fn pi_kdl_expansion_matches_snapshot() {
+    assert_snapshot(
+        include_str!("fixtures/driver/pi.in.kdl"),
+        include_str!("fixtures/driver/pi.out.kdl"),
+    );
+}
+
+/// The declaration must not name the channel extension. `st2 driver pi-session` splices it in from
+/// this binary's verified hook set at launch, so a catalog never carries a machine-local path and
+/// an operator reading the expansion sees only the harness policy they authored.
+#[test]
+fn pi_expansion_carries_no_machine_local_extension_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("agents/host/worker/agent.kdl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, include_str!("fixtures/driver/pi.in.kdl")).unwrap();
+
+    let found = discover(temp.path());
+    let expanded = expand_driver(&found.specs[0], "unused").unwrap().to_string();
+
+    assert!(!expanded.contains("pi-channel.ts"), "{expanded}");
+    assert!(!expanded.contains("ST_HOOKS"), "{expanded}");
+    assert!(!expanded.contains(" -e "), "{expanded}");
+    // The one thing expansion does owe the launch is accepting the workspace without mutating the
+    // operator's ambient pi config.
+    assert!(expanded.contains("-- pi -a "), "{expanded}");
+}
+
+/// A hand-authored pi seat reaches the same wrapper as the typed driver. Unlike `deliver "mcp"`,
+/// this transport renders nothing into the workspace: pi's channel is an extension st2 injects at
+/// launch, so the authored argv is wrapped and otherwise left alone.
+#[test]
+fn pi_deliver_wraps_the_authored_launch_without_rendering_anything() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let path = catalog.join("legacy.kdl");
+    fs::write(
+        &path,
+        format!(
+            r#"agent "worker" {{
+  host "h"
+  workspace "{}"
+  deliver "pi-channel"
+  argv "pi" "-a" "--model" "anthropic/claude-opus-5" "boot"
+}}
+"#,
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    let (specs, _) = st2::discover_file(&catalog, &path).unwrap();
+    let mut spec = specs.into_iter().next().unwrap();
+    let executable = catalog.join("bin/st2");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "test binary").unwrap();
+    let context = TaskCompileContext::new(catalog.clone(), executable.clone()).unwrap();
+
+    compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap();
+
+    let task = spec.tasks.iter().find(|task| task.name == "agent").unwrap();
+    assert_eq!(
+        task.argv.as_ref().unwrap(),
+        &[
+            executable.to_string_lossy().into_owned(),
+            "--catalog".into(),
+            catalog.to_string_lossy().into_owned(),
+            "driver".into(),
+            "pi-session".into(),
+            "--identity".into(),
+            "h.worker".into(),
+            "--runtime-id".into(),
+            "h.worker".into(),
+            "--".into(),
+            "pi".into(),
+            "-a".into(),
+            "--model".into(),
+            "anthropic/claude-opus-5".into(),
+            "boot".into(),
+        ]
+    );
+    // No derived DING companion, and no rendered channel configuration of any kind.
+    assert!(spec.tasks.iter().all(|task| !task.derived));
+    let rendered = materialize_agent(&catalog, &spec, "h").unwrap();
+    assert!(
+        !format!("{rendered:?}").contains("pi-channel"),
+        "{rendered:?}"
+    );
+}
+
+#[test]
 fn cli_prints_each_snapshot_without_changing_its_input() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/driver");
-    for provider in ["claude", "codex"] {
+    for provider in ["claude", "codex", "pi"] {
         let input = fixtures.join(format!("{provider}.in.kdl"));
         let before = fs::read(&input).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_st2"))

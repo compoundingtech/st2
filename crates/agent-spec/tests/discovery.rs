@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::{
-    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, TaskKind, TaskLifecycle,
+    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, PiDriver, TaskKind, TaskLifecycle,
 };
 use agent_spec::{
     AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
@@ -348,16 +348,24 @@ fn deliver_is_typed_without_lowering_to_the_legacy_ding_task() {
         "agents/h/codex/agent.kdl",
         r#"agent "codex" { host "h"; command "codex"; deliver "app-server" }"#,
     );
+    write(
+        tmp.path(),
+        "agents/h/pi/agent.kdl",
+        r#"agent "pi" { host "h"; command "pi"; deliver "pi-channel" }"#,
+    );
 
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let claude = find(&found.specs, "claude");
     let codex = find(&found.specs, "codex");
+    let pi = find(&found.specs, "pi");
     assert_eq!(claude.delivery, Some(DeliveryTransport::Mcp));
     assert_eq!(codex.delivery, Some(DeliveryTransport::AppServer));
+    assert_eq!(pi.delivery, Some(DeliveryTransport::PiChannel));
     assert_eq!(claude.delivery.unwrap().as_str(), "mcp");
     assert_eq!(codex.delivery.unwrap().as_str(), "app-server");
-    for spec in [claude, codex] {
+    assert_eq!(pi.delivery.unwrap().as_str(), "pi-channel");
+    for spec in [claude, codex, pi] {
         assert!(spec.has_delivery_transport());
         assert_eq!(spec.tasks.len(), 1);
         assert!(spec.tasks.iter().all(|task| !task.derived));
@@ -628,6 +636,44 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
 }"#,
     );
 
+    write(
+        tmp.path(),
+        "agents/h/pi-kdl/agent.kdl",
+        r#"agent "pi-kdl" {
+  pi {
+    model "anthropic/claude-opus-5"
+    effort "high"
+    prompt "Start the assigned work."
+    args "--tools" "read,bash,edit,write"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/pi-toml/agent.toml",
+        r#"identity = "pi-toml"
+
+[pi]
+model = "anthropic/claude-opus-5"
+effort = "high"
+prompt = "Start the assigned work."
+args = ["--tools", "read,bash,edit,write"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/pi-json/agent.json",
+        r#"{
+  "identity": "pi-json",
+  "pi": {
+    "model": "anthropic/claude-opus-5",
+    "effort": "high",
+    "prompt": "Start the assigned work.",
+    "args": ["--tools", "read,bash,edit,write"]
+  }
+}"#,
+    );
+
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let claude = Driver::Claude(ClaudeDriver {
@@ -653,6 +699,17 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
         assert_eq!(spec.driver.as_ref(), Some(&codex));
         assert!(!spec.is_runnable());
     }
+    let pi = Driver::Pi(PiDriver {
+        model: Some("anthropic/claude-opus-5".into()),
+        effort: Some("high".into()),
+        prompt: "Start the assigned work.".into(),
+        args: vec!["--tools".into(), "read,bash,edit,write".into()],
+    });
+    for identity in ["pi-kdl", "pi-toml", "pi-json"] {
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.driver.as_ref(), Some(&pi));
+        assert!(!spec.is_runnable());
+    }
 }
 
 #[test]
@@ -662,6 +719,10 @@ fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
             "both",
             r#"claude { prompt "go" }; codex { prompt "go" }"#,
         ),
+        ("claude-and-pi", r#"claude { prompt "go" }; pi { prompt "go" }"#),
+        ("codex-and-pi", r#"codex { prompt "go" }; pi { prompt "go" }"#),
+        ("pi-dev", r#"pi { dev-channels #true; prompt "go" }"#),
+        ("pi-missing-prompt", r#"pi { model "anthropic/x" }"#),
         ("missing-prompt", r#"claude { model "opus" }"#),
         ("wrong-bool", r#"claude { dev-channels "yes"; prompt "go" }"#),
         ("codex-dev", r#"codex { dev-channels #true; prompt "go" }"#),

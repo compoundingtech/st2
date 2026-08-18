@@ -900,6 +900,88 @@ The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.
 
+## pi native delivery
+
+pi has no MCP, no app-server, and no lifecycle-hook mechanism. Its integration
+point is an extension loaded into the live interactive process. st2 therefore
+delivers to pi through a channel that runs inside the session rather than
+through the terminal.
+
+```text
+inbox --> st2 driver pi-channel --NDJSON--> pi-channel.ts --> pi.sendUserMessage()
+                   ^                              |
+                   `-------- delivered/failed ----'
+```
+
+`st2 driver pi-session` owns the launch. It resolves `pi-channel.ts` from this
+binary's verified immutable hook set and splices `-e <path>` in immediately
+after the provider program, so a declaration never carries a machine-local
+path. It exports `ST2_PI_CHANNEL_BIN`, `ST2_PI_CHANNEL_CATALOG`, and
+`ST2_PI_CHANNEL_IDENTITY`; the extension spawns exactly that binary rather than
+resolving `st2` from `PATH`, which is what keeps a replaced control plane and
+its live agents from disagreeing under R11. The wrapper also owns the
+five-minute presence heartbeat for as long as its provider lives, on the same
+terms as the Claude wrapper.
+
+The channel is newline-delimited JSON in both directions. It opens with
+`{"type":"hello","protocol":1,"identity":...}`; an extension that does not
+understand the protocol number closes the channel rather than guessing. Each
+unread inbox entry becomes one `{"type":"message","deliverAs":...,"content":
+...,"meta":{...}}` frame carrying the same subject-and-body envelope the Claude
+channel uses. The inbox remains the durable source of truth: the channel holds
+only an ephemeral set of filenames delivered in its current lifetime, and a
+restart rescans. EOF on stdin is the session boundary.
+
+pi has no session-start hook, so the `hello` frame also carries
+`sessionContext`: the same restored working state, boot ritual, and
+unread-inbox listing that `$ST_HOOKS/codex-session-start.sh` composes, in the
+same order, composed here in Rust. The extension awaits that frame inside
+`session_start`, which orders restoration ahead of the boot turn rather than
+after it, and a fresh channel is opened for `/new`, `/resume`, and `/fork`, so
+a replaced session is restored on the same terms.
+
+`deliverAs` is st2's decision, not the extension's, so delivery behaviour is a
+Rust change with one place to make it. The shipped value is `steer`: the
+earliest point pi accepts input without discarding the running turn, and the
+same choice the Codex native path makes when it routes an active turn to a
+steer. Measured against a live provider, the boundary is one tool call, not one
+job — each tool call and its result are their own assistant message, so a steer
+sent mid-job is injected in the same millisecond as the next tool result.
+Latency is bounded by the in-flight call's remaining duration. Whether displaced
+work resumes is the model's choice, not a harness guarantee. Holding until the agent settles would defer
+delivery inside pi where st2 cannot observe it, which is what the "`busy`
+delivers immediately" rule exists to prevent. Per-message selection between
+steer and queue is tracked in #277.
+
+A managed pi seat runs with `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1` unless
+its declaration already sets them: a supervised agent must not self-update or
+make its boot latency depend on the network. The extension unexports
+`ST2_PI_CHANNEL_*` once it has read it, because pi places its environment in
+front of every tool child, and eval seats scrub `PI_*` for the same reason they
+scrub `CLAUDE_*` and `CODEX_*`.
+
+st2 pins no pi version. pi publishes none to pin — no changelog, stability
+policy, compat field, or API version constant — but it does publish its
+TypeScript declarations, and those govern this coupling.
+`checks.pi-extension-types` type-checks the shipped extension against a pinned
+pi release at build time, which is what makes the asset's otherwise-erased
+`import type` load-bearing. This follows the repo's existing rule that st2 pins
+where skew fails silently (`pty`, `codex-cli`) and not where it fails loudly
+(`claude`); the extension's one silent surface was its idle proof, and using
+that proof without calling it is now a build error.
+
+A pi agent never enters the DING path. `deliver` and `ding` are mutually
+exclusive in a declaration, so no PTY write is authorized for a pi seat and the
+synchronous composer proof is not consulted. Workspace trust is a launch flag
+(`pi -a`), so nothing in the operator's ambient pi configuration is mutated and
+there is no pi analogue of the pre-boot trust batching Claude requires.
+
+The measured basis for this design, including the runs that fixed `steer` and
+the modal case, is recorded in
+[2026-08-18-pi-harness-integration](./.experiments/2026-08-18-pi-harness-integration.md);
+the ruling is
+[decision 0005](./.decisions/0005-pi-delivers-natively-through-an-injected-extension.md).
+
 ## Event contracts (R13–R15)
 
 An event is evidence, not permission to run the world. The reconciler retains

@@ -42,6 +42,7 @@ pub enum AgentDesiredState {
 pub enum DeliveryTransport {
     Mcp,
     AppServer,
+    PiChannel,
 }
 
 impl DeliveryTransport {
@@ -49,6 +50,7 @@ impl DeliveryTransport {
         match self {
             Self::Mcp => "mcp",
             Self::AppServer => "app-server",
+            Self::PiChannel => "pi-channel",
         }
     }
 
@@ -56,8 +58,9 @@ impl DeliveryTransport {
         match value {
             "mcp" => Ok(Self::Mcp),
             "app-server" => Ok(Self::AppServer),
+            "pi-channel" => Ok(Self::PiChannel),
             _ => anyhow::bail!(
-                "unsupported `deliver` value '{value}' (expected `mcp` or `app-server`)"
+                "unsupported `deliver` value '{value}' (expected `mcp`, `app-server`, or `pi-channel`)"
             ),
         }
     }
@@ -70,6 +73,7 @@ impl DeliveryTransport {
 pub enum Driver {
     Claude(ClaudeDriver),
     Codex(CodexDriver),
+    Pi(PiDriver),
 }
 
 impl Driver {
@@ -77,6 +81,7 @@ impl Driver {
         match self {
             Self::Claude(_) => "claude",
             Self::Codex(_) => "codex",
+            Self::Pi(_) => "pi",
         }
     }
 }
@@ -89,6 +94,20 @@ pub struct ClaudeDriver {
     pub effort: Option<String>,
     #[serde(default)]
     pub dev_channels: bool,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Typed fields accepted by a `pi {}` driver block.
+///
+/// `effort` carries pi's thinking level verbatim; st2 does not translate the maintained harnesses'
+/// effort vocabularies into one another.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PiDriver {
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -491,17 +510,33 @@ pub(crate) struct RawSpec {
 pub(crate) struct RawDriver {
     pub(crate) claude: Option<ClaudeDriver>,
     pub(crate) codex: Option<CodexDriver>,
+    pub(crate) pi: Option<PiDriver>,
 }
 
 impl RawDriver {
     fn lower(self, identity: &str) -> anyhow::Result<Option<Driver>> {
-        match (self.claude, self.codex) {
-            (None, None) => Ok(None),
-            (Some(driver), None) => Ok(Some(Driver::Claude(driver))),
-            (None, Some(driver)) => Ok(Some(Driver::Codex(driver))),
-            (Some(_), Some(_)) => anyhow::bail!(
-                "agent '{identity}' declares both `claude` and `codex`; choose one driver"
-            ),
+        // Named rather than positional so a fourth provider cannot silently widen a tuple match.
+        let mut declared: Vec<(&str, Driver)> = Vec::new();
+        if let Some(driver) = self.claude {
+            declared.push(("claude", Driver::Claude(driver)));
+        }
+        if let Some(driver) = self.codex {
+            declared.push(("codex", Driver::Codex(driver)));
+        }
+        if let Some(driver) = self.pi {
+            declared.push(("pi", Driver::Pi(driver)));
+        }
+        match declared.len() {
+            0 => Ok(None),
+            1 => Ok(Some(declared.pop().expect("length was just checked").1)),
+            _ => {
+                let names = declared
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join("` and `");
+                anyhow::bail!("agent '{identity}' declares both `{names}`; choose one driver")
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 # st2
 
-st2 runs a declarative network of Codex and Claude agents from one catalog. It owns process
+st2 runs a declarative network of Codex, Claude, and pi agents from one catalog. It owns process
 reconciliation, native messages, normalized terminal DING delivery, presence, durable context,
 workspace materialization, and explicit teardown.
 
@@ -20,7 +20,9 @@ Prerequisites:
 
 - Rust and Cargo;
 - `pty` on `PATH` with `pty run --unset-env` support;
-- at least one supported harness on `PATH`: `codex` or `claude`;
+- at least one supported harness on `PATH`: `codex`, `claude`, or `pi`;
+  (`codex` is admitted by an exact version allowlist; `pi` is not version-pinned, but the shipped pi
+  extension is type-checked against a pinned pi release by `nix flake check`);
 - Git when a declaration materializes workspace files;
 - Bash and `jq` on `PATH` when lifecycle hooks are enabled.
 
@@ -92,10 +94,22 @@ current inbox; pre-compact preserves a recovery breadcrumb when no context was w
 failure hooks surface newly arrived work or a harness failure. They fail open so hook trouble does
 not prevent the harness from starting or stopping.
 
+The same immutable set also carries `pi-channel.ts`. pi has no hook mechanism of its own — an
+extension is where a pi session exposes that surface — so st2 ships one and `st2 driver pi-session`
+splices it into the launch from the set this binary verified. A declaration never names it, and a
+host whose selected set predates it is told to run `st2 hooks install` rather than launching
+without a channel. That extension carries the pi equivalent of the session-start hook: st2 composes
+the same restored working state, boot ritual, and unread-inbox listing and puts it on the channel's
+opening frame, and the extension waits for that frame before the session's first turn, so a
+restarted pi agent boots knowing what it was doing. A managed pi seat also runs with `PI_OFFLINE=1`
+and `PI_SKIP_VERSION_CHECK=1` unless its declaration sets them, so a supervised agent does not
+self-update or make its boot latency depend on the network.
+
 ## Author a native agent
 
-Start from the maintained [Codex](examples/native/agent-codex.kdl) or
-[Claude](examples/native/agent-claude.kdl) declaration:
+Start from the maintained [Codex](examples/native/agent-codex.kdl),
+[Claude](examples/native/agent-claude.kdl), or [pi](examples/native/agent-pi.kdl)
+declaration:
 
 ```sh
 export CATALOG="${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog"
@@ -473,6 +487,11 @@ verify hooks, validate and materialize its hand-authored declaration, stop any p
 and decide how any unread predecessor backlog will be archived or forwarded. Never run predecessor
 and native DING owners concurrently for the same identity.
 
+A pi agent does not use DING. Its messages are delivered natively into the live session by the
+channel extension st2 injects, which calls pi's own message API and reads pi's own idle proof, so
+no screen is inspected on that path. Declare it with a typed `pi {}` driver or with
+`deliver "pi-channel"`; a declaration carrying both `ding` and `deliver` is refused.
+
 Native DING watches the recipient inbox and delivers a normalized notice:
 
 ```text
@@ -480,8 +499,8 @@ Native DING watches the recipient inbox and delivers a normalized notice:
 ```
 
 Consumers must key on the `[DING]` prefix and stable id, not descriptive words. Every maintained
-harness uses the same transport: normalize untrusted fields into bounded, single-line printable
-text, positively identify an empty current Codex or Claude composer, and send one bracketed-paste
+harness that uses DING uses the same transport: normalize untrusted fields into bounded,
+single-line printable text, positively identify an empty current Codex or Claude composer, and send one bracketed-paste
 sequence without Return. The sidecar then observes for a short bounded window and sends a separate
 bare Return only after two immediately adjacent inspections show the exact notice in a positively
 idle composer. A human draft, active turn, modal, changed composer, unreadable screen, command

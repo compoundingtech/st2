@@ -9,3 +9,6 @@
 
 # Local scratch note.
 .ding-bus-quoting-note.md
+
+# Assembled by the `pi-extension-types` check from pinned tarballs; never committed.
+hooks/typecheck/node_modules/

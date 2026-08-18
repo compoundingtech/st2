@@ -91,6 +91,7 @@ pub fn compile_generated_tasks(
     }
     compile_driver_agent_tasks(specs, this_host, context)?;
     compile_claude_session_agent_tasks(specs, this_host, context)?;
+    compile_pi_session_agent_tasks(specs, this_host, context)?;
     compile_generated_ding_tasks(specs, this_host, context)?;
     compile_app_server_agent_tasks(specs, this_host, context)?;
     // Claude's MCP server remains declared to Claude itself. The canonical task wrapper owns only
@@ -155,6 +156,7 @@ pub fn compile_driver_agent_tasks(
         let wrapper = match driver {
             Driver::Codex(_) => "codex",
             Driver::Claude(_) => "claude-session",
+            Driver::Pi(_) => "pi-session",
         };
         anyhow::ensure!(
             argv.first().map(String::as_str) == Some("st2")
@@ -194,6 +196,42 @@ pub fn compile_claude_session_agent_tasks(
     this_host: &str,
     context: &TaskCompileContext,
 ) -> Result<()> {
+    compile_session_wrapped_agent_tasks(
+        specs,
+        this_host,
+        context,
+        DeliveryTransport::Mcp,
+        "claude-session",
+    )
+}
+
+/// Route legacy pi-channel delivery through the same pi session wrapper as a typed driver.
+///
+/// pi's channel is an extension the wrapper injects, so — unlike `mcp` — this transport adds
+/// nothing to the workspace. A hand-authored pi task therefore needs only the wrapper.
+pub fn compile_pi_session_agent_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+) -> Result<()> {
+    compile_session_wrapped_agent_tasks(
+        specs,
+        this_host,
+        context,
+        DeliveryTransport::PiChannel,
+        "pi-session",
+    )
+}
+
+/// The shape both session-wrapped transports share: take the one canonical PTY `agent` task's
+/// authored launch and re-express it as that provider's st2 wrapper, preserving the runtime id.
+fn compile_session_wrapped_agent_tasks(
+    specs: &mut [AgentSpec],
+    this_host: &str,
+    context: &TaskCompileContext,
+    transport: DeliveryTransport,
+    wrapper: &str,
+) -> Result<()> {
     let st2_executable = context
         .st2_executable
         .to_str()
@@ -206,9 +244,10 @@ pub fn compile_claude_session_agent_tasks(
         .to_owned();
 
     for spec in specs {
-        if spec.driver.is_some() || spec.delivery != Some(DeliveryTransport::Mcp) {
+        if spec.driver.is_some() || spec.delivery != Some(transport) {
             continue;
         }
+        let selected = transport.as_str();
         let bus_id = spec.bus_id(this_host);
         let mut candidates = spec
             .tasks
@@ -216,16 +255,16 @@ pub fn compile_claude_session_agent_tasks(
             .filter(|task| !task.derived && task.name == "agent");
         let task = candidates.next().with_context(|| {
             format!(
-                "agent '{bus_id}' selects `deliver \"mcp\"` but has no canonical `agent` task"
+                "agent '{bus_id}' selects `deliver \"{selected}\"` but has no canonical `agent` task"
             )
         })?;
         anyhow::ensure!(
             candidates.next().is_none(),
-            "agent '{bus_id}' selects `deliver \"mcp\"` with more than one canonical `agent` task"
+            "agent '{bus_id}' selects `deliver \"{selected}\"` with more than one canonical `agent` task"
         );
         anyhow::ensure!(
             task.kind == TaskKind::Pty,
-            "agent '{bus_id}' selects `deliver \"mcp\"` for a non-PTY canonical task"
+            "agent '{bus_id}' selects `deliver \"{selected}\"` for a non-PTY canonical task"
         );
         let provider = match (&task.command, &task.argv) {
             (None, Some(argv)) => argv.clone(),
@@ -239,7 +278,7 @@ pub fn compile_claude_session_agent_tasks(
         };
         anyhow::ensure!(
             !provider.is_empty(),
-            "agent '{bus_id}' selects `deliver \"mcp\"` with an empty canonical argv"
+            "agent '{bus_id}' selects `deliver \"{selected}\"` with an empty canonical argv"
         );
         let runtime_id = task
             .id
@@ -250,7 +289,7 @@ pub fn compile_claude_session_agent_tasks(
             "--catalog".to_string(),
             catalog_root.clone(),
             "driver".to_string(),
-            "claude-session".to_string(),
+            wrapper.to_string(),
             "--identity".to_string(),
             bus_id,
             "--runtime-id".to_string(),

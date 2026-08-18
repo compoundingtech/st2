@@ -20,18 +20,22 @@ const CODEX_STOP: &[u8] = include_bytes!("../hooks/codex-stop.sh");
 const CLAUDE_SESSION_START: &[u8] = include_bytes!("../hooks/claude-session-start.sh");
 const CLAUDE_PRE_COMPACT: &[u8] = include_bytes!("../hooks/claude-pre-compact.sh");
 const CLAUDE_STOP_FAILURE: &[u8] = include_bytes!("../hooks/claude-stop-failure.sh");
+// pi has no lifecycle-hook mechanism of its own; an extension is where a pi session exposes the
+// same surface, so it is published and verified as part of the same immutable set.
+const PI_CHANNEL: &[u8] = include_bytes!("../hooks/pi-channel.ts");
 
 const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
-const HOOKS: [(&str, &[u8]); 6] = [
+const HOOKS: [(&str, &[u8]); 7] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
     ("codex-stop.sh", CODEX_STOP),
     ("claude-session-start.sh", CLAUDE_SESSION_START),
     ("claude-pre-compact.sh", CLAUDE_PRE_COMPACT),
     ("claude-stop-failure.sh", CLAUDE_STOP_FAILURE),
+    ("pi-channel.ts", PI_CHANNEL),
 ];
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -154,6 +158,82 @@ pub fn required_by_codex_agent(
                         .as_deref()
                         .is_some_and(|argv| argv_invokes_codex(argv, catalog_root)))
         }))
+}
+
+/// Whether this host has a pi agent whose next launch needs this hook set.
+///
+/// pi differs from Codex in where the set is needed: nothing pi renders references `$ST_HOOKS`, but
+/// the launch cannot proceed without `pi-channel.ts`, so an unverified set must hold the launch
+/// rather than let the wrapper start and fail.
+pub fn required_by_pi(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    catalog_root: &Path,
+) -> bool {
+    specs
+        .iter()
+        .any(|spec| required_by_pi_agent(spec, this_host, catalog_root))
+}
+
+/// Whether one local declaration owns a pi agent launch.
+pub fn required_by_pi_agent(
+    spec: &agent_spec::spec::AgentSpec,
+    this_host: &str,
+    catalog_root: &Path,
+) -> bool {
+    spec.host.as_deref().is_none_or(|host| host == this_host)
+        && (matches!(
+            spec.driver.as_ref(),
+            Some(agent_spec::spec::Driver::Pi(_))
+        ) || spec.tasks.iter().any(|task| {
+            task.name == "agent"
+                && (task.command.as_deref().is_some_and(command_invokes_pi)
+                    || task
+                        .argv
+                        .as_deref()
+                        .is_some_and(|argv| argv_invokes_pi(argv, catalog_root)))
+        }))
+}
+
+pub(crate) fn launch_invokes_pi(
+    launch: &crate::reconcile::TaskLaunch,
+    catalog_root: &Path,
+) -> bool {
+    match launch {
+        crate::reconcile::TaskLaunch::Shell(command) => command_invokes_pi(command),
+        crate::reconcile::TaskLaunch::Argv(argv) => argv_invokes_pi(argv, catalog_root),
+    }
+}
+
+fn argv_invokes_pi(argv: &[String], catalog_root: &Path) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let program = crate::expand::expand_catalog(program, catalog_root);
+    let Some(program) = Path::new(&program).file_name() else {
+        return false;
+    };
+    if program == "pi" {
+        return true;
+    }
+    program == "st2"
+        && argv.get(1).map(String::as_str) == Some("--catalog")
+        && argv.get(3).map(String::as_str) == Some("driver")
+        && argv.get(4).map(String::as_str) == Some("pi-session")
+}
+
+fn command_invokes_pi(command: &str) -> bool {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("exec ")
+        .unwrap_or(command)
+        .trim_start();
+    let Some(program) = command.split_ascii_whitespace().next() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "pi")
 }
 
 pub(crate) fn launch_invokes_codex(
@@ -434,6 +514,56 @@ pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
+    /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one
+    /// expansion actually emits.
+    #[test]
+    fn pi_launch_classification_is_exact() {
+        let root = Path::new("/catalog");
+        assert!(command_invokes_pi("exec pi -a 'boot'"));
+        assert!(command_invokes_pi("/opt/bin/pi --model x"));
+        assert!(!command_invokes_pi("echo pi"));
+        assert!(!command_invokes_pi("exec /opt/bin/pilot --model x"));
+        assert!(argv_invokes_pi(&["pi".into(), "-a".into()], root));
+        assert!(argv_invokes_pi(&["/opt/bin/pi".into(), "-a".into()], root));
+        assert!(argv_invokes_pi(&["$CATALOG/bin/pi".into(), "-a".into()], root));
+        assert!(argv_invokes_pi(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "driver".into(),
+                "pi-session".into(),
+                "--identity".into(),
+                "h.worker".into(),
+            ],
+            root
+        ));
+        // A different wrapper, a missing `--catalog`, and a lookalike program are all not pi.
+        assert!(!argv_invokes_pi(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "driver".into(),
+                "claude-session".into(),
+            ],
+            root
+        ));
+        assert!(!argv_invokes_pi(
+            &[
+                "st2".into(),
+                "driver".into(),
+                "pi-session".into(),
+                "--identity".into(),
+                "h.worker".into(),
+            ],
+            root
+        ));
+        assert!(!argv_invokes_pi(&["pilot".into(), "-a".into()], root));
+        assert!(!argv_invokes_pi(&[], root));
+    }
 
     #[test]
     fn codex_command_classification_is_exact() {
