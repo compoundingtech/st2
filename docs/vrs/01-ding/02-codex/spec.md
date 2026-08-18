@@ -83,6 +83,17 @@ ownership and narrowing the contents were deliberately separated so that the
 move carried no behavior change; narrowing is outstanding, and is recorded as a
 known limit below rather than described as done.
 
+## Failed turns
+
+This section describes the control protocol named in the opening paragraph, not the screen.
+
+A turn that ends because the thread reported an error resolves to that error, held. The thread
+status is the only signal that reports a thread condition, so the turn's own completion neither
+clears the condition nor stands as evidence of a second live turn. Delivery is gated for as long
+as the hold stands: a thread that has just reported a system error, or that is not loaded, is not
+a thread st2 sends into. Only a later thread status releases it — `idle` directly, or `active`
+followed by the turn that starts under it — never turn traffic alone.
+
 ## Known limits
 
 - Recognition depends on exact styled sequences, so a renderer change that

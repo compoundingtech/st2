@@ -829,20 +829,28 @@ impl CodexControlState {
             CodexObservedState::Active { turn_id: current } if current == turn_id => {
                 CodexObservedState::Idle
             }
-            CodexObservedState::Held {
-                reason: CodexHoldReason::Review | CodexHoldReason::Compaction,
-                ..
-            } => self.observed.clone(),
             CodexObservedState::AwaitingStatus
             | CodexObservedState::Held {
                 reason: CodexHoldReason::ActiveWithoutTurn,
                 ..
             } => CodexObservedState::Idle,
+            // Every other hold is owned by a signal that is not the turn lifecycle. A completion
+            // is not evidence that a review or a compaction ended, that the thread reloaded, or
+            // that a reported system error cleared, so it does not speak for them. Only the
+            // signal that minted the hold releases it.
             CodexObservedState::Held {
-                reason: CodexHoldReason::ConflictingTurn,
+                reason:
+                    CodexHoldReason::Review
+                    | CodexHoldReason::Compaction
+                    | CodexHoldReason::ConflictingTurn
+                    | CodexHoldReason::NotLoaded
+                    | CodexHoldReason::SystemError,
                 ..
             } => self.observed.clone(),
-            _ => CodexObservedState::Held {
+            // A completion for a turn other than the one believed live is the only evidence here
+            // that two turns exist. This match stays exhaustive so a new observed state cannot
+            // silently arrive as a conflict it never was.
+            CodexObservedState::Active { .. } => CodexObservedState::Held {
                 reason: CodexHoldReason::ConflictingTurn,
                 turn_id: None,
             },
@@ -3869,6 +3877,144 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn an_errored_turn_completes_into_the_named_error_not_a_conflicting_turn() {
+        // Replays the captured terminal-error ordering (#264): a usage limit emits
+        // `thread/status/changed -> systemError` immediately before the failed turn's
+        // `turn/completed`. That completion reports one turn's lifecycle and carries no thread
+        // status, so it is not evidence the thread recovered, and it is not evidence of a second
+        // live turn either. The honest resolution is the condition the thread itself reported,
+        // still held, until a thread status says otherwise.
+        for (status, reason) in [
+            ("systemError", CodexHoldReason::SystemError),
+            ("notLoaded", CodexHoldReason::NotLoaded),
+        ] {
+            let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+            let mut state = CodexControlState::new(&runtime, "thread-main".into());
+            state.subscribed = true;
+            state
+                .observe(&json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+                }))
+                .unwrap();
+            assert!(
+                state
+                    .observe(&json!({
+                        "method": "thread/status/changed",
+                        "params": { "threadId": "thread-main", "status": { "type": status } }
+                    }))
+                    .unwrap()
+            );
+            assert_eq!(
+                state.observed(),
+                &CodexObservedState::Held {
+                    reason,
+                    turn_id: None
+                }
+            );
+
+            // The completion of the turn that just failed changes nothing. st2 never believed a
+            // second turn was live, so it must not begin reporting one.
+            assert!(
+                !state
+                    .observe(&json!({
+                        "method": "turn/completed",
+                        "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+                    }))
+                    .unwrap()
+            );
+            assert_eq!(
+                state.observed(),
+                &CodexObservedState::Held {
+                    reason,
+                    turn_id: None
+                }
+            );
+
+            // The hold gates delivery deliberately: a thread that just reported an error is not
+            // a thread st2 sends into, and the unread head stays unread.
+            let tmp = tempfile::tempdir().unwrap();
+            let config = delivery_config(tmp.path());
+            let filename =
+                message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+                    .unwrap();
+            let mut delivery = inbox_delivery(tmp.path(), config.clone());
+            assert_eq!(delivery.maybe_request(&state).unwrap(), None);
+            assert!(config.inbox.join(&filename).is_file());
+
+            // The gate is released by the signal that owns it: the next thread status.
+            assert!(
+                state
+                    .observe(&json!({
+                        "method": "thread/status/changed",
+                        "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+                    }))
+                    .unwrap()
+            );
+            assert_eq!(state.observed(), &CodexObservedState::Idle);
+            assert!(delivery.maybe_request(&state).unwrap().is_some());
+        }
+
+        // The truthful hold is not a new wedge. It has strictly more exits than the conflict it
+        // replaces: `active` does not preserve a system error the way it preserves a conflicting
+        // turn, so a thread that simply resumes work is live again on its next turn.
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state.subscribed = true;
+        for message in [
+            json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }),
+            json!({
+                "method": "thread/status/changed",
+                "params": { "threadId": "thread-main", "status": { "type": "systemError" } }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }),
+        ] {
+            state.observe(&message).unwrap();
+        }
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                turn_id: None
+            }
+        );
+        state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-main",
+                    "status": { "type": "active", "activeFlags": [] }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::ActiveWithoutTurn,
+                turn_id: None
+            }
+        );
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-2" } }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-2".into()
+            }
+        );
     }
 
     #[test]
