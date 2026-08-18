@@ -765,13 +765,26 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let item_type = required_string(message, "/params/item/type", method)?;
-                let reason = match item_type {
-                    "enteredReviewMode" => CodexHoldReason::Review,
-                    "contextCompaction" => CodexHoldReason::Compaction,
+                // Codex 0.146/0.147 `ThreadItem` has eighteen variants; only these three carry
+                // steerability. Every other item reports work inside a turn that the turn and
+                // thread status already model, so it is ignored on purpose — a later protocol
+                // item that gates or releases input has to be added here explicitly, because
+                // silently dropping one is how `exitedReviewMode` stayed unmatched. Review is
+                // also the only hold the protocol ends with a typed item of its own:
+                // `contextCompaction` has no exit item, so both of its lifecycle edges keep
+                // holding until the thread proves otherwise.
+                let (reason, released) = match item_type {
+                    "enteredReviewMode" => (CodexHoldReason::Review, false),
+                    "exitedReviewMode" => (CodexHoldReason::Review, true),
+                    "contextCompaction" => (CodexHoldReason::Compaction, false),
                     _ => return Ok(false),
                 };
                 let turn_id = required_string(message, "/params/turnId", method)?;
-                self.observe_non_steerable(turn_id, reason);
+                if released {
+                    self.observe_hold_released(turn_id, reason);
+                } else {
+                    self.observe_non_steerable(turn_id, reason);
+                }
             }
             _ => return Ok(false),
         }
@@ -901,6 +914,27 @@ impl CodexControlState {
                 reason: CodexHoldReason::ConflictingTurn,
                 turn_id: None,
             },
+        };
+    }
+
+    /// A typed hold-exit item releases only the hold it ends, and only for the exact turn that
+    /// hold carries. The exit arrives inside a running turn, so the honest result is that turn
+    /// active again rather than idle. Anything else — a different hold reason, a hold bound to
+    /// another turn, or no hold at all — is not evidence about this state, so it is left alone:
+    /// an exit must never invent an active turn or release a hold it did not end.
+    fn observe_hold_released(&mut self, turn_id: &str, reason: CodexHoldReason) {
+        let CodexObservedState::Held {
+            reason: current_reason,
+            turn_id: held_turn_id,
+        } = &self.observed
+        else {
+            return;
+        };
+        if *current_reason != reason || held_turn_id.as_deref() != Some(turn_id) {
+            return;
+        }
+        self.observed = CodexObservedState::Active {
+            turn_id: turn_id.to_string(),
         };
     }
 }
@@ -3897,6 +3931,186 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn exiting_review_mode_mid_turn_restores_the_steerable_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+                .unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
+
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state.subscribed = true;
+
+        // An inline review runs as its own turn on the reviewed thread, so the hold binds to the
+        // reviewer turn that `exitedReviewMode` later reports.
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-review" } }
+            }))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-main",
+                    "turnId": "turn-review",
+                    "item": { "type": "enteredReviewMode", "id": "item-1", "review": "review" }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-review".into()),
+            }
+        );
+        assert_eq!(delivery.maybe_request(&state).unwrap(), None);
+
+        // Review ends while the turn keeps running: the typed exit item is the only signal, and it
+        // must restore the exact turn the hold carried instead of waiting for the next idle.
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turnId": "turn-review",
+                        "item": { "type": "exitedReviewMode", "id": "item-2", "review": "review" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-review".into(),
+            }
+        );
+
+        // Codex reports both lifecycle edges of the same item; the second one changes nothing.
+        assert!(
+            !state
+                .observe(&json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turnId": "turn-review",
+                        "item": { "type": "exitedReviewMode", "id": "item-2", "review": "review" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-review".into(),
+            }
+        );
+
+        // The payoff: native delivery steers the still-running turn instead of waiting for idle.
+        let request = delivery.maybe_request(&state).unwrap().unwrap();
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(request["params"]["threadId"], "thread-main");
+        assert_eq!(request["params"]["expectedTurnId"], "turn-review");
+        assert!(config.inbox.join(&filename).is_file());
+    }
+
+    #[test]
+    fn delivery_irrelevant_items_and_foreign_turn_review_exits_keep_the_observed_state() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+
+        // Most item types say nothing about steerability. They are ignored on purpose, not by
+        // omission: the observed state and the changed flag both stay put.
+        for item_type in ["agentMessage", "commandExecution", "webSearch"] {
+            assert!(
+                !state
+                    .observe(&json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-1",
+                            "item": { "type": item_type, "id": "item-1" }
+                        }
+                    }))
+                    .unwrap()
+            );
+            assert_eq!(
+                state.observed(),
+                &CodexObservedState::Active {
+                    turn_id: "turn-1".into(),
+                }
+            );
+        }
+
+        // A review exit reporting a turn the hold does not carry proves nothing about the held
+        // turn, so the hold survives exactly as it did before typed exits were observed.
+        state.observed = CodexObservedState::Held {
+            reason: CodexHoldReason::Review,
+            turn_id: Some("turn-2".into()),
+        };
+        let stale_exit = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-main",
+                "turnId": "turn-1",
+                "item": { "type": "exitedReviewMode", "id": "item-2", "review": "review" }
+            }
+        });
+        assert!(!state.observe(&stale_exit).unwrap());
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::Review,
+                turn_id: Some("turn-2".into()),
+            }
+        );
+
+        // A review exit never invents a turn on an idle thread and never releases another hold.
+        for observed in [
+            CodexObservedState::Idle,
+            CodexObservedState::AwaitingStatus,
+            CodexObservedState::Held {
+                reason: CodexHoldReason::Compaction,
+                turn_id: Some("turn-1".into()),
+            },
+            CodexObservedState::Held {
+                reason: CodexHoldReason::ConflictingTurn,
+                turn_id: None,
+            },
+        ] {
+            state.observed = observed.clone();
+            assert!(
+                !state
+                    .observe(&json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-1",
+                            "item": {
+                                "type": "exitedReviewMode",
+                                "id": "item-3",
+                                "review": "review"
+                            }
+                        }
+                    }))
+                    .unwrap()
+            );
+            assert_eq!(state.observed(), &observed);
+        }
     }
 
     #[test]
