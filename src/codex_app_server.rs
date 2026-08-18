@@ -35,7 +35,18 @@ use crate::{ding, message, run, status};
 /// Every admitted version has a delivery-critical schema comparison and live remote-TUI evidence.
 /// A later version stays rejected until both checks are repeated; semantic-version proximity is
 /// not compatibility evidence for this experimental provider surface.
-pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &["codex-cli 0.145.0", "codex-cli 0.146.0"];
+///
+/// `codex-cli 0.147.0` is admitted on a completed schema comparison against 0.146.0 and on live
+/// evidence that reached a submitted `turn/start` against the real binary. Its live evidence stops
+/// short of a completed model turn: the account was over its usage limit when the check ran. The
+/// `turn/start` response body, `turn/started`, `turn/completed`, the typed `item/completed`
+/// receipt, `turn/steer`, and the `thread/resume` subscription path are therefore unproven on this
+/// version. See #267.
+pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &[
+    "codex-cli 0.145.0",
+    "codex-cli 0.146.0",
+    "codex-cli 0.147.0",
+];
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
@@ -2428,24 +2439,33 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             path
         };
-        for (name, version) in [
-            ("codex-0145", "codex-cli 0.145.0"),
-            ("codex-0146", "codex-cli 0.146.0"),
-        ] {
-            ensure_supported_version(write_version(name, version).to_str().unwrap()).unwrap();
+        for (index, version) in SUPPORTED_CODEX_CLI_VERSIONS.iter().enumerate() {
+            ensure_supported_version(
+                write_version(&format!("codex-admitted-{index}"), version)
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
         }
-        let error = ensure_supported_version(
-            write_version("codex-0147", "codex-cli 0.147.0")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("codex-cli 0.147.0"));
-        assert!(
-            error
-                .to_string()
-                .contains("codex-cli 0.145.0, codex-cli 0.146.0")
-        );
+        // An unadmitted release stays rejected until both policy checks are repeated for it, and
+        // an alpha cannot carry live evidence at all.
+        for (index, unadmitted) in ["codex-cli 0.144.0", "codex-cli 0.148.0-alpha.21"]
+            .into_iter()
+            .enumerate()
+        {
+            let error = ensure_supported_version(
+                write_version(&format!("codex-unadmitted-{index}"), unadmitted)
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(unadmitted));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&SUPPORTED_CODEX_CLI_VERSIONS.join(", "))
+            );
+        }
     }
 
     #[test]
