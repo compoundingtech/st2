@@ -292,6 +292,21 @@ identical retry is `unchanged`. Its domain-separated, path-sorted root SHA-256
 covers normalized relative paths, file bytes, executable bits, and empty
 workspace directory facts.
 
+`st2 catalog snapshot --catalog ROOT --output DIR --raw-preimage --json`
+exists only to externalize CAS for an invalid incumbent. Under the same shared
+lock it structurally captures `catalog.kdl`, canonical
+`agents/<host>/<identity>/agent.kdl` leaves, their bounded static bundle files,
+the bounded `_templates` tree, and existing canonical `.workspace` directory
+facts without parsing Agent Spec bytes. The ordinary state/control exclusions
+still apply. Every captured input must be a safe real file or directory with no
+symlink or hard-link alias. The incumbent catalog envelope must parse and name
+an external PTY root. A catalog that passes strict projection, live workspace
+validation, and full admission is refused. Its root uses the distinct
+`st2.catalog-raw-preimage-root.v1` hash domain and the receipt schema is
+`st2.catalog-raw-preimage-snapshot.v1`; it is not interchangeable with a strict
+snapshot root. Create-only retry rechecks both the raw root and output link
+counts.
+
 `st2 catalog diff --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
 holds the existing authoring lock in shared mode and performs no initialization
 or publication. It projects and fully admits the coherent live catalog, rejects
@@ -427,6 +442,22 @@ precondition already passed, so recovery converges the partial live tree from
 the durable desired stage and original owned-leaf list without re-enforcing
 that stale precondition. Malformed or mismatched records remain fenced.
 External lock execution and bypass flags are not part of the contract.
+
+`st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX
+--raw-preimage --json` is the only writer that accepts the raw-preimage root.
+It first captures and fully admits `DIR` through the ordinary strict prepared
+projection. Under EX it refuses a strictly valid incumbent, requires the
+incumbent catalog envelope to parse, proves the effective external PTY root is
+unchanged, structurally reprojects the invalid live declaration plane, and
+checks its raw-domain root against `HEX` before any declaration, workspace,
+state, writer-temporary, marker, or stage mutation. A successful CAS reuses the
+ordinary durable stage, generation commit, leaf publication, strict live
+verification, and fsync sequence. Its receipt schema is
+`st2.catalog-raw-preimage-apply.v1`; its durable marker schema is
+`st2.catalog-raw-preimage-apply-incomplete.v1`. The marker schema preserves the
+projection type, so source-free `--resume` emits the truthful raw-preimage
+receipt after converging from the strictly validated stage. This mode owns no
+policy for interpreting or transforming invalid bytes.
 
 `st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 HEX --json`
 is the create-only declaration transaction for an absent catalog. `ROOT` must
