@@ -197,6 +197,8 @@ pub enum CodexHoldReason {
     Compaction,
     NotLoaded,
     SystemError,
+    WaitingOnApproval,
+    WaitingOnUserInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,9 +715,10 @@ impl CodexControlState {
             "/result/thread/status/type",
             "thread/resume response",
         )?;
+        let blocked = human_blocking_flag(message.pointer("/result/thread/status"));
         let before = (self.subscribed, self.observed.clone());
         self.subscribed = true;
-        self.observe_thread_status(status);
+        self.observe_thread_status(status, blocked);
         Ok(SubscriptionAcceptance::Accepted {
             changed: (self.subscribed, self.observed.clone()) != before,
         })
@@ -733,7 +736,8 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let status = required_string(message, "/params/thread/status/type", method)?;
-                self.observe_thread_status(status);
+                let blocked = human_blocking_flag(message.pointer("/params/thread/status"));
+                self.observe_thread_status(status, blocked);
             }
             "thread/status/changed" => {
                 let thread_id = required_string(message, "/params/threadId", method)?;
@@ -741,7 +745,8 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let status = required_string(message, "/params/status/type", method)?;
-                self.observe_thread_status(status);
+                let blocked = human_blocking_flag(message.pointer("/params/status"));
+                self.observe_thread_status(status, blocked);
             }
             "turn/started" => {
                 let thread_id = required_string(message, "/params/threadId", method)?;
@@ -778,19 +783,57 @@ impl CodexControlState {
         Ok(self.observed != before)
     }
 
-    fn observe_thread_status(&mut self, status: &str) {
+    fn observe_thread_status(&mut self, status: &str, blocked: Option<CodexHoldReason>) {
         self.observed = match status {
             "idle" => CodexObservedState::Idle,
-            "active" => match &self.observed {
-                CodexObservedState::Active { .. }
-                | CodexObservedState::Held {
-                    reason:
-                        CodexHoldReason::Review
-                        | CodexHoldReason::Compaction
-                        | CodexHoldReason::ConflictingTurn,
-                    ..
-                } => self.observed.clone(),
-                _ => CodexObservedState::Held {
+            "active" => match (&self.observed, blocked) {
+                // A human-blocking flag holds the exact turn already proven active. Clearing it
+                // releases that same turn, because no second `turn/started` arrives mid-turn.
+                (CodexObservedState::Active { turn_id }, Some(reason)) => {
+                    CodexObservedState::Held {
+                        reason,
+                        turn_id: Some(turn_id.clone()),
+                    }
+                }
+                (
+                    CodexObservedState::Held {
+                        reason:
+                            CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput,
+                        turn_id,
+                    },
+                    Some(reason),
+                ) => CodexObservedState::Held {
+                    reason,
+                    turn_id: turn_id.clone(),
+                },
+                (
+                    CodexObservedState::Held {
+                        reason:
+                            CodexHoldReason::WaitingOnApproval | CodexHoldReason::WaitingOnUserInput,
+                        turn_id: Some(turn_id),
+                    },
+                    None,
+                ) => CodexObservedState::Active {
+                    turn_id: turn_id.clone(),
+                },
+                // A more specific hold outranks the flag: its turn ID still tracks the lifecycle.
+                (
+                    CodexObservedState::Active { .. }
+                    | CodexObservedState::Held {
+                        reason:
+                            CodexHoldReason::Review
+                            | CodexHoldReason::Compaction
+                            | CodexHoldReason::ConflictingTurn,
+                        ..
+                    },
+                    _,
+                ) => self.observed.clone(),
+                // Flagged without a known turn: still a hold, but it names what it waits on.
+                (_, Some(reason)) => CodexObservedState::Held {
+                    reason,
+                    turn_id: None,
+                },
+                (_, None) => CodexObservedState::Held {
                     reason: CodexHoldReason::ActiveWithoutTurn,
                     turn_id: None,
                 },
@@ -846,14 +889,18 @@ impl CodexControlState {
                 ..
             } => CodexObservedState::Idle,
             // Every other hold is owned by a signal that is not the turn lifecycle. A completion
-            // is not evidence that a review or a compaction ended, that the thread reloaded, or
-            // that a reported system error cleared, so it does not speak for them. Only the
-            // signal that minted the hold releases it.
+            // is not evidence that a review or a compaction ended, that the thread reloaded, that
+            // a reported system error cleared, or that the human a turn was waiting on has
+            // answered, so it does not speak for them. Only the signal that minted the hold
+            // releases it: the waiting-on-human holds are minted from `activeFlags` on a thread
+            // status and are cleared by the next thread status that omits the flag.
             CodexObservedState::Held {
                 reason:
                     CodexHoldReason::Review
                     | CodexHoldReason::Compaction
                     | CodexHoldReason::ConflictingTurn
+                    | CodexHoldReason::WaitingOnApproval
+                    | CodexHoldReason::WaitingOnUserInput
                     | CodexHoldReason::NotLoaded
                     | CodexHoldReason::SystemError,
                 ..
@@ -903,6 +950,28 @@ impl CodexControlState {
             },
         };
     }
+}
+
+/// Read the delivery-relevant part of `ThreadStatus.activeFlags`: the first flag that says this
+/// thread is blocked on a human rather than on the model.
+///
+/// `activeFlags` is a required property of the `active` arm of `ThreadStatus` on both supported
+/// codex-cli versions, and appears on no other arm, so a missing or malformed array reads as no
+/// flag instead of failing the frame - a schema surprise must not kill the control watcher.
+/// Unknown future flag values degrade the same way, to a plain `active` status; admitting a new
+/// codex-cli version already requires a delivery-critical schema comparison, which is where a new
+/// flag value has to be classified.
+fn human_blocking_flag(status: Option<&Value>) -> Option<CodexHoldReason> {
+    status?
+        .get("activeFlags")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|flag| match flag {
+            "waitingOnApproval" => Some(CodexHoldReason::WaitingOnApproval),
+            "waitingOnUserInput" => Some(CodexHoldReason::WaitingOnUserInput),
+            _ => None,
+        })
 }
 
 fn required_string<'a>(message: &'a Value, pointer: &str, method: &str) -> Result<&'a str> {
@@ -4519,5 +4588,139 @@ mod tests {
         assert!(error.to_string().contains("already has an owner"));
         drop(first);
         acquire_owner_lock(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn waiting_on_a_human_holds_the_exact_turn_and_releases_it_when_the_flag_clears() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        let status_changed = |flags: Value| {
+            json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-main",
+                    "status": { "type": "active", "activeFlags": flags }
+                }
+            })
+        };
+        let active_turn_1 = CodexObservedState::Active {
+            turn_id: "turn-1".into(),
+        };
+
+        state.observe(&status_changed(json!([]))).unwrap();
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+        assert_eq!(state.observed(), &active_turn_1);
+
+        for (flags, reason) in [
+            (
+                json!(["waitingOnApproval"]),
+                CodexHoldReason::WaitingOnApproval,
+            ),
+            (
+                json!(["waitingOnUserInput"]),
+                CodexHoldReason::WaitingOnUserInput,
+            ),
+            (
+                json!(["conversationHandoff", "waitingOnApproval"]),
+                CodexHoldReason::WaitingOnApproval,
+            ),
+        ] {
+            assert!(state.observe(&status_changed(flags)).unwrap());
+            assert_eq!(
+                state.observed(),
+                &CodexObservedState::Held {
+                    reason,
+                    turn_id: Some("turn-1".into()),
+                }
+            );
+            // Clearing the flag releases the same turn: no `turn/started` repeats mid-turn.
+            assert!(state.observe(&status_changed(json!([]))).unwrap());
+            assert_eq!(state.observed(), &active_turn_1);
+        }
+
+        // An unknown future flag value degrades to plain `active` instead of failing the frame.
+        assert!(!state.observe(&status_changed(json!(["handoff"]))).unwrap());
+        assert_eq!(state.observed(), &active_turn_1);
+
+        // The same field is carried by `thread/started`, before any turn is known.
+        let mut resumed = CodexControlState::new(&runtime, "thread-main".into());
+        assert!(
+            resumed
+                .observe(&json!({
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "thread-main",
+                            "status": {
+                                "type": "active",
+                                "activeFlags": ["waitingOnUserInput"]
+                            }
+                        }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            resumed.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::WaitingOnUserInput,
+                turn_id: None,
+            }
+        );
+
+        // A turn that ends while still flagged stays unsteerable and is released by the next
+        // idle status. `observe_turn_completed` is not modified here; this pins only that the
+        // flagged hold cannot decay into a steerable turn.
+        state
+            .observe(&status_changed(json!(["waitingOnApproval"])))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "turn/completed",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+        assert!(matches!(state.observed(), CodexObservedState::Held { .. }));
+
+        // A status arm without `activeFlags` keeps reading exactly as before.
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "thread/status/changed",
+                    "params": { "threadId": "thread-main", "status": { "type": "idle" } }
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
+
+        // Delivery declines to steer a session that is waiting on a human, and retains the head.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+                .unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
+        for reason in [
+            CodexHoldReason::WaitingOnApproval,
+            CodexHoldReason::WaitingOnUserInput,
+        ] {
+            let blocked = subscribed_state(CodexObservedState::Held {
+                reason,
+                turn_id: Some("turn-1".into()),
+            });
+            assert_eq!(delivery.maybe_request(&blocked).unwrap(), None);
+            assert!(config.inbox.join(&filename).is_file());
+        }
+        let released = delivery
+            .maybe_request(&subscribed_state(active_turn_1.clone()))
+            .unwrap()
+            .expect("the retained head steers once the human has answered");
+        assert_eq!(released["method"], "turn/steer");
+        assert_eq!(released["params"]["expectedTurnId"], "turn-1");
     }
 }
