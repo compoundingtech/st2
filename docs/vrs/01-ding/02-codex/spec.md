@@ -12,6 +12,20 @@ The screen grammar by which DING recognizes a Codex composer. It realizes
 
 Active.
 
+## Provider-native delivery
+
+The controlled app-server transport starts a turn after the watcher sees
+`idle` or a completed turn with `systemError`. A `systemError` blocks delivery
+until `turn/completed` makes the failed turn terminal. The completed error
+remains the typed `TerminalError { SystemError }` diagnostic until a new
+`turn/started` event or later provider status replaces it. This diagnostic
+permits `turn/start`; it never permits `turn/steer`.
+
+Codex preserves its system-error status after turn completion and sends no
+later status notification. The next turn clears the provider error. The
+`notLoaded`, review, compaction, human-wait, and conflicting-turn states remain
+delivery holds.
+
 ## Locating the composer
 
 This harness is located against the **raw** screen, including escape sequences,
