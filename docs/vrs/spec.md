@@ -381,11 +381,21 @@ array is normalized agent equivalence, not byte identity. The command does not
 decide whether a change is safe, select agents for migration, inspect a PTY
 registry, or authorize apply.
 
-`st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX --json`
+`st2 catalog digest --catalog ROOT --prepared DIR [--json]` performs the same
+retained no-follow capture and desired projection as apply without taking the
+catalog lock or mutating it. Its `st2.catalog-digest.v1` receipt carries the
+canonical catalog and prepared paths plus `rootSha256`, the capability passed as
+`INPUT_HEX`. This command exists for invalid-incumbent repair, where semantic diff
+cannot parse the live side; ordinary apply callers reuse the diff receipt's
+`afterRootSha256` rather than making a redundant capture.
+
+`st2 catalog apply --catalog ROOT --prepared DIR --input-sha256 INPUT_HEX
+--expect-sha256 HEX --json`
 rejects any prepared state/control path, symlink, special node, unprojected
 file/directory, malformed declaration, nonempty prepared workspace fact,
 catalog-local/default PTY root, or effective PTY-root change. Hash-CAS captures
-and validates exact prepared bytes, takes EX, rechecks the canonical live root,
+and validates exact prepared bytes, rejects a captured declaration root unequal
+to `INPUT_HEX` before taking EX or mutating catalog state, takes EX, rechecks the canonical live root,
 and either reports `unchanged` for exact equality or creates a durable
 content-addressed stage before publishing the marker. Version 1 requires an
 explicit PTY root outside the canonical catalog. Hash-CAS permits declared live
@@ -436,14 +446,15 @@ split; exactly one distinct canonical address must exist. Only real state
 directories and a real regular status file can establish marker-time
 addressability. Only `catalog apply --resume --catalog ROOT --json` may open an
 existing marker. The closed marker and internal content-addressed stage are
-sufficient recovery authority; the original prepared path and CAS precondition are
-neither required nor consulted. Marker authority proves the original
-precondition already passed, so recovery converges the partial live tree from
+sufficient recovery authority; the original prepared path, input digest, and incumbent CAS
+precondition are neither required nor consulted. The marker's `preparedRootSha256`
+is the input digest already proven against retained capture before publication.
+Marker authority proves both original preconditions already passed, so recovery converges the partial live tree from
 the durable desired stage and original owned-leaf list without re-enforcing
 that stale precondition. Malformed or mismatched records remain fenced.
 External lock execution and bypass flags are not part of the contract.
 
-`st2 catalog apply --catalog ROOT --prepared DIR --expect-sha256 HEX
+`st2 catalog apply --catalog ROOT --prepared DIR --input-sha256 INPUT_HEX --expect-sha256 HEX
 --raw-preimage --json` is the only writer that accepts the raw-preimage root.
 It first captures and fully admits `DIR` through the ordinary strict prepared
 projection. Under EX it refuses a strictly valid incumbent, requires the

@@ -97,7 +97,16 @@ fn raw_snapshot(catalog: &Path, output: &Path) -> Output {
         .unwrap()
 }
 
+fn prepared_root_sha256(catalog: &Path, prepared: &Path) -> String {
+    st2::catalog_transaction::digest_prepared(catalog, prepared)
+        .map(|digest| digest.root_sha256)
+        // Negative apply fixtures deliberately cannot be digested. A well-formed mismatch lets
+        // the apply command itself reach and report the more specific structural rejection.
+        .unwrap_or_else(|_| "0".repeat(64))
+}
+
 fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
+    let input_sha256 = prepared_root_sha256(catalog, prepared);
     st2()
         .args([
             "catalog",
@@ -106,6 +115,8 @@ fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             expected,
             "--json",
@@ -115,6 +126,7 @@ fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
 }
 
 fn raw_apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
+    let input_sha256 = prepared_root_sha256(catalog, prepared);
     st2()
         .args([
             "catalog",
@@ -123,6 +135,8 @@ fn raw_apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             expected,
             "--raw-preimage",
@@ -170,6 +184,7 @@ fn catalog_apply_cli_exposes_exactly_the_three_closed_modes() {
     let help = String::from_utf8(help.stdout).unwrap();
     for flag in [
         "--prepared",
+        "--input-sha256",
         "--expect-sha256",
         "--raw-preimage",
         "--resume",
@@ -182,6 +197,14 @@ fn catalog_apply_cli_exposes_exactly_the_three_closed_modes() {
     for args in [
         vec!["catalog", "apply"],
         vec!["catalog", "apply", "--prepared", "/tmp/prepared"],
+        vec![
+            "catalog",
+            "apply",
+            "--prepared",
+            "/tmp/prepared",
+            "--expect-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
         vec![
             "catalog",
             "apply",
@@ -204,6 +227,208 @@ fn catalog_apply_cli_exposes_exactly_the_three_closed_modes() {
             "catalog apply accepted an incomplete or ambiguous mode"
         );
     }
+}
+
+#[test]
+fn apply_rejects_a_prepared_projection_mutated_after_digest_without_live_mutation() {
+    for raw_preimage in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        if raw_preimage {
+            write_invalid_agent(&catalog, "worker");
+        } else {
+            write_agent(&catalog, "worker", false);
+        }
+        ensure_external_pty_config(&catalog);
+        let prepared = temp.path().join("prepared");
+        let before = if raw_preimage {
+            let output = raw_snapshot(&catalog, &temp.path().join("raw-preimage"));
+            assert!(output.status.success());
+            let before = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+            let desired = temp.path().join("desired");
+            write_agent(&desired, "worker", false);
+            snapshot(&desired, &prepared);
+            before
+        } else {
+            snapshot(&catalog, &prepared)
+        };
+        let approved = prepared_root_sha256(&catalog, &prepared);
+        fs::write(
+            prepared.join("agents/host/worker/agent.kdl"),
+            agent("worker", true),
+        )
+        .unwrap();
+
+        let mut command = st2();
+        command.args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            &approved,
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+            "--json",
+        ]);
+        if raw_preimage {
+            command.arg("--raw-preimage");
+        }
+        let rejected = command.output().unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("catalog apply input precondition failed"),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+        let live = fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap();
+        if raw_preimage {
+            assert!(live.contains("because=\"unsupported\""));
+        } else {
+            assert_eq!(live, agent("worker", false));
+        }
+    }
+}
+
+#[test]
+fn catalog_digest_is_a_typed_read_only_projection_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let control_before = fs::read_dir(catalog.join(".st2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    let digest = st2()
+        .args([
+            "catalog",
+            "digest",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        digest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&digest.stderr)
+    );
+    let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
+    assert_eq!(digest["schema"], "st2.catalog-digest.v1");
+    assert_eq!(
+        digest["catalog"],
+        catalog.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        digest["prepared"],
+        prepared.canonicalize().unwrap().to_str().unwrap()
+    );
+
+    let diff = st2()
+        .args([
+            "catalog",
+            "diff",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let diff: Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert_eq!(digest["rootSha256"], diff["afterRootSha256"]);
+    let control_after = fs::read_dir(catalog.join(".st2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(control_after, control_before);
+}
+
+#[test]
+fn apply_input_fence_survives_source_free_crash_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let digest = st2()
+        .args([
+            "catalog",
+            "digest",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_WORKSPACE", ".workspace")
+        .output()
+        .unwrap();
+    assert!(digest.status.success());
+    let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
+    let input_sha256 = digest["rootSha256"].as_str().unwrap().to_string();
+    let interrupted = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_CRASH_AT", "marker-created")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    let marker: Value = serde_json::from_slice(
+        &fs::read(catalog.join(".st2/catalog-apply-incomplete")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["preparedRootSha256"], input_sha256);
+    fs::remove_dir_all(&prepared).unwrap();
+
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+        agent("worker", true)
+    );
 }
 
 #[test]
@@ -898,6 +1123,7 @@ fn paused_apply(
     release: &Path,
 ) -> Child {
     let mut command = st2();
+    let input_sha256 = prepared_root_sha256(catalog, prepared);
     command
         .args([
             "catalog",
@@ -906,6 +1132,8 @@ fn paused_apply(
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             expected,
             "--json",
@@ -1220,6 +1448,7 @@ fn raw_preimage_resume_uses_the_durable_validated_stage() {
     write_agent(&desired_source, "worker", false);
     let prepared = temp.path().join("prepared");
     snapshot(&desired_source, &prepared);
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let interrupted = st2()
         .args([
             "catalog",
@@ -1228,6 +1457,8 @@ fn raw_preimage_resume_uses_the_durable_validated_stage() {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             raw_capture["rootSha256"].as_str().unwrap(),
             "--raw-preimage",
@@ -1587,6 +1818,22 @@ fn environment_expanded_relative_workspace_is_projected_and_admitted_consistentl
         "agent \"worker\" {\n  host \"host\"\n  role \"updated\"\n  workspace \"$ST2_TEST_WORKSPACE\"\n  argv \"true\"\n}\n",
     )
     .unwrap();
+    let digest = st2()
+        .args([
+            "catalog",
+            "digest",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--json",
+        ])
+        .env("ST2_TEST_WORKSPACE", ".workspace")
+        .output()
+        .unwrap();
+    assert!(digest.status.success());
+    let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
+    let input_sha256 = digest["rootSha256"].as_str().unwrap().to_string();
     let applied = st2()
         .args([
             "catalog",
@@ -1595,6 +1842,8 @@ fn environment_expanded_relative_workspace_is_projected_and_admitted_consistentl
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
             "--json",
@@ -1784,6 +2033,7 @@ fn retained_capture_refuses_a_destination_inside_its_source_before_traversal() {
     write_agent(&catalog, "worker", false);
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let result = st2()
         .args([
             "catalog",
@@ -1792,6 +2042,8 @@ fn retained_capture_refuses_a_destination_inside_its_source_before_traversal() {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
         ])
@@ -1943,6 +2195,7 @@ fn crashes_recover_from_the_durable_stage_without_rechecking_partial_live_state(
             )
             .unwrap();
         }
+        let input_sha256 = prepared_root_sha256(&catalog, &prepared);
 
         let crashed = st2()
             .args([
@@ -1952,6 +2205,8 @@ fn crashes_recover_from_the_durable_stage_without_rechecking_partial_live_state(
                 catalog.to_str().unwrap(),
                 "--prepared",
                 prepared.to_str().unwrap(),
+                "--input-sha256",
+                &input_sha256,
                 "--expect-sha256",
                 before["rootSha256"].as_str().unwrap(),
                 "--json",
@@ -2001,6 +2256,7 @@ fn a_crash_before_new_identity_publication_resumes_from_control_plane_staging() 
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);
     write_agent(&prepared, "new", false);
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
 
     let crashed = st2()
         .args([
@@ -2010,6 +2266,8 @@ fn a_crash_before_new_identity_publication_resumes_from_control_plane_staging() 
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
         ])
@@ -2043,6 +2301,7 @@ fn apply_post_commit_generation_failure_is_fenced_and_recovered() {
         agent("worker", true),
     )
     .unwrap();
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let failed = st2()
         .args([
             "catalog",
@@ -2051,6 +2310,8 @@ fn apply_post_commit_generation_failure_is_fenced_and_recovered() {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
             "--json",
@@ -2099,6 +2360,7 @@ fn control_directory_swap_cannot_redirect_apply_leaf_or_identity_staging() {
     )
     .unwrap();
     write_agent(&prepared, "new", false);
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let ready = temp.path().join("ready");
     let release = temp.path().join("release");
     let apply = st2()
@@ -2109,6 +2371,8 @@ fn control_directory_swap_cannot_redirect_apply_leaf_or_identity_staging() {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
             "--json",
@@ -2154,6 +2418,7 @@ fn cross_device_leaf_publication_fails_closed_and_remains_source_free_resumable(
         agent("worker", true),
     )
     .unwrap();
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let failed = st2()
         .args([
             "catalog",
@@ -2162,6 +2427,8 @@ fn cross_device_leaf_publication_fails_closed_and_remains_source_free_resumable(
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
         ])
@@ -2200,6 +2467,7 @@ fn cross_device_identity_publication_fails_closed_and_remains_source_free_resuma
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);
     write_agent(&prepared, "new", false);
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let failed = st2()
         .args([
             "catalog",
@@ -2208,6 +2476,8 @@ fn cross_device_identity_publication_fails_closed_and_remains_source_free_resuma
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
         ])
@@ -2257,6 +2527,7 @@ fn recovery_does_not_need_a_partially_broken_old_render_graph() {
         ),
     )
     .unwrap();
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
 
     let crashed = st2()
         .args([
@@ -2266,6 +2537,8 @@ fn recovery_does_not_need_a_partially_broken_old_render_graph() {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
         ])
@@ -2305,6 +2578,7 @@ fn mismatched_recovery_and_malformed_markers_remain_fenced_without_mutation() {
         agent("worker", true),
     )
     .unwrap();
+    let input_sha256 = prepared_root_sha256(&catalog, &prepared);
     let crashed = st2()
         .args([
             "catalog",
@@ -2313,6 +2587,8 @@ fn mismatched_recovery_and_malformed_markers_remain_fenced_without_mutation() {
             catalog.to_str().unwrap(),
             "--prepared",
             prepared.to_str().unwrap(),
+            "--input-sha256",
+            &input_sha256,
             "--expect-sha256",
             before["rootSha256"].as_str().unwrap(),
         ])

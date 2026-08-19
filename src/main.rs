@@ -432,6 +432,15 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum CatalogCmd {
+    /// Compute the authoritative digest bound by `catalog apply --input-sha256`.
+    Digest {
+        /// Complete prepared declaration directory. Runtime state and control paths are rejected.
+        #[arg(long, value_name = "DIR")]
+        prepared: PathBuf,
+        /// Emit the typed source-digest receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare one prepared declaration directory with the coherent live catalog without writing.
     Diff {
         /// Complete prepared declaration directory. Runtime state and control paths are rejected.
@@ -479,6 +488,14 @@ enum CatalogCmd {
             conflicts_with = "resume"
         )]
         prepared: Option<PathBuf>,
+        /// Root SHA-256 of the exact prepared projection being applied.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required_unless_present = "resume",
+            conflicts_with = "resume"
+        )]
+        input_sha256: Option<String>,
         /// Expected canonical declaration-root SHA-256 of the live catalog.
         #[arg(
             long,
@@ -492,7 +509,7 @@ enum CatalogCmd {
         #[arg(long, conflicts_with = "resume")]
         raw_preimage: bool,
         /// Resume the durable incomplete marker and internal stage without the original source.
-        #[arg(long, conflicts_with_all = ["prepared", "expect_sha256"])]
+        #[arg(long, conflicts_with_all = ["prepared", "input_sha256", "expect_sha256"])]
         resume: bool,
         /// Emit the typed application receipt as JSON.
         #[arg(long)]
@@ -1032,6 +1049,15 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Catalog(CatalogCmd::Digest { prepared, json }) => {
+            let digest = st2::catalog_transaction::digest_prepared(&catalog_arg(None)?, &prepared)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&digest)?);
+            } else {
+                println!("{}", digest.root_sha256);
+            }
+            Ok(())
+        }
         Command::Catalog(CatalogCmd::Diff {
             prepared,
             expect_sha256,
@@ -1076,6 +1102,7 @@ fn main() -> Result<()> {
         }
         Command::Catalog(CatalogCmd::Apply {
             prepared,
+            input_sha256,
             expect_sha256,
             raw_preimage,
             resume,
@@ -1085,16 +1112,20 @@ fn main() -> Result<()> {
                 st2::catalog_transaction::ApplyMode::Resume
             } else {
                 let prepared = prepared.context("clap requires --prepared unless --resume")?;
+                let input_sha256 =
+                    input_sha256.context("clap requires --input-sha256 unless --resume")?;
                 let expect_sha256 =
                     expect_sha256.context("clap requires --expect-sha256 unless --resume")?;
                 if raw_preimage {
                     st2::catalog_transaction::ApplyMode::RawPreimage {
                         prepared,
+                        input_sha256,
                         expect_sha256,
                     }
                 } else {
                     st2::catalog_transaction::ApplyMode::Prepared {
                         prepared,
+                        input_sha256,
                         expect_sha256,
                     }
                 }

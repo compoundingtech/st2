@@ -189,8 +189,9 @@ accepted.
   externalizes the declaration-root digest while excluding runtime state and
   workspace content. Its closed projection includes every regular file in a
   bounded `_templates` library and exact declared canonical workspace directory
-  facts. Whole-catalog apply accepts only that projection, rechecks the root
-  digest under the exclusive lock, durably stages the desired bytes, and resumes
+  facts. Whole-catalog apply binds its exact captured desired projection to a
+  caller-supplied input digest before locking or mutation, rechecks the incumbent
+  root digest under the exclusive lock, durably stages the desired bytes, and resumes
   after interruption solely from a closed marker and its content-addressed
   stage. A distinct raw-preimage projection may bind a repair to the exact
   structural declaration bytes of an invalid incumbent without interpreting
