@@ -1613,7 +1613,18 @@ fn strict_discovery_reports_unobservable_declaration_entries() {
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixListener;
 
-    let tmp = tempfile::tempdir().unwrap();
+    // A SHORT root, not `tempfile::tempdir()`, which honours TMPDIR. This test
+    // binds a unix socket inside the directory it then scans, and a socket
+    // address is capped at 104 bytes (Darwin; Linux allows 108, so the portable
+    // bound is the smaller). Under `cargo test` in a session that points TMPDIR
+    // at a long per-agent directory the bind fails with "path must be shorter
+    // than SUN_LEN", reported from inside a discovery assertion rather than at
+    // the socket. The socket has to live in the scanned directory, so the root
+    // itself is what must stay short.
+    let tmp = tempfile::Builder::new()
+        .prefix("st2-discovery-")
+        .tempdir_in("/tmp")
+        .unwrap();
     write(
         tmp.path(),
         "agents/hetz/live/agent.kdl",
