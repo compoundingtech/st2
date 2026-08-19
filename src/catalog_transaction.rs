@@ -194,13 +194,34 @@ pub struct ApplyRequest {
 pub enum ApplyMode {
     Prepared {
         prepared: PathBuf,
+        input_sha256: String,
         expect_sha256: String,
     },
     RawPreimage {
         prepared: PathBuf,
+        input_sha256: String,
         expect_sha256: String,
     },
     Resume,
+}
+
+/// Compute the declaration-root digest that binds a prepared whole-catalog input.
+///
+/// This uses the same retained, no-follow capture and projection as [`apply`], but performs no
+/// catalog mutation. Deployment producers normally retain this digest from their own prepared
+/// artifact; the public helper keeps tests and other Rust callers on the transaction's exact hash
+/// domain.
+pub fn digest_prepared(catalog: &Path, prepared: &Path) -> Result<String> {
+    let catalog = canonical_real_dir(catalog, "catalog")?;
+    let prepared = canonical_real_dir_no_alias(prepared, "prepared catalog")?;
+    anyhow::ensure!(
+        !prepared.starts_with(&catalog),
+        "prepared catalog must be outside the live catalog: {}",
+        prepared.display()
+    );
+    let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
+    capture_prepared_catalog(&prepared, captured.path())?;
+    Ok(project(captured.path(), ProjectionSource::Prepared, &catalog)?.root_sha256)
 }
 
 #[derive(Debug, Serialize)]
@@ -1361,8 +1382,10 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     let prepared_input = match request.mode {
         ApplyMode::Prepared {
             prepared,
+            input_sha256,
             expect_sha256,
         } => {
+            validate_sha256(&input_sha256)?;
             validate_sha256(&expect_sha256)?;
             let prepared = canonical_real_dir_no_alias(&prepared, "prepared catalog")?;
             anyhow::ensure!(
@@ -1373,12 +1396,20 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
             let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
             capture_prepared_catalog(&prepared, captured.path())?;
             let desired = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
+            anyhow::ensure!(
+                desired.root_sha256 == input_sha256,
+                "catalog apply input precondition failed: expected sha256 {}, captured {}",
+                input_sha256,
+                desired.root_sha256
+            );
             Some((prepared, expect_sha256, desired, false))
         }
         ApplyMode::RawPreimage {
             prepared,
+            input_sha256,
             expect_sha256,
         } => {
+            validate_sha256(&input_sha256)?;
             validate_sha256(&expect_sha256)?;
             let prepared = canonical_real_dir_no_alias(&prepared, "prepared catalog")?;
             anyhow::ensure!(
@@ -1389,6 +1420,12 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
             let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
             capture_prepared_catalog(&prepared, captured.path())?;
             let desired = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
+            anyhow::ensure!(
+                desired.root_sha256 == input_sha256,
+                "catalog apply input precondition failed: expected sha256 {}, captured {}",
+                input_sha256,
+                desired.root_sha256
+            );
             Some((prepared, expect_sha256, desired, true))
         }
         ApplyMode::Resume => None,
