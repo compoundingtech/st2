@@ -98,7 +98,11 @@ fn raw_snapshot(catalog: &Path, output: &Path) -> Output {
 }
 
 fn prepared_root_sha256(catalog: &Path, prepared: &Path) -> String {
-    st2::catalog_transaction::digest_prepared(catalog, prepared).unwrap_or_else(|_| "0".repeat(64))
+    st2::catalog_transaction::digest_prepared(catalog, prepared)
+        .map(|digest| digest.root_sha256)
+        // Negative apply fixtures deliberately cannot be digested. A well-formed mismatch lets
+        // the apply command itself reach and report the more specific structural rejection.
+        .unwrap_or_else(|_| "0".repeat(64))
 }
 
 fn apply(catalog: &Path, prepared: &Path, expected: &str) -> Output {
@@ -291,6 +295,79 @@ fn apply_rejects_a_prepared_projection_mutated_after_digest_without_live_mutatio
 }
 
 #[test]
+fn catalog_digest_is_a_typed_read_only_projection_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let control_before = fs::read_dir(catalog.join(".st2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    let digest = st2()
+        .args([
+            "catalog",
+            "digest",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        digest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&digest.stderr)
+    );
+    let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
+    assert_eq!(digest["schema"], "st2.catalog-digest.v1");
+    assert_eq!(
+        digest["catalog"],
+        catalog.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        digest["prepared"],
+        prepared.canonicalize().unwrap().to_str().unwrap()
+    );
+
+    let diff = st2()
+        .args([
+            "catalog",
+            "diff",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let diff: Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert_eq!(digest["rootSha256"], diff["afterRootSha256"]);
+    let control_after = fs::read_dir(catalog.join(".st2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(control_after, control_before);
+}
+
+#[test]
 fn apply_input_fence_survives_source_free_crash_resume() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -317,7 +394,7 @@ fn apply_input_fence_survives_source_free_crash_resume() {
         .unwrap();
     assert!(digest.status.success());
     let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
-    let input_sha256 = digest["sha256"].as_str().unwrap().to_string();
+    let input_sha256 = digest["rootSha256"].as_str().unwrap().to_string();
     let interrupted = st2()
         .args([
             "catalog",
@@ -1756,7 +1833,7 @@ fn environment_expanded_relative_workspace_is_projected_and_admitted_consistentl
         .unwrap();
     assert!(digest.status.success());
     let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
-    let input_sha256 = digest["sha256"].as_str().unwrap().to_string();
+    let input_sha256 = digest["rootSha256"].as_str().unwrap().to_string();
     let applied = st2()
         .args([
             "catalog",

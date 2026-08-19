@@ -1050,21 +1050,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Catalog(CatalogCmd::Digest { prepared, json }) => {
-            let sha256 = st2::catalog_transaction::digest_prepared(
-                &catalog_arg(None)?,
-                &prepared,
-            )?;
+            let digest = st2::catalog_transaction::digest_prepared(&catalog_arg(None)?, &prepared)?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema": "st2.catalog-digest.v1",
-                        "prepared": prepared,
-                        "sha256": sha256,
-                    }))?
-                );
+                println!("{}", serde_json::to_string_pretty(&digest)?);
             } else {
-                println!("{sha256}");
+                println!("{}", digest.root_sha256);
             }
             Ok(())
         }

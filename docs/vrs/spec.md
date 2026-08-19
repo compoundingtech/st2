@@ -383,7 +383,11 @@ registry, or authorize apply.
 
 `st2 catalog digest --catalog ROOT --prepared DIR [--json]` performs the same
 retained no-follow capture and desired projection as apply without taking the
-catalog lock or mutating it. Its digest is the capability passed as `INPUT_HEX`.
+catalog lock or mutating it. Its `st2.catalog-digest.v1` receipt carries the
+canonical catalog and prepared paths plus `rootSha256`, the capability passed as
+`INPUT_HEX`. This command exists for invalid-incumbent repair, where semantic diff
+cannot parse the live side; ordinary apply callers reuse the diff receipt's
+`afterRootSha256` rather than making a redundant capture.
 
 `st2 catalog apply --catalog ROOT --prepared DIR --input-sha256 INPUT_HEX
 --expect-sha256 HEX --json`

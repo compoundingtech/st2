@@ -24,6 +24,7 @@ const MARKER_SCHEMA: &str = "st2.catalog-apply-incomplete.v1";
 const RAW_SNAPSHOT_SCHEMA: &str = "st2.catalog-raw-preimage-snapshot.v1";
 const RAW_APPLY_SCHEMA: &str = "st2.catalog-raw-preimage-apply.v1";
 const RAW_MARKER_SCHEMA: &str = "st2.catalog-raw-preimage-apply-incomplete.v1";
+const DIGEST_SCHEMA: &str = "st2.catalog-digest.v1";
 const HASH_DOMAIN: &[u8] = b"st2.catalog-declaration-root.v1\0";
 const RAW_HASH_DOMAIN: &[u8] = b"st2.catalog-raw-preimage-root.v1\0";
 const STAGE_PREFIX: &str = "catalog-apply-stage-";
@@ -211,7 +212,16 @@ pub enum ApplyMode {
 /// catalog mutation. Deployment producers normally retain this digest from their own prepared
 /// artifact; the public helper keeps tests and other Rust callers on the transaction's exact hash
 /// domain.
-pub fn digest_prepared(catalog: &Path, prepared: &Path) -> Result<String> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogDigest {
+    pub schema: &'static str,
+    pub catalog: PathBuf,
+    pub prepared: PathBuf,
+    pub root_sha256: String,
+}
+
+pub fn digest_prepared(catalog: &Path, prepared: &Path) -> Result<CatalogDigest> {
     let catalog = canonical_real_dir(catalog, "catalog")?;
     let prepared = canonical_real_dir_no_alias(prepared, "prepared catalog")?;
     anyhow::ensure!(
@@ -221,7 +231,13 @@ pub fn digest_prepared(catalog: &Path, prepared: &Path) -> Result<String> {
     );
     let captured = tempfile::tempdir().context("create prepared-catalog capture root")?;
     capture_prepared_catalog(&prepared, captured.path())?;
-    Ok(project(captured.path(), ProjectionSource::Prepared, &catalog)?.root_sha256)
+    let root_sha256 = project(captured.path(), ProjectionSource::Prepared, &catalog)?.root_sha256;
+    Ok(CatalogDigest {
+        schema: DIGEST_SCHEMA,
+        catalog,
+        prepared,
+        root_sha256,
+    })
 }
 
 #[derive(Debug, Serialize)]

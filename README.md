@@ -137,7 +137,7 @@ st2 catalog snapshot --catalog "$CATALOG" --output ./invalid-preimage \
 # Produce a fully valid ./prepared directory from that capture.
 st2 catalog digest --catalog "$CATALOG" --prepared ./prepared --json
 st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
-  --input-sha256 <desired-rootSha256> --expect-sha256 <raw-rootSha256> \
+  --input-sha256 <rootSha256> --expect-sha256 <raw-rootSha256> \
   --raw-preimage --json
 ```
 
@@ -607,7 +607,8 @@ declaration-plane writer. Each admits the complete prospective catalog under a
 compare-and-swap lock before making one atomic change.
 `st2 catalog digest --catalog ROOT --prepared DIR` computes the exact desired
 projection digest consumed by apply, including for raw-preimage repair where the
-incumbent cannot support semantic diff.
+invalid incumbent cannot support semantic diff. Ordinary valid-catalog workflows
+reuse `afterRootSha256` from the required policy-inspection diff instead.
 `st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 ROOT_HEX`
 is the create-only writer for an absent catalog. An exact completed replay is
 `unchanged`; any different or incomplete existing target fails closed.
