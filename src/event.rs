@@ -451,14 +451,20 @@ pub fn emit(
                     // Publish before compacting. If predecessor archival fails or the process
                     // crashes between these operations, both records remain unread; replaying the
                     // durable pending reservation completes compaction without risking a lost wake.
-                    let (created, published_dir) = match read_message_entry(archive, &filename)? {
-                        Some(bytes) => {
-                            anyhow::ensure!(
-                                bytes == rendered.as_bytes(),
-                                "archived pending event '{}#{}' has different bytes",
+                    let (created, published_dir) = match open_message_entry(archive, &filename)? {
+                        Some((_, bytes)) => {
+                            validate_pending_message(
                                 stream,
-                                event_id
-                            );
+                                record.pending.as_ref().expect("pending reservation exists"),
+                                &bytes,
+                            )?;
+                            if let Some((_, inbox_bytes)) = open_message_entry(inbox, &filename)? {
+                                validate_pending_message(
+                                    stream,
+                                    record.pending.as_ref().expect("pending reservation exists"),
+                                    &inbox_bytes,
+                                )?;
+                            }
                             (false, archive)
                         }
                         None => match read_message_entry(inbox, &filename)? {
@@ -592,24 +598,28 @@ fn finish_predecessor(
     archive: &Path,
 ) -> anyhow::Result<()> {
     let inbox_entry = open_message_entry(inbox, &predecessor.filename)?;
-    let archive_bytes = read_message_entry(archive, &predecessor.filename)?;
+    let archive_entry = open_message_entry(archive, &predecessor.filename)?;
     if let Some((_, bytes)) = inbox_entry.as_ref() {
         validate_retained_message(stream, predecessor, bytes)?;
     }
-    if let Some(bytes) = archive_bytes.as_deref() {
+    if let Some((_, bytes)) = archive_entry.as_ref() {
         validate_retained_message(stream, predecessor, bytes)?;
     }
     anyhow::ensure!(
-        inbox_entry.is_some() || archive_bytes.is_some(),
+        inbox_entry.is_some() || archive_entry.is_some(),
         "supersession predecessor '{}#{}' has no inbox file or archive receipt",
         stream,
         predecessor.event_id
     );
-    if archive_bytes.is_none()
+    if archive_entry.is_none()
         && let Some((file, _)) = inbox_entry.as_ref()
     {
         test_predecessor_archive_checkpoint()?;
         archive_validated_file(file, inbox, archive, &predecessor.filename)?;
+    } else if let (Some((inbox_file, _)), Some((archive_file, _))) =
+        (inbox_entry.as_ref(), archive_entry.as_ref())
+    {
+        conditional_unlink_same_inode(inbox_file, archive_file, inbox, &predecessor.filename)?;
     }
     Ok(())
 }
@@ -674,16 +684,31 @@ fn archive_validated_file(
     anyhow::ensure!(archived == expected, "archive receipt has different bytes");
     File::open(archive.join(filename))?.sync_all()?;
     archive_dir.sync_all()?;
-    let validated = file.metadata()?;
+    conditional_unlink_same_inode(file, file, inbox, filename)?;
+    File::open(inbox)?.sync_all()?;
+    Ok(())
+}
+
+fn conditional_unlink_same_inode(
+    inbox_file: &File,
+    expected_file: &File,
+    inbox: &Path,
+    filename: &str,
+) -> anyhow::Result<()> {
+    let validated = expected_file.metadata()?;
+    let opened = inbox_file.metadata()?;
+    if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
+        return Ok(());
+    }
     match fs::symlink_metadata(inbox.join(filename)) {
         Ok(current) if current.dev() == validated.dev() && current.ino() == validated.ino() => {
             fs::remove_file(inbox.join(filename))?;
+            File::open(inbox)?.sync_all()?;
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("inspect predecessor before conditional unlink"),
     }
-    File::open(inbox)?.sync_all()?;
     Ok(())
 }
 

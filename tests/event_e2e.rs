@@ -1159,6 +1159,91 @@ fn pending_supersession_accepts_an_authenticated_archive_only_predecessor() {
 }
 
 #[test]
+fn pending_supersession_recovery_unlinks_a_durably_archived_predecessor() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "running", Some("pr-1"), false);
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "passed",
+        Some("pr-1"),
+        Some("passed"),
+        "passed",
+        true,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    let inbox = message::inbox_dir(&agent);
+    let archive = message::archive_dir(&agent);
+    fs::create_dir_all(&archive).unwrap();
+    fs::hard_link(
+        inbox.join(&predecessor.filename),
+        archive.join(&predecessor.filename),
+    )
+    .unwrap();
+
+    let next = emit(catalog.path(), "unrelated", Some("pr-2"), false);
+
+    assert_eq!(next.status, EventReceiptStatus::Created);
+    assert!(archive.join(&predecessor.filename).is_file());
+    assert!(!inbox.join(&predecessor.filename).exists());
+}
+
+#[test]
+fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved:materialized") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "reserved",
+        Some("pr-1"),
+        Some("reserved"),
+        "reserved",
+        false,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(agent.join("resources/streams/gh-ci/state.json")).unwrap(),
+    )
+    .unwrap();
+    let filename = state["pending"]["filename"].as_str().unwrap();
+    let inbox = message::inbox_dir(&agent);
+    let archive = message::archive_dir(&agent);
+    message::archive_msg(&inbox, &archive, filename).unwrap();
+    fs::write(inbox.join(filename), b"forged same-name inbox entry").unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "next",
+        None,
+        None,
+        "next",
+        false,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("different bytes"), "{error:#}");
+    assert_eq!(
+        fs::read(inbox.join(filename)).unwrap(),
+        b"forged same-name inbox entry"
+    );
+}
+
+#[test]
 fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
     let catalog = tempfile::tempdir().unwrap();
