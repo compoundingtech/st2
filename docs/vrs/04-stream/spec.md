@@ -97,15 +97,25 @@ Emitting to an undeclared stream or unknown agent is refused before writes,
 and so is a recipient whose desired state is not running — suspension means
 eyes closed for external producers too (STREAM-R09): the emit returns a typed
 refusal rather than accumulating events a suspended agent will wake to.
-Emit acquires the same catalog-authoring lock used by stream add/remove and
-desired-state edits, then performs strict catalog discovery and eligibility
-validation while holding it. It retains that lock across the entire
-per-stream transaction — pending reconciliation, reservation, inbox/archive
-work, and receipt finalization. The global lock order is catalog-authoring
-then stream state (then the ordinary message-box locks); no path may acquire
-them in reverse. Thus emit and removal/suspension have one linearization order:
-an authoring change that wins the lock is visible to admission, while an emit
-that wins first completes before that change commits.
+
+Ingress is owner-host-local. During strict discovery, the recipient
+declaration's resolved owner host must equal the caller's st2 host context. A
+catalog copy synchronized onto another host is observation state, not ingress
+authority, and `event emit` there refuses before acquiring stream state or
+writing inbox/archive bytes. A cross-host producer must forward its observation
+to an adapter or transport endpoint running on the owner host and invoke emit
+there; that forwarding transport is not implemented by this subsystem.
+
+On the owner host, emit acquires the same local catalog-authoring lock used by
+stream add/remove and desired-state edits, then performs strict catalog
+discovery and eligibility validation while holding it. It retains that lock
+across the entire per-stream transaction — pending reconciliation,
+reservation, inbox/archive work, and receipt finalization. The local lock order
+is catalog-authoring then stream state (then the ordinary message-box locks);
+no path may acquire them in reverse. Thus owner-local emit and
+removal/suspension have one linearization order: an authoring change that wins
+the lock is visible to admission, while an emit that wins first completes
+before that change commits. No cross-host POSIX-lock claim is made.
 
 Replaying `(stream, event-id)` — concurrently or across a crash — returns the
 original filename with `deduplicated` while that identity remains in the

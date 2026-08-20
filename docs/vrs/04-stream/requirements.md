@@ -20,7 +20,10 @@ executable evidence lives in [`.experiments/`](./.experiments/).
 
 - **STREAM-A01 Host-local streams:** A stream runs on its owning agent's
   declared host (`R03`). Cross-host observation is served by placing the
-  adapter on the right host, not by remote streams.
+  adapter on the right host, not by remote streams. Ingress executes only in
+  that owner's local lock domain: the caller's host context must equal the
+  declaration's resolved owner host. A synchronized remote catalog copy is
+  not publication authority.
 - **STREAM-A02 Trusted producers:** Emitting into a declared stream is gated
   by the declaration's existence and the trusted-fleet model (root `A02`), not
   by authentication. An external producer that names an undeclared stream is
@@ -65,7 +68,9 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   `event-id` are refused. Dedup scope is `(stream, event-id)` per recipient.
   Admission and publication linearize while holding the catalog-authoring lock
   across strict declaration/desired-state revalidation and the stream-state
-  transaction; lock order is catalog-authoring then stream state.
+  transaction; lock order is catalog-authoring then stream state. This
+  linearization exists only in the recipient owner's host-local lock domain;
+  remote callers are refused before publication.
 - **STREAM-R04 Idempotent ingress:** One external event becomes exactly one
   durable inbox record while its identity remains in the stream's retained
   receipt ring. Replaying an `event-id` within that horizon — including
@@ -120,9 +125,11 @@ executable evidence lives in [`.experiments/`](./.experiments/).
 - **STREAM-R09 Suspension means eyes closed:** While an agent is suspended no
   events accumulate for it. Resume re-observes current state; re-emitting
   still-current state is safe under `STREAM-R03` dedup. Suspension and stream
-  removal serialize with emit through the catalog-authoring lock: whichever
-  owns it first is the linearized operation, and no emit admitted after the
-  lifecycle/catalog change can publish under stale eligibility.
+  removal serialize with owner-local emit through the catalog-authoring lock:
+  whichever owns it first is the linearized operation, and no emit admitted
+  after the lifecycle/catalog change can publish under stale eligibility.
+  This guarantee is scoped to the owner's local lock domain; cross-host
+  producers must forward to an owner-host adapter/transport before ingress.
 
 ## Evidence
 
