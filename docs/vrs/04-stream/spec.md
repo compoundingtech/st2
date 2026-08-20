@@ -97,9 +97,12 @@ and so is a recipient whose desired state is not running — suspension means
 eyes closed for external producers too (STREAM-R09): the emit returns a typed
 refusal rather than accumulating events a suspended agent will wake to.
 Replaying `(stream, event-id)` — concurrently or across a crash — returns the
-original filename with `deduplicated`; conflicting reuse of an `event-id` with
-different content fails. A duplicate never re-notifies: archive receipts keep
-their `03-message` authority.
+original filename with `deduplicated` while that identity remains in the
+stream's retained receipt ring. Conflicting reuse with different content
+fails within the same horizon. Once an identity is evicted, ingress honestly
+treats it as new; inbox and archive files are not searched as an unbounded
+secondary index. An archive receipt keeps its `03-message` authority for a
+known filename, so crash recovery never restores that filename to the inbox.
 
 ## Event record (STREAM-R06)
 
@@ -127,28 +130,17 @@ gating are inherited.
 
 ## Stream state (STREAM-R05)
 
-Dedup authority is ordered, and correctness never depends on the bounded
-state:
+Per-stream durable state is a constant-size ring of the last `K`
+`(event-id → filename, content digest)` receipts under the owning agent's
+resources (exact path DQ-S2). The ring is the entire deduplication and
+conflicting-content-detection horizon: a hit answers in O(1), while a miss is
+accepted as a new identity without scanning the unread inbox or archive.
 
-1. **Ring hit** — a constant-size ring of the last `K` `(event-id → filename,
-   content digest)` entries under the owning agent's resources (exact path
-   DQ-S2) answers the common replay in O(1).
-2. **Unread inbox copy** — on a ring miss, the recipient's unread inbox is
-   scanned for the `(stream, event-id)` frontmatter; an unread event always
-   deduplicates against itself.
-3. **Archive receipt** — an archived event deduplicates through its receipt,
-   with the same `03-message` authority and retention boundary ordinary
-   messages have.
-
-Same identity with different content fails at whichever layer answers.
-Nothing is chained, hashed, or validated O(history): emit work is
-history-independent — O(1) on the ring path, at most proportional to the
-unread backlog on a stale replay or supersession lookup (STREAM-R05). The
-ring is the only durable stream state; `K` defaults to 128 pending
-measurement (DQ-S3) and affects only the fast-path hit rate and the
-conflicting-content detection window, never replay identity, which survives
-as long as the unread copy or its archive receipt — the same honesty boundary
-the bus already carries.
+Nothing is chained, hashed, or validated O(history), and publication work is
+independent of retained stream history. `K` is 128 pending measurement
+(DQ-S3). An ordinary archive receipt remains authoritative for its known
+filename, but random inbox/archive filenames do not form a reverse index from
+`(stream, event-id)` and are not searched as one.
 
 ## Supersession (STREAM-R07)
 

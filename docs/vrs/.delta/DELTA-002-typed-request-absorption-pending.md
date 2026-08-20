@@ -18,7 +18,10 @@ The accepted target is stated in decision 0004 and staged as
 [04-stream DQ-S4](../04-stream/open-questions.md): a reply to an event is an
 ordinary `message reply`; `pending | replied` derives from `in-reply-to`;
 `MESSAGE-R11`'s separation purpose survives because events never write the
-sender ledger. The superseded sections carry forward-pointers to this delta.
+sender ledger. A stream-qualified producer identity does not currently resolve
+to an agent or service-principal mailbox, so ordinary reply routing is still
+an explicit design and implementation gap (04-stream DQ-S1). The superseded
+sections carry forward-pointers to this delta.
 
 ## Implementation
 
@@ -29,7 +32,8 @@ wire types carry `deny_unknown_fields` and cannot evolve in place (fresh
 namespace, not migration), and `request-state` dedup receipts are retired, not
 converted — an announced loss after a deprecation window. The eval-owned
 external requester capability (`MESSAGE-A01`) must keep a working path
-throughout.
+throughout. The typed request surface must not enter deprecation until an
+event reply reaches a real producer endpoint end to end.
 
 ## Direction
 
@@ -37,11 +41,12 @@ update implementation
 
 ## Resolution Signal
 
-Staged, in order: (1) stream events plus reply-derived status land with their
-own invariant proofs; (2) the **Idempotent service requests** row is re-pointed
-to the replacement proofs in the same commit that starts the `st2 request`
-deprecation window (`qualified_proof_references_resolve` enforces the
-ordering); (3) after the window, `src/request.rs` and `request-state` writes
-are removed, the superseded spec sections are deleted, and `MESSAGE-R11` is
-re-worded to its surviving form. Close this delta at step 3 with the exact
-removal commit recorded.
+Staged, in order: (1) stream events land with their own invariant proofs;
+(2) a routable event-producer reply endpoint and reply-derived status land
+with an end-to-end proof preserving `MESSAGE-A01`; (3) the **Idempotent service
+requests** row is re-pointed to those replacement proofs in the same commit
+that starts the `st2 request` deprecation window
+(`qualified_proof_references_resolve` enforces the ordering); (4) after the
+window, `src/request.rs` and `request-state` writes are removed, the superseded
+spec sections are deleted, and `MESSAGE-R11` is re-worded to its surviving
+form. Close this delta at step 4 with the exact removal commit recorded.

@@ -60,17 +60,18 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   a declared stream, and a producer-supplied `event-id`. Emits without an
   `event-id` are refused. Dedup scope is `(stream, event-id)` per recipient.
 - **STREAM-R04 Idempotent ingress:** One external event becomes exactly one
-  durable inbox record. Replaying an `event-id` — including concurrent and
-  crash-interrupted retries — returns the original filename, creates no second
-  record, and never re-notifies; an archive receipt retains its existing
-  authority. The machine receipt distinguishes `created` from `deduplicated`.
+  durable inbox record while its identity remains in the stream's retained
+  receipt ring. Replaying an `event-id` within that horizon — including
+  concurrent and crash-interrupted retries — returns the original filename,
+  creates no second record, and never re-notifies. Once evicted, the identity
+  is honestly accepted as new; an archive receipt retains its existing
+  authority for a known filename but is not an event-identity index. The
+  machine receipt distinguishes `created` from `deduplicated`.
 - **STREAM-R05 Bounded stream state:** Per-stream durable dedup state is
-  constant-size (a bounded ring), and correctness never depends on it: replay
-  identity is anchored in the unread inbox copy and the archive receipt. Event
-  publication does not write the Agent Sent ledger and performs
-  history-independent work per emit — constant on the ring fast path, at most
-  proportional to the unread backlog on a stale replay or supersession lookup,
-  never proportional to stream history.
+  constant-size (a bounded ring), which defines the deduplication and
+  conflicting-content-detection horizon. Event publication does not write the
+  Agent Sent ledger and performs history-independent work per emit: it never
+  scans inbox or archive history to recover an evicted event identity.
 
 ### Must deliver as ordinary inbox work
 
@@ -79,10 +80,12 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   Delivery rides the unchanged inbox paths; DING renders events with the `»`
   marker and inherits every fail-closed guarantee untouched.
 - **STREAM-R07 Producer-side supersession:** An emit may declare supersession:
-  the stream's unread predecessor for the same `key` is archived before the
-  successor publishes. Supersession never touches DING staged ownership — a
-  staged notice is released only through the existing archive-receipt rule —
-  and a fast-superseding stream stays within `R15` bounds.
+  the successor publishes before the stream's unread predecessor for the same
+  `key` is archived. A crash between those steps may leave both events unread
+  but never removes the only wakeup. Supersession never touches DING staged
+  ownership — a staged notice is released only through the existing
+  archive-receipt rule — and a fast-superseding stream stays within `R15`
+  bounds.
 
 ### Must couple to the owning agent's lifecycle
 

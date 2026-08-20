@@ -32,16 +32,21 @@ event frontmatter: the producing stream, a mandatory producer-supplied
 
 Event publication does not write the permanent hash-chained Agent Sent ledger.
 Dedup state is a bounded, constant-size ring per stream; replaying an
-`event-id` returns the original filename and never re-notifies (archive
-receipts keep their existing authority). An emit may declare `--supersede`,
-which archives the stream's unread predecessor for the same `key` —
-log-compaction semantics — implemented producer-side only; DING's staged
-ownership is never touched.
+`event-id` within the retained receipt horizon returns the original filename
+and never re-notifies. An evicted identity is accepted as new without scanning
+inbox or archive history; archive receipts keep their existing authority for
+known filenames. An emit may declare `--supersede`, which publishes the
+successor before archiving the stream's unread predecessor for the same `key`
+— log-compaction semantics with a duplicate-wakeup rather than lost-wakeup
+crash bias — implemented producer-side only; DING's staged ownership is never
+touched.
 
 Ordinary messages and `MESSAGE-R01..R11` are unchanged. The typed
 service-principal request/reply envelopes are absorbed over time: a reply to
 an event is an ordinary `message reply`, and the `pending | replied` status
-derives from `in-reply-to`.
+derives from `in-reply-to`. Retirement is conditional on defining and proving
+a routable reply endpoint for the stream producer; a stream-qualified `from`
+identity is not by itself such an endpoint.
 
 ## Options
 

@@ -4,28 +4,33 @@ Each entry links a spec `DQ-S*`. Questions leave this file when resolved —
 into [spec.md](./spec.md) as decisions or [`.experiments/`](./.experiments/)
 as tested hypotheses.
 
-- **DQ-S1 Producer-identity grammar.** What exact `from` value does a nested
-  stream's event carry? Candidates: `<host>.<agent>/<stream>` (slash keeps the
-  bus-ID grammar unambiguous) vs `<host>.<agent>.<stream>` (collides with the
-  task runtime-ID grammar). Resolves by: checking every existing `from`
-  consumer (DING marker resolution, roster joins, message filters) against
-  both grammars; the one no consumer misparses wins.
+- **DQ-S1 Producer identity and reply routing.** What exact `from` value does a
+  nested stream's event carry, and what routable endpoint receives an ordinary
+  `message reply` to it? Candidates for producer identity are
+  `<host>.<agent>/<stream>` (slash keeps the bus-ID grammar unambiguous) vs
+  `<host>.<agent>.<stream>` (collides with the task runtime-ID grammar), but
+  neither currently resolves as an agent or service-principal mailbox.
+  Resolves by: checking every existing `from` consumer and specifying a real
+  reply recipient with an end-to-end proof. Typed request retirement remains
+  blocked until the eval-owned external requester has that working path.
 - **DQ-S2 Stream state path.** Where the dedup ring lives under the owner's
   resources (`resources/streams/<name>/` proposed; the ring is the only
   durable stream state — supersession heads are derived from the unread
   inbox, not stored). Resolves during implementation with the
   state-namespace conventions of R02.
-- **DQ-S3 Ring bound.** `K = 128` is a guess. Correctness does not depend on
-  it (replay identity anchors in the unread copy and archive receipt); `K`
-  sets the O(1) fast-path hit rate and the conflicting-content detection
-  window. Resolves by: measuring real adapter emit rates (CI flaps, timer
-  sources) against replay windows.
+- **DQ-S3 Ring bound and identity horizon.** `K = 128` is the current
+  deduplication and conflicting-content-detection horizon, not merely a fast
+  path: an evicted identity is accepted as new without scanning inbox or
+  archive history. Resolves by: measuring real adapter emit rates and
+  retry/rediscovery windows (CI transitions, builds, timer sources), then
+  retaining this bound or selecting another constant-size index.
 - **DQ-S4 Request absorption staging.** The typed request/reply envelopes
   (`request.rs`) are absorbed by events + ordinary replies (decision 0004),
   but its wire types carry `deny_unknown_fields` and its invariant row names
-  live tests. Resolves by: a staged plan — land replacement proofs, re-point
-  the invariant row, retire the module behind a deprecation window; blocked
-  until the stream implementation itself is merged.
+  live tests. Resolves by: a staged plan — land replacement proofs including
+  the routable reply endpoint from DQ-S1, re-point the invariant row, retire
+  the module behind a deprecation window; blocked until both the stream
+  implementation and that reply path are merged.
 - **DQ-S5 Top-level shared streams.** One adapter feeding many agents
   (STREAM-T02). Must be defined as a generalization: a nested stream is a
   top-level stream whose owner and sole recipient is the enclosing agent.
