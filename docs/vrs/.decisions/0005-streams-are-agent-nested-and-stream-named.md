@@ -75,6 +75,8 @@ run natively without a second producer-identity mechanism.
   R27 tears it down with the agent — eyes closed, no accumulation, resume
   re-observes; the dedup ring makes re-emission of still-current state safe.
 - Ingress authority follows the same locality: `event emit` runs only when its
-  caller host context is the declaration's resolved owner host. Synchronized
-  remote catalogs cannot publish; cross-host observations need an owner-host
-  forwarding adapter/transport, which v1 does not provide.
+  non-overridable locally detected host identity is the declaration's resolved
+  owner host. Caller-controlled logical resolution such as `--host` cannot
+  grant authority. Synchronized remote catalogs cannot publish; cross-host
+  observations need an owner-host forwarding adapter/transport, which v1 does
+  not provide.

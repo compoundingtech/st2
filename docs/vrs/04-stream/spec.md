@@ -99,9 +99,14 @@ eyes closed for external producers too (STREAM-R09): the emit returns a typed
 refusal rather than accumulating events a suspended agent will wake to.
 
 Ingress is owner-host-local. During strict discovery, the recipient
-declaration's resolved owner host must equal the caller's st2 host context. A
-catalog copy synchronized onto another host is observation state, not ingress
-authority, and `event emit` there refuses before acquiring stream state or
+declaration's resolved owner host must equal st2's non-overridable local-host
+authority (the running machine's detected short hostname, or an equivalently
+trusted host identity fixed when an owner-local service starts). `MsgCtx --host`
+is only a logical bus-ID resolution override and must not participate
+in this authority check; `event emit --host <owner>` on another machine still
+refuses. An implementation may instead reject `--host` for event ingress
+entirely. A catalog copy synchronized onto another host is observation state,
+not ingress authority, and emit there refuses before acquiring stream state or
 writing inbox/archive bytes. A cross-host producer must forward its observation
 to an adapter or transport endpoint running on the owner host and invoke emit
 there; that forwarding transport is not implemented by this subsystem.
