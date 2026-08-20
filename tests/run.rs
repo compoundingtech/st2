@@ -2073,10 +2073,10 @@ fn selected_missing_derived_stream_is_held_without_broadening_to_its_agent() {
     assert!(runner.reaped.borrow().is_empty());
 }
 
-/// A stream is a companion, not work. `is_runnable` filters derived tasks, so a declaration whose
-/// only launch is a stream is unrunnable — correct, and asserted here rather than bent.
+/// A launched stream is a companion, not work, and discovery rejects it without a canonical agent
+/// task instead of silently treating the derived adapter as a runnable primary.
 #[test]
-fn a_stream_alone_does_not_make_an_agent_runnable() {
+fn a_launched_stream_alone_is_rejected_before_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -2087,7 +2087,14 @@ fn a_stream_alone_does_not_make_an_agent_runnable() {
 
     let report = up_once(tmp.path(), "hetz", &runner).unwrap();
 
-    assert_eq!(report.unrunnable, ["sourceless"]);
+    assert!(report.unrunnable.is_empty());
+    assert!(
+        report.errors.iter().any(
+            |error| error.contains("launched stream 'gh-ci' requires a canonical `agent` task")
+        ),
+        "{:?}",
+        report.errors
+    );
     assert!(report.launched.is_empty());
     assert!(runner.spawned.borrow().is_empty());
 }

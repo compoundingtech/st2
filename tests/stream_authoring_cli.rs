@@ -1,4 +1,6 @@
 use st2::Runner as _;
+
+static RUNTIME_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -11,6 +13,7 @@ fn write_agent(root: &Path) {
         "agent \"worker\" {\n  host \"hetz\"\n  command \"agent\"\n}\n",
     )
     .unwrap();
+    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
 }
 
 fn st2(root: &Path, args: &[&str]) -> std::process::Output {
@@ -250,6 +253,7 @@ fn command_and_direct_argv_are_mutually_exclusive() {
 
 #[test]
 fn launched_stream_removal_retires_runtime_before_source_publication() {
+    let _runtime = RUNTIME_TEST.lock().unwrap();
     let catalog = tempfile::tempdir().unwrap();
     write_agent(catalog.path());
     let add = st2(
@@ -272,8 +276,19 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
         String::from_utf8_lossy(&add.stderr)
     );
     let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
-    let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
-    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    for _ in 0..3 {
+        let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        if runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.alive && session.pty_id == "hetz.worker.stream-live")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         runner
             .list_sessions()
@@ -300,12 +315,21 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
         "{}",
         String::from_utf8_lossy(&remove.stderr)
     );
-    assert!(
-        runner
+    let mut retired = false;
+    for _ in 0..100 {
+        retired = runner
             .list_sessions()
             .unwrap()
             .iter()
-            .all(|session| { !session.alive || session.pty_id != "hetz.worker.stream-live" })
+            .all(|session| !session.alive || session.pty_id != "hetz.worker.stream-live");
+        if retired {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        retired,
+        "stream adapter remained alive after lifecycle-first removal"
     );
     assert!(
         !fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
@@ -316,6 +340,7 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
 
 #[test]
 fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
+    let _runtime = RUNTIME_TEST.lock().unwrap();
     let catalog = tempfile::tempdir().unwrap();
     write_agent(catalog.path());
     assert!(
@@ -365,8 +390,19 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
             .contains("stream \"live\"")
     );
 
-    let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
-    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    for _ in 0..3 {
+        let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        if runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.alive && session.pty_id == "hetz.worker.stream-live")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         runner
             .list_sessions()

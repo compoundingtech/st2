@@ -20,6 +20,7 @@ fn declare_agent(root: &Path, desired: &str, streams: &str) -> PathBuf {
         ),
     )
     .unwrap();
+    event::publish_owner_binding_for_test(root, "hetz").unwrap();
     directory
 }
 
@@ -245,6 +246,7 @@ fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
         "agent \"hetz.worker\" {\n  host \"hetz\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
     )
     .unwrap();
+    event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
 
     let error = event::emit(
         catalog.path(),
@@ -278,6 +280,7 @@ fn exact_remote_bus_id_cannot_bypass_the_owner_host_lock_domain() {
         "agent \"worker\" {\n  host \"berlin\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
     )
     .unwrap();
+    event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
 
     let error = event::emit(
         catalog.path(),
@@ -335,11 +338,55 @@ fn public_host_flag_cannot_override_detected_event_authority() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("must run on that host"),
+        String::from_utf8_lossy(&output.stderr).contains("no active local stream owner binding"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!message::inbox_dir(&remote).exists());
+}
+
+#[test]
+fn established_logical_host_alias_admits_owner_local_cli_ingress() {
+    let catalog = tempfile::tempdir().unwrap();
+    let owner = catalog.path().join("agents/berlin/worker");
+    fs::create_dir_all(&owner).unwrap();
+    fs::write(
+        owner.join("agent.kdl"),
+        "agent \"worker\" { host \"berlin\"; command \"agent\"; stream \"gh-ci\" {} }\n",
+    )
+    .unwrap();
+    event::publish_owner_binding_for_test(catalog.path(), "berlin").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            catalog.path().to_str().unwrap(),
+            "event",
+            "emit",
+            "berlin.worker",
+            "--stream",
+            "gh-ci",
+            "--event-id",
+            "alias-owned",
+            "--message",
+            "payload",
+            "--host",
+            "berlin",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        message::list_inbox(&message::inbox_dir(&owner))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[cfg(unix)]

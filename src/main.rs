@@ -2521,14 +2521,6 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     }
 }
 
-fn event_admission_host() -> String {
-    #[cfg(debug_assertions)]
-    if let Ok(host) = std::env::var("ST2_TEST_EVENT_HOST") {
-        return host;
-    }
-    detect_host()
-}
-
 fn send_resolved_message(
     root: &Path,
     to: &str,
@@ -2571,8 +2563,7 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
             json,
             ctx,
         } => {
-            let (root, _caller_host) = resolve_ctx(&ctx)?;
-            let host = event_admission_host();
+            let (root, host) = resolve_ctx(&ctx)?;
             let body = body_or_stdin(body)?;
             let receipt = st2::event::emit(
                 &root,

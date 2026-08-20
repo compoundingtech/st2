@@ -1890,6 +1890,7 @@ pub fn up_loop_specs(
     eprintln!(
         "st2: stopping; leaving sessions running (agents are decoupled from the supervisor)."
     );
+    crate::event::clear_owner_binding(root, this_host);
     Ok(())
 }
 
@@ -2009,6 +2010,8 @@ fn up_loop_until(
     stop: &AtomicBool,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
+    crate::event::publish_owner_binding(root, this_host)
+        .context("publish machine-local stream owner binding")?;
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
     let _watcher = crate::watch::watch_catalog_declarations(root, tx);

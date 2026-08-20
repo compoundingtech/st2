@@ -77,6 +77,10 @@ impl SupervisorScope {
     pub fn unpark_request_dir(&self) -> PathBuf {
         self.root.join("unpark")
     }
+
+    pub(crate) fn stream_owner_binding_path(&self) -> PathBuf {
+        self.root.join("stream-owner.json")
+    }
 }
 
 /// One parked task, as published by the supervisor that parked it.

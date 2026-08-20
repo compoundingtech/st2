@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,6 +91,90 @@ pub enum EventReceiptStatus {
 
 struct ResolvedStream {
     recipient: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamOwnerBinding {
+    schema: String,
+    logical_host: String,
+    catalog_lock_device: u64,
+    catalog_lock_inode: u64,
+    supervisor_pid: u32,
+    supervisor_start_time_ticks: u64,
+}
+
+pub(crate) fn publish_owner_binding(root: &Path, host: &str) -> anyhow::Result<()> {
+    let lock = crate::catalog_lock::CatalogLock::shared(root)?;
+    let metadata = lock.control().metadata()?;
+    let binding = StreamOwnerBinding {
+        schema: "st2.stream-owner.v1".to_owned(),
+        logical_host: host.to_owned(),
+        catalog_lock_device: metadata.dev(),
+        catalog_lock_inode: metadata.ino(),
+        supervisor_pid: std::process::id(),
+        supervisor_start_time_ticks: crate::exec_backend::process_start_time_ticks(
+            std::process::id() as i32,
+        )?,
+    };
+    let path = crate::park::SupervisorScope::current(root, host)?.stream_owner_binding_path();
+    fs::create_dir_all(path.parent().context("owner binding has no parent")?)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, serde_json::to_vec(&binding)?)?;
+    File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    File::open(path.parent().context("owner binding has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn clear_owner_binding(root: &Path, host: &str) {
+    let Ok(path) = crate::park::SupervisorScope::current(root, host)
+        .map(|scope| scope.stream_owner_binding_path())
+    else {
+        return;
+    };
+    let Ok(bytes) = fs::read(&path) else { return };
+    let Ok(binding) = serde_json::from_slice::<StreamOwnerBinding>(&bytes) else {
+        return;
+    };
+    if binding.supervisor_pid == std::process::id()
+        && crate::exec_backend::process_start_time_ticks(std::process::id() as i32).ok()
+            == Some(binding.supervisor_start_time_ticks)
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[doc(hidden)]
+pub fn publish_owner_binding_for_test(root: &Path, host: &str) -> anyhow::Result<()> {
+    publish_owner_binding(root, host)
+}
+
+fn validate_owner_binding(
+    root: &Path,
+    host: &str,
+    lock: &crate::CatalogLock,
+) -> anyhow::Result<()> {
+    let path = crate::park::SupervisorScope::current(root, host)?.stream_owner_binding_path();
+    let binding: StreamOwnerBinding = serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("no active local stream owner binding for host '{host}'"))?,
+    )?;
+    let metadata = lock.control().metadata()?;
+    anyhow::ensure!(
+        binding.schema == "st2.stream-owner.v1"
+            && binding.logical_host == host
+            && binding.catalog_lock_device == metadata.dev()
+            && binding.catalog_lock_inode == metadata.ino(),
+        "stream owner binding does not match this catalog lock domain"
+    );
+    anyhow::ensure!(
+        crate::host_lock::process_alive(binding.supervisor_pid as i32)
+            && crate::exec_backend::process_start_time_ticks(binding.supervisor_pid as i32).ok()
+                == Some(binding.supervisor_start_time_ticks),
+        "stream owner binding for host '{host}' is stale"
+    );
+    Ok(())
 }
 
 fn resolve_stream(
@@ -205,7 +290,8 @@ pub fn emit(
     }
     // Serialize the eligibility observation with self-authoring and desired-state changes. Once a
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
-    let _catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
+    let catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
+    validate_owner_binding(root, this_host, &catalog_lock)?;
     let resolved = resolve_stream(root, this_host, recipient, stream)?;
     let canonical_recipient = resolved.recipient;
     let from = format!("{canonical_recipient}/{stream}");
