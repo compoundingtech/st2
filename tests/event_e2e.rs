@@ -195,6 +195,96 @@ fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
     assert!(!message::inbox_dir(&ambiguous).exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn unobservable_declaration_entry_blocks_event_recipient_resolution() {
+    use std::os::unix::fs::symlink;
+
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    symlink(
+        catalog.path().join("missing-agent.kdl"),
+        catalog.path().join("concealed-agent.kdl"),
+    )
+    .unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "strict-discovery",
+        None,
+        None,
+        "payload",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("catalog has errors"), "{error}");
+    assert!(error.contains("unobservable declaration entry"), "{error}");
+    assert!(!message::inbox_dir(&agent).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_stream_state_ancestor_cannot_escape_the_agent_capability() {
+    use std::os::unix::fs::symlink;
+
+    let catalog = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    fs::create_dir_all(agent.join("resources")).unwrap();
+    symlink(outside.path(), agent.join("resources/streams")).unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "escape-state",
+        None,
+        None,
+        "payload",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(!error.is_empty());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_inbox_cannot_escape_the_agent_capability() {
+    use std::os::unix::fs::symlink;
+
+    let catalog = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    fs::create_dir_all(agent.join("resources")).unwrap();
+    symlink(outside.path(), agent.join("resources/inbox")).unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "escape-inbox",
+        None,
+        None,
+        "payload",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(!error.is_empty());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn supersede_collapses_only_the_matching_key_and_preserves_archive_receipts() {
     let catalog = tempfile::tempdir().unwrap();

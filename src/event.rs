@@ -4,7 +4,7 @@
 //! own bounded, agent-local receipt ring rather than writing the agent's immutable Sent ledger.
 
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
@@ -79,7 +79,6 @@ pub enum EventReceiptStatus {
 
 struct ResolvedStream {
     recipient: String,
-    agent_dir: PathBuf,
 }
 
 fn resolve_stream(
@@ -88,7 +87,7 @@ fn resolve_stream(
     recipient: &str,
     stream: &str,
 ) -> anyhow::Result<ResolvedStream> {
-    let discovered = crate::discover(root);
+    let discovered = crate::discover_strict(root);
     anyhow::ensure!(
         discovered.errors.is_empty(),
         "catalog has errors; refusing event publication: {}",
@@ -136,14 +135,8 @@ fn resolve_stream(
         spec.bus_id(this_host),
         spec.desired_state.as_str()
     );
-    let agent_dir = spec
-        .path
-        .parent()
-        .context("agent declaration has no parent")?
-        .to_path_buf();
     Ok(ResolvedStream {
         recipient: spec.bus_id(this_host),
-        agent_dir,
     })
 }
 
@@ -197,116 +190,130 @@ pub fn emit(
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
     let _catalog_lock = crate::catalog_lock::CatalogLock::exclusive(root)?;
     let resolved = resolve_stream(root, this_host, recipient, stream)?;
-    let from = format!("{}/{}", resolved.recipient, stream);
+    let canonical_recipient = resolved.recipient;
+    let from = format!("{canonical_recipient}/{stream}");
     let rendered = render_event(&from, subject, stream, event_id, key, body);
-    let state_dir = resolved.agent_dir.join("resources/streams").join(stream);
-    fs::create_dir_all(&state_dir)?;
-    let _lock = StreamLock::exclusive(&state_dir)?;
-    let record_path = state_dir.join("state.json");
-    let mut record = read_record(&record_path)?
-        .unwrap_or_else(|| StreamRecord::fresh(stream, &resolved.recipient));
-    anyhow::ensure!(
-        record.version == EVENT_VERSION
-            && record.stream == stream
-            && record.recipient == resolved.recipient,
-        "stream state for '{}#{stream}' is not readable at version {EVENT_VERSION}",
-        resolved.recipient
-    );
-
-    let rendered_sha256 = hex_digest(rendered.as_bytes());
-    if let Some(entry) = record
-        .recent
-        .iter()
-        .find(|entry| entry.event_id == event_id)
-    {
-        anyhow::ensure!(
-            entry.rendered_sha256 == rendered_sha256,
-            "event identity `{stream}#{event_id}` reused with different content"
-        );
-        return Ok(EventReceipt {
-            recipient: resolved.recipient,
-            stream: stream.to_owned(),
-            event_id: event_id.to_owned(),
-            filename: entry.filename.clone(),
-            status: EventReceiptStatus::Deduplicated,
-            superseded: None,
-        });
-    }
-
-    let (filename, resumed) = match record.pending.as_ref() {
-        Some(pending) if pending.event_id == event_id => {
+    message::with_resolved_state_dir(
+        root,
+        &canonical_recipient,
+        this_host,
+        &["resources", "streams", stream],
+        true,
+        |state_dir| {
+            let _lock = StreamLock::exclusive(state_dir)?;
+            let record_path = state_dir.join("state.json");
+            let mut record = read_record(&record_path)?
+                .unwrap_or_else(|| StreamRecord::fresh(stream, &canonical_recipient));
             anyhow::ensure!(
-                pending.rendered_sha256 == rendered_sha256
-                    && pending.key.as_deref() == key
-                    && pending.supersede == supersede,
-                "event identity `{stream}#{event_id}` reused with different content"
+                record.version == EVENT_VERSION
+                    && record.stream == stream
+                    && record.recipient == canonical_recipient,
+                "stream state for '{}#{stream}' is not readable at version {EVENT_VERSION}",
+                canonical_recipient
             );
-            (pending.filename.clone(), true)
-        }
-        Some(pending) => anyhow::bail!(
-            "stream '{stream}' has an interrupted event '{}'; replay it before publishing another",
-            pending.event_id
-        ),
-        None => (message::new_filename(), false),
-    };
-    if !resumed {
-        record.pending = Some(StreamPending {
-            event_id: event_id.to_owned(),
-            filename: filename.clone(),
-            key: key.map(str::to_owned),
-            rendered_sha256: rendered_sha256.clone(),
-            supersede,
-        });
-        write_record(&record_path, &record)?;
-    }
 
-    let inbox = message::inbox_dir(&resolved.agent_dir);
-    let archive = message::archive_dir(&resolved.agent_dir);
-    let predecessor = if supersede {
-        record
-            .recent
-            .iter()
-            .find(|entry| entry.key.as_deref() == key && entry.filename != filename)
-            .map(|entry| entry.filename.clone())
-    } else {
-        None
-    };
-    if let Some(predecessor) = &predecessor {
-        message::archive_msg(&inbox, &archive, predecessor)?;
-    }
-    // An archive filename is the bus's authoritative durable receipt. A crash after materializing
-    // and external archive, but before advancing this state, must not restore the inbox replica.
-    let created = if archive.join(&filename).is_file() {
-        false
-    } else {
-        message::materialize_message_once(&inbox, &filename, &rendered)?
-    };
+            let rendered_sha256 = hex_digest(rendered.as_bytes());
+            if let Some(entry) = record
+                .recent
+                .iter()
+                .find(|entry| entry.event_id == event_id)
+            {
+                anyhow::ensure!(
+                    entry.rendered_sha256 == rendered_sha256,
+                    "event identity `{stream}#{event_id}` reused with different content"
+                );
+                return Ok(EventReceipt {
+                    recipient: canonical_recipient.clone(),
+                    stream: stream.to_owned(),
+                    event_id: event_id.to_owned(),
+                    filename: entry.filename.clone(),
+                    status: EventReceiptStatus::Deduplicated,
+                    superseded: None,
+                });
+            }
 
-    record.pending = None;
-    record.recent.insert(
-        0,
-        StreamEntry {
-            event_id: event_id.to_owned(),
-            filename: filename.clone(),
-            key: key.map(str::to_owned),
-            rendered_sha256,
+            let (filename, resumed) = match record.pending.as_ref() {
+                Some(pending) if pending.event_id == event_id => {
+                    anyhow::ensure!(
+                        pending.rendered_sha256 == rendered_sha256
+                            && pending.key.as_deref() == key
+                            && pending.supersede == supersede,
+                        "event identity `{stream}#{event_id}` reused with different content"
+                    );
+                    (pending.filename.clone(), true)
+                }
+                Some(pending) => anyhow::bail!(
+                    "stream '{stream}' has an interrupted event '{}'; replay it before publishing another",
+                    pending.event_id
+                ),
+                None => (message::new_filename(), false),
+            };
+            if !resumed {
+                record.pending = Some(StreamPending {
+                    event_id: event_id.to_owned(),
+                    filename: filename.clone(),
+                    key: key.map(str::to_owned),
+                    rendered_sha256: rendered_sha256.clone(),
+                    supersede,
+                });
+                write_record(&record_path, &record)?;
+            }
+
+            let predecessor = if supersede {
+                record
+                    .recent
+                    .iter()
+                    .find(|entry| entry.key.as_deref() == key && entry.filename != filename)
+                    .map(|entry| entry.filename.clone())
+            } else {
+                None
+            };
+            let created = message::with_resolved_message_boxes(
+                root,
+                &canonical_recipient,
+                this_host,
+                |inbox, archive| {
+                    if let Some(predecessor) = &predecessor {
+                        message::archive_msg(inbox, archive, predecessor)?;
+                    }
+                    // An archive filename is the bus's authoritative durable receipt. A crash after
+                    // materializing an external archive, but before advancing this state, must not restore
+                    // the inbox replica.
+                    if archive.join(&filename).is_file() {
+                        Ok(false)
+                    } else {
+                        message::materialize_message_once(inbox, &filename, &rendered)
+                    }
+                },
+            )?;
+
+            record.pending = None;
+            record.recent.insert(
+                0,
+                StreamEntry {
+                    event_id: event_id.to_owned(),
+                    filename: filename.clone(),
+                    key: key.map(str::to_owned),
+                    rendered_sha256,
+                },
+            );
+            record.recent.truncate(RING_CAPACITY);
+            write_record(&record_path, &record)?;
+
+            Ok(EventReceipt {
+                recipient: canonical_recipient.clone(),
+                stream: stream.to_owned(),
+                event_id: event_id.to_owned(),
+                filename,
+                status: if created {
+                    EventReceiptStatus::Created
+                } else {
+                    EventReceiptStatus::Deduplicated
+                },
+                superseded: predecessor,
+            })
         },
-    );
-    record.recent.truncate(RING_CAPACITY);
-    write_record(&record_path, &record)?;
-
-    Ok(EventReceipt {
-        recipient: resolved.recipient,
-        stream: stream.to_owned(),
-        event_id: event_id.to_owned(),
-        filename,
-        status: if created {
-            EventReceiptStatus::Created
-        } else {
-            EventReceiptStatus::Deduplicated
-        },
-        superseded: predecessor,
-    })
+    )
 }
 
 fn validate_component(label: &str, value: &str) -> anyhow::Result<()> {
