@@ -339,6 +339,84 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
 }
 
 #[test]
+fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() {
+    let _runtime = RUNTIME_TEST.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+    let add = st2(
+        catalog.path(),
+        &[
+            "stream",
+            "add",
+            "stubborn",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+            "--command",
+            "trap '' TERM; while :; do sleep 1; done",
+        ],
+    );
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
+    assert!(
+        st2::up_once(catalog.path(), "hetz", &runner)
+            .unwrap()
+            .errors
+            .is_empty()
+    );
+    let runtime_id = "hetz.worker.stream-stubborn";
+    for _ in 0..100 {
+        if runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.alive && session.pty_id == runtime_id)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let started = std::time::Instant::now();
+    let remove = st2(
+        catalog.path(),
+        &[
+            "stream",
+            "rm",
+            "stubborn",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+        ],
+    );
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+    assert!(
+        runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .all(|session| session.pty_id != runtime_id),
+        "retirement must not erase the record until the ignoring process group exits"
+    );
+    assert!(
+        !fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
+            .unwrap()
+            .contains("stream \"stubborn\"")
+    );
+}
+
+#[test]
 fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
     let _runtime = RUNTIME_TEST.lock().unwrap();
     let catalog = tempfile::tempdir().unwrap();

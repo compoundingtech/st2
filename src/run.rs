@@ -831,6 +831,18 @@ impl SystemRunner {
             index: RefCell::new(HashMap::new()),
         }
     }
+
+    /// Fully retire a launched stream runtime before its declaration is removed.
+    pub fn retire(&self, runtime_id: &str) -> anyhow::Result<()> {
+        match self.index.borrow().get(runtime_id) {
+            Some(TaskKind::Exec) => self.exec.retire(runtime_id),
+            Some(TaskKind::Pty) => {
+                self.pty.kill(runtime_id)?;
+                self.pty.reap_for_restart(runtime_id)
+            }
+            None => anyhow::bail!("runtime '{runtime_id}' disappeared before retirement"),
+        }
+    }
 }
 
 impl RuntimeObserver for SystemRunner {

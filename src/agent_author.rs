@@ -290,16 +290,10 @@ fn author_stream(
                 .into_iter()
                 .any(|session| session.alive && session.pty_id == runtime_id);
             if live {
-                runner.kill(&runtime_id).map_err(|error| {
+                runner.retire(&runtime_id).map_err(|error| {
                     AuthorError::new(
                         "stream-runtime-retirement-failed",
                         format!("retire launched stream runtime {runtime_id}: {error:#}"),
-                    )
-                })?;
-                runner.reap_for_restart(&runtime_id).map_err(|error| {
-                    AuthorError::new(
-                        "stream-runtime-retirement-failed",
-                        format!("reap launched stream runtime {runtime_id}: {error:#}"),
                     )
                 })?;
             }
