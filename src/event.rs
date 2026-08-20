@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use crate::message;
 
 const EVENT_VERSION: u32 = 1;
+const MAX_STATE_BYTES: u64 = 1_048_576;
 pub const RING_CAPACITY: usize = 128;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +39,7 @@ struct StreamPending {
     rendered_sha256: String,
     supersede: bool,
     #[serde(default)]
-    predecessor: Option<String>,
+    predecessor: Option<StreamEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,8 +241,8 @@ pub fn emit(
                             validate_pending_message(stream, &pending, bytes)?;
                         }
                         if inbox_bytes.is_some() || archive_bytes.is_some() {
-                            if let Some(predecessor) = pending.predecessor.as_deref() {
-                                message::archive_msg(inbox, archive, predecessor)?;
+                            if let Some(predecessor) = pending.predecessor.as_ref() {
+                                finish_predecessor(stream, predecessor, inbox, archive)?;
                             }
                             Ok(true)
                         } else {
@@ -309,7 +310,7 @@ pub fn emit(
                                     key.is_none_or(|key| entry.key.as_deref() == Some(key))
                                 }) {
                                     if read_message_entry(inbox, &entry.filename)?.is_some() {
-                                        return Ok(Some(entry.filename.clone()));
+                                        return Ok(Some(entry.clone()));
                                     }
                                 }
                                 Ok(None)
@@ -355,8 +356,8 @@ pub fn emit(
                         None => message::materialize_message_once(inbox, &filename, &rendered)?,
                     };
                     test_event_checkpoint(event_id, "materialized")?;
-                    if let Some(predecessor) = predecessor.as_deref() {
-                        message::archive_msg(inbox, archive, predecessor)?;
+                    if let Some(predecessor) = predecessor.as_ref() {
+                        finish_predecessor(stream, predecessor, inbox, archive)?;
                     }
                     Ok(created)
                 },
@@ -385,7 +386,7 @@ pub fn emit(
                 } else {
                     EventReceiptStatus::Deduplicated
                 },
-                superseded: predecessor,
+                superseded: predecessor.map(|entry| entry.filename),
             })
         },
     )
@@ -441,6 +442,56 @@ fn validate_pending_message(
     Ok(())
 }
 
+fn finish_predecessor(
+    stream: &str,
+    predecessor: &StreamEntry,
+    inbox: &Path,
+    archive: &Path,
+) -> anyhow::Result<()> {
+    let inbox_bytes = read_message_entry(inbox, &predecessor.filename)?;
+    let archive_bytes = read_message_entry(archive, &predecessor.filename)?;
+    if let Some(bytes) = inbox_bytes.as_deref() {
+        validate_retained_message(stream, predecessor, bytes)?;
+    }
+    if let Some(bytes) = archive_bytes.as_deref() {
+        validate_retained_message(stream, predecessor, bytes)?;
+    }
+    anyhow::ensure!(
+        inbox_bytes.is_some() || archive_bytes.is_some(),
+        "supersession predecessor '{}#{}' has no inbox file or archive receipt",
+        stream,
+        predecessor.event_id
+    );
+    if inbox_bytes.is_some() {
+        message::archive_msg(inbox, archive, &predecessor.filename)?;
+    }
+    Ok(())
+}
+
+fn validate_retained_message(
+    stream: &str,
+    entry: &StreamEntry,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        hex_digest(bytes) == entry.rendered_sha256,
+        "supersession predecessor '{}#{}' has different bytes",
+        stream,
+        entry.event_id
+    );
+    let contents = std::str::from_utf8(bytes).context("supersession predecessor is not UTF-8")?;
+    let parsed = message::parse_message(&entry.filename, contents);
+    anyhow::ensure!(
+        parsed.stream.as_deref() == Some(stream)
+            && parsed.event_id.as_deref() == Some(entry.event_id.as_str())
+            && parsed.event_key.as_deref() == entry.key.as_deref(),
+        "supersession predecessor '{}#{}' has different event identity",
+        stream,
+        entry.event_id
+    );
+    Ok(())
+}
+
 #[cfg(debug_assertions)]
 fn test_event_checkpoint(event_id: &str, point: &str) -> anyhow::Result<()> {
     if std::env::var("ST2_TEST_EVENT_FAIL_AT").as_deref()
@@ -483,10 +534,29 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn read_record(path: &Path) -> anyhow::Result<Option<StreamRecord>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
-            format!("stream state {} is malformed", path.display())
-        })?)),
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file(),
+                "stream state {} is not a real regular file",
+                path.display()
+            );
+            anyhow::ensure!(
+                metadata.len() <= MAX_STATE_BYTES,
+                "stream state {} exceeds {MAX_STATE_BYTES} bytes",
+                path.display()
+            );
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("stream state {} is malformed", path.display())
+            })?))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }

@@ -13,7 +13,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -370,7 +371,13 @@ pub fn materialize_message_once(
         anyhow::bail!("message filename collision with different bytes: {filename}");
     }
     let temporary = inbox_dir.join(tmp_name());
-    fs::write(&temporary, contents)?;
+    let mut temporary_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)?;
+    temporary_file.write_all(contents.as_bytes())?;
+    drop(temporary_file);
     let result = match fs::hard_link(&temporary, &destination) {
         Ok(()) => Ok(true),
         Err(_) if destination.is_file() => {
@@ -2329,6 +2336,32 @@ mod tests {
             .to_string();
         assert!(error.contains("collision with different bytes"));
         assert_eq!(fs::read_to_string(inbox.join(filename)).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_message_temporary_symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "must remain unchanged").unwrap();
+        let start = TMP_COUNTER.load(Ordering::Relaxed);
+        for counter in start..start + 4096 {
+            symlink(
+                &victim,
+                inbox.join(format!(".message.tmp-{}-{counter}", std::process::id())),
+            )
+            .unwrap();
+        }
+
+        let error = materialize_message_once(&inbox, "1784649988123-symlnk.md", "must not escape")
+            .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(fs::read_to_string(victim).unwrap(), "must remain unchanged");
     }
 
     #[test]

@@ -299,6 +299,46 @@ fn predictable_stream_state_temporary_symlink_is_never_followed() {
 
 #[cfg(unix)]
 #[test]
+fn stream_state_symlink_and_fifo_fail_without_following_or_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::symlink;
+
+    for entry in ["symlink", "fifo"] {
+        let catalog = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+        let state_dir = agent.join("resources/streams/gh-ci");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("state.json");
+        if entry == "symlink" {
+            let victim = outside.path().join("victim");
+            fs::write(&victim, "must not be read").unwrap();
+            symlink(&victim, &state_path).unwrap();
+        } else {
+            let path = CString::new(state_path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+
+        let error = event::emit(
+            catalog.path(),
+            "hetz",
+            "hetz.worker",
+            "gh-ci",
+            entry,
+            None,
+            None,
+            "payload",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn symlinked_inbox_cannot_escape_the_agent_capability() {
     use std::os::unix::fs::symlink;
 
@@ -393,7 +433,10 @@ fn failed_predecessor_archive_leaves_the_successor_unread_and_replay_completes()
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("archiving"), "{error:#}");
+    assert!(
+        error.to_string().contains("not a real regular file"),
+        "{error:#}"
+    );
     let unread = message::list_inbox(&inbox).unwrap();
     assert_eq!(unread.len(), 2);
     assert!(
@@ -623,6 +666,57 @@ fn a_different_event_completes_pending_successor_compaction() {
         unread
             .iter()
             .any(|message| message.event_id.as_deref() == Some("unrelated"))
+    );
+}
+
+#[test]
+fn pending_supersession_authenticates_its_predecessor_before_archive() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "running", Some("pr-1"), false);
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "passed",
+        Some("pr-1"),
+        Some("passed"),
+        "passed",
+        true,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    let inbox = message::inbox_dir(&agent);
+    fs::write(inbox.join(&predecessor.filename), "forged predecessor").unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "unrelated",
+        None,
+        None,
+        "unrelated",
+        false,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("different bytes"), "{error:#}");
+    assert!(inbox.join(&predecessor.filename).is_file());
+    assert!(
+        !message::archive_dir(&agent)
+            .join(&predecessor.filename)
+            .exists()
+    );
+    assert!(
+        message::list_inbox(&inbox)
+            .unwrap()
+            .iter()
+            .all(|message| message.event_id.as_deref() != Some("unrelated"))
     );
 }
 
