@@ -379,11 +379,18 @@ fn eval_exit_code(catalog: &Path, identity: &str) -> Option<i64> {
 /// child/one-shot — it exits after the boot turn instead of staying interactive (the seat-persistence
 /// failure). A fresh top-level harness has none of these, so the child must not inherit them.
 /// `ANTHROPIC_*` (API creds) is deliberately kept — only the per-session identity is stripped.
+///
+/// pi is the same shape: it exports `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_CODING_AGENT`, and the
+/// selected model into every child, and st2's own `ST2_PI_CHANNEL_*` would hand a nested seat its
+/// launcher's bus identity and inbox. Provider credentials are not `PI_`-prefixed, so stripping the
+/// prefix wholesale costs nothing.
 fn sanitize_agent_env() {
     let should_strip = |k: &str| {
         matches!(k, "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "AI_AGENT")
             || k.starts_with("CLAUDE_CODE_")
             || k.starts_with("CODEX_")
+            || k.starts_with("PI_")
+            || k.starts_with("ST2_PI_CHANNEL_")
     };
     let victims: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())

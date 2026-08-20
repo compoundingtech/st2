@@ -3,7 +3,7 @@
 //! Expansion does not read files, inspect a harness, mutate a declaration, or execute a process.
 //! Print, reconcile, and materialization use this same expansion.
 
-use agent_spec::spec::{AgentSpec, ClaudeDriver, CodexDriver, Driver};
+use agent_spec::spec::{AgentSpec, ClaudeDriver, CodexDriver, Driver, PiDriver};
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 
@@ -37,6 +37,7 @@ pub fn expand_driver(spec: &AgentSpec, this_host: &str) -> Result<KdlDocument> {
     let mut output = match driver {
         Driver::Claude(driver) => expand_claude(driver, &bus_id)?,
         Driver::Codex(driver) => expand_codex(driver, &bus_id),
+        Driver::Pi(driver) => expand_pi(driver, &bus_id),
     };
     output.autoformat();
     Ok(output)
@@ -62,6 +63,37 @@ fn expand_codex(driver: &CodexDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "codex".to_string(),
+        "--identity".to_string(),
+        bus_id.to_string(),
+        "--runtime-id".to_string(),
+        bus_id.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(provider);
+    document([node("argv", argv)])
+}
+
+/// pi needs no rendered configuration file: its channel is an extension, and the wrapper injects
+/// that extension from this binary's verified hook set rather than writing a machine-local path
+/// into the declaration. `-a` accepts the workspace for this run only, which is why no pi analogue
+/// of [`crate::pretrust`] exists — nothing in the operator's ambient pi config is mutated.
+fn expand_pi(driver: &PiDriver, bus_id: &str) -> KdlDocument {
+    let mut provider = vec!["pi".to_string(), "-a".to_string()];
+    if let Some(model) = &driver.model {
+        provider.extend(["--model".to_string(), model.clone()]);
+    }
+    if let Some(effort) = &driver.effort {
+        provider.extend(["--thinking".to_string(), effort.clone()]);
+    }
+    provider.extend(driver.args.iter().cloned());
+    provider.push(driver.prompt.clone());
+
+    let mut argv = vec![
+        ST2.to_string(),
+        "--catalog".to_string(),
+        CATALOG.to_string(),
+        "driver".to_string(),
+        "pi-session".to_string(),
         "--identity".to_string(),
         bus_id.to_string(),
         "--runtime-id".to_string(),

@@ -109,6 +109,11 @@
           # here. It covers the restart cap's supervision behaviour, which is
           # otherwise unprotected: deleting the flapping cap's per-pass hook left
           # this build green before `run` was added.
+          # `driver_expansion` is hermetic for the same reason — it discovers from
+          # `tempfile` roots and compares expanded KDL — and it is the only gate on
+          # the exact argv every typed harness driver produces. That argv is the
+          # whole launch contract, so a silent change to it is the class of defect
+          # this build should not ship.
           # `--workspace` because the root is a real package: without it cargo
           # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
@@ -123,6 +128,8 @@
             "hooks"
             "--test"
             "run"
+            "--test"
+            "driver_expansion"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
@@ -232,6 +239,57 @@
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
         # output and a wedged child; this check proves the healthy 0/75/100/500-session path crosses
         # both packaged binaries within st2's short outer deadline.
+        # The pi extension's only compile-time coupling to pi.
+        #
+        # `hooks/pi-channel.ts` is shipped as an opaque asset inside the content-addressed hook set
+        # and pi loads the TypeScript directly, so its `import type` is erased and nothing in a
+        # cargo build ever reads it. This check is what makes that import real: it type-checks the
+        # asset against the exact pi release st2 was written for.
+        #
+        # Measured over pi 0.74.0..0.84.2 (41 releases): the whole `types.d.ts` changed in 17 of 40
+        # transitions, but the surface this extension depends on changed in exactly ONE, additively.
+        # So the check is close to noise-free, and it has teeth on the failure that matters most —
+        # using pi's idle proof as a property rather than calling it type-errors, and that mistake
+        # would otherwise silently turn every mid-turn delivery into a plain send.
+        #
+        # Pinned as tarballs rather than an npm lockfile because pi bundles its sibling packages
+        # without integrity hashes, which `fetchNpmDeps` cannot express.
+        checks.pi-extension-types =
+          let
+            piVersion = "0.84.2";
+            piTarball = pkgs.fetchurl {
+              url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-${piVersion}.tgz";
+              hash = "sha256-lbiZzXsaDB8BdMe/M6tCdDXjVTp9H0dWZhqpx/Gmj/o=";
+            };
+            nodeTypesTarball = pkgs.fetchurl {
+              url = "https://registry.npmjs.org/@types/node/-/node-26.2.0.tgz";
+              hash = "sha256-ATysqeRVcLEeqPuz+LnjJ0NpNrNiiAZAtZ+f4qz93sk=";
+            };
+          in
+          pkgs.runCommand "st2-pi-extension-types-${version}" {
+            nativeBuildInputs = [
+              pkgs.gnutar
+              pkgs.nodejs
+              pkgs.typescript
+            ];
+          } ''
+            cp -R ${self}/hooks hooks
+            chmod -R u+w hooks
+
+            modules=hooks/typecheck/node_modules
+            mkdir -p "$modules/@earendil-works/pi-coding-agent" "$modules/@types/node"
+            tar -xzf ${piTarball} -C "$modules/@earendil-works/pi-coding-agent" --strip-components=1
+            tar -xzf ${nodeTypesTarball} -C "$modules/@types/node" --strip-components=1
+
+            # Non-vacuous: the asset must exist and must actually import pi's types, or a green
+            # result here would mean nothing.
+            test -f hooks/pi-channel.ts
+            grep -q '@earendil-works/pi-coding-agent' hooks/pi-channel.ts
+
+            tsc --noEmit -p hooks/typecheck/tsconfig.json
+            touch $out
+          '';
+
         checks.pty-fleet-contract = pkgs.runCommand "st2-pty-fleet-contract-${version}" {
           nativeBuildInputs = [
             pkgs.coreutils

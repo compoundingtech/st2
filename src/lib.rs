@@ -27,7 +27,10 @@ pub mod isolate;
 pub mod materialize;
 pub mod message;
 pub mod park;
+pub mod pi_channel;
+pub mod pi_session;
 pub mod pretrust;
+pub mod provider_session;
 pub mod reconcile;
 pub mod request;
 pub mod resource;
@@ -49,7 +52,7 @@ pub use agent_spec::discovery::{
 };
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,
+    PiDriver, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

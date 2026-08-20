@@ -1477,14 +1477,20 @@ fn reconcile_pass(
     // Verify before touching any Codex workspace. A missing/stale/partial hook set must not rewrite
     // an already-live agent's settings to a nonexistent path. Codex specs remain in reconciliation
     // so live sessions can still be adopted; only their materialization and any new launch defer.
-    let hook_error = crate::hooks::required_by_codex(&found.specs, this_host, root)
+    //
+    // pi needs the same verified set, but for its launch only: nothing it renders references
+    // `$ST_HOOKS`, while `st2 driver pi-session` cannot start without the channel extension. So a
+    // pi agent contributes to this verification without having its materialization deferred.
+    let needs_hooks = crate::hooks::required_by_codex(&found.specs, this_host, root)
+        || crate::hooks::required_by_pi(&found.specs, this_host, root);
+    let hook_error = needs_hooks
         .then(crate::hooks::verify_required_set)
         .transpose()
         .err()
         .map(|error| error.to_string());
     if let Some(error) = &hook_error {
         report.errors.push(format!(
-            "verify this binary's lifecycle hooks before Codex materialization: {error}; materialization deferred"
+            "verify this binary's lifecycle hooks before harness materialization: {error}; materialization deferred"
         ));
     }
     let materializable_specs = found
@@ -1542,7 +1548,7 @@ fn reconcile_pass(
         }
     };
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_codex_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
+    gate_harness_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
@@ -1557,7 +1563,7 @@ fn reconcile_pass(
 /// runtime. Reconciliation deliberately does not mutate an ambient Codex config: an account selector
 /// may choose `CODEX_HOME` only after this process launches the command, so such a write would target
 /// the wrong state and could not satisfy the launched seat's trust gate.
-fn gate_codex_launches_on_hooks<'a, V>(
+fn gate_harness_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
     catalog_root: &Path,
     report: &mut UpReport,
@@ -1569,7 +1575,8 @@ fn gate_codex_launches_on_hooks<'a, V>(
     for launch in &plan.launch {
         let Some(_) = launch.tasks.iter().find(|target| {
             target.name == "agent"
-                && crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
+                && (crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
+                    || crate::hooks::launch_invokes_pi(&target.launch, catalog_root))
         }) else {
             continue;
         };
@@ -1583,7 +1590,7 @@ fn gate_codex_launches_on_hooks<'a, V>(
         plan.launch
             .retain(|launch| !gated_agents.contains(&launch.spec.identity));
         report.errors.push(format!(
-            "verify lifecycle hooks for new Codex agent(s) {}: {error}; launch suppressed",
+            "verify lifecycle hooks for new Codex or pi agent(s) {}: {error}; launch suppressed",
             gated_agents.join(", ")
         ));
     }
@@ -1802,7 +1809,7 @@ where
     let mut plan =
         crate::reconcile::reconcile_selected(&compiled_specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
-    gate_codex_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
+    gate_harness_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
     execute(&plan, runner, &mut FlappingCap::default(), &mut report);
     Ok(report)
 }
@@ -2516,7 +2523,7 @@ mod tests {
     }
 
     /// A pass can execute a plan the task was never in: `up_once` drops an owner whose
-    /// materialization failed, `gate_codex_launches_on_hooks` strips gated launches, and
+    /// materialization failed, `gate_harness_launches_on_hooks` strips gated launches, and
     /// `defer_flickers` removes debounced ones — each after the pass is already committed to
     /// running. Silence about a task is not evidence it is alive, and crediting uptime for it lets
     /// a permanently-dead task refill its budget on every gated pass and never park. Identical to
@@ -2734,7 +2741,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
+        gate_harness_launches_on_hooks(
             &mut plan,
             Path::new("/catalog"),
             &mut report,
@@ -2768,7 +2775,7 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
+        gate_harness_launches_on_hooks(
             &mut plan,
             Path::new("/catalog"),
             &mut report,
@@ -2805,7 +2812,7 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
+        gate_harness_launches_on_hooks(
             &mut plan,
             Path::new("/catalog"),
             &mut report,

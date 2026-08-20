@@ -7,6 +7,10 @@ These maintained, hand-authored declarations are the canonical starting points:
 - [`agent-codex.kdl`](agent-codex.kdl) composes the persona and bus contract
   into `AGENTS.md` and uses Codex's native `SessionStart`, `PreCompact`, and
   `Stop` hooks.
+- [`agent-pi.kdl`](agent-pi.kdl) composes the persona and bus contract into
+  `AGENTS.md` and delivers natively. pi has no hook mechanism of its own: st2
+  injects a channel extension from the same immutable set, so this declaration
+  declares no `ding` and renders nothing for delivery.
 
 The examples use `<host>`, `<identity>`, and `<workspace>` placeholders. st2 provides `CATALOG`,
 `ST_ROOT`, `PTY_ROOT`, and `ST_HOOKS` when it starts a task, so hook declarations contain no
@@ -39,11 +43,15 @@ selected immutable hook set; they never refresh shared scripts. Managed settings
 
 ## Status discipline
 
-Both maintained declarations load the shipped bus contract. Agents must declare `busy` before
+All three maintained declarations load the shipped bus contract. Agents must declare `busy` before
 actively executing a unit of work and return to `available` only when yielding or ready for new
 work. Busy agents still receive DING. `dnd` is the only delivery hold and the sidecar does not renew
-it, so an abandoned hold becomes stale after 15 minutes. st2 intentionally does not inspect either
+it, so an abandoned hold becomes stale after 15 minutes. st2 intentionally does not inspect any
 harness's terminal pixels.
+
+A pi seat never enters the DING path at all — a declaration carrying both `ding` and `deliver` is
+refused — so its delivery rests on `pi.sendUserMessage()` and pi's own idle proof rather than on a
+composer heuristic.
 
 The `render { ... }` block is ordered. `copy`, `file`, `json-upsert`, and `ensure-line` are
 boot-gating operations; a failure prevents that agent from starting. Materialization refuses any

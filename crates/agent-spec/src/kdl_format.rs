@@ -8,7 +8,9 @@
 //! ignored.
 
 use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
-use crate::spec::{ClaudeDriver, CodexDriver, RawResource, RawRestart, RawSpec, RawTask};
+use crate::spec::{
+    ClaudeDriver, CodexDriver, PiDriver, RawResource, RawRestart, RawSpec, RawTask,
+};
 
 /// Lower an already parsed declaration document into the runner's raw representation.
 pub(crate) fn lower_declared_document(document: &DeclaredDocument) -> anyhow::Result<Vec<RawSpec>> {
@@ -155,6 +157,13 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                 );
                 raw.driver.codex = Some(codex_driver_node_to_raw(child)?);
             }
+            "pi" => {
+                anyhow::ensure!(
+                    raw.driver.pi.is_none(),
+                    "agent declares `pi` more than once"
+                );
+                raw.driver.pi = Some(pi_driver_node_to_raw(child)?);
+            }
             "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {
@@ -300,6 +309,16 @@ fn claude_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<ClaudeDriver
 fn codex_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<CodexDriver> {
     let (model, effort, _, prompt, args) = common_driver_fields(node, "codex", false)?;
     Ok(CodexDriver {
+        model,
+        effort,
+        prompt,
+        args,
+    })
+}
+
+fn pi_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<PiDriver> {
+    let (model, effort, _, prompt, args) = common_driver_fields(node, "pi", false)?;
+    Ok(PiDriver {
         model,
         effort,
         prompt,
