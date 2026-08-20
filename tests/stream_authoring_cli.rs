@@ -17,6 +17,7 @@ fn st2(root: &Path, args: &[&str]) -> std::process::Output {
         .arg("--catalog")
         .arg(root)
         .args(args)
+        .env("ST2_TEST_EVENT_HOST", "hetz")
         .env_remove("ST_AGENT")
         .output()
         .unwrap()
@@ -147,7 +148,11 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
         .unwrap();
     assert!(adapter.derived);
     let argv = adapter.argv.as_ref().unwrap();
-    let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
+        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

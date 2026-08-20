@@ -377,6 +377,7 @@ pub fn materialize_message_once(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temporary)?;
     temporary_file.write_all(contents.as_bytes())?;
+    temporary_file.sync_all()?;
     drop(temporary_file);
     let result = match fs::hard_link(&temporary, &destination) {
         Ok(()) => Ok(true),
@@ -391,6 +392,9 @@ pub fn materialize_message_once(
         Err(error) => Err(error.into()),
     };
     let _ = fs::remove_file(temporary);
+    if result.is_ok() {
+        File::open(inbox_dir)?.sync_all()?;
+    }
     result
 }
 

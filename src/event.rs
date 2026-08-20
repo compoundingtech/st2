@@ -4,8 +4,9 @@
 //! own bounded, agent-local receipt ring rather than writing the agent's immutable Sent ledger.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +29,10 @@ struct StreamEntry {
     filename: String,
     key: Option<String>,
     rendered_sha256: String,
+    #[serde(default)]
+    supersede: bool,
+    #[serde(default)]
+    predecessor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +269,11 @@ pub fn emit(
                             filename: pending.filename,
                             key: pending.key,
                             rendered_sha256: pending.rendered_sha256,
+                            supersede: pending.supersede,
+                            predecessor: pending
+                                .predecessor
+                                .as_ref()
+                                .map(|entry| entry.filename.clone()),
                         },
                     );
                     record.recent.truncate(RING_CAPACITY);
@@ -281,13 +291,17 @@ pub fn emit(
                     entry.rendered_sha256 == rendered_sha256,
                     "event identity `{stream}#{event_id}` reused with different content"
                 );
+                anyhow::ensure!(
+                    entry.supersede == supersede,
+                    "event identity `{stream}#{event_id}` reused with different supersession intent"
+                );
                 return Ok(EventReceipt {
                     recipient: canonical_recipient.clone(),
                     stream: stream.to_owned(),
                     event_id: event_id.to_owned(),
                     filename: entry.filename.clone(),
                     status: EventReceiptStatus::Deduplicated,
-                    superseded: None,
+                    superseded: entry.predecessor.clone(),
                 });
             }
 
@@ -351,7 +365,7 @@ pub fn emit(
                     // Publish before compacting. If predecessor archival fails or the process
                     // crashes between these operations, both records remain unread; replaying the
                     // durable pending reservation completes compaction without risking a lost wake.
-                    let created = match read_message_entry(archive, &filename)? {
+                    let (created, published_dir) = match read_message_entry(archive, &filename)? {
                         Some(bytes) => {
                             anyhow::ensure!(
                                 bytes == rendered.as_bytes(),
@@ -359,7 +373,7 @@ pub fn emit(
                                 stream,
                                 event_id
                             );
-                            false
+                            (false, archive)
                         }
                         None => match read_message_entry(inbox, &filename)? {
                             Some(bytes) => {
@@ -368,11 +382,16 @@ pub fn emit(
                                     record.pending.as_ref().expect("pending reservation exists"),
                                     &bytes,
                                 )?;
-                                false
+                                (false, inbox)
                             }
-                            None => message::materialize_message_once(inbox, &filename, &rendered)?,
+                            None => (
+                                message::materialize_message_once(inbox, &filename, &rendered)?,
+                                inbox,
+                            ),
                         },
                     };
+                    sync_message_entry(published_dir, &filename)?;
+                    test_event_checkpoint(event_id, "durable")?;
                     test_event_checkpoint(event_id, "materialized")?;
                     if let Some(predecessor) = predecessor.as_ref() {
                         finish_predecessor(stream, predecessor, inbox, archive)?;
@@ -389,6 +408,8 @@ pub fn emit(
                     filename: filename.clone(),
                     key: key.map(str::to_owned),
                     rendered_sha256,
+                    supersede,
+                    predecessor: predecessor.as_ref().map(|entry| entry.filename.clone()),
                 },
             );
             record.recent.truncate(RING_CAPACITY);
@@ -411,6 +432,10 @@ pub fn emit(
 }
 
 fn read_message_entry(directory: &Path, filename: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    Ok(open_message_entry(directory, filename)?.map(|(_, bytes)| bytes))
+}
+
+fn open_message_entry(directory: &Path, filename: &str) -> anyhow::Result<Option<(File, Vec<u8>)>> {
     anyhow::ensure!(
         message::is_message_filename(filename),
         "invalid pending message filename {filename:?}"
@@ -429,7 +454,7 @@ fn read_message_entry(directory: &Path, filename: &str) -> anyhow::Result<Option
             );
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
-            Ok(Some(bytes))
+            Ok(Some((file, bytes)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -460,29 +485,111 @@ fn validate_pending_message(
     Ok(())
 }
 
+fn sync_message_entry(directory: &Path, filename: &str) -> anyhow::Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(directory.join(filename))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "event publication is not a regular file"
+    );
+    file.sync_all()?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn finish_predecessor(
     stream: &str,
     predecessor: &StreamEntry,
     inbox: &Path,
     archive: &Path,
 ) -> anyhow::Result<()> {
-    let inbox_bytes = read_message_entry(inbox, &predecessor.filename)?;
+    let inbox_entry = open_message_entry(inbox, &predecessor.filename)?;
     let archive_bytes = read_message_entry(archive, &predecessor.filename)?;
-    if let Some(bytes) = inbox_bytes.as_deref() {
+    if let Some((_, bytes)) = inbox_entry.as_ref() {
         validate_retained_message(stream, predecessor, bytes)?;
     }
     if let Some(bytes) = archive_bytes.as_deref() {
         validate_retained_message(stream, predecessor, bytes)?;
     }
     anyhow::ensure!(
-        inbox_bytes.is_some() || archive_bytes.is_some(),
+        inbox_entry.is_some() || archive_bytes.is_some(),
         "supersession predecessor '{}#{}' has no inbox file or archive receipt",
         stream,
         predecessor.event_id
     );
-    if inbox_bytes.is_some() {
-        message::archive_msg(inbox, archive, &predecessor.filename)?;
+    if archive_bytes.is_none()
+        && let Some((file, _)) = inbox_entry.as_ref()
+    {
+        test_predecessor_archive_checkpoint()?;
+        archive_validated_file(file, inbox, archive, &predecessor.filename)?;
     }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn test_predecessor_archive_checkpoint() -> anyhow::Result<()> {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_EVENT_ARCHIVE_READY"),
+        std::env::var("ST2_TEST_EVENT_ARCHIVE_RELEASE"),
+    ) else {
+        return Ok(());
+    };
+    fs::write(&ready, b"validated")?;
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn test_predecessor_archive_checkpoint() -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn archive_validated_file(
+    file: &File,
+    inbox: &Path,
+    archive: &Path,
+    filename: &str,
+) -> anyhow::Result<()> {
+    use std::ffi::CString;
+
+    fs::create_dir_all(archive)?;
+    let archive_dir = File::open(archive)?;
+    #[cfg(target_os = "linux")]
+    let capability = format!("/proc/self/fd/{}", file.as_raw_fd());
+    #[cfg(not(target_os = "linux"))]
+    let capability = format!("/dev/fd/{}", file.as_raw_fd());
+    let capability = CString::new(capability)?;
+    let filename_c = CString::new(std::ffi::OsStr::new(filename).as_bytes())?;
+    let result = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            capability.as_ptr(),
+            archive_dir.as_raw_fd(),
+            filename_c.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).context("archive the validated predecessor capability");
+        }
+    }
+    let archived = read_message_entry(archive, filename)?
+        .context("validated predecessor archive receipt disappeared")?;
+    let mut source = file.try_clone()?;
+    source.rewind()?;
+    let mut expected = Vec::new();
+    source.read_to_end(&mut expected)?;
+    anyhow::ensure!(archived == expected, "archive receipt has different bytes");
+    File::open(archive.join(filename))?.sync_all()?;
+    archive_dir.sync_all()?;
+    let _ = fs::remove_file(inbox.join(filename));
+    File::open(inbox)?.sync_all()?;
     Ok(())
 }
 

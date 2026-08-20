@@ -58,6 +58,76 @@ fn stable_event_identity_publishes_exactly_one_canonical_message() {
 }
 
 #[test]
+fn completed_event_replay_rejects_changed_supersession_intent() {
+    let catalog = tempfile::tempdir().unwrap();
+    declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    emit(catalog.path(), "stable-intent", Some("pr-1"), false);
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "stable-intent",
+        Some("pr-1"),
+        Some("CI stable-intent"),
+        "{\"id\":\"stable-intent\"}",
+        true,
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("different supersession intent"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn durable_successor_failure_retains_replayable_pending_receipt() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "durable-successor:durable") };
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "durable-successor",
+        None,
+        None,
+        "durable",
+        false,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    assert!(
+        error.to_string().contains("failure at durable"),
+        "{error:#}"
+    );
+    assert!(
+        message::list_inbox(&message::inbox_dir(&agent))
+            .unwrap()
+            .iter()
+            .any(|message| { message.event_id.as_deref() == Some("durable-successor") })
+    );
+
+    let replay = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "durable-successor",
+        None,
+        None,
+        "durable",
+        false,
+    )
+    .unwrap();
+    assert_eq!(replay.status, EventReceiptStatus::Deduplicated);
+}
+
+#[test]
 fn concurrent_replays_publish_exactly_one_event() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
@@ -230,6 +300,46 @@ fn exact_remote_bus_id_cannot_bypass_the_owner_host_lock_domain() {
     );
     assert!(!message::inbox_dir(&remote).exists());
     assert!(!remote.join("resources/streams/gh-ci").exists());
+}
+
+#[test]
+fn public_host_flag_cannot_override_detected_event_authority() {
+    let catalog = tempfile::tempdir().unwrap();
+    let remote = catalog.path().join("agents/berlin/worker");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(
+        remote.join("agent.kdl"),
+        "agent \"worker\" { host \"berlin\"; command \"agent\"; stream \"gh-ci\" {} }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            catalog.path().to_str().unwrap(),
+            "event",
+            "emit",
+            "berlin.worker",
+            "--stream",
+            "gh-ci",
+            "--event-id",
+            "forged-host",
+            "--message",
+            "payload",
+            "--host",
+            "berlin",
+        ])
+        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must run on that host"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!message::inbox_dir(&remote).exists());
 }
 
 #[cfg(unix)]
@@ -506,6 +616,63 @@ fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
             .iter()
             .any(|message| { message.event_id.as_deref() == Some("initial-passed") })
     );
+}
+
+#[test]
+fn predecessor_replacement_after_validation_cannot_forge_archive_receipt() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "race-running", Some("pr-1"), false);
+    let inbox = message::inbox_dir(&agent);
+    let predecessor_path = inbox.join(&predecessor.filename);
+    let authentic = fs::read(&predecessor_path).unwrap();
+    let ready = catalog.path().join("archive-ready");
+    let release = catalog.path().join("archive-release");
+    unsafe {
+        std::env::set_var("ST2_TEST_EVENT_ARCHIVE_READY", &ready);
+        std::env::set_var("ST2_TEST_EVENT_ARCHIVE_RELEASE", &release);
+    }
+    let root = catalog.path().to_path_buf();
+    let publish = std::thread::spawn(move || {
+        event::emit(
+            &root,
+            "hetz",
+            "hetz.worker",
+            "gh-ci",
+            "race-passed",
+            Some("pr-1"),
+            None,
+            "passed",
+            true,
+        )
+    });
+    for _ in 0..500 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        ready.exists(),
+        "publisher never reached validated archive checkpoint"
+    );
+    let displaced = inbox.join("displaced-authentic-predecessor");
+    fs::rename(&predecessor_path, &displaced).unwrap();
+    fs::write(&predecessor_path, "forged after validation").unwrap();
+    fs::write(&release, b"release").unwrap();
+    let receipt = publish.join().unwrap().unwrap();
+    unsafe {
+        std::env::remove_var("ST2_TEST_EVENT_ARCHIVE_READY");
+        std::env::remove_var("ST2_TEST_EVENT_ARCHIVE_RELEASE");
+    }
+
+    assert_eq!(receipt.status, EventReceiptStatus::Created);
+    assert_eq!(
+        fs::read(message::archive_dir(&agent).join(&predecessor.filename)).unwrap(),
+        authentic
+    );
+    fs::remove_file(displaced).unwrap();
 }
 
 #[test]
@@ -1112,6 +1279,7 @@ fn event_emit_cli_returns_a_stable_json_receipt_and_ding_marks_the_record() {
             "hetz",
             "--json",
         ])
+        .env("ST2_TEST_EVENT_HOST", "hetz")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
