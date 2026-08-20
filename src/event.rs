@@ -261,25 +261,31 @@ pub fn emit(
                 write_record(&record_path, &record)?;
             }
 
-            let predecessor = if supersede {
+            let predecessor_candidates = if supersede {
                 record
                     .recent
                     .iter()
-                    .find(|entry| {
+                    .filter(|entry| {
                         entry.filename != filename
                             && key.is_none_or(|key| entry.key.as_deref() == Some(key))
                     })
                     .map(|entry| entry.filename.clone())
+                    .collect::<Vec<_>>()
             } else {
-                None
+                Vec::new()
             };
+            let mut predecessor = None;
             let created = message::with_resolved_message_boxes(
                 root,
                 &canonical_recipient,
                 this_host,
                 |inbox, archive| {
-                    if let Some(predecessor) = &predecessor {
-                        message::archive_msg(inbox, archive, predecessor)?;
+                    if let Some(unread) = predecessor_candidates
+                        .iter()
+                        .find(|candidate| inbox.join(candidate).is_file())
+                    {
+                        message::archive_msg(inbox, archive, unread)?;
+                        predecessor = Some(unread.clone());
                     }
                     // An archive filename is the bus's authoritative durable receipt. A crash after
                     // materializing an external archive, but before advancing this state, must not restore

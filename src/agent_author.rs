@@ -241,11 +241,14 @@ fn author_stream(
         ));
     }
     let target = resolve_target(&found.specs, selector, this_host)?;
+    let actor = actor
+        .map(|actor| resolve_target(&found.specs, actor, this_host).map(|target| target.identity))
+        .transpose()?;
     authorize_actor(
         &found.specs,
         &target.identity,
         this_host,
-        actor,
+        actor.as_deref(),
         "stream-not-authorized",
     )?;
     let result = edit_stream_declaration(
@@ -631,6 +634,8 @@ fn edit_stream_declaration(
         catalog,
         path,
         &replacement,
+        expected_identity,
+        expected_host,
         expected_agent,
         name,
         launch,
@@ -744,6 +749,8 @@ fn verify_stream_candidate(
     catalog: &Path,
     path: &Path,
     candidate: &str,
+    expected_identity: &str,
+    expected_host: &str,
     expected_agent: &str,
     name: &str,
     launch: Option<&StreamLaunch>,
@@ -778,7 +785,9 @@ fn verify_stream_candidate(
         .map_err(|error| AuthorError::new("invalid-stream", error.to_string()))?;
     let spec = specs
         .iter()
-        .find(|spec| spec.identity == expected_agent)
+        .find(|spec| {
+            spec.identity == expected_agent && spec.bus_id(expected_host) == expected_identity
+        })
         .ok_or_else(|| {
             AuthorError::new(
                 "unsafe-source-edit",
@@ -1889,6 +1898,45 @@ mod tests {
             );
         }
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn stream_candidate_verification_matches_the_exact_host_agent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = write(
+            root,
+            "agents.kdl",
+            "agent \"worker\" { host \"alpha\"; command \"sleep 60\"; stream \"existing\" {} }\nagent \"worker\" { host \"beta\"; command \"sleep 60\"; stream \"existing\" {} }\n",
+        );
+
+        assert_eq!(
+            add_stream(
+                root,
+                "beta.worker",
+                "beta",
+                Some("beta.worker"),
+                "webhook",
+                None,
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Changed
+        );
+        assert_eq!(
+            remove_stream(root, "beta.worker", "beta", Some("beta.worker"), "existing",)
+                .unwrap()
+                .result,
+            AuthorOutcome::Changed
+        );
+
+        let authored = fs::read_to_string(path).unwrap();
+        let document = KdlDocument::parse(&authored).unwrap();
+        let agents = document.nodes();
+        assert!(agents[0].to_string().contains("stream \"existing\""));
+        assert!(!agents[0].to_string().contains("stream \"webhook\""));
+        assert!(!agents[1].to_string().contains("stream \"existing\""));
+        assert!(agents[1].to_string().contains("stream \"webhook\""));
     }
 
     #[test]

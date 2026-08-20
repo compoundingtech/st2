@@ -164,3 +164,33 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
         1
     );
 }
+
+#[test]
+fn a_bare_actor_can_self_author_on_the_selected_host() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+
+    let add = st2(
+        catalog.path(),
+        &[
+            "stream", "add", "webhook", "--as", "worker", "--host", "hetz",
+        ],
+    );
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let remove = st2(
+        catalog.path(),
+        &[
+            "stream", "rm", "webhook", "--as", "worker", "--host", "hetz",
+        ],
+    );
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+}

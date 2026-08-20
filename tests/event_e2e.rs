@@ -348,6 +348,28 @@ fn supersede_collapses_only_the_matching_key_and_preserves_archive_receipts() {
 }
 
 #[test]
+fn supersede_skips_an_archived_head_and_retires_the_latest_unread_predecessor() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let older = emit(catalog.path(), "pr1-queued", Some("pr-1"), false);
+    let archived_head = emit(catalog.path(), "pr1-running", Some("pr-1"), false);
+    let inbox = message::inbox_dir(&agent);
+    let archive = message::archive_dir(&agent);
+    message::archive_msg(&inbox, &archive, &archived_head.filename).unwrap();
+
+    let successor = emit(catalog.path(), "pr1-pass", Some("pr-1"), true);
+
+    assert_eq!(
+        successor.superseded.as_deref(),
+        Some(older.filename.as_str())
+    );
+    assert!(!inbox.join(&older.filename).exists());
+    assert!(archive.join(&older.filename).exists());
+    assert!(archive.join(&archived_head.filename).exists());
+    assert!(inbox.join(&successor.filename).exists());
+}
+
+#[test]
 fn keyless_supersede_replaces_the_stream_wide_head() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
