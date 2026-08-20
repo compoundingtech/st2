@@ -198,6 +198,40 @@ fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
     assert!(!message::inbox_dir(&ambiguous).exists());
 }
 
+#[test]
+fn exact_remote_bus_id_cannot_bypass_the_owner_host_lock_domain() {
+    let catalog = tempfile::tempdir().unwrap();
+    let remote = catalog.path().join("agents/berlin/worker");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(
+        remote.join("agent.kdl"),
+        "agent \"worker\" {\n  host \"berlin\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+    )
+    .unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "berlin.worker",
+        "gh-ci",
+        "remote-attempt",
+        None,
+        None,
+        "payload",
+        false,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("event publication must run on that host"),
+        "{error:#}"
+    );
+    assert!(!message::inbox_dir(&remote).exists());
+    assert!(!remote.join("resources/streams/gh-ci").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn unobservable_declaration_entry_blocks_event_recipient_resolution() {

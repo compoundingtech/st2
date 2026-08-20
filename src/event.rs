@@ -131,6 +131,12 @@ fn resolve_stream(
         .pop()
         .context("exactly one matching agent expected")?;
     anyhow::ensure!(
+        spec.resolved_host(this_host) == this_host,
+        "agent '{}' is owned by host '{}'; event publication must run on that host",
+        spec.bus_id(this_host),
+        spec.resolved_host(this_host)
+    );
+    anyhow::ensure!(
         spec.streams.iter().any(|declared| declared.name == stream),
         "agent '{}' does not declare stream '{stream}'",
         spec.bus_id(this_host)
