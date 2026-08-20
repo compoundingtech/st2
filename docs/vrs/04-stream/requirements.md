@@ -53,7 +53,10 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   are unique per agent alongside task names.
 - **STREAM-R02 Self-authoring:** An agent adds or removes its own streams by
   editing its own declaration through the serialized catalog-authoring path,
-  under the same authority boundary as presentation authoring (`R25`).
+  under the same authority boundary as presentation authoring (`R25`). Add
+  exposes mutually exclusive shell `--command <shell>` and direct non-empty
+  `-- <program> [<arg>...]` argv forms, or neither for external ingress, while
+  preserving unrelated source bytes and the exact authored launch values.
 
 ### Must ingest exactly once
 
@@ -81,8 +84,10 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   to recover an evicted event identity or predecessor. A later emit
   reconciles an abandoned reservation by validating its chosen file and
   completing its stored compaction intent against the predecessor's retained
-  receipt, so recovery does not require the producer to replay stale state and
-  never archives unvalidated bytes.
+  receipt. Absence from the inbox proves completion only through an
+  authenticated same-name archive receipt; absence from both fails closed.
+  Recovery does not require the producer to replay stale state and never
+  archives unvalidated bytes.
 
 ### Must deliver as ordinary inbox work
 

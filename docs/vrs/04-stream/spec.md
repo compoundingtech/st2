@@ -162,17 +162,18 @@ unpublished reservation is abandoned and cleared.
 For a valid materialized reservation with supersession intent, recovery next
 completes the stored predecessor move. The stored filename must resolve to its
 retained ring receipt; that receipt, not newer stream state, is the validation
-authority. If the predecessor is still present in the inbox, recovery requires
-a no-follow regular file whose parsed `stream`, `event-id`, and optional `key`
-and full rendered SHA-256 equal that receipt before archiving it. Any mismatch,
-missing retained receipt, non-regular path, or conflicting archive destination
-fails closed without moving bytes. If the predecessor is absent from the
-inbox, the archive move is already idempotently complete and no predecessor
-bytes are required. Only then are the successor's stored identity, filename,
-key, and digest promoted to the retained receipt ring and the reservation
-cleared. The current event is evaluated against the resulting ring afterward.
-Neither producer replay nor retained payload bytes are required to unblock the
-stream.
+authority. If a same-name archive file exists, recovery requires it to be a
+no-follow regular file whose parsed `stream`, `event-id`, optional `key`, and
+full rendered SHA-256 equal that receipt; only that authenticated archive
+receipt proves the compaction already completed. Otherwise the predecessor
+must still be a no-follow regular inbox file with the same verified identity
+and bytes, and recovery archives it. Absence from both inbox and archive,
+missing retained receipt, non-regular paths, or any identity/digest mismatch
+fails closed without advancing state. Only then are the successor's stored
+identity, filename, key, and digest promoted to the retained receipt ring and
+the reservation cleared. The current event is evaluated against the resulting
+ring afterward. Neither producer replay nor retained payload bytes are
+required to unblock the stream.
 
 For a new identity, emit persists a reservation with its identity, chosen
 filename, key, content digest, and the predecessor filename selected from the
@@ -245,10 +246,19 @@ task model rather than a stream-level flag.
 
 ## Authoring (STREAM-R02)
 
-`st2 stream add <name> [--command …]` / `st2 stream rm <name>` edit exactly
-one declaration through the persistent catalog-authoring lock with the same
-source-preserving, fail-closed contract as `st2 rename` (R25 authority: self
-or declared descendant; Nix-owned declarations refuse).
+```text
+st2 stream add <name> [--command <shell> | -- <program> [<arg>...]]
+st2 stream rm <name>
+```
+
+The launch forms are mutually exclusive. Arguments after `--` are the direct
+non-empty argv form: element zero is the program, hyphen-leading values are
+data, and argument order and bytes are preserved. Omitting both forms creates
+external ingress. Add/rm edit exactly one declaration through the persistent
+catalog-authoring lock with the same source-preserving, fail-closed contract as
+`st2 rename`: unrelated comments, whitespace, ordering, and node bytes remain
+unchanged, while authored `command` or `argv` string values round-trip exactly
+(R25 authority: self or declared descendant; Nix-owned declarations refuse).
 
 ## Verification plan
 

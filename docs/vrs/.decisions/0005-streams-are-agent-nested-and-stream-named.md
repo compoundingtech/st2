@@ -37,7 +37,8 @@ stream declared with either `command` or `argv` runs that adapter as a
 supervised stream task. Only a stream with neither adapter form is an external
 ingress endpoint: outside producers emit into it via `st2 event emit`, which
 natively covers issue #137's bootstrap-timer case. "pipe" is retired as a
-working title.
+working title. Self-authoring exposes the same choice as mutually exclusive
+`--command <shell>` and direct `-- <program> [<arg>...]` forms.
 
 ## Options
 
