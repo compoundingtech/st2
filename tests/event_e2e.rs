@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
 use sha2::{Digest as _, Sha256};
 use st2::event::{self, EventReceiptStatus, RING_CAPACITY};
 use st2::message;
+
+static EVENT_FAIL_ENV: Mutex<()> = Mutex::new(());
 
 fn declare_agent(root: &Path, desired: &str, streams: &str) -> PathBuf {
     let directory = root.join("agents/hetz/worker");
@@ -415,6 +417,7 @@ fn failed_predecessor_archive_leaves_the_successor_unread_and_replay_completes()
 
 #[test]
 fn a_different_event_reconciles_both_pending_crash_windows() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
     let inbox = message::inbox_dir(&agent);
@@ -492,6 +495,134 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
             .filter(|message| message.event_id.as_deref() == Some("materialized-a"))
             .count(),
         1
+    );
+}
+
+#[test]
+fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved:pending") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "reserved",
+        Some("pr-1"),
+        Some("reserved"),
+        "reserved",
+        false,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+
+    let state_path = agent.join("resources/streams/gh-ci/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let filename = state["pending"]["filename"].as_str().unwrap().to_owned();
+    let inbox = message::inbox_dir(&agent);
+    fs::create_dir_all(&inbox).unwrap();
+    let forged = event::render_event(
+        "hetz.worker/gh-ci",
+        Some("forged"),
+        "gh-ci",
+        "different",
+        Some("pr-1"),
+        "forged",
+    );
+    fs::write(inbox.join(&filename), &forged).unwrap();
+
+    let corrupt = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "next",
+        None,
+        None,
+        "next",
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        corrupt.to_string().contains("different bytes"),
+        "{corrupt:#}"
+    );
+
+    state["pending"]["renderedSha256"] =
+        serde_json::Value::String(format!("{:x}", Sha256::digest(forged.as_bytes())));
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let forged_identity = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "next",
+        None,
+        None,
+        "next",
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        forged_identity
+            .to_string()
+            .contains("different event identity"),
+        "{forged_identity:#}"
+    );
+    assert!(
+        message::list_inbox(&inbox)
+            .unwrap()
+            .iter()
+            .all(|message| message.event_id.as_deref() != Some("next"))
+    );
+}
+
+#[test]
+fn a_different_event_completes_pending_successor_compaction() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "running", Some("pr-1"), false);
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "passed",
+        Some("pr-1"),
+        Some("passed"),
+        "passed",
+        true,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    let inbox = message::inbox_dir(&agent);
+    assert!(inbox.join(&predecessor.filename).is_file());
+
+    let next = emit(catalog.path(), "unrelated", Some("pr-2"), false);
+
+    assert_eq!(next.status, EventReceiptStatus::Created);
+    assert!(!inbox.join(&predecessor.filename).exists());
+    assert!(
+        message::archive_dir(&agent)
+            .join(&predecessor.filename)
+            .is_file()
+    );
+    let unread = message::list_inbox(&inbox).unwrap();
+    assert_eq!(unread.len(), 2);
+    assert!(
+        unread
+            .iter()
+            .any(|message| message.event_id.as_deref() == Some("passed"))
+    );
+    assert!(
+        unread
+            .iter()
+            .any(|message| message.event_id.as_deref() == Some("unrelated"))
     );
 }
 

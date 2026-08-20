@@ -4,8 +4,9 @@
 //! own bounded, agent-local receipt ring rather than writing the agent's immutable Sent ledger.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,6 +37,8 @@ struct StreamPending {
     key: Option<String>,
     rendered_sha256: String,
     supersede: bool,
+    #[serde(default)]
+    predecessor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,8 +231,22 @@ pub fn emit(
                     &canonical_recipient,
                     this_host,
                     |inbox, archive| {
-                        Ok(message_entry_exists(inbox, &pending.filename)?
-                            || message_entry_exists(archive, &pending.filename)?)
+                        let inbox_bytes = read_message_entry(inbox, &pending.filename)?;
+                        let archive_bytes = read_message_entry(archive, &pending.filename)?;
+                        if let Some(bytes) = inbox_bytes.as_deref() {
+                            validate_pending_message(stream, &pending, bytes)?;
+                        }
+                        if let Some(bytes) = archive_bytes.as_deref() {
+                            validate_pending_message(stream, &pending, bytes)?;
+                        }
+                        if inbox_bytes.is_some() || archive_bytes.is_some() {
+                            if let Some(predecessor) = pending.predecessor.as_deref() {
+                                message::archive_msg(inbox, archive, predecessor)?;
+                            }
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
                     },
                 )?;
                 if materialized {
@@ -267,7 +284,7 @@ pub fn emit(
                 });
             }
 
-            let (filename, resumed) = match record.pending.as_ref() {
+            let (filename, resumed, predecessor) = match record.pending.as_ref() {
                 Some(pending) if pending.event_id == event_id => {
                     anyhow::ensure!(
                         pending.rendered_sha256 == rendered_sha256
@@ -275,13 +292,34 @@ pub fn emit(
                             && pending.supersede == supersede,
                         "event identity `{stream}#{event_id}` reused with different content"
                     );
-                    (pending.filename.clone(), true)
+                    (pending.filename.clone(), true, pending.predecessor.clone())
                 }
                 Some(pending) => anyhow::bail!(
                     "stream '{stream}' has an interrupted event '{}'; replay it before publishing another",
                     pending.event_id
                 ),
-                None => (message::new_filename(), false),
+                None => {
+                    let predecessor = if supersede {
+                        message::with_resolved_message_boxes(
+                            root,
+                            &canonical_recipient,
+                            this_host,
+                            |inbox, _archive| {
+                                for entry in record.recent.iter().filter(|entry| {
+                                    key.is_none_or(|key| entry.key.as_deref() == Some(key))
+                                }) {
+                                    if read_message_entry(inbox, &entry.filename)?.is_some() {
+                                        return Ok(Some(entry.filename.clone()));
+                                    }
+                                }
+                                Ok(None)
+                            },
+                        )?
+                    } else {
+                        None
+                    };
+                    (message::new_filename(), false, predecessor)
+                }
             };
             if !resumed {
                 record.pending = Some(StreamPending {
@@ -290,25 +328,12 @@ pub fn emit(
                     key: key.map(str::to_owned),
                     rendered_sha256: rendered_sha256.clone(),
                     supersede,
+                    predecessor: predecessor.clone(),
                 });
                 write_record(&record_path, &record)?;
                 test_event_checkpoint(event_id, "pending")?;
             }
 
-            let predecessor_candidates = if supersede {
-                record
-                    .recent
-                    .iter()
-                    .filter(|entry| {
-                        entry.filename != filename
-                            && key.is_none_or(|key| entry.key.as_deref() == Some(key))
-                    })
-                    .map(|entry| entry.filename.clone())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let mut predecessor = None;
             let created = message::with_resolved_message_boxes(
                 root,
                 &canonical_recipient,
@@ -317,18 +342,21 @@ pub fn emit(
                     // Publish before compacting. If predecessor archival fails or the process
                     // crashes between these operations, both records remain unread; replaying the
                     // durable pending reservation completes compaction without risking a lost wake.
-                    let created = if archive.join(&filename).is_file() {
-                        false
-                    } else {
-                        message::materialize_message_once(inbox, &filename, &rendered)?
+                    let created = match read_message_entry(archive, &filename)? {
+                        Some(bytes) => {
+                            anyhow::ensure!(
+                                bytes == rendered.as_bytes(),
+                                "archived pending event '{}#{}' has different bytes",
+                                stream,
+                                event_id
+                            );
+                            false
+                        }
+                        None => message::materialize_message_once(inbox, &filename, &rendered)?,
                     };
                     test_event_checkpoint(event_id, "materialized")?;
-                    if let Some(unread) = predecessor_candidates
-                        .iter()
-                        .find(|candidate| inbox.join(candidate).is_file())
-                    {
-                        message::archive_msg(inbox, archive, unread)?;
-                        predecessor = Some(unread.clone());
+                    if let Some(predecessor) = predecessor.as_deref() {
+                        message::archive_msg(inbox, archive, predecessor)?;
                     }
                     Ok(created)
                 },
@@ -363,22 +391,54 @@ pub fn emit(
     )
 }
 
-fn message_entry_exists(directory: &Path, filename: &str) -> anyhow::Result<bool> {
+fn read_message_entry(directory: &Path, filename: &str) -> anyhow::Result<Option<Vec<u8>>> {
     anyhow::ensure!(
         message::is_message_filename(filename),
         "invalid pending message filename {filename:?}"
     );
-    match fs::symlink_metadata(directory.join(filename)) {
-        Ok(metadata) => {
+    let path = directory.join(filename);
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
             anyhow::ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
+                metadata.is_file(),
                 "pending message entry {filename:?} is not a real regular file"
             );
-            Ok(true)
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn validate_pending_message(
+    stream: &str,
+    pending: &StreamPending,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        hex_digest(bytes) == pending.rendered_sha256,
+        "pending event '{}#{}' reserved file has different bytes",
+        stream,
+        pending.event_id
+    );
+    let contents = std::str::from_utf8(bytes).context("pending event record is not UTF-8")?;
+    let parsed = message::parse_message(&pending.filename, contents);
+    anyhow::ensure!(
+        parsed.stream.as_deref() == Some(stream)
+            && parsed.event_id.as_deref() == Some(pending.event_id.as_str())
+            && parsed.event_key.as_deref() == pending.key.as_deref(),
+        "pending event '{}#{}' reserved file has different event identity",
+        stream,
+        pending.event_id
+    );
+    Ok(())
 }
 
 #[cfg(debug_assertions)]

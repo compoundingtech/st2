@@ -243,7 +243,7 @@ fn render_message_with_idempotency(
 }
 
 /// Parse a message file's contents into frontmatter fields + body. Permissive.
-fn parse_message(filename: &str, contents: &str) -> Message {
+pub(crate) fn parse_message(filename: &str, contents: &str) -> Message {
     let ts_ms = filename
         .split_once('-')
         .and_then(|(ts, _)| ts.parse::<u64>().ok())
