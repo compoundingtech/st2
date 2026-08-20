@@ -719,6 +719,11 @@ fn predecessor_replacement_after_validation_cannot_forge_archive_receipt() {
         fs::read(message::archive_dir(&agent).join(&predecessor.filename)).unwrap(),
         authentic
     );
+    assert_eq!(
+        fs::read(&predecessor_path).unwrap(),
+        b"forged after validation",
+        "conditional unlink must preserve a replacement directory entry"
+    );
     fs::remove_file(displaced).unwrap();
 }
 

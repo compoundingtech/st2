@@ -674,7 +674,15 @@ fn archive_validated_file(
     anyhow::ensure!(archived == expected, "archive receipt has different bytes");
     File::open(archive.join(filename))?.sync_all()?;
     archive_dir.sync_all()?;
-    let _ = fs::remove_file(inbox.join(filename));
+    let validated = file.metadata()?;
+    match fs::symlink_metadata(inbox.join(filename)) {
+        Ok(current) if current.dev() == validated.dev() && current.ino() == validated.ino() => {
+            fs::remove_file(inbox.join(filename))?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect predecessor before conditional unlink"),
+    }
     File::open(inbox)?.sync_all()?;
     Ok(())
 }
