@@ -80,6 +80,47 @@ fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn event_metadata_is_exposed_by_list_and_read_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "bob");
+    let inbox = tmp.path().join("h/bob/resources/inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    let filename = "1785000000000-abcdef.md";
+    fs::write(
+        inbox.join(filename),
+        "---\nfrom: h.bob/gh-ci\nsubject: CI result\nstream: gh-ci\nevent-id: run-812\nkey: main\n---\npayload\n",
+    )
+    .unwrap();
+
+    let listed = list(tmp.path(), &["--json"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["stream"], "gh-ci");
+    assert_eq!(listed[0]["eventId"], "run-812");
+    assert_eq!(listed[0]["eventKey"], "main");
+
+    let read = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "read", "bob", filename, "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(read["stream"], "gh-ci");
+    assert_eq!(read["eventId"], "run-812");
+    assert_eq!(read["eventKey"], "main");
+}
+
+#[test]
 fn uninitialized_sent_history_is_explicitly_unavailable_not_a_complete_empty_list() {
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");

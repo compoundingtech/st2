@@ -1842,3 +1842,58 @@ fn stream_names_launches_and_task_collisions_fail_closed() {
         );
     }
 }
+
+#[test]
+fn malformed_stream_kdl_shapes_fail_closed() {
+    for (identity, declaration, expected) in [
+        (
+            "extra-name-argument",
+            "stream \"ci\" \"extra\" {}",
+            "exactly one positional name string",
+        ),
+        (
+            "stream-property",
+            "stream \"ci\" bogus=#true {}",
+            "no properties",
+        ),
+        (
+            "typed-stream",
+            "(typed)stream \"ci\" {}",
+            "exactly one positional name string",
+        ),
+        (
+            "extra-command-argument",
+            "stream \"ci\" { command \"watch\" \"typo\" }",
+            "exactly one positional string",
+        ),
+        (
+            "nested-command",
+            "stream \"ci\" { command \"watch\" { typo \"value\" } }",
+            "exactly one positional string",
+        ),
+        (
+            "argv-property",
+            "stream \"ci\" { argv \"watch\" typo=#true }",
+            "only positional string arguments",
+        ),
+        (
+            "nested-argv",
+            "stream \"ci\" { argv \"watch\" { typo \"value\" } }",
+            "only positional string arguments",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; command \"agent\"; {declaration} }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{identity}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{identity}: {:?}",
+            found.errors
+        );
+    }
+}

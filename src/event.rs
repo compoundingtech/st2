@@ -99,14 +99,32 @@ fn resolve_stream(
             .collect::<Vec<_>>()
             .join("; ")
     );
-    let spec = discovered
+    let mut matches = discovered
         .specs
         .into_iter()
-        .find(|spec| {
+        .filter(|spec| {
             spec.bus_id(this_host) == recipient
                 || (spec.resolved_host(this_host) == this_host && spec.identity == recipient)
         })
-        .with_context(|| format!("no agent '{recipient}' found in catalog {}", root.display()))?;
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !matches.is_empty(),
+        "no agent '{recipient}' found in catalog {}",
+        root.display()
+    );
+    anyhow::ensure!(
+        matches.len() == 1,
+        "agent recipient '{recipient}' is ambiguous; matched {} declarations: {}",
+        matches.len(),
+        matches
+            .iter()
+            .map(|spec| spec.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let spec = matches
+        .pop()
+        .context("exactly one matching agent expected")?;
     anyhow::ensure!(
         spec.streams.iter().any(|declared| declared.name == stream),
         "agent '{}' does not declare stream '{stream}'",
