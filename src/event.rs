@@ -280,6 +280,14 @@ pub fn emit(
                 &canonical_recipient,
                 this_host,
                 |inbox, archive| {
+                    // Publish before compacting. If predecessor archival fails or the process
+                    // crashes between these operations, both records remain unread; replaying the
+                    // durable pending reservation completes compaction without risking a lost wake.
+                    let created = if archive.join(&filename).is_file() {
+                        false
+                    } else {
+                        message::materialize_message_once(inbox, &filename, &rendered)?
+                    };
                     if let Some(unread) = predecessor_candidates
                         .iter()
                         .find(|candidate| inbox.join(candidate).is_file())
@@ -287,14 +295,7 @@ pub fn emit(
                         message::archive_msg(inbox, archive, unread)?;
                         predecessor = Some(unread.clone());
                     }
-                    // An archive filename is the bus's authoritative durable receipt. A crash after
-                    // materializing an external archive, but before advancing this state, must not restore
-                    // the inbox replica.
-                    if archive.join(&filename).is_file() {
-                        Ok(false)
-                    } else {
-                        message::materialize_message_once(inbox, &filename, &rendered)
-                    }
+                    Ok(created)
                 },
             )?;
 

@@ -370,6 +370,50 @@ fn supersede_skips_an_archived_head_and_retires_the_latest_unread_predecessor() 
 }
 
 #[test]
+fn failed_predecessor_archive_leaves_the_successor_unread_and_replay_completes() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "pr1-running", Some("pr-1"), false);
+    let inbox = message::inbox_dir(&agent);
+    let archive = message::archive_dir(&agent);
+    fs::create_dir_all(archive.join(&predecessor.filename)).unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "pr1-pass",
+        Some("pr-1"),
+        Some("CI pr1-pass"),
+        "{\"id\":\"pr1-pass\"}",
+        true,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("archiving"), "{error:#}");
+    let unread = message::list_inbox(&inbox).unwrap();
+    assert_eq!(unread.len(), 2);
+    assert!(
+        unread
+            .iter()
+            .any(|message| message.event_id.as_deref() == Some("pr1-pass"))
+    );
+    assert!(inbox.join(&predecessor.filename).exists());
+
+    fs::remove_dir(archive.join(&predecessor.filename)).unwrap();
+    let replay = emit(catalog.path(), "pr1-pass", Some("pr-1"), true);
+    assert_eq!(replay.status, EventReceiptStatus::Deduplicated);
+    assert_eq!(
+        replay.superseded.as_deref(),
+        Some(predecessor.filename.as_str())
+    );
+    assert_eq!(message::list_inbox(&inbox).unwrap().len(), 1);
+    assert!(!inbox.join(&predecessor.filename).exists());
+    assert!(archive.join(&predecessor.filename).is_file());
+}
+
+#[test]
 fn keyless_supersede_replaces_the_stream_wide_head() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
