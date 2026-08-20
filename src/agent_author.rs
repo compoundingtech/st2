@@ -21,6 +21,7 @@ use kdl::{KdlDocument, KdlNode};
 use serde::Serialize;
 
 use crate::catalog_lock::CatalogLock;
+use crate::run::Runner as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceVersion {
@@ -251,6 +252,53 @@ fn author_stream(
         actor.as_deref(),
         "stream-not-authorized",
     )?;
+    if remove {
+        let spec = found
+            .specs
+            .iter()
+            .find(|spec| spec.path == target.declaration)
+            .ok_or_else(|| {
+                AuthorError::new("stream-target-lost", "resolved stream target disappeared")
+            })?;
+        if spec
+            .streams
+            .iter()
+            .find(|stream| stream.name == name)
+            .is_some_and(|stream| stream.launch.is_some())
+        {
+            let task_name = format!("{}{}", agent_spec::STREAM_TASK_PREFIX, name);
+            let task = spec
+                .tasks
+                .iter()
+                .find(|task| task.name == task_name)
+                .ok_or_else(|| {
+                    AuthorError::new("stream-task-missing", "launched stream has no derived task")
+                })?;
+            let runtime_id = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+            let runner = crate::run::SystemRunner::new(
+                catalog_root.to_path_buf(),
+                crate::run::exec_state_dir(this_host),
+            );
+            let live = runner
+                .list_sessions()
+                .map_err(|error| {
+                    AuthorError::new("stream-runtime-observation-failed", error.to_string())
+                })?
+                .into_iter()
+                .any(|session| session.alive && session.pty_id == runtime_id);
+            if live {
+                runner.kill(&runtime_id).map_err(|error| {
+                    AuthorError::new(
+                        "stream-runtime-retirement-failed",
+                        format!("retire launched stream runtime {runtime_id}: {error:#}"),
+                    )
+                })?;
+            }
+        }
+    }
     let result = edit_stream_declaration(
         &catalog_lock,
         catalog_root,
@@ -1483,6 +1531,13 @@ fn atomic_replace_checked(
                 "declaration {} changed while the edit was authored",
                 path.display()
             ),
+        ));
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ST2_TEST_AGENT_AUTHOR_FAIL_BEFORE_PUBLISH").is_some() {
+        return Err(AuthorError::new(
+            "declaration-write-failed",
+            "injected declaration publication failure",
         ));
     }
     let generation = catalog_lock.begin_generation_commit().map_err(|error| {

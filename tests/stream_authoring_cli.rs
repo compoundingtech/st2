@@ -1,3 +1,4 @@
+use st2::Runner as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -244,6 +245,194 @@ fn command_and_direct_argv_are_mutually_exclusive() {
         String::from_utf8_lossy(&add.stderr).contains("cannot be used with"),
         "{}",
         String::from_utf8_lossy(&add.stderr)
+    );
+}
+
+#[test]
+fn launched_stream_removal_retires_runtime_before_source_publication() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+    let add = st2(
+        catalog.path(),
+        &[
+            "stream",
+            "add",
+            "live",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+            "--command",
+            "sleep 60",
+        ],
+    );
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
+    let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| { session.alive && session.pty_id == "hetz.worker.stream-live" })
+    );
+
+    let remove = st2(
+        catalog.path(),
+        &[
+            "stream",
+            "rm",
+            "live",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+        ],
+    );
+
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(
+        runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .all(|session| { !session.alive || session.pty_id != "hetz.worker.stream-live" })
+    );
+    assert!(
+        !fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
+            .unwrap()
+            .contains("stream \"live\"")
+    );
+}
+
+#[test]
+fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+    assert!(
+        st2(
+            catalog.path(),
+            &[
+                "stream",
+                "add",
+                "live",
+                "--agent",
+                "hetz.worker",
+                "--host",
+                "hetz",
+                "--command",
+                "sleep 60"
+            ]
+        )
+        .status
+        .success()
+    );
+    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
+    assert!(
+        st2::up_once(catalog.path(), "hetz", &runner)
+            .unwrap()
+            .errors
+            .is_empty()
+    );
+    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(catalog.path())
+        .args([
+            "stream",
+            "rm",
+            "live",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+        ])
+        .env("ST2_TEST_AGENT_AUTHOR_FAIL_BEFORE_PUBLISH", "1")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
+            .unwrap()
+            .contains("stream \"live\"")
+    );
+
+    let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        runner
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| { session.alive && session.pty_id == "hetz.worker.stream-live" })
+    );
+    assert!(
+        st2(
+            catalog.path(),
+            &[
+                "stream",
+                "rm",
+                "live",
+                "--agent",
+                "hetz.worker",
+                "--host",
+                "hetz"
+            ]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn external_stream_removal_performs_no_runtime_operation() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+    assert!(
+        st2(
+            catalog.path(),
+            &[
+                "stream",
+                "add",
+                "external",
+                "--agent",
+                "hetz.worker",
+                "--host",
+                "hetz"
+            ]
+        )
+        .status
+        .success()
+    );
+
+    let remove = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("--catalog")
+        .arg(catalog.path())
+        .args([
+            "stream",
+            "rm",
+            "external",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+        ])
+        .env("PATH", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
     );
 }
 
