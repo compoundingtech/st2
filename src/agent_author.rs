@@ -229,7 +229,7 @@ fn author_stream(
             format!("acquire catalog-authoring lock: {error:#}"),
         )
     })?;
-    let found = crate::discover(catalog_root);
+    let found = crate::discover_strict(catalog_root);
     if let Some(error) = found.errors.first() {
         return Err(AuthorError::new(
             "catalog-malformed",
@@ -1948,5 +1948,35 @@ mod tests {
             .code(),
             "invalid-stream"
         );
+    }
+
+    #[test]
+    fn stream_authoring_refuses_catalogs_with_concealed_declarations() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("catalog");
+        let concealed = temporary.path().join("concealed");
+        let declaration_path = write(
+            &root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+        write(
+            &concealed,
+            "agent.kdl",
+            &declaration("shadow", "h", None, "catalog"),
+        );
+        symlink(&concealed, root.join("concealed-link")).unwrap();
+        let original = fs::read(&declaration_path).unwrap();
+
+        let error = add_stream(&root, "h.worker", "h", None, "events", None).unwrap_err();
+
+        assert_eq!(error.code(), "catalog-malformed");
+        assert!(
+            error.to_string().contains("unobservable declaration entry"),
+            "{error}"
+        );
+        assert_eq!(fs::read(declaration_path).unwrap(), original);
     }
 }

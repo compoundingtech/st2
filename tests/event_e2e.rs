@@ -258,6 +258,45 @@ fn symlinked_stream_state_ancestor_cannot_escape_the_agent_capability() {
 
 #[cfg(unix)]
 #[test]
+fn predictable_stream_state_temporary_symlink_is_never_followed() {
+    use std::os::unix::fs::symlink;
+
+    let catalog = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let state_dir = agent.join("resources/streams/gh-ci");
+    fs::create_dir_all(&state_dir).unwrap();
+    let victim = outside.path().join("victim");
+    fs::write(&victim, "must remain unchanged").unwrap();
+    for counter in 0..4096 {
+        symlink(
+            &victim,
+            state_dir.join(format!(".state.tmp-{}-{counter}", std::process::id())),
+        )
+        .unwrap();
+    }
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "temp-symlink",
+        None,
+        None,
+        "payload",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("fresh stream state temporary"), "{error}");
+    assert_eq!(fs::read_to_string(victim).unwrap(), "must remain unchanged");
+    assert!(!state_dir.join("state.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn symlinked_inbox_cannot_escape_the_agent_capability() {
     use std::os::unix::fs::symlink;
 
@@ -312,7 +351,7 @@ fn supersede_collapses_only_the_matching_key_and_preserves_archive_receipts() {
 fn keyless_supersede_replaces_the_stream_wide_head() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
-    let old = emit(catalog.path(), "old", None, true);
+    let old = emit(catalog.path(), "old", Some("pr-1"), true);
     let new = emit(catalog.path(), "new", None, true);
     assert_eq!(new.superseded.as_deref(), Some(old.filename.as_str()));
     assert!(!message::inbox_dir(&agent).join(old.filename).exists());
