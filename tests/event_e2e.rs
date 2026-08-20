@@ -1025,6 +1025,60 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn pending_reconciliation_rejects_a_fifo_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved-fifo:pending") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "reserved-fifo",
+        None,
+        None,
+        "reserved",
+        false,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(agent.join("resources/streams/gh-ci/state.json")).unwrap(),
+    )
+    .unwrap();
+    let filename = state["pending"]["filename"].as_str().unwrap();
+    let inbox = message::inbox_dir(&agent);
+    fs::create_dir_all(&inbox).unwrap();
+    let fifo = CString::new(inbox.join(filename).as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let started = std::time::Instant::now();
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "next",
+        None,
+        None,
+        "next",
+        false,
+    )
+    .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        error.to_string().contains("not a real regular file"),
+        "{error:#}"
+    );
+}
+
 #[test]
 fn a_different_event_completes_pending_successor_compaction() {
     let _fail_env = EVENT_FAIL_ENV.lock().unwrap();

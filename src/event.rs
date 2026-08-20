@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
@@ -535,7 +536,7 @@ fn open_message_entry(directory: &Path, filename: &str) -> anyhow::Result<Option
     let path = directory.join(filename);
     match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(&path)
     {
         Ok(mut file) => {
@@ -700,14 +701,36 @@ fn conditional_unlink_same_inode(
     if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
         return Ok(());
     }
-    match fs::symlink_metadata(inbox.join(filename)) {
-        Ok(current) if current.dev() == validated.dev() && current.ino() == validated.ino() => {
-            fs::remove_file(inbox.join(filename))?;
-            File::open(inbox)?.sync_all()?;
+    let quarantine = inbox.join(format!(
+        ".st2-unlink-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&quarantine)?;
+    let source = inbox.join(filename);
+    let isolated = quarantine.join(filename);
+    match fs::rename(&source, &isolated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::remove_dir(&quarantine)?;
+            return Ok(());
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("inspect predecessor before conditional unlink"),
+        Err(error) => return Err(error).context("isolate predecessor before conditional unlink"),
+    }
+
+    let isolated_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&isolated)?;
+    let isolated_metadata = isolated_file.metadata()?;
+    if isolated_metadata.dev() == validated.dev() && isolated_metadata.ino() == validated.ino() {
+        fs::remove_file(&isolated)?;
+        fs::remove_dir(&quarantine)?;
+        File::open(inbox)?.sync_all()?;
+    } else {
+        crate::catalog_transaction::rename_noreplace(&isolated, &source)
+            .context("restore concurrently replaced predecessor after atomic isolation")?;
+        fs::remove_dir(&quarantine)?;
     }
     Ok(())
 }
