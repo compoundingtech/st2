@@ -1808,6 +1808,98 @@ fn streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks() {
 }
 
 #[test]
+fn streams_have_toml_and_json_parity_and_reject_unknown_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+host = "h"
+command = "agent"
+
+[stream.external]
+
+[stream.direct]
+argv = ["watch", "--json"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","command":"agent","stream":{"external":{},"shell":{"command":"watch-ci"}}}"#,
+    );
+
+    for (identity, extension, stream) in [
+        ("toml-every", "toml", "every = \"1m\""),
+        ("toml-misspelled", "toml", "commmand = \"watch-ci\""),
+        ("json-every", "json", r#""every":"1m""#),
+        ("json-misspelled", "json", r#""commmand":"watch-ci""#),
+    ] {
+        let contents = if extension == "toml" {
+            format!(
+                "identity = \"{identity}\"\nhost = \"h\"\ncommand = \"agent\"\n[stream.ci]\n{stream}\n"
+            )
+        } else {
+            format!(
+                r#"{{"identity":"{identity}","host":"h","command":"agent","stream":{{"ci":{{{stream}}}}}}}"#
+            )
+        };
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.{extension}"),
+            &contents,
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert_eq!(found.specs.len(), 2, "specs: {:?}", found.specs);
+    assert_eq!(found.errors.len(), 4, "errors: {:?}", found.errors);
+
+    let toml = find(&found.specs, "toml");
+    assert_eq!(toml.streams.len(), 2);
+    assert!(toml.tasks.iter().all(|task| task.name != "stream-external"));
+    assert_eq!(
+        argv(
+            toml.tasks
+                .iter()
+                .find(|task| task.name == "stream-direct")
+                .unwrap()
+        ),
+        ["watch", "--json"]
+    );
+
+    let json = find(&found.specs, "json");
+    assert_eq!(json.streams.len(), 2);
+    assert!(json.tasks.iter().all(|task| task.name != "stream-external"));
+    assert_eq!(
+        json.tasks
+            .iter()
+            .find(|task| task.name == "stream-shell")
+            .unwrap()
+            .command
+            .as_deref(),
+        Some("watch-ci")
+    );
+
+    for identity in [
+        "toml-every",
+        "toml-misspelled",
+        "json-every",
+        "json-misspelled",
+    ] {
+        let error = found
+            .errors
+            .iter()
+            .find(|error| error.path.to_string_lossy().contains(identity))
+            .unwrap_or_else(|| panic!("missing error for {identity}: {:?}", found.errors));
+        assert!(
+            error.message.contains("unknown field"),
+            "{identity}: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn stream_names_launches_and_task_collisions_fail_closed() {
     for (identity, body, expected) in [
         (

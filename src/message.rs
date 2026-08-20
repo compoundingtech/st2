@@ -1021,6 +1021,37 @@ pub fn with_resolved_state_dir<T>(
     }
 }
 
+/// Run an operation against retained, no-follow capabilities for an agent's inbox and archive.
+///
+/// Both directories are opened relative to the resolved agent capability, so replacing the
+/// declaration directory or either message-box ancestor with a symlink cannot redirect the
+/// operation outside the catalog after recipient resolution.
+pub(crate) fn with_resolved_message_boxes<T>(
+    catalog_root: &Path,
+    identity: &str,
+    this_host: &str,
+    operation: impl FnOnce(&Path, &Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let agent = resolve_agent_handle(catalog_root, identity, this_host)?.with_context(|| {
+        format!(
+            "no agent '{identity}' found in catalog {}",
+            catalog_root.display()
+        )
+    })?;
+    let capability = agent
+        .capability
+        .as_ref()
+        .context("resolved agent has no retained directory capability")?;
+    let inbox = open_message_box(capability, &["resources", "inbox"], true)?
+        .context("created inbox capability is missing")?;
+    let archive = open_message_box(capability, &["resources", "archive"], true)?
+        .context("created archive capability is missing")?;
+    operation(
+        &crate::catalog_transaction::retained_dir_path(&inbox)?,
+        &crate::catalog_transaction::retained_dir_path(&archive)?,
+    )
+}
+
 fn resolve_agent_handle(
     catalog_root: &Path,
     recipient: &str,

@@ -496,6 +496,7 @@ pub(crate) struct RawSpec {
 
 /// A declared event source. Exactly one of `command` / `argv` launches the source process.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RawStream {
     pub command: Option<String>,
     pub argv: Option<Vec<String>>,
