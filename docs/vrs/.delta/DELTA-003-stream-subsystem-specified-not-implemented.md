@@ -32,8 +32,13 @@ declaration becomes the agent-nested `stream` node. The lifecycle worktree
 (27 green) modulo the `pipe`→`stream` rename and the removal of its line-
 protocol runner (adapters call `st2 event emit` directly). Still unbuilt
 anywhere: the `resources/streams/<name>/` ring store behind DQ-S2/DQ-S3, the
-`st2 stream add/rm` authoring commands, nix-layer real adapters (q8), and the
-new INVARIANTS rows named in the spec's verification plan.
+`st2 stream add/rm` authoring commands, the nix-layer real adapters — the
+first two are `gh-ci-watch` and `pty-lifecycle-watch` (the "waits are standing
+feeds" doctrine in the spec: keyed pty phase/exit events replace agents
+polling `pty peek`) — and the new INVARIANTS rows named in the spec's
+verification plan. Wait-style adapters must keep their process alive after a
+terminal emit (DQ-S8): the task model has no run-to-completion lifecycle, so
+an exiting adapter flaps into a park.
 
 Out-of-repo obligation: the `stream` node is an Agent Spec capability, so the
 canonical `compoundingtech/evals/AGENT-SPEC.md` and the

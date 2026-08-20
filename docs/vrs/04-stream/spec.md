@@ -143,6 +143,30 @@ pasted at most once ever, never re-pasted, successor delivers next. Proven:
 24 supersedes in 146 ms produced one fresh poke, zero staged retries, one
 unread head (`.experiments/2026-08-20-pipes-event-model-differentiation.md`).
 
+## Waits are standing feeds (doctrine, STREAM-R01 + STREAM-R07)
+
+"Wake me when X finishes" — a build in a pty, CI on a PR, a human decision —
+is modeled as a standing stream with the individual wait as `key`, never as a
+per-wait subscription:
+
+```kdl
+agent "demo" {
+  stream "pty" { command "pty-lifecycle-watch" }
+}
+```
+
+One supervised adapter watches all of the agent's pty sessions and emits
+`--key <session>` events on phase changes (superseding) plus a terminal
+exit event. Starting a new build requires no declaration change and leaves
+nothing to clean up; the same shape serves CI (`gh-ci-watch` discovers the
+agent's PRs itself, `key` per PR) and approval watching. This is deliberate:
+the task model has no run-to-completion lifecycle (`TaskLifecycle` is
+`Service | AdoptOnly`), so an adapter that exits on success would relaunch
+into a flap and park. A rare genuinely one-off custom wait uses
+`st2 stream add`/`rm` and an adapter that keeps its process alive; first-class
+completion semantics are deferred to DQ-S8 and, if ever needed, belong in the
+task model rather than a stream-level flag.
+
 ## Authoring (STREAM-R02)
 
 `st2 stream add <name> [--command …]` / `st2 stream rm <name>` edit exactly
@@ -164,4 +188,5 @@ the derived-companion row extended to stream tasks. The prototype tests in
 Tracked with context in [open-questions.md](./open-questions.md): DQ-S1
 producer-identity grammar, DQ-S2 state path, DQ-S3 ring bound, DQ-S4 request
 absorption staging, DQ-S5 top-level shared streams, DQ-S6 parked-stream
-owner notification, DQ-S7 event body bounds vs issue #238.
+owner notification, DQ-S7 event body bounds vs issue #238, DQ-S8 one-shot
+stream completion.

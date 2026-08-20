@@ -35,3 +35,13 @@ as tested hypotheses.
   one-inference DING handling; the DING frame carries no body, so an event's
   subject is the entire wake-time signal. Resolves with #238's outcome; until
   then adapters keep subjects self-sufficient.
+- **DQ-S8 One-shot stream completion.** The task model has no run-to-completion
+  lifecycle (`TaskLifecycle` is `Service | AdoptOnly`), so a wait-adapter that
+  exits after its terminal event relaunches, flaps, and parks — a fault report
+  for a successful wait. The accepted doctrine (spec: "Waits are standing
+  feeds") makes this the rare residual case: common waits ride standing keyed
+  feeds like `pty-lifecycle-watch`. If completion semantics are ever needed,
+  they belong in the task model (`TaskLifecycle`/`JobType`, adjacent to root
+  DQ1's scheduled exec work), not as a stream-level flag. Blocked on: real
+  demand — an agent whose one-off custom waits are frequent enough that
+  add/rm plus a kept-alive adapter measurably hurts.
