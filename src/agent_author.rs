@@ -296,6 +296,12 @@ fn author_stream(
                         format!("retire launched stream runtime {runtime_id}: {error:#}"),
                     )
                 })?;
+                runner.reap_for_restart(&runtime_id).map_err(|error| {
+                    AuthorError::new(
+                        "stream-runtime-retirement-failed",
+                        format!("reap launched stream runtime {runtime_id}: {error:#}"),
+                    )
+                })?;
             }
         }
     }
