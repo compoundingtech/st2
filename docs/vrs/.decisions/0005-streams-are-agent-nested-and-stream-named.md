@@ -80,3 +80,9 @@ run natively without a second producer-identity mechanism.
   grant authority. Synchronized remote catalogs cannot publish; cross-host
   observations need an owner-host forwarding adapter/transport, which v1 does
   not provide.
+- Public removal is lifecycle-first: under catalog then exact-runtime
+  serialization, `stream rm` stops/retires an adapter companion and durably
+  proves process absence before publishing declaration removal. A failure
+  before source publish leaves the declaration intact for reconcile to
+  relaunch; adapter-less external ingress skips runtime teardown. Direct KDL
+  edits are not the self-authoring operation and carry no orphan-free promise.

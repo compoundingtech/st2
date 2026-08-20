@@ -60,7 +60,12 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   under the same authority boundary as presentation authoring (`R25`). Add
   exposes mutually exclusive shell `--command <shell>` and direct non-empty
   `-- <program> [<arg>...]` argv forms, or neither for external ingress, while
-  preserving unrelated source bytes and the exact authored launch values.
+  preserving unrelated source bytes and the exact authored launch values. To
+  remove an adapter-bearing stream, the serialized path identifies its exact
+  derived runtime, stops/retires it, and durably confirms process absence
+  before publishing declaration removal. Failure before that source publish
+  leaves the declaration intact; adapter-less external ingress has no runtime
+  teardown. Direct manual KDL edits are outside this guarantee.
 
 ### Must ingest exactly once
 
@@ -127,7 +132,10 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   and is stopped while the agent is held, suspended, retired, or terminally
   parked, under the existing derived-companion contract. A crash-looping
   adapter parks the stream task without disturbing its agent and surfaces to
-  the declared supervisor.
+  the declared supervisor. Public `stream rm` holds catalog and exact-runtime
+  lifecycle serialization across stop confirmation and declaration commit, so
+  no reconcile pass can relaunch the adapter in between and no removed stream
+  leaves an orphan process.
 - **STREAM-R09 Suspension means eyes closed:** While an agent is suspended no
   events accumulate for it. Resume re-observes current state; re-emitting
   still-current state is safe under `STREAM-R03` dedup. Suspension and stream

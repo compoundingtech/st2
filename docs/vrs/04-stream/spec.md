@@ -314,6 +314,37 @@ catalog-authoring lock with the same source-preserving, fail-closed contract as
 unchanged, while authored `command` or `argv` string values round-trip exactly
 (R25 authority: self or declared descendant; Nix-owned declarations refuse).
 
+`stream rm` is a lifecycle transaction, not merely a source edit. While
+holding the catalog-authoring lock, it strictly resolves the declaration and
+its launch form. An external-ingress stream has no derived runtime and may
+proceed directly to the source transaction. For `command` or `argv`, removal:
+
+1. Derives the one expected runtime identity from the canonical owner and
+   stream name, then verifies its generated-companion ownership marker. An
+   ambiguous, foreign, or unprovable runtime fails closed.
+2. Acquires that exact runtime's lifecycle serialization after the catalog
+   lock. Reconcile/launch paths must acquire the same runtime serialization and
+   therefore cannot relaunch it during removal.
+3. Requests stop/retirement through the ordinary task backend and waits for a
+   durable runtime receipt/state proving both the managed task and its process
+   are absent. Timeout, backend error, or surviving process aborts removal.
+4. Only after confirmed absence publishes the source-preserving declaration
+   removal, fsyncs the source transaction, and releases the locks.
+
+The lock order is catalog-authoring then exact-runtime lifecycle (and any task
+backend locks beneath it). Failure anywhere before step 4 leaves the stream
+declaration byte-identical. If the adapter was already stopped, releasing the
+locks lets ordinary reconcile observe that intact declaration and relaunch it,
+so stop-before-source-publish is recoverable. After step 4, reconcile cannot
+derive the companion and the confirmed-dead process cannot be orphaned.
+Removing an already absent declaration remains idempotent only when strict
+discovery also proves there is no owned derived runtime to retire.
+
+These guarantees apply to the public serialized `st2 stream rm` operation.
+Direct manual edits of `agent.kdl` are outside STREAM-R02 and do not acquire the
+lifecycle transaction; operators must not infer orphan-free teardown from an
+unserialized file edit.
+
 ## Verification plan
 
 The invariant rows this subsystem must add or keep green when implementation
