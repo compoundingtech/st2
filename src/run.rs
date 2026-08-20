@@ -2760,12 +2760,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || Ok(()),
-        );
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || Ok(()));
 
         assert_eq!(
             plan.launch
@@ -2794,12 +2789,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || panic!("an already-live Codex agent must not enter the hook gate"),
-        );
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            panic!("an already-live Codex agent must not enter the hook gate")
+        });
 
         assert_eq!(plan.adopt, [&spec]);
         assert_eq!(plan.launch.len(), 1);
@@ -2831,12 +2823,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || anyhow::bail!("stale receipt"),
-        );
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            anyhow::bail!("stale receipt")
+        });
 
         assert_eq!(
             plan.launch

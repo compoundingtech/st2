@@ -8,9 +8,7 @@
 //! ignored.
 
 use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
-use crate::spec::{
-    ClaudeDriver, CodexDriver, PiDriver, RawResource, RawRestart, RawSpec, RawTask,
-};
+use crate::spec::{ClaudeDriver, CodexDriver, PiDriver, RawResource, RawRestart, RawSpec, RawTask};
 
 /// Lower an already parsed declaration document into the runner's raw representation.
 pub(crate) fn lower_declared_document(document: &DeclaredDocument) -> anyhow::Result<Vec<RawSpec>> {

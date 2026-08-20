@@ -34,8 +34,7 @@ pub const CHANNEL_IDENTITY: &str = "ST2_PI_CHANNEL_IDENTITY";
 /// A managed agent that update-checks or self-updates at boot makes its own launch latency and its
 /// own behaviour depend on the network, and lets a release change a running fleet. Each is applied
 /// only when the operator has not already set it, so a declaration's `env` still wins.
-const OFFLINE_DEFAULTS: [(&str, &str); 2] =
-    [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
+const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
 /// Run one interactive pi provider and maintain its presence until it exits.
 pub fn run(

@@ -716,12 +716,15 @@ args = ["--tools", "read,bash,edit,write"]
 #[test]
 fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
     for (name, body) in [
+        ("both", r#"claude { prompt "go" }; codex { prompt "go" }"#),
         (
-            "both",
-            r#"claude { prompt "go" }; codex { prompt "go" }"#,
+            "claude-and-pi",
+            r#"claude { prompt "go" }; pi { prompt "go" }"#,
         ),
-        ("claude-and-pi", r#"claude { prompt "go" }; pi { prompt "go" }"#),
-        ("codex-and-pi", r#"codex { prompt "go" }; pi { prompt "go" }"#),
+        (
+            "codex-and-pi",
+            r#"codex { prompt "go" }; pi { prompt "go" }"#,
+        ),
         ("pi-dev", r#"pi { dev-channels #true; prompt "go" }"#),
         ("pi-missing-prompt", r#"pi { model "anthropic/x" }"#),
         ("missing-prompt", r#"claude { model "opus" }"#),

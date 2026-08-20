@@ -57,7 +57,9 @@ fn pi_expansion_carries_no_machine_local_extension_path() {
     fs::write(&path, include_str!("fixtures/driver/pi.in.kdl")).unwrap();
 
     let found = discover(temp.path());
-    let expanded = expand_driver(&found.specs[0], "unused").unwrap().to_string();
+    let expanded = expand_driver(&found.specs[0], "unused")
+        .unwrap()
+        .to_string();
 
     assert!(!expanded.contains("pi-channel.ts"), "{expanded}");
     assert!(!expanded.contains("ST_HOOKS"), "{expanded}");
