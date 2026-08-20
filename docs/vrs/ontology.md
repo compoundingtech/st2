@@ -261,6 +261,50 @@ The terminal notification that makes an agent aware of unread messages.
 
 Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
 
+### stream
+
+A named declared event producer feeding one agent. With a command, st2
+supervises its adapter; without one, it is an external ingress endpoint.
+
+Authority: [STREAM-R01 declared streams](04-stream/requirements.md);
+[decision 0005](.decisions/0005-streams-are-agent-nested-and-stream-named.md)
+
+### event
+
+One durable inbox record produced on a stream. A fact observed in the world,
+not addressed speech; a distinct record kind on the shared bus transport.
+
+Authority: [STREAM-R04 and STREAM-R06](04-stream/requirements.md);
+[decision 0004](.decisions/0004-stream-events-are-a-distinct-record-kind.md)
+
+### event-id
+
+The mandatory producer-supplied identity of one event, deduplicated per
+`(stream, event-id)`.
+
+Authority: [STREAM-R03 mandatory event identity](04-stream/requirements.md)
+
+### key
+
+The optional grouping axis within a stream. Supersession collapses unread
+events per `(stream, key)`.
+
+Authority: [STREAM-R07 producer-side supersession](04-stream/requirements.md)
+
+### adapter
+
+The world-specific command a stream runs. Packaged outside st2; it emits
+through `st2 event emit`.
+
+Authority: [STREAM-A03 world logic stays outside](04-stream/requirements.md)
+
+### stream task
+
+The derived exec companion supervising a stream's adapter, under the same
+generated-companion lifecycle as the derived DING.
+
+Authority: [STREAM-R08 companion lifecycle](04-stream/requirements.md)
+
 ## Structure
 
 ```text
@@ -300,6 +344,16 @@ explicit `unpark` recovery request.
   host-qualified address.
 - Use [message](../../src/message.rs#L26-L46) for the durable record and
   [DING](../../src/ding/mod.rs#L1-L14) for its terminal notification.
+- Qualify **event**: a bare *event* in stream context is the durable
+  [event](04-stream/requirements.md) record; the R13–R15 filesystem-watcher
+  usage is a **watcher event**. New requirements text keeps the qualification.
+- Use [key](04-stream/requirements.md) for the event-side grouping axis. The
+  message-side thread/topic axis explored in
+  [issue #49](https://github.com/compoundingtech/st2/issues/49) is a separate
+  concept; do not merge the two by name.
+- Use [stream](04-stream/requirements.md) for the declared producer and
+  **stream task** for its derived companion. A *watcher stream* (R15) is
+  watcher machinery, not a declared stream.
 
 ## Avoid
 
