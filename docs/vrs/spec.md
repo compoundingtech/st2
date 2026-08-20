@@ -178,6 +178,14 @@ union `pending | replied`, suitable for a durable workflow to observe between
 its own durable waits. st2 provides no wait loop or timer and does not turn the
 request into agent lifecycle authority.
 
+This transport is design-superseded but still normative for the shipped
+implementation: [decision 0004](.decisions/0004-stream-events-are-a-distinct-record-kind.md)
+absorbs typed requests into stream events plus ordinary replies, staged behind
+a deprecation window ([04-stream DQ-S4](04-stream/open-questions.md)). Until
+that staging completes, this section and its invariant row remain the truth;
+the drift is fenced by
+[DELTA-002](.delta/DELTA-002-typed-request-absorption-pending.md).
+
 ## Resource bindings (R20-R21)
 
 An agent may directly declare zero or more generic Resource bindings:
@@ -986,7 +994,13 @@ the resident supervisor continues to reconcile the complete local catalog.
   distributed workflow engine, but the KDL shape, event inbox, deduplication
   boundary, and execution receipts are not yet specified. A successful
   executable eval and Nathan's approval should resolve this before adding
-  scheduler requirements.
+  scheduler requirements. Three of the four unspecified items now have accepted
+  answers in the [stream subsystem](04-stream/requirements.md): the event inbox
+  is the ordinary agent inbox, deduplication is `(stream, event-id)` per
+  recipient, and receipts are the `created | deduplicated` emit receipt plus
+  archive filenames. The `schedule` KDL shape, its relationship to a timer
+  stream, and the approval above remain open; `every` on a stream stays
+  rejected so this question is not resolved by implication.
 - **DQ2 Safe DING delivery:** Bounded observation now replaces the fixed
   paste-to-Return delay: maintained Codex and Claude composers must be
   positively empty before paste and show the exact staged notice twice before

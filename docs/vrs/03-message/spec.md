@@ -205,6 +205,15 @@ generic activity feed or that typed service-principal requests belong in it.
 for reserving a filename before delivery, but service principals are not Agents and their records do
 not enter ordinary Sent history (`MESSAGE-R11`).
 
+The typed request surface is design-superseded by stream events
+([decision 0004](../.decisions/0004-stream-events-are-a-distinct-record-kind.md)): a reply to an
+event is an ordinary `message reply`, and the `pending | replied` union derives from `in-reply-to`.
+This section stays normative until the staged absorption in
+[04-stream DQ-S4](../04-stream/open-questions.md) completes; the drift is fenced by
+[DELTA-002](../.delta/DELTA-002-typed-request-absorption-pending.md). `MESSAGE-R11`'s separation
+purpose survives the absorption: events remain excluded from ordinary Sent history by never writing
+the sender ledger at all.
+
 ## Verification
 
 `tests/message_cli.rs` injects failure after coverage, pending creation, active publication,
