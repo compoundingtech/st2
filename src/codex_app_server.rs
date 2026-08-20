@@ -197,6 +197,7 @@ pub enum CodexHoldReason {
     Compaction,
     NotLoaded,
     SystemError,
+    UnknownStatus,
     WaitingOnApproval,
     WaitingOnUserInput,
 }
@@ -860,7 +861,7 @@ impl CodexControlState {
                 turn_id: None,
             },
             _ => CodexObservedState::Held {
-                reason: CodexHoldReason::SystemError,
+                reason: CodexHoldReason::UnknownStatus,
                 turn_id: None,
             },
         };
@@ -915,7 +916,8 @@ impl CodexControlState {
                     | CodexHoldReason::WaitingOnApproval
                     | CodexHoldReason::WaitingOnUserInput
                     | CodexHoldReason::NotLoaded
-                    | CodexHoldReason::SystemError,
+                    | CodexHoldReason::SystemError
+                    | CodexHoldReason::UnknownStatus,
                 ..
             } => self.observed.clone(),
             // A completion for a turn other than the one believed live is the only evidence here
@@ -4343,6 +4345,51 @@ mod tests {
                 turn_id: "turn-2".into()
             }
         );
+    }
+
+    #[test]
+    fn an_unrecognized_thread_status_has_a_distinct_delivery_hold() {
+        let mut state = subscribed_state(CodexObservedState::Active {
+            turn_id: "turn-1".into(),
+        });
+
+        state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-main",
+                    "status": { "type": "futureStatus" }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownStatus,
+                turn_id: None,
+            }
+        );
+
+        state
+            .observe(&json!({
+                "method": "turn/completed",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownStatus,
+                ..
+            }
+        ));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+            .unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        assert_eq!(delivery.maybe_request(&state).unwrap(), None);
     }
 
     #[test]
