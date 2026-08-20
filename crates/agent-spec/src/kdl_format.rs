@@ -178,13 +178,22 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                 }
             }
             "stream" => {
-                if let Some(name) = arg_string(child) {
-                    let stream = stream_node_to_raw(child, &name)?;
-                    anyhow::ensure!(
-                        raw.stream.insert(name.clone(), stream).is_none(),
-                        "agent declares `stream \"{name}\"` more than once"
-                    );
-                }
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "agent `stream` must contain exactly one positional name string and no properties"
+                );
+                let name = arg_string(child).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "agent `stream` must contain exactly one positional name string and no properties"
+                    )
+                })?;
+                let stream = stream_node_to_raw(child, &name)?;
+                anyhow::ensure!(
+                    raw.stream.insert(name.clone(), stream).is_none(),
+                    "agent declares `stream \"{name}\"` more than once"
+                );
             }
             // meta, harness, model, persona, permissions, transport, strategy, … — ignored.
             _ => {}
@@ -479,14 +488,29 @@ fn stream_node_to_raw(node: &DeclaredNode, name: &str) -> anyhow::Result<crate::
                     stream.command.is_none(),
                     "stream '{name}' has duplicate `command`"
                 );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "stream '{name}' `command` must be exactly one positional string"
+                );
                 stream.command = Some(arg_string(child).ok_or_else(|| {
-                    anyhow::anyhow!("stream '{name}' `command` must be one positional string")
+                    anyhow::anyhow!(
+                        "stream '{name}' `command` must be exactly one positional string"
+                    )
                 })?);
             }
             "argv" => {
                 anyhow::ensure!(
                     stream.argv.is_none(),
                     "stream '{name}' has duplicate `argv`"
+                );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.iter().all(|entry| entry.name.is_none()),
+                    "stream '{name}' `argv` must contain only positional string arguments"
                 );
                 stream.argv = Some(argv(child)?);
             }

@@ -2781,6 +2781,12 @@ struct LsItemJson<'a> {
     #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<&'a str>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(rename = "eventKey", skip_serializing_if = "Option::is_none")]
+    event_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
 }
 
@@ -2795,6 +2801,9 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             tags: &m.tags,
             priority: m.priority.as_deref(),
             idempotency_key: m.idempotency_key.as_deref(),
+            stream: m.stream.as_deref(),
+            event_id: m.event_id.as_deref(),
+            event_key: m.event_key.as_deref(),
             body: None,
         }
     }
@@ -2823,6 +2832,12 @@ struct MessageJson<'a> {
     priority: Option<&'a str>,
     #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<&'a str>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(rename = "eventKey", skip_serializing_if = "Option::is_none")]
+    event_key: Option<&'a str>,
     body: &'a str,
 }
 
@@ -2837,6 +2852,9 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
             tags: &m.tags,
             priority: m.priority.as_deref(),
             idempotency_key: m.idempotency_key.as_deref(),
+            stream: m.stream.as_deref(),
+            event_id: m.event_id.as_deref(),
+            event_key: m.event_key.as_deref(),
             body: &m.body,
         }
     }

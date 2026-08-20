@@ -162,6 +162,40 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
 }
 
 #[test]
+fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
+    let catalog = tempfile::tempdir().unwrap();
+    let canonical = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let ambiguous = catalog.path().join("agents/hetz/ambiguous");
+    fs::create_dir_all(&ambiguous).unwrap();
+    fs::write(
+        ambiguous.join("agent.kdl"),
+        "agent \"hetz.worker\" {\n  host \"hetz\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+    )
+    .unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "ambiguous",
+        None,
+        None,
+        "payload",
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("recipient 'hetz.worker' is ambiguous"),
+        "{error}"
+    );
+    assert!(!message::inbox_dir(&canonical).exists());
+    assert!(!message::inbox_dir(&ambiguous).exists());
+}
+
+#[test]
 fn supersede_collapses_only_the_matching_key_and_preserves_archive_receipts() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
