@@ -4,26 +4,21 @@ Each entry links a spec `DQ-S*`. Questions leave this file when resolved —
 into [spec.md](./spec.md) as decisions or [`.experiments/`](./.experiments/)
 as tested hypotheses.
 
-- **DQ-S1 Producer identity and reply routing.** What exact `from` value does a
-  nested stream's event carry, and what routable endpoint receives an ordinary
-  `message reply` to it? Candidates for producer identity are
-  `<host>.<agent>/<stream>` (slash keeps the bus-ID grammar unambiguous) vs
-  `<host>.<agent>.<stream>` (collides with the task runtime-ID grammar), but
-  neither currently resolves as an agent or service-principal mailbox.
-  Resolves by: checking every existing `from` consumer and specifying a real
-  reply recipient with an end-to-end proof. Typed request retirement remains
-  blocked until the eval-owned external requester has that working path.
-- **DQ-S2 Stream state path.** Where the dedup ring lives under the owner's
-  resources (`resources/streams/<name>/` proposed; the ring is the only
-  retained-history state, accompanied by one durable in-flight publication
-  reservation; no supersession heads are stored). Resolves during
-  implementation with the state-namespace conventions of R02.
-- **DQ-S3 Ring bound and identity horizon.** `K = 128` is the current
+- **DQ-S1 Producer reply routing.** Events use `<host>.<agent>/<stream>` as
+  their producer identity, but that subordinate identity does not currently
+  resolve as an agent or service-principal mailbox for an ordinary
+  `message reply`. Resolves by: specifying a real reply recipient with an
+  end-to-end proof. Typed request retirement remains blocked until the
+  eval-owned external requester has that working path.
+- **DQ-S3 Ring bound and identity horizon.** `K = 128` is the implemented
   deduplication and conflicting-content-detection horizon, not merely a fast
-  path: an evicted identity is accepted as new without scanning inbox or
-  archive history. Resolves by: measuring real adapter emit rates and
-  retry/rediscovery windows (CI transitions, builds, timer sources), then
-  retaining this bound or selecting another constant-size index.
+  path: an evicted identity is accepted as new, without scanning inbox or
+  archive history. This conflicts with ratified STREAM-R04/R05 and decision
+  0004; [`DELTA-004`](../.delta/DELTA-004-stream-dedup-horizon.md) records the
+  protected-doc change required. Resolves by: measuring real adapter emit
+  rates and retry/rediscovery windows (CI transitions, builds, timer sources),
+  then approving the bounded identity contract or choosing a different
+  bounded index.
 - **DQ-S4 Request absorption staging.** The typed request/reply envelopes
   (`request.rs`) are absorbed by events + ordinary replies (decision 0004),
   but its wire types carry `deny_unknown_fields` and its invariant row names
@@ -42,8 +37,10 @@ as tested hypotheses.
   stream died silently, the answer is yes.
 - **DQ-S7 Event body bounds.** Issue #238 wants bounded inbox bodies for
   one-inference DING handling; the DING frame carries no body, so an event's
-  subject is the entire wake-time signal. Resolves with #238's outcome; until
-  then adapters keep subjects self-sufficient.
+  subject is the entire wake-time signal. st2 enforces a 1,000-byte subject
+  ceiling but currently no body ceiling. Resolves with #238's outcome; until
+  then adapters keep subjects self-sufficient and impose a small explicit body
+  bound rather than attaching unbounded provider/build logs.
 - **DQ-S8 One-shot stream completion.** The task model has no run-to-completion
   lifecycle (`TaskLifecycle` is `Service | AdoptOnly`), so a wait-adapter that
   exits after its terminal event relaunches, flaps, and parks — a fault report
