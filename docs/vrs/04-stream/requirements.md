@@ -77,8 +77,9 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   history-independent work per emit: it never scans inbox or archive history
   to recover an evicted event identity or predecessor. A later emit
   reconciles an abandoned reservation by validating its chosen file and
-  completing its stored compaction intent, so recovery does not require the
-  producer to replay stale state.
+  completing its stored compaction intent against the predecessor's retained
+  receipt, so recovery does not require the producer to replay stale state and
+  never archives unvalidated bytes.
 
 ### Must deliver as ordinary inbox work
 

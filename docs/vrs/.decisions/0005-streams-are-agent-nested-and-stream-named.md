@@ -31,17 +31,19 @@ The vocabulary is **stream-centric**: *stream* (the named declared event
 producer feeding an agent), *event* (one item on a stream), *key* (optional
 grouping axis; supersession collapses unread events per `(stream, key)` — the
 borrowed intuition is Kafka log compaction), *event-id* (producer-supplied
-dedup identity), *adapter* (the world-specific command a stream runs), and
+dedup identity), *adapter* (the world-specific program a stream runs), and
 *stream task* (the derived companion, an implementation-level follower). A
-stream declared without a `command` is an external ingress endpoint: outside
-producers emit into it via `st2 event emit`, which natively covers issue
-#137's bootstrap-timer case. "pipe" is retired as a working title.
+stream declared with either `command` or `argv` runs that adapter as a
+supervised stream task. Only a stream with neither adapter form is an external
+ingress endpoint: outside producers emit into it via `st2 event emit`, which
+natively covers issue #137's bootstrap-timer case. "pipe" is retired as a
+working title.
 
 ## Options
 
 | Option | Result | Reason |
 | --- | --- | --- |
-| Agent-nested declaration: `agent { stream "…" { command … } }` | Selected | The subscription is visible on its subscriber, lifecycle coupling is the proven derived-companion behavior, and self-authoring stays inside R25's existing authority. Accepted cost: two agents watching one feed run two adapters until a top-level generalization exists. |
+| Agent-nested declaration: `agent { stream "…" { command … } }` or `argv …` | Selected | The subscription is visible on its subscriber, lifecycle coupling is the proven derived-companion behavior, and self-authoring stays inside R25's existing authority. Accepted cost: two agents watching one feed run two adapters until a top-level generalization exists. |
 | Top-level `source` declarations beside agents | Rejected for v1 | An agent's declaration no longer shows what can wake it, self-subscription becomes authoring a foreign declaration outside R25, and subscriber lifecycle coupling was the one part neither design spike built. Reserved as the future shared-feed generalization. |
 | *pipe*-anchored vocabulary | Rejected | Unix "pipe" connotes a byte transport between two processes, not a durable deduplicated feed, and it forces two anchor-weight words for one family. |
 | *source*-anchored vocabulary | Rejected | Producer-perspective ("the agent's sources" says where events come from, not that they flow to you) and collides subtly with R13's "source" classification axis. |
@@ -57,7 +59,7 @@ coupling unbuilt and flagged locality as a human call — so the only fully
 proven locality is the nested one. On vocabulary, the borrowed intuition
 decides: supersession per `(stream, key)` is exactly Kafka log compaction, a
 mental model operators already hold, while "pipe" and "source" each import a
-weaker or colliding intuition. The command-less stream unifies external
+weaker or colliding intuition. The adapter-less stream unifies external
 ingress into the same concept, which lets issue #137's bootstrap-timer case
 run natively without a second producer-identity mechanism.
 

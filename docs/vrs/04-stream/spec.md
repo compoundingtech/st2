@@ -71,13 +71,14 @@ and inner hyphens, starting and ending alphanumeric, and share the per-agent
 uniqueness space with task names; `stream "x"` and a task named `stream-x`
 collide at validation.
 
-A command-bearing stream lowers to one derived exec task named
-`stream-<name>`, synthesized beside the derived DING through the same seam and
-late-bound to the running st2 binary each reconcile pass. It inherits the
-derived-companion contract unchanged: launch with the agent's canonical task,
-stop while held/suspended/retired/parked, its own restart accounting, crash
-surfacing to the supervisor. The adapter process calls `st2 event emit`
-itself; there is no line-protocol runner in between.
+A stream bearing either adapter form (`command` or `argv`) lowers to one
+derived exec task named `stream-<name>`, synthesized beside the derived DING
+through the same seam and late-bound to the running st2 binary each reconcile
+pass. A stream with neither form is external ingress and has no companion. The
+derived task inherits the companion contract unchanged: launch with the
+agent's canonical task, stop while held/suspended/retired/parked, its own
+restart accounting, crash surfacing to the supervisor. The adapter process
+calls `st2 event emit` itself; there is no line-protocol runner in between.
 
 ## Ingress boundary (STREAM-R03, STREAM-R04)
 
@@ -149,14 +150,19 @@ closed without changing state. If the file exists in neither location, the
 unpublished reservation is abandoned and cleared.
 
 For a valid materialized reservation with supersession intent, recovery next
-completes the stored predecessor move: archive that exact filename if it is
-still a no-follow regular inbox file, accept it as already compacted if its
-archive receipt exists, and fail closed on any other present path shape. Only
-then are the successor's stored identity, filename, key, and digest promoted
-to the retained receipt ring and the reservation cleared. The current event
-is evaluated against the resulting ring afterward. The predecessor is never
-recomputed against newer receipts, and neither producer replay nor retained
-payload bytes are required to unblock the stream.
+completes the stored predecessor move. The stored filename must resolve to its
+retained ring receipt; that receipt, not newer stream state, is the validation
+authority. If the predecessor is still present in the inbox, recovery requires
+a no-follow regular file whose parsed `stream`, `event-id`, and optional `key`
+and full rendered SHA-256 equal that receipt before archiving it. Any mismatch,
+missing retained receipt, non-regular path, or conflicting archive destination
+fails closed without moving bytes. If the predecessor is absent from the
+inbox, the archive move is already idempotently complete and no predecessor
+bytes are required. Only then are the successor's stored identity, filename,
+key, and digest promoted to the retained receipt ring and the reservation
+cleared. The current event is evaluated against the resulting ring afterward.
+Neither producer replay nor retained payload bytes are required to unblock the
+stream.
 
 For a new identity, emit persists a reservation with its identity, chosen
 filename, key, content digest, and the predecessor filename selected from the

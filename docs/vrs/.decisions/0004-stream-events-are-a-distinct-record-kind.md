@@ -37,8 +37,9 @@ rendered-content digest and at most one predecessor filename selected from the
 ring. Replaying an `event-id` within the retained receipt horizon returns the
 original filename and never re-notifies. The next emit reconciles an abandoned
 reservation only after its materialized event identity and full bytes match,
-then completes the stored predecessor compaction, without requiring stale
-producer replay or retaining payload bytes.
+then validates the stored predecessor against its retained receipt before
+completing compaction, without requiring stale producer replay or retaining
+payload bytes.
 An evicted identity is accepted as new without scanning inbox or archive
 history; archive receipts keep their existing authority for known filenames.
 An emit may declare `--supersede`, which publishes the successor before

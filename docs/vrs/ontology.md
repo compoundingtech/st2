@@ -263,8 +263,9 @@ Authority: [DING module contract](../../src/ding/mod.rs#L1-L14)
 
 ### stream
 
-A named declared event producer feeding one agent. With a command, st2
-supervises its adapter; without one, it is an external ingress endpoint.
+A named declared event producer feeding one agent. With a `command` or `argv`
+adapter form, st2 supervises its adapter; with neither, it is an external
+ingress endpoint.
 
 Authority: [STREAM-R01 declared streams](04-stream/requirements.md);
 [decision 0005](.decisions/0005-streams-are-agent-nested-and-stream-named.md)
@@ -293,8 +294,8 @@ Authority: [STREAM-R07 producer-side supersession](04-stream/requirements.md)
 
 ### adapter
 
-The world-specific command a stream runs. Packaged outside st2; it emits
-through `st2 event emit`.
+The world-specific program a stream runs, declared as either a shell `command`
+or direct `argv`. Packaged outside st2; it emits through `st2 event emit`.
 
 Authority: [STREAM-A03 world logic stays outside](04-stream/requirements.md)
 
