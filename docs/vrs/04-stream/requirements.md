@@ -46,10 +46,11 @@ executable evidence lives in [`.experiments/`](./.experiments/).
 ### Must be a declared subscription
 
 - **STREAM-R01 Declared streams:** An agent declares zero or more named
-  streams. A stream exists iff declared. A stream with a `command` lowers to
-  one derived exec companion (the stream task) that supervises the adapter; a
-  stream without a `command` is an external ingress endpoint. Stream names
-  follow the task-name grammar and are unique per agent alongside task names.
+  streams. A stream exists iff declared. A stream with exactly one adapter
+  form — `command` or `argv` — lowers to one derived exec companion (the
+  stream task) that supervises the adapter; only a stream with neither form is
+  an external ingress endpoint. Stream names follow the task-name grammar and
+  are unique per agent alongside task names.
 - **STREAM-R02 Self-authoring:** An agent adds or removes its own streams by
   editing its own declaration through the serialized catalog-authoring path,
   under the same authority boundary as presentation authoring (`R25`).
@@ -73,7 +74,9 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   conflicting-content-detection, and supersession-lookup horizon. Event
   publication does not write the Agent Sent ledger and performs
   history-independent work per emit: it never scans inbox or archive history
-  to recover an evicted event identity or predecessor.
+  to recover an evicted event identity or predecessor. A later emit
+  reconciles an abandoned reservation from the presence of its chosen
+  filename, so recovery does not require the producer to replay stale state.
 
 ### Must deliver as ordinary inbox work
 

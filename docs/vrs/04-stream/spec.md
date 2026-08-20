@@ -138,14 +138,23 @@ conflicting-content-detection, and supersession-lookup horizon: a replay hit
 answers in O(1), while a miss is accepted as a new identity without scanning
 the unread inbox or archive.
 
-Under the per-stream lock, a new emit first persists the reservation with its
-identity, chosen filename, key, content digest, and supersession intent; it
-then materializes that filename and finally atomically clears the reservation
-while inserting the receipt. A crash-interrupted retry of the same identity
-resumes the reserved filename and content. A different identity is refused
-until the pending one is replayed. This prevents both an unrecorded inbox file
-and a receipt for a file that never materialized, while adding only one
-bounded state slot.
+Under the per-stream lock, every emit first reconciles an existing
+reservation. If its chosen filename exists as a regular file in the inbox or
+archive, its stored identity, filename, key, and content digest are promoted
+to the retained receipt ring and the reservation is cleared. If the filename
+exists in neither location, the unpublished reservation is abandoned and
+cleared. The current event is then evaluated against the resulting ring; no
+producer replay and no retained payload bytes are required to unblock the
+stream.
+
+For a new identity, emit persists a reservation with its identity, chosen
+filename, key, content digest, and supersession intent; it then materializes
+that filename and finally atomically clears the reservation while inserting
+the receipt. A crash before materialization leaves a safely abandonable
+intent; a crash after materialization leaves a filename whose presence is
+enough to finalize the receipt on the next emit. This prevents both an
+unrecorded inbox file and a receipt for a file that never materialized, while
+adding only one bounded state slot.
 
 Nothing is chained, hashed, or validated O(history), and publication work is
 independent of retained stream history. `K` is 128 pending measurement

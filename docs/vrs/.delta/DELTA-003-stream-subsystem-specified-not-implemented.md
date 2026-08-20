@@ -8,8 +8,10 @@ Status: open
 ratified and [04-stream/spec.md](../04-stream/spec.md) is a settled Draft, but
 `main` contains no stream code: no `stream` KDL node, no `st2 event emit`, no
 `st2 stream add/rm`, no dedup ring, no `»` DING marker. The evidence behind the
-design lives as committed spikes in four exploration worktrees, not in this
-tree.
+design lives in the four committed
+[04-stream experiments](../04-stream/.experiments/). The implementation is
+under review in the stacked [PR #300](https://github.com/compoundingtech/st2/pull/300),
+not yet shipped on `main`.
 
 ## VRS
 
@@ -23,21 +25,19 @@ grammar) blocks the event-record wire shape and should be resolved first.
 
 ## Implementation
 
-The implementing agent starts from the differentiation-pole worktree —
-`.bare/.claude/worktrees/agent-ae190cd91778e7149` (`src/event.rs`,
-`tests/event_e2e.rs`, 12 green tests) — with two renames per decision 0005:
-its per-emit `stream` axis becomes `key`, and its top-level `source`
-declaration becomes the agent-nested `stream` node. The lifecycle worktree
-`agent-a540e72fcb3229f96` contributes the declaration/lowering/companion tests
-(27 green) modulo the `pipe`→`stream` rename and the removal of its line-
-protocol runner (adapters call `st2 event emit` directly). Still unbuilt
-anywhere: the `resources/streams/<name>/` ring store behind DQ-S2/DQ-S3, the
-`st2 stream add/rm` authoring commands, the nix-layer real adapters — the
-first two are `gh-ci-watch` and `pty-lifecycle-watch` (the "waits are standing
-feeds" doctrine in the spec: keyed pty phase/exit events replace agents
-polling `pty peek`) — and the new INVARIANTS rows named in the spec's
-verification plan. Wait-style adapters must keep their process alive after a
-terminal emit (DQ-S8): the task model has no run-to-completion lifecycle, so
+[PR #300](https://github.com/compoundingtech/st2/pull/300) is the durable
+implementation record. Its reviewed commit series implements declared ingress,
+fail-closed and no-follow boundaries, bounded publication state, stream
+authoring, lifecycle lowering, and publish-before-compact crash safety. The
+normative design inputs remain decision 0005 and the committed differentiation
+and lifecycle experiments; local worktree names are deliberately not
+provenance.
+
+The remaining review work is tracked on that PR and its exact head rather than
+copied here as a mutable commit list. In particular, its publication state must
+reconcile an abandoned pending reservation as specified in STREAM-R05 before
+this delta can close. Wait-style adapters must keep their process alive after
+a terminal emit (DQ-S8): the task model has no run-to-completion lifecycle, so
 an exiting adapter flaps into a park.
 
 Out-of-repo obligation: the `stream` node is an Agent Spec capability, so the
