@@ -414,6 +414,88 @@ fn failed_predecessor_archive_leaves_the_successor_unread_and_replay_completes()
 }
 
 #[test]
+fn a_different_event_reconciles_both_pending_crash_windows() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let inbox = message::inbox_dir(&agent);
+
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved-a:pending") };
+    let before_materialization = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "reserved-a",
+        None,
+        Some("reserved A"),
+        "reserved A",
+        false,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    assert!(
+        before_materialization
+            .to_string()
+            .contains("injected event failure at pending")
+    );
+    assert!(message::list_inbox(&inbox).unwrap().is_empty());
+
+    let after_abandoned = emit(catalog.path(), "after-abandoned", None, false);
+    assert_eq!(after_abandoned.status, EventReceiptStatus::Created);
+
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "materialized-a:materialized") };
+    let after_materialization = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "materialized-a",
+        Some("pr-1"),
+        Some("materialized A"),
+        "materialized A",
+        false,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    assert!(
+        after_materialization
+            .to_string()
+            .contains("injected event failure at materialized")
+    );
+    let materialized_filename = message::list_inbox(&inbox)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.event_id.as_deref() == Some("materialized-a"))
+        .unwrap()
+        .filename;
+
+    let after_materialized = emit(catalog.path(), "after-materialized", None, false);
+    assert_eq!(after_materialized.status, EventReceiptStatus::Created);
+    let replay = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "materialized-a",
+        Some("pr-1"),
+        Some("materialized A"),
+        "materialized A",
+        false,
+    )
+    .unwrap();
+    assert_eq!(replay.status, EventReceiptStatus::Deduplicated);
+    assert_eq!(replay.filename, materialized_filename);
+    assert_eq!(
+        message::list_inbox(&inbox)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.event_id.as_deref() == Some("materialized-a"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn keyless_supersede_replaces_the_stream_wide_head() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");

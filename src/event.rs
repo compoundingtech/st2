@@ -214,6 +214,39 @@ pub fn emit(
                 canonical_recipient
             );
 
+            if record
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.event_id != event_id)
+            {
+                let pending = record
+                    .pending
+                    .take()
+                    .expect("different pending event was just observed");
+                let materialized = message::with_resolved_message_boxes(
+                    root,
+                    &canonical_recipient,
+                    this_host,
+                    |inbox, archive| {
+                        Ok(message_entry_exists(inbox, &pending.filename)?
+                            || message_entry_exists(archive, &pending.filename)?)
+                    },
+                )?;
+                if materialized {
+                    record.recent.insert(
+                        0,
+                        StreamEntry {
+                            event_id: pending.event_id,
+                            filename: pending.filename,
+                            key: pending.key,
+                            rendered_sha256: pending.rendered_sha256,
+                        },
+                    );
+                    record.recent.truncate(RING_CAPACITY);
+                }
+                write_record(&record_path, &record)?;
+            }
+
             let rendered_sha256 = hex_digest(rendered.as_bytes());
             if let Some(entry) = record
                 .recent
@@ -259,6 +292,7 @@ pub fn emit(
                     supersede,
                 });
                 write_record(&record_path, &record)?;
+                test_event_checkpoint(event_id, "pending")?;
             }
 
             let predecessor_candidates = if supersede {
@@ -288,6 +322,7 @@ pub fn emit(
                     } else {
                         message::materialize_message_once(inbox, &filename, &rendered)?
                     };
+                    test_event_checkpoint(event_id, "materialized")?;
                     if let Some(unread) = predecessor_candidates
                         .iter()
                         .find(|candidate| inbox.join(candidate).is_file())
@@ -326,6 +361,39 @@ pub fn emit(
             })
         },
     )
+}
+
+fn message_entry_exists(directory: &Path, filename: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        message::is_message_filename(filename),
+        "invalid pending message filename {filename:?}"
+    );
+    match fs::symlink_metadata(directory.join(filename)) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "pending message entry {filename:?} is not a real regular file"
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_event_checkpoint(event_id: &str, point: &str) -> anyhow::Result<()> {
+    if std::env::var("ST2_TEST_EVENT_FAIL_AT").as_deref()
+        == Ok(format!("{event_id}:{point}").as_str())
+    {
+        anyhow::bail!("injected event failure at {point}");
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn test_event_checkpoint(_event_id: &str, _point: &str) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn validate_component(label: &str, value: &str) -> anyhow::Result<()> {
