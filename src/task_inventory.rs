@@ -400,7 +400,10 @@ pub fn inventory(
         push_error(&mut errors, error.clone());
     }
     if !parks.complete && parks.errors.is_empty() {
-        push_error(&mut errors, "park projection reported an incomplete batch".into());
+        push_error(
+            &mut errors,
+            "park projection reported an incomplete batch".into(),
+        );
     }
 
     desired.sort_by(|a, b| {

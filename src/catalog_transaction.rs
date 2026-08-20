@@ -782,10 +782,7 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
                 effective_cwd,
             ),
             None => {
-                fields.insert(
-                    format!("{root}/cwd"),
-                    default_atom(SemanticType::String),
-                );
+                fields.insert(format!("{root}/cwd"), default_atom(SemanticType::String));
             }
         }
         for (key, value) in &task.tags {
@@ -1177,13 +1174,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
 
     match fs::symlink_metadata(&catalog) {
         Ok(_) => {
-            return inspect_existing_bootstrap(
-                &parent_file,
-                name,
-                &catalog,
-                &prepared,
-                &desired,
-            );
+            return inspect_existing_bootstrap(&parent_file, name, &catalog, &prepared, &desired);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -1231,13 +1222,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             drop(staged_lock);
             let _ = remove_tree_at(&parent_file, &source_name);
-            return inspect_existing_bootstrap(
-                &parent_file,
-                name,
-                &catalog,
-                &prepared,
-                &desired,
-            );
+            return inspect_existing_bootstrap(&parent_file, name, &catalog, &prepared, &desired);
         }
         Err(error) => {
             drop(staged_lock);
@@ -1382,7 +1367,10 @@ fn unlinkat(parent: &File, name: &std::ffi::OsStr, flags: libc::c_int) -> std::i
     use std::os::unix::ffi::OsStrExt as _;
 
     let name = CString::new(name.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component contains NUL")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component contains NUL",
+        )
     })?;
     let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if result == 0 {

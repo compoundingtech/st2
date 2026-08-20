@@ -140,6 +140,10 @@ pub struct Message {
     pub priority: Option<String>,
     /// `idempotency-key:` — the caller's optional operation identity for exact retries.
     pub idempotency_key: Option<String>,
+    /// `stream:` + `event-id:` classify an ordinary inbox record as an event.
+    pub stream: Option<Box<str>>,
+    pub event_id: Option<Box<str>>,
+    pub event_key: Option<Box<str>>,
     /// The markdown body.
     pub body: String,
 }
@@ -254,6 +258,9 @@ fn parse_message(filename: &str, contents: &str) -> Message {
         tags: Vec::new(),
         priority: None,
         idempotency_key: None,
+        stream: None,
+        event_id: None,
+        event_key: None,
         body: String::new(),
     };
 
@@ -286,6 +293,9 @@ fn parse_message(filename: &str, contents: &str) -> Message {
                 }
                 "priority" => msg.priority = Some(v.to_string()),
                 "idempotency-key" => msg.idempotency_key = Some(v.to_string()),
+                "stream" => msg.stream = Some(v.into()),
+                "event-id" => msg.event_id = Some(v.into()),
+                "key" => msg.event_key = Some(v.into()),
                 _ => {}
             }
         }
@@ -509,8 +519,7 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
     match (active.as_ref(), pending.as_slice()) {
         (None, []) | (None, [_]) => {}
         (Some(active), [record]) => anyhow::ensure!(
-            active.filename == record.filename
-                && active.record_digest == digest_json(record)?,
+            active.filename == record.filename && active.record_digest == digest_json(record)?,
             "active sent intent differs from pending record"
         ),
         (Some(_), []) => {}
@@ -539,9 +548,17 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         let node = commits.get(&current).context("missing sent commit node")?;
         anyhow::ensure!(digest_json(node)? == current, "sent commit digest mismatch");
         anyhow::ensure!(node.ordinal == ordinal, "sent commit ordinal mismatch");
-        let row = rows.get(&node.filename).context("missing committed sent record")?;
-        anyhow::ensure!(digest_json(row)? == node.row_digest, "sent row digest mismatch");
-        anyhow::ensure!(reachable_nodes.insert(current), "sent commit chain contains a cycle");
+        let row = rows
+            .get(&node.filename)
+            .context("missing committed sent record")?;
+        anyhow::ensure!(
+            digest_json(row)? == node.row_digest,
+            "sent row digest mismatch"
+        );
+        anyhow::ensure!(
+            reachable_nodes.insert(current),
+            "sent commit chain contains a cycle"
+        );
         anyhow::ensure!(
             reachable_rows.insert(node.filename.clone()),
             "sent commit chain references one row more than once"
@@ -589,7 +606,9 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
     anyhow::ensure!(
         rows.keys().all(|filename| {
             reachable_rows.contains(filename)
-                || active.as_ref().is_some_and(|active| active.filename == *filename)
+                || active
+                    .as_ref()
+                    .is_some_and(|active| active.filename == *filename)
         }),
         "unexplained sent record"
     );
@@ -607,13 +626,14 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
             let key_digest = digest_json(&(&row.to, key))?;
             if let Some(receipt) = keys.get(&key_digest) {
                 anyhow::ensure!(
-                    receipt.filename == row.filename
-                        && receipt.record_digest == digest_json(row)?,
+                    receipt.filename == row.filename && receipt.record_digest == digest_json(row)?,
                     "sent idempotency receipt differs from committed row"
                 );
             } else {
                 anyhow::ensure!(
-                    active.as_ref().is_some_and(|active| active.filename == *filename),
+                    active
+                        .as_ref()
+                        .is_some_and(|active| active.filename == *filename),
                     "committed sent row is missing its idempotency receipt"
                 );
             }
@@ -661,7 +681,10 @@ fn read_sent_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         anyhow::ensure!(name.ends_with(".json"), "unexpected sent record entry");
         let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading sent record {}", entry.path().display()))?;
-        anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
+        anyhow::ensure!(
+            record.version == SENT_VERSION,
+            "unsupported sent record version"
+        );
         anyhow::ensure!(
             sent_record_name(&record.filename) == name,
             "sent record filename does not match its payload"
@@ -694,9 +717,18 @@ fn read_pending_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         anyhow::ensure!(is_sha256(digest), "invalid pending sent record digest");
         let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading pending sent record {}", entry.path().display()))?;
-        anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
-        anyhow::ensure!(is_message_filename(&record.filename), "invalid sent record filename");
-        anyhow::ensure!(digest_json(&record)? == digest, "pending sent record digest mismatch");
+        anyhow::ensure!(
+            record.version == SENT_VERSION,
+            "unsupported sent record version"
+        );
+        anyhow::ensure!(
+            is_message_filename(&record.filename),
+            "invalid sent record filename"
+        );
+        anyhow::ensure!(
+            digest_json(&record)? == digest,
+            "pending sent record digest mismatch"
+        );
         records.push(record);
     }
     records.sort_by(|left, right| left.filename.cmp(&right.filename));
@@ -712,8 +744,14 @@ fn read_sent_active(root: &Path) -> anyhow::Result<Option<SentActive>> {
     };
     let active: SentActive = serde_json::from_slice(&bytes)
         .with_context(|| format!("reading active sent intent {}", path.display()))?;
-    anyhow::ensure!(active.version == SENT_VERSION, "unsupported active sent version");
-    anyhow::ensure!(is_message_filename(&active.filename), "invalid active sent filename");
+    anyhow::ensure!(
+        active.version == SENT_VERSION,
+        "unsupported active sent version"
+    );
+    anyhow::ensure!(
+        is_message_filename(&active.filename),
+        "invalid active sent filename"
+    );
     Ok(Some(active))
 }
 
@@ -738,10 +776,22 @@ fn read_sent_commits(directory: &Path) -> anyhow::Result<BTreeMap<String, SentCo
             .context("unexpected sent commit entry")?;
         let node: SentCommit = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading sent commit {}", entry.path().display()))?;
-        anyhow::ensure!(node.version == SENT_VERSION, "unsupported sent commit version");
-        anyhow::ensure!(is_message_filename(&node.filename), "invalid sent commit filename");
-        anyhow::ensure!(digest_json(&node)? == digest, "sent commit filename mismatch");
-        anyhow::ensure!(commits.insert(digest.to_string(), node).is_none(), "duplicate sent commit");
+        anyhow::ensure!(
+            node.version == SENT_VERSION,
+            "unsupported sent commit version"
+        );
+        anyhow::ensure!(
+            is_message_filename(&node.filename),
+            "invalid sent commit filename"
+        );
+        anyhow::ensure!(
+            digest_json(&node)? == digest,
+            "sent commit filename mismatch"
+        );
+        anyhow::ensure!(
+            commits.insert(digest.to_string(), node).is_none(),
+            "duplicate sent commit"
+        );
     }
     Ok(commits)
 }
@@ -768,8 +818,14 @@ fn read_sent_keys(directory: &Path) -> anyhow::Result<BTreeMap<String, SentKey>>
         let key: SentKey = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading sent key {}", entry.path().display()))?;
         anyhow::ensure!(key.version == SENT_VERSION, "unsupported sent key version");
-        anyhow::ensure!(digest_json(&(&key.to, &key.key))? == digest, "sent key filename mismatch");
-        anyhow::ensure!(keys.insert(digest.to_string(), key).is_none(), "duplicate sent key");
+        anyhow::ensure!(
+            digest_json(&(&key.to, &key.key))? == digest,
+            "sent key filename mismatch"
+        );
+        anyhow::ensure!(
+            keys.insert(digest.to_string(), key).is_none(),
+            "duplicate sent key"
+        );
     }
     Ok(keys)
 }
@@ -1296,8 +1352,16 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> anyhow::Result<Vec
 
 enum DeliveryEndpoint {
     Agent(AddressableAgent),
-    External { bus_id: String, inbox: PathBuf, archive: PathBuf },
-    Flat { bus_id: String, inbox: PathBuf, archive: PathBuf },
+    External {
+        bus_id: String,
+        inbox: PathBuf,
+        archive: PathBuf,
+    },
+    Flat {
+        bus_id: String,
+        inbox: PathBuf,
+        archive: PathBuf,
+    },
 }
 
 impl DeliveryEndpoint {
@@ -1382,9 +1446,8 @@ pub fn send_to_resolved_inbox(
     }
     let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, external)?;
     let sender = resolve_agent_handle(catalog_root, from, this_host)?;
-    let external_sender = external.is_some_and(|external| {
-        external.root == catalog_root && external.identity == from
-    });
+    let external_sender =
+        external.is_some_and(|external| external.root == catalog_root && external.identity == from);
     if matches!(&recipient, DeliveryEndpoint::External { .. }) || external_sender {
         anyhow::ensure!(
             idempotency_key.is_none(),
@@ -1411,7 +1474,10 @@ pub fn send_to_resolved_inbox(
             (agent.bus_id.clone(), path)
         }
         None if catalogless(catalog_root) => (from.to_string(), catalog_root.join(from)),
-        None => anyhow::bail!("no agent '{from}' found in catalog {}", catalog_root.display()),
+        None => anyhow::bail!(
+            "no agent '{from}' found in catalog {}",
+            catalog_root.display()
+        ),
     };
     test_capability_checkpoint();
     send_with_ledger(
@@ -1451,14 +1517,8 @@ fn send_with_ledger(
     let recovered = recover_active(catalog_root, this_host, external, &root, &mut head)?;
 
     let filename = new_filename();
-    let rendered_message = render_message_with_idempotency(
-        from,
-        subject,
-        in_reply_to,
-        tags,
-        body,
-        idempotency_key,
-    );
+    let rendered_message =
+        render_message_with_idempotency(from, subject, in_reply_to, tags, body, idempotency_key);
     let parsed = parse_message(&filename, &rendered_message);
     let candidate = SentRecord {
         version: SENT_VERSION,
@@ -1481,7 +1541,10 @@ fn send_with_ledger(
         .iter()
         .filter(|record| record.same_operation(&candidate));
     if let Some(existing) = matching.next() {
-        anyhow::ensure!(matching.next().is_none(), "multiple recovered sends match one retry");
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "multiple recovered sends match one retry"
+        );
         return Ok(existing.filename.clone());
     }
 
@@ -1530,8 +1593,14 @@ fn ensure_sent_head(root: &Path) -> anyhow::Result<SentHead> {
 }
 
 fn validate_sent_head(head: &SentHead) -> anyhow::Result<()> {
-    anyhow::ensure!(head.version == SENT_VERSION, "unsupported sent head version");
-    anyhow::ensure!((head.count == 0) == head.tip.is_none(), "sent head count/tip mismatch");
+    anyhow::ensure!(
+        head.version == SENT_VERSION,
+        "unsupported sent head version"
+    );
+    anyhow::ensure!(
+        (head.count == 0) == head.tip.is_none(),
+        "sent head count/tip mismatch"
+    );
     if let Some(tip) = &head.tip {
         anyhow::ensure!(is_sha256(tip), "invalid sent head tip");
     }
@@ -1544,17 +1613,35 @@ fn validate_sent_tip(root: &Path, head: &SentHead) -> anyhow::Result<()> {
     };
     let node_path = root.join(SENT_COMMITS).join(format!("{digest}.json"));
     let node: SentCommit = serde_json::from_slice(&fs::read(node_path)?)?;
-    anyhow::ensure!(node.version == SENT_VERSION, "unsupported sent commit version");
-    anyhow::ensure!(is_message_filename(&node.filename), "invalid sent commit filename");
-    anyhow::ensure!(digest_json(&node)? == *digest, "sent commit digest mismatch");
+    anyhow::ensure!(
+        node.version == SENT_VERSION,
+        "unsupported sent commit version"
+    );
+    anyhow::ensure!(
+        is_message_filename(&node.filename),
+        "invalid sent commit filename"
+    );
+    anyhow::ensure!(
+        digest_json(&node)? == *digest,
+        "sent commit digest mismatch"
+    );
     anyhow::ensure!(node.ordinal == head.count, "sent commit ordinal mismatch");
     let row_path = root
         .join(SENT_MESSAGES)
         .join(sent_record_name(&node.filename));
     let row: SentRecord = serde_json::from_slice(&fs::read(row_path)?)?;
-    anyhow::ensure!(row.version == SENT_VERSION, "unsupported sent record version");
-    anyhow::ensure!(row.filename == node.filename, "sent record filename does not match payload");
-    anyhow::ensure!(digest_json(&row)? == node.row_digest, "sent row digest mismatch");
+    anyhow::ensure!(
+        row.version == SENT_VERSION,
+        "unsupported sent record version"
+    );
+    anyhow::ensure!(
+        row.filename == node.filename,
+        "sent record filename does not match payload"
+    );
+    anyhow::ensure!(
+        digest_json(&row)? == node.row_digest,
+        "sent row digest mismatch"
+    );
     Ok(())
 }
 
@@ -1578,11 +1665,7 @@ fn recover_active(
             "committed active intent differs from sender row"
         );
         publish_key(root, &record)?;
-        remove_if_exists(
-            &root
-                .join(SENT_PENDING)
-                .join(pending_record_name(&record)?),
-        )?;
+        remove_if_exists(&root.join(SENT_PENDING).join(pending_record_name(&record)?))?;
         remove_if_exists(&root.join(SENT_ACTIVE))?;
         return Ok(Vec::new());
     }
@@ -1607,7 +1690,10 @@ fn recover_active(
         _ => unreachable!(),
     };
     let recipient = resolve_delivery_endpoint(catalog_root, &record.to, this_host, external)?;
-    anyhow::ensure!(recipient.bus_id() == record.to, "pending recipient identity changed");
+    anyhow::ensure!(
+        recipient.bus_id() == record.to,
+        "pending recipient identity changed"
+    );
     deliver_record(&recipient, &record)?;
     publish_sent_record(root, &record)?;
     let node = publish_sent_commit(root, head, &record)?;
@@ -1615,11 +1701,7 @@ fn recover_active(
     head.tip = Some(digest_json(&node)?);
     write_sent_head(root, head)?;
     publish_key(root, &record)?;
-    remove_if_exists(
-        &root
-            .join(SENT_PENDING)
-            .join(pending_record_name(&record)?),
-    )?;
+    remove_if_exists(&root.join(SENT_PENDING).join(pending_record_name(&record)?))?;
     remove_if_exists(&root.join(SENT_ACTIVE))?;
     Ok(vec![record])
 }
@@ -1645,7 +1727,10 @@ fn pending_record_name(record: &SentRecord) -> anyhow::Result<String> {
 fn sent_commit(head: &SentHead, record: &SentRecord) -> anyhow::Result<SentCommit> {
     Ok(SentCommit {
         version: SENT_VERSION,
-        ordinal: head.count.checked_add(1).context("sent commit count overflow")?,
+        ordinal: head
+            .count
+            .checked_add(1)
+            .context("sent commit count overflow")?,
         previous: head.tip.clone(),
         filename: record.filename.clone(),
         row_digest: digest_json(record)?,
@@ -1679,22 +1764,30 @@ fn publish_sent_record(root: &Path, record: &SentRecord) -> anyhow::Result<()> {
 }
 
 fn read_sent_record(root: &Path, filename: &str) -> anyhow::Result<SentRecord> {
-    anyhow::ensure!(is_message_filename(filename), "invalid sent record filename");
-    let path = root
-        .join(SENT_MESSAGES)
-        .join(sent_record_name(filename));
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid sent record filename"
+    );
+    let path = root.join(SENT_MESSAGES).join(sent_record_name(filename));
     let record: SentRecord = serde_json::from_slice(&fs::read(&path)?)
         .with_context(|| format!("reading sent record {}", path.display()))?;
-    anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
-    anyhow::ensure!(record.filename == filename, "sent record filename does not match payload");
+    anyhow::ensure!(
+        record.version == SENT_VERSION,
+        "unsupported sent record version"
+    );
+    anyhow::ensure!(
+        record.filename == filename,
+        "sent record filename does not match payload"
+    );
     Ok(record)
 }
 
 fn sent_record_exists(root: &Path, filename: &str) -> anyhow::Result<bool> {
-    anyhow::ensure!(is_message_filename(filename), "invalid sent record filename");
-    let path = root
-        .join(SENT_MESSAGES)
-        .join(sent_record_name(filename));
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid sent record filename"
+    );
+    let path = root.join(SENT_MESSAGES).join(sent_record_name(filename));
     match fs::metadata(path) {
         Ok(metadata) => {
             anyhow::ensure!(metadata.is_file(), "sent record path is not a file");
@@ -1756,17 +1849,38 @@ fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<Se
         Err(error) => return Err(error.into()),
     };
     let receipt: SentKey = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(receipt.version == SENT_VERSION, "unsupported sent key version");
-    anyhow::ensure!(receipt.to == candidate.to && receipt.key == key, "sent key scope mismatch");
-    anyhow::ensure!(is_message_filename(&receipt.filename), "invalid sent key filename");
+    anyhow::ensure!(
+        receipt.version == SENT_VERSION,
+        "unsupported sent key version"
+    );
+    anyhow::ensure!(
+        receipt.to == candidate.to && receipt.key == key,
+        "sent key scope mismatch"
+    );
+    anyhow::ensure!(
+        is_message_filename(&receipt.filename),
+        "invalid sent key filename"
+    );
     let record_path = root
         .join(SENT_MESSAGES)
         .join(sent_record_name(&receipt.filename));
     let record: SentRecord = serde_json::from_slice(&fs::read(record_path)?)?;
-    anyhow::ensure!(record.version == SENT_VERSION, "unsupported sent record version");
-    anyhow::ensure!(record.filename == receipt.filename, "sent key record filename mismatch");
-    anyhow::ensure!(digest_json(&record)? == receipt.record_digest, "sent key record mismatch");
-    anyhow::ensure!(record.same_operation(candidate), "message idempotency key reused with different content");
+    anyhow::ensure!(
+        record.version == SENT_VERSION,
+        "unsupported sent record version"
+    );
+    anyhow::ensure!(
+        record.filename == receipt.filename,
+        "sent key record filename mismatch"
+    );
+    anyhow::ensure!(
+        digest_json(&record)? == receipt.record_digest,
+        "sent key record mismatch"
+    );
+    anyhow::ensure!(
+        record.same_operation(candidate),
+        "message idempotency key reused with different content"
+    );
     Ok(Some(record))
 }
 
@@ -1776,9 +1890,18 @@ fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Res
     };
     let path = root.join(SENT_COMMITS).join(format!("{digest}.json"));
     let node: SentCommit = serde_json::from_slice(&fs::read(path)?)?;
-    anyhow::ensure!(node.version == SENT_VERSION, "unsupported sent commit version");
-    anyhow::ensure!(is_message_filename(&node.filename), "invalid sent commit filename");
-    anyhow::ensure!(digest_json(&node)? == *digest, "sent commit digest mismatch");
+    anyhow::ensure!(
+        node.version == SENT_VERSION,
+        "unsupported sent commit version"
+    );
+    anyhow::ensure!(
+        is_message_filename(&node.filename),
+        "invalid sent commit filename"
+    );
+    anyhow::ensure!(
+        digest_json(&node)? == *digest,
+        "sent commit digest mismatch"
+    );
     anyhow::ensure!(node.ordinal == head.count, "sent commit ordinal mismatch");
     Ok(node.filename == filename)
 }

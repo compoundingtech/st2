@@ -10,19 +10,34 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn pty_available() -> bool {
-    Command::new("pty").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("pty")
+        .arg("--help")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn pty_ids(pty_root: &Path) -> Vec<(String, String)> {
-    let out = Command::new("pty").args(["list", "--json"]).env("PTY_ROOT", pty_root).output().unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Array(vec![]));
+    let out = Command::new("pty")
+        .args(["list", "--json"])
+        .env("PTY_ROOT", pty_root)
+        .output()
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Array(vec![]));
     v.as_array()
         .map(|rows| {
             rows.iter()
                 .map(|s| {
                     (
-                        s.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                        s.get("status").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        s.get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        s.get("status")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     )
                 })
                 .collect()
@@ -60,7 +75,11 @@ team "t" {
     .unwrap();
 
     let pty_root = tmp.path().join("pty");
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let out = Command::new(bin)
         .args(["up"])
         .arg(&spec_dir)
@@ -76,25 +95,49 @@ team "t" {
         "st2 up <spec> failed.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("booted team from spec"), "no boot line:\n{stdout}");
+    assert!(
+        stdout.contains("booted team from spec"),
+        "no boot line:\n{stdout}"
+    );
 
     // The team is running under its team-prefixed ids, in the isolated PTY_ROOT.
     std::thread::sleep(std::time::Duration::from_millis(500));
     let ids = pty_ids(&pty_root);
-    let running: Vec<&str> = ids.iter().filter(|(_, s)| s == "running").map(|(n, _)| n.as_str()).collect();
-    assert!(running.contains(&"t.a"), "t.a not running; sessions={ids:?}");
-    assert!(running.contains(&"t.b"), "t.b not running; sessions={ids:?}");
+    let running: Vec<&str> = ids
+        .iter()
+        .filter(|(_, s)| s == "running")
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(
+        running.contains(&"t.a"),
+        "t.a not running; sessions={ids:?}"
+    );
+    assert!(
+        running.contains(&"t.b"),
+        "t.b not running; sessions={ids:?}"
+    );
 
     // Teardown — the team persists after st2 exits (nomad-decoupled), so clean it up ourselves.
     for id in ["t.a", "t.b"] {
-        let _ = Command::new("pty").args(["kill", id]).env("PTY_ROOT", &pty_root).status();
-        let _ = Command::new("pty").args(["rm", id]).env("PTY_ROOT", &pty_root).status();
+        let _ = Command::new("pty")
+            .args(["kill", id])
+            .env("PTY_ROOT", &pty_root)
+            .status();
+        let _ = Command::new("pty")
+            .args(["rm", id])
+            .env("PTY_ROOT", &pty_root)
+            .status();
     }
     // Stop any lingering per-task scopes (this spec's ids only).
-    if let Ok(o) = Command::new("systemctl").args(["--user", "list-units", "--no-legend", "st2-t.*"]).output() {
+    if let Ok(o) = Command::new("systemctl")
+        .args(["--user", "list-units", "--no-legend", "st2-t.*"])
+        .output()
+    {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             if let Some(unit) = line.split_whitespace().next() {
-                let _ = Command::new("systemctl").args(["--user", "stop", unit]).status();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .status();
             }
         }
     }
@@ -119,7 +162,10 @@ fn st2_up_refuses_an_eval_only_file() {
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .output()
         .unwrap();
-    assert!(!out.status.success(), "st2 up on an eval-only file must refuse");
+    assert!(
+        !out.status.success(),
+        "st2 up on an eval-only file must refuse"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("eval-only file") && stderr.contains("st2 eval"),
@@ -133,7 +179,10 @@ fn st2_up_refuses_an_eval_only_file() {
 #[test]
 fn st2_down_tears_down_a_spec_fleet() {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP st2_down_tears_down_a_spec_fleet: `pty` not on PATH");
         return;
     }
@@ -154,7 +203,11 @@ team "down" {
     )
     .unwrap();
     let pty_root = tmp.path().join("pty");
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let run = |args: &[&str]| {
         Command::new(bin)
             .args(args)
@@ -168,36 +221,73 @@ team "down" {
 
     // Boot the team, confirm it's running.
     let up = run(&["up", "--once"]);
-    assert!(up.status.success(), "up failed: {}", String::from_utf8_lossy(&up.stderr));
+    assert!(
+        up.status.success(),
+        "up failed: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
     std::thread::sleep(Duration::from_millis(500));
     let running = |ids: &[(String, String)]| -> Vec<String> {
-        ids.iter().filter(|(_, s)| s == "running").map(|(n, _)| n.clone()).collect()
+        ids.iter()
+            .filter(|(_, s)| s == "running")
+            .map(|(n, _)| n.clone())
+            .collect()
     };
     let before = running(&pty_ids(&pty_root));
-    assert!(before.contains(&"down.a".to_string()), "t.a not running before down; {before:?}");
-    assert!(before.contains(&"down.b".to_string()), "t.b not running before down; {before:?}");
+    assert!(
+        before.contains(&"down.a".to_string()),
+        "t.a not running before down; {before:?}"
+    );
+    assert!(
+        before.contains(&"down.b".to_string()),
+        "t.b not running before down; {before:?}"
+    );
 
     // `st2 down <spec>` tears down the declared team.
     let down = run(&["down"]);
     let dstdout = String::from_utf8_lossy(&down.stdout);
-    assert!(down.status.success(), "down failed: {}", String::from_utf8_lossy(&down.stderr));
-    assert!(dstdout.contains("teardown of spec"), "no spec-teardown line:\n{dstdout}");
-    assert!(dstdout.contains("down.a") && dstdout.contains("down.b"), "down did not report tearing down down.a/down.b:\n{dstdout}");
+    assert!(
+        down.status.success(),
+        "down failed: {}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    assert!(
+        dstdout.contains("teardown of spec"),
+        "no spec-teardown line:\n{dstdout}"
+    );
+    assert!(
+        dstdout.contains("down.a") && dstdout.contains("down.b"),
+        "down did not report tearing down down.a/down.b:\n{dstdout}"
+    );
 
     // The sessions are no longer running.
     std::thread::sleep(Duration::from_millis(500));
     let after = running(&pty_ids(&pty_root));
-    assert!(!after.contains(&"down.a".to_string()), "t.a still running after down; {after:?}");
-    assert!(!after.contains(&"down.b".to_string()), "t.b still running after down; {after:?}");
+    assert!(
+        !after.contains(&"down.a".to_string()),
+        "t.a still running after down; {after:?}"
+    );
+    assert!(
+        !after.contains(&"down.b".to_string()),
+        "t.b still running after down; {after:?}"
+    );
 
     // Clean up the (now-stopped) sessions + any per-task scopes.
     for id in ["down.a", "down.b"] {
-        let _ = Command::new("pty").args(["rm", id]).env("PTY_ROOT", &pty_root).status();
+        let _ = Command::new("pty")
+            .args(["rm", id])
+            .env("PTY_ROOT", &pty_root)
+            .status();
     }
-    if let Ok(o) = Command::new("systemctl").args(["--user", "list-units", "--no-legend", "st2-down.*"]).output() {
+    if let Ok(o) = Command::new("systemctl")
+        .args(["--user", "list-units", "--no-legend", "st2-down.*"])
+        .output()
+    {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             if let Some(unit) = line.split_whitespace().next() {
-                let _ = Command::new("systemctl").args(["--user", "stop", unit]).status();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .status();
             }
         }
     }
@@ -210,7 +300,10 @@ team "down" {
 #[test]
 fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP st2_up_once_atomically_respawns_a_hard_killed_agent: `pty` not on PATH");
         return;
     }
@@ -225,7 +318,11 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
     )
     .unwrap();
     let pty_root = tmp.path().join("pty");
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let once = || {
         Command::new(bin)
             .args(["up", "--once"])
@@ -237,7 +334,11 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
             .unwrap()
     };
     let pid_of = |id: &str| -> Option<i64> {
-        let out = Command::new("pty").args(["list", "--json"]).env("PTY_ROOT", &pty_root).output().ok()?;
+        let out = Command::new("pty")
+            .args(["list", "--json"])
+            .env("PTY_ROOT", &pty_root)
+            .output()
+            .ok()?;
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
         v.as_array()?
             .iter()
@@ -252,24 +353,44 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
     assert!(once().status.success(), "initial boot failed");
     std::thread::sleep(Duration::from_millis(700));
     let pid1 = pid_of("raceonce").expect("agent 'raceonce' should be running after boot");
-    let _ = Command::new("kill").args(["-9", &pid1.to_string()]).status();
+    let _ = Command::new("kill")
+        .args(["-9", &pid1.to_string()])
+        .status();
 
     // A single `--once` pass right after the hard-kill must atomically reap + respawn — no "in use".
     let out = once();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "up --once failed after hard-kill:\n{stderr}");
-    assert!(!stderr.contains("already in use"), "respawn hit the reap race:\n{stderr}");
+    assert!(
+        out.status.success(),
+        "up --once failed after hard-kill:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("already in use"),
+        "respawn hit the reap race:\n{stderr}"
+    );
     std::thread::sleep(Duration::from_millis(500));
-    let pid2 = pid_of("raceonce").expect("agent 'raceonce' should be respawned by the same --once pass");
+    let pid2 =
+        pid_of("raceonce").expect("agent 'raceonce' should be respawned by the same --once pass");
     assert_ne!(pid1, pid2, "respawn must be a NEW process");
 
     // Clean up.
-    let _ = Command::new("pty").args(["kill", "raceonce"]).env("PTY_ROOT", &pty_root).status();
-    let _ = Command::new("pty").args(["rm", "raceonce"]).env("PTY_ROOT", &pty_root).status();
-    if let Ok(o) = Command::new("systemctl").args(["--user", "list-units", "--no-legend", "st2-raceonce*"]).output() {
+    let _ = Command::new("pty")
+        .args(["kill", "raceonce"])
+        .env("PTY_ROOT", &pty_root)
+        .status();
+    let _ = Command::new("pty")
+        .args(["rm", "raceonce"])
+        .env("PTY_ROOT", &pty_root)
+        .status();
+    if let Ok(o) = Command::new("systemctl")
+        .args(["--user", "list-units", "--no-legend", "st2-raceonce*"])
+        .output()
+    {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
             if let Some(unit) = line.split_whitespace().next() {
-                let _ = Command::new("systemctl").args(["--user", "stop", unit]).status();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .status();
             }
         }
     }
@@ -281,7 +402,10 @@ fn st2_up_once_atomically_respawns_a_hard_killed_agent() {
 #[test]
 fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP st2_up_spec_supervises_and_respawns_a_killed_agent: `pty` not on PATH");
         return;
     }
@@ -296,11 +420,17 @@ fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
     )
     .unwrap();
     let pty_root = tmp.path().join("pty");
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     // Supervise in the background with a fast reconcile interval.
     let mut child = std::process::Command::new(bin)
-        .args(["up"]).arg(&spec_dir).args(["--interval", "1"])
+        .args(["up"])
+        .arg(&spec_dir)
+        .args(["--interval", "1"])
         .env("PATH", &path)
         .env("XDG_STATE_HOME", tmp.path().join("xdg"))
         .env("PTY_ROOT", &pty_root)
@@ -310,37 +440,67 @@ fn st2_up_spec_supervises_and_respawns_a_killed_agent() {
         .unwrap();
 
     let pid_of = |id: &str| -> Option<i64> {
-        let out = std::process::Command::new("pty").args(["list", "--json"]).env("PTY_ROOT", &pty_root).output().ok()?;
+        let out = std::process::Command::new("pty")
+            .args(["list", "--json"])
+            .env("PTY_ROOT", &pty_root)
+            .output()
+            .ok()?;
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-        v.as_array()?.iter().find(|s| s.get("name").and_then(|x| x.as_str()) == Some(id) && s.get("status").and_then(|x| x.as_str()) == Some("running"))
+        v.as_array()?
+            .iter()
+            .find(|s| {
+                s.get("name").and_then(|x| x.as_str()) == Some(id)
+                    && s.get("status").and_then(|x| x.as_str()) == Some("running")
+            })
             .and_then(|s| s.get("pid").and_then(|p| p.as_i64()))
     };
     let wait_for = |id: &str, secs: u64| -> Option<i64> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
-            if let Some(pid) = pid_of(id) { return Some(pid); }
-            if Instant::now() > deadline { return None; }
+            if let Some(pid) = pid_of(id) {
+                return Some(pid);
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(300));
         }
     };
 
     let pid1 = wait_for("a", 15).expect("agent 'a' should boot under supervision");
     // Kill it out from under the supervisor.
-    let _ = std::process::Command::new("pty").args(["kill", "a"]).env("PTY_ROOT", &pty_root).status();
+    let _ = std::process::Command::new("pty")
+        .args(["kill", "a"])
+        .env("PTY_ROOT", &pty_root)
+        .status();
     // The supervise loop must bring it back (new pid) within a few reconcile intervals.
     let pid2 = wait_for("a", 15).expect("supervisor should RESPAWN the killed agent");
-    assert_ne!(pid1, pid2, "respawn must be a NEW process, not the killed one");
+    assert_ne!(
+        pid1, pid2,
+        "respawn must be a NEW process, not the killed one"
+    );
 
     // Stop the supervisor; the session persists (nomad-decoupled). Clean up.
     let _ = child.kill();
     let _ = child.wait();
-    let _ = std::process::Command::new("pty").args(["kill", "a"]).env("PTY_ROOT", &pty_root).status();
-    let _ = std::process::Command::new("pty").args(["rm", "a"]).env("PTY_ROOT", &pty_root).status();
+    let _ = std::process::Command::new("pty")
+        .args(["kill", "a"])
+        .env("PTY_ROOT", &pty_root)
+        .status();
+    let _ = std::process::Command::new("pty")
+        .args(["rm", "a"])
+        .env("PTY_ROOT", &pty_root)
+        .status();
     for u in ["st2-a"] {
-        if let Ok(o) = std::process::Command::new("systemctl").args(["--user", "list-units", "--no-legend", &format!("{u}*")]).output() {
+        if let Ok(o) = std::process::Command::new("systemctl")
+            .args(["--user", "list-units", "--no-legend", &format!("{u}*")])
+            .output()
+        {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 if let Some(unit) = line.split_whitespace().next() {
-                    let _ = std::process::Command::new("systemctl").args(["--user", "stop", unit]).status();
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "stop", unit])
+                        .status();
                 }
             }
         }

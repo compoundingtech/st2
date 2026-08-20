@@ -36,6 +36,9 @@ const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
 const SUPERVISOR_CHAIN_LIMIT: usize = 64;
+/// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
+/// producer-supplied text — so the bounded-notice proofs are unaffected.
+const SOURCE_MARKER: &str = "»";
 const RECOVERY_POKE: &str = "[DING] unread st2 messages remain; check your inbox";
 // Must exceed face607's bounded 0.5s delivery delay plus PTY/Node startup overhead; otherwise a
 // successful pane write is misreported as a timeout and retried, duplicating the owned payload.
@@ -222,7 +225,11 @@ fn poke_text_with_resolver(
 ) -> String {
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
     let from = normalize_field(msg.from.as_deref(), "unknown", SENDER_MAX_CHARS);
-    let marker = relationship_marker(resolver, this_host, recipient, msg.from.as_deref());
+    let marker = if msg.stream.is_some() && msg.event_id.is_some() {
+        SOURCE_MARKER.to_string()
+    } else {
+        relationship_marker(resolver, this_host, recipient, msg.from.as_deref())
+    };
     format!(
         "[DING] {marker} {from}: {subject} [id:{}]",
         poke_id(&msg.filename)
@@ -1177,6 +1184,9 @@ mod tests {
             tags: vec![],
             priority: None,
             idempotency_key: None,
+            stream: None,
+            event_id: None,
+            event_key: None,
             body: String::new(),
         }
     }
@@ -3083,6 +3093,204 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
     }
 
+    // -----------------------------------------------------------------------------------------
+    // SPIKE — producer-side event supersede against staged payload ownership.
+    //
+    // Supersede is the one genuinely new semantic in
+    // `docs/vrs/.experiments/2026-08-20-pipes-event-model-differentiation.md`, and it archives an
+    // inbox item *from outside DING*, possibly while DING already owns that item's payload in a
+    // composer. These two tests are the seam: if either fails, the differentiated event model's
+    // main earned semantic is unsafe and the design collapses back to unification.
+    // -----------------------------------------------------------------------------------------
+
+    /// A real catalog with one agent-owned stream.
+    fn event_catalog() -> (tempfile::TempDir, PathBuf) {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "hetz", "worker", None);
+        let declaration = catalog.path().join("hetz/worker/agent.kdl");
+        let source = std::fs::read_to_string(&declaration).unwrap();
+        std::fs::write(
+            declaration,
+            source.replacen("\n}\n", "\n  stream \"gh-ci\" {}\n}\n", 1),
+        )
+        .unwrap();
+        let inbox = inbox_dir(&catalog.path().join("hetz").join("worker"));
+        (catalog, inbox)
+    }
+
+    fn emit_ci(root: &Path, event_id: &str, supersede: bool) -> String {
+        crate::event::emit(
+            root,
+            "hetz",
+            "hetz.worker",
+            "gh-ci",
+            event_id,
+            Some("pr-42"),
+            Some(&format!("CI {event_id} on PR #42")),
+            event_id,
+            supersede,
+        )
+        .unwrap()
+        .filename
+    }
+
+    fn flush_in(root: &Path, pending: &mut VecDeque<PendingNotice>, poker: &dyn Poker) {
+        flush_pending(
+            DingContext {
+                catalog_root: root,
+                this_host: "hetz",
+                recipient: "hetz.worker",
+            },
+            None,
+            pending,
+            poker,
+        );
+    }
+
+    /// The race: the producer supersedes event N *while DING owns N's staged payload*. The
+    /// existing ownership rules must carry it — N is pasted exactly once and never again, the
+    /// archived-and-not-retained head releases FIFO, and N+1 still delivers. Nothing about
+    /// `flush_pending` or `prune_archived_pending` changes to make this true.
+    #[test]
+    fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_delivers() {
+        let (catalog, inbox) = event_catalog();
+        let root = catalog.path();
+
+        let failure = emit_ci(root, "failure", true);
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<PendingNotice> = new_arrivals(&inbox, &mut seen)
+            .into_iter()
+            .map(PendingNotice::message)
+            .collect();
+        let failure_text = pending[0].text(
+            DingContext {
+                catalog_root: root,
+                this_host: "hetz",
+                recipient: "hetz.worker",
+            },
+            &mut None,
+        );
+        assert!(
+            failure_text.starts_with("[DING] » hetz.worker/gh-ci:"),
+            "an event announces itself as a world-event: {failure_text}"
+        );
+
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([
+                // the successor, once ownership of the superseded head is released
+                PokeOutcome::Delivered,
+            ])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::NotRetained])),
+        };
+        // DING stages the failure notice and owns it.
+        let stage_only = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+            retry_outcomes: Mutex::new(VecDeque::new()),
+        };
+        flush_in(root, &mut pending, &stage_only);
+        assert_eq!(pending[0].staged_text(), Some(failure_text.as_str()));
+
+        // The producer now supersedes: `success` is materialized and `failure` is archived under
+        // DING's feet.
+        let success = emit_ci(root, "success", true);
+        assert!(!inbox.join(&failure).exists(), "the head was retired");
+        assert!(inbox.join(&success).exists(), "the successor is unread");
+
+        pending.extend(
+            new_arrivals(&inbox, &mut seen)
+                .into_iter()
+                .map(PendingNotice::message),
+        );
+        prune_archived_pending(&inbox, &mut pending);
+        assert_eq!(
+            pending.len(),
+            2,
+            "the staged-but-archived head keeps ownership; the successor queues behind it"
+        );
+
+        flush_in(root, &mut pending, &poker);
+
+        assert!(pending.is_empty(), "FIFO drained, nothing stuck");
+        let success_text = poker.pokes.lock().unwrap()[0].clone();
+        assert!(
+            success_text.contains("CI success on PR #42"),
+            "{success_text}"
+        );
+        assert_eq!(
+            stage_only.pokes.lock().unwrap().as_slice(),
+            [failure_text.as_str()],
+            "the superseded notice was pasted exactly once, ever"
+        );
+        assert_eq!(
+            poker.pokes.lock().unwrap().len(),
+            1,
+            "and the only fresh paste after supersede is the successor"
+        );
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            [failure_text.as_str()],
+            "the superseded head was released by inspection only, never re-pasted"
+        );
+    }
+
+    /// The pessimistic half of the same race: the adapter still sees the superseded notice in the
+    /// composer. Ownership is retained, FIFO stays blocked behind it, and the successor is *not*
+    /// pasted on top of a live payload. Supersede therefore cannot leak a second paste into a
+    /// composer that is still holding the first.
+    #[test]
+    fn a_superseded_but_still_retained_staged_event_keeps_ownership_without_repasting() {
+        let (catalog, inbox) = event_catalog();
+        let root = catalog.path();
+
+        emit_ci(root, "failure", true);
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<PendingNotice> = new_arrivals(&inbox, &mut seen)
+            .into_iter()
+            .map(PendingNotice::message)
+            .collect();
+        let failure_text = pending[0].text(
+            DingContext {
+                catalog_root: root,
+                this_host: "hetz",
+                recipient: "hetz.worker",
+            },
+            &mut None,
+        );
+
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+        };
+        flush_in(root, &mut pending, &poker);
+
+        emit_ci(root, "success", true);
+        pending.extend(
+            new_arrivals(&inbox, &mut seen)
+                .into_iter()
+                .map(PendingNotice::message),
+        );
+        prune_archived_pending(&inbox, &mut pending);
+        flush_in(root, &mut pending, &poker);
+
+        assert_eq!(pending.len(), 2, "later FIFO work remains blocked");
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [failure_text.as_str()],
+            "the successor is never pasted on top of a retained payload"
+        );
+        assert_eq!(
+            poker.retries.lock().unwrap().as_slice(),
+            [failure_text.as_str()],
+            "the retained superseded notice is retried by inspection only"
+        );
+    }
+
     #[test]
     fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
         let agent = tempfile::tempdir().unwrap();
@@ -3211,11 +3419,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        std::fs::write(
-            &status_path,
-            format!("dnd\nv1 {stale_ms}\n"),
-        )
-        .unwrap();
+        std::fs::write(&status_path, format!("dnd\nv1 {stale_ms}\n")).unwrap();
         flush_without_catalog(Some(&status_path), &mut pending, &poker);
         assert!(
             pending.is_empty(),

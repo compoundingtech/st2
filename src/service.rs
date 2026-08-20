@@ -187,7 +187,10 @@ fn install_systemd_user(_spec: &ServiceSpec) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn status_systemd_user() -> Result<()> {
-    run_command("systemctl", &["--user", "status", SERVICE_NAME, "--no-pager"])
+    run_command(
+        "systemctl",
+        &["--user", "status", SERVICE_NAME, "--no-pager"],
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -238,7 +241,9 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from).context("HOME is not set")
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
 }
 
 #[cfg(target_os = "linux")]
@@ -340,9 +345,9 @@ mod tests {
         assert!(unit.contains("RestartSec=5s"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("WorkingDirectory=/home/user/catalog"));
-        assert!(unit.contains(
-            "Environment=PATH=/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin"
-        ));
+        assert!(
+            unit.contains("Environment=PATH=/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin")
+        );
         assert!(!unit.contains("Environment=PTY_ROOT="));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("Description=st2 supervisor (st2 up)"));
@@ -383,9 +388,7 @@ mod tests {
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(
-            unit.contains("ExecStart=\"/opt/st2 tools/st2\" up --catalog \"/srv/cat 100%%\"")
-        );
+        assert!(unit.contains("ExecStart=\"/opt/st2 tools/st2\" up --catalog \"/srv/cat 100%%\""));
         assert!(unit.contains("WorkingDirectory=\"/srv/cat 100%%\""));
         assert!(unit.contains("Environment=\"PATH=/opt/st2 tools:/usr/bin\""));
         assert!(unit.contains("Environment=\"PTY_ROOT=/srv/pty 100%%\""));

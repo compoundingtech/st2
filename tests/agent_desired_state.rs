@@ -55,7 +55,11 @@ fn cli_suspends_resumes_and_retires_without_rewriting_unrelated_source() {
     write(root, "h/worker/agent.kdl", initial);
 
     let suspended = author(root, "suspended", Some("Waiting for capacity"));
-    assert!(suspended.status.success(), "{}", String::from_utf8_lossy(&suspended.stderr));
+    assert!(
+        suspended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&suspended.stderr)
+    );
     let receipt: serde_json::Value = serde_json::from_slice(&suspended.stdout).unwrap();
     assert_eq!(receipt["result"], "changed");
     assert_eq!(receipt["desired_state"], "suspended");
@@ -67,18 +71,31 @@ fn cli_suspends_resumes_and_retires_without_rewriting_unrelated_source() {
 
     let repeat = author(root, "suspended", Some("Waiting for capacity"));
     assert!(repeat.status.success());
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&repeat.stdout).unwrap()["result"], "unchanged");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&repeat.stdout).unwrap()["result"],
+        "unchanged"
+    );
 
     let running = author(root, "running", None);
-    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
-    assert_eq!(fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(), initial);
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        initial
+    );
 
     let retired = author(root, "retired", Some("Mission complete"));
     assert!(retired.status.success());
     let found = st2::discover(root);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     assert!(found.specs[0].desired_state.is_retired());
-    assert_eq!(found.specs[0].desired_state.reason(), Some("Mission complete"));
+    assert_eq!(
+        found.specs[0].desired_state.reason(),
+        Some("Mission complete")
+    );
 }
 
 #[test]
@@ -89,7 +106,11 @@ fn cli_resume_preserves_same_line_leading_comment() {
     write(root, "h/worker/agent.kdl", initial);
 
     let running = author(root, "running", None);
-    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
     assert_eq!(
         fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
         "agent \"worker\" {\n  host \"h\"\n  /* operator note */\n  command \"true\"\n}\n"
@@ -104,7 +125,11 @@ fn cli_authors_a_canonical_path_derived_identity() {
     write(root, "h/worker/agent.kdl", initial);
 
     let suspended = author(root, "suspended", Some("Waiting for capacity"));
-    assert!(suspended.status.success(), "{}", String::from_utf8_lossy(&suspended.stderr));
+    assert!(
+        suspended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&suspended.stderr)
+    );
     assert!(
         fs::read_to_string(root.join("h/worker/agent.kdl"))
             .unwrap()
@@ -112,8 +137,15 @@ fn cli_authors_a_canonical_path_derived_identity() {
     );
 
     let running = author(root, "running", None);
-    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
-    assert_eq!(fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(), initial);
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+        initial
+    );
 }
 
 #[test]
@@ -130,8 +162,14 @@ fn cli_rejects_invalid_reason_contract_without_mutation() {
         ("suspended", Some(" surrounding ")),
     ] {
         let output = author(root, state, reason);
-        assert!(!output.status.success(), "{state} {reason:?} unexpectedly succeeded");
-        assert_eq!(fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(), initial);
+        assert!(
+            !output.status.success(),
+            "{state} {reason:?} unexpectedly succeeded"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
+            initial
+        );
     }
 }
 
@@ -145,7 +183,11 @@ fn cli_canonicalizes_legacy_retirement_and_refuses_nix_owned_declarations() {
         "agent \"worker\" { host \"h\"; retired #true; command \"true\" }\n",
     );
     let output = author(root, "suspended", Some("May return"));
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let authored = fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap();
     assert!(!authored.contains("retired"));
     assert!(authored.contains("desired-state \"suspended\" reason=\"May return\""));
@@ -182,13 +224,20 @@ fn cli_applies_the_existing_self_or_descendant_authority_guardrail() {
     );
 
     let allowed = author_as(root, "h.root");
-    assert!(allowed.status.success(), "{}", String::from_utf8_lossy(&allowed.stderr));
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
     assert!(author(root, "running", None).status.success());
     let refused = author_as(root, "h.sibling");
     assert!(!refused.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert_eq!(receipt["code"], "desired-state-not-authorized");
-    assert!(st2::discover(root).specs
-        .iter()
-        .any(|spec| spec.identity == "worker" && spec.desired_state.is_running()));
+    assert!(
+        st2::discover(root)
+            .specs
+            .iter()
+            .any(|spec| spec.identity == "worker" && spec.desired_state.is_running())
+    );
 }

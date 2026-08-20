@@ -327,8 +327,15 @@ fn suspended_declaration_is_healthy_when_tasks_are_absent_without_presence() {
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("✓ h.idle suspension effective (no live tasks)"), "{stdout}");
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("✓ h.idle suspension effective (no live tasks)"),
+        "{stdout}"
+    );
     assert!(!stdout.contains("h.idle presence"), "{stdout}");
 }
 
@@ -353,8 +360,15 @@ fn suspended_declaration_distinguishes_live_dead_keep_and_dead_nonkeep() {
 
         let output = doctor(&catalog, &bin, &tmp.path().join("state"));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(output.status.success(), healthy, "status={status} keep={keep}\n{stdout}");
-        assert!(stdout.contains("h.idle suspension effective (no live tasks)"), "{stdout}");
+        assert_eq!(
+            output.status.success(),
+            healthy,
+            "status={status} keep={keep}\n{stdout}"
+        );
+        assert!(
+            stdout.contains("h.idle suspension effective (no live tasks)"),
+            "{stdout}"
+        );
         if !detail.is_empty() {
             assert!(stdout.contains(detail), "{stdout}");
         }
@@ -423,5 +437,8 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
     let invalid = doctor(&catalog, &bin, &tmp.path().join("state"));
     let stdout = String::from_utf8_lossy(&invalid.stdout);
     assert!(!invalid.status.success(), "{stdout}");
-    assert!(stdout.contains("unsupported `deliver` value 'mpc'"), "{stdout}");
+    assert!(
+        stdout.contains("unsupported `deliver` value 'mpc'"),
+        "{stdout}"
+    );
 }

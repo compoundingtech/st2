@@ -46,15 +46,25 @@ fn a_declared_pty_root_replaces_the_catalog_default_in_the_bus_env() {
     )
     .unwrap();
 
-    let out = st2(&["env", "--catalog", declared.to_str().unwrap()], tmp.path());
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = st2(
+        &["env", "--catalog", declared.to_str().unwrap()],
+        tmp.path(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let env = String::from_utf8_lossy(&out.stdout);
     assert!(
         env.contains(&format!("export PTY_ROOT={}\n", shared.display())),
         "declared root missing from the bus env:\n{env}"
     );
     assert!(
-        env.contains(&format!("export ST_ROOT={}\n", declared.canonicalize().unwrap().display())),
+        env.contains(&format!(
+            "export ST_ROOT={}\n",
+            declared.canonicalize().unwrap().display()
+        )),
         "the flat native ST_ROOT must be unaffected:\n{env}"
     );
 

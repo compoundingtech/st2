@@ -79,7 +79,10 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
             "workspace" => raw.workspace = arg_string(child),
             "supervisor" => raw.supervisor = arg_string(child),
             "retired" => {
-                anyhow::ensure!(raw.retired.is_none(), "agent declares `retired` more than once");
+                anyhow::ensure!(
+                    raw.retired.is_none(),
+                    "agent declares `retired` more than once"
+                );
                 raw.retired = Some(Some(arg_bool(child)));
             }
             "desired-state" => {
@@ -138,10 +141,9 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                         && child.entries[0].name.is_none(),
                     "agent `deliver` must contain exactly one positional string"
                 );
-                raw.deliver = Some(Some(
-                    arg_string(child)
-                        .ok_or_else(|| anyhow::anyhow!("agent `deliver` value must be a string"))?,
-                ));
+                raw.deliver = Some(Some(arg_string(child).ok_or_else(|| {
+                    anyhow::anyhow!("agent `deliver` value must be a string")
+                })?));
             }
             "claude" => {
                 anyhow::ensure!(
@@ -173,6 +175,15 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
             "exec" => {
                 if let Some(name) = arg_string(child) {
                     raw.exec.insert(name, task_node_to_raw(child)?);
+                }
+            }
+            "stream" => {
+                if let Some(name) = arg_string(child) {
+                    let stream = stream_node_to_raw(child, &name)?;
+                    anyhow::ensure!(
+                        raw.stream.insert(name.clone(), stream).is_none(),
+                        "agent declares `stream \"{name}\"` more than once"
+                    );
                 }
             }
             // meta, harness, model, persona, permissions, transport, strategy, … — ignored.
@@ -295,8 +306,7 @@ fn common_driver_fields(
 }
 
 fn claude_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<ClaudeDriver> {
-    let (model, effort, dev_channels, prompt, args) =
-        common_driver_fields(node, "claude", true)?;
+    let (model, effort, dev_channels, prompt, args) = common_driver_fields(node, "claude", true)?;
     Ok(ClaudeDriver {
         model,
         effort,
@@ -451,6 +461,47 @@ fn task_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawTask> {
         }
     }
     Ok(t)
+}
+
+/// `stream "<name>" { command "…" }` or `stream "<name>" { argv "prog" "arg" }`.
+///
+/// The child set is deliberately minimal. A stream declares WHERE events come from; everything about
+/// how they are supervised is inherited from the agent (restart policy, teardown, parking), and
+/// everything about how they are delivered is the bus contract. `every` is rejected by the
+/// declaration parser rather than accepted here: an interval makes this scheduled work, which is
+/// the reserved `schedule` node's contract.
+fn stream_node_to_raw(node: &DeclaredNode, name: &str) -> anyhow::Result<crate::spec::RawStream> {
+    let mut stream = crate::spec::RawStream::default();
+    for child in &node.children {
+        match child.name.as_str() {
+            "command" => {
+                anyhow::ensure!(
+                    stream.command.is_none(),
+                    "stream '{name}' has duplicate `command`"
+                );
+                stream.command = Some(arg_string(child).ok_or_else(|| {
+                    anyhow::anyhow!("stream '{name}' `command` must be one positional string")
+                })?);
+            }
+            "argv" => {
+                anyhow::ensure!(
+                    stream.argv.is_none(),
+                    "stream '{name}' has duplicate `argv`"
+                );
+                stream.argv = Some(argv(child)?);
+            }
+            "every" => anyhow::bail!(
+                "stream '{name}' declares `every`; scheduled work is the reserved `schedule` \
+                 contract, a stream is a long-running event source"
+            ),
+            other => anyhow::bail!("stream '{name}' has unsupported field `{other}`"),
+        }
+    }
+    anyhow::ensure!(
+        !(stream.command.is_some() && stream.argv.is_some()),
+        "stream '{name}' must declare at most one of `command` or `argv`"
+    );
+    Ok(stream)
 }
 
 fn env_node_to_raw(node: &DeclaredNode) -> std::collections::BTreeMap<String, String> {

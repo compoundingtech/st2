@@ -32,9 +32,13 @@ pub const AGENT_DESIRED_STATE_REASON_MAX_BYTES: usize = 160;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentDesiredState {
     Running,
-    Suspended { reason: String },
+    Suspended {
+        reason: String,
+    },
     /// `None` exists only for legacy `retired #true` declarations.
-    Retired { reason: Option<String> },
+    Retired {
+        reason: Option<String>,
+    },
 }
 
 /// One provider-native message delivery transport declared by an agent.
@@ -186,6 +190,9 @@ pub struct AgentSpec {
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
+    /// Named event subscriptions. Command-less streams are external ingress endpoints; launched
+    /// streams additionally lower to one derived exec companion.
+    pub streams: Vec<Stream>,
     /// The runnable tasks (`pty` + `exec`), sorted by name for determinism.
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
@@ -272,12 +279,9 @@ impl<'de> Deserialize<'de> for Resource {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
         let resource = match (descriptor.relation, descriptor.reason) {
             (None, None) => Self::new(descriptor.name, descriptor.uri),
-            (Some(relation), Some(reason)) => Self::new_with_relation_reason(
-                descriptor.name,
-                descriptor.uri,
-                relation,
-                reason,
-            ),
+            (Some(relation), Some(reason)) => {
+                Self::new_with_relation_reason(descriptor.name, descriptor.uri, relation, reason)
+            }
             (Some(_), None) => Err(format!(
                 "resource binding '{}' with `relation` must also declare string `reason`",
                 descriptor.name
@@ -503,6 +507,59 @@ pub(crate) struct RawSpec {
     /// `exec "<name>" {}` / `[exec.<name>]` — terminal-free tasks.
     #[serde(default)]
     pub exec: BTreeMap<String, RawTask>,
+    /// `stream "<name>" {}` / `[stream.<name>]` — an external event source whose stdout lines st2
+    /// delivers into this agent's inbox. Lowers to one derived exec companion, exactly like `ding`.
+    #[serde(default)]
+    pub stream: BTreeMap<String, RawStream>,
+}
+
+/// A declared event source. Exactly one of `command` / `argv` launches the source process.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct RawStream {
+    pub command: Option<String>,
+    pub argv: Option<Vec<String>>,
+}
+
+/// One agent-owned event subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Stream {
+    pub name: String,
+    pub launch: Option<StreamLaunch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "type", content = "value")]
+pub enum StreamLaunch {
+    Command(String),
+    Argv(Vec<String>),
+}
+
+/// The longest stream name that still leaves a legible `<host>.<identity>.stream-<name>` runtime id.
+const STREAM_NAME_MAX_CHARS: usize = 40;
+
+/// Derived stream task names are exactly `stream-<declared name>`.
+pub const STREAM_TASK_PREFIX: &str = "stream-";
+
+/// The declared stream name behind a derived task name, if this is a stream companion.
+pub fn stream_name_of_task(task_name: &str) -> Option<&str> {
+    task_name.strip_prefix(STREAM_TASK_PREFIX)
+}
+
+/// A stream name becomes part of a runner-owned task name and runtime id, so it is restricted to a
+/// lowercase slug. This keeps `stream-<name>` unambiguous against the `<bus-id>.<task>` id grammar.
+fn validate_stream_name(identity: &str, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty() && name.chars().count() <= STREAM_NAME_MAX_CHARS,
+        "agent '{identity}' stream name '{name}' must be 1..={STREAM_NAME_MAX_CHARS} characters"
+    );
+    anyhow::ensure!(
+        name.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !name.starts_with('-')
+            && !name.ends_with('-'),
+        "agent '{identity}' stream name '{name}' must match [a-z0-9]([a-z0-9-]*[a-z0-9])?"
+    );
+    Ok(())
 }
 
 /// The permissive raw envelope keeps the provider name at the same level in KDL, TOML, and JSON.
@@ -841,8 +898,7 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
         } else if byte.is_ascii_alphanumeric()
             || matches!(
                 byte,
-                b'-'
-                    | b'.'
+                b'-' | b'.'
                     | b'_'
                     | b'~'
                     | b'!'
@@ -886,6 +942,7 @@ impl RawSpec {
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
+            || !self.stream.is_empty()
     }
 
     /// Lower into an [`AgentSpec`], with `identity`/`host` resolved from the path when content omits them.
@@ -902,8 +959,7 @@ impl RawSpec {
             AGENT_DESCRIPTION_MAX_CHARS,
         )?;
         let retired = reject_explicit_null("retired", self.retired)?;
-        let desired_state_value =
-            reject_explicit_null("desired_state", self.desired_state)?;
+        let desired_state_value = reject_explicit_null("desired_state", self.desired_state)?;
         let desired_state_reason =
             reject_explicit_null("desired_state_reason", self.desired_state_reason)?;
         let desired_state = lower_desired_state(
@@ -939,6 +995,14 @@ impl RawSpec {
             .trim_start_matches('.')
             .to_string();
         let mut tasks: Vec<Task> = Vec::new();
+        // Authored task names, captured before the maps are consumed: a derived stream companion must
+        // not silently shadow an explicit sibling that already owns `stream-<name>`.
+        let authored_task_names = self
+            .pty
+            .keys()
+            .chain(self.exec.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         for (name, t) in self.pty {
             tasks.push(t.lower(&identity, TaskKind::Pty, name, &self.env)?);
         }
@@ -973,7 +1037,67 @@ impl RawSpec {
                 argv: None,
                 cwd: None,
                 tags: BTreeMap::new(),
-                env: self.env,
+                env: self.env.clone(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            });
+        }
+        // One derived exec companion per stream, through the exact seam the DING sidecar uses. The
+        // marker argv carries the declared source launch; `reconcile` late-binds argv[0] to the
+        // running st2 binary and substitutes the effective `ST_ROOT`, exactly as it does for DING
+        // and for a driver expansion.
+        let mut streams = Vec::new();
+        for (name, stream) in self.stream {
+            validate_stream_name(&identity, &name)?;
+            let task_name = format!("stream-{name}");
+            anyhow::ensure!(
+                !authored_task_names.contains(&task_name),
+                "agent '{identity}' declares both `stream \"{name}\"` and a task named \
+                 `{task_name}`; choose one form"
+            );
+            let (command, argv) = match (stream.command, stream.argv) {
+                (Some(command), None) => {
+                    anyhow::ensure!(
+                        !command.trim().is_empty(),
+                        "agent '{identity}' stream '{name}' has an empty `command`"
+                    );
+                    (Some(command), None)
+                }
+                (None, Some(argv)) => {
+                    anyhow::ensure!(
+                        !argv.is_empty() && !argv[0].trim().is_empty(),
+                        "agent '{identity}' stream '{name}' has an empty `argv`"
+                    );
+                    (None, Some(argv))
+                }
+                (None, None) => (None, None),
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "agent '{identity}' stream '{name}' declares both `command` and `argv`; choose one"
+                ),
+            };
+            let launch = match (&command, &argv) {
+                (Some(command), None) => Some(StreamLaunch::Command(command.clone())),
+                (None, Some(argv)) => Some(StreamLaunch::Argv(argv.clone())),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("validated above"),
+            };
+            streams.push(Stream {
+                name: name.clone(),
+                launch,
+            });
+            if command.is_none() && argv.is_none() {
+                continue;
+            }
+            tasks.push(Task {
+                kind: TaskKind::Exec,
+                derived: true,
+                name: task_name.clone(),
+                id: Some(format!("{bus_id}.{task_name}")),
+                command,
+                argv,
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: self.env.clone(),
                 keep: false,
                 lifecycle: TaskLifecycle::Service,
             });
@@ -999,6 +1123,7 @@ impl RawSpec {
             delivery,
             driver,
             resources,
+            streams,
             tasks,
             path,
         })
@@ -1007,9 +1132,7 @@ impl RawSpec {
 
 /// Preserve the distinction between an omitted TOML/JSON field and an explicit `null`.
 /// Serde's ordinary `Option<T>` representation intentionally collapses those cases.
-fn deserialize_explicit_optional<'de, D, T>(
-    deserializer: D,
-) -> Result<Option<Option<T>>, D::Error>
+fn deserialize_explicit_optional<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -1072,8 +1195,10 @@ pub fn validate_desired_state_reason(reason: &str) -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         reason.trim() == reason
-            && !reason.chars().any(|character| character.is_control()
-                || matches!(character, '\u{2028}' | '\u{2029}')),
+            && !reason
+                .chars()
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
         "agent desired-state `reason` must have no surrounding Unicode whitespace, controls, or line separators"
     );
     Ok(())
@@ -1222,7 +1347,7 @@ mod tests {
             "thing://bad^caret",
             "thing://bad`tick",
             "thing://bad{brace",
-            "thing://bad|pipe",
+            "thing://bad|stream",
             "thing://bad}brace",
             "thing://bad space",
             "thing://bad%2",

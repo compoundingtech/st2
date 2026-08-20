@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -80,7 +80,9 @@ fn real_tasks(catalog: &Path, state: &Path) -> Output {
 
 fn seeded_supervisor_scope(catalog: &Path, host: Option<&str>, state: &Path) -> PathBuf {
     let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
-    command.args(["unpark", "h.worker", "--catalog"]).arg(catalog);
+    command
+        .args(["unpark", "h.worker", "--catalog"])
+        .arg(catalog);
     if let Some(host) = host {
         command.args(["--host", host]);
     }
@@ -89,7 +91,11 @@ fn seeded_supervisor_scope(catalog: &Path, host: Option<&str>, state: &Path) -> 
         .env_remove("CATALOG")
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let supervisors = state.join("st2/supervisors");
     let scope = fs::read_dir(&supervisors)
@@ -108,7 +114,9 @@ fn execute_recovery(action: &serde_json::Value, bin: &Path, ambient_catalog: &Pa
         command.args(["-c", shell]);
         command
     } else {
-        let argv = action["argv"].as_array().expect("recovery action carries argv");
+        let argv = action["argv"]
+            .as_array()
+            .expect("recovery action carries argv");
         let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
         command.args(argv.iter().skip(1).map(|arg| arg.as_str().unwrap()));
         command
@@ -119,7 +127,11 @@ fn execute_recovery(action: &serde_json::Value, bin: &Path, ambient_catalog: &Pa
         .env("XDG_STATE_HOME", state)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -135,24 +147,35 @@ fn projected_recovery_targets_its_exact_catalog_and_host_despite_ambient_default
     assert_ne!(selected_scope, ambient_scope);
     for scope in [&selected_scope, &ambient_scope] {
         let projection = st2::park::ParkProjection::current(scope.join("parked")).unwrap();
-        assert!(projection
-            .publish(&BTreeSet::from(["h.worker".to_string()]), "same-id collision")
-            .is_empty());
+        assert!(
+            projection
+                .publish(
+                    &BTreeSet::from(["h.worker".to_string()]),
+                    "same-id collision"
+                )
+                .is_empty()
+        );
     }
 
     let output = tasks(&selected_catalog, &bin, &state);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let inventory: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let recovery = &inventory["tasks"][0]["parked"]["recovery"];
     execute_recovery(recovery, &bin, &ambient_catalog, &state);
 
     let (selected, selected_errors) =
         st2::park::take_unpark_requests(&selected_scope.join("unpark"));
-    let (ambient, ambient_errors) =
-        st2::park::take_unpark_requests(&ambient_scope.join("unpark"));
+    let (ambient, ambient_errors) = st2::park::take_unpark_requests(&ambient_scope.join("unpark"));
     assert!(selected_errors.is_empty() && ambient_errors.is_empty());
     assert_eq!(selected, ["h.worker"]);
-    assert!(ambient.is_empty(), "emitted recovery targeted the ambient supervisor scope");
+    assert!(
+        ambient.is_empty(),
+        "emitted recovery targeted the ambient supervisor scope"
+    );
 }
 
 #[test]
@@ -249,16 +272,18 @@ agent "worker" {
 fn suspended_agent_projects_task_absence_and_agent_rationale_separately() {
     let (tmp, catalog, bin) = fixture("[]");
     let declaration = catalog.join("agents/h/worker/agent.kdl");
-    let authored = fs::read_to_string(&declaration)
-        .unwrap()
-        .replace(
-            "  host \"h\"\n",
-            "  host \"h\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
-        );
+    let authored = fs::read_to_string(&declaration).unwrap().replace(
+        "  host \"h\"\n",
+        "  host \"h\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+    );
     fs::write(declaration, authored).unwrap();
 
     let output = tasks(&catalog, &bin, &tmp.path().join("state"));
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let row = &value["tasks"][0];
     assert_eq!(row["retired"], false);
@@ -821,4 +846,40 @@ fn packaged_tasks_tracks_real_pty_generation_replacement() {
             .unwrap(),
         first_generation
     );
+}
+
+#[test]
+fn a_derived_stream_task_is_reported_honestly_alongside_its_agent() {
+    let (tmp, catalog, bin) = fixture(
+        r#"[{"name":"h.streamed","status":"running","pid":91,"createdAt":"2026-08-20T10:00:00.000Z"}]"#,
+    );
+    fs::create_dir_all(catalog.join("agents/h/streamed")).unwrap();
+    fs::write(
+        catalog.join("agents/h/streamed/agent.kdl"),
+        r#"
+agent "streamed" {
+  host "h"
+  command "true"
+  stream "gh-ci" { command "poll-gh-ci.sh" }
+}
+"#,
+    )
+    .unwrap();
+    let output = tasks(&catalog, &bin, &tmp.path().join("state"));
+    let inventory: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = inventory["tasks"].as_array().unwrap();
+    let stream = rows
+        .iter()
+        .find(|row| row["task"] == "stream-gh-ci")
+        .unwrap_or_else(|| {
+            panic!(
+                "no stream row in {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(stream["agent"], "h.streamed");
+    assert_eq!(stream["runtimeId"], "h.streamed.stream-gh-ci");
+    assert_eq!(stream["kind"], "exec");
+    assert_eq!(stream["runtime"]["state"], "absent");
+    assert!(stream.get("parked").is_none() || stream["parked"].is_null());
 }

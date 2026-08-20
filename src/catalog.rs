@@ -63,7 +63,9 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
                         .and_then(|v| v.as_string())
                         .filter(|v| !v.is_empty())
                         .ok_or_else(|| {
-                            anyhow::anyhow!("pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\"")
+                            anyhow::anyhow!(
+                                "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
+                            )
                         })?;
                     config.pty_root = Some(value.to_string());
                 }
@@ -109,7 +111,11 @@ mod tests {
         assert_eq!(pty_root(tmp.path()), tmp.path().join("pty"));
 
         // A file that declares other things, but no pty root.
-        std::fs::write(config_path(tmp.path()), "agent \"a\" { command \"true\" }\n").unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "agent \"a\" { command \"true\" }\n",
+        )
+        .unwrap();
         assert_eq!(pty_root(tmp.path()), tmp.path().join("pty"));
     }
 
@@ -123,12 +129,19 @@ mod tests {
         .unwrap();
         assert_eq!(pty_root(tmp.path()), PathBuf::from("/run/agents/pty"));
 
-        std::fs::write(config_path(tmp.path()), "catalog { pty-root \"$CATALOG/../shared\" }\n")
-            .unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "catalog { pty-root \"$CATALOG/../shared\" }\n",
+        )
+        .unwrap();
         assert_eq!(pty_root(tmp.path()), tmp.path().join("../shared"));
 
         // A relative value belongs to the catalog, never to the caller's cwd.
-        std::fs::write(config_path(tmp.path()), "catalog { pty-root \"registry\" }\n").unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "catalog { pty-root \"registry\" }\n",
+        )
+        .unwrap();
         assert_eq!(pty_root(tmp.path()), tmp.path().join("registry"));
     }
 
@@ -142,8 +155,11 @@ mod tests {
 
         // Reported by `st2 validate`; the runtime path stays on the native root.
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(config_path(tmp.path()), "catalog { pty_root \"/run/agents/pty\" }\n")
-            .unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "catalog { pty_root \"/run/agents/pty\" }\n",
+        )
+        .unwrap();
         assert_eq!(pty_root(tmp.path()), tmp.path().join("pty"));
     }
 }
