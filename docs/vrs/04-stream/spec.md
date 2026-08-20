@@ -130,11 +130,22 @@ gating are inherited.
 
 ## Stream state (STREAM-R05)
 
-Per-stream durable state is a constant-size ring of the last `K`
-`(event-id → filename, content digest)` receipts under the owning agent's
-resources (exact path DQ-S2). The ring is the entire deduplication and
-conflicting-content-detection horizon: a hit answers in O(1), while a miss is
-accepted as a new identity without scanning the unread inbox or archive.
+Per-stream durable state is one constant-size record under the owning agent's
+resources (exact path DQ-S2): a ring of the last `K`
+`(event-id → filename, key, content digest)` receipts plus a single in-flight
+publication reservation. The ring is the entire deduplication,
+conflicting-content-detection, and supersession-lookup horizon: a replay hit
+answers in O(1), while a miss is accepted as a new identity without scanning
+the unread inbox or archive.
+
+Under the per-stream lock, a new emit first persists the reservation with its
+identity, chosen filename, key, content digest, and supersession intent; it
+then materializes that filename and finally atomically clears the reservation
+while inserting the receipt. A crash-interrupted retry of the same identity
+resumes the reserved filename and content. A different identity is refused
+until the pending one is replayed. This prevents both an unrecorded inbox file
+and a receipt for a file that never materialized, while adding only one
+bounded state slot.
 
 Nothing is chained, hashed, or validated O(history), and publication work is
 independent of retained stream history. `K` is 128 pending measurement
@@ -146,13 +157,15 @@ filename, but random inbox/archive filenames do not form a reverse index from
 
 `--supersede` collapses the stream to its latest unread event per `key`
 (absent `key`: per stream) — log-compaction semantics — in wakeup-safe order:
-the successor is published first, then the unread predecessor (found by the
-same unread-inbox scan, `(stream, key)`) is archived. A crash between the two
-leaves both events unread — the failure bias is a duplicate wake, never a
-lost one — and the next emit or a supersede retry completes the compaction
-idempotently. This is the ordering the differentiation experiment proved
-(steps 3–4 materialize the successor before touching the predecessor). The
-archive move uses the ordinary archive path, so a DING-staged predecessor
+the successor is published first, then the newest matching receipt among the
+retained `K` whose filename still exists in the inbox is archived. The lookup
+examines at most `K` receipt candidates and performs no unread-backlog scan;
+an older predecessor outside the horizon is not compacted. A crash between
+the two steps leaves both events unread — the failure bias is a duplicate
+wake, never a lost one — and the next emit or a supersede retry completes the
+compaction idempotently. This is the ordering the differentiation experiment
+proved (steps 3–4 materialize the successor before touching the predecessor).
+The archive move uses the ordinary archive path, so a DING-staged predecessor
 resolves through the existing archive-receipt rule: pasted at most once ever,
 never re-pasted, successor delivers next. Proven: 24 supersedes in 146 ms
 produced one fresh poke, zero staged retries, one unread head

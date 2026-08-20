@@ -68,10 +68,12 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   authority for a known filename but is not an event-identity index. The
   machine receipt distinguishes `created` from `deduplicated`.
 - **STREAM-R05 Bounded stream state:** Per-stream durable dedup state is
-  constant-size (a bounded ring), which defines the deduplication and
-  conflicting-content-detection horizon. Event publication does not write the
-  Agent Sent ledger and performs history-independent work per emit: it never
-  scans inbox or archive history to recover an evicted event identity.
+  constant-size: a bounded receipt ring plus one in-flight publication
+  reservation. The ring defines the deduplication,
+  conflicting-content-detection, and supersession-lookup horizon. Event
+  publication does not write the Agent Sent ledger and performs
+  history-independent work per emit: it never scans inbox or archive history
+  to recover an evicted event identity or predecessor.
 
 ### Must deliver as ordinary inbox work
 
@@ -80,12 +82,13 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   Delivery rides the unchanged inbox paths; DING renders events with the `»`
   marker and inherits every fail-closed guarantee untouched.
 - **STREAM-R07 Producer-side supersession:** An emit may declare supersession:
-  the successor publishes before the stream's unread predecessor for the same
-  `key` is archived. A crash between those steps may leave both events unread
-  but never removes the only wakeup. Supersession never touches DING staged
-  ownership — a staged notice is released only through the existing
-  archive-receipt rule — and a fast-superseding stream stays within `R15`
-  bounds.
+  the successor publishes before the newest still-unread matching predecessor
+  among the stream's retained receipts is archived (`key` scopes the match;
+  absent `key`, the whole stream does). A crash between those steps may leave
+  both events unread but never removes the only wakeup. Supersession never
+  touches DING staged ownership — a staged notice is released only through the
+  existing archive-receipt rule — and a fast-superseding stream stays within
+  `R15` bounds.
 
 ### Must couple to the owning agent's lifecycle
 

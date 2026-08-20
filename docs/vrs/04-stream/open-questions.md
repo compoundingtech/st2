@@ -15,9 +15,9 @@ as tested hypotheses.
   blocked until the eval-owned external requester has that working path.
 - **DQ-S2 Stream state path.** Where the dedup ring lives under the owner's
   resources (`resources/streams/<name>/` proposed; the ring is the only
-  durable stream state — supersession heads are derived from the unread
-  inbox, not stored). Resolves during implementation with the
-  state-namespace conventions of R02.
+  retained-history state, accompanied by one durable in-flight publication
+  reservation; no supersession heads are stored). Resolves during
+  implementation with the state-namespace conventions of R02.
 - **DQ-S3 Ring bound and identity horizon.** `K = 128` is the current
   deduplication and conflicting-content-detection horizon, not merely a fast
   path: an evicted identity is accepted as new without scanning inbox or
