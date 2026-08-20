@@ -32,11 +32,13 @@ event frontmatter: the producing stream, a mandatory producer-supplied
 
 Event publication does not write the permanent hash-chained Agent Sent ledger.
 Dedup state is a bounded, constant-size receipt ring plus one in-flight
-publication reservation per stream; replaying an `event-id` within the
-retained receipt horizon returns the original filename and never re-notifies.
-The next emit reconciles an abandoned reservation from whether its chosen
-filename reached the inbox or archive, without requiring stale producer
-replay or retaining payload bytes.
+publication reservation per stream. The reservation includes the full
+rendered-content digest and at most one predecessor filename selected from the
+ring. Replaying an `event-id` within the retained receipt horizon returns the
+original filename and never re-notifies. The next emit reconciles an abandoned
+reservation only after its materialized event identity and full bytes match,
+then completes the stored predecessor compaction, without requiring stale
+producer replay or retaining payload bytes.
 An evicted identity is accepted as new without scanning inbox or archive
 history; archive receipts keep their existing authority for known filenames.
 An emit may declare `--supersede`, which publishes the successor before

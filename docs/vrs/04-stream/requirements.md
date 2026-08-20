@@ -70,13 +70,15 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   machine receipt distinguishes `created` from `deduplicated`.
 - **STREAM-R05 Bounded stream state:** Per-stream durable dedup state is
   constant-size: a bounded receipt ring plus one in-flight publication
-  reservation. The ring defines the deduplication,
+  reservation, including at most one selected predecessor filename. The ring
+  defines the deduplication,
   conflicting-content-detection, and supersession-lookup horizon. Event
   publication does not write the Agent Sent ledger and performs
   history-independent work per emit: it never scans inbox or archive history
   to recover an evicted event identity or predecessor. A later emit
-  reconciles an abandoned reservation from the presence of its chosen
-  filename, so recovery does not require the producer to replay stale state.
+  reconciles an abandoned reservation by validating its chosen file and
+  completing its stored compaction intent, so recovery does not require the
+  producer to replay stale state.
 
 ### Must deliver as ordinary inbox work
 
@@ -88,10 +90,12 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   the successor publishes before the newest still-unread matching predecessor
   among the stream's retained receipts is archived (`key` scopes the match;
   absent `key`, the whole stream does). A crash between those steps may leave
-  both events unread but never removes the only wakeup. Supersession never
-  touches DING staged ownership — a staged notice is released only through the
-  existing archive-receipt rule — and a fast-superseding stream stays within
-  `R15` bounds.
+  both events unread but never removes the only wakeup; the selected
+  predecessor filename is retained in the pending reservation so recovery
+  finishes that exact compaction rather than selecting against newer state.
+  Supersession never touches DING staged ownership — a staged notice is
+  released only through the existing archive-receipt rule — and a
+  fast-superseding stream stays within `R15` bounds.
 
 ### Must couple to the owning agent's lifecycle
 

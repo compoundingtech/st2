@@ -133,28 +133,40 @@ gating are inherited.
 Per-stream durable state is one constant-size record under the owning agent's
 resources (exact path DQ-S2): a ring of the last `K`
 `(event-id → filename, key, content digest)` receipts plus a single in-flight
-publication reservation. The ring is the entire deduplication,
+publication reservation. The reservation holds the new event's identity,
+filename, key, full rendered-content digest, and at most one predecessor
+filename selected for supersession. The ring is the entire deduplication,
 conflicting-content-detection, and supersession-lookup horizon: a replay hit
 answers in O(1), while a miss is accepted as a new identity without scanning
 the unread inbox or archive.
 
 Under the per-stream lock, every emit first reconciles an existing
-reservation. If its chosen filename exists as a regular file in the inbox or
-archive, its stored identity, filename, key, and content digest are promoted
-to the retained receipt ring and the reservation is cleared. If the filename
-exists in neither location, the unpublished reservation is abandoned and
-cleared. The current event is then evaluated against the resulting ring; no
-producer replay and no retained payload bytes are required to unblock the
-stream.
+reservation. If its chosen filename exists as a no-follow regular file in the
+inbox or archive, recovery parses the event and requires its `stream`,
+`event-id`, and optional `key` to equal the reservation and its full rendered
+bytes to match the reserved SHA-256. Any mismatch or non-regular path fails
+closed without changing state. If the file exists in neither location, the
+unpublished reservation is abandoned and cleared.
+
+For a valid materialized reservation with supersession intent, recovery next
+completes the stored predecessor move: archive that exact filename if it is
+still a no-follow regular inbox file, accept it as already compacted if its
+archive receipt exists, and fail closed on any other present path shape. Only
+then are the successor's stored identity, filename, key, and digest promoted
+to the retained receipt ring and the reservation cleared. The current event
+is evaluated against the resulting ring afterward. The predecessor is never
+recomputed against newer receipts, and neither producer replay nor retained
+payload bytes are required to unblock the stream.
 
 For a new identity, emit persists a reservation with its identity, chosen
-filename, key, content digest, and supersession intent; it then materializes
-that filename and finally atomically clears the reservation while inserting
-the receipt. A crash before materialization leaves a safely abandonable
-intent; a crash after materialization leaves a filename whose presence is
-enough to finalize the receipt on the next emit. This prevents both an
-unrecorded inbox file and a receipt for a file that never materialized, while
-adding only one bounded state slot.
+filename, key, content digest, and the predecessor filename selected from the
+bounded ring (when superseding); it then materializes the successor, archives
+that stored predecessor, and finally atomically clears the reservation while
+inserting the successor receipt. A crash before materialization leaves a
+safely abandonable intent; a crash afterward leaves validated bytes plus the
+exact compaction target needed to finish on the next emit. This prevents an
+unrecorded inbox file, a receipt for unrelated bytes, and abandoned
+supersession while adding only one bounded state slot.
 
 Nothing is chained, hashed, or validated O(history), and publication work is
 independent of retained stream history. `K` is 128 pending measurement
@@ -169,10 +181,12 @@ filename, but random inbox/archive filenames do not form a reverse index from
 the successor is published first, then the newest matching receipt among the
 retained `K` whose filename still exists in the inbox is archived. The lookup
 examines at most `K` receipt candidates and performs no unread-backlog scan;
-an older predecessor outside the horizon is not compacted. A crash between
-the two steps leaves both events unread — the failure bias is a duplicate
-wake, never a lost one — and the next emit or a supersede retry completes the
-compaction idempotently. This is the ordering the differentiation experiment
+an older predecessor outside the horizon is not compacted. The chosen
+predecessor filename is persisted in the successor's reservation before
+publication. A crash between the two steps leaves both events unread — the
+failure bias is a duplicate wake, never a lost one — and the next emit
+validates the successor and completes that stored compaction idempotently.
+This is the ordering the differentiation experiment
 proved (steps 3–4 materialize the successor before touching the predecessor).
 The archive move uses the ordinary archive path, so a DING-staged predecessor
 resolves through the existing archive-receipt rule: pasted at most once ever,
