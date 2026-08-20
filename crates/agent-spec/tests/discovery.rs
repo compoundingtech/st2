@@ -1872,6 +1872,41 @@ fn streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks() {
 }
 
 #[test]
+fn launched_streams_require_a_canonical_agent_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/launched/agent.kdl",
+        r#"agent "launched" {
+  host "h"
+  exec "worker" { command "agent" }
+  stream "ci" { command "watch-ci" }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/external/agent.kdl",
+        r#"agent "external" {
+  host "h"
+  exec "worker" { command "agent" }
+  stream "webhook" {}
+}"#,
+    );
+
+    let found = discover(tmp.path());
+
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("launched stream 'ci' requires a canonical `agent` task"),
+        "{:?}",
+        found.errors
+    );
+    assert_eq!(find(&found.specs, "external").streams.len(), 1);
+}
+
+#[test]
 fn streams_have_toml_and_json_parity_and_reject_unknown_fields() {
     let tmp = tempfile::tempdir().unwrap();
     write(

@@ -1043,6 +1043,9 @@ impl RawSpec {
                 lifecycle: TaskLifecycle::Service,
             });
         }
+        let has_canonical_agent_task = tasks
+            .iter()
+            .any(|task| !task.derived && task.name == "agent");
         // One derived exec companion per stream, through the exact seam the DING sidecar uses. The
         // marker argv carries the declared source launch; `reconcile` late-binds argv[0] to the
         // running st2 binary and substitutes the effective `ST_ROOT`, exactly as it does for DING
@@ -1082,6 +1085,10 @@ impl RawSpec {
                 (None, None) => None,
                 (Some(_), Some(_)) => unreachable!("validated above"),
             };
+            anyhow::ensure!(
+                launch.is_none() || has_canonical_agent_task,
+                "agent '{identity}' launched stream '{name}' requires a canonical `agent` task"
+            );
             streams.push(Stream {
                 name: name.clone(),
                 launch,
