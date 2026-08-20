@@ -4,6 +4,8 @@
 //! own bounded, agent-local receipt ring rather than writing the agent's immutable Sent ledger.
 
 use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -263,7 +265,10 @@ pub fn emit(
                 record
                     .recent
                     .iter()
-                    .find(|entry| entry.key.as_deref() == key && entry.filename != filename)
+                    .find(|entry| {
+                        entry.filename != filename
+                            && key.is_none_or(|key| entry.key.as_deref() == Some(key))
+                    })
                     .map(|entry| entry.filename.clone())
             } else {
                 None
@@ -353,15 +358,63 @@ fn read_record(path: &Path) -> anyhow::Result<Option<StreamRecord>> {
 }
 
 fn write_record(path: &Path, record: &StreamRecord) -> anyhow::Result<()> {
+    use std::ffi::CString;
+
     let parent = path.parent().context("stream state has no parent")?;
     fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
+    let directory = File::open(parent)
+        .with_context(|| format!("open stream state directory {}", parent.display()))?;
+    let temporary = format!(
         ".state.tmp-{}-{}",
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&temporary, serde_json::to_vec(record)?)?;
-    fs::rename(&temporary, path)?;
+    );
+    let temporary = CString::new(temporary)?;
+    let target = CString::new(
+        path.file_name()
+            .context("stream state has no filename")?
+            .as_encoded_bytes(),
+    )?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "create fresh stream state temporary in {}",
+                parent.display()
+            )
+        });
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&serde_json::to_vec(record)?)?;
+        file.sync_all()?;
+        let renamed = unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                target.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err(std::io::Error::last_os_error()).context("publish stream state atomically");
+        }
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+    }
+    result?;
     Ok(())
 }
 
