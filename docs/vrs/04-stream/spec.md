@@ -97,6 +97,16 @@ Emitting to an undeclared stream or unknown agent is refused before writes,
 and so is a recipient whose desired state is not running — suspension means
 eyes closed for external producers too (STREAM-R09): the emit returns a typed
 refusal rather than accumulating events a suspended agent will wake to.
+Emit acquires the same catalog-authoring lock used by stream add/remove and
+desired-state edits, then performs strict catalog discovery and eligibility
+validation while holding it. It retains that lock across the entire
+per-stream transaction — pending reconciliation, reservation, inbox/archive
+work, and receipt finalization. The global lock order is catalog-authoring
+then stream state (then the ordinary message-box locks); no path may acquire
+them in reverse. Thus emit and removal/suspension have one linearization order:
+an authoring change that wins the lock is visible to admission, while an emit
+that wins first completes before that change commits.
+
 Replaying `(stream, event-id)` — concurrently or across a crash — returns the
 original filename with `deduplicated` while that identity remains in the
 stream's retained receipt ring. Conflicting reuse with different content
@@ -166,13 +176,19 @@ stream.
 
 For a new identity, emit persists a reservation with its identity, chosen
 filename, key, content digest, and the predecessor filename selected from the
-bounded ring (when superseding); it then materializes the successor, archives
-that stored predecessor, and finally atomically clears the reservation while
-inserting the successor receipt. A crash before materialization leaves a
-safely abandonable intent; a crash afterward leaves validated bytes plus the
-exact compaction target needed to finish on the next emit. This prevents an
-unrecorded inbox file, a receipt for unrelated bytes, and abandoned
-supersession while adding only one bounded state slot.
+bounded ring (when superseding). Candidate selection requires the predecessor
+filename to be present as a no-follow regular inbox file and absent from the
+archive. Emit then materializes the successor and, immediately before moving
+the stored predecessor, validates its current parsed `stream`, `event-id`, and
+optional `key` plus full rendered SHA-256 against that retained receipt — the
+same rule recovery uses. A mismatch or changed path shape fails closed. Only
+after validation does emit archive the predecessor and atomically clear the
+reservation while inserting the successor receipt. A crash before
+materialization leaves a safely abandonable intent; a crash afterward leaves
+validated bytes plus the exact compaction target needed to finish on the next
+emit. This prevents an unrecorded inbox file, a receipt for unrelated bytes,
+and abandoned or misdirected supersession while adding only one bounded state
+slot.
 
 Nothing is chained, hashed, or validated O(history), and publication work is
 independent of retained stream history. `K` is 128 pending measurement
@@ -185,13 +201,16 @@ filename, but random inbox/archive filenames do not form a reverse index from
 `--supersede` collapses the stream to its latest unread event per `key`
 (absent `key`: per stream) — log-compaction semantics — in wakeup-safe order:
 the successor is published first, then the newest matching receipt among the
-retained `K` whose filename still exists in the inbox is archived. The lookup
-examines at most `K` receipt candidates and performs no unread-backlog scan;
-an older predecessor outside the horizon is not compacted. The chosen
-predecessor filename is persisted in the successor's reservation before
-publication. A crash between the two steps leaves both events unread — the
-failure bias is a duplicate wake, never a lost one — and the next emit
-validates the successor and completes that stored compaction idempotently.
+retained `K` whose filename is a no-follow regular inbox file and has no
+same-name archive receipt is archived. The lookup examines at most `K` receipt
+candidates and performs no unread-backlog scan; an older predecessor outside
+the horizon is not compacted. The chosen predecessor filename is persisted in
+the successor's reservation before publication. Immediately before the move,
+both initial publication and recovery validate the predecessor's parsed
+identity, key, and full digest against that retained receipt. A crash between
+the two steps leaves both events unread — the failure bias is a duplicate
+wake, never a lost one — and the next emit validates the successor and
+completes that stored compaction idempotently.
 This is the ordering the differentiation experiment
 proved (steps 3–4 materialize the successor before touching the predecessor).
 The archive move uses the ordinary archive path, so a DING-staged predecessor

@@ -43,10 +43,12 @@ payload bytes.
 An evicted identity is accepted as new without scanning inbox or archive
 history; archive receipts keep their existing authority for known filenames.
 An emit may declare `--supersede`, which publishes the successor before
-archiving the newest still-unread matching predecessor among the retained
-receipts — log-compaction semantics with bounded lookup and a duplicate-wakeup
-rather than lost-wakeup crash bias — implemented producer-side only; DING's
-staged ownership is never touched.
+archiving the newest matching retained predecessor that is present in inbox
+and absent from archive. Both initial publication and recovery validate that
+predecessor's no-follow bytes and parsed identity against its retained receipt
+immediately before the move — log-compaction semantics with bounded lookup and
+a duplicate-wakeup rather than lost-wakeup crash bias — implemented
+producer-side only; DING's staged ownership is never touched.
 
 Ordinary messages and `MESSAGE-R01..R11` are unchanged. The typed
 service-principal request/reply envelopes are absorbed over time: a reply to

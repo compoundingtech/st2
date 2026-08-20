@@ -60,6 +60,9 @@ executable evidence lives in [`.experiments/`](./.experiments/).
 - **STREAM-R03 Mandatory event identity:** Every emit names the target agent,
   a declared stream, and a producer-supplied `event-id`. Emits without an
   `event-id` are refused. Dedup scope is `(stream, event-id)` per recipient.
+  Admission and publication linearize while holding the catalog-authoring lock
+  across strict declaration/desired-state revalidation and the stream-state
+  transaction; lock order is catalog-authoring then stream state.
 - **STREAM-R04 Idempotent ingress:** One external event becomes exactly one
   durable inbox record while its identity remains in the stream's retained
   receipt ring. Replaying an `event-id` within that horizon — including
@@ -90,13 +93,17 @@ executable evidence lives in [`.experiments/`](./.experiments/).
 - **STREAM-R07 Producer-side supersession:** An emit may declare supersession:
   the successor publishes before the newest still-unread matching predecessor
   among the stream's retained receipts is archived (`key` scopes the match;
-  absent `key`, the whole stream does). A crash between those steps may leave
-  both events unread but never removes the only wakeup; the selected
-  predecessor filename is retained in the pending reservation so recovery
-  finishes that exact compaction rather than selecting against newer state.
-  Supersession never touches DING staged ownership — a staged notice is
-  released only through the existing archive-receipt rule — and a
-  fast-superseding stream stays within `R15` bounds.
+  absent `key`, the whole stream does). Still-unread requires an inbox file and
+  no same-name archive receipt. Immediately before either the initial or a
+  recovered archive move, the predecessor's no-follow regular bytes and
+  parsed event identity must match its retained receipt or publication fails
+  closed. A crash between those steps may leave both events unread but never
+  removes the only wakeup; the selected predecessor filename is retained in
+  the pending reservation so recovery finishes that exact compaction rather
+  than selecting against newer state. Supersession never touches DING staged
+  ownership — a staged notice is released only through the existing
+  archive-receipt rule — and a fast-superseding stream stays within `R15`
+  bounds.
 
 ### Must couple to the owning agent's lifecycle
 
@@ -107,7 +114,10 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   the declared supervisor.
 - **STREAM-R09 Suspension means eyes closed:** While an agent is suspended no
   events accumulate for it. Resume re-observes current state; re-emitting
-  still-current state is safe under `STREAM-R03` dedup.
+  still-current state is safe under `STREAM-R03` dedup. Suspension and stream
+  removal serialize with emit through the catalog-authoring lock: whichever
+  owns it first is the linearized operation, and no emit admitted after the
+  lifecycle/catalog change can publish under stale eligibility.
 
 ## Evidence
 
