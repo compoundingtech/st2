@@ -99,20 +99,27 @@ eyes closed for external producers too (STREAM-R09): the emit returns a typed
 refusal rather than accumulating events a suspended agent will wake to.
 
 Ingress is owner-host-local. During strict discovery, the recipient
-declaration's resolved owner host must equal st2's non-overridable local-host
-authority (the running machine's detected short hostname, or an equivalently
-trusted host identity fixed when an owner-local service starts). `MsgCtx --host`
-is only a logical bus-ID resolution override and must not participate
-in this authority check; `event emit --host <owner>` on another machine still
-refuses. An implementation may instead reject `--host` for event ingress
-entirely. A catalog copy synchronized onto another host is observation state,
-not ingress authority, and emit there refuses before acquiring stream state or
-writing inbox/archive bytes. A cross-host producer must forward its observation
-to an adapter or transport endpoint running on the owner host and invoke emit
-there; that forwarding transport is not implemented by this subsystem.
+declaration's resolved logical host must match an active machine-local owner
+binding established by `st2 up`/the supervisor for this catalog. The binding
+lives in the unsynchronized machine-local runner-state root, is keyed by a
+canonical catalog identity plus logical host, and records the local persistent
+catalog-authoring-lock `(device, inode)` and supervisor scope/generation. A
+derived adapter inherits this binding/capability. An external owner-local
+producer resolves the same machine-local record.
 
-On the owner host, emit acquires the same local catalog-authoring lock used by
-stream add/remove and desired-state edits, then performs strict catalog
+Ingress opens the selected catalog lock and requires its identity plus the
+resolved logical owner host to match that binding before admission.
+`MsgCtx --host` may choose the logical bus label, including a supported alias that
+differs from the OS hostname, but cannot establish or replace the binding. A
+remote synchronized checkout has a different lock inode and no matching local
+supervisor binding, so `event emit --host <owner>` there refuses before stream
+state or inbox/archive writes. Stale/missing binding, supervisor-generation
+mismatch, or catalog relocation fails closed. A cross-host producer must
+forward its observation to an adapter or transport endpoint in the bound owner
+domain; that forwarding transport is not implemented by this subsystem.
+
+In the bound owner domain, emit acquires the same local catalog-authoring lock
+used by stream add/remove and desired-state edits, then performs strict catalog
 discovery and eligibility validation while holding it. It retains that lock
 across the entire per-stream transaction — pending reconciliation,
 reservation, inbox/archive work, and receipt finalization. The local lock order

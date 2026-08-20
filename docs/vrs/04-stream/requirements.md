@@ -21,10 +21,11 @@ executable evidence lives in [`.experiments/`](./.experiments/).
 - **STREAM-A01 Host-local streams:** A stream runs on its owning agent's
   declared host (`R03`). Cross-host observation is served by placing the
   adapter on the right host, not by remote streams. Ingress executes only in
-  that owner's local lock domain: the declaration's resolved owner host must
-  equal a non-overridable local host authority derived from the running
-  machine, not the caller-controlled logical `--host` context. A synchronized
-  remote catalog copy is not publication authority.
+  that owner's local lock domain: the declaration's resolved logical host must
+  match a machine-local catalog/host binding established by the active
+  supervisor. The binding is not synchronized and records the local catalog
+  lock identity; caller-controlled logical `--host` cannot create it. A
+  synchronized remote catalog copy is not publication authority.
 - **STREAM-A02 Trusted producers:** Emitting into a declared stream is gated
   by the declaration's existence and the trusted-fleet model (root `A02`), not
   by authentication. An external producer that names an undeclared stream is
