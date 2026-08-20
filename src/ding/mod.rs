@@ -3107,6 +3107,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn event_catalog() -> (tempfile::TempDir, PathBuf) {
         let catalog = tempfile::tempdir().unwrap();
         declare_agent(catalog.path(), "hetz", "worker", None);
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
         let declaration = catalog.path().join("hetz/worker/agent.kdl");
         let source = std::fs::read_to_string(&declaration).unwrap();
         std::fs::write(

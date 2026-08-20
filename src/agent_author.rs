@@ -1888,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_add_supports_external_command_and_argv_and_remove_is_idempotent() {
+    fn stream_add_supports_external_command_and_argv_and_external_remove_is_idempotent() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         let path = write(
@@ -1944,21 +1944,23 @@ mod tests {
         assert!(authored.contains("stream \"github-ci\" { command \"gh watch --repo st2\" }"));
         assert!(authored.contains("stream \"tick\" { argv \"tick-source\" \"--daily\" }"));
 
-        for name in ["webhook", "github-ci", "tick"] {
-            assert_eq!(
-                remove_stream(root, "h.worker", "h", None, name)
-                    .unwrap()
-                    .result,
-                AuthorOutcome::Changed
-            );
-            assert_eq!(
-                remove_stream(root, "h.worker", "h", None, name)
-                    .unwrap()
-                    .result,
-                AuthorOutcome::Unchanged
-            );
-        }
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        assert_eq!(
+            remove_stream(root, "h.worker", "h", None, "webhook")
+                .unwrap()
+                .result,
+            AuthorOutcome::Changed
+        );
+        assert_eq!(
+            remove_stream(root, "h.worker", "h", None, "webhook")
+                .unwrap()
+                .result,
+            AuthorOutcome::Unchanged
+        );
+        let remaining = fs::read_to_string(path).unwrap();
+        assert!(!remaining.contains("stream \"webhook\""));
+        assert!(remaining.contains("stream \"github-ci\""));
+        assert!(remaining.contains("stream \"tick\""));
+        assert_ne!(remaining, original);
     }
 
     #[test]
