@@ -16,7 +16,9 @@ pub struct HostLock {
 
 impl HostLock {
     pub fn new(root: &Path, host: &str) -> Self {
-        Self { path: root.join(format!(".st2.{host}.lock")) }
+        Self {
+            path: root.join(format!(".st2.{host}.lock")),
+        }
     }
 
     pub fn pid_path(&self) -> &Path {
@@ -93,7 +95,10 @@ mod tests {
 
         lock.acquire().unwrap();
         assert!(lock.pid_path().exists());
-        assert!(lock.live_owner().is_none(), "our own lock is not a foreign owner");
+        assert!(
+            lock.live_owner().is_none(),
+            "our own lock is not a foreign owner"
+        );
 
         lock.release();
         assert!(!lock.pid_path().exists());
@@ -105,7 +110,14 @@ mod tests {
         let a = HostLock::new(tmp.path(), "hetz");
         let b = HostLock::new(tmp.path(), "silber");
         assert_ne!(a.pid_path(), b.pid_path(), "per-host lock files");
-        assert!(a.pid_path().file_name().unwrap().to_str().unwrap().starts_with('.'));
+        assert!(
+            a.pid_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with('.')
+        );
     }
 
     #[test]

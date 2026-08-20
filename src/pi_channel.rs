@@ -188,7 +188,11 @@ mod tests {
     fn session_context_restores_state_ritual_and_unread_work_in_hook_order() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path();
-        context::write_now(&context::context_dir(agent_dir), "Mid-migration on shard 3.").unwrap();
+        context::write_now(
+            &context::context_dir(agent_dir),
+            "Mid-migration on shard 3.",
+        )
+        .unwrap();
         let inbox = message::inbox_dir(agent_dir);
         std::fs::create_dir_all(&inbox).unwrap();
         std::fs::write(
@@ -199,9 +203,15 @@ mod tests {
 
         let restored = session_context(agent_dir, "h.worker");
 
-        let state = restored.find("Mid-migration on shard 3.").expect("state restored");
-        let ritual = restored.find("Run the st2 boot ritual").expect("ritual present");
-        let unread = restored.find("## st2 inbox (1 unread)").expect("unread listed");
+        let state = restored
+            .find("Mid-migration on shard 3.")
+            .expect("state restored");
+        let ritual = restored
+            .find("Run the st2 boot ritual")
+            .expect("ritual present");
+        let unread = restored
+            .find("## st2 inbox (1 unread)")
+            .expect("unread listed");
         assert!(state < ritual && ritual < unread, "{restored}");
         assert!(
             restored.contains("<context source=\"st2/context/now.md\" agent=\"h.worker\">"),
@@ -218,7 +228,10 @@ mod tests {
 
         let restored = session_context(tmp.path(), "h.worker");
 
-        assert!(restored.starts_with("Run the st2 boot ritual"), "{restored}");
+        assert!(
+            restored.starts_with("Run the st2 boot ritual"),
+            "{restored}"
+        );
         assert!(!restored.contains("<context"), "{restored}");
         assert!(!restored.contains("st2 inbox"), "{restored}");
     }
@@ -237,6 +250,9 @@ mod tests {
                 tags: Vec::new(),
                 priority: None,
                 idempotency_key: None,
+                stream: None,
+                event_id: None,
+                event_key: None,
                 body: "Please verify the staging deploy.".into(),
             },
             "h.worker",

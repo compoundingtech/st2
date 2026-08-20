@@ -34,8 +34,21 @@ pub struct MessageRow {
     pub tags: Vec<String>,
     pub priority: Option<String>,
     /// The caller's optional operation identity for exact retry semantics.
-    #[serde(rename = "idempotencyKey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "idempotencyKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idempotency_key: Option<String>,
+    /// The declared stream that produced this inbox event, when this is an event record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    /// The producer-owned stable identity of this event.
+    #[serde(rename = "eventId", default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// The optional stream-local supersession key.
+    #[serde(rename = "eventKey", default, skip_serializing_if = "Option::is_none")]
+    pub event_key: Option<String>,
     /// The markdown body.
     ///
     /// Absent — the key omitted entirely, not `null` — from a `ls --json` row unless
@@ -71,7 +84,11 @@ pub struct SentMessageRow {
     #[serde(default)]
     pub tags: Vec<String>,
     pub priority: Option<String>,
-    #[serde(rename = "idempotencyKey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "idempotencyKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -98,6 +115,9 @@ mod tests {
             tags: Vec::new(),
             priority: None,
             idempotency_key: None,
+            stream: None,
+            event_id: None,
+            event_key: None,
             body: None,
         }
     }
@@ -162,6 +182,26 @@ mod tests {
         assert!(json.contains(r#""body":"""#), "{json}");
     }
 
+    #[test]
+    fn event_identity_round_trips_without_changing_ordinary_message_rows() {
+        let ordinary = serde_json::to_value(row()).unwrap();
+        assert!(ordinary.get("stream").is_none());
+        assert!(ordinary.get("eventId").is_none());
+        assert!(ordinary.get("eventKey").is_none());
+
+        let event = MessageRow {
+            stream: Some("gh-ci".to_string()),
+            event_id: Some("run-812".to_string()),
+            event_key: Some("main".to_string()),
+            ..row()
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["stream"], "gh-ci");
+        assert_eq!(json["eventId"], "run-812");
+        assert_eq!(json["eventKey"], "main");
+        assert_eq!(serde_json::from_value::<MessageRow>(json).unwrap(), event);
+    }
+
     /// An ABSENT optional key and an explicit `null` both mean "not carried", and both must parse.
     ///
     /// This is the distinction the defect turned on: `#[serde(default)]` covers only the absent
@@ -205,7 +245,9 @@ mod tests {
         );
 
         let indexed = SentMessages {
-            coverage: SentCoverage::Since { since: 1_785_000_000_000 },
+            coverage: SentCoverage::Since {
+                since: 1_785_000_000_000,
+            },
             messages: vec![SentMessageRow {
                 filename: "1785000000000-abcdef.md".to_string(),
                 ts: 1_785_000_000_000,

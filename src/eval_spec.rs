@@ -159,13 +159,21 @@ pub enum Check {
     /// `file "p" lacks "text"` — path does NOT contain the substring.
     FileLacks { path: String, text: String },
     /// `json "p" field "x" is "y"` — the JSON field equals the value.
-    JsonField { path: String, field: String, value: JsonScalar },
+    JsonField {
+        path: String,
+        field: String,
+        value: JsonScalar,
+    },
     /// `committed "p"` — the path is tracked + committed (checked by the eval flow via git).
     Committed { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JsonScalar { String(String), Bool(bool), Integer(i64) }
+pub enum JsonScalar {
+    String(String),
+    Bool(bool),
+    Integer(i64),
+}
 
 // ── KDL helpers (match the idiom in render.rs / kdl_format.rs) ───────────────────────────────────
 
@@ -181,7 +189,9 @@ fn arg_n(node: &KdlNode, n: usize) -> Option<String> {
 
 /// The first positional argument as a `u32` (KDL bare integer, e.g. `attempts 3`).
 fn arg_u32(node: &KdlNode) -> Option<u32> {
-    node.get(0).and_then(|v| v.as_integer()).and_then(|i| u32::try_from(i).ok())
+    node.get(0)
+        .and_then(|v| v.as_integer())
+        .and_then(|i| u32::try_from(i).ok())
 }
 
 /// A child node's first argument, by child name.
@@ -220,8 +230,9 @@ fn parse_agent_presentation(
 /// the eval block run in file order. (The old nested `run { step … }` wrapper was retired once every
 /// cell moved to the flat form — a `run` with no label is now an error.)
 fn parse_run_stage(node: &KdlNode, out: &mut Vec<RunStep>) -> anyhow::Result<()> {
-    let label = arg(node)
-        .ok_or_else(|| anyhow::anyhow!("run needs a label: write `run \"label\" {{ command … }}`"))?;
+    let label = arg(node).ok_or_else(|| {
+        anyhow::anyhow!("run needs a label: write `run \"label\" {{ command … }}`")
+    })?;
     out.push(parse_step_body(node, label)?);
     Ok(())
 }
@@ -230,7 +241,9 @@ fn parse_run_stage(node: &KdlNode, out: &mut Vec<RunStep>) -> anyhow::Result<()>
 /// allow-nonzero }`. By default the step must exit 0; `allow-nonzero` opts out. `require-exit 0` is
 /// still accepted (it now just affirms the default).
 fn parse_step_body(node: &KdlNode, id: String) -> anyhow::Result<RunStep> {
-    let ch = node.children().ok_or_else(|| anyhow::anyhow!("run step '{id}' is empty"))?;
+    let ch = node
+        .children()
+        .ok_or_else(|| anyhow::anyhow!("run step '{id}' is empty"))?;
     let mut workspace = None;
     let mut command = None;
     let mut env = BTreeMap::new();
@@ -257,8 +270,12 @@ fn parse_step_body(node: &KdlNode, id: String) -> anyhow::Result<RunStep> {
             // (accepted, no-op). Any other value is still an error.
             "require-exit" => match c.get(0).and_then(|v| v.as_integer()) {
                 Some(0) => {}
-                Some(n) => anyhow::bail!("step '{id}': `require-exit {n}` — exit 0 is the default; use `allow-nonzero` to accept a non-zero exit"),
-                None => anyhow::bail!("step '{id}': require-exit needs the integer `0` (or drop it — exit 0 is the default)"),
+                Some(n) => anyhow::bail!(
+                    "step '{id}': `require-exit {n}` — exit 0 is the default; use `allow-nonzero` to accept a non-zero exit"
+                ),
+                None => anyhow::bail!(
+                    "step '{id}': require-exit needs the integer `0` (or drop it — exit 0 is the default)"
+                ),
             },
             other => anyhow::bail!(
                 "step '{id}': unexpected node '{other}' (expected workspace|command|env|unset|retry|allow-nonzero)"
@@ -278,7 +295,9 @@ fn parse_step_body(node: &KdlNode, id: String) -> anyhow::Result<RunStep> {
 
 /// `retry { attempts N; interval T }` → a [`Restart`] (mode=fail; `delay` = the inter-retry backoff).
 fn parse_retry(node: &KdlNode, step_id: &str) -> anyhow::Result<Restart> {
-    let ch = node.children().ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry{{}} is empty"))?;
+    let ch = node
+        .children()
+        .ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry{{}} is empty"))?;
     let mut attempts = None;
     let mut interval = None;
     for c in ch.nodes() {
@@ -290,17 +309,30 @@ fn parse_retry(node: &KdlNode, step_id: &str) -> anyhow::Result<Restart> {
                 }
             }
             "interval" => {
-                let s = arg(c).ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry interval needs a duration"))?;
-                interval =
-                    Some(parse_duration(&s).map_err(|e| anyhow::anyhow!("step '{step_id}': retry interval: {e}"))?);
+                let s = arg(c).ok_or_else(|| {
+                    anyhow::anyhow!("step '{step_id}': retry interval needs a duration")
+                })?;
+                interval = Some(
+                    parse_duration(&s)
+                        .map_err(|e| anyhow::anyhow!("step '{step_id}': retry interval: {e}"))?,
+                );
             }
-            other => anyhow::bail!("step '{step_id}': retry has unexpected node '{other}' (expected attempts|interval)"),
+            other => anyhow::bail!(
+                "step '{step_id}': retry has unexpected node '{other}' (expected attempts|interval)"
+            ),
         }
     }
-    let attempts = attempts.ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry needs `attempts N`"))?;
-    let interval = interval.ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry needs `interval T`"))?;
+    let attempts =
+        attempts.ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry needs `attempts N`"))?;
+    let interval =
+        interval.ok_or_else(|| anyhow::anyhow!("step '{step_id}': retry needs `interval T`"))?;
     // Retry maps to a fail-mode Restart: stop after `attempts`, wait `interval` (the backoff) between.
-    Ok(Restart { attempts, interval, delay: interval, mode: RestartMode::Fail })
+    Ok(Restart {
+        attempts,
+        interval,
+        delay: interval,
+        mode: RestartMode::Fail,
+    })
 }
 
 /// Parse an `env { }` block into a map of var → value (raw; `$CATALOG` expands at spawn).
@@ -317,7 +349,10 @@ fn parse_env(node: &KdlNode) -> BTreeMap<String, String> {
 }
 
 /// Merge `parent` and `child` env, child winning. (The env cascade: top → team → agent → process.)
-fn cascade(parent: &BTreeMap<String, String>, child: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+fn cascade(
+    parent: &BTreeMap<String, String>,
+    child: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     let mut out = parent.clone();
     out.extend(child.iter().map(|(k, v)| (k.clone(), v.clone())));
     out
@@ -358,7 +393,9 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
             "agent" => agents.push(parse_agent(node, "", &top_env)?),
             "eval" => eval = Some(parse_eval(node, &top_env)?),
             other => {
-                anyhow::bail!("st2 spec: unexpected top-level node '{other}' (expected host|env|team|agent|eval)")
+                anyhow::bail!(
+                    "st2 spec: unexpected top-level node '{other}' (expected host|env|team|agent|eval)"
+                )
             }
         }
     }
@@ -372,7 +409,12 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
             "eval `canonical-agents` is mutually exclusive with compact `team` / `agent` declarations"
         );
     }
-    Ok(Spec { host, env: top_env, agents, eval })
+    Ok(Spec {
+        host,
+        env: top_env,
+        agents,
+        eval,
+    })
 }
 
 /// Recurse a `team "name" { }`: prefix its agents' ids and cascade its env into them.
@@ -383,7 +425,11 @@ fn collect_team(
     out: &mut Vec<SpecAgent>,
 ) -> anyhow::Result<()> {
     let name = arg(node).ok_or_else(|| anyhow::anyhow!("team needs a name"))?;
-    let new_prefix = if prefix.is_empty() { name } else { format!("{prefix}.{name}") };
+    let new_prefix = if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix}.{name}")
+    };
     // A team may carry its own env, cascading to the agents it holds.
     let mut team_env = parent_env.clone();
     if let Some(ch) = node.children() {
@@ -397,7 +443,9 @@ fn collect_team(
                 "env" => {}
                 "agent" => out.push(parse_agent(c, &new_prefix, &team_env)?),
                 "team" => collect_team(c, &new_prefix, &team_env, out)?,
-                other => anyhow::bail!("team '{new_prefix}': unexpected node '{other}' (expected env|agent|team)"),
+                other => anyhow::bail!(
+                    "team '{new_prefix}': unexpected node '{other}' (expected env|agent|team)"
+                ),
             }
         }
     }
@@ -405,9 +453,17 @@ fn collect_team(
 }
 
 /// Parse one `agent "id" { }` with the accumulated (top+team) env as its parent scope.
-fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, String>) -> anyhow::Result<SpecAgent> {
+fn parse_agent(
+    node: &KdlNode,
+    prefix: &str,
+    parent_env: &BTreeMap<String, String>,
+) -> anyhow::Result<SpecAgent> {
     let name = arg(node).ok_or_else(|| anyhow::anyhow!("agent needs an id"))?;
-    let id = if prefix.is_empty() { name } else { format!("{prefix}.{name}") };
+    let id = if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix}.{name}")
+    };
 
     let mut display_name = None;
     let mut description = None;
@@ -429,9 +485,7 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
             match c.name().value() {
                 "env" => {}
                 "name" => parse_agent_presentation(c, &id, "name", &mut display_name)?,
-                "description" => {
-                    parse_agent_presentation(c, &id, "description", &mut description)?
-                }
+                "description" => parse_agent_presentation(c, &id, "description", &mut description)?,
                 "workspace" => workspace = arg(c),
                 "supervisor" => supervisor = arg(c),
                 "command" => command = arg(c),
@@ -458,14 +512,16 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
                 // id `ts.cos.foo`. An already-fully-qualified name (the older verbose form) is kept
                 // as-is, so both forms resolve to the same id. A command is always required.
                 "exec" => {
-                    let ex_leaf = arg(c).ok_or_else(|| anyhow::anyhow!("agent '{id}': exec needs an id"))?;
+                    let ex_leaf =
+                        arg(c).ok_or_else(|| anyhow::anyhow!("agent '{id}': exec needs an id"))?;
                     let ex_id = if ex_leaf == id || ex_leaf.starts_with(&format!("{id}.")) {
                         ex_leaf.clone()
                     } else {
                         format!("{id}.{ex_leaf}")
                     };
-                    let ex_command = child_arg(c, "command")
-                        .ok_or_else(|| anyhow::anyhow!("agent '{id}': exec '{ex_id}' needs a command"))?;
+                    let ex_command = child_arg(c, "command").ok_or_else(|| {
+                        anyhow::anyhow!("agent '{id}': exec '{ex_id}' needs a command")
+                    })?;
                     let mut ex_env = BTreeMap::new();
                     if let Some(exc) = c.children() {
                         for e in exc.nodes() {
@@ -509,7 +565,9 @@ fn parse_agent(node: &KdlNode, prefix: &str, parent_env: &BTreeMap<String, Strin
 
 /// Parse the `eval { }` block.
 fn parse_eval(node: &KdlNode, top_env: &BTreeMap<String, String>) -> anyhow::Result<Eval> {
-    let ch = node.children().ok_or_else(|| anyhow::anyhow!("eval {{}} is empty"))?;
+    let ch = node
+        .children()
+        .ok_or_else(|| anyhow::anyhow!("eval {{}} is empty"))?;
     let mut copy = None;
     let mut message = None;
     let mut max_timeout = None;
@@ -524,8 +582,10 @@ fn parse_eval(node: &KdlNode, top_env: &BTreeMap<String, String>) -> anyhow::Res
             "copy" => copy = arg(c),
             "message" => message = Some(parse_message(c)?),
             "max-timeout" => {
-                let s = arg(c).ok_or_else(|| anyhow::anyhow!("eval: max-timeout needs a duration"))?;
-                max_timeout = Some(parse_duration(&s).map_err(|e| anyhow::anyhow!("eval max-timeout: {e}"))?);
+                let s =
+                    arg(c).ok_or_else(|| anyhow::anyhow!("eval: max-timeout needs a duration"))?;
+                max_timeout =
+                    Some(parse_duration(&s).map_err(|e| anyhow::anyhow!("eval max-timeout: {e}"))?);
             }
             "agent" => agents.push(parse_agent(c, "", top_env)?),
             "team" => collect_team(c, "", top_env, &mut agents)?,
@@ -571,10 +631,11 @@ fn parse_message(node: &KdlNode) -> anyhow::Result<Kick> {
     // Catch the reference-example glitch first: `message { from "r" to "a" content "c" }` on one line
     // (no newline/`;` separators) mis-parses as a SINGLE `from` node with the rest as args. Reject it
     // with a fix-it rather than silently taking one field.
-    if node
-        .children()
-        .is_some_and(|d| d.nodes().iter().any(|n| n.name().value() == "from" && n.entries().len() > 1))
-    {
+    if node.children().is_some_and(|d| {
+        d.nodes()
+            .iter()
+            .any(|n| n.name().value() == "from" && n.entries().len() > 1)
+    }) {
         anyhow::bail!(
             "message: `from`/`to`/`content` must be SEPARATE nodes (newline- or `;`-separated), not one \
              unseparated line — `message {{ from \"r\"; to \"a\"; content \"./task.md\" }}`"
@@ -582,17 +643,23 @@ fn parse_message(node: &KdlNode) -> anyhow::Result<Kick> {
     }
     let from = child_arg(node, "from").ok_or_else(|| anyhow::anyhow!("message needs `from`"))?;
     let to = child_arg(node, "to").ok_or_else(|| anyhow::anyhow!("message needs `to`"))?;
-    let content = child_arg(node, "content").ok_or_else(|| anyhow::anyhow!("message needs `content`"))?;
+    let content =
+        child_arg(node, "content").ok_or_else(|| anyhow::anyhow!("message needs `content`"))?;
     Ok(Kick { from, to, content })
 }
 
 /// Parse the `judges { }` block into all-must-pass judges.
 fn parse_judges(node: &KdlNode) -> anyhow::Result<Vec<Judge>> {
     let mut judges = Vec::new();
-    let Some(ch) = node.children() else { return Ok(judges) };
+    let Some(ch) = node.children() else {
+        return Ok(judges);
+    };
     for c in ch.nodes() {
         if c.name().value() != "judge" {
-            anyhow::bail!("judges: unexpected node '{}' (expected judge)", c.name().value());
+            anyhow::bail!(
+                "judges: unexpected node '{}' (expected judge)",
+                c.name().value()
+            );
         }
         judges.push(parse_judge(c)?);
     }
@@ -618,34 +685,59 @@ fn parse_judge(node: &KdlNode) -> anyhow::Result<Judge> {
             "signal" => signal = true,
             "timeout" => {
                 if let Some(s) = arg(c) {
-                    timeout = Some(parse_duration(&s).map_err(|e| anyhow::anyhow!("judge '{name}' timeout: {e}"))?);
+                    timeout = Some(
+                        parse_duration(&s)
+                            .map_err(|e| anyhow::anyhow!("judge '{name}' timeout: {e}"))?,
+                    );
                 }
             }
             "exec" => exec_cmd = arg(c),
             "ask" => {
-                let agent = arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': ask needs an agent"))?;
-                let prompt = arg_n(c, 1).ok_or_else(|| anyhow::anyhow!("judge '{name}': ask needs a prompt"))?;
+                let agent =
+                    arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': ask needs an agent"))?;
+                let prompt = arg_n(c, 1)
+                    .ok_or_else(|| anyhow::anyhow!("judge '{name}': ask needs a prompt"))?;
                 ask = Some((agent, prompt));
             }
             "file" => {
-                let path = arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': file needs a path"))?;
-                let op = arg_n(c, 1).ok_or_else(|| anyhow::anyhow!("judge '{name}': file needs has/lacks"))?;
-                let text = arg_n(c, 2).ok_or_else(|| anyhow::anyhow!("judge '{name}': file needs a value"))?;
+                let path =
+                    arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': file needs a path"))?;
+                let op = arg_n(c, 1)
+                    .ok_or_else(|| anyhow::anyhow!("judge '{name}': file needs has/lacks"))?;
+                let text = arg_n(c, 2)
+                    .ok_or_else(|| anyhow::anyhow!("judge '{name}': file needs a value"))?;
                 checks.push(match op.as_str() {
                     "has" => Check::FileHas { path, text },
                     "lacks" => Check::FileLacks { path, text },
-                    other => anyhow::bail!("judge '{name}': file op '{other}' (expected has|lacks)"),
+                    other => {
+                        anyhow::bail!("judge '{name}': file op '{other}' (expected has|lacks)")
+                    }
                 });
             }
             "json" => {
                 // json "p" field "x" is "y"
-                let path = arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs a path"))?;
-                let field = arg_n(c, 2).ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs `field <x>`"))?;
-                let value = c.get(4).and_then(|v| match v { KdlValue::String(s) => Some(JsonScalar::String(s.clone())), KdlValue::Bool(b) => Some(JsonScalar::Bool(*b)), KdlValue::Integer(i) => (*i).try_into().ok().map(JsonScalar::Integer), _ => None }).ok_or_else(|| anyhow::anyhow!("judge '{name}': json value must be string, boolean, or integer"))?;
+                let path =
+                    arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs a path"))?;
+                let field = arg_n(c, 2)
+                    .ok_or_else(|| anyhow::anyhow!("judge '{name}': json needs `field <x>`"))?;
+                let value = c
+                    .get(4)
+                    .and_then(|v| match v {
+                        KdlValue::String(s) => Some(JsonScalar::String(s.clone())),
+                        KdlValue::Bool(b) => Some(JsonScalar::Bool(*b)),
+                        KdlValue::Integer(i) => (*i).try_into().ok().map(JsonScalar::Integer),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "judge '{name}': json value must be string, boolean, or integer"
+                        )
+                    })?;
                 checks.push(Check::JsonField { path, field, value });
             }
             "committed" => {
-                let path = arg(c).ok_or_else(|| anyhow::anyhow!("judge '{name}': committed needs a path"))?;
+                let path = arg(c)
+                    .ok_or_else(|| anyhow::anyhow!("judge '{name}': committed needs a path"))?;
                 checks.push(Check::Committed { path });
             }
             other => anyhow::bail!("judge '{name}': unexpected node '{other}'"),
@@ -653,12 +745,19 @@ fn parse_judge(node: &KdlNode) -> anyhow::Result<Judge> {
     }
 
     // Exactly one flavor.
-    let flavors = [exec_cmd.is_some(), ask.is_some(), !checks.is_empty()].iter().filter(|b| **b).count();
+    let flavors = [exec_cmd.is_some(), ask.is_some(), !checks.is_empty()]
+        .iter()
+        .filter(|b| **b)
+        .count();
     if flavors == 0 {
-        anyhow::bail!("judge '{name}' has no check (need exec | ask | declarative file/json/committed)");
+        anyhow::bail!(
+            "judge '{name}' has no check (need exec | ask | declarative file/json/committed)"
+        );
     }
     if flavors > 1 {
-        anyhow::bail!("judge '{name}' mixes flavors — a judge is exactly one of exec | ask | declarative");
+        anyhow::bail!(
+            "judge '{name}' mixes flavors — a judge is exactly one of exec | ask | declarative"
+        );
     }
     let kind = if let Some(cmd) = exec_cmd {
         JudgeKind::Bash(cmd)
@@ -667,7 +766,12 @@ fn parse_judge(node: &KdlNode) -> anyhow::Result<Judge> {
     } else {
         JudgeKind::Declarative(checks)
     };
-    Ok(Judge { name, timeout, kind, signal })
+    Ok(Judge {
+        name,
+        timeout,
+        kind,
+        signal,
+    })
 }
 
 #[cfg(test)]
@@ -736,33 +840,50 @@ eval {
         // Agent IS its pty (command on the agent) + cascaded authored env. The runner adds identity.
         let sup = &s.agents[0];
         assert_eq!(sup.workspace.as_deref(), Some("./sup"));
-        assert!(sup.command.contains("exec claude --permission-mode bypassPermissions"));
+        assert!(
+            sup.command
+                .contains("exec claude --permission-mode bypassPermissions")
+        );
         assert_eq!(sup.env.get("ST_ROOT").unwrap(), "$CATALOG/custom-bus"); // cascaded from top
         assert!(!sup.env.contains_key("ST_AGENT"));
         // The bare `ding` node auto-derives `<agent>.ding` and st2 generates the standard sidecar
         // against the cascaded $ST_ROOT; it inherits the agent env.
         assert_eq!(sup.execs.len(), 1);
         assert_eq!(sup.execs[0].id, "mix.sup.ding");
-        assert_eq!(sup.execs[0].command, "st2 ding --identity mix.sup --root $ST_ROOT");
+        assert_eq!(
+            sup.execs[0].command,
+            "st2 ding --identity mix.sup --root $ST_ROOT"
+        );
         assert!(!sup.execs[0].env.contains_key("ST_AGENT"));
 
         // Eval block.
         let ev = s.eval.as_ref().unwrap();
         assert_eq!(ev.copy.as_deref(), Some("./fixture"));
-        assert_eq!(ev.message, Some(Kick { from: "requester".into(), to: "mix.sup".into(), content: "./task.md".into() }));
+        assert_eq!(
+            ev.message,
+            Some(Kick {
+                from: "requester".into(),
+                to: "mix.sup".into(),
+                content: "./task.md".into()
+            })
+        );
         assert_eq!(ev.max_timeout, Duration::from_secs(1200));
         assert_eq!(ev.agents.len(), 1); // the eval-only judge agent
         assert_eq!(ev.agents[0].id, "judge");
 
         // Judges — all three flavors parsed.
         assert_eq!(ev.judges.len(), 5);
-        assert!(matches!(&ev.judges[0].kind, JudgeKind::Bash(c) if c == "sh ./judges/isolation.sh"));
+        assert!(
+            matches!(&ev.judges[0].kind, JudgeKind::Bash(c) if c == "sh ./judges/isolation.sh")
+        );
         match &ev.judges[1].kind {
             JudgeKind::Declarative(checks) => {
                 assert_eq!(checks.len(), 2);
                 assert!(matches!(&checks[0], Check::FileHas { path, text }
                     if path == "worker/LICENSE" && text.starts_with("Permission is hereby")));
-                assert!(matches!(&checks[1], Check::FileLacks { path, .. } if path == "worker/LICENSE"));
+                assert!(
+                    matches!(&checks[1], Check::FileLacks { path, .. } if path == "worker/LICENSE")
+                );
             }
             other => panic!("expected declarative, got {other:?}"),
         }
@@ -781,12 +902,15 @@ eval {
         // The dedicated `ding` node must parse to EXACTLY what the `ding_exec` helper generates.
         let sup = &parse_spec(REFERENCE).unwrap().agents[0];
         assert!(sup.execs[0].derived);
-        assert_eq!(ding_exec("mix.sup"), SpecExec {
-            id: sup.execs[0].id.clone(),
-            command: sup.execs[0].command.clone(),
-            env: BTreeMap::new(),
-            derived: true,
-        });
+        assert_eq!(
+            ding_exec("mix.sup"),
+            SpecExec {
+                id: sup.execs[0].id.clone(),
+                command: sup.execs[0].command.clone(),
+                env: BTreeMap::new(),
+                derived: true,
+            }
+        );
     }
 
     #[test]
@@ -809,16 +933,25 @@ eval {
                 let source = format!(
                     "agent \"worker\" {{ {field} \"left{separator}right\"; command \"true\" }}"
                 );
-                assert!(parse_spec(&source).is_err(), "accepted {field} U+{:04X}", separator as u32);
+                assert!(
+                    parse_spec(&source).is_err(),
+                    "accepted {field} U+{:04X}",
+                    separator as u32
+                );
             }
             let duplicate = format!(
                 "agent \"worker\" {{ {field} \"one\"; {field} \"two\"; command \"true\" }}"
             );
-            assert!(parse_spec(&duplicate).is_err(), "accepted duplicate {field}");
+            assert!(
+                parse_spec(&duplicate).is_err(),
+                "accepted duplicate {field}"
+            );
 
-            let malformed =
-                format!("agent \"worker\" {{ {field} 1; command \"true\" }}");
-            assert!(parse_spec(&malformed).is_err(), "accepted malformed {field}");
+            let malformed = format!("agent \"worker\" {{ {field} 1; command \"true\" }}");
+            assert!(
+                parse_spec(&malformed).is_err(),
+                "accepted malformed {field}"
+            );
         }
     }
 
@@ -875,18 +1008,21 @@ team "mix" {
         assert_eq!(ex.command, "run it");
 
         // ...and a command-less non-ding exec is an error (only "ding" has a built-in).
-        let err = parse_spec(
-            r#"team "mix" { agent "sup" { command "boot"; exec "sidecar" } }"#,
-        )
-        .unwrap_err();
+        let err = parse_spec(r#"team "mix" { agent "sup" { command "boot"; exec "sidecar" } }"#)
+            .unwrap_err();
         assert!(err.to_string().contains("needs a command"), "{err}");
     }
 
     #[test]
     fn json_judge_rejects_non_scalar_expected_values() {
         for value in ["null", "[1]", "{\"x\":1}", "1.5"] {
-            let text = format!("eval {{ judges {{ judge \"j\" {{ json \"x.json\" field \"n\" is {value} }} }} }}");
-            assert!(parse_spec(&text).is_err(), "accepted invalid JSON scalar {value}");
+            let text = format!(
+                "eval {{ judges {{ judge \"j\" {{ json \"x.json\" field \"n\" is {value} }} }} }}"
+            );
+            assert!(
+                parse_spec(&text).is_err(),
+                "accepted invalid JSON scalar {value}"
+            );
         }
     }
 
@@ -909,7 +1045,13 @@ team "mix" {
                  eval {{\n  message {{ from \"r\"; to \"sup\"; content \"go\" }}\n  max-timeout \"5s\"\n{extra}}}\n"
             )
         };
-        assert!(parse_spec(&ev("  supervise\n")).unwrap().eval.unwrap().supervise);
+        assert!(
+            parse_spec(&ev("  supervise\n"))
+                .unwrap()
+                .eval
+                .unwrap()
+                .supervise
+        );
         assert!(!parse_spec(&ev("")).unwrap().eval.unwrap().supervise);
     }
 
@@ -962,8 +1104,15 @@ team "mix" {
         .unwrap();
         assert!(spec.agents.is_empty(), "team-less: no base-team agents");
         let ev = spec.eval.unwrap();
-        assert!(ev.message.is_none(), "a team-less eval has no kickoff message");
-        assert_eq!(ev.run_steps.len(), 2, "two flat run nodes → two ordered steps");
+        assert!(
+            ev.message.is_none(),
+            "a team-less eval has no kickoff message"
+        );
+        assert_eq!(
+            ev.run_steps.len(),
+            2,
+            "two flat run nodes → two ordered steps"
+        );
         let build = &ev.run_steps[0];
         assert_eq!(build.id, "build");
         assert_eq!(build.workspace.as_deref(), Some("repo"));
@@ -975,7 +1124,10 @@ team "mix" {
         let probe = &ev.run_steps[1];
         assert_eq!(probe.id, "probe");
         assert_eq!(probe.env.get("FOO").map(String::as_str), Some("bar"));
-        assert_eq!(probe.unset, vec!["ST_ROOT".to_string(), "PTY_ROOT".to_string()]);
+        assert_eq!(
+            probe.unset,
+            vec!["ST_ROOT".to_string(), "PTY_ROOT".to_string()]
+        );
         assert!(probe.allow_nonzero, "opted out of must-exit-0");
     }
 

@@ -261,8 +261,8 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
     if plan.ops.is_empty() {
         return Ok(());
     }
-    let executable = std::env::current_exe()
-        .context("resolving st2 executable for driver materialization")?;
+    let executable =
+        std::env::current_exe().context("resolving st2 executable for driver materialization")?;
     for operation in &mut plan.ops {
         let RenderOp::JsonUpsert {
             destination,
@@ -278,9 +278,7 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
         let mut patch: serde_json::Value = serde_json::from_str(content)?;
         let command = patch
             .pointer_mut("/mcpServers/st2/command")
-            .with_context(|| {
-                format!("agent '{agent}' driver expansion has no st2 MCP command")
-            })?;
+            .with_context(|| format!("agent '{agent}' driver expansion has no st2 MCP command"))?;
         anyhow::ensure!(
             command.as_str() == Some("st2"),
             "agent '{agent}' driver expansion has an unexpected st2 MCP command"
@@ -295,9 +293,7 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
 fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
     crate::driver::ensure_single_source(spec)?;
     let mut plan = parse_plan_with_driver(spec, this_host)?;
-    if spec.driver.is_none()
-        && spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp)
-    {
+    if spec.driver.is_none() && spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp) {
         let executable = std::env::current_exe()
             .context("resolving st2 executable for Claude MCP declaration")?;
         let content = serde_json::json!({

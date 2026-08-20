@@ -25,13 +25,16 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::host_lock::process_alive;
 use crate::reconcile::{Session, TaskLaunch, TaskTarget};
 use crate::run::resolve_task_cwd;
 
 const EXEC_GENERATION_SCHEMA: &str = "st2.exec-generation.v1";
+const RETIRE_TERM_WAIT: Duration = Duration::from_secs(2);
+const RETIRE_KILL_WAIT: Duration = Duration::from_secs(2);
+const RETIRE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The immutable identity of one exec process generation.
 ///
@@ -245,6 +248,94 @@ impl ExecBackend {
         Ok(())
     }
 
+    /// Retire one exact recorded generation, including every process in its session, before
+    /// deleting its runner-state. A cooperative task gets a bounded SIGTERM grace period; an
+    /// ignoring task is escalated to SIGKILL. The generation record remains present throughout so
+    /// a failed/aborted retirement cannot turn a live adapter into an untracked orphan.
+    pub fn retire(&self, id: &str) -> anyhow::Result<()> {
+        let expected = match self.observe_generation(id)? {
+            ExecGenerationObservation::Running {
+                pid,
+                created_at,
+                generation_id,
+            } => (pid, created_at, generation_id),
+            ExecGenerationObservation::Exited { .. } => {
+                self.remove(id)?;
+                return Ok(());
+            }
+            ExecGenerationObservation::Indeterminate { reason, .. } => {
+                anyhow::bail!("exec generation for '{id}' is indeterminate: {reason}")
+            }
+        };
+
+        self.signal_expected_generation(id, &expected, libc::SIGTERM)?;
+        if self.wait_for_group_exit(expected.0 as i32, RETIRE_TERM_WAIT) {
+            self.remove(id)?;
+            return Ok(());
+        }
+
+        self.signal_expected_generation(id, &expected, libc::SIGKILL)?;
+        if !self.wait_for_group_exit(expected.0 as i32, RETIRE_KILL_WAIT) {
+            anyhow::bail!(
+                "exec process group {} for '{id}' survived bounded SIGKILL retirement",
+                expected.0
+            );
+        }
+        self.remove(id)?;
+        Ok(())
+    }
+
+    fn signal_expected_generation(
+        &self,
+        id: &str,
+        expected: &(u32, String, String),
+        signal: i32,
+    ) -> anyhow::Result<()> {
+        match self.observe_generation(id)? {
+            ExecGenerationObservation::Running {
+                pid,
+                created_at,
+                generation_id,
+            } if pid == expected.0 && created_at == expected.1 && generation_id == expected.2 => {}
+            ExecGenerationObservation::Exited {
+                pid,
+                created_at,
+                generation_id,
+            } if pid == expected.0 && created_at == expected.1 && generation_id == expected.2 => {
+                return Ok(());
+            }
+            other => {
+                anyhow::bail!("exec generation for '{id}' changed during retirement: {other:?}")
+            }
+        }
+        let result = unsafe { libc::kill(-(expected.0 as i32), signal) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                anyhow::bail!(
+                    "signal {signal} to exec group '{}' (pgid {}): {error}",
+                    id,
+                    expected.0
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_group_exit(&self, pgid: i32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.reap_owned_children();
+            if !process_group_has_live_member(pgid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(RETIRE_POLL_INTERVAL);
+        }
+    }
+
     /// Reap a crashed exec before restarting it: remove only the stale pid and rotate the current
     /// diagnostic log to one bounded prior generation. The next spawn creates a fresh current log,
     /// leaving `<id>.log` + `<id>.log.1` inspectable without unbounded crash-loop accumulation.
@@ -389,6 +480,42 @@ impl ExecBackend {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_has_live_member(pgid: i32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(") ").map(|(_, fields)| fields) else {
+            continue;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let process_group = fields.next().and_then(|field| field.parse::<i32>().ok());
+        if process_group == Some(pgid) && state != Some("Z") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_has_live_member(pgid: i32) -> bool {
+    let result = unsafe { libc::kill(-pgid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 const MAX_LEGACY_PID_RECORD_BYTES: u64 = 64;

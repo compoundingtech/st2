@@ -7,12 +7,16 @@
 //! Needs `pty` on PATH — HARD failure if absent unless ST2_ALLOW_PTY_SKIP is set.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn pty_available() -> bool {
-    Command::new("pty").arg("--help").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("pty")
+        .arg("--help")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 struct RemoveDirOnDrop(std::path::PathBuf);
@@ -25,7 +29,11 @@ impl Drop for RemoveDirOnDrop {
 
 #[allow(dead_code)]
 fn preserved_eval_catalog(output: &std::process::Output) -> std::path::PathBuf {
-    let text = format!("{}\n{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
     text.lines()
         .find_map(|line| line.strip_prefix("catalog preserved (--keep): "))
         .map(std::path::PathBuf::from)
@@ -134,7 +142,11 @@ sleep 60
     )
     .unwrap();
 
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let out = Command::new(bin)
         .args(["eval"])
         .arg(&cell)
@@ -151,10 +163,16 @@ sleep 60
         stdout.contains("team signalled done"),
         "the flow didn't reach done (kick → worker report → sup confirm):\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
-    assert!(stdout.contains("VERDICT: PASS"), "expected PASS:\n--stdout--\n{stdout}\n--stderr--\n{stderr}");
+    assert!(
+        stdout.contains("VERDICT: PASS"),
+        "expected PASS:\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
+    );
     assert!(out.status.success(), "exit non-zero:\n{stdout}\n{stderr}");
     // Both judges (bash + declarative) passed.
-    assert!(stdout.contains("SCORE: 5 PASS / 0 FAIL"), "expected 5/0:\n{stdout}");
+    assert!(
+        stdout.contains("SCORE: 5 PASS / 0 FAIL"),
+        "expected 5/0:\n{stdout}"
+    );
 
     let json_out = Command::new(bin)
         .args(["eval", "--json"])
@@ -166,27 +184,46 @@ sleep 60
         .env("XDG_STATE_HOME", tmp.path().join("xdg-json"))
         .output()
         .unwrap();
-    assert!(json_out.status.success(), "json eval should preserve exit 0: {}", String::from_utf8_lossy(&json_out.stderr));
-    let json: serde_json::Value = serde_json::from_slice(&json_out.stdout).expect("--json emits EvalReport");
+    assert!(
+        json_out.status.success(),
+        "json eval should preserve exit 0: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("--json emits EvalReport");
     assert_eq!(json["done"], true);
     assert!(json["judges"].as_array().is_some());
 
     let fail_cell = cell.join("fail.kdl");
-    let fail_spec = std::fs::read_to_string(cell.join("cell.kdl")).unwrap()
-        .replace("test -f $CATALOG/worker/DONE", "test -f $CATALOG/worker/NOPE")
+    let fail_spec = std::fs::read_to_string(cell.join("cell.kdl"))
+        .unwrap()
+        .replace(
+            "test -f $CATALOG/worker/DONE",
+            "test -f $CATALOG/worker/NOPE",
+        )
         .replace("field \"count\" is 7", "field \"count\" is 8");
     std::fs::write(&fail_cell, fail_spec).unwrap();
     let fail_out = Command::new(bin)
         .args(["eval", "--json"])
         .arg(&fail_cell)
         .env("PATH", &path)
-        .env_remove("CATALOG").env_remove("ST_ROOT").env_remove("PTY_ROOT")
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
         .env("XDG_STATE_HOME", tmp.path().join("xdg-fail"))
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(!fail_out.status.success());
-    let fail_json: serde_json::Value = serde_json::from_slice(&fail_out.stdout).expect("failed eval report");
+    let fail_json: serde_json::Value =
+        serde_json::from_slice(&fail_out.stdout).expect("failed eval report");
     assert_eq!(fail_json["judges"][0]["passed"], false);
-    assert!(fail_json["judges"].as_array().unwrap().iter().any(|j| j["detail"].as_str().unwrap_or("").contains("count")));
+    assert!(
+        fail_json["judges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["detail"].as_str().unwrap_or("").contains("count"))
+    );
     assert!(!String::from_utf8_lossy(&fail_out.stdout).contains("=="));
 
     let invalid = Command::new(bin)
@@ -194,7 +231,10 @@ sleep 60
         .arg(tmp.path().join("missing.kdl"))
         .output()
         .unwrap();
-    assert!(!invalid.status.success(), "invalid eval input must retain nonzero exit");
+    assert!(
+        !invalid.status.success(),
+        "invalid eval input must retain nonzero exit"
+    );
 }
 
 #[test]
@@ -204,7 +244,9 @@ fn canonical_agents_run_from_the_hermetic_catalog_with_one_root_and_native_bus()
             std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
             "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
         );
-        eprintln!("SKIP canonical_agents_run_from_the_hermetic_catalog_with_one_root_and_native_bus");
+        eprintln!(
+            "SKIP canonical_agents_run_from_the_hermetic_catalog_with_one_root_and_native_bus"
+        );
         return;
     }
 
@@ -329,7 +371,11 @@ exec sleep 60
     )
     .unwrap();
 
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let poison = tmp.path().join("ambient-poison");
     let child = Command::new(bin)
         .args(["eval", "--keep", "--host", "evalhost"])
@@ -364,7 +410,11 @@ exec sleep 60
     );
     for id in ["canonical-sup-main", "canonical-worker-main"] {
         let log = catalog.join("logs").join(format!("{id}.log"));
-        assert!(log.exists(), "custom main id did not flow into log capture: {}", log.display());
+        assert!(
+            log.exists(),
+            "custom main id did not flow into log capture: {}",
+            log.display()
+        );
     }
     let sessions = Command::new("pty")
         .args(["ls", "--json"])
@@ -443,7 +493,11 @@ eval {
 "#,
     )
     .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let child = Command::new(bin)
         .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
@@ -553,7 +607,11 @@ eval {
 "#,
     )
     .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let child = Command::new(bin)
         .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
@@ -630,13 +688,18 @@ eval {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "unknown kickoff target was accepted:\n{combined}");
     assert!(
-        combined.contains("kickoff target `evalhost.missing`")
-            && combined.contains("found 0"),
+        !out.status.success(),
+        "unknown kickoff target was accepted:\n{combined}"
+    );
+    assert!(
+        combined.contains("kickoff target `evalhost.missing`") && combined.contains("found 0"),
         "wrong refusal:\n{combined}"
     );
-    assert!(!catalog.join("SPAWNED").exists(), "task spawned before kickoff admission");
+    assert!(
+        !catalog.join("SPAWNED").exists(),
+        "task spawned before kickoff admission"
+    );
 }
 
 #[test]
@@ -706,7 +769,11 @@ eval {
 "#,
     )
     .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let child = Command::new(bin)
         .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
@@ -877,7 +944,10 @@ eval {{
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(!out.status.success(), "`{expected}` case launched:\n{combined}");
+        assert!(
+            !out.status.success(),
+            "`{expected}` case launched:\n{combined}"
+        );
         assert!(
             combined.contains(expected),
             "`{expected}` case produced the wrong refusal:\n{combined}"
@@ -932,7 +1002,10 @@ eval {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "malformed catalog config launched:\n{combined}");
+    assert!(
+        !out.status.success(),
+        "malformed catalog config launched:\n{combined}"
+    );
     assert!(
         combined.contains("catalog-config") && combined.contains("pty_root"),
         "malformed catalog config produced the wrong refusal:\n{combined}"
@@ -961,7 +1034,10 @@ eval {
 
 fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, expect_success: bool) {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP supervise_teardown_reaps_a_runtime_spawned_seat: `pty` not on PATH");
         return;
     }
@@ -978,8 +1054,19 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
     assert_eq!(spec_text.len(), 434);
     let sentinel = "judge \"trivial\" { exec \"exit 0\" }";
     assert_eq!(spec_text.matches(sentinel).count(), 1);
-    std::fs::write(cell.join("cell.kdl"), spec_text.replace(sentinel, &format!("judge \"trivial\" {{ exec \"{judge_command}\" }}"))).unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    std::fs::write(
+        cell.join("cell.kdl"),
+        spec_text.replace(
+            sentinel,
+            &format!("judge \"trivial\" {{ exec \"{judge_command}\" }}"),
+        ),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let child = Command::new(bin)
         .args(["eval", "--keep"])
         .arg(&cell)
@@ -1006,9 +1093,15 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
     );
     assert_eq!(out.status.success(), expect_success);
     if expect_success {
-        assert!(stdout.contains("VERDICT: PASS"), "expected human PASS verdict:\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("VERDICT: PASS"),
+            "expected human PASS verdict:\n{stdout}\n{stderr}"
+        );
     } else {
-        assert!(stderr.contains("VERDICT: FAIL"), "expected human FAIL verdict on stderr:\n{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("VERDICT: FAIL"),
+            "expected human FAIL verdict on stderr:\n{stdout}\n{stderr}"
+        );
         assert!(!out.status.success(), "human FAIL must be nonzero");
     }
 
@@ -1018,7 +1111,10 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
         .parse()
         .unwrap();
     let peer_alive = unsafe { libc::kill(peer_pid, 0) == 0 };
-    assert!(!peer_alive, "runtime peer still alive before post-teardown assertions (pid {peer_pid})");
+    assert!(
+        !peer_alive,
+        "runtime peer still alive before post-teardown assertions (pid {peer_pid})"
+    );
     let sessions = Command::new("pty")
         .args(["--root"])
         .arg(catalog.join("pty"))
@@ -1034,17 +1130,23 @@ fn supervise_teardown_reaps_a_runtime_spawned_seat_case(judge_command: &str, exp
     assert!(
         !catalog.join("pty/rtpeer.pid").exists()
             && !catalog.join("pty/rtpeer.sock").exists()
-            && session_json.as_array().is_some_and(|sessions| sessions.is_empty()),
+            && session_json
+                .as_array()
+                .is_some_and(|sessions| sessions.is_empty()),
         "runtime-spawned seat leaked after supervise teardown (pid {peer_pid}, registry {session_json}):\n\
          --stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
 }
 
 #[test]
-fn supervise_teardown_reaps_a_runtime_spawned_seat() { supervise_teardown_reaps_a_runtime_spawned_seat_case("exit 0", true); }
+fn supervise_teardown_reaps_a_runtime_spawned_seat() {
+    supervise_teardown_reaps_a_runtime_spawned_seat_case("exit 0", true);
+}
 
 #[test]
-fn supervise_teardown_runtime_peer_human_failure() { supervise_teardown_reaps_a_runtime_spawned_seat_case("exit 1", false); }
+fn supervise_teardown_runtime_peer_human_failure() {
+    supervise_teardown_reaps_a_runtime_spawned_seat_case("exit 1", false);
+}
 
 struct SignalCaseFailureGuard {
     child: Option<std::process::Child>,
@@ -1056,39 +1158,107 @@ struct SignalCaseFailureGuard {
 }
 
 fn pty_session_pid(root: &Path, id: &str) -> (i32, serde_json::Value) {
-    let out = Command::new("pty").args(["--root"]).arg(root).args(["stats", "--json", id]).output().unwrap();
-    let raw: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("stats parse failed: {e}; raw={}", String::from_utf8_lossy(&out.stdout)));
-    fn find(v: &serde_json::Value) -> Option<i32> { match v { serde_json::Value::Object(m) => m.get("process").and_then(|p| p.get("pid")).and_then(|p| p.as_i64()).map(|p| p as i32).or_else(|| m.values().find_map(find)), serde_json::Value::Array(a) => a.iter().find_map(find), _ => None } }
-    let pid = find(&raw).unwrap_or_else(|| panic!("stats missing process.pid: {raw}")); (pid, raw)
+    let out = Command::new("pty")
+        .args(["--root"])
+        .arg(root)
+        .args(["stats", "--json", id])
+        .output()
+        .unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stats parse failed: {e}; raw={}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    fn find(v: &serde_json::Value) -> Option<i32> {
+        match v {
+            serde_json::Value::Object(m) => m
+                .get("process")
+                .and_then(|p| p.get("pid"))
+                .and_then(|p| p.as_i64())
+                .map(|p| p as i32)
+                .or_else(|| m.values().find_map(find)),
+            serde_json::Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        }
+    }
+    let pid = find(&raw).unwrap_or_else(|| panic!("stats missing process.pid: {raw}"));
+    (pid, raw)
 }
 
 #[derive(Clone, Debug, Default)]
-struct SignalCleanupReceipt { success: bool, diagnostics: String, child_pid: Option<u32>, child_dead: bool, peer_pid: Option<i32>, peer_dead: bool, registry_empty: bool, pid_absent: bool, socket_absent: bool }
+struct SignalCleanupReceipt {
+    success: bool,
+    diagnostics: String,
+    child_pid: Option<u32>,
+    child_dead: bool,
+    peer_pid: Option<i32>,
+    peer_dead: bool,
+    registry_empty: bool,
+    pid_absent: bool,
+    socket_absent: bool,
+}
 
 impl SignalCaseFailureGuard {
-    fn disarm(&mut self) { self.armed = false; }
-    fn child_mut(&mut self) -> Option<&mut std::process::Child> { self.child.as_mut() }
-    fn take_child(&mut self) -> Option<std::process::Child> { self.child.take() }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+    fn child_mut(&mut self) -> Option<&mut std::process::Child> {
+        self.child.as_mut()
+    }
+    fn take_child(&mut self) -> Option<std::process::Child> {
+        self.child.take()
+    }
 }
 
 impl Drop for SignalCaseFailureGuard {
     fn drop(&mut self) {
-        if !self.armed { return; }
+        if !self.armed {
+            return;
+        }
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let child_pid = self.child.as_ref().map(|c| c.id()); let peer_pid = self.peer_pid;
-        let mut ok = false; let mut diagnostics = String::new();
+        let child_pid = self.child.as_ref().map(|c| c.id());
+        let peer_pid = self.peer_pid;
+        let mut ok = false;
+        let mut diagnostics = String::new();
         for _ in 0..5 {
-            let _ = Command::new("pty").args(["--root"]).arg(&self.pty_root).args(["kill", &self.peer_id]).status();
-            if let Some(pid) = peer_pid && unsafe { libc::kill(pid, 0) == 0 } { unsafe { libc::kill(pid, libc::SIGKILL); } }
-            let _ = Command::new("pty").args(["--root"]).arg(&self.pty_root).args(["rm", &self.peer_id]).status();
-            match Command::new("pty").args(["--root"]).arg(&self.pty_root).args(["list", "--json"]).output() {
-                Ok(out) => if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    if json.as_array().is_some_and(|v| v.is_empty()) { ok = true; break; }
-                    diagnostics = json.to_string();
-                } else { diagnostics = String::from_utf8_lossy(&out.stderr).into_owned(); },
+            let _ = Command::new("pty")
+                .args(["--root"])
+                .arg(&self.pty_root)
+                .args(["kill", &self.peer_id])
+                .status();
+            if let Some(pid) = peer_pid
+                && unsafe { libc::kill(pid, 0) == 0 }
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            let _ = Command::new("pty")
+                .args(["--root"])
+                .arg(&self.pty_root)
+                .args(["rm", &self.peer_id])
+                .status();
+            match Command::new("pty")
+                .args(["--root"])
+                .arg(&self.pty_root)
+                .args(["list", "--json"])
+                .output()
+            {
+                Ok(out) => {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                        if json.as_array().is_some_and(|v| v.is_empty()) {
+                            ok = true;
+                            break;
+                        }
+                        diagnostics = json.to_string();
+                    } else {
+                        diagnostics = String::from_utf8_lossy(&out.stderr).into_owned();
+                    }
+                }
                 Err(e) => diagnostics = e.to_string(),
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1096,57 +1266,149 @@ impl Drop for SignalCaseFailureGuard {
         let child_dead = child_pid.is_some_and(|p| unsafe { libc::kill(p as i32, 0) != 0 });
         let peer_dead = peer_pid.is_none_or(|p| unsafe { libc::kill(p, 0) != 0 });
         let pid_absent = !self.pty_root.join(format!("{}.pid", self.peer_id)).exists();
-        let socket_absent = !self.pty_root.join(format!("{}.sock", self.peer_id)).exists();
-        if !ok && diagnostics.is_empty() { diagnostics = "registry did not converge empty".into(); }
-        if let Ok(mut receipt) = self.receipt.lock() { receipt.child_pid=child_pid; receipt.child_dead=child_dead; receipt.peer_pid=peer_pid; receipt.peer_dead=peer_dead; receipt.registry_empty=ok; receipt.pid_absent=pid_absent; receipt.socket_absent=socket_absent; receipt.success=child_dead&&peer_dead&&ok&&pid_absent&&socket_absent; receipt.diagnostics=diagnostics; }
+        let socket_absent = !self
+            .pty_root
+            .join(format!("{}.sock", self.peer_id))
+            .exists();
+        if !ok && diagnostics.is_empty() {
+            diagnostics = "registry did not converge empty".into();
+        }
+        if let Ok(mut receipt) = self.receipt.lock() {
+            receipt.child_pid = child_pid;
+            receipt.child_dead = child_dead;
+            receipt.peer_pid = peer_pid;
+            receipt.peer_dead = peer_dead;
+            receipt.registry_empty = ok;
+            receipt.pid_absent = pid_absent;
+            receipt.socket_absent = socket_absent;
+            receipt.success = child_dead && peer_dead && ok && pid_absent && socket_absent;
+            receipt.diagnostics = diagnostics;
+        }
     }
 }
 
 fn runtime_peer_signal_case(sig: libc::c_int) {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "pty not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "pty not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP runtime_peer_signal_case: pty not on PATH");
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_st2"); let bin_dir = Path::new(bin).parent().unwrap();
-    let tmp = tempfile::tempdir().unwrap(); let cell = tmp.path().join("cell"); std::fs::create_dir_all(&cell).unwrap();
+    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cell = tmp.path().join("cell");
+    std::fs::create_dir_all(&cell).unwrap();
     std::fs::write(cell.join("cell.kdl"), RUNTIME_PEER_SPEC).unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
-    let child = Command::new(bin).args(["eval", "--keep"]).arg(&cell).env("PATH", path)
-        .env("XDG_STATE_HOME", tmp.path().join("xdg")).env_remove("CATALOG").env_remove("ST_ROOT").env_remove("PTY_ROOT")
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id())); let _guard = RemoveDirOnDrop(catalog.clone());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let child = Command::new(bin)
+        .args(["eval", "--keep"])
+        .arg(&cell)
+        .env("PATH", path)
+        .env("XDG_STATE_HOME", tmp.path().join("xdg"))
+        .env_remove("CATALOG")
+        .env_remove("ST_ROOT")
+        .env_remove("PTY_ROOT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let catalog = std::env::temp_dir().join(format!("st2e-{}", child.id()));
+    let _guard = RemoveDirOnDrop(catalog.clone());
     let receipt = Arc::new(Mutex::new(SignalCleanupReceipt::default()));
-    let mut failure = SignalCaseFailureGuard { child: Some(child), pty_root: catalog.join("pty"), peer_id: "rtpeer".into(), peer_pid: None, armed: true, receipt };
-    let marker = catalog.join("runtime-peer.pid"); let deadline = Instant::now() + Duration::from_secs(15);
-    while !marker.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(100)); }
-    if !marker.exists() { let status = failure.child_mut().and_then(|c| c.try_wait().ok()).flatten(); panic!("marker timeout status={status:?} catalog={}", catalog.display()); }
+    let mut failure = SignalCaseFailureGuard {
+        child: Some(child),
+        pty_root: catalog.join("pty"),
+        peer_id: "rtpeer".into(),
+        peer_pid: None,
+        armed: true,
+        receipt,
+    };
+    let marker = catalog.join("runtime-peer.pid");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !marker.exists() {
+        let status = failure
+            .child_mut()
+            .and_then(|c| c.try_wait().ok())
+            .flatten();
+        panic!(
+            "marker timeout status={status:?} catalog={}",
+            catalog.display()
+        );
+    }
     assert!(catalog.is_dir());
     let (session_pid, _stats) = pty_session_pid(&catalog.join("pty"), "rtpeer");
     let child_id = failure.child_mut().unwrap().id();
     assert_eq!(unsafe { libc::kill(child_id as i32, sig) }, 0);
-    let out = failure.take_child().unwrap().wait_with_output().unwrap(); assert!(!out.status.success(), "status={:?} stdout={} stderr={}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(combined.contains("eval interrupted by SIGINT/SIGTERM"), "missing interruption contract: {combined}");
-    let peer: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap(); failure.peer_pid = Some(peer); assert!(unsafe { libc::kill(peer, 0) != 0 });
+    let out = failure.take_child().unwrap().wait_with_output().unwrap();
+    assert!(
+        !out.status.success(),
+        "status={:?} stdout={} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("eval interrupted by SIGINT/SIGTERM"),
+        "missing interruption contract: {combined}"
+    );
+    let peer: i32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    failure.peer_pid = Some(peer);
+    assert!(unsafe { libc::kill(peer, 0) != 0 });
     assert!(unsafe { libc::kill(session_pid, 0) != 0 });
-    let listed = Command::new("pty").args(["--root"]).arg(catalog.join("pty")).args(["list", "--json"]).output().unwrap();
-    let registry: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap(); assert!(registry.as_array().is_some_and(|v| v.is_empty()));
-    assert!(!catalog.join("pty/rtpeer.pid").exists()); assert!(!catalog.join("pty/rtpeer.sock").exists());
+    let listed = Command::new("pty")
+        .args(["--root"])
+        .arg(catalog.join("pty"))
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    let registry: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert!(registry.as_array().is_some_and(|v| v.is_empty()));
+    assert!(!catalog.join("pty/rtpeer.pid").exists());
+    assert!(!catalog.join("pty/rtpeer.sock").exists());
     failure.disarm();
 }
 
-#[test] fn supervise_runtime_peer_sigterm_reaps() { runtime_peer_signal_case(libc::SIGTERM); }
-#[test] fn supervise_runtime_peer_sigint_reaps() { runtime_peer_signal_case(libc::SIGINT); }
+#[test]
+fn supervise_runtime_peer_sigterm_reaps() {
+    runtime_peer_signal_case(libc::SIGTERM);
+}
+#[test]
+fn supervise_runtime_peer_sigint_reaps() {
+    runtime_peer_signal_case(libc::SIGINT);
+}
 
 #[test]
 fn signal_case_failure_guard_reaps_on_unwind() {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "pty not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "pty not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP signal_case_failure_guard_reaps_on_unwind: pty not on PATH");
         return;
     }
-    let tmp = tempfile::tempdir().unwrap(); let catalog = tmp.path().join("catalog"); let receipt = Arc::new(Mutex::new(SignalCleanupReceipt::default()));
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let receipt = Arc::new(Mutex::new(SignalCleanupReceipt::default()));
     let receipt_out = receipt.clone();
     let session_pid_out: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
     let session_pid_capture = session_pid_out.clone();
@@ -1154,16 +1416,60 @@ fn signal_case_failure_guard_reaps_on_unwind() {
         std::fs::create_dir_all(catalog.join("pty")).unwrap();
         let _catalog = RemoveDirOnDrop(catalog.clone());
         let root = catalog.join("pty");
-        let peer = Command::new("pty").args(["--root"]).arg(&root).args(["run", "-d", "--id", "rtpeer", "--", "sleep", "1000"]).status().unwrap(); assert!(peer.success());
-        let pid_path = root.join("rtpeer.pid"); let deadline = Instant::now() + Duration::from_secs(5);
-        while !pid_path.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(50)); }
-        let peer_pid: i32 = std::fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
-        let (session_pid, _) = pty_session_pid(&root, "rtpeer"); *session_pid_capture.lock().unwrap() = Some(session_pid);
-        let child = Command::new("sh").args(["-c", "sleep 1000"]).spawn().unwrap();
-        let guard = SignalCaseFailureGuard { child: Some(child), pty_root: root, peer_id: "rtpeer".into(), peer_pid: Some(peer_pid), armed: true, receipt: receipt.clone() };
-        let _guard = guard; panic!("representative post-signal assertion");
+        let peer = Command::new("pty")
+            .args(["--root"])
+            .arg(&root)
+            .args(["run", "-d", "--id", "rtpeer", "--", "sleep", "1000"])
+            .status()
+            .unwrap();
+        assert!(peer.success());
+        let pid_path = root.join("rtpeer.pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let peer_pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let (session_pid, _) = pty_session_pid(&root, "rtpeer");
+        *session_pid_capture.lock().unwrap() = Some(session_pid);
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1000"])
+            .spawn()
+            .unwrap();
+        let guard = SignalCaseFailureGuard {
+            child: Some(child),
+            pty_root: root,
+            peer_id: "rtpeer".into(),
+            peer_pid: Some(peer_pid),
+            armed: true,
+            receipt: receipt.clone(),
+        };
+        let _guard = guard;
+        panic!("representative post-signal assertion");
     }));
-    assert!(result.is_err()); let receipt = receipt_out.lock().unwrap(); assert!(receipt.success, "cleanup diagnostics: {}", receipt.diagnostics); assert!(receipt.diagnostics.is_empty()); assert!(receipt.child_pid.is_some() && receipt.child_dead && receipt.peer_pid.is_some() && receipt.peer_dead && receipt.registry_empty && receipt.pid_absent && receipt.socket_absent); let session_pid = session_pid_out.lock().unwrap().unwrap(); assert!(unsafe { libc::kill(session_pid, 0) != 0 }); assert!(!catalog.exists());
+    assert!(result.is_err());
+    let receipt = receipt_out.lock().unwrap();
+    assert!(
+        receipt.success,
+        "cleanup diagnostics: {}",
+        receipt.diagnostics
+    );
+    assert!(receipt.diagnostics.is_empty());
+    assert!(
+        receipt.child_pid.is_some()
+            && receipt.child_dead
+            && receipt.peer_pid.is_some()
+            && receipt.peer_dead
+            && receipt.registry_empty
+            && receipt.pid_absent
+            && receipt.socket_absent
+    );
+    let session_pid = session_pid_out.lock().unwrap().unwrap();
+    assert!(unsafe { libc::kill(session_pid, 0) != 0 });
+    assert!(!catalog.exists());
 }
 
 /// A TEAM-LESS eval (no agents, no kickoff) runs its `run` steps to completion, captures each step's
@@ -1199,7 +1505,11 @@ eval {
 "#,
     )
     .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let out = Command::new(bin)
         .args(["eval"])
         .arg(&cell)
@@ -1212,13 +1522,22 @@ eval {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stdout.contains("team-less eval: 2 run step(s)"), "not the team-less path:\n{stdout}\n{stderr}");
-    assert!(stdout.contains("run step probe → exit 3"), "probe's non-zero exit not captured:\n{stdout}");
+    assert!(
+        stdout.contains("team-less eval: 2 run step(s)"),
+        "not the team-less path:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("run step probe → exit 3"),
+        "probe's non-zero exit not captured:\n{stdout}"
+    );
     assert!(
         stdout.contains("SCORE: 6 PASS / 0 FAIL"),
         "team-less run-stage eval should be 6/0 (make must-exit-0 gate + 5 judges incl. $LOGS_DIR):\n--stdout--\n{stdout}\n--stderr--\n{stderr}"
     );
-    assert!(stdout.contains("VERDICT: PASS") && out.status.success(), "expected PASS:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("VERDICT: PASS") && out.status.success(),
+        "expected PASS:\n{stdout}\n{stderr}"
+    );
 }
 
 /// crash-ding: under `supervise`, a seat that CRASHES (non-zero/killed/vanished) is respawned AND its
@@ -1229,8 +1548,13 @@ eval {
 #[test]
 fn supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit() {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
-        eprintln!("SKIP supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit: `pty` not on PATH");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
+        eprintln!(
+            "SKIP supervise_crash_dings_up_the_chain_and_is_silent_on_clean_exit: `pty` not on PATH"
+        );
         return;
     }
     let bin = env!("CARGO_BIN_EXE_st2");
@@ -1326,7 +1650,11 @@ sleep 100000
 "#,
     )
     .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let child = Command::new(bin)
         .args(["eval", "--keep", "--host", "evalhost"])
         .arg(&cell)
@@ -1373,7 +1701,10 @@ sleep 100000
 #[test]
 fn st2_eval_fails_fast_when_a_seat_exits_at_boot() {
     if !pty_available() {
-        assert!(std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(), "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1");
+        assert!(
+            std::env::var_os("ST2_ALLOW_PTY_SKIP").is_some(),
+            "`pty` not on PATH; set ST2_ALLOW_PTY_SKIP=1"
+        );
         eprintln!("SKIP st2_eval_fails_fast_when_a_seat_exits_at_boot: `pty` not on PATH");
         return;
     }
@@ -1398,7 +1729,11 @@ eval {
 "#,
     )
     .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let start = Instant::now();
     let out = Command::new(bin)
         .args(["eval"])
@@ -1411,8 +1746,21 @@ eval {
         .output()
         .unwrap();
     let elapsed = start.elapsed();
-    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(!out.status.success(), "a dead-at-boot seat must fail the eval:\n{combined}");
-    assert!(combined.contains("exited at boot"), "expected a clear fail-fast error:\n{combined}");
-    assert!(elapsed < Duration::from_secs(60), "must fail FAST, not wait max-timeout — took {elapsed:?}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a dead-at-boot seat must fail the eval:\n{combined}"
+    );
+    assert!(
+        combined.contains("exited at boot"),
+        "expected a clear fail-fast error:\n{combined}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "must fail FAST, not wait max-timeout — took {elapsed:?}"
+    );
 }

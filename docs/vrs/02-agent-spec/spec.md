@@ -490,6 +490,32 @@ change lands. st2 source: [`AgentSpec`](../../../crates/agent-spec/src/spec.rs),
 [roster](../../../src/agents.rs), and [reconciliation](../../../src/reconcile.rs).
 Evidence: parser, roster, exact-ID metadata, and no-restart presentation tests.
 
+<h3 id="f19">F19 Agent <code>stream</code></h3>
+
+A `stream "<name>" {}` declares one agent-owned event ingress endpoint. Names
+are 1..=40 characters matching
+`[a-z0-9]([a-z0-9-]*[a-z0-9])?` and cannot collide with an authored task named
+`stream-<name>`. The declaration contains at most one launch: `command` is an
+opaque shell command, `argv` is a non-empty structured argument vector, and an
+empty body means external ingress. Unknown children, including the reserved
+`every`, fail admission.
+
+A launched stream adds exactly one derived exec task named `stream-<name>` and
+with runtime ID `<host>.<agent>.stream-<name>`. Its authored `command` or
+`argv` lowers directly to that task; no stream runner or stdout line protocol
+is inserted. An external-ingress stream adds no task. Adding or removing a
+launched stream therefore adds or removes that exact derived companion under
+the owning agent's lifecycle; changing its launch is spawn-input drift under
+F11. It does not change the canonical agent task or select a delivery
+transport.
+
+Authoring: canonical Agent Spec stream field after the matching evals change
+lands. st2 source: [`Stream`](../../../crates/agent-spec/src/spec.rs),
+[KDL lowering](../../../crates/agent-spec/src/kdl_format.rs), and
+[reconciliation](../../../src/reconcile.rs). Evidence:
+[`streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks`](../../../crates/agent-spec/tests/discovery.rs)
+and stream lifecycle tests in [`tests/run.rs`](../../../tests/run.rs).
+
 Catalog and PTY roots are host runtime inputs, not Agent Spec fields. Their
 migration contract is outside this VRS. See
 [#85](https://github.com/compoundingtech/st2/issues/85).
@@ -559,6 +585,11 @@ replacement of drifted work.
   structured diagnostic envelope. Publication verifies exact digests and a
   full-catalog overlay before its atomic transition, but must also re-admit the
   published view under the lock and bind the policy profile in its receipt.
+- **G11, F19 canonical ownership:** st2 admits, lowers, authors, and runs the
+  `stream` field, but the canonical evals `AGENT-SPEC.md` and its maintained
+  acceptance cells do not yet define or prove that capability. Until the
+  matching evals change lands, st2's stream implementation is ahead of the
+  authoring authority rather than conformant to it.
 
 ## Acceptance cases
 

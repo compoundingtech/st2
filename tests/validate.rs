@@ -431,7 +431,12 @@ fn fleet_validation_compiles_remote_driver_launches() {
 
     for report in [validate(c.path()), validate_for_host(c.path(), "droppy")] {
         assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
-        assert_eq!(report.warnings(), 0, "unexpected issues: {:?}", report.issues);
+        assert_eq!(
+            report.warnings(),
+            0,
+            "unexpected issues: {:?}",
+            report.issues
+        );
     }
 }
 

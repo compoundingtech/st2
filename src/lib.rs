@@ -18,6 +18,7 @@ pub mod ding;
 pub mod driver;
 pub mod eval_run;
 pub mod eval_spec;
+pub mod event;
 pub mod exec_backend;
 pub mod expand;
 pub mod flapping;
@@ -47,9 +48,7 @@ mod watch;
 // `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
 pub use agent_spec::{discovery, spec};
 
-pub use agent_spec::discovery::{
-    Discovered, SpecError, discover, discover_file, discover_strict,
-};
+pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
     PiDriver, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,

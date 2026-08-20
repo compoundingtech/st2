@@ -42,11 +42,17 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (catalog, xdg, pty_root) = (root.join("catalog"), root.join("xdg"), root.join("ptyroot"));
+        let (catalog, xdg, pty_root) =
+            (root.join("catalog"), root.join("xdg"), root.join("ptyroot"));
         for d in [&catalog, &xdg, &pty_root] {
             std::fs::create_dir_all(d).unwrap();
         }
-        Fixture { catalog, xdg, pty_root, _tmp: tmp }
+        Fixture {
+            catalog,
+            xdg,
+            pty_root,
+            _tmp: tmp,
+        }
     }
 
     fn write_exec_agent(&self, identity: &str) {
@@ -60,7 +66,11 @@ impl Fixture {
     }
 
     fn task_pidfile(&self, identity: &str) -> PathBuf {
-        self.xdg.join("st2").join(HOST).join("exec").join(format!("{HOST}.{identity}.task.pid"))
+        self.xdg
+            .join("st2")
+            .join(HOST)
+            .join("exec")
+            .join(format!("{HOST}.{identity}.task.pid"))
     }
 
     fn supervisor_pidfile(&self) -> PathBuf {
@@ -107,7 +117,12 @@ impl Drop for Fixture {
                     && let Some(pid) = read_pid(&e.path())
                 {
                     for t in [format!("-{pid}"), pid.to_string()] {
-                        let _ = Command::new("kill").arg("-KILL").arg(t).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                        let _ = Command::new("kill")
+                            .arg("-KILL")
+                            .arg(t)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
                     }
                 }
             }
@@ -130,7 +145,10 @@ fn read_alive(pidfile: &Path) -> bool {
 
 /// A pid's parent pid via `ps` (macOS has no `/proc`). `Some(1)` == reparented to launchd/init.
 fn ppid_of(pid: i32) -> Option<i32> {
-    let out = Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]).output().ok()?;
+    let out = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
@@ -148,7 +166,13 @@ fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 /// This gate needs `pty` on PATH (the real `st2 up` lists pty every reconcile pass). Missing it means
 /// the gate cannot run and is UNPROVEN — a HARD FAILURE, never a silent skip, unless a dev opts out.
 fn isolation_gate(test: &str) -> bool {
-    let pty = Command::new("pty").arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    let pty = Command::new("pty")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     if pty {
         return true;
     }
@@ -163,7 +187,12 @@ fn isolation_gate(test: &str) -> bool {
 
 /// Kill a process group (leader `pgid`) with SIGKILL: `kill -KILL -<pgid>`.
 fn kill_group(pgid: i32) {
-    let ok = Command::new("kill").arg("-KILL").arg(format!("-{pgid}")).status().map(|s| s.success()).unwrap_or(false);
+    let ok = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pgid}"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     assert!(ok, "failed to kill process group {pgid}");
 }
 
@@ -182,7 +211,8 @@ fn task_survives_spawner_group_kill() {
     let mut sup = Handle(fx.spawn_supervisor_in_own_group());
     let task_pidfile = fx.task_pidfile("survivor");
     assert!(
-        poll_until(SPAWN_TIMEOUT, || read_alive(&task_pidfile) && read_alive(&fx.supervisor_pidfile())),
+        poll_until(SPAWN_TIMEOUT, || read_alive(&task_pidfile)
+            && read_alive(&fx.supervisor_pidfile())),
         "supervisor never brought up a live task (task pidfile {})",
         task_pidfile.display()
     );
@@ -209,7 +239,10 @@ fn task_survives_spawner_group_kill() {
     );
 
     // 5) THE PROPERTY: the task outlived the group kill and reparented to launchd/init (ppid == 1).
-    assert!(process_alive(task_pid), "task pid {task_pid} died with the spawner's group — NOT detached");
+    assert!(
+        process_alive(task_pid),
+        "task pid {task_pid} died with the spawner's group — NOT detached"
+    );
     assert!(
         poll_until(DEATH_TIMEOUT, || ppid_of(task_pid) == Some(1)),
         "task pid {task_pid} survived but did not reparent to launchd/init (ppid {:?})",

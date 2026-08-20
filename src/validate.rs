@@ -462,6 +462,9 @@ fn kdl_shape_check(root: &Path, path: &Path, parsed: &DeclaredParse) -> Vec<Issu
                 } else {
                     match diagnostic.code {
                         DeclaredDiagnosticCode::UnsupportedSchedule => "unsupported-schedule",
+                        DeclaredDiagnosticCode::UnsupportedStreamInterval => {
+                            "unsupported-stream-interval"
+                        }
                         DeclaredDiagnosticCode::UnexpectedTopLevelNode => {
                             "unexpected-top-level-node"
                         }

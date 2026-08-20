@@ -15,7 +15,9 @@ fn assert_snapshot(input: &str, expected: &str) {
     let found = discover(temp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     assert_eq!(found.specs.len(), 1);
-    let actual = expand_driver(&found.specs[0], "unused").unwrap().to_string();
+    let actual = expand_driver(&found.specs[0], "unused")
+        .unwrap()
+        .to_string();
     assert_eq!(actual, expected);
     expected.parse::<kdl::KdlDocument>().unwrap();
 }
@@ -55,7 +57,9 @@ fn pi_expansion_carries_no_machine_local_extension_path() {
     fs::write(&path, include_str!("fixtures/driver/pi.in.kdl")).unwrap();
 
     let found = discover(temp.path());
-    let expanded = expand_driver(&found.specs[0], "unused").unwrap().to_string();
+    let expanded = expand_driver(&found.specs[0], "unused")
+        .unwrap()
+        .to_string();
 
     assert!(!expanded.contains("pi-channel.ts"), "{expanded}");
     assert!(!expanded.contains("ST_HOOKS"), "{expanded}");
@@ -209,11 +213,7 @@ fn claude_driver_matches_deliver_after_normalizing_the_legacy_command_namespace(
     let (driver, _) = st2::discover_file(&catalog, &driver_path).unwrap();
     let mut legacy = legacy.into_iter().next().unwrap();
     let mut driver = driver.into_iter().next().unwrap();
-    assert!(!st2::hooks::required_by_codex_agent(
-        &driver,
-        "h",
-        &catalog
-    ));
+    assert!(!st2::hooks::required_by_codex_agent(&driver, "h", &catalog));
     let executable = catalog.join("bin/st2");
     fs::create_dir_all(executable.parent().unwrap()).unwrap();
     fs::write(&executable, "test binary").unwrap();
@@ -390,7 +390,11 @@ fn ambiguous_driver_source_neither_compiles_nor_materializes() {
 
     let compile_error =
         compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap_err();
-    assert!(compile_error.to_string().contains("choose one launch source"));
+    assert!(
+        compile_error
+            .to_string()
+            .contains("choose one launch source")
+    );
     assert_eq!(spec, before);
     let materialize_error = materialize_agent(&catalog, &spec, "h").unwrap_err();
     assert!(

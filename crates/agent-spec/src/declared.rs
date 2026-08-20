@@ -39,6 +39,7 @@ pub enum DeclaredDiagnosticCode {
     TaskNameMissing,
     UnsupportedSchedule,
     DuplicateRoutingField,
+    UnsupportedStreamInterval,
 }
 
 impl DeclaredDiagnosticCode {
@@ -49,6 +50,7 @@ impl DeclaredDiagnosticCode {
             Self::TaskNameMissing => "task-name-missing",
             Self::UnsupportedSchedule => "unsupported-schedule",
             Self::DuplicateRoutingField => "duplicate-routing-field",
+            Self::UnsupportedStreamInterval => "unsupported-stream-interval",
         }
     }
 }
@@ -301,13 +303,30 @@ pub fn parse_declared_document(source_name: &Path, source: &str) -> DeclaredPars
         }
         for child in &node.children {
             match child.name.as_str() {
-                "pty" | "exec" if child.argument(0).and_then(DeclaredValue::as_str).is_none() => {
+                "pty" | "exec" | "stream"
+                    if child.argument(0).and_then(DeclaredValue::as_str).is_none() =>
+                {
                     diagnostics.push(shape_diagnostic(
                         source_name,
                         child.span,
                         DeclaredDiagnosticCode::TaskNameMissing,
                         format!("{} task must have one positional string name", child.name),
                     ));
+                }
+                // A command-bearing stream lowers to a derived exec companion. A command-less
+                // stream is an external ingress endpoint. `every` would make either one a schedule,
+                // which is the reserved `schedule` node's business.
+                "stream" => {
+                    for field in child.children_named("every") {
+                        diagnostics.push(shape_diagnostic(
+                            source_name,
+                            field.span,
+                            DeclaredDiagnosticCode::UnsupportedStreamInterval,
+                            "stream `every` is reserved for the future `schedule` contract; a stream \
+                             declares a long-running event source"
+                                .to_owned(),
+                        ));
+                    }
                 }
                 "schedule" => diagnostics.push(shape_diagnostic(
                     source_name,

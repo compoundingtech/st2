@@ -69,6 +69,12 @@ enum Command {
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.
     #[command(subcommand)]
     Message(MessageCmd),
+    /// Declared event streams: durable, bounded, idempotent ingress into an agent inbox.
+    #[command(subcommand)]
+    Event(EventCmd),
+    /// Self-author declared event streams through the serialized catalog path.
+    #[command(subcommand)]
+    Stream(StreamCmd),
     /// Idempotent JSON request/reply transport for declared non-agent service principals.
     #[command(subcommand)]
     Request(RequestCmd),
@@ -826,6 +832,70 @@ enum MessageCmd {
 }
 
 #[derive(Subcommand)]
+enum EventCmd {
+    /// Emit one producer-identified event into a declared agent stream.
+    Emit {
+        /// Owning agent: `<host>.<identity>` or a bare local identity.
+        recipient: String,
+        /// Declared stream name.
+        #[arg(long)]
+        stream: String,
+        /// Stable producer-supplied event identity.
+        #[arg(long = "event-id")]
+        event_id: String,
+        /// Producer grouping key used by --supersede.
+        #[arg(long)]
+        key: Option<String>,
+        /// Archive the unread predecessor for the same key, or the stream-wide head without --key.
+        #[arg(long)]
+        supersede: bool,
+        /// One-line wake-time summary.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Event body. Read from stdin when omitted.
+        #[arg(short = 'm', long = "message")]
+        body: Option<String>,
+        /// Emit the stable machine receipt.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
+#[derive(Subcommand)]
+enum StreamCmd {
+    /// Add a stream to your declaration, optionally with a supervised adapter launch.
+    Add {
+        name: String,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Adapter command run under `sh -c`; omit both launch forms for external ingress.
+        #[arg(long, conflicts_with = "adapter_argv")]
+        command: Option<String>,
+        /// Direct adapter argv after `--`. Element 0 is the program; values are preserved exactly.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        adapter_argv: Vec<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Remove a stream from your declaration.
+    Rm {
+        name: String,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+}
+
+#[derive(Subcommand)]
 enum RequestCmd {
     /// Publish one idempotent JSON request from a declared service principal to an agent.
     Send {
@@ -912,6 +982,8 @@ fn main() -> Result<()> {
             up(&root, host, once, materialize_only, interval, agent, task)
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Event(cmd) => event_cmd(cmd),
+        Command::Stream(cmd) => stream_cmd(cmd),
         Command::Request(cmd) => request_cmd(cmd),
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
@@ -931,19 +1003,18 @@ fn main() -> Result<()> {
         } => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(
-                &catalog,
-                identity,
-                runtime_id,
-                codex_argv,
-            )
+            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, codex_argv)
         }
         Command::ClaudeMcp { identity } => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_mcp::run(&catalog, &identity)
         }
-        Command::Driver(DriverCmd::Codex { identity, runtime_id, argv }) => {
+        Command::Driver(DriverCmd::Codex {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
@@ -1256,9 +1327,7 @@ fn driver_expand_cmd(
         eprintln!("warning: {warning}");
     }
     if let Some(agent) = agent {
-        specs.retain(|spec| {
-            spec.identity == agent || spec.bus_id(host.unwrap_or("")) == agent
-        });
+        specs.retain(|spec| spec.identity == agent || spec.bus_id(host.unwrap_or("")) == agent);
     }
     anyhow::ensure!(
         specs.len() == 1,
@@ -1820,9 +1889,9 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
 /// why the confirmation says "requested" rather than claiming the task is back.
 fn unpark_cmd(catalog: &Path, task: &str, host: Option<String>) -> Result<()> {
     let host = host.unwrap_or_else(detect_host);
-    let catalog = catalog.canonicalize().with_context(|| {
-        format!("canonicalize catalog {}", catalog.display())
-    })?;
+    let catalog = catalog
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", catalog.display()))?;
     let dir = st2::park::SupervisorScope::current(&catalog, &host)?.unpark_request_dir();
     st2::park::request_unpark(&dir, task)?;
     println!(
@@ -1940,7 +2009,9 @@ fn desired_state_cmd(
     };
     let root = catalog_arg(None)?;
     let host = host.unwrap_or_else(detect_host);
-    let actor = std::env::var("ST_AGENT").ok().filter(|value| !value.is_empty());
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty());
     match st2::agent_author::set_desired_state(
         &root,
         &identity,
@@ -2479,6 +2550,102 @@ fn send_resolved_message(
     )
 }
 
+fn event_cmd(cmd: EventCmd) -> Result<()> {
+    match cmd {
+        EventCmd::Emit {
+            recipient,
+            stream,
+            event_id,
+            key,
+            supersede,
+            subject,
+            body,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let body = body_or_stdin(body)?;
+            let receipt = st2::event::emit(
+                &root,
+                &host,
+                &recipient,
+                &stream,
+                &event_id,
+                key.as_deref(),
+                subject.as_deref(),
+                &body,
+                supersede,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!("{}", receipt.filename);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn stream_cmd(cmd: StreamCmd) -> Result<()> {
+    let (name, agent, json, ctx, launch, remove) = match cmd {
+        StreamCmd::Add {
+            name,
+            agent,
+            command,
+            adapter_argv,
+            json,
+            ctx,
+        } => {
+            let launch = match (command, adapter_argv.is_empty()) {
+                (Some(command), true) => Some(agent_spec::StreamLaunch::Command(command)),
+                (None, false) => Some(agent_spec::StreamLaunch::Argv(adapter_argv)),
+                (None, true) => None,
+                (Some(_), false) => anyhow::bail!("stream add got both --command and adapter argv"),
+            };
+            (name, agent, json, ctx, launch, false)
+        }
+        StreamCmd::Rm {
+            name,
+            agent,
+            json,
+            ctx,
+        } => (name, agent, json, ctx, None, true),
+    };
+    let (root, host) = resolve_ctx(&ctx)?;
+    let actor = ctx
+        .as_id
+        .clone()
+        .or_else(|| std::env::var("ST_AGENT").ok())
+        .filter(|value| !value.is_empty());
+    let target = agent
+        .or_else(|| actor.clone())
+        .context("no stream target: pass --agent, --as, or set $ST_AGENT")?;
+    if remove {
+        let receipt =
+            st2::agent_author::remove_stream(&root, &target, &host, actor.as_deref(), &name)?;
+        if json {
+            println!("{}", serde_json::to_string(&receipt)?);
+        } else {
+            println!(
+                "{:?} stream {} on {}",
+                receipt.result, receipt.name, receipt.identity
+            );
+        }
+    } else {
+        let receipt =
+            st2::agent_author::add_stream(&root, &target, &host, actor.as_deref(), &name, launch)?;
+        if json {
+            println!("{}", serde_json::to_string(&receipt)?);
+        } else {
+            println!(
+                "{:?} stream {} on {}",
+                receipt.result, receipt.name, receipt.identity
+            );
+        }
+    }
+    Ok(())
+}
+
 fn request_cmd(cmd: RequestCmd) -> Result<()> {
     match cmd {
         RequestCmd::Send {
@@ -2548,12 +2715,7 @@ fn request_cmd(cmd: RequestCmd) -> Result<()> {
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let principal = acting_id(&ctx)?;
-            let status = st2::request::status(
-                &root,
-                &host,
-                &principal,
-                &idempotency_key,
-            )?;
+            let status = st2::request::status(&root, &host, &principal, &idempotency_key)?;
             if json {
                 println!("{}", serde_json::to_string(&status)?);
             } else {
@@ -2619,6 +2781,12 @@ struct LsItemJson<'a> {
     #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<&'a str>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(rename = "eventKey", skip_serializing_if = "Option::is_none")]
+    event_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
 }
 
@@ -2633,6 +2801,9 @@ impl<'a> From<&'a st2::message::Message> for LsItemJson<'a> {
             tags: &m.tags,
             priority: m.priority.as_deref(),
             idempotency_key: m.idempotency_key.as_deref(),
+            stream: m.stream.as_deref(),
+            event_id: m.event_id.as_deref(),
+            event_key: m.event_key.as_deref(),
             body: None,
         }
     }
@@ -2661,6 +2832,12 @@ struct MessageJson<'a> {
     priority: Option<&'a str>,
     #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<&'a str>,
+    #[serde(rename = "eventId", skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+    #[serde(rename = "eventKey", skip_serializing_if = "Option::is_none")]
+    event_key: Option<&'a str>,
     body: &'a str,
 }
 
@@ -2675,6 +2852,9 @@ impl<'a> From<&'a st2::message::Message> for MessageJson<'a> {
             tags: &m.tags,
             priority: m.priority.as_deref(),
             idempotency_key: m.idempotency_key.as_deref(),
+            stream: m.stream.as_deref(),
+            event_id: m.event_id.as_deref(),
+            event_key: m.event_key.as_deref(),
             body: &m.body,
         }
     }

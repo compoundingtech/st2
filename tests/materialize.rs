@@ -585,14 +585,11 @@ fn suspended_declaration_does_not_materialize_workspace_content() {
     fs::create_dir_all(&workspace).unwrap();
     write(&workspace.join("AGENTS.md"), "existing\n");
     write(&catalog.join("_templates/AGENTS.md"), "new\n");
-    let declaration = agent_kdl(
-        &workspace,
-        r#"    copy "_templates/AGENTS.md" "AGENTS.md""#,
-    )
-    .replace(
-        "  host \"Silber\"\n",
-        "  host \"Silber\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
-    );
+    let declaration = agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#)
+        .replace(
+            "  host \"Silber\"\n",
+            "  host \"Silber\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+        );
     write(&catalog.join("agents/Silber/cos/agent.kdl"), declaration);
 
     let found = discover(&catalog);

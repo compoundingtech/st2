@@ -1964,14 +1964,15 @@ fn pump_control(
                     }
                 }
             }
-            let message = match poll_json_message(&mut websocket).context("polling Codex control socket")? {
-                ControlRead::Message(message) => Some(message),
-                ControlRead::Timeout => None,
-                ControlRead::Closed => {
-                    let _ = events.send(ControlEvent::Closed);
-                    return Ok(());
-                }
-            };
+            let message =
+                match poll_json_message(&mut websocket).context("polling Codex control socket")? {
+                    ControlRead::Message(message) => Some(message),
+                    ControlRead::Timeout => None,
+                    ControlRead::Closed => {
+                        let _ = events.send(ControlEvent::Closed);
+                        return Ok(());
+                    }
+                };
             let Some(message) = message else {
                 if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut())
                     && let Some(request) = delivery.maybe_request(state)?
@@ -1994,10 +1995,15 @@ fn pump_control(
                     );
                     subscription_pending = false;
                     let mut bound = CodexControlState::new(runtime, thread_id.to_string());
-                    match bound.accept_subscription(&message).context("accepting Codex resume subscription")? {
+                    match bound
+                        .accept_subscription(&message)
+                        .context("accepting Codex resume subscription")?
+                    {
                         SubscriptionAcceptance::Accepted { .. } => {
                             if let Some(delivery) = delivery.as_mut() {
-                                delivery.reconcile_resume(&message, &bound).context("reconciling Codex resume delivery")?;
+                                delivery
+                                    .reconcile_resume(&message, &bound)
+                                    .context("reconciling Codex resume delivery")?;
                             }
                         }
                         SubscriptionAcceptance::Deferred => anyhow::bail!(
@@ -2009,13 +2015,16 @@ fn pump_control(
                         &CodexThreadBinding::new(runtime, thread_id.to_string()),
                     )
                     .context("persisting Codex resume binding")?;
-                    atomic_json(control_state_path, &bound).context("persisting Codex control state")?;
+                    atomic_json(control_state_path, &bound)
+                        .context("persisting Codex control state")?;
                     control_state = Some(bound);
                     let _ = events.send(ControlEvent::Bound);
                     continue;
                 }
 
-                let Some(thread_id) = binding_candidate(&message).context("reading Codex thread binding candidate")? else {
+                let Some(thread_id) = binding_candidate(&message)
+                    .context("reading Codex thread binding candidate")?
+                else {
                     continue;
                 };
                 atomic_json(
@@ -2028,7 +2037,8 @@ fn pump_control(
                 // notification is already subscribed to that thread's broadcasts. Before its
                 // first turn there is no persisted rollout for a redundant `thread/resume`.
                 bound.subscribed = true;
-                atomic_json(control_state_path, &bound).context("persisting Codex fresh control state")?;
+                atomic_json(control_state_path, &bound)
+                    .context("persisting Codex fresh control state")?;
                 control_state = Some(bound);
                 let _ = events.send(ControlEvent::Bound);
             }
@@ -2038,8 +2048,12 @@ fn pump_control(
                 .context("Codex control state is unbound")?;
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
-                    delivery.accept_response(&message, &state.observed).context("accepting Codex delivery response")?
-                        || delivery.accept_typed_receipt(&message, state).context("accepting Codex typed receipt")?
+                    delivery
+                        .accept_response(&message, &state.observed)
+                        .context("accepting Codex delivery response")?
+                        || delivery
+                            .accept_typed_receipt(&message, state)
+                            .context("accepting Codex typed receipt")?
                 }
                 None => false,
             };
@@ -2053,20 +2067,28 @@ fn pump_control(
                     "Codex control received an unexpected thread/resume response"
                 );
                 subscription_pending = false;
-                match state.accept_subscription(&message).context("accepting Codex subscription")? {
+                match state
+                    .accept_subscription(&message)
+                    .context("accepting Codex subscription")?
+                {
                     SubscriptionAcceptance::Accepted { changed } => {
                         if let Some(delivery) = delivery.as_mut() {
-                            delivery.reconcile_resume(&message, state).context("reconciling Codex subscription delivery")?;
+                            delivery
+                                .reconcile_resume(&message, state)
+                                .context("reconciling Codex subscription delivery")?;
                         }
                         changed
                     }
                     SubscriptionAcceptance::Deferred => false,
                 }
             } else {
-                state.observe(&message).context("observing Codex control event")?
+                state
+                    .observe(&message)
+                    .context("observing Codex control event")?
             };
             if changed {
-                atomic_json(control_state_path, state).context("persisting Codex observed control state")?;
+                atomic_json(control_state_path, state)
+                    .context("persisting Codex observed control state")?;
                 let _ = events.send(ControlEvent::Observed);
             }
             if !state.subscribed
@@ -3388,7 +3410,10 @@ mod tests {
             )
         });
         let first_event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(first_event, ControlEvent::Bound), "first control event: {first_event:?}");
+        assert!(
+            matches!(first_event, ControlEvent::Bound),
+            "first control event: {first_event:?}"
+        );
         server.join().unwrap();
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
@@ -4550,9 +4575,7 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg(
-                r#"sh -c 'printf "%s" "$$" > "$DESCENDANT_PIDFILE"; exec sleep 60' & sleep 60"#,
-            )
+            .arg(r#"sh -c 'printf "%s" "$$" > "$DESCENDANT_PIDFILE"; exec sleep 60' & sleep 60"#)
             .env("DESCENDANT_PIDFILE", &descendant_pidfile)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

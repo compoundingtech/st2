@@ -52,7 +52,10 @@ fn desired_state_rejects_illegal_state_reason_combinations() {
             "non-string-reason",
             "desired-state \"suspended\" reason=#true",
         ),
-        ("unknown-property", "desired-state \"running\" because=\"no\""),
+        (
+            "unknown-property",
+            "desired-state \"running\" because=\"no\"",
+        ),
         (
             "duplicate-reason",
             "desired-state \"suspended\" reason=\"one\" reason=\"two\"",
@@ -155,9 +158,7 @@ fn explicit_json_null_fields_are_rejected_instead_of_granting_default_behavior()
         write(
             tmp.path(),
             &format!("agents/h/{name}/agent.json"),
-            &format!(
-                r#"{{"identity":"{name}","host":"h",{lifecycle},"argv":["true"]}}"#
-            ),
+            &format!(r#"{{"identity":"{name}","host":"h",{lifecycle},"argv":["true"]}}"#),
         );
         let found = discover(tmp.path());
         assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
@@ -715,16 +716,22 @@ args = ["--tools", "read,bash,edit,write"]
 #[test]
 fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
     for (name, body) in [
+        ("both", r#"claude { prompt "go" }; codex { prompt "go" }"#),
         (
-            "both",
-            r#"claude { prompt "go" }; codex { prompt "go" }"#,
+            "claude-and-pi",
+            r#"claude { prompt "go" }; pi { prompt "go" }"#,
         ),
-        ("claude-and-pi", r#"claude { prompt "go" }; pi { prompt "go" }"#),
-        ("codex-and-pi", r#"codex { prompt "go" }; pi { prompt "go" }"#),
+        (
+            "codex-and-pi",
+            r#"codex { prompt "go" }; pi { prompt "go" }"#,
+        ),
         ("pi-dev", r#"pi { dev-channels #true; prompt "go" }"#),
         ("pi-missing-prompt", r#"pi { model "anthropic/x" }"#),
         ("missing-prompt", r#"claude { model "opus" }"#),
-        ("wrong-bool", r#"claude { dev-channels "yes"; prompt "go" }"#),
+        (
+            "wrong-bool",
+            r#"claude { dev-channels "yes"; prompt "go" }"#,
+        ),
         ("codex-dev", r#"codex { dev-channels #true; prompt "go" }"#),
         ("unknown", r#"claude { presence #true; prompt "go" }"#),
     ] {
@@ -1097,10 +1104,7 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
             r#"resource "work" _tag="issue" uri="issue://example/1""#,
         ),
         ("missing-uri", r#"resource "work""#),
-        (
-            "relative-uri",
-            r#"resource "work" uri="./issue/1""#,
-        ),
+        ("relative-uri", r#"resource "work" uri="./issue/1""#),
         (
             "policy",
             r#"resource "work" uri="issue://example/1" required=#true"#,
@@ -1827,4 +1831,263 @@ fn only_contextually_reserved_namespaces_are_ignored() {
         found.specs.iter().all(|spec| spec.identity != "excluded"),
         "reserved control/state namespaces must not become declarations"
     );
+}
+
+#[test]
+fn streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  command "agent"
+  stream "external" {}
+  stream "shell" { command "watch-ci" }
+  stream "direct" { argv "watch" "--json" }
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = find(&found.specs, "worker");
+    assert_eq!(
+        spec.streams
+            .iter()
+            .map(|stream| stream.name.as_str())
+            .collect::<Vec<_>>(),
+        ["direct", "external", "shell"]
+    );
+    assert!(spec.tasks.iter().all(|task| task.name != "stream-external"));
+    let direct = spec
+        .tasks
+        .iter()
+        .find(|task| task.name == "stream-direct")
+        .unwrap();
+    assert_eq!(direct.kind, TaskKind::Exec);
+    assert!(direct.derived);
+    assert_eq!(argv(direct), ["watch", "--json"]);
+    let shell = spec
+        .tasks
+        .iter()
+        .find(|task| task.name == "stream-shell")
+        .unwrap();
+    assert_eq!(shell.command.as_deref(), Some("watch-ci"));
+}
+
+#[test]
+fn launched_streams_require_a_canonical_agent_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/launched/agent.kdl",
+        r#"agent "launched" {
+  host "h"
+  exec "worker" { command "agent" }
+  stream "ci" { command "watch-ci" }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/external/agent.kdl",
+        r#"agent "external" {
+  host "h"
+  exec "worker" { command "agent" }
+  stream "webhook" {}
+}"#,
+    );
+
+    let found = discover(tmp.path());
+
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("launched stream 'ci' requires a canonical `agent` task"),
+        "{:?}",
+        found.errors
+    );
+    assert_eq!(find(&found.specs, "external").streams.len(), 1);
+}
+
+#[test]
+fn streams_have_toml_and_json_parity_and_reject_unknown_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        r#"identity = "toml"
+host = "h"
+command = "agent"
+
+[stream.external]
+
+[stream.direct]
+argv = ["watch", "--json"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","command":"agent","stream":{"external":{},"shell":{"command":"watch-ci"}}}"#,
+    );
+
+    for (identity, extension, stream) in [
+        ("toml-every", "toml", "every = \"1m\""),
+        ("toml-misspelled", "toml", "commmand = \"watch-ci\""),
+        ("json-every", "json", r#""every":"1m""#),
+        ("json-misspelled", "json", r#""commmand":"watch-ci""#),
+    ] {
+        let contents = if extension == "toml" {
+            format!(
+                "identity = \"{identity}\"\nhost = \"h\"\ncommand = \"agent\"\n[stream.ci]\n{stream}\n"
+            )
+        } else {
+            format!(
+                r#"{{"identity":"{identity}","host":"h","command":"agent","stream":{{"ci":{{{stream}}}}}}}"#
+            )
+        };
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.{extension}"),
+            &contents,
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert_eq!(found.specs.len(), 2, "specs: {:?}", found.specs);
+    assert_eq!(found.errors.len(), 4, "errors: {:?}", found.errors);
+
+    let toml = find(&found.specs, "toml");
+    assert_eq!(toml.streams.len(), 2);
+    assert!(toml.tasks.iter().all(|task| task.name != "stream-external"));
+    assert_eq!(
+        argv(
+            toml.tasks
+                .iter()
+                .find(|task| task.name == "stream-direct")
+                .unwrap()
+        ),
+        ["watch", "--json"]
+    );
+
+    let json = find(&found.specs, "json");
+    assert_eq!(json.streams.len(), 2);
+    assert!(json.tasks.iter().all(|task| task.name != "stream-external"));
+    assert_eq!(
+        json.tasks
+            .iter()
+            .find(|task| task.name == "stream-shell")
+            .unwrap()
+            .command
+            .as_deref(),
+        Some("watch-ci")
+    );
+
+    for identity in [
+        "toml-every",
+        "toml-misspelled",
+        "json-every",
+        "json-misspelled",
+    ] {
+        let error = found
+            .errors
+            .iter()
+            .find(|error| error.path.to_string_lossy().contains(identity))
+            .unwrap_or_else(|| panic!("missing error for {identity}: {:?}", found.errors));
+        assert!(
+            error.message.contains("unknown field"),
+            "{identity}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn stream_names_launches_and_task_collisions_fail_closed() {
+    for (identity, body, expected) in [
+        (
+            "both",
+            "stream \"x\" { command \"a\"; argv \"b\" }",
+            "at most one",
+        ),
+        (
+            "every",
+            "stream \"x\" { every \"1m\" }",
+            "reserved for the future",
+        ),
+        ("bad-name", "stream \"Bad\" {}", "must match"),
+        (
+            "collision",
+            "stream \"x\" { command \"a\" }; exec \"stream-x\" { command \"b\" }",
+            "declares both",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; command \"agent\"; {body} }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{identity}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{identity}: {:?}",
+            found.errors
+        );
+    }
+}
+
+#[test]
+fn malformed_stream_kdl_shapes_fail_closed() {
+    for (identity, declaration, expected) in [
+        (
+            "extra-name-argument",
+            "stream \"ci\" \"extra\" {}",
+            "exactly one positional name string",
+        ),
+        (
+            "stream-property",
+            "stream \"ci\" bogus=#true {}",
+            "no properties",
+        ),
+        (
+            "typed-stream",
+            "(typed)stream \"ci\" {}",
+            "exactly one positional name string",
+        ),
+        (
+            "extra-command-argument",
+            "stream \"ci\" { command \"watch\" \"typo\" }",
+            "exactly one positional string",
+        ),
+        (
+            "nested-command",
+            "stream \"ci\" { command \"watch\" { typo \"value\" } }",
+            "exactly one positional string",
+        ),
+        (
+            "argv-property",
+            "stream \"ci\" { argv \"watch\" typo=#true }",
+            "only positional string arguments",
+        ),
+        (
+            "nested-argv",
+            "stream \"ci\" { argv \"watch\" { typo \"value\" } }",
+            "only positional string arguments",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; command \"agent\"; {declaration} }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{identity}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{identity}: {:?}",
+            found.errors
+        );
+    }
 }

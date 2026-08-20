@@ -87,7 +87,12 @@ impl Fleet {
     }
 
     /// Poll the inventory until `row` satisfies `done`, or fail with what it last looked like.
-    fn until(&self, runtime_id: &str, what: &str, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    fn until(
+        &self,
+        runtime_id: &str,
+        what: &str,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
         let deadline = Instant::now() + DEADLINE;
         let mut last = self.row(runtime_id);
         while Instant::now() < deadline {
@@ -144,7 +149,10 @@ fn repaired_flapper(catalog: &Path) {
 }
 
 fn generation(row: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
-    (row["runtime"]["pid"].clone(), row["runtime"]["generationId"].clone())
+    (
+        row["runtime"]["pid"].clone(),
+        row["runtime"]["generationId"].clone(),
+    )
 }
 
 #[test]
@@ -251,8 +259,14 @@ fn a_real_supervisor_parks_a_crash_looper_and_unpark_recovers_only_that_task() {
     // 6. And it stays recovered past the policy's own observation window, rather than for one pass.
     while recovered_at.elapsed() < INTERVAL + Duration::from_secs(1) {
         let row = fleet.row(FLAPPER);
-        assert_eq!(row["runtime"]["state"], "running", "the recovered task fell over again");
-        assert!(row["parked"].is_null(), "the recovered task re-parked: {row}");
+        assert_eq!(
+            row["runtime"]["state"], "running",
+            "the recovered task fell over again"
+        );
+        assert!(
+            row["parked"].is_null(),
+            "the recovered task re-parked: {row}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(

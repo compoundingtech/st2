@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use agent_spec::spec::{AgentSpec, DeliveryTransport, Driver, TaskKind, TaskLifecycle};
+use agent_spec::spec::{
+    AgentSpec, DeliveryTransport, Driver, TaskKind, TaskLifecycle, stream_name_of_task,
+};
 use kdl::KdlValue;
 
 /// Immutable inputs captured once before generated tasks are compiled.
@@ -173,9 +175,9 @@ pub fn compile_driver_agent_tasks(
             .tasks
             .iter_mut()
             .filter(|task| !task.derived && task.name == "agent");
-        let task = candidates.next().with_context(|| {
-            format!("agent '{bus_id}' driver has no canonical `agent` task")
-        })?;
+        let task = candidates
+            .next()
+            .with_context(|| format!("agent '{bus_id}' driver has no canonical `agent` task"))?;
         anyhow::ensure!(
             candidates.next().is_none(),
             "agent '{bus_id}' driver has more than one canonical `agent` task"
@@ -303,8 +305,13 @@ fn compile_session_wrapped_agent_tasks(
     Ok(())
 }
 
-/// Replace only runner-generated DING markers with exact direct argv. Authored tasks never carry
-/// `derived=true`, so source that happens to invoke `st2 ding` remains byte-for-byte unchanged.
+/// Replace only runner-generated companion markers with exact direct argv. Authored tasks never
+/// carry `derived=true`, so source that happens to invoke `st2 ding` or `st2 stream run` remains
+/// byte-for-byte unchanged.
+///
+/// The single `ensure!` below is the fail-closed "unsupported derived task" gate. Every derived
+/// companion kind must be named in the exhaustive match; an unrecognized derived task refuses the
+/// pass rather than reaching a runner with an unbound placeholder command.
 pub fn compile_generated_ding_tasks(
     specs: &mut [AgentSpec],
     this_host: &str,
@@ -321,9 +328,11 @@ pub fn compile_generated_ding_tasks(
             if !task.derived {
                 continue;
             }
+            let is_ding = task.name == "ding" || task.name.ends_with(".ding");
+            let task_name = task.name.clone();
+            let stream_name = stream_name_of_task(&task_name).map(str::to_owned);
             anyhow::ensure!(
-                task.kind == TaskKind::Exec
-                    && (task.name == "ding" || task.name.ends_with(".ding")),
+                task.kind == TaskKind::Exec && (is_ding || stream_name.is_some()),
                 "unsupported derived task: {}",
                 task.name
             );
@@ -334,8 +343,15 @@ pub fn compile_generated_ding_tasks(
                 .unwrap_or_else(|| context.catalog_root.display().to_string());
             anyhow::ensure!(
                 Path::new(&effective_root).is_absolute(),
-                "derived DING root is not absolute: {effective_root}"
+                "derived companion root is not absolute: {effective_root}"
             );
+            if let Some(stream_name) = stream_name {
+                anyhow::ensure!(
+                    task.command.is_some() != task.argv.is_some(),
+                    "derived stream task '{task_name}' for stream '{stream_name}' has no exact launch"
+                );
+                continue;
+            }
             task.command = None;
             task.argv = Some(vec![
                 st2_executable.clone(),
@@ -600,10 +616,7 @@ fn pty_presentation(
     })
 }
 
-fn presentation_matches(
-    desired: &PtyPresentation,
-    observed: &ObservedPtyPresentation,
-) -> bool {
+fn presentation_matches(desired: &PtyPresentation, observed: &ObservedPtyPresentation) -> bool {
     let display_name_matches = desired
         .display_name
         .as_ref()
@@ -896,13 +909,13 @@ pub fn reconcile<'a>(
         let agent_eligible = targets
             .iter()
             .find(|(target, _)| target.name == "agent" && !target.derived)
-            .is_some_and(|(target, lifecycle)| match session_state(&by_id, &target.pty_id) {
-                SessionState::Alive => true,
-                SessionState::Dead => {
-                    !target.keep && *lifecycle == TaskLifecycle::Service
-                }
-                SessionState::Absent => *lifecycle == TaskLifecycle::Service,
-            });
+            .is_some_and(
+                |(target, lifecycle)| match session_state(&by_id, &target.pty_id) {
+                    SessionState::Alive => true,
+                    SessionState::Dead => !target.keep && *lifecycle == TaskLifecycle::Service,
+                    SessionState::Absent => *lifecycle == TaskLifecycle::Service,
+                },
+            );
         let mut to_launch = Vec::new();
         let mut live_derived = Vec::new();
         let mut ineligible_derived = Vec::new();

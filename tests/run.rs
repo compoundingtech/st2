@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use st2::message;
 use st2::reconcile::{
-    Launch, PtyPresentation, ReconcilePlan, Session, TaskLaunch, TaskTarget, Teardown,
+    Launch, PtyPresentation, ReconcilePlan, Session, TaskCompileContext, TaskLaunch, TaskTarget,
+    Teardown, compile_generated_tasks,
 };
 use st2::run::Runner;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
@@ -239,6 +240,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         delivery: None,
         driver: None,
         resources: vec![],
+        streams: Vec::new(),
         tasks: vec![Task {
             kind: TaskKind::Exec,
             derived: false,
@@ -1062,11 +1064,8 @@ command = "st2 ding hetz.demo"
 #[test]
 fn retired_compact_agent_stops_agent_and_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
-    let retired = COMPACT_AGENT_WITH_DING.replacen(
-        "  host \"hetz\"",
-        "  host \"hetz\"\n  retired #true",
-        1,
-    );
+    let retired =
+        COMPACT_AGENT_WITH_DING.replacen("  host \"hetz\"", "  host \"hetz\"\n  retired #true", 1);
     write(tmp.path(), "agents/hetz/demo/agent.kdl", &retired);
     let runner = FakeRunner {
         sessions: vec![live("hetz.demo"), live("hetz.demo.ding")],
@@ -1112,10 +1111,11 @@ fn suspend_and_resume_cover_derived_ding_sibling_continuity_and_inbox_retention(
     assert_eq!(suspended_report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
     assert_eq!(suspended_report.adopted, ["sibling"]);
     assert!(suspended_report.launched.is_empty());
-    assert!(tmp
-        .path()
-        .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
-        .is_file());
+    assert!(
+        tmp.path()
+            .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+            .is_file()
+    );
 
     write(tmp.path(), "agents/hetz/demo/agent.kdl", running);
     let resume_runner = FakeRunner {
@@ -1129,10 +1129,11 @@ fn suspend_and_resume_cover_derived_ding_sibling_continuity_and_inbox_retention(
     let resumed_report = up_once(tmp.path(), "hetz", &resume_runner).unwrap();
     assert_eq!(resumed_report.restarted, ["hetz.demo", "hetz.demo.ding"]);
     assert_eq!(resumed_report.adopted, ["sibling"]);
-    assert!(tmp
-        .path()
-        .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
-        .is_file());
+    assert!(
+        tmp.path()
+            .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+            .is_file()
+    );
 }
 
 #[test]
@@ -1454,11 +1455,7 @@ fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
 
     // Phase 1 — the flapper dies before every pass; the peer is up and stays up.
     let crashing = FakeRunner {
-        sessions: vec![
-            dead("hetz.demo"),
-            live("hetz.demo.ding"),
-            live("hetz.peer"),
-        ],
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding"), live("hetz.peer")],
         ..Default::default()
     };
     let mut parked_report = UpReport::default();
@@ -1474,7 +1471,10 @@ fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
     // The park is legible to a separate reader — the entire point of #204.
     let observer = DirParkObserver::new(state.path().join("parked"));
     let batch = observer.observe(&["hetz.demo".to_string(), "hetz.peer".to_string()]);
-    assert!(batch.complete, "a park is a known fault, not missing evidence");
+    assert!(
+        batch.complete,
+        "a park is a known fault, not missing evidence"
+    );
     let ParkState::Parked(record) = batch.state("hetz.demo") else {
         panic!("the parked task is not visible in the projection");
     };
@@ -1576,7 +1576,11 @@ fn an_unpark_request_for_a_task_that_is_not_parked_says_so() {
 
     assert!(report.unparked.is_empty());
     assert_eq!(report.warnings.len(), 1);
-    assert!(report.warnings[0].contains("hetz.typo"), "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("hetz.typo"),
+        "{:?}",
+        report.warnings
+    );
 }
 
 /// A parked crash-loop is surfaced to the agent's supervisor over the native bus: a `crash-loop`-tagged
@@ -1720,5 +1724,419 @@ fn up_once_marks_a_list_failure_as_a_skipped_pass() {
     assert_eq!(
         report.errors,
         vec!["list sessions (pass skipped): simulated list failure"]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streams (DQ1 spike) — a declared event SOURCE lowers to a derived exec companion, so it inherits
+// the derived-companion lifecycle wholesale. Every test below is the derived-DING proof for the
+// same guarantee, re-run against `stream-gh-ci`, plus the two claims a stream adds that DING does not:
+// it must not make an otherwise-empty agent runnable, and it must not disturb its agent when it
+// crash-loops.
+// ---------------------------------------------------------------------------------------------
+
+/// An agent with BOTH companions. Every stream test carries the ding too, so a claim about the stream
+/// is also a claim that the two derived siblings stay independent.
+const COMPACT_AGENT_WITH_STREAM: &str = r#"
+agent "demo" {
+  host "hetz"
+  supervisor "cos-claude"
+  command "true"
+  ding
+  stream "gh-ci" { command "poll-gh-ci.sh" }
+  restart { attempts 1; interval "60s"; delay "0s"; mode "fail" }
+}
+"#;
+
+const COMPACT_STREAM_ONLY_AGENT: &str = r#"
+agent "sourceless" {
+  host "hetz"
+  stream "gh-ci" { command "poll-gh-ci.sh" }
+}
+"#;
+
+/// 4a. One reconcile pass launches the agent and BOTH derived companions — no second pass, no
+/// ordering ceremony at the call site, with the declared adapter launch carried through verbatim.
+#[test]
+fn fresh_compact_agent_launches_with_its_derived_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_STREAM,
+    );
+
+    let runner = FakeRunner::default();
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(
+        report.launched,
+        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+    );
+    let targets = runner.spawned_targets.borrow();
+    let stream = targets
+        .iter()
+        .find(|target| target.pty_id == "hetz.demo.stream-gh-ci")
+        .unwrap();
+    assert_eq!(
+        stream.kind,
+        TaskKind::Exec,
+        "a stream source needs no terminal"
+    );
+    assert!(stream.derived, "a stream companion is runner-generated");
+    assert_eq!(&stream.launch, &TaskLaunch::Shell("poll-gh-ci.sh".into()));
+    // Runner-owned task identity reaches the stream exactly as it reaches every other task.
+    assert_eq!(
+        stream.env.get("ST_AGENT").map(String::as_str),
+        Some("hetz.demo")
+    );
+}
+
+/// 4b (retire). Retirement tears down the agent and BOTH companions in the same pass.
+#[test]
+fn retired_compact_agent_stops_agent_and_derived_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let retired = COMPACT_AGENT_WITH_STREAM.replacen(
+        "  host \"hetz\"",
+        "  host \"hetz\"\n  retired #true",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &retired);
+    let runner = FakeRunner {
+        sessions: vec![
+            live("hetz.demo"),
+            live("hetz.demo.ding"),
+            live("hetz.demo.stream-gh-ci"),
+        ],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(
+        report.torn_down,
+        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+    );
+    assert!(report.launched.is_empty());
+}
+
+/// 4b (suspend). A suspended agent stops its stream with it, and a sibling agent is untouched.
+#[test]
+fn suspended_compact_agent_stops_its_derived_stream_without_touching_a_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let suspended = COMPACT_AGENT_WITH_STREAM.replacen(
+        "  host \"hetz\"",
+        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for CI budget\"",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    write(
+        tmp.path(),
+        "agents/hetz/sibling/agent.kdl",
+        "agent \"sibling\" { host \"hetz\"; command \"true\" }\n",
+    );
+    let runner = FakeRunner {
+        sessions: vec![
+            live("hetz.demo"),
+            live("hetz.demo.ding"),
+            live("hetz.demo.stream-gh-ci"),
+            live("hetz.sibling"),
+        ],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(
+        report.torn_down,
+        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+    );
+    assert_eq!(report.adopted, ["sibling"]);
+    assert!(report.launched.is_empty());
+}
+
+#[test]
+fn suspend_and_resume_relaunch_the_agent_and_stream_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let suspended = COMPACT_AGENT_WITH_STREAM.replacen(
+        "  host \"hetz\"",
+        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    let suspend_runner = FakeRunner {
+        sessions: vec![
+            live("hetz.demo"),
+            live("hetz.demo.ding"),
+            live("hetz.demo.stream-gh-ci"),
+        ],
+        ..Default::default()
+    };
+    let suspended_report = up_once(tmp.path(), "hetz", &suspend_runner).unwrap();
+    assert_eq!(
+        suspended_report.torn_down,
+        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+    );
+
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_STREAM,
+    );
+    let resume_runner = FakeRunner {
+        sessions: vec![
+            dead("hetz.demo"),
+            dead("hetz.demo.ding"),
+            dead("hetz.demo.stream-gh-ci"),
+        ],
+        ..Default::default()
+    };
+    let resumed_report = up_once(tmp.path(), "hetz", &resume_runner).unwrap();
+    assert_eq!(
+        resumed_report.restarted,
+        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+    );
+}
+
+/// A held (adopt-only) agent stops a live stream, exactly as it stops a live ding.
+#[test]
+fn held_adopt_only_compact_agent_stops_its_live_derived_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let held = COMPACT_AGENT_WITH_STREAM.replacen(
+        "  command \"true\"",
+        "  command \"true\"\n  lifecycle \"adopt-only\"",
+        1,
+    );
+    write(tmp.path(), "agents/hetz/demo/agent.kdl", &held);
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.stream-gh-ci")],
+        ..Default::default()
+    };
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert_eq!(report.held, ["hetz.demo"]);
+    assert_eq!(report.torn_down, ["hetz.demo.stream-gh-ci"]);
+    assert!(report.launched.is_empty());
+}
+
+/// 4c. THE claim the hypothesis rests on: a stream source that keeps dying exhausts the agent's
+/// `mode = fail` budget, parks, and is surfaced as a crash-loop record — while its agent and its
+/// ding sibling are never touched.
+///
+/// `up_once` cannot express this (both single-pass entry points build a fresh `FlappingCap`, so a
+/// one-shot reconcile can never park anything), so this drives `discover` + `reconcile`/`execute`
+/// with ONE cap across passes, exactly as `flapping_cap_parks_a_fail_mode_task_that_keeps_dying`
+/// does. The live agent and live ding are the negative controls: a host-wide or agent-wide reaction
+/// would name them in the runner's op log, and nothing does.
+#[test]
+fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_STREAM,
+    );
+    let found = discover(tmp.path());
+    let runner = FakeRunner {
+        sessions: vec![
+            live("hetz.demo"),
+            live("hetz.demo.ding"),
+            dead("hetz.demo.stream-gh-ci"),
+        ],
+        ..Default::default()
+    };
+    let mut cap = FlappingCap::default();
+
+    let mut last = UpReport::default();
+    for _ in 0..4 {
+        let plan = reconcile(&found.specs, &runner.sessions, "hetz");
+        last = UpReport::default();
+        execute(&plan, &runner, &mut cap, &mut last);
+    }
+
+    assert_eq!(last.flapping, ["hetz.demo.stream-gh-ci"]);
+    assert!(last.launched.is_empty());
+    assert!(
+        last.gc.is_empty(),
+        "a parked stream keeps its corpse as evidence"
+    );
+    assert_eq!(
+        runner.spawned.borrow().len(),
+        1,
+        "attempts = 1 bounds the relaunches"
+    );
+
+    // The agent and its ding sibling take NO lifecycle op — not spawned, not killed, not reaped.
+    // This is the "without affecting the agent" half of the claim, and it is a stronger check than
+    // comparing a pid because it also catches a kill followed by an identical relaunch.
+    //
+    // `patch:` is deliberately excluded: presentation patching is the pass's ordinary cosmetic
+    // batch for every live task and carries no lifecycle meaning. Measured, not assumed — the
+    // agent DOES appear in the raw op log, as `patch:hetz.demo` and nothing else.
+    let ops = runner.ops.borrow();
+    let lifecycle_ops = ops
+        .iter()
+        .filter(|op| !op.starts_with("patch:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle_ops,
+        [
+            "reap:hetz.demo.stream-gh-ci",
+            "spawn:hetz.demo.stream-gh-ci"
+        ],
+        "only the stream may be touched while it crash-loops"
+    );
+    assert!(
+        ops.iter().filter(|op| !op.starts_with("patch:")).count() < ops.len(),
+        "the agent is still presented; this test's claim is about lifecycle ops"
+    );
+
+    // …and it surfaces. The crash-loop record carries the parked TASK, its owning agent, and the
+    // supervisor to notify, so `surface_crash_loop` can deliver it over the bus unchanged.
+    assert_eq!(last.crash_loops.len(), 1);
+    let cl = &last.crash_loops[0];
+    assert_eq!(cl.pty_id, "hetz.demo.stream-gh-ci");
+    assert_eq!(cl.identity, "demo");
+    assert_eq!(cl.supervisor.as_deref(), Some("cos-claude"));
+    assert_eq!(cl.agent_bus_id("hetz"), "hetz.demo");
+
+    write(
+        tmp.path(),
+        "agents/hetz/cos-claude/agent.kdl",
+        "agent \"cos-claude\" { host \"hetz\"; command \"true\" }\n",
+    );
+    surface_crash_loop(tmp.path(), "hetz", cl);
+    let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos-claude"));
+    let msgs = message::list_dir(&inbox).unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert!(msgs[0].tags.contains(&"crash-loop".to_string()));
+    assert!(
+        msgs[0].body.contains("hetz.demo.stream-gh-ci"),
+        "the supervisor is told WHICH task parked, not just which agent"
+    );
+}
+
+/// A parked AGENT still stops its live stream — the coupling runs in both directions.
+#[test]
+fn parked_compact_agent_stops_its_live_derived_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_STREAM,
+    );
+    let found = discover(tmp.path());
+    let runner = FakeRunner {
+        sessions: vec![dead("hetz.demo"), live("hetz.demo.stream-gh-ci")],
+        ..Default::default()
+    };
+    let mut cap = FlappingCap::default();
+
+    let first = reconcile(&found.specs, &runner.sessions, "hetz");
+    execute(&first, &runner, &mut cap, &mut UpReport::default());
+    let second = reconcile(&found.specs, &runner.sessions, "hetz");
+    let mut report = UpReport::default();
+    execute(&second, &runner, &mut cap, &mut report);
+
+    assert_eq!(report.flapping, ["hetz.demo"]);
+    assert!(
+        runner
+            .killed
+            .borrow()
+            .contains(&"hetz.demo.stream-gh-ci".to_string())
+    );
+}
+
+/// A missing stream under targeted reconciliation is HELD, never broadened to its agent — the same
+/// guarantee `selected_missing_derived_ding_is_held_without_broadening_to_its_agent` states.
+#[test]
+fn selected_missing_derived_stream_is_held_without_broadening_to_its_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        COMPACT_AGENT_WITH_STREAM,
+    );
+    let runner = FakeRunner::default();
+
+    let report = up_once_selected(tmp.path(), "hetz.demo.stream-gh-ci", "hetz", &runner).unwrap();
+
+    assert_eq!(runner.list_calls.get(), 1);
+    assert_eq!(report.held, ["hetz.demo.stream-gh-ci"]);
+    assert!(report.launched.is_empty());
+    assert!(
+        runner.spawned.borrow().is_empty(),
+        "targeted reconciliation must not broaden to the agent"
+    );
+    assert!(runner.reaped.borrow().is_empty());
+}
+
+/// A launched stream is a companion, not work, and discovery rejects it without a canonical agent
+/// task instead of silently treating the derived adapter as a runnable primary.
+#[test]
+fn a_launched_stream_alone_is_rejected_before_reconciliation() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/sourceless/agent.kdl",
+        COMPACT_STREAM_ONLY_AGENT,
+    );
+    let runner = FakeRunner::default();
+
+    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+    assert!(report.unrunnable.is_empty());
+    assert!(
+        report.errors.iter().any(
+            |error| error.contains("launched stream 'gh-ci' requires a canonical `agent` task")
+        ),
+        "{:?}",
+        report.errors
+    );
+    assert!(report.launched.is_empty());
+    assert!(runner.spawned.borrow().is_empty());
+}
+
+/// A stream must not accidentally claim a delivery transport: `has_delivery_transport` is scoped to
+/// the derived `ding` companion, and an agent with a stream but no `ding` still has no transport.
+#[test]
+fn a_stream_does_not_claim_a_delivery_transport() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        "agent \"demo\" { host \"hetz\"; command \"true\"; stream \"gh-ci\" { command \"poll.sh\" } }\n",
+    );
+    let found = discover(tmp.path());
+    let spec = &found.specs[0];
+
+    assert!(!spec.has_delivery_transport());
+    assert!(spec.is_runnable());
+    let names = spec
+        .tasks
+        .iter()
+        .map(|task| task.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["agent", "stream-gh-ci"]);
+}
+
+/// The "unsupported derived task" gate stays fail-closed: extending it for streams must not have
+/// turned it into a permissive fall-through.
+#[test]
+fn an_unknown_derived_task_still_refuses_the_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spec = task_spec("demo", Some("hetz"), "hetz.demo.mystery");
+    spec.tasks[0].derived = true;
+    spec.tasks[0].name = "mystery".to_string();
+    let context = TaskCompileContext::current(tmp.path().to_path_buf()).unwrap();
+    let mut specs = vec![spec];
+
+    let error = compile_generated_tasks(&mut specs, "hetz", &context).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("unsupported derived task: mystery"),
+        "got: {error:#}"
     );
 }

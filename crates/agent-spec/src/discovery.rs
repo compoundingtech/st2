@@ -80,10 +80,7 @@ pub fn discover_strict(root: &Path) -> Discovered {
 ///
 /// `root` supplies the same path defaults as [`discover`]. The returned warnings describe only
 /// this file.
-pub fn discover_file(
-    root: &Path,
-    path: &Path,
-) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
+pub fn discover_file(root: &Path, path: &Path) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
     let raws = parse_raw_file(path)?;
     load_specs(root, path, raws)
 }

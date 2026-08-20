@@ -182,17 +182,15 @@ pub fn required_by_pi_agent(
     catalog_root: &Path,
 ) -> bool {
     spec.host.as_deref().is_none_or(|host| host == this_host)
-        && (matches!(
-            spec.driver.as_ref(),
-            Some(agent_spec::spec::Driver::Pi(_))
-        ) || spec.tasks.iter().any(|task| {
-            task.name == "agent"
-                && (task.command.as_deref().is_some_and(command_invokes_pi)
-                    || task
-                        .argv
-                        .as_deref()
-                        .is_some_and(|argv| argv_invokes_pi(argv, catalog_root)))
-        }))
+        && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Pi(_)))
+            || spec.tasks.iter().any(|task| {
+                task.name == "agent"
+                    && (task.command.as_deref().is_some_and(command_invokes_pi)
+                        || task
+                            .argv
+                            .as_deref()
+                            .is_some_and(|argv| argv_invokes_pi(argv, catalog_root)))
+            }))
 }
 
 pub(crate) fn launch_invokes_pi(
@@ -527,7 +525,10 @@ mod tests {
         assert!(!command_invokes_pi("exec /opt/bin/pilot --model x"));
         assert!(argv_invokes_pi(&["pi".into(), "-a".into()], root));
         assert!(argv_invokes_pi(&["/opt/bin/pi".into(), "-a".into()], root));
-        assert!(argv_invokes_pi(&["$CATALOG/bin/pi".into(), "-a".into()], root));
+        assert!(argv_invokes_pi(
+            &["$CATALOG/bin/pi".into(), "-a".into()],
+            root
+        ));
         assert!(argv_invokes_pi(
             &[
                 "st2".into(),

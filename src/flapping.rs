@@ -192,10 +192,16 @@ mod tests {
             assert_eq!(cap.decide("p", now, &p), RestartDecision::Allow);
             cap.record("p", now);
         }
-        assert_eq!(cap.decide("p", t0 + Duration::from_secs(4), &p), RestartDecision::GaveUp);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(4), &p),
+            RestartDecision::GaveUp
+        );
         assert!(cap.is_parked("p"));
         // stays parked even after the window empties
-        assert_eq!(cap.decide("p", t0 + Duration::from_secs(600), &p), RestartDecision::GaveUp);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(600), &p),
+            RestartDecision::GaveUp
+        );
     }
 
     #[test]
@@ -209,10 +215,16 @@ mod tests {
             cap.record("p", now);
         }
         // 4th within the window → rate-limited, NOT parked.
-        assert_eq!(cap.decide("p", t0 + Duration::from_secs(4), &p), RestartDecision::RateLimited);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(4), &p),
+            RestartDecision::RateLimited
+        );
         assert!(!cap.is_parked("p"));
         // Once the window clears, it's allowed again.
-        assert_eq!(cap.decide("p", t0 + Duration::from_secs(120), &p), RestartDecision::Allow);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(120), &p),
+            RestartDecision::Allow
+        );
     }
 
     #[test]
@@ -222,9 +234,15 @@ mod tests {
         let t0 = Instant::now();
         cap.record("p", t0);
         // 5s later — still within the 10s delay.
-        assert_eq!(cap.decide("p", t0 + Duration::from_secs(5), &p), RestartDecision::Delaying);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(5), &p),
+            RestartDecision::Delaying
+        );
         // 11s later — delay satisfied.
-        assert_eq!(cap.decide("p", t0 + Duration::from_secs(11), &p), RestartDecision::Allow);
+        assert_eq!(
+            cap.decide("p", t0 + Duration::from_secs(11), &p),
+            RestartDecision::Allow
+        );
     }
 
     #[test]
@@ -233,8 +251,14 @@ mod tests {
         let p = policy(1, 60, 0, RestartMode::Fail);
         let t0 = Instant::now();
         cap.record("a", t0);
-        assert_eq!(cap.decide("a", t0 + Duration::from_secs(1), &p), RestartDecision::GaveUp);
-        assert_eq!(cap.decide("b", t0 + Duration::from_secs(1), &p), RestartDecision::Allow);
+        assert_eq!(
+            cap.decide("a", t0 + Duration::from_secs(1), &p),
+            RestartDecision::GaveUp
+        );
+        assert_eq!(
+            cap.decide("b", t0 + Duration::from_secs(1), &p),
+            RestartDecision::Allow
+        );
     }
 
     /// Reproduction for the crash-loop budget being unreachable at the supervisor's own cadence.
@@ -268,7 +292,10 @@ mod tests {
                     launches += 1;
                 }
                 RestartDecision::GaveUp => {
-                    assert_eq!(launches, 3, "parked, but not after exactly `attempts` launches");
+                    assert_eq!(
+                        launches, 3,
+                        "parked, but not after exactly `attempts` launches"
+                    );
                     return;
                 }
                 other => panic!("unexpected {other:?} at pass {pass} (delay is 0)"),
@@ -342,7 +369,10 @@ mod tests {
         assert!(cap.is_parked("p"));
 
         // The operator fixed the cause and cleared this one task's park.
-        assert!(cap.unpark("p"), "unpark reports that it cleared a parked task");
+        assert!(
+            cap.unpark("p"),
+            "unpark reports that it cleared a parked task"
+        );
         assert!(!cap.is_parked("p"));
 
         let mut launches = 0;
@@ -378,12 +408,21 @@ mod tests {
 
         for id in ["a", "b"] {
             cap.record(id, t0);
-            assert_eq!(cap.decide(id, t0 + Duration::from_secs(1), &p), RestartDecision::GaveUp);
+            assert_eq!(
+                cap.decide(id, t0 + Duration::from_secs(1), &p),
+                RestartDecision::GaveUp
+            );
         }
 
         assert!(cap.unpark("a"));
-        assert!(cap.is_parked("b"), "unparking 'a' also released the untouched 'b'");
-        assert_eq!(cap.decide("b", t0 + Duration::from_secs(2), &p), RestartDecision::GaveUp);
+        assert!(
+            cap.is_parked("b"),
+            "unparking 'a' also released the untouched 'b'"
+        );
+        assert_eq!(
+            cap.decide("b", t0 + Duration::from_secs(2), &p),
+            RestartDecision::GaveUp
+        );
 
         // Unparking something that was never parked is a no-op the caller can distinguish, so
         // `st2 unpark` can tell an operator it acted on nothing rather than claim a recovery.
@@ -407,7 +446,10 @@ mod tests {
             cap.end_pass(now, &[]);
         }
 
-        assert!(!cap.unpark("p"), "a non-parked task was reported as recovered");
+        assert!(
+            !cap.unpark("p"),
+            "a non-parked task was reported as recovered"
+        );
 
         let last_launch = t0 + Duration::from_secs(2);
         assert_eq!(cap.decide("p", last_launch, &p), RestartDecision::Allow);

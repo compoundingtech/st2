@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use st2::reconcile::ObservedPtyPresentation;
 use st2::reconcile::reconcile_selected;
 use st2::reconcile::resolve_task;
-use st2::reconcile::ObservedPtyPresentation;
 use st2::spec::{AgentDesiredState, AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile as reconcile_result};
 
@@ -138,9 +138,22 @@ fn selected_reconcile_launches_missing_and_adopts_live_without_siblings() {
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.launch[0].tasks.len(), 1);
     assert_eq!(plan.launch[0].tasks[0].pty_id, "host.a.x");
-    let plan2 = reconcile_selected(&specs, &[live("host.a.x"), live("host.a.y"), live("host.b.z")], "host", "host.a.x").unwrap();
+    let plan2 = reconcile_selected(
+        &specs,
+        &[live("host.a.x"), live("host.a.y"), live("host.b.z")],
+        "host",
+        "host.a.x",
+    )
+    .unwrap();
     assert!(plan2.launch.is_empty() && plan2.gc.is_empty() && plan2.teardown.is_empty());
-    assert_eq!(plan2.adopt.iter().map(|s| s.identity.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    assert_eq!(
+        plan2
+            .adopt
+            .iter()
+            .map(|s| s.identity.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a"]
+    );
 }
 
 #[test]
@@ -234,7 +247,13 @@ fn selected_reconcile_action_ids_are_exact_and_refusals_immutable() {
     let sessions = vec![live("host.a.y"), live("host.b.z")];
     let before = (specs.clone(), sessions.clone());
     let p = reconcile_selected(&specs, &sessions, "host", "host.a.x").unwrap();
-    assert_eq!(p.launch.iter().flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str())).collect::<Vec<_>>(), vec!["host.a.x"]);
+    assert_eq!(
+        p.launch
+            .iter()
+            .flat_map(|l| l.tasks.iter().map(|t| t.pty_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec!["host.a.x"]
+    );
     assert!(p.gc.is_empty() && p.teardown.is_empty());
     assert!(reconcile_selected(&specs, &sessions, "host", "host.a.missing").is_err());
     assert_eq!((specs, sessions), before);
@@ -291,9 +310,19 @@ fn selected_dead_non_keep_gc_and_relaunch_only_selected() {
 }
 #[test]
 fn selected_retired_live_tears_down_only_selected() {
-    let mut s = svc("a", None, vec![task(TaskKind::Exec, "x", None, Some("a")), task(TaskKind::Exec, "sib", None, Some("b"))]);
+    let mut s = svc(
+        "a",
+        None,
+        vec![
+            task(TaskKind::Exec, "x", None, Some("a")),
+            task(TaskKind::Exec, "sib", None, Some("b")),
+        ],
+    );
     s.desired_state = AgentDesiredState::Retired { reason: None };
-    let specs = [s, svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))])];
+    let specs = [
+        s,
+        svc("b", None, vec![task(TaskKind::Exec, "z", None, Some("c"))]),
+    ];
     let p = reconcile_selected(
         &specs,
         &[live("host.a.x"), live("host.a.sib"), live("host.b.z")],
@@ -301,7 +330,13 @@ fn selected_retired_live_tears_down_only_selected() {
         "host.a.x",
     )
     .unwrap();
-    assert_eq!(p.teardown.iter().flat_map(|t| t.pty_ids.iter().map(String::as_str)).collect::<Vec<_>>(), vec!["host.a.x"]);
+    assert_eq!(
+        p.teardown
+            .iter()
+            .flat_map(|t| t.pty_ids.iter().map(String::as_str))
+            .collect::<Vec<_>>(),
+        vec!["host.a.x"]
+    );
     assert!(p.launch.is_empty() && p.gc.is_empty());
 }
 #[test]
@@ -401,6 +436,7 @@ fn spec(
         delivery: None,
         driver: None,
         resources: Vec::new(),
+        streams: Vec::new(),
         tasks,
         path: PathBuf::from(format!(
             "/cat/agents/{}/{identity}/agent.kdl",
@@ -493,7 +529,11 @@ fn resuming_uses_ordinary_reconcile_and_does_not_override_keep() {
     let specs = [spec];
     let plan = reconcile(&specs, &[dead("host.idle.agent")], "host");
     assert!(plan.launch.is_empty());
-    assert_eq!(plan.adopt.len(), 1, "resume preserves the existing keep contract");
+    assert_eq!(
+        plan.adopt.len(),
+        1,
+        "resume preserves the existing keep contract"
+    );
 }
 
 fn live(id: &str) -> Session {
@@ -565,12 +605,7 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         "worker",
         Some(HOST),
         vec![
-            task(
-                TaskKind::Pty,
-                "agent",
-                Some("hetz.worker"),
-                Some("codex"),
-            ),
+            task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("codex")),
             task(
                 TaskKind::Pty,
                 "shell",
@@ -602,7 +637,10 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         primary.tags,
         BTreeMap::from([
             ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
-            ("agent.actor.path".to_owned(), Some("hetz.worker".to_owned())),
+            (
+                "agent.actor.path".to_owned(),
+                Some("hetz.worker".to_owned())
+            ),
             (
                 "agent.presentation.description".to_owned(),
                 Some("Owns build delivery".to_owned()),
@@ -700,7 +738,12 @@ fn live_pty_presentation_only_queues_observed_drift() {
         }),
     };
     assert_eq!(reconcile(&specs, &[drifted], HOST).presentation.len(), 1);
-    assert_eq!(reconcile(&specs, &[live("hetz.worker")], HOST).presentation.len(), 1);
+    assert_eq!(
+        reconcile(&specs, &[live("hetz.worker")], HOST)
+            .presentation
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -710,13 +753,8 @@ fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
         Some(HOST),
         vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
     );
-    spec.resources.push(
-        Resource::new(
-            "work".into(),
-            "github-issue://example/project/41".into(),
-        )
-        .unwrap(),
-    );
+    spec.resources
+        .push(Resource::new("work".into(), "github-issue://example/project/41".into()).unwrap());
 
     let specs = [spec];
     let plan = reconcile(&specs, &[live("hetz.a")], HOST);
@@ -954,7 +992,9 @@ fn adopting_a_live_task_proves_it_alive_to_the_restart_cap() {
         vec![task(TaskKind::Pty, "agent", None, Some("run"))],
     )];
     // Take the runtime id from the launch plan itself rather than restating the derivation.
-    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0].pty_id.clone();
+    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0]
+        .pty_id
+        .clone();
 
     let plan = reconcile(&specs, &[live(&runtime)], HOST);
 
@@ -979,7 +1019,9 @@ fn selecting_a_live_task_proves_it_alive_to_the_restart_cap() {
         None,
         vec![task(TaskKind::Pty, "agent", None, Some("run"))],
     )];
-    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0].pty_id.clone();
+    let runtime = reconcile(&specs, &[], HOST).launch[0].tasks[0]
+        .pty_id
+        .clone();
 
     let plan = reconcile_selected(&specs, &[live(&runtime)], HOST, &runtime).unwrap();
 

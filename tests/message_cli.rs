@@ -80,6 +80,47 @@ fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn event_metadata_is_exposed_by_list_and_read_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "bob");
+    let inbox = tmp.path().join("h/bob/resources/inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    let filename = "1785000000000-abcdef.md";
+    fs::write(
+        inbox.join(filename),
+        "---\nfrom: h.bob/gh-ci\nsubject: CI result\nstream: gh-ci\nevent-id: run-812\nkey: main\n---\npayload\n",
+    )
+    .unwrap();
+
+    let listed = list(tmp.path(), &["--json"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["stream"], "gh-ci");
+    assert_eq!(listed[0]["eventId"], "run-812");
+    assert_eq!(listed[0]["eventKey"], "main");
+
+    let read = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "read", "bob", filename, "--root"])
+        .arg(tmp.path())
+        .args(["--host", "h", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(read["stream"], "gh-ci");
+    assert_eq!(read["eventId"], "run-812");
+    assert_eq!(read["eventKey"], "main");
+}
+
+#[test]
 fn uninitialized_sent_history_is_explicitly_unavailable_not_a_complete_empty_list() {
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
@@ -126,11 +167,8 @@ fn send_persists_canonical_sender_history_independent_of_every_recipient_box() {
         String::from_utf8_lossy(&output.stderr)
     );
     let filename = String::from_utf8(output.stdout).unwrap().trim().to_string();
-    let delivered = st2::message::read_msg(
-        &tmp.path().join("h/recipient/resources/inbox"),
-        &filename,
-    )
-    .unwrap();
+    let delivered =
+        st2::message::read_msg(&tmp.path().join("h/recipient/resources/inbox"), &filename).unwrap();
     assert_eq!(delivered.from.as_deref(), Some("h.sender"));
 
     fs::remove_file(
@@ -174,7 +212,10 @@ fn replies_are_indexed_with_the_canonical_recipient_and_thread_relation() {
 
     let original = send_message(tmp.path(), "recipient", "sender", "question", &[]);
     assert!(original.status.success());
-    let original = String::from_utf8(original.stdout).unwrap().trim().to_string();
+    let original = String::from_utf8(original.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let reply = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["message", "reply", &original, "--root"])
         .arg(tmp.path())
@@ -212,7 +253,10 @@ fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() 
 
     let original = send_message(tmp.path(), "recipient", "sender", "question", &[]);
     assert!(original.status.success());
-    let original = String::from_utf8(original.stdout).unwrap().trim().to_string();
+    let original = String::from_utf8(original.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let first = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["message", "reply", &original, "--root"])
         .arg(tmp.path())
@@ -229,7 +273,10 @@ fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() 
         .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "active-cleanup")
         .output()
         .unwrap();
-    assert!(!first.status.success(), "first reply must simulate lost output");
+    assert!(
+        !first.status.success(),
+        "first reply must simulate lost output"
+    );
     let recipient_inbox = tmp.path().join("h/recipient/resources/inbox");
     let reply_filename = fs::read_dir(&recipient_inbox)
         .unwrap()
@@ -262,8 +309,15 @@ fn keyed_reply_retry_reads_an_archived_source_and_returns_the_committed_reply() 
         ])
         .output()
         .unwrap();
-    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
-    assert_eq!(String::from_utf8_lossy(&retry.stdout).trim(), reply_filename);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&retry.stdout).trim(),
+        reply_filename
+    );
     assert_eq!(fs::read_dir(recipient_inbox).unwrap().count(), 1);
     assert_eq!(
         String::from_utf8_lossy(&sent(tmp.path(), "sender", &["--count"]).stdout).trim(),
@@ -304,12 +358,14 @@ fn keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates() 
             .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", crash_after)
             .output()
             .unwrap();
-        assert!(!failed.status.success(), "{crash_after} must inject failure");
+        assert!(
+            !failed.status.success(),
+            "{crash_after} must inject failure"
+        );
 
         let interrupted = sent(tmp.path(), "sender", &["--json"]);
         assert!(interrupted.status.success());
-        let interrupted: serde_json::Value =
-            serde_json::from_slice(&interrupted.stdout).unwrap();
+        let interrupted: serde_json::Value = serde_json::from_slice(&interrupted.stdout).unwrap();
         assert_ne!(interrupted["coverage"]["_tag"], "unavailable");
         if matches!(
             crash_after,
@@ -387,21 +443,24 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     ] {
         let tmp = prepare();
         let messages = tmp.path().join("h/sender/resources/sent/messages");
-        let row = fs::read_dir(&messages).unwrap().next().unwrap().unwrap().path();
+        let row = fs::read_dir(&messages)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         match mutate {
             "missing-directory" => fs::remove_dir_all(&messages).unwrap(),
             "missing-row" => fs::remove_file(&row).unwrap(),
             "extra-row" => {
                 let extra = messages.join("1700000000000-aaaaaa.md.json");
-                let value = fs::read_to_string(&row)
-                    .unwrap()
-                    .replace(
-                        serde_json::from_slice::<serde_json::Value>(&fs::read(&row).unwrap())
-                            .unwrap()["filename"]
-                            .as_str()
-                            .unwrap(),
-                        "1700000000000-aaaaaa.md",
-                    );
+                let value = fs::read_to_string(&row).unwrap().replace(
+                    serde_json::from_slice::<serde_json::Value>(&fs::read(&row).unwrap()).unwrap()
+                        ["filename"]
+                        .as_str()
+                        .unwrap(),
+                    "1700000000000-aaaaaa.md",
+                );
                 fs::write(extra, value).unwrap();
             }
             "unexpected-row-entry" => fs::write(messages.join("unexpected"), "junk").unwrap(),
@@ -440,7 +499,12 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     ] {
         let tmp = prepare();
         let commits = tmp.path().join("h/sender/resources/sent/commits");
-        let node = fs::read_dir(&commits).unwrap().next().unwrap().unwrap().path();
+        let node = fs::read_dir(&commits)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         match mutate {
             "missing-node" => fs::remove_file(&node).unwrap(),
             "extra-node" => {
@@ -465,8 +529,11 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
                 }
                 let digest = json_digest(&value);
                 fs::remove_file(&node).unwrap();
-                fs::write(commits.join(format!("{digest}.json")), serde_json::to_vec(&value).unwrap())
-                    .unwrap();
+                fs::write(
+                    commits.join(format!("{digest}.json")),
+                    serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
                 let head = tmp.path().join("h/sender/resources/sent/index.json");
                 let mut head_value: serde_json::Value =
                     serde_json::from_slice(&fs::read(&head).unwrap()).unwrap();
@@ -530,7 +597,10 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         assert!(output.stdout.is_empty());
         if mutate == "tip-format" {
             let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
-            assert!(!retry.status.success(), "invalid tip must fail before node lookup");
+            assert!(
+                !retry.status.success(),
+                "invalid tip must fail before node lookup"
+            );
         }
     }
 
@@ -580,7 +650,10 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
                 "durable",
                 &["--idempotency-key", "stable"],
             );
-            assert!(!retry.status.success(), "key filename must fail before row lookup");
+            assert!(
+                !retry.status.success(),
+                "key filename must fail before row lookup"
+            );
         }
     }
 
@@ -591,7 +664,10 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         fs::write(path.join(".message.tmp-999-0"), "interrupted atomic write").unwrap();
     }
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(output.status.success(), "atomic-write temporary siblings stay invisible");
+    assert!(
+        output.status.success(),
+        "atomic-write temporary siblings stay invisible"
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
@@ -605,17 +681,28 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         .unwrap();
     assert!(!interrupted.status.success());
     let pending = tmp.path().join("h/sender/resources/sent/pending");
-    let pending_record = fs::read_dir(&pending).unwrap().next().unwrap().unwrap().path();
+    let pending_record = fs::read_dir(&pending)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&pending_record).unwrap()).unwrap();
     value["body"] = "substituted pending\n".into();
     value["renderedMessage"] = "---\nfrom: h.sender\n---\nsubstituted pending\n".into();
     fs::write(&pending_record, serde_json::to_vec(&value).unwrap()).unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(!output.status.success(), "substituted pending intent must fail closed");
+    assert!(
+        !output.status.success(),
+        "substituted pending intent must fail closed"
+    );
     assert!(output.stdout.is_empty());
     let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
-    assert!(!retry.status.success(), "next sender operation must reject substituted pending");
+    assert!(
+        !retry.status.success(),
+        "next sender operation must reject substituted pending"
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
@@ -629,13 +716,21 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         .unwrap();
     assert!(!interrupted.status.success());
     let messages = tmp.path().join("h/sender/resources/sent/messages");
-    let row = fs::read_dir(&messages).unwrap().next().unwrap().unwrap().path();
+    let row = fs::read_dir(&messages)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&row).unwrap()).unwrap();
     value["body"] = "substituted row\n".into();
     value["renderedMessage"] = "---\nfrom: h.sender\n---\nsubstituted row\n".into();
     fs::write(row, serde_json::to_vec(&value).unwrap()).unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(!output.status.success(), "active-owned substituted row must fail closed");
+    assert!(
+        !output.status.success(),
+        "active-owned substituted row must fail closed"
+    );
     assert!(output.stdout.is_empty());
 
     let tmp = tempfile::tempdir().unwrap();
@@ -660,7 +755,10 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     )
     .unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(!output.status.success(), "missing pending intent must fail closed");
+    assert!(
+        !output.status.success(),
+        "missing pending intent must fail closed"
+    );
     assert!(output.stdout.is_empty());
 
     let tmp = tempfile::tempdir().unwrap();
@@ -679,7 +777,10 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     value["recordDigest"] = "substituted".into();
     fs::write(active, serde_json::to_vec(&value).unwrap()).unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(!output.status.success(), "substituted active digest must fail closed");
+    assert!(
+        !output.status.success(),
+        "substituted active digest must fail closed"
+    );
     assert!(output.stdout.is_empty());
 
     let tmp = tempfile::tempdir().unwrap();
@@ -695,20 +796,30 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     assert!(!interrupted.status.success());
     fs::remove_file(tmp.path().join("h/sender/resources/sent/active.json")).unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(!output.status.success(), "committed pending without active must fail closed");
+    assert!(
+        !output.status.success(),
+        "committed pending without active must fail closed"
+    );
     assert!(output.stdout.is_empty());
     let retry = send_message(tmp.path(), "sender", "recipient", "committed", &[]);
-    assert!(!retry.status.success(), "recovery must not commit the same row twice");
+    assert!(
+        !retry.status.success(),
+        "recovery must not commit the same row twice"
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "sender");
     write_agent(tmp.path(), "recipient");
-    assert!(send_message(tmp.path(), "sender", "recipient", "older", &[])
-        .status
-        .success());
-    assert!(send_message(tmp.path(), "sender", "recipient", "newer", &[])
-        .status
-        .success());
+    assert!(
+        send_message(tmp.path(), "sender", "recipient", "older", &[])
+            .status
+            .success()
+    );
+    assert!(
+        send_message(tmp.path(), "sender", "recipient", "newer", &[])
+            .status
+            .success()
+    );
     let messages = tmp.path().join("h/sender/resources/sent/messages");
     let mut rows = fs::read_dir(&messages)
         .unwrap()
@@ -717,16 +828,26 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     rows.sort();
     let pending = tmp.path().join("h/sender/resources/sent/pending");
     let older = fs::read(&rows[0]).unwrap();
-    fs::write(pending.join(format!("{}.json", bytes_digest(&older))), older).unwrap();
+    fs::write(
+        pending.join(format!("{}.json", bytes_digest(&older))),
+        older,
+    )
+    .unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
-    assert!(!output.status.success(), "older committed row cannot become pending again");
+    assert!(
+        !output.status.success(),
+        "older committed row cannot become pending again"
+    );
     assert!(output.stdout.is_empty());
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("committed pending intent is missing its active marker")
     );
     let retry = send_message(tmp.path(), "sender", "recipient", "next", &[]);
-    assert!(!retry.status.success(), "recovery must not recommit an older row");
+    assert!(
+        !retry.status.success(),
+        "recovery must not recommit an older row"
+    );
     assert!(
         String::from_utf8_lossy(&retry.stderr)
             .contains("committed pending intent is missing its active marker")
@@ -1064,10 +1185,16 @@ fn send_routes_only_by_stable_identity_in_a_catalog_and_preserves_catalogless_bu
     );
 
     fs::create_dir_all(catalog.path().join("requester/inbox")).unwrap();
-    assert!(!send(catalog.path(), "requester", "--catalog", None).status.success());
-    assert!(!send(catalog.path(), "requester", "--catalog", Some("other"))
-        .status
-        .success());
+    assert!(
+        !send(catalog.path(), "requester", "--catalog", None)
+            .status
+            .success()
+    );
+    assert!(
+        !send(catalog.path(), "requester", "--catalog", Some("other"))
+            .status
+            .success()
+    );
     let external = send(catalog.path(), "requester", "--catalog", Some("requester"));
     assert!(
         external.status.success(),

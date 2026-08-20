@@ -24,7 +24,8 @@ fn config_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         Ok(PathBuf::from(dir).join(".claude.json"))
     } else {
-        let home = std::env::var_os("HOME").context("neither $CLAUDE_CONFIG_DIR nor $HOME is set")?;
+        let home =
+            std::env::var_os("HOME").context("neither $CLAUDE_CONFIG_DIR nor $HOME is set")?;
         Ok(PathBuf::from(home).join(".claude.json"))
     }
 }
@@ -65,7 +66,8 @@ fn codex_config_path() -> Result<PathBuf> {
 pub fn pretrust_codex_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
     let existing = std::fs::read_to_string(config).unwrap_or_default();
     // Parse read-only just to see which dirs are already trusted (never rewrites the file).
-    let parsed: toml::Value = toml::from_str(&existing).unwrap_or(toml::Value::Table(Default::default()));
+    let parsed: toml::Value =
+        toml::from_str(&existing).unwrap_or(toml::Value::Table(Default::default()));
     let already = |dir: &str| -> bool {
         parsed
             .get("projects")
@@ -82,7 +84,10 @@ pub fn pretrust_codex_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
         if already(&key) {
             continue;
         }
-        appended.push_str(&format!("\n[projects.{}]\ntrust_level = \"trusted\"\n", toml_key(&key)));
+        appended.push_str(&format!(
+            "\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            toml_key(&key)
+        ));
         n += 1;
     }
     if !appended.is_empty() {
@@ -184,9 +189,15 @@ mod tests {
         assert_eq!(n, 1);
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        let key = std::fs::canonicalize(&ws).unwrap().to_string_lossy().into_owned();
+        let key = std::fs::canonicalize(&ws)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(v["projects"][&key]["hasTrustDialogAccepted"], json!(true));
-        assert_eq!(v["projects"][&key]["hasCompletedProjectOnboarding"], json!(true));
+        assert_eq!(
+            v["projects"][&key]["hasCompletedProjectOnboarding"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -195,7 +206,10 @@ mod tests {
         let cfg = tmp.path().join(".claude.json");
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        let key = std::fs::canonicalize(&ws).unwrap().to_string_lossy().into_owned();
+        let key = std::fs::canonicalize(&ws)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         // Seed a config with a top-level key AND an existing project entry carrying extra fields.
         let seed = json!({
@@ -212,10 +226,25 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         // The trust flag flipped true; the sibling field and the other top-level/project keys survive.
         assert_eq!(v["projects"][&key]["hasTrustDialogAccepted"], json!(true));
-        assert_eq!(v["projects"][&key]["hasCompletedProjectOnboarding"], json!(true));
-        assert_eq!(v["projects"][&key]["lastCost"], json!(1.23), "existing field clobbered");
-        assert_eq!(v["oauthAccount"]["keep"], json!("me"), "top-level key clobbered");
-        assert_eq!(v["projects"]["/other/dir"]["hasTrustDialogAccepted"], json!(true), "sibling clobbered");
+        assert_eq!(
+            v["projects"][&key]["hasCompletedProjectOnboarding"],
+            json!(true)
+        );
+        assert_eq!(
+            v["projects"][&key]["lastCost"],
+            json!(1.23),
+            "existing field clobbered"
+        );
+        assert_eq!(
+            v["oauthAccount"]["keep"],
+            json!("me"),
+            "top-level key clobbered"
+        );
+        assert_eq!(
+            v["projects"]["/other/dir"]["hasTrustDialogAccepted"],
+            json!(true),
+            "sibling clobbered"
+        );
     }
 
     #[test]
@@ -224,24 +253,45 @@ mod tests {
         let cfg = tmp.path().join("config.toml");
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        let key = std::fs::canonicalize(&ws).unwrap().to_string_lossy().into_owned();
+        let key = std::fs::canonicalize(&ws)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         // Existing codex config with a COMMENT and an unrelated project entry — must survive.
         std::fs::write(&cfg, "# my codex config\nmodel = \"gpt-5\"\n\n[projects.\"/other\"]\ntrust_level = \"trusted\"\n").unwrap();
 
-        assert_eq!(pretrust_codex_at(&cfg, std::slice::from_ref(&ws)).unwrap(), 1);
+        assert_eq!(
+            pretrust_codex_at(&cfg, std::slice::from_ref(&ws)).unwrap(),
+            1
+        );
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert!(text.contains("# my codex config"), "comment clobbered");
-        assert!(text.contains("model = \"gpt-5\""), "top-level setting clobbered");
-        assert!(text.contains("[projects.\"/other\"]"), "existing project clobbered");
+        assert!(
+            text.contains("model = \"gpt-5\""),
+            "top-level setting clobbered"
+        );
+        assert!(
+            text.contains("[projects.\"/other\"]"),
+            "existing project clobbered"
+        );
         // The new dir is trusted, and the whole file still parses as TOML.
         let v: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(v["projects"][&key]["trust_level"].as_str(), Some("trusted"));
 
         // Idempotent: re-trusting writes nothing (already trusted) and doesn't duplicate the table.
-        assert_eq!(pretrust_codex_at(&cfg, std::slice::from_ref(&ws)).unwrap(), 0);
+        assert_eq!(
+            pretrust_codex_at(&cfg, std::slice::from_ref(&ws)).unwrap(),
+            0
+        );
         let again = std::fs::read_to_string(&cfg).unwrap();
-        assert_eq!(again.matches(&format!("[projects.{}]", toml_key(&key))).count(), 1, "duplicated table");
+        assert_eq!(
+            again
+                .matches(&format!("[projects.{}]", toml_key(&key)))
+                .count(),
+            1,
+            "duplicated table"
+        );
     }
 
     #[test]
@@ -259,7 +309,10 @@ mod tests {
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         for d in [&a, &b] {
-            let key = std::fs::canonicalize(d).unwrap().to_string_lossy().into_owned();
+            let key = std::fs::canonicalize(d)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             assert_eq!(v["projects"][&key]["hasTrustDialogAccepted"], json!(true));
         }
     }
