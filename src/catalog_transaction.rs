@@ -600,7 +600,7 @@ fn agent_semantic_deltas(
 }
 
 fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, SemanticAtom>> {
-    use agent_spec::{Restart, RestartMode, TaskKind, TaskLifecycle};
+    use agent_spec::{Restart, RestartMode, StreamLaunch, TaskKind, TaskLifecycle};
 
     let host = spec
         .host
@@ -681,6 +681,48 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         SemanticType::String,
         spec.delivery.map(|delivery| delivery.as_str()),
     );
+
+    for stream in &spec.streams {
+        let stream_base = format!("{base}/streams/{}", pointer_segment(&stream.name));
+        match &stream.launch {
+            None => insert_value(
+                &mut fields,
+                &format!("{stream_base}/launch"),
+                SemanticType::String,
+                "external",
+            ),
+            Some(StreamLaunch::Command(command)) => {
+                insert_value(
+                    &mut fields,
+                    &format!("{stream_base}/launch"),
+                    SemanticType::String,
+                    "command",
+                );
+                insert_value(
+                    &mut fields,
+                    &format!("{stream_base}/command"),
+                    SemanticType::String,
+                    command,
+                );
+            }
+            Some(StreamLaunch::Argv(argv)) => {
+                insert_value(
+                    &mut fields,
+                    &format!("{stream_base}/launch"),
+                    SemanticType::String,
+                    "argv",
+                );
+                for (index, argument) in argv.iter().enumerate() {
+                    insert_value(
+                        &mut fields,
+                        &format!("{stream_base}/argv/{index}"),
+                        SemanticType::String,
+                        argument,
+                    );
+                }
+            }
+        }
+    }
 
     let restart = spec.restart_policy();
     let default_restart = Restart::default();
@@ -3420,6 +3462,27 @@ fn test_forced_cross_device(_point: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_streams_participate_in_semantic_catalog_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/host/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            "agent \"worker\" {\n  host \"host\"\n  command \"worker\"\n  stream \"webhook\" {}\n}\n",
+        )
+        .unwrap();
+        let discovered = agent_spec::discover_strict(root.path());
+        assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+
+        let fields = normalize_agent(&discovered.specs[0]).unwrap();
+
+        let atom = fields
+            .get("/agents/host/worker/streams/webhook/launch")
+            .expect("external stream must affect semantic projection");
+        assert_eq!(atom, &present_atom(SemanticType::String, "external"));
+    }
 
     #[test]
     fn workspace_directory_facts_are_typed_into_the_projection_hash() {

@@ -194,7 +194,7 @@ pub fn emit(
     }
     // Serialize the eligibility observation with self-authoring and desired-state changes. Once a
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
-    let _catalog_lock = crate::catalog_lock::CatalogLock::exclusive(root)?;
+    let _catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
     let resolved = resolve_stream(root, this_host, recipient, stream)?;
     let canonical_recipient = resolved.recipient;
     let from = format!("{canonical_recipient}/{stream}");
@@ -305,11 +305,13 @@ pub fn emit(
                             root,
                             &canonical_recipient,
                             this_host,
-                            |inbox, _archive| {
+                            |inbox, archive| {
                                 for entry in record.recent.iter().filter(|entry| {
                                     key.is_none_or(|key| entry.key.as_deref() == Some(key))
                                 }) {
-                                    if read_message_entry(inbox, &entry.filename)?.is_some() {
+                                    if read_message_entry(inbox, &entry.filename)?.is_some()
+                                        && read_message_entry(archive, &entry.filename)?.is_none()
+                                    {
                                         return Ok(Some(entry.clone()));
                                     }
                                 }
@@ -353,7 +355,17 @@ pub fn emit(
                             );
                             false
                         }
-                        None => message::materialize_message_once(inbox, &filename, &rendered)?,
+                        None => match read_message_entry(inbox, &filename)? {
+                            Some(bytes) => {
+                                validate_pending_message(
+                                    stream,
+                                    record.pending.as_ref().expect("pending reservation exists"),
+                                    &bytes,
+                                )?;
+                                false
+                            }
+                            None => message::materialize_message_once(inbox, &filename, &rendered)?,
+                        },
                     };
                     test_event_checkpoint(event_id, "materialized")?;
                     if let Some(predecessor) = predecessor.as_ref() {

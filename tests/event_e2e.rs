@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
 use st2::event::{self, EventReceiptStatus, RING_CAPACITY};
@@ -412,7 +413,155 @@ fn supersede_skips_an_archived_head_and_retires_the_latest_unread_predecessor() 
 }
 
 #[test]
-fn failed_predecessor_archive_leaves_the_successor_unread_and_replay_completes() {
+fn supersede_skips_an_archive_shadowed_inbox_candidate() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let older = emit(catalog.path(), "pr1-queued", Some("pr-1"), false);
+    let shadowed = emit(catalog.path(), "pr1-running", Some("pr-1"), false);
+    let inbox = message::inbox_dir(&agent);
+    let archive = message::archive_dir(&agent);
+    fs::create_dir_all(&archive).unwrap();
+    fs::copy(
+        inbox.join(&shadowed.filename),
+        archive.join(&shadowed.filename),
+    )
+    .unwrap();
+
+    let successor = emit(catalog.path(), "pr1-pass", Some("pr-1"), true);
+
+    assert_eq!(
+        successor.superseded.as_deref(),
+        Some(older.filename.as_str())
+    );
+    assert!(inbox.join(&shadowed.filename).is_file());
+    assert!(archive.join(&shadowed.filename).is_file());
+    assert!(archive.join(&older.filename).is_file());
+}
+
+#[test]
+fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "running", Some("pr-1"), false);
+    let inbox = message::inbox_dir(&agent);
+    fs::write(inbox.join(&predecessor.filename), "forged predecessor").unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "passed",
+        Some("pr-1"),
+        Some("passed"),
+        "passed",
+        true,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("different bytes"), "{error:#}");
+    assert!(inbox.join(&predecessor.filename).is_file());
+    assert!(
+        !message::archive_dir(&agent)
+            .join(&predecessor.filename)
+            .exists()
+    );
+    assert!(
+        message::list_inbox(&inbox)
+            .unwrap()
+            .iter()
+            .any(|message| { message.event_id.as_deref() == Some("passed") })
+    );
+}
+
+#[test]
+fn catalog_authoring_and_emit_linearize_without_deadlock() {
+    let catalog = tempfile::tempdir().unwrap();
+    declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let admission = st2::CatalogLock::shared(catalog.path()).unwrap();
+    let root = catalog.path().to_path_buf();
+    let (done_tx, done_rx) = mpsc::channel();
+    let author = std::thread::spawn(move || {
+        let result = st2::agent_author::remove_stream(&root, "hetz.worker", "hetz", None, "gh-ci");
+        done_tx.send(result).unwrap();
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    let receipt = emit(catalog.path(), "before-remove", None, false);
+    assert_eq!(receipt.status, EventReceiptStatus::Created);
+    drop(admission);
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    author.join().unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "after-remove",
+        None,
+        None,
+        "after",
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("does not declare stream"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn desired_state_authoring_and_emit_linearize_without_deadlock() {
+    let catalog = tempfile::tempdir().unwrap();
+    declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let admission = st2::CatalogLock::shared(catalog.path()).unwrap();
+    let root = catalog.path().to_path_buf();
+    let (done_tx, done_rx) = mpsc::channel();
+    let author = std::thread::spawn(move || {
+        let result = st2::agent_author::set_desired_state(
+            &root,
+            "hetz.worker",
+            "hetz",
+            None,
+            st2::agent_author::DesiredStateValue::Suspended,
+            Some("maintenance"),
+        );
+        done_tx.send(result).unwrap();
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    assert_eq!(
+        emit(catalog.path(), "before-suspend", None, false).status,
+        EventReceiptStatus::Created
+    );
+    drop(admission);
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    author.join().unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "after-suspend",
+        None,
+        None,
+        "after",
+        false,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("is suspended"), "{error:#}");
+}
+
+#[test]
+fn invalid_archive_receipt_blocks_supersession_before_successor_publication() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
     let predecessor = emit(catalog.path(), "pr1-running", Some("pr-1"), false);
@@ -438,17 +587,17 @@ fn failed_predecessor_archive_leaves_the_successor_unread_and_replay_completes()
         "{error:#}"
     );
     let unread = message::list_inbox(&inbox).unwrap();
-    assert_eq!(unread.len(), 2);
+    assert_eq!(unread.len(), 1);
     assert!(
         unread
             .iter()
-            .any(|message| message.event_id.as_deref() == Some("pr1-pass"))
+            .all(|message| message.event_id.as_deref() != Some("pr1-pass"))
     );
     assert!(inbox.join(&predecessor.filename).exists());
 
     fs::remove_dir(archive.join(&predecessor.filename)).unwrap();
     let replay = emit(catalog.path(), "pr1-pass", Some("pr-1"), true);
-    assert_eq!(replay.status, EventReceiptStatus::Deduplicated);
+    assert_eq!(replay.status, EventReceiptStatus::Created);
     assert_eq!(
         replay.superseded.as_deref(),
         Some(predecessor.filename.as_str())
