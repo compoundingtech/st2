@@ -92,7 +92,10 @@ st2 event emit <host>.<agent>
   [body on stdin]
 ```
 
-Emitting to an undeclared stream or unknown agent is refused before writes.
+Emitting to an undeclared stream or unknown agent is refused before writes,
+and so is a recipient whose desired state is not running — suspension means
+eyes closed for external producers too (STREAM-R09): the emit returns a typed
+refusal rather than accumulating events a suspended agent will wake to.
 Replaying `(stream, event-id)` — concurrently or across a crash — returns the
 original filename with `deduplicated`; conflicting reuse of an `event-id` with
 different content fails. A duplicate never re-notifies: archive receipts keep
@@ -124,24 +127,44 @@ gating are inherited.
 
 ## Stream state (STREAM-R05)
 
-Per-stream durable dedup state lives under the owning agent's resources,
-beside inbox/archive (exact path DQ-S2): a constant-size ring of the last `K`
-`(event-id → filename)` entries plus, per `key`, the unread head's filename
-for supersession. Publication is O(1); nothing is chained, hashed, or
-validated O(history). `K` defaults to 128 pending measurement (DQ-S3). An
-`event-id` older than the ring's horizon deduplicates only through a surviving
-archive receipt; beyond both, a replay is a new event — the bound is the
-honesty boundary, stated rather than hidden.
+Dedup authority is ordered, and correctness never depends on the bounded
+state:
+
+1. **Ring hit** — a constant-size ring of the last `K` `(event-id → filename,
+   content digest)` entries under the owning agent's resources (exact path
+   DQ-S2) answers the common replay in O(1).
+2. **Unread inbox copy** — on a ring miss, the recipient's unread inbox is
+   scanned for the `(stream, event-id)` frontmatter; an unread event always
+   deduplicates against itself.
+3. **Archive receipt** — an archived event deduplicates through its receipt,
+   with the same `03-message` authority and retention boundary ordinary
+   messages have.
+
+Same identity with different content fails at whichever layer answers.
+Nothing is chained, hashed, or validated O(history): emit work is
+history-independent — O(1) on the ring path, at most proportional to the
+unread backlog on a stale replay or supersession lookup (STREAM-R05). The
+ring is the only durable stream state; `K` defaults to 128 pending
+measurement (DQ-S3) and affects only the fast-path hit rate and the
+conflicting-content detection window, never replay identity, which survives
+as long as the unread copy or its archive receipt — the same honesty boundary
+the bus already carries.
 
 ## Supersession (STREAM-R07)
 
-`--supersede` archives the stream's unread predecessor for the same `key`
-(absent `key`: the stream's unread head) before publishing the successor —
-log-compaction semantics. The archive move uses the ordinary archive path, so
-a DING-staged predecessor resolves through the existing archive-receipt rule:
-pasted at most once ever, never re-pasted, successor delivers next. Proven:
-24 supersedes in 146 ms produced one fresh poke, zero staged retries, one
-unread head (`.experiments/2026-08-20-pipes-event-model-differentiation.md`).
+`--supersede` collapses the stream to its latest unread event per `key`
+(absent `key`: per stream) — log-compaction semantics — in wakeup-safe order:
+the successor is published first, then the unread predecessor (found by the
+same unread-inbox scan, `(stream, key)`) is archived. A crash between the two
+leaves both events unread — the failure bias is a duplicate wake, never a
+lost one — and the next emit or a supersede retry completes the compaction
+idempotently. This is the ordering the differentiation experiment proved
+(steps 3–4 materialize the successor before touching the predecessor). The
+archive move uses the ordinary archive path, so a DING-staged predecessor
+resolves through the existing archive-receipt rule: pasted at most once ever,
+never re-pasted, successor delivers next. Proven: 24 supersedes in 146 ms
+produced one fresh poke, zero staged retries, one unread head
+(`.experiments/2026-08-20-pipes-event-model-differentiation.md`).
 
 ## Waits are standing feeds (doctrine, STREAM-R01 + STREAM-R07)
 

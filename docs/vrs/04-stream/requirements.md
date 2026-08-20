@@ -65,8 +65,12 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   record, and never re-notifies; an archive receipt retains its existing
   authority. The machine receipt distinguishes `created` from `deduplicated`.
 - **STREAM-R05 Bounded stream state:** Per-stream durable dedup state is
-  constant-size (a bounded ring). Event publication does not write the Agent
-  Sent ledger and performs constant work per emit.
+  constant-size (a bounded ring), and correctness never depends on it: replay
+  identity is anchored in the unread inbox copy and the archive receipt. Event
+  publication does not write the Agent Sent ledger and performs
+  history-independent work per emit — constant on the ring fast path, at most
+  proportional to the unread backlog on a stale replay or supersession lookup,
+  never proportional to stream history.
 
 ### Must deliver as ordinary inbox work
 

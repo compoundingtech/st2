@@ -10,12 +10,16 @@ as tested hypotheses.
   task runtime-ID grammar). Resolves by: checking every existing `from`
   consumer (DING marker resolution, roster joins, message filters) against
   both grammars; the one no consumer misparses wins.
-- **DQ-S2 Stream state path.** Where the dedup ring and supersession heads
-  live under the owner's resources (`resources/streams/<name>/` proposed).
-  Resolves during implementation with the state-namespace conventions of R02.
-- **DQ-S3 Ring bound.** `K = 128` is a guess. Resolves by: measuring real
-  adapter emit rates (CI flaps, timer sources) against replay windows; the
-  bound must exceed the longest plausible producer retry horizon.
+- **DQ-S2 Stream state path.** Where the dedup ring lives under the owner's
+  resources (`resources/streams/<name>/` proposed; the ring is the only
+  durable stream state — supersession heads are derived from the unread
+  inbox, not stored). Resolves during implementation with the
+  state-namespace conventions of R02.
+- **DQ-S3 Ring bound.** `K = 128` is a guess. Correctness does not depend on
+  it (replay identity anchors in the unread copy and archive receipt); `K`
+  sets the O(1) fast-path hit rate and the conflicting-content detection
+  window. Resolves by: measuring real adapter emit rates (CI flaps, timer
+  sources) against replay windows.
 - **DQ-S4 Request absorption staging.** The typed request/reply envelopes
   (`request.rs`) are absorbed by events + ordinary replies (decision 0004),
   but its wire types carry `deny_unknown_fields` and its invariant row names
