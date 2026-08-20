@@ -451,10 +451,10 @@ fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
         "hetz",
         "hetz.worker",
         "gh-ci",
-        "passed",
+        "initial-passed",
         Some("pr-1"),
-        Some("passed"),
-        "passed",
+        Some("initial passed"),
+        "initial passed",
         true,
     )
     .unwrap_err();
@@ -470,7 +470,7 @@ fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
         message::list_inbox(&inbox)
             .unwrap()
             .iter()
-            .any(|message| { message.event_id.as_deref() == Some("passed") })
+            .any(|message| { message.event_id.as_deref() == Some("initial-passed") })
     );
 }
 
@@ -866,6 +866,92 @@ fn pending_supersession_authenticates_its_predecessor_before_archive() {
             .unwrap()
             .iter()
             .all(|message| message.event_id.as_deref() != Some("unrelated"))
+    );
+}
+
+#[test]
+fn pending_supersession_accepts_an_authenticated_archive_only_predecessor() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "running", Some("pr-1"), false);
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "passed",
+        Some("pr-1"),
+        Some("passed"),
+        "passed",
+        true,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    let inbox = message::inbox_dir(&agent);
+    let archive = message::archive_dir(&agent);
+    message::archive_msg(&inbox, &archive, &predecessor.filename).unwrap();
+
+    let next = emit(catalog.path(), "unrelated", Some("pr-2"), false);
+
+    assert_eq!(next.status, EventReceiptStatus::Created);
+    assert!(archive.join(&predecessor.filename).is_file());
+    assert!(
+        message::list_inbox(&inbox)
+            .unwrap()
+            .iter()
+            .any(|message| { message.event_id.as_deref() == Some("passed") })
+    );
+}
+
+#[test]
+fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
+    let _fail_env = EVENT_FAIL_ENV.lock().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let predecessor = emit(catalog.path(), "running", Some("pr-1"), false);
+    unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
+    let _ = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "passed",
+        Some("pr-1"),
+        Some("passed"),
+        "passed",
+        true,
+    )
+    .unwrap_err();
+    unsafe { std::env::remove_var("ST2_TEST_EVENT_FAIL_AT") };
+    let inbox = message::inbox_dir(&agent);
+    fs::remove_file(inbox.join(&predecessor.filename)).unwrap();
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "gh-ci",
+        "unrelated",
+        None,
+        None,
+        "unrelated",
+        false,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("has no inbox file or archive receipt"),
+        "{error:#}"
+    );
+    assert!(
+        message::list_inbox(&inbox)
+            .unwrap()
+            .iter()
+            .all(|message| { message.event_id.as_deref() != Some("unrelated") })
     );
 }
 

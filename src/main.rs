@@ -874,7 +874,7 @@ enum StreamCmd {
         /// Adapter command run under `sh -c`; omit both launch forms for external ingress.
         #[arg(long, conflicts_with = "adapter_argv")]
         command: Option<String>,
-        /// Direct adapter argv. Element 0 is the program.
+        /// Direct adapter argv after `--`. Element 0 is the program; values are preserved exactly.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         adapter_argv: Vec<String>,
         #[arg(long)]

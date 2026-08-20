@@ -166,6 +166,83 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
 }
 
 #[test]
+fn direct_adapter_argv_preserves_spaces_and_metacharacters_exactly() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+    let expected = [
+        "/bin/example adapter",
+        "argument with spaces",
+        "$HOME",
+        "$(never-executed)",
+        "semi;colon",
+        "quote\"and\\slash",
+        "--looks-like-a-flag",
+    ];
+    let mut args = vec![
+        "stream",
+        "add",
+        "exact-argv",
+        "--agent",
+        "hetz.worker",
+        "--host",
+        "hetz",
+        "--",
+    ];
+    args.extend(expected);
+
+    let add = st2(catalog.path(), &args);
+
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let spec = st2::discover(catalog.path()).specs.remove(0);
+    let stream = spec
+        .streams
+        .iter()
+        .find(|stream| stream.name == "exact-argv")
+        .unwrap();
+    assert_eq!(
+        stream.launch,
+        Some(st2::spec::StreamLaunch::Argv(
+            expected.iter().map(|value| (*value).to_owned()).collect()
+        ))
+    );
+}
+
+#[test]
+fn command_and_direct_argv_are_mutually_exclusive() {
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+
+    let add = st2(
+        catalog.path(),
+        &[
+            "stream",
+            "add",
+            "ambiguous",
+            "--agent",
+            "hetz.worker",
+            "--host",
+            "hetz",
+            "--command",
+            "echo shell",
+            "--",
+            "/bin/echo",
+            "direct",
+        ],
+    );
+
+    assert!(!add.status.success());
+    assert!(
+        String::from_utf8_lossy(&add.stderr).contains("cannot be used with"),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+}
+
+#[test]
 fn a_bare_actor_can_self_author_on_the_selected_host() {
     let catalog = tempfile::tempdir().unwrap();
     write_agent(catalog.path());
