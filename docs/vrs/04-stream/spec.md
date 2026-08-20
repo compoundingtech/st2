@@ -7,10 +7,9 @@ This document specifies declared event streams. It builds on
 
 ## Status
 
-Draft. The shapes below are the interview-settled design over the executable
-prototypes in [`.experiments/`](./.experiments/); field names and on-disk
-layouts may still move during implementation, the open questions are tracked
-in [open-questions.md](./open-questions.md).
+Active. The declared-stream ingress, record, bounded-state, and companion
+lifecycle shapes are implemented. Remaining extensions are tracked in
+[open-questions.md](./open-questions.md).
 
 ## Scope
 
@@ -71,13 +70,14 @@ and inner hyphens, starting and ending alphanumeric, and share the per-agent
 uniqueness space with task names; `stream "x"` and a task named `stream-x`
 collide at validation.
 
-A command-bearing stream lowers to one derived exec task named
-`stream-<name>`, synthesized beside the derived DING through the same seam and
-late-bound to the running st2 binary each reconcile pass. It inherits the
+A launched stream lowers its authored `command` or `argv` directly to one
+derived exec task named `stream-<name>`, synthesized beside the derived DING
+through the same seam. st2 adds no wrapper or line protocol: the adapter is
+the task process and calls `st2 event emit` itself. It inherits the
 derived-companion contract unchanged: launch with the agent's canonical task,
 stop while held/suspended/retired/parked, its own restart accounting, crash
-surfacing to the supervisor. The adapter process calls `st2 event emit`
-itself; there is no line-protocol runner in between.
+surfacing to the supervisor. An empty stream declaration creates only an
+external ingress endpoint and no task.
 
 ## Ingress boundary (STREAM-R03, STREAM-R04)
 
@@ -115,8 +115,10 @@ subject: 'CI: failure on PR #42'
 ```
 
 `parse_message` ignores unknown frontmatter keys, so old readers see a normal
-message; new readers classify on the presence of `stream` + `event-id`. The
-exact `from` grammar for a nested stream's producer identity is DQ-S1.
+message; new readers classify on the presence of `stream` + `event-id`.
+Producer identity is `<host>.<agent>/<stream>`: the slash makes the declared
+stream subordinate to the stable bus ID without colliding with the dotted
+runtime task ID `<host>.<agent>.stream-<stream>`.
 
 DING renders events as `[DING] » <from>: <subject> [id:…]` — the `»` marker is
 the only DING change; classification, staged ownership, retries, and presence
@@ -124,20 +126,23 @@ gating are inherited.
 
 ## Stream state (STREAM-R05)
 
-Per-stream durable dedup state lives under the owning agent's resources,
-beside inbox/archive (exact path DQ-S2): a constant-size ring of the last `K`
-`(event-id → filename)` entries plus, per `key`, the unread head's filename
-for supersession. Publication is O(1); nothing is chained, hashed, or
-validated O(history). `K` defaults to 128 pending measurement (DQ-S3). An
-`event-id` older than the ring's horizon deduplicates only through a surviving
-archive receipt; beyond both, a replay is a new event — the bound is the
-honesty boundary, stated rather than hidden.
+Per-stream durable state is
+`<agent>/resources/streams/<name>/state.json`: a pending publication record
+plus a constant-size ring of the last `K` event receipts. Each receipt binds
+`event-id`, filename, optional `key`, and the rendered-content digest.
+Publication is constant work with respect to total stream history; the
+current implementation uses `K = 128` pending measurement (DQ-S3).
+
+The ring is the entire dedup horizon. Inbox and archive files are not searched
+to recover evicted identities. Replaying an `event-id` after its receipt has
+fallen out of the ring creates a new event even when the earlier inbox or
+archive file survives. This is the bounded-state honesty boundary.
 
 ## Supersession (STREAM-R07)
 
-`--supersede` archives the stream's unread predecessor for the same `key`
-(absent `key`: the stream's unread head) before publishing the successor —
-log-compaction semantics. The archive move uses the ordinary archive path, so
+`--supersede` archives the most recent retained predecessor for the same
+`(stream, key)` before publishing the successor; without `--key`, it archives
+the stream-wide head — log-compaction semantics. The archive move uses the ordinary archive path, so
 a DING-staged predecessor resolves through the existing archive-receipt rule:
 pasted at most once ever, never re-pasted, successor delivers next. Proven:
 24 supersedes in 146 ms produced one fresh poke, zero staged retries, one
@@ -169,24 +174,24 @@ task model rather than a stream-level flag.
 
 ## Authoring (STREAM-R02)
 
-`st2 stream add <name> [--command …]` / `st2 stream rm <name>` edit exactly
-one declaration through the persistent catalog-authoring lock with the same
-source-preserving, fail-closed contract as `st2 rename` (R25 authority: self
-or declared descendant; Nix-owned declarations refuse).
+`st2 stream add <name> [--agent <identity>] [--command <shell> | <adapter argv…>]`
+and `st2 stream rm <name> [--agent <identity>]` edit exactly one declaration
+through the persistent catalog-authoring lock with the same source-preserving,
+fail-closed contract as `st2 rename` (R25 authority: self or declared
+descendant; Nix-owned declarations refuse). Without `--agent`, the actor's
+`--as`/`ST_AGENT` identity is also the target.
 
-## Verification plan
+## Verification
 
-The invariant rows this subsystem must add or keep green when implementation
-lands: idempotent event ingress (replacing the request-transport row when the
-absorption completes), bounded stream state, supersession-vs-DING safety, and
-the derived-companion row extended to stream tasks. The prototype tests in
-`.experiments/` name the intended proofs; they become `tests/event_e2e.rs`,
-`tests/stream_lifecycle.rs`, and `agent-spec` declaration tests.
+The load-bearing proof names are recorded in [`INVARIANTS.md`](../../../INVARIANTS.md).
+They cover idempotent and concurrent ingress, fail-closed admission, keyed
+supersession, bounded ring honesty, the CLI/DING record shape, typed Agent Spec
+lowering, and companion lifecycle. Typed request retirement remains separately
+staged by DELTA-002; stream ingress does not weaken its existing invariant.
 
 ## Open design questions
 
-Tracked with context in [open-questions.md](./open-questions.md): DQ-S1
-producer-identity grammar, DQ-S2 state path, DQ-S3 ring bound, DQ-S4 request
-absorption staging, DQ-S5 top-level shared streams, DQ-S6 parked-stream
-owner notification, DQ-S7 event body bounds vs issue #238, DQ-S8 one-shot
-stream completion.
+Tracked with context in [open-questions.md](./open-questions.md): DQ-S3 ring
+bound, DQ-S4 request absorption staging, DQ-S5 top-level shared streams, DQ-S6
+parked-stream owner notification, DQ-S7 event body bounds vs issue #238, and
+DQ-S8 one-shot stream completion.

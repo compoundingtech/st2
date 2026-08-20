@@ -450,9 +450,7 @@ fn request_status_propagates_non_not_found_message_directory_errors() {
     );
     assert!(sent.status.success());
 
-    let inbox = tmp
-        .path()
-        .join("principals/h/example-ci/resources/inbox");
+    let inbox = tmp.path().join("principals/h/example-ci/resources/inbox");
     fs::create_dir_all(inbox.parent().unwrap()).unwrap();
     fs::write(&inbox, "not a directory").unwrap();
     assert!(inbox.is_file());

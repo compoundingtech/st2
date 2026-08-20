@@ -190,11 +190,13 @@ fn codex_materialization_verifies_before_writing_and_renders_a_versioned_path() 
         "materialization verification must not install hooks"
     );
 
-    assert!(command(&hooks_root)
-        .args(["hooks", "install"])
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        command(&hooks_root)
+            .args(["hooks", "install"])
+            .status()
+            .unwrap()
+            .success()
+    );
     let materialized = command(&hooks_root)
         .arg("up")
         .arg(&catalog)
@@ -231,7 +233,10 @@ fn claude_hook_materialization_rejects_a_missing_receipt_before_writing() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&blocked.stderr);
     assert!(!blocked.status.success(), "{stderr}");
-    assert!(stderr.contains("render plan references $ST_HOOKS"), "{stderr}");
+    assert!(
+        stderr.contains("render plan references $ST_HOOKS"),
+        "{stderr}"
+    );
     assert!(!workspace.join(".claude/settings.local.json").exists());
     assert!(
         !hooks_root.exists(),
@@ -308,10 +313,9 @@ fn claude_hook_materialization_accepts_a_valid_receipt_and_renders_a_versioned_p
         "{}",
         String::from_utf8_lossy(&materialized.stderr)
     );
-    let settings: serde_json::Value = serde_json::from_slice(
-        &fs::read(workspace.join(".claude/settings.local.json")).unwrap(),
-    )
-    .unwrap();
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.join(".claude/settings.local.json")).unwrap())
+            .unwrap();
     let hook = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();

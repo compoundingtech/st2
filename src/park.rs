@@ -57,15 +57,17 @@ impl SupervisorScope {
     }
 
     fn in_state_root(state_root: &Path, catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
-        let catalog_root = catalog_root
-            .canonicalize()
-            .with_context(|| format!("canonicalize supervisor catalog {}", catalog_root.display()))?;
+        let catalog_root = catalog_root.canonicalize().with_context(|| {
+            format!("canonicalize supervisor catalog {}", catalog_root.display())
+        })?;
         let mut hash = Sha256::new();
         hash.update(b"st2.supervisor-scope.v1");
         hash_scope_component(&mut hash, catalog_root.as_os_str().as_bytes());
         hash_scope_component(&mut hash, host.as_bytes());
         let scope_id = format!("sha256-{:x}", hash.finalize());
-        Ok(Self { root: state_root.join("st2/supervisors").join(scope_id) })
+        Ok(Self {
+            root: state_root.join("st2/supervisors").join(scope_id),
+        })
     }
 
     pub fn park_dir(&self) -> PathBuf {
@@ -153,7 +155,9 @@ impl DirParkObserver {
     }
 
     pub fn for_supervisor(catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
-        Ok(Self::new(SupervisorScope::current(catalog_root, host)?.park_dir()))
+        Ok(Self::new(
+            SupervisorScope::current(catalog_root, host)?.park_dir(),
+        ))
     }
 
     fn observe_with(
@@ -477,8 +481,7 @@ mod tests {
 
         projection_a.publish(&parked(&["same.task"]), "crash-looped");
         projection_b.publish(&BTreeSet::new(), "crash-looped");
-        let marker_a =
-            DirParkObserver::new(channel_a.park_dir()).observe(&desired(&["same.task"]));
+        let marker_a = DirParkObserver::new(channel_a.park_dir()).observe(&desired(&["same.task"]));
 
         request_unpark(&channel_b.unpark_request_dir(), "same.task").unwrap();
         let (taken_by_a, errors_a) = take_unpark_requests(&channel_a.unpark_request_dir());
@@ -489,7 +492,10 @@ mod tests {
             matches!(marker_a.state("same.task"), ParkState::Parked(_)),
             "catalog B deleted catalog A's same-host marker"
         );
-        assert!(taken_by_a.is_empty(), "catalog A consumed catalog B's request");
+        assert!(
+            taken_by_a.is_empty(),
+            "catalog A consumed catalog B's request"
+        );
         assert_eq!(taken_by_b, ["same.task"]);
     }
 
@@ -515,9 +521,16 @@ mod tests {
         let projection = projection(dir.path());
         let observer = DirParkObserver::new(dir.path().to_path_buf());
 
-        assert!(projection.publish(&parked(&["a", "b"]), "crash-looped").is_empty());
+        assert!(
+            projection
+                .publish(&parked(&["a", "b"]), "crash-looped")
+                .is_empty()
+        );
         let batch = observer.observe(&desired(&["a", "b", "healthy"]));
-        assert!(batch.complete, "a parked task is a known fault, not missing evidence");
+        assert!(
+            batch.complete,
+            "a parked task is a known fault, not missing evidence"
+        );
         assert!(batch.errors.is_empty());
         let ParkState::Parked(record) = batch.state("a") else {
             panic!("'a' was published as parked but does not read back as parked");
@@ -529,7 +542,11 @@ mod tests {
         assert_eq!(batch.state("healthy"), &ParkState::NotParked);
 
         // 'a' recovers: republishing without it must retract its marker, not leave a fault standing.
-        assert!(projection.publish(&parked(&["b"]), "crash-looped").is_empty());
+        assert!(
+            projection
+                .publish(&parked(&["b"]), "crash-looped")
+                .is_empty()
+        );
         let batch = observer.observe(&desired(&["a", "b"]));
         assert_eq!(batch.state("a"), &ParkState::NotParked);
         assert!(matches!(batch.state("b"), ParkState::Parked(_)));
@@ -559,7 +576,10 @@ mod tests {
             &ParkState::NotParked,
             "a park outlived the supervisor run it belongs to"
         );
-        assert!(batch.complete, "a stale marker is a positive absence, not an unknown");
+        assert!(
+            batch.complete,
+            "a stale marker is a positive absence, not an unknown"
+        );
         assert!(batch.errors.is_empty());
     }
 
@@ -570,7 +590,11 @@ mod tests {
     fn a_supervisor_generation_observation_error_is_indeterminate() {
         let dir = tempfile::tempdir().unwrap();
         let projection = projection(dir.path());
-        assert!(projection.publish(&parked(&["a"]), "crash-looped").is_empty());
+        assert!(
+            projection
+                .publish(&parked(&["a"]), "crash-looped")
+                .is_empty()
+        );
 
         let observer = DirParkObserver::new(dir.path().to_path_buf());
         let batch = observer.observe_with(&desired(&["a"]), &|_| {
@@ -644,12 +668,18 @@ mod tests {
         )
         .unwrap();
 
-        let batch =
-            DirParkObserver::new(dir.path().to_path_buf()).observe(&desired(&["garbage", "wrong-schema"]));
+        let batch = DirParkObserver::new(dir.path().to_path_buf())
+            .observe(&desired(&["garbage", "wrong-schema"]));
         assert!(!batch.complete);
         assert_eq!(batch.errors.len(), 2);
-        assert!(matches!(batch.state("garbage"), ParkState::Indeterminate(_)));
-        assert!(matches!(batch.state("wrong-schema"), ParkState::Indeterminate(_)));
+        assert!(matches!(
+            batch.state("garbage"),
+            ParkState::Indeterminate(_)
+        ));
+        assert!(matches!(
+            batch.state("wrong-schema"),
+            ParkState::Indeterminate(_)
+        ));
     }
 
     /// The park's age is what tells a fresh crash-loop from one that has been down all day, so a pass
@@ -696,7 +726,15 @@ mod tests {
     #[test]
     fn a_request_id_cannot_escape_its_dir() {
         let dir = tempfile::tempdir().unwrap();
-        for bad in ["../escaped", "sub/nested", "/absolute", "", ".", "..", ".hidden"] {
+        for bad in [
+            "../escaped",
+            "sub/nested",
+            "/absolute",
+            "",
+            ".",
+            "..",
+            ".hidden",
+        ] {
             assert!(
                 request_unpark(dir.path(), bad).is_err(),
                 "{bad:?} was accepted as a task id"

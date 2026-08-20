@@ -52,7 +52,10 @@ fn desired_state_rejects_illegal_state_reason_combinations() {
             "non-string-reason",
             "desired-state \"suspended\" reason=#true",
         ),
-        ("unknown-property", "desired-state \"running\" because=\"no\""),
+        (
+            "unknown-property",
+            "desired-state \"running\" because=\"no\"",
+        ),
         (
             "duplicate-reason",
             "desired-state \"suspended\" reason=\"one\" reason=\"two\"",
@@ -155,9 +158,7 @@ fn explicit_json_null_fields_are_rejected_instead_of_granting_default_behavior()
         write(
             tmp.path(),
             &format!("agents/h/{name}/agent.json"),
-            &format!(
-                r#"{{"identity":"{name}","host":"h",{lifecycle},"argv":["true"]}}"#
-            ),
+            &format!(r#"{{"identity":"{name}","host":"h",{lifecycle},"argv":["true"]}}"#),
         );
         let found = discover(tmp.path());
         assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
@@ -658,12 +659,12 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
 #[test]
 fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
     for (name, body) in [
-        (
-            "both",
-            r#"claude { prompt "go" }; codex { prompt "go" }"#,
-        ),
+        ("both", r#"claude { prompt "go" }; codex { prompt "go" }"#),
         ("missing-prompt", r#"claude { model "opus" }"#),
-        ("wrong-bool", r#"claude { dev-channels "yes"; prompt "go" }"#),
+        (
+            "wrong-bool",
+            r#"claude { dev-channels "yes"; prompt "go" }"#,
+        ),
         ("codex-dev", r#"codex { dev-channels #true; prompt "go" }"#),
         ("unknown", r#"claude { presence #true; prompt "go" }"#),
     ] {
@@ -1036,10 +1037,7 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
             r#"resource "work" _tag="issue" uri="issue://example/1""#,
         ),
         ("missing-uri", r#"resource "work""#),
-        (
-            "relative-uri",
-            r#"resource "work" uri="./issue/1""#,
-        ),
+        ("relative-uri", r#"resource "work" uri="./issue/1""#),
         (
             "policy",
             r#"resource "work" uri="issue://example/1" required=#true"#,
@@ -1766,4 +1764,81 @@ fn only_contextually_reserved_namespaces_are_ignored() {
         found.specs.iter().all(|spec| spec.identity != "excluded"),
         "reserved control/state namespaces must not become declarations"
     );
+}
+
+#[test]
+fn streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  command "agent"
+  stream "external" {}
+  stream "shell" { command "watch-ci" }
+  stream "direct" { argv "watch" "--json" }
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let spec = find(&found.specs, "worker");
+    assert_eq!(
+        spec.streams
+            .iter()
+            .map(|stream| stream.name.as_str())
+            .collect::<Vec<_>>(),
+        ["direct", "external", "shell"]
+    );
+    assert!(spec.tasks.iter().all(|task| task.name != "stream-external"));
+    let direct = spec
+        .tasks
+        .iter()
+        .find(|task| task.name == "stream-direct")
+        .unwrap();
+    assert_eq!(direct.kind, TaskKind::Exec);
+    assert!(direct.derived);
+    assert_eq!(argv(direct), ["watch", "--json"]);
+    let shell = spec
+        .tasks
+        .iter()
+        .find(|task| task.name == "stream-shell")
+        .unwrap();
+    assert_eq!(shell.command.as_deref(), Some("watch-ci"));
+}
+
+#[test]
+fn stream_names_launches_and_task_collisions_fail_closed() {
+    for (identity, body, expected) in [
+        (
+            "both",
+            "stream \"x\" { command \"a\"; argv \"b\" }",
+            "at most one",
+        ),
+        (
+            "every",
+            "stream \"x\" { every \"1m\" }",
+            "reserved for the future",
+        ),
+        ("bad-name", "stream \"Bad\" {}", "must match"),
+        (
+            "collision",
+            "stream \"x\" { command \"a\" }; exec \"stream-x\" { command \"b\" }",
+            "declares both",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; command \"agent\"; {body} }}"),
+        );
+        let found = discover(tmp.path());
+        assert_eq!(found.errors.len(), 1, "{identity}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{identity}: {:?}",
+            found.errors
+        );
+    }
 }

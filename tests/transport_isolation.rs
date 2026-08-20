@@ -63,7 +63,8 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (catalog, xdg, pty_root) = (root.join("catalog"), root.join("xdg"), root.join("ptyroot"));
+        let (catalog, xdg, pty_root) =
+            (root.join("catalog"), root.join("xdg"), root.join("ptyroot"));
         for d in [&catalog, &xdg, &pty_root] {
             std::fs::create_dir_all(d).unwrap();
         }
@@ -80,7 +81,9 @@ impl Fixture {
     /// One service agent whose single task is `kind` = "exec" | "pty".
     fn write_agent(&self, identity: &str, kind: &str) {
         if kind == "pty" {
-            self.pty_sessions.borrow_mut().push(format!("{HOST}.{identity}.task"));
+            self.pty_sessions
+                .borrow_mut()
+                .push(format!("{HOST}.{identity}.task"));
         }
         let kdl = format!(
             "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{HOST}\"\n  \
@@ -95,7 +98,12 @@ impl Fixture {
     /// daemon's pid (which owns the session). Both must survive the transport cascade.
     fn task_pidfile(&self, kind: &str, identity: &str) -> PathBuf {
         match kind {
-            "exec" => self.xdg.join("st2").join(HOST).join("exec").join(format!("{HOST}.{identity}.task.pid")),
+            "exec" => self
+                .xdg
+                .join("st2")
+                .join(HOST)
+                .join("exec")
+                .join(format!("{HOST}.{identity}.task.pid")),
             "pty" => self.pty_root.join(format!("{HOST}.{identity}.task.pid")),
             other => panic!("unknown task kind {other}"),
         }
@@ -145,7 +153,11 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let quiet = |args: &[&str]| {
-            let _ = Command::new("systemctl").args(args).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = Command::new("systemctl")
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         };
         // Stop only the transport scopes WE registered — never a broad `st2-<host>` sweep, which would
         // stop a concurrently-running sibling test's task scope (same host). The task scopes this
@@ -162,7 +174,12 @@ impl Drop for Fixture {
                     && let Some(pid) = read_pid(&e.path())
                 {
                     for t in [format!("-{pid}"), pid.to_string()] {
-                        let _ = Command::new("kill").arg("-KILL").arg(t).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                        let _ = Command::new("kill")
+                            .arg("-KILL")
+                            .arg(t)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
                     }
                 }
             }
@@ -207,13 +224,23 @@ fn read_alive(pidfile: &Path) -> bool {
 
 /// A pid's cgroup line (`0::/…`), or empty if unreadable.
 fn cgroup_of(pid: i32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default().trim().to_string()
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// The live pids inside a scope's cgroup (empty once the scope is drained/gone).
 fn scope_pids(unit: &str) -> Vec<i32> {
     let out = match Command::new("systemctl")
-        .args(["--user", "show", &format!("{unit}.scope"), "-p", "ControlGroup", "--value"])
+        .args([
+            "--user",
+            "show",
+            &format!("{unit}.scope"),
+            "-p",
+            "ControlGroup",
+            "--value",
+        ])
         .output()
     {
         Ok(o) => o,
@@ -248,7 +275,13 @@ fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 /// is untouched — which is the whole point.
 fn cascade_kill_scope(unit: &str) {
     let ok = Command::new("systemctl")
-        .args(["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", &format!("{unit}.scope")])
+        .args([
+            "--user",
+            "kill",
+            "--kill-whom=all",
+            "--signal=SIGKILL",
+            &format!("{unit}.scope"),
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -256,7 +289,13 @@ fn cascade_kill_scope(unit: &str) {
 }
 
 fn have(bin: &str, args: &[&str]) -> bool {
-    Command::new(bin).args(args).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+    Command::new(bin)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// This gate needs `systemd-run`/`systemctl --user` (the isolation mechanism) AND `pty` on PATH (the
@@ -264,7 +303,8 @@ fn have(bin: &str, args: &[&str]) -> bool {
 /// UNPROVEN — a HARD FAILURE, never a silent green skip, unless a dev explicitly opts out with
 /// `ST2_ALLOW_ISOLATION_SKIP` on a box without them. CI/gating MUST provide both.
 fn isolation_gate(test: &str) -> bool {
-    let systemd = have("systemd-run", &["--user", "--version"]) && std::env::var_os("XDG_RUNTIME_DIR").is_some();
+    let systemd = have("systemd-run", &["--user", "--version"])
+        && std::env::var_os("XDG_RUNTIME_DIR").is_some();
     let pty = have("pty", &["--help"]);
     if systemd && pty {
         return true;
@@ -301,7 +341,8 @@ fn task_survives_transport_cgroup_cascade(kind: &str) {
     let _tr = Handle(fx.spawn_transport(&transport));
     let task_pidfile = fx.task_pidfile(kind, &identity);
     assert!(
-        poll_until(SPAWN_TIMEOUT, || read_alive(&task_pidfile) && !scope_pids(&transport).is_empty()),
+        poll_until(SPAWN_TIMEOUT, || read_alive(&task_pidfile)
+            && !scope_pids(&transport).is_empty()),
         "st2 up --once never brought up a live task (task pidfile {})",
         task_pidfile.display()
     );
@@ -324,7 +365,10 @@ fn task_survives_transport_cgroup_cascade(kind: &str) {
         cgroup_of(task_pid)
     );
     // The control (a naive `sleep`) is live in the transport cgroup right now.
-    assert!(!scope_pids(&transport).is_empty(), "transport scope unexpectedly empty before the cascade");
+    assert!(
+        !scope_pids(&transport).is_empty(),
+        "transport scope unexpectedly empty before the cascade"
+    );
 
     // 3) Fire the cascade: SIGKILL the transport scope's cgroup — the supervisor-restart failure
     //    restart (its SIGTERM would be trapped by a supervisor; the SIGKILL escalation is what kills).

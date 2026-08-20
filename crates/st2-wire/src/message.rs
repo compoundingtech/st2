@@ -34,7 +34,11 @@ pub struct MessageRow {
     pub tags: Vec<String>,
     pub priority: Option<String>,
     /// The caller's optional operation identity for exact retry semantics.
-    #[serde(rename = "idempotencyKey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "idempotencyKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idempotency_key: Option<String>,
     /// The markdown body.
     ///
@@ -71,7 +75,11 @@ pub struct SentMessageRow {
     #[serde(default)]
     pub tags: Vec<String>,
     pub priority: Option<String>,
-    #[serde(rename = "idempotencyKey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "idempotencyKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -205,7 +213,9 @@ mod tests {
         );
 
         let indexed = SentMessages {
-            coverage: SentCoverage::Since { since: 1_785_000_000_000 },
+            coverage: SentCoverage::Since {
+                since: 1_785_000_000_000,
+            },
             messages: vec![SentMessageRow {
                 filename: "1785000000000-abcdef.md".to_string(),
                 ts: 1_785_000_000_000,

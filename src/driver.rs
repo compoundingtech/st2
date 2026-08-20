@@ -48,10 +48,7 @@ fn expand_codex(driver: &CodexDriver, bus_id: &str) -> KdlDocument {
         provider.extend(["--model".to_string(), model.clone()]);
     }
     if let Some(effort) = &driver.effort {
-        provider.extend([
-            "-c".to_string(),
-            format!("model_reasoning_effort={effort}"),
-        ]);
+        provider.extend(["-c".to_string(), format!("model_reasoning_effort={effort}")]);
     }
     provider.extend(driver.args.iter().cloned());
     provider.push(driver.prompt.clone());
@@ -163,6 +160,7 @@ mod tests {
             delivery: None,
             driver: Some(driver),
             resources: Vec::new(),
+            streams: Vec::new(),
             tasks: Vec::new(),
             path: PathBuf::from("/catalog/agents/host/worker/agent.kdl"),
         }

@@ -1110,9 +1110,15 @@ pub fn grant_unpark_requests(cap: &mut FlappingCap, request_dir: &Path, report: 
 ///
 /// Supervisor loops only, for the same reason as [`grant_unpark_requests`]: publishing an empty
 /// one-shot cap would wipe the running supervisor's projection and hide every live park.
-pub fn publish_parks(cap: &FlappingCap, projection: &crate::park::ParkProjection, report: &mut UpReport) {
+pub fn publish_parks(
+    cap: &FlappingCap,
+    projection: &crate::park::ParkProjection,
+    report: &mut UpReport,
+) {
     let parked: std::collections::BTreeSet<String> = cap.parked_ids().cloned().collect();
-    report.errors.extend(projection.publish(&parked, PARK_REASON));
+    report
+        .errors
+        .extend(projection.publish(&parked, PARK_REASON));
 }
 
 /// A supervisor loop's end of the park channel: the projection it publishes and the request dir it
@@ -1135,7 +1141,10 @@ impl ParkChannel {
                 eprintln!(
                     "st2: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
                 );
-                return Self { projection: None, request_dir: None };
+                return Self {
+                    projection: None,
+                    request_dir: None,
+                };
             }
         };
         let projection = match crate::park::ParkProjection::current(scope.park_dir()) {
@@ -1147,7 +1156,10 @@ impl ParkChannel {
                 None
             }
         };
-        Self { projection, request_dir: Some(scope.unpark_request_dir()) }
+        Self {
+            projection,
+            request_dir: Some(scope.unpark_request_dir()),
+        }
     }
 
     fn grant_requests(&self, cap: &mut FlappingCap, report: &mut UpReport) {
@@ -1189,9 +1201,9 @@ fn stop_live_derived_companions(
     for companion_id in &launch.live_derived {
         match runner.kill(companion_id) {
             Ok(()) => report.torn_down.push(companion_id.clone()),
-            Err(error) => report
-                .errors
-                .push(format!("kill unavailable derived companion {companion_id}: {error}")),
+            Err(error) => report.errors.push(format!(
+                "kill unavailable derived companion {companion_id}: {error}"
+            )),
         }
     }
 }
@@ -2080,7 +2092,8 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         );
         return;
     };
-    let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host) else {
+    let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
+    else {
         eprintln!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id
@@ -2283,6 +2296,7 @@ mod tests {
             delivery: None,
             driver: None,
             resources: vec![],
+            streams: Vec::new(),
             tasks: vec![Task {
                 kind: TaskKind::Pty,
                 derived: false,
@@ -2334,6 +2348,7 @@ mod tests {
             delivery: None,
             driver: None,
             resources: vec![],
+            streams: Vec::new(),
             tasks: vec![Task {
                 kind: TaskKind::Pty,
                 derived: false,
@@ -2592,6 +2607,7 @@ mod tests {
             delivery: None,
             driver: None,
             resources: vec![],
+            streams: Vec::new(),
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }
@@ -2734,12 +2750,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || Ok(()),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || Ok(()));
 
         assert_eq!(
             plan.launch
@@ -2768,12 +2779,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || panic!("an already-live Codex agent must not enter the hook gate"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            panic!("an already-live Codex agent must not enter the hook gate")
+        });
 
         assert_eq!(plan.adopt, [&spec]);
         assert_eq!(plan.launch.len(), 1);
@@ -2805,12 +2813,9 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_codex_launches_on_hooks(
-            &mut plan,
-            Path::new("/catalog"),
-            &mut report,
-            || anyhow::bail!("stale receipt"),
-        );
+        gate_codex_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+            anyhow::bail!("stale receipt")
+        });
 
         assert_eq!(
             plan.launch
@@ -2866,19 +2871,14 @@ mod tests {
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "codex");
         t.bus_id = "hetz.demo".to_owned();
-        t.tags.insert("unrelated".to_owned(), "preserved".to_owned());
+        t.tags
+            .insert("unrelated".to_owned(), "preserved".to_owned());
         t.presentation = Some(PtyPresentation {
             pty_id: "hetz.demo".to_owned(),
             display_name: Some(Some("Build owner".to_owned())),
             tags: BTreeMap::from([
-                (
-                    "agent.presentation.schema".to_owned(),
-                    Some("1".to_owned()),
-                ),
-                (
-                    "agent.actor.path".to_owned(),
-                    Some("hetz.demo".to_owned()),
-                ),
+                ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
+                ("agent.actor.path".to_owned(), Some("hetz.demo".to_owned())),
                 (
                     "agent.presentation.description".to_owned(),
                     Some(format!("${key}")),
@@ -2924,10 +2924,7 @@ mod tests {
             pty_id: "stable.agent.id".to_owned(),
             display_name: Some(None),
             tags: BTreeMap::from([
-                (
-                    "agent.presentation.schema".to_owned(),
-                    Some("1".to_owned()),
-                ),
+                ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
                 ("agent.presentation.description".to_owned(), None),
             ]),
         };
@@ -2938,10 +2935,9 @@ mod tests {
             std::fs::read_to_string(executable.with_extension("args")).unwrap(),
             "metadata\npatch\n--id\nstable.agent.id\n"
         );
-        let payload: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(executable.with_extension("stdin")).unwrap(),
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(executable.with_extension("stdin")).unwrap())
+                .unwrap();
         assert_eq!(payload["displayName"], serde_json::Value::Null);
         assert_eq!(payload["tags"]["agent.presentation.schema"], "1");
         assert_eq!(
@@ -3113,7 +3109,10 @@ mod tests {
         use std::os::fd::{FromRawFd as _, OwnedFd};
 
         let mut pipe_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         let reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
         let pipe = std::fs::read_link(format!("/proc/self/fd/{}", reader.as_raw_fd())).unwrap();
@@ -3147,7 +3146,10 @@ mod tests {
         use std::os::fd::{FromRawFd as _, OwnedFd};
 
         let mut pipe_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         let _reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
 
@@ -3722,7 +3724,10 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         let presentation = sessions[0].presentation.as_ref().unwrap();
         assert_eq!(presentation.display_name.as_deref(), Some("Build owner"));
         assert_eq!(
-            presentation.tags.get("agent.presentation.schema").map(String::as_str),
+            presentation
+                .tags
+                .get("agent.presentation.schema")
+                .map(String::as_str),
             Some("1")
         );
         assert_eq!(

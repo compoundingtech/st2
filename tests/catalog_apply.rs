@@ -412,10 +412,9 @@ fn apply_input_fence_survives_source_free_crash_resume() {
         .output()
         .unwrap();
     assert!(!interrupted.status.success());
-    let marker: Value = serde_json::from_slice(
-        &fs::read(catalog.join(".st2/catalog-apply-incomplete")).unwrap(),
-    )
-    .unwrap();
+    let marker: Value =
+        serde_json::from_slice(&fs::read(catalog.join(".st2/catalog-apply-incomplete")).unwrap())
+            .unwrap();
     assert_eq!(marker["preparedRootSha256"], input_sha256);
     fs::remove_dir_all(&prepared).unwrap();
 
@@ -459,11 +458,7 @@ fn bootstrap_atomically_publishes_an_absent_catalog_and_replays_exactly() {
     let captured = snapshot(&source, &prepared);
     let target = temp.path().join("target");
 
-    let first = bootstrap(
-        &target,
-        &prepared,
-        captured["rootSha256"].as_str().unwrap(),
-    );
+    let first = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
     assert!(
         first.status.success(),
         "{}",
@@ -487,11 +482,7 @@ fn bootstrap_atomically_publishes_an_absent_catalog_and_replays_exactly() {
         "state survives replay",
     )
     .unwrap();
-    let replay = bootstrap(
-        &target,
-        &prepared,
-        captured["rootSha256"].as_str().unwrap(),
-    );
+    let replay = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
     assert!(
         replay.status.success(),
         "{}",
@@ -500,10 +491,8 @@ fn bootstrap_atomically_publishes_an_absent_catalog_and_replays_exactly() {
     let replay: Value = serde_json::from_slice(&replay.stdout).unwrap();
     assert_eq!(replay["status"], "unchanged");
     assert_eq!(
-        fs::read_to_string(
-            agent_dir(&target, "worker").join("resources/inbox/message.md")
-        )
-        .unwrap(),
+        fs::read_to_string(agent_dir(&target, "worker").join("resources/inbox/message.md"))
+            .unwrap(),
         "state survives replay"
     );
 }
@@ -528,11 +517,7 @@ fn bootstrap_rejects_a_different_existing_catalog_without_mutation() {
     assert!(created.status.success());
     let before = fs::read_to_string(agent_dir(&target, "incumbent").join("agent.kdl")).unwrap();
 
-    let rejected = bootstrap(
-        &target,
-        &prepared,
-        captured["rootSha256"].as_str().unwrap(),
-    );
+    let rejected = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("already exists with root sha256"),
@@ -575,11 +560,7 @@ fn bootstrap_requires_an_explicit_external_pty_root_before_publication() {
         assert!(captured.status.success());
         let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
         let target = temp.path().join(format!("target-{case}"));
-        let rejected = bootstrap(
-            &target,
-            &prepared,
-            captured["rootSha256"].as_str().unwrap(),
-        );
+        let rejected = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
         assert!(!rejected.status.success());
         assert!(!target.exists());
         let stderr = String::from_utf8_lossy(&rejected.stderr);
@@ -696,7 +677,7 @@ fn bootstrap_crash_boundaries_replay_from_absent_or_complete_only() {
         .env(
             "ST2_TEST_CATALOG_BOOTSTRAP_CRASH_AT",
             "after-publish-before-parent-sync",
-    )
+        )
         .output()
         .unwrap();
     assert!(!after.status.success());
@@ -837,11 +818,7 @@ fn bootstrap_never_touches_the_external_pty_root() {
     let prepared = temp.path().join("prepared");
     let captured = snapshot(&source, &prepared);
     let target = temp.path().join("target");
-    let output = bootstrap(
-        &target,
-        &prepared,
-        captured["rootSha256"].as_str().unwrap(),
-    );
+    let output = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
     assert!(output.status.success());
     assert_eq!(
         fs::read_to_string(pty_root.join("sentinel")).unwrap(),
@@ -881,11 +858,7 @@ fn bootstrap_composes_with_the_next_root_cas_apply_generation() {
     let prepared = temp.path().join("prepared");
     let captured = snapshot(&source, &prepared);
     let target = temp.path().join("target");
-    let created = bootstrap(
-        &target,
-        &prepared,
-        captured["rootSha256"].as_str().unwrap(),
-    );
+    let created = bootstrap(&target, &prepared, captured["rootSha256"].as_str().unwrap());
     assert!(created.status.success());
 
     let update = temp.path().join("update");
@@ -895,11 +868,7 @@ fn bootstrap_composes_with_the_next_root_cas_apply_generation() {
         "agent \"worker\" { host \"host\"; role \"updated\"; argv \"true\" }\n",
     )
     .unwrap();
-    let applied = apply(
-        &target,
-        &update,
-        before["rootSha256"].as_str().unwrap(),
-    );
+    let applied = apply(&target, &update, before["rootSha256"].as_str().unwrap());
     assert!(
         applied.status.success(),
         "{}",
@@ -1366,13 +1335,13 @@ fn raw_preimage_refuses_valid_catalogs_and_wrong_cas_without_declaration_writes(
         "unfinished writer bytes"
     );
     assert!(!invalid.join(".st2/catalog-apply-incomplete").exists());
-    assert!(fs::read_dir(invalid.join(".st2"))
-        .unwrap()
-        .all(|entry| !entry
+    assert!(fs::read_dir(invalid.join(".st2")).unwrap().all(|entry| {
+        !entry
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with("catalog-apply-stage-")));
+            .starts_with("catalog-apply-stage-")
+    }));
 }
 
 #[test]
@@ -1394,13 +1363,12 @@ fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
     let malformed_envelope = temp.path().join("malformed-envelope");
     write_invalid_agent(&malformed_envelope, "worker");
     fs::write(malformed_envelope.join("catalog.kdl"), "catalog {").unwrap();
-    let rejected = raw_snapshot(
-        &malformed_envelope,
-        &temp.path().join("malformed-capture"),
-    );
+    let rejected = raw_snapshot(&malformed_envelope, &temp.path().join("malformed-capture"));
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr)
-        .contains("requires a valid incumbent catalog envelope"));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("requires a valid incumbent catalog envelope")
+    );
 
     let catalog = temp.path().join("catalog");
     write_invalid_agent(&catalog, "worker");
@@ -1425,8 +1393,9 @@ fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
         raw_capture["rootSha256"].as_str().unwrap(),
     );
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr)
-        .contains("refuses an effective pty-root change"));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("refuses an effective pty-root change")
+    );
     assert_eq!(
         fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
         declaration

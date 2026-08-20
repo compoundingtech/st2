@@ -4,15 +4,6 @@ Each entry links a spec `DQ-S*`. Questions leave this file when resolved —
 into [spec.md](./spec.md) as decisions or [`.experiments/`](./.experiments/)
 as tested hypotheses.
 
-- **DQ-S1 Producer-identity grammar.** What exact `from` value does a nested
-  stream's event carry? Candidates: `<host>.<agent>/<stream>` (slash keeps the
-  bus-ID grammar unambiguous) vs `<host>.<agent>.<stream>` (collides with the
-  task runtime-ID grammar). Resolves by: checking every existing `from`
-  consumer (DING marker resolution, roster joins, message filters) against
-  both grammars; the one no consumer misparses wins.
-- **DQ-S2 Stream state path.** Where the dedup ring and supersession heads
-  live under the owner's resources (`resources/streams/<name>/` proposed).
-  Resolves during implementation with the state-namespace conventions of R02.
 - **DQ-S3 Ring bound.** `K = 128` is a guess. Resolves by: measuring real
   adapter emit rates (CI flaps, timer sources) against replay windows; the
   bound must exceed the longest plausible producer retry horizon.

@@ -102,18 +102,8 @@ fn codex_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
         tmp.path()
     ));
 
-    compile_generated_tasks(
-        std::slice::from_mut(&mut legacy),
-        "h",
-        &compile_context,
-    )
-    .unwrap();
-    compile_generated_tasks(
-        std::slice::from_mut(&mut driver),
-        "h",
-        &compile_context,
-    )
-    .unwrap();
+    compile_generated_tasks(std::slice::from_mut(&mut legacy), "h", &compile_context).unwrap();
+    compile_generated_tasks(std::slice::from_mut(&mut driver), "h", &compile_context).unwrap();
 
     let legacy_task = legacy
         .tasks

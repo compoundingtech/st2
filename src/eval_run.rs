@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -16,9 +16,9 @@ use crate::eval_spec::{
 };
 use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
-use crate::reconcile::{TaskCompileContext, compile_generated_tasks, reconcile};
 #[cfg(test)]
 use crate::reconcile::compile_generated_ding_tasks;
+use crate::reconcile::{TaskCompileContext, compile_generated_tasks, reconcile};
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
 use agent_spec::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
@@ -39,17 +39,25 @@ fn install_eval_signal_handlers() -> (libc::sighandler_t, libc::sighandler_t) {
     // libc exposes sighandler_t as a numeric ABI token on some targets.
     #[allow(clippy::fn_to_numeric_cast, function_casts_as_integer)]
     unsafe {
-        (libc::signal(libc::SIGINT, on_eval_signal as libc::sighandler_t), libc::signal(libc::SIGTERM, on_eval_signal as libc::sighandler_t))
+        (
+            libc::signal(libc::SIGINT, on_eval_signal as libc::sighandler_t),
+            libc::signal(libc::SIGTERM, on_eval_signal as libc::sighandler_t),
+        )
     }
 }
 
 fn restore_eval_signal_handlers(previous: (libc::sighandler_t, libc::sighandler_t)) {
-    unsafe { libc::signal(libc::SIGINT, previous.0); libc::signal(libc::SIGTERM, previous.1); }
+    unsafe {
+        libc::signal(libc::SIGINT, previous.0);
+        libc::signal(libc::SIGTERM, previous.1);
+    }
 }
 
 struct EvalSignalGuard((libc::sighandler_t, libc::sighandler_t));
 impl Drop for EvalSignalGuard {
-    fn drop(&mut self) { restore_eval_signal_handlers(self.0); }
+    fn drop(&mut self) {
+        restore_eval_signal_handlers(self.0);
+    }
 }
 
 /// Map a parsed spec's agents into in-memory [`AgentSpec`]s rooted at `root` (which becomes `$CATALOG`
@@ -122,6 +130,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 delivery: None,
                 driver: None,
                 resources: Vec::new(),
+                streams: Vec::new(),
                 tasks,
                 path: path.clone(),
             }
@@ -302,8 +311,7 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             }
         }
     }
-    let materialized =
-        crate::materialize::materialize_catalog(catalog, &local_specs, host);
+    let materialized = crate::materialize::materialize_catalog(catalog, &local_specs, host);
     if !materialized.errors.is_empty() {
         anyhow::bail!(
             "canonical eval Agent Spec materialization failed: {}",
@@ -381,8 +389,10 @@ fn eval_exit_code(catalog: &Path, identity: &str) -> Option<i64> {
 /// `ANTHROPIC_*` (API creds) is deliberately kept — only the per-session identity is stripped.
 fn sanitize_agent_env() {
     let should_strip = |k: &str| {
-        matches!(k, "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "AI_AGENT")
-            || k.starts_with("CLAUDE_CODE_")
+        matches!(
+            k,
+            "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "AI_AGENT"
+        ) || k.starts_with("CLAUDE_CODE_")
             || k.starts_with("CODEX_")
     };
     let victims: Vec<String> = std::env::vars_os()
@@ -449,7 +459,11 @@ pub fn resolve_spec_path(path: &Path) -> Option<PathBuf> {
             .collect();
         if let [one] = kdls.as_slice() {
             // Confirm it parses as a spec (vs a stray .kdl in a catalog dir).
-            if std::fs::read_to_string(one).ok().and_then(|t| parse_spec(&t).ok()).is_some() {
+            if std::fs::read_to_string(one)
+                .ok()
+                .and_then(|t| parse_spec(&t).ok())
+                .is_some()
+            {
                 return Some(one.clone());
             }
         }
@@ -528,12 +542,17 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let from = entry.path();
         let name = entry.file_name();
-        let dst_name = if name == "_git" { std::ffi::OsString::from(".git") } else { name };
+        let dst_name = if name == "_git" {
+            std::ffi::OsString::from(".git")
+        } else {
+            name
+        };
         let to = dst.join(&dst_name);
         if entry.file_type()?.is_dir() {
             copy_tree(&from, &to)?;
         } else {
-            std::fs::copy(&from, &to).with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
         }
     }
     Ok(())
@@ -552,7 +571,8 @@ fn bus_root(spec: &Spec, catalog: &Path) -> PathBuf {
 fn resolve_content(content: &str, spec_dir: &Path) -> Result<String> {
     let candidate = spec_dir.join(content);
     if candidate.is_file() {
-        std::fs::read_to_string(&candidate).with_context(|| format!("reading kickoff content {}", candidate.display()))
+        std::fs::read_to_string(&candidate)
+            .with_context(|| format!("reading kickoff content {}", candidate.display()))
     } else {
         Ok(content.to_string())
     }
@@ -585,10 +605,7 @@ fn wait_done(
             let route = admitted_route(routes, sup);
             (route.inbox.clone(), route.archive.clone())
         }
-        None => (
-            bus.join(sup).join("inbox"),
-            bus.join(sup).join("archive"),
-        ),
+        None => (bus.join(sup).join("inbox"), bus.join(sup).join("archive")),
     };
     // The requester is eval-owned, not an admitted Agent Spec, and deliberately keeps one explicit
     // flat mailbox. Every canonical agent route above comes from the frozen admitted vector.
@@ -658,8 +675,16 @@ fn boot_gate(task_ids: &[String], specs: &[AgentSpec], host: &str, catalog: &Pat
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let sessions = runner.list_sessions().unwrap_or_default();
-        let alive: HashSet<&str> = sessions.iter().filter(|s| s.alive).map(|s| s.pty_id.as_str()).collect();
-        let dead: Vec<&str> = want.iter().copied().filter(|id| !alive.contains(id)).collect();
+        let alive: HashSet<&str> = sessions
+            .iter()
+            .filter(|s| s.alive)
+            .map(|s| s.pty_id.as_str())
+            .collect();
+        let dead: Vec<&str> = want
+            .iter()
+            .copied()
+            .filter(|id| !alive.contains(id))
+            .collect();
         if dead.is_empty() {
             return Ok(());
         }
@@ -716,12 +741,7 @@ fn message_timestamp(filename: &str) -> Result<u64> {
 /// team-standup specialist the CoS spun up mid-run). Declared teardown only reaps declared tasks, so
 /// a runtime task would leak as an orphan; since the PTY_ROOT is hermetic to this eval, anything still
 /// alive is ours to clean. Killing an already-dead declared session is a harmless no-op.
-fn teardown_team_with_runner(
-    specs: &[AgentSpec],
-    host: &str,
-    runner: &dyn Runner,
-    reap_all: bool,
-) {
+fn teardown_team_with_runner(specs: &[AgentSpec], host: &str, runner: &dyn Runner, reap_all: bool) {
     let retired: Vec<AgentSpec> = specs
         .iter()
         .cloned()
@@ -737,9 +757,7 @@ fn teardown_team_with_runner(
         let mut cap = FlappingCap::default();
         execute(&plan, runner, &mut cap, &mut report);
     }
-    if reap_all
-        && let Ok(remaining) = runner.list_sessions()
-    {
+    if reap_all && let Ok(remaining) = runner.list_sessions() {
         for s in &remaining {
             let _ = runner.kill(&s.pty_id);
             let _ = runner.remove(&s.pty_id);
@@ -760,17 +778,27 @@ pub fn run_eval(spec_file: &Path, host: Option<String>, keep: bool) -> Result<Ev
     let _signal_guard = EvalSignalGuard(install_eval_signal_handlers());
     let (spec, spec_dir) = load_spec(spec_file)?;
     let eval = spec.eval.clone().ok_or_else(|| {
-        anyhow::anyhow!("{} has no `eval {{}}` block — use `st2 up` to just boot the team", spec_file.display())
+        anyhow::anyhow!(
+            "{} has no `eval {{}}` block — use `st2 up` to just boot the team",
+            spec_file.display()
+        )
     })?;
     // --host (explicit) › the spec's top-level `host` › the OS hostname.
-    let host = host.or_else(|| spec.host.clone()).unwrap_or_else(detect_host);
+    let host = host
+        .or_else(|| spec.host.clone())
+        .unwrap_or_else(detect_host);
 
     // Hermetic temp catalog + PTY_ROOT. Setting PTY_ROOT OVERRIDES any inherited ambient, so eval
     // sessions can NEVER leak into a live/prod pty registry (isolation by construction).
     let catalog = std::env::temp_dir().join(format!("st2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&catalog);
     std::fs::create_dir_all(&catalog)?;
-    let _guard = EvalCleanupGuard { runner: SystemRunner::new(catalog.clone(), catalog.join("exec")), catalog: catalog.clone(), host: host.clone(), keep };
+    let _guard = EvalCleanupGuard {
+        runner: SystemRunner::new(catalog.clone(), catalog.join("exec")),
+        catalog: catalog.clone(),
+        host: host.clone(),
+        keep,
+    };
     // SAFETY: st2 eval is single-threaded up to the boot; set before any seat spawns.
     unsafe { std::env::set_var("PTY_ROOT", catalog.join("pty")) };
     // Root exec-task state under the catalog too, so ANY st2 sub-invocation spawned INSIDE the eval — a
@@ -810,15 +838,28 @@ fn reap_all_eval_sessions_with_runner<R: Runner>(runner: &R, host: &str) -> Resu
     let _host = host;
     let mut last_error = None;
     for _ in 0..5 {
-        let sessions = runner.list_sessions().with_context(|| format!("listing eval sessions for host {host}"))?;
-        if sessions.is_empty() { return Ok(()); }
+        let sessions = runner
+            .list_sessions()
+            .with_context(|| format!("listing eval sessions for host {host}"))?;
+        if sessions.is_empty() {
+            return Ok(());
+        }
         for session in sessions {
-            if session.alive && let Err(error) = runner.kill(&session.pty_id) { last_error = Some(format!("kill {}: {error:#}", session.pty_id)); }
-            if let Err(error) = runner.remove(&session.pty_id) { last_error = Some(format!("remove {}: {error:#}", session.pty_id)); }
+            if session.alive
+                && let Err(error) = runner.kill(&session.pty_id)
+            {
+                last_error = Some(format!("kill {}: {error:#}", session.pty_id));
+            }
+            if let Err(error) = runner.remove(&session.pty_id) {
+                last_error = Some(format!("remove {}: {error:#}", session.pty_id));
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    anyhow::bail!("eval session reap did not reach empty state on host {host}; last error: {}", last_error.unwrap_or_else(|| "none".into()))
+    anyhow::bail!(
+        "eval session reap did not reach empty state on host {host}; last error: {}",
+        last_error.unwrap_or_else(|| "none".into())
+    )
 }
 
 fn reap_all_eval_sessions(catalog: &Path, host: &str) -> Result<()> {
@@ -828,15 +869,25 @@ fn reap_all_eval_sessions(catalog: &Path, host: &str) -> Result<()> {
 
 /// Idempotent safety net for eval catalog lifetime. Normal teardown remains responsible for
 /// sessions; this guard ensures an unwind cannot strand the hermetic catalog on disk.
-struct EvalCleanupGuard<R: Runner> { runner: R, catalog: PathBuf, host: String, keep: bool }
+struct EvalCleanupGuard<R: Runner> {
+    runner: R,
+    catalog: PathBuf,
+    host: String,
+    keep: bool,
+}
 impl<R: Runner> Drop for EvalCleanupGuard<R> {
     fn drop(&mut self) {
         let reap = reap_all_eval_sessions_with_runner(&self.runner, &self.host);
         if let Err(error) = reap {
-            eprintln!("st2 eval cleanup: {error:#}; preserving catalog {}", self.catalog.display());
+            eprintln!(
+                "st2 eval cleanup: {error:#}; preserving catalog {}",
+                self.catalog.display()
+            );
             return;
         }
-        if !self.keep { let _ = std::fs::remove_dir_all(&self.catalog); }
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.catalog);
+        }
     }
 }
 
@@ -882,8 +933,11 @@ fn run_steps(
             Some(w) => catalog.join(expand_catalog(w, catalog)),
             None => catalog.to_path_buf(),
         };
-        let (attempts, backoff) =
-            step.retry.as_ref().map(|r| (r.attempts.max(1), r.delay)).unwrap_or((1, Duration::ZERO));
+        let (attempts, backoff) = step
+            .retry
+            .as_ref()
+            .map(|r| (r.attempts.max(1), r.delay))
+            .unwrap_or((1, Duration::ZERO));
 
         let mut exit = -1;
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -927,7 +981,16 @@ fn run_steps(
         combined.extend_from_slice(&err);
         let _ = std::fs::write(logs_dir.join(format!("{}.log", step.id)), &combined);
         runtime.insert(format!("RUN_{}_EXIT", env_key(&step.id)), exit.to_string());
-        eval_log!("== run step {} → exit {}{} ==", step.id, exit, if step.allow_nonzero { " (allow-nonzero)" } else { "" });
+        eval_log!(
+            "== run step {} → exit {}{} ==",
+            step.id,
+            exit,
+            if step.allow_nonzero {
+                " (allow-nonzero)"
+            } else {
+                ""
+            }
+        );
 
         if !step.allow_nonzero {
             // Default: a run step must succeed. A non-zero final exit hard-fails the verdict as a
@@ -972,7 +1035,9 @@ fn dump_agent_logs(pty_task_ids: &[String], catalog: &Path) {
 
 /// An env-var-safe form of a step id (non-alphanumerics → `_`), for `RUN_<id>_EXIT`.
 fn env_key(id: &str) -> String {
-    id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 /// The supervisor chain of `agent_id`, walked transitively via each agent's `supervisor` field to the
@@ -1041,7 +1106,11 @@ fn run_eval_inner(
     }
 
     let bus = bus_root(spec, catalog);
-    let requester = eval.message.as_ref().map(|m| m.from.clone()).unwrap_or_else(|| "eval-runner".to_string());
+    let requester = eval
+        .message
+        .as_ref()
+        .map(|m| m.from.clone())
+        .unwrap_or_else(|| "eval-runner".to_string());
 
     // The run{} stage runs to completion BEFORE judging — the WHOLE work of a team-less eval, or setup
     // before a team. must-exit-0 failures come back as failing synthetic judge results (folded into
@@ -1056,7 +1125,10 @@ fn run_eval_inner(
     let (done, specs, pty_task_ids) = if compact_agents.is_empty() && !eval.canonical_agents {
         // TEAM-LESS: nothing to boot, kick off, or wait on — the run steps did the work → straight to judging.
         if !eval.run_steps.is_empty() {
-            eval_log!("== team-less eval: {} run step(s) ran → judging ==", eval.run_steps.len());
+            eval_log!(
+                "== team-less eval: {} run step(s) ran → judging ==",
+                eval.run_steps.len()
+            );
         }
         (true, Vec::new(), Vec::new())
     } else {
@@ -1074,11 +1146,7 @@ fn run_eval_inner(
                 .iter()
                 .map(|spec| spec.bus_id(host))
                 .collect::<Vec<_>>();
-            (
-                team.specs,
-                participants,
-                Some(team.routes),
-            )
+            (team.specs, participants, Some(team.routes))
         } else {
             let specs = spec_to_agent_specs(&compact_agents, host, catalog);
             let participants = specs
@@ -1172,7 +1240,7 @@ fn run_eval_inner(
         });
         let kickoff_receipt =
             crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
-            .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
+                .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
         let kickoff_ts = eval
             .canonical_agents
             .then(|| message_timestamp(&kickoff_receipt))
@@ -1185,7 +1253,8 @@ fn run_eval_inner(
             .collect();
         eval_log!(
             "== waiting for {sup}→{} confirmation post-dating a worker report (≤{:?}) ==",
-            msg.from, eval.max_timeout
+            msg.from,
+            eval.max_timeout
         );
 
         // `supervise`: each wait tick, respawn any dead task FROM SPEC (full env → rejoins cold). Carry a
@@ -1213,10 +1282,8 @@ fn run_eval_inner(
                     // finish is as bad as a missed crash).
                     let report = match supervised_eval_sessions(&specs, host, &supervise_runner) {
                         Ok(sessions) => {
-                            let by_id: std::collections::HashMap<
-                                &str,
-                                &crate::reconcile::Session,
-                            > = sessions.iter().map(|s| (s.pty_id.as_str(), s)).collect();
+                            let by_id: std::collections::HashMap<&str, &crate::reconcile::Session> =
+                                sessions.iter().map(|s| (s.pty_id.as_str(), s)).collect();
                             for task in &runtime_tasks {
                                 let id = task.runtime_id.as_str();
                                 match by_id.get(id) {
@@ -1225,12 +1292,9 @@ fn run_eval_inner(
                                         dinged.remove(id); // healthy again → re-arm for a future crash
                                     }
                                     found => {
-                                        let clean =
-                                            matches!(found, Some(s) if s.exit_code == Some(0))
-                                                || eval_exit_code(catalog, id) == Some(0);
-                                        if ever_alive.contains(id)
-                                            && !clean
-                                            && !dinged.contains(id)
+                                        let clean = matches!(found, Some(s) if s.exit_code == Some(0))
+                                            || eval_exit_code(catalog, id) == Some(0);
+                                        if ever_alive.contains(id) && !clean && !dinged.contains(id)
                                         {
                                             crash_ding(
                                                 &task.agent_id,
@@ -1270,7 +1334,10 @@ fn run_eval_inner(
                         eval_log!("== supervise: launched {:?} from spec ==", report.launched);
                     }
                     if !report.restarted.is_empty() {
-                        eval_log!("== supervise: restarted {:?} from spec ==", report.restarted);
+                        eval_log!(
+                            "== supervise: restarted {:?} from spec ==",
+                            report.restarted
+                        );
                     }
                 }
             };
@@ -1294,7 +1361,10 @@ fn run_eval_inner(
         if done {
             eval_log!("== team signalled done — judging ==");
         } else {
-            eval_log!("== max-timeout: no confirmation within {:?} — judging the final state ==", eval.max_timeout);
+            eval_log!(
+                "== max-timeout: no confirmation within {:?} — judging the final state ==",
+                eval.max_timeout
+            );
         }
         (done, specs, pty_task_ids)
     };
@@ -1319,10 +1389,21 @@ fn run_eval_inner(
 
     // Judges: the run-step gate results first, then the declared judges (all must pass). Judge BEFORE
     // teardown — an ask-agent judge needs its judge agent still alive to answer.
-    judges.extend(run_judges(&eval.judges, spec_dir, catalog, &bus, &requester, &run_env));
+    judges.extend(run_judges(
+        &eval.judges,
+        spec_dir,
+        catalog,
+        &bus,
+        &requester,
+        &run_env,
+    ));
     // Under `supervise`, reap runtime-spawned tasks too (team-standup), not just the declared team.
     teardown_team(&specs, host, catalog, eval.supervise);
-    Ok(EvalReport { done, judges, timeout: eval.max_timeout })
+    Ok(EvalReport {
+        done,
+        judges,
+        timeout: eval.max_timeout,
+    })
 }
 
 // ── P4: the judge engine (all-must-pass; declarative / bash / ask-agent; per-judge timeout) ─────────
@@ -1345,10 +1426,19 @@ pub fn run_judges(
             let timeout = j.timeout.unwrap_or(default_timeout);
             let (passed, detail) = match &j.kind {
                 JudgeKind::Declarative(checks) => run_declarative(checks, catalog),
-                JudgeKind::Bash(cmd) => run_bash_judge(cmd, spec_dir, catalog, bus, timeout, run_env),
-                JudgeKind::Ask { agent, prompt } => run_ask_judge(agent, prompt, bus, requester, timeout),
+                JudgeKind::Bash(cmd) => {
+                    run_bash_judge(cmd, spec_dir, catalog, bus, timeout, run_env)
+                }
+                JudgeKind::Ask { agent, prompt } => {
+                    run_ask_judge(agent, prompt, bus, requester, timeout)
+                }
             };
-            JudgeResult { name: j.name.clone(), passed, detail, signal: j.signal }
+            JudgeResult {
+                name: j.name.clone(),
+                passed,
+                detail,
+                signal: j.signal,
+            }
         })
         .collect()
 }
@@ -1363,12 +1453,27 @@ fn run_declarative(checks: &[Check], catalog: &Path) -> (bool, String) {
             }
             Check::FileLacks { path, text } => {
                 let body = std::fs::read_to_string(catalog.join(path)).unwrap_or_default();
-                (!body.contains(text.as_str()), format!("{path} lacks {text:?}"))
+                (
+                    !body.contains(text.as_str()),
+                    format!("{path} lacks {text:?}"),
+                )
             }
             Check::JsonField { path, field, value } => {
-                let expected = match value { crate::eval_spec::JsonScalar::String(s) => serde_json::Value::String(s.clone()), crate::eval_spec::JsonScalar::Bool(b) => serde_json::Value::Bool(*b), crate::eval_spec::JsonScalar::Integer(i) => serde_json::Value::Number((*i).into()) };
-                let got = std::fs::read_to_string(catalog.join(path)).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v.get(field).cloned());
-                (got.as_ref() == Some(&expected), format!("{path} field {field} is {value:?} (got {got:?})"))
+                let expected = match value {
+                    crate::eval_spec::JsonScalar::String(s) => serde_json::Value::String(s.clone()),
+                    crate::eval_spec::JsonScalar::Bool(b) => serde_json::Value::Bool(*b),
+                    crate::eval_spec::JsonScalar::Integer(i) => {
+                        serde_json::Value::Number((*i).into())
+                    }
+                };
+                let got = std::fs::read_to_string(catalog.join(path))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| v.get(field).cloned());
+                (
+                    got.as_ref() == Some(&expected),
+                    format!("{path} field {field} is {value:?} (got {got:?})"),
+                )
             }
             Check::Committed { path } => {
                 let ok = is_committed_clean(catalog, path);
@@ -1391,11 +1496,21 @@ fn is_committed_clean(catalog: &Path, path: &str) -> bool {
         if dir.join(".git").exists() {
             let rel = target.strip_prefix(dir).unwrap_or(&target);
             let tracked = std::process::Command::new("git")
-                .arg("-C").arg(dir).args(["ls-files", "--error-unmatch"]).arg(rel)
-                .output().map(|o| o.status.success()).unwrap_or(false);
+                .arg("-C")
+                .arg(dir)
+                .args(["ls-files", "--error-unmatch"])
+                .arg(rel)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
             let clean = std::process::Command::new("git")
-                .arg("-C").arg(dir).args(["status", "--porcelain", "--"]).arg(rel)
-                .output().map(|o| o.stdout.is_empty()).unwrap_or(false);
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain", "--"])
+                .arg(rel)
+                .output()
+                .map(|o| o.stdout.is_empty())
+                .unwrap_or(false);
             return tracked && clean;
         }
         repo = dir.parent();
@@ -1419,8 +1534,9 @@ fn run_bash_judge(
     // `sh` reports the physical cwd on macOS (for example `/private/var/...`) even when tempfile
     // handed us its symlinked spelling (`/var/...`). Export the same physical path so `$SPEC_DIR`
     // remains a truthful explicit name for the judge's cwd on every platform.
-    let physical_spec_dir =
-        spec_dir.canonicalize().unwrap_or_else(|_| spec_dir.to_path_buf());
+    let physical_spec_dir = spec_dir
+        .canonicalize()
+        .unwrap_or_else(|_| spec_dir.to_path_buf());
     let mut command = Command::new("sh");
     command
         .arg("-c")
@@ -1443,7 +1559,12 @@ fn run_bash_judge(
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return (status.success(), format!("exit {}", status.code().unwrap_or(-1))),
+            Ok(Some(status)) => {
+                return (
+                    status.success(),
+                    format!("exit {}", status.code().unwrap_or(-1)),
+                );
+            }
             Ok(None) => {
                 if Instant::now() > deadline {
                     let _ = child.kill();
@@ -1458,10 +1579,18 @@ fn run_bash_judge(
 
 /// An ask-agent judge: message the judge agent the prompt, wait for its reply (post the ask) in the
 /// requester's inbox within the timeout, and read PASS/FAIL out of it.
-fn run_ask_judge(agent: &str, prompt: &str, bus: &Path, requester: &str, timeout: Duration) -> (bool, String) {
+fn run_ask_judge(
+    agent: &str,
+    prompt: &str,
+    bus: &Path,
+    requester: &str,
+    timeout: Duration,
+) -> (bool, String) {
     let ask_ts = now_ms();
     let to_inbox = bus.join(agent).join("inbox");
-    if let Err(e) = crate::message::send_to_inbox(&to_inbox, requester, Some("judge"), None, &[], prompt) {
+    if let Err(e) =
+        crate::message::send_to_inbox(&to_inbox, requester, Some("judge"), None, &[], prompt)
+    {
         return (false, format!("could not ask judge '{agent}': {e}"));
     }
     let req_inbox = bus.join(requester).join("inbox");
@@ -1481,7 +1610,10 @@ fn run_ask_judge(agent: &str, prompt: &str, bus: &Path, requester: &str, timeout
             };
         }
         if Instant::now() > deadline {
-            return (false, format!("judge '{agent}' did not reply within {timeout:?}"));
+            return (
+                false,
+                format!("judge '{agent}' did not reply within {timeout:?}"),
+            );
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -1559,7 +1691,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["evalhost.sup", "evalhost.worker"]
         );
-        assert!(team.specs.iter().all(|spec| spec.path.ends_with("agent.kdl")));
+        assert!(
+            team.specs
+                .iter()
+                .all(|spec| spec.path.ends_with("agent.kdl"))
+        );
     }
 
     #[test]
@@ -1836,12 +1972,25 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         );
     }
 
-    struct RaceRunner { lists: RefCell<Vec<Vec<Session>>>, ops: RefCell<Vec<String>> }
+    struct RaceRunner {
+        lists: RefCell<Vec<Vec<Session>>>,
+        ops: RefCell<Vec<String>>,
+    }
     impl Runner for RaceRunner {
-        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { Ok(self.lists.borrow_mut().remove(0)) }
-        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
-        fn kill(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("kill:{id}")); anyhow::bail!("already gone") }
-        fn remove(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("remove:{id}")); anyhow::bail!("already gone") }
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.lists.borrow_mut().remove(0))
+        }
+        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kill(&self, id: &str) -> anyhow::Result<()> {
+            self.ops.borrow_mut().push(format!("kill:{id}"));
+            anyhow::bail!("already gone")
+        }
+        fn remove(&self, id: &str) -> anyhow::Result<()> {
+            self.ops.borrow_mut().push(format!("remove:{id}"));
+            anyhow::bail!("already gone")
+        }
     }
 
     struct InventoryRunner {
@@ -1903,23 +2052,58 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
 
     #[test]
     fn reap_race_errors_converge_only_after_empty_list() {
-        let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None, presentation: None }], vec![]]), ops: RefCell::new(Vec::new()) };
+        let runner = RaceRunner {
+            lists: RefCell::new(vec![
+                vec![Session {
+                    pty_id: "x".into(),
+                    alive: true,
+                    exit_code: None,
+                    presentation: None,
+                }],
+                vec![],
+            ]),
+            ops: RefCell::new(Vec::new()),
+        };
         assert!(reap_all_eval_sessions_with_runner(&runner, "test").is_ok());
         assert_eq!(runner.ops.borrow().len(), 2);
     }
 
-    struct PersistentRunner { lists: RefCell<usize>, ops: RefCell<usize> }
+    struct PersistentRunner {
+        lists: RefCell<usize>,
+        ops: RefCell<usize>,
+    }
     impl Runner for PersistentRunner {
-        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { *self.lists.borrow_mut() += 1; Ok(vec![Session { pty_id: "stuck".into(), alive: true, exit_code: None, presentation: None }]) }
-        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
-        fn kill(&self, _: &str) -> anyhow::Result<()> { *self.ops.borrow_mut() += 1; Ok(()) }
-        fn remove(&self, _: &str) -> anyhow::Result<()> { *self.ops.borrow_mut() += 1; Ok(()) }
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            *self.lists.borrow_mut() += 1;
+            Ok(vec![Session {
+                pty_id: "stuck".into(),
+                alive: true,
+                exit_code: None,
+                presentation: None,
+            }])
+        }
+        fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            *self.ops.borrow_mut() += 1;
+            Ok(())
+        }
+        fn remove(&self, _: &str) -> anyhow::Result<()> {
+            *self.ops.borrow_mut() += 1;
+            Ok(())
+        }
     }
 
     #[test]
     fn reap_persistent_residual_fails_after_bounded_attempts() {
-        let runner = PersistentRunner { lists: RefCell::new(0), ops: RefCell::new(0) };
-        let error = reap_all_eval_sessions_with_runner(&runner, "host-x").unwrap_err().to_string();
+        let runner = PersistentRunner {
+            lists: RefCell::new(0),
+            ops: RefCell::new(0),
+        };
+        let error = reap_all_eval_sessions_with_runner(&runner, "host-x")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("host-x") && error.contains("empty state"));
         assert_eq!(*runner.lists.borrow(), 5);
         assert_eq!(*runner.ops.borrow(), 10);
@@ -1928,18 +2112,47 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     #[test]
     fn cleanup_guard_reaps_on_unwind_without_double_panic() {
         use std::rc::Rc;
-        let lists = Rc::new(RefCell::new(vec![vec![Session { pty_id: "panic".into(), alive: true, exit_code: None, presentation: None }], vec![]]));
+        let lists = Rc::new(RefCell::new(vec![
+            vec![Session {
+                pty_id: "panic".into(),
+                alive: true,
+                exit_code: None,
+                presentation: None,
+            }],
+            vec![],
+        ]));
         let ops = Rc::new(RefCell::new(Vec::new()));
-        struct Shared { lists: Rc<RefCell<Vec<Vec<Session>>>>, ops: Rc<RefCell<Vec<String>>> }
-        impl Runner for Shared {
-            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> { Ok(self.lists.borrow_mut().remove(0)) }
-            fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> { Ok(()) }
-            fn kill(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("kill:{id}")); Ok(()) }
-            fn remove(&self, id: &str) -> anyhow::Result<()> { self.ops.borrow_mut().push(format!("remove:{id}")); Ok(()) }
+        struct Shared {
+            lists: Rc<RefCell<Vec<Vec<Session>>>>,
+            ops: Rc<RefCell<Vec<String>>>,
         }
-        let runner = Shared { lists: lists.clone(), ops: ops.clone() };
+        impl Runner for Shared {
+            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+                Ok(self.lists.borrow_mut().remove(0))
+            }
+            fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn kill(&self, id: &str) -> anyhow::Result<()> {
+                self.ops.borrow_mut().push(format!("kill:{id}"));
+                Ok(())
+            }
+            fn remove(&self, id: &str) -> anyhow::Result<()> {
+                self.ops.borrow_mut().push(format!("remove:{id}"));
+                Ok(())
+            }
+        }
+        let runner = Shared {
+            lists: lists.clone(),
+            ops: ops.clone(),
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = EvalCleanupGuard { runner, catalog: std::env::temp_dir().join("st2-test-panic"), host: "test".into(), keep: true };
+            let _guard = EvalCleanupGuard {
+                runner,
+                catalog: std::env::temp_dir().join("st2-test-panic"),
+                host: "test".into(),
+                keep: true,
+            };
             panic!("panic after guard acquisition");
         }));
         assert!(result.is_err());
@@ -1950,14 +2163,46 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     #[test]
     fn cleanup_guard_catalog_lifetime_matrix() {
         for keep in [false, true] {
-            let dir = tempfile::tempdir().unwrap(); let catalog = dir.path().join("catalog"); std::fs::create_dir_all(&catalog).unwrap();
-            let runner = RaceRunner { lists: RefCell::new(vec![vec![Session { pty_id: "x".into(), alive: true, exit_code: None, presentation: None }], vec![]]), ops: RefCell::new(Vec::new()) };
-            { let _guard = EvalCleanupGuard { runner, catalog: catalog.clone(), host: "test".into(), keep }; }
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = dir.path().join("catalog");
+            std::fs::create_dir_all(&catalog).unwrap();
+            let runner = RaceRunner {
+                lists: RefCell::new(vec![
+                    vec![Session {
+                        pty_id: "x".into(),
+                        alive: true,
+                        exit_code: None,
+                        presentation: None,
+                    }],
+                    vec![],
+                ]),
+                ops: RefCell::new(Vec::new()),
+            };
+            {
+                let _guard = EvalCleanupGuard {
+                    runner,
+                    catalog: catalog.clone(),
+                    host: "test".into(),
+                    keep,
+                };
+            }
             assert_eq!(catalog.exists(), keep);
         }
-        let dir = tempfile::tempdir().unwrap(); let catalog = dir.path().join("catalog"); std::fs::create_dir_all(&catalog).unwrap();
-        let runner = PersistentRunner { lists: RefCell::new(0), ops: RefCell::new(0) };
-        { let _guard = EvalCleanupGuard { runner, catalog: catalog.clone(), host: "test".into(), keep: false }; }
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = dir.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        let runner = PersistentRunner {
+            lists: RefCell::new(0),
+            ops: RefCell::new(0),
+        };
+        {
+            let _guard = EvalCleanupGuard {
+                runner,
+                catalog: catalog.clone(),
+                host: "test".into(),
+                keep: false,
+            };
+        }
         assert!(catalog.exists());
     }
 
@@ -1969,7 +2214,11 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             detail: String::new(),
             signal,
         };
-        let report = |judges: Vec<JudgeResult>| EvalReport { done: true, judges, timeout: Duration::ZERO };
+        let report = |judges: Vec<JudgeResult>| EvalReport {
+            done: true,
+            judges,
+            timeout: Duration::ZERO,
+        };
         // A FAILING signal judge does NOT gate a passing gating judge.
         assert!(report(vec![j("gate", true, false), j("sig", false, true)]).passed());
         // A failing GATING judge does gate.
@@ -2060,9 +2309,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         add_eval_exit_markers(&mut specs, catalog.path(), "evalhost");
 
         let command = specs[0].tasks[0].command.as_deref().unwrap();
-        let canonical = catalog
-            .path()
-            .join(".eval-exits/evalhost.worker.status");
+        let canonical = catalog.path().join(".eval-exits/evalhost.worker.status");
         let flat = catalog.path().join(".eval-exits/worker.status");
         assert!(command.contains(&canonical.display().to_string()));
         assert!(!command.contains(&flat.display().to_string()));
@@ -2279,7 +2526,8 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             .iter()
             .find(|task| task.derived)
             .unwrap();
-        let compact_runtime = task_runtime_id(&compact_specs[0], &compact_specs[0].tasks[0], "host");
+        let compact_runtime =
+            task_runtime_id(&compact_specs[0], &compact_specs[0].tasks[0], "host");
         let eval_runtime = task_runtime_id(&eval_specs[0], &eval_specs[0].tasks[0], "host");
 
         assert_eq!(compact_ding.command, eval_ding.command);
@@ -2292,7 +2540,11 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
 
     fn seed_msg(inbox: &Path, ts: u64, rand: &str, from: &str) {
         std::fs::create_dir_all(inbox).unwrap();
-        std::fs::write(inbox.join(format!("{ts:013}-{rand}.md")), format!("---\nfrom: {from}\n---\nbody\n")).unwrap();
+        std::fs::write(
+            inbox.join(format!("{ts:013}-{rand}.md")),
+            format!("---\nfrom: {from}\n---\nbody\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2300,20 +2552,39 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("worker/_git")).unwrap();
-        std::fs::write(src.path().join("worker/_git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            src.path().join("worker/_git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
         std::fs::write(src.path().join("worker/LICENSE"), "proprietary\n").unwrap();
         copy_tree(src.path(), dst.path()).unwrap();
-        assert!(dst.path().join("worker/.git/HEAD").is_file(), ".git materialized from _git");
-        assert!(!dst.path().join("worker/_git").exists(), "_git renamed away");
-        assert_eq!(std::fs::read_to_string(dst.path().join("worker/LICENSE")).unwrap(), "proprietary\n");
+        assert!(
+            dst.path().join("worker/.git/HEAD").is_file(),
+            ".git materialized from _git"
+        );
+        assert!(
+            !dst.path().join("worker/_git").exists(),
+            "_git renamed away"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("worker/LICENSE")).unwrap(),
+            "proprietary\n"
+        );
     }
 
     #[test]
     fn resolve_content_reads_a_file_else_inline() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("task.md"), "the task\n").unwrap();
-        assert_eq!(resolve_content("./task.md", dir.path()).unwrap(), "the task\n");
-        assert_eq!(resolve_content("just do it inline", dir.path()).unwrap(), "just do it inline");
+        assert_eq!(
+            resolve_content("./task.md", dir.path()).unwrap(),
+            "the task\n"
+        );
+        assert_eq!(
+            resolve_content("just do it inline", dir.path()).unwrap(),
+            "just do it inline"
+        );
     }
 
     #[test]
@@ -2337,8 +2608,18 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         ));
         // A worker→sup report at t=2000 + a sup→requester confirm that PRE-dates it (t=1000) → false
         // (the early "on it" ack the discriminator exists to reject).
-        seed_msg(&root.join(sup).join("inbox"), 1_700_000_002_000, "aaaaaa", "mix.worker");
-        seed_msg(&root.join(req).join("inbox"), 1_700_000_001_000, "bbbbbb", "mix.sup");
+        seed_msg(
+            &root.join(sup).join("inbox"),
+            1_700_000_002_000,
+            "aaaaaa",
+            "mix.worker",
+        );
+        seed_msg(
+            &root.join(req).join("inbox"),
+            1_700_000_001_000,
+            "bbbbbb",
+            "mix.sup",
+        );
         assert!(!wait_done(
             root,
             None,
@@ -2351,7 +2632,12 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             noop,
         ));
         // A confirm that POST-dates the report (t=3000) → done.
-        seed_msg(&root.join(req).join("inbox"), 1_700_000_003_000, "cccccc", "mix.sup");
+        seed_msg(
+            &root.join(req).join("inbox"),
+            1_700_000_003_000,
+            "cccccc",
+            "mix.sup",
+        );
         assert!(wait_done(
             root,
             None,
@@ -2377,8 +2663,18 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         let noop = &mut (|| {}) as &mut dyn FnMut();
         // The report is ONLY in the sup's archive (inbox is empty — the sup archived on-act); the confirm
         // post-dates it in the requester's inbox → the loop closed → done must fire.
-        seed_msg(&root.join(sup).join("archive"), 1_700_000_002_000, "aaaaaa", "mix.worker");
-        seed_msg(&root.join(req).join("inbox"), 1_700_000_003_000, "cccccc", "mix.sup");
+        seed_msg(
+            &root.join(sup).join("archive"),
+            1_700_000_002_000,
+            "aaaaaa",
+            "mix.worker",
+        );
+        seed_msg(
+            &root.join(req).join("inbox"),
+            1_700_000_003_000,
+            "cccccc",
+            "mix.sup",
+        );
         assert!(
             wait_done(
                 root,
@@ -2415,7 +2711,10 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             &mut tick,
         );
         assert!(!fired, "no confirmation was seeded → must time out");
-        assert!(ticks.get() >= 1, "the supervise tick must run during the wait");
+        assert!(
+            ticks.get() >= 1,
+            "the supervise tick must run during the wait"
+        );
     }
 
     #[test]
@@ -2507,8 +2806,12 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
 
     #[test]
     fn bus_root_expands_st_root_else_defaults() {
-        let s = parse_spec("env { ST_ROOT \"$CATALOG/bus\" }\nagent \"a\" { command \"run\" }").unwrap();
-        assert_eq!(bus_root(&s, Path::new("/tmp/cat")), PathBuf::from("/tmp/cat/bus"));
+        let s = parse_spec("env { ST_ROOT \"$CATALOG/bus\" }\nagent \"a\" { command \"run\" }")
+            .unwrap();
+        assert_eq!(
+            bus_root(&s, Path::new("/tmp/cat")),
+            PathBuf::from("/tmp/cat/bus")
+        );
         let s2 = parse_spec(r#"agent "a" { command "run" }"#).unwrap();
         assert_eq!(
             bus_root(&s2, Path::new("/tmp/cat")),
@@ -2521,7 +2824,10 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     fn parse_pass_fail_takes_the_first_token() {
         assert_eq!(parse_pass_fail("PASS — cites the real commit"), Some(true));
         assert_eq!(parse_pass_fail("FAIL — vague 'done!'"), Some(false));
-        assert_eq!(parse_pass_fail("PASS, though it could FAIL on edge cases"), Some(true)); // PASS first
+        assert_eq!(
+            parse_pass_fail("PASS, though it could FAIL on edge cases"),
+            Some(true)
+        ); // PASS first
         assert_eq!(parse_pass_fail("verdict: fail, because…"), Some(false));
         assert_eq!(parse_pass_fail("no verdict here"), None);
     }
@@ -2530,35 +2836,84 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     fn declarative_checks_file_json() {
         let cat = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cat.path().join("worker")).unwrap();
-        std::fs::write(cat.path().join("worker/LICENSE"), "Permission is hereby granted, free of charge\n").unwrap();
-        std::fs::write(cat.path().join("worker/package.json"), r#"{"name":"w","license":"MIT","ok":true,"count":3}"#).unwrap();
+        std::fs::write(
+            cat.path().join("worker/LICENSE"),
+            "Permission is hereby granted, free of charge\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cat.path().join("worker/package.json"),
+            r#"{"name":"w","license":"MIT","ok":true,"count":3}"#,
+        )
+        .unwrap();
         let ok = [
-            Check::FileHas { path: "worker/LICENSE".into(), text: "Permission is hereby granted".into() },
-            Check::FileLacks { path: "worker/LICENSE".into(), text: "proprietary".into() },
-            Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: crate::eval_spec::JsonScalar::String("MIT".into()) },
+            Check::FileHas {
+                path: "worker/LICENSE".into(),
+                text: "Permission is hereby granted".into(),
+            },
+            Check::FileLacks {
+                path: "worker/LICENSE".into(),
+                text: "proprietary".into(),
+            },
+            Check::JsonField {
+                path: "worker/package.json".into(),
+                field: "license".into(),
+                value: crate::eval_spec::JsonScalar::String("MIT".into()),
+            },
         ];
         assert!(run_declarative(&ok, cat.path()).0);
         // A wrong json value fails.
-        let bad = [Check::JsonField { path: "worker/package.json".into(), field: "license".into(), value: crate::eval_spec::JsonScalar::String("GPL".into()) }];
+        let bad = [Check::JsonField {
+            path: "worker/package.json".into(),
+            field: "license".into(),
+            value: crate::eval_spec::JsonScalar::String("GPL".into()),
+        }];
         assert!(!run_declarative(&bad, cat.path()).0);
         let typed = [
-            Check::JsonField { path: "worker/package.json".into(), field: "ok".into(), value: crate::eval_spec::JsonScalar::Bool(true) },
-            Check::JsonField { path: "worker/package.json".into(), field: "count".into(), value: crate::eval_spec::JsonScalar::Integer(3) },
+            Check::JsonField {
+                path: "worker/package.json".into(),
+                field: "ok".into(),
+                value: crate::eval_spec::JsonScalar::Bool(true),
+            },
+            Check::JsonField {
+                path: "worker/package.json".into(),
+                field: "count".into(),
+                value: crate::eval_spec::JsonScalar::Integer(3),
+            },
         ];
         assert!(run_declarative(&typed, cat.path()).0);
         let mismatches = [
-            Check::JsonField { path: "worker/package.json".into(), field: "count".into(), value: crate::eval_spec::JsonScalar::String("3".into()) },
-            Check::JsonField { path: "worker/package.json".into(), field: "ok".into(), value: crate::eval_spec::JsonScalar::String("true".into()) },
+            Check::JsonField {
+                path: "worker/package.json".into(),
+                field: "count".into(),
+                value: crate::eval_spec::JsonScalar::String("3".into()),
+            },
+            Check::JsonField {
+                path: "worker/package.json".into(),
+                field: "ok".into(),
+                value: crate::eval_spec::JsonScalar::String("true".into()),
+            },
         ];
         assert!(!run_declarative(&mismatches[..1], cat.path()).0);
         assert!(!run_declarative(&mismatches[1..], cat.path()).0);
         std::fs::write(cat.path().join("worker/malformed.json"), "{").unwrap();
-        let malformed = [Check::JsonField { path: "worker/malformed.json".into(), field: "n".into(), value: crate::eval_spec::JsonScalar::Integer(1) }];
-        let missing_json = [Check::JsonField { path: "worker/missing.json".into(), field: "n".into(), value: crate::eval_spec::JsonScalar::Integer(1) }];
+        let malformed = [Check::JsonField {
+            path: "worker/malformed.json".into(),
+            field: "n".into(),
+            value: crate::eval_spec::JsonScalar::Integer(1),
+        }];
+        let missing_json = [Check::JsonField {
+            path: "worker/missing.json".into(),
+            field: "n".into(),
+            value: crate::eval_spec::JsonScalar::Integer(1),
+        }];
         assert!(!run_declarative(&malformed, cat.path()).0);
         assert!(!run_declarative(&missing_json, cat.path()).0);
         // FileHas on a missing file fails.
-        let missing = [Check::FileHas { path: "worker/NOPE".into(), text: "x".into() }];
+        let missing = [Check::FileHas {
+            path: "worker/NOPE".into(),
+            text: "x".into(),
+        }];
         assert!(!run_declarative(&missing, cat.path()).0);
     }
 
@@ -2575,9 +2930,26 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         assert!(!run_bash_judge("sleep 30", s, c, b, Duration::from_millis(300), je).0);
         // CWD is the SPEC folder (so ./judges/x.sh resolves); $CATALOG/$ST_ROOT reach the sandbox+bus.
         std::fs::create_dir_all(s.join("judges")).unwrap();
-        std::fs::write(s.join("judges/ok.sh"), "#!/bin/sh\ntest -n \"$CATALOG\" && test -n \"$ST_ROOT\"\n").unwrap();
-        assert!(run_bash_judge("test \"$(pwd)\" = \"$SPEC_DIR\"", s, c, b, Duration::from_secs(5), je).0);
-        assert!(run_bash_judge("sh ./judges/ok.sh", s, c, b, Duration::from_secs(5), je).0, "./judges resolves from CWD=spec");
+        std::fs::write(
+            s.join("judges/ok.sh"),
+            "#!/bin/sh\ntest -n \"$CATALOG\" && test -n \"$ST_ROOT\"\n",
+        )
+        .unwrap();
+        assert!(
+            run_bash_judge(
+                "test \"$(pwd)\" = \"$SPEC_DIR\"",
+                s,
+                c,
+                b,
+                Duration::from_secs(5),
+                je
+            )
+            .0
+        );
+        assert!(
+            run_bash_judge("sh ./judges/ok.sh", s, c, b, Duration::from_secs(5), je).0,
+            "./judges resolves from CWD=spec"
+        );
     }
 
     #[test]
