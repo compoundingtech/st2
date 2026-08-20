@@ -33,15 +33,17 @@ event frontmatter: the producing stream, a mandatory producer-supplied
 Event publication does not write the permanent hash-chained Agent Sent ledger.
 Dedup state is a bounded, constant-size receipt ring plus one in-flight
 publication reservation per stream. The reservation includes the full
-rendered-content digest and at most one predecessor filename selected from the
-ring. Replaying an `event-id` within the retained receipt horizon returns the
-original filename and never re-notifies. The next emit reconciles an abandoned
-reservation only after its materialized event identity and full bytes match,
-then validates the stored predecessor against its retained receipt before
-completing compaction. An authenticated same-name archive receipt is the only
-proof that an inbox-absent predecessor already moved; absence from both fails
-closed. Recovery requires neither stale producer replay nor retained payload
-bytes.
+rendered-content digest, supersession intent, and exact predecessor receipt (or
+none) selected from the ring; final receipts retain those semantics too.
+Replaying an `event-id` within the retained receipt horizon returns the
+original filename and never re-notifies only when content and supersession
+intent match. The next emit reconciles an abandoned reservation only after its
+materialized event identity and full bytes match, then validates and moves the
+exact stored predecessor inode before completing compaction. An authenticated
+same-name archive receipt is the only proof that an inbox-absent predecessor
+already moved; absence from both fails closed. Successor bytes and their inbox
+directory are fsynced before the final receipt commit. Recovery requires
+neither stale producer replay nor retained payload bytes.
 An evicted identity is accepted as new without scanning inbox or archive
 history; archive receipts keep their existing authority for known filenames.
 An emit may declare `--supersede`, which publishes the successor before

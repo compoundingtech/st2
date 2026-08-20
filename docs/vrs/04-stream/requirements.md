@@ -75,13 +75,16 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   durable inbox record while its identity remains in the stream's retained
   receipt ring. Replaying an `event-id` within that horizon — including
   concurrent and crash-interrupted retries — returns the original filename,
-  creates no second record, and never re-notifies. Once evicted, the identity
-  is honestly accepted as new; an archive receipt retains its existing
-  authority for a known filename but is not an event-identity index. The
-  machine receipt distinguishes `created` from `deduplicated`.
+  creates no second record, and never re-notifies only when content, key,
+  supersession intent, and the originally selected predecessor semantics all
+  match. Reuse with changed intent is a conflict, not deduplication. Once
+  evicted, the identity is honestly accepted as new; an archive receipt
+  retains its existing authority for a known filename but is not an
+  event-identity index. The machine receipt distinguishes `created` from
+  `deduplicated`.
 - **STREAM-R05 Bounded stream state:** Per-stream durable dedup state is
   constant-size: a bounded receipt ring plus one in-flight publication
-  reservation, including at most one selected predecessor filename. The ring
+  reservation, including at most one selected predecessor receipt. The ring
   defines the deduplication,
   conflicting-content-detection, and supersession-lookup horizon. Event
   publication does not write the Agent Sent ledger and performs
@@ -106,14 +109,16 @@ executable evidence lives in [`.experiments/`](./.experiments/).
   absent `key`, the whole stream does). Still-unread requires an inbox file and
   no same-name archive receipt. Immediately before either the initial or a
   recovered archive move, the predecessor's no-follow regular bytes and
-  parsed event identity must match its retained receipt or publication fails
-  closed. A crash between those steps may leave both events unread but never
-  removes the only wakeup; the selected predecessor filename is retained in
-  the pending reservation so recovery finishes that exact compaction rather
-  than selecting against newer state. Supersession never touches DING staged
-  ownership — a staged notice is released only through the existing
-  archive-receipt rule — and a fast-superseding stream stays within `R15`
-  bounds.
+  parsed event identity must match its retained receipt, and the move must be
+  bound to that validated inode rather than re-resolving a replaceable
+  pathname. Any inability to prove or move that exact object fails closed
+  while preserving the inbox wake. A crash between those steps may leave both
+  events unread but never removes the only wakeup; the selected predecessor
+  filename and identity are retained in both pending and final receipts so
+  recovery and replay preserve that exact compaction semantics. Supersession
+  never touches DING staged ownership — a staged notice is released only
+  through the existing archive-receipt rule — and a fast-superseding stream
+  stays within `R15` bounds.
 
 ### Must couple to the owning agent's lifecycle
 

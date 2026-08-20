@@ -153,13 +153,17 @@ gating are inherited.
 
 Per-stream durable state is one constant-size record under the owning agent's
 resources (exact path DQ-S2): a ring of the last `K`
-`(event-id → filename, key, content digest)` receipts plus a single in-flight
-publication reservation. The reservation holds the new event's identity,
-filename, key, full rendered-content digest, and at most one predecessor
-filename selected for supersession. The ring is the entire deduplication,
+`(event-id → filename, key, content digest, supersede, predecessor)` receipts
+plus a single in-flight publication reservation. Both forms bind the new
+event's identity, filename, key, full rendered-content digest, supersession
+intent, and the exact selected predecessor receipt (or explicit none). The
+ring is the entire deduplication,
 conflicting-content-detection, and supersession-lookup horizon: a replay hit
-answers in O(1), while a miss is accepted as a new identity without scanning
-the unread inbox or archive.
+answers in O(1) only if the rendered digest, key, and supersession intent match
+the retained receipt. Its stored predecessor selection is authoritative and
+is not recomputed on replay. A changed `--supersede` value is conflicting
+identity reuse, not a silent deduplication. A miss is accepted as a new
+identity without scanning the unread inbox or archive.
 
 Under the per-stream lock, every emit first reconciles an existing
 reservation. If its chosen filename exists as a no-follow regular file in the
@@ -186,10 +190,11 @@ ring afterward. Neither producer replay nor retained payload bytes are
 required to unblock the stream.
 
 For a new identity, emit persists a reservation with its identity, chosen
-filename, key, content digest, and the predecessor filename selected from the
-bounded ring (when superseding). Candidate selection requires the predecessor
-filename to be present as a no-follow regular inbox file and absent from the
-archive. Emit then materializes the successor and, immediately before moving
+filename, key, content digest, supersession intent, and the exact predecessor
+receipt selected from the bounded ring (when superseding). Candidate selection
+requires the predecessor filename to be present as a no-follow regular inbox
+file and absent from the archive. Emit then materializes the successor and,
+immediately before moving
 the stored predecessor, validates its current parsed `stream`, `event-id`, and
 optional `key` plus full rendered SHA-256 against that retained receipt — the
 same rule recovery uses. A mismatch or changed path shape fails closed. Only
@@ -200,6 +205,40 @@ validated bytes plus the exact compaction target needed to finish on the next
 emit. This prevents an unrecorded inbox file, a receipt for unrelated bytes,
 and abandoned or misdirected supersession while adding only one bounded state
 slot.
+
+### Filesystem publication protocol
+
+All file operations are relative to already-open, no-follow inbox/archive
+directory capabilities. Predecessor validation opens the source with
+`openat(..., O_NOFOLLOW)`, requires a regular file, parses and hashes bytes
+from that descriptor, and records its `(device, inode)` identity. The archive
+operation must bind the destination to that exact open object without a second
+unprotected pathname lookup (for example, capability-relative no-replace
+linking from the open descriptor). If the platform cannot link from an open
+descriptor, every box pathname mutator must share one exclusive mutation lock
+and `fstatat` must prove the source still has the validated `(device, inode)`
+immediately before a capability-relative no-replace link/rename. An
+uncooperative replacement, unsupported exact-object primitive, destination
+collision, or identity change fails closed; the inbox source is not unlinked
+and its wake remains visible. After the exact object is durably present in
+archive, unlinking the source is conditional on the pathname still naming the
+validated inode.
+
+Crash ordering is normative:
+
+1. Persist and fsync the pending state file and its directory.
+2. Write the successor through a no-follow temporary, fsync the file, publish
+   it no-replace at the reserved inbox filename, then fsync the inbox
+   directory.
+3. When superseding, validate and archive the exact predecessor object, fsync
+   the archive directory, conditionally unlink the validated inbox pathname,
+   then fsync the inbox directory.
+4. Only afterward persist the final receipt ring, fsync its state file, rename
+   it into place, and fsync the stream-state directory.
+
+A durable receipt can therefore never precede durable successor bytes. A
+crash before step 4 leaves pending as recovery authority; recovery repeats the
+same ordered, exact-object protocol idempotently.
 
 Nothing is chained, hashed, or validated O(history), and publication work is
 independent of retained stream history. `K` is 128 pending measurement
