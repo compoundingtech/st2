@@ -371,8 +371,8 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
 
     let mut name = None;
     let mut uri = None;
-    let mut relation = None;
     let mut reason = None;
+    let mut inactive_reason = None;
     for entry in &node.entries {
         let Some(property) = entry.name.as_deref() else {
             if name.is_some() {
@@ -396,15 +396,6 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
                     anyhow::bail!("resource binding needs string `uri`");
                 }
             }
-            "relation" => {
-                if relation.is_some() {
-                    anyhow::bail!("resource binding has duplicate `relation`");
-                }
-                relation = value;
-                if relation.is_none() {
-                    anyhow::bail!("resource binding needs string `relation`");
-                }
-            }
             "reason" => {
                 if reason.is_some() {
                     anyhow::bail!("resource binding has duplicate `reason`");
@@ -412,6 +403,15 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
                 reason = value;
                 if reason.is_none() {
                     anyhow::bail!("resource binding needs string `reason`");
+                }
+            }
+            "inactive-reason" => {
+                if inactive_reason.is_some() {
+                    anyhow::bail!("resource binding has duplicate `inactive-reason`");
+                }
+                inactive_reason = value;
+                if inactive_reason.is_none() {
+                    anyhow::bail!("resource binding needs string `inactive-reason`");
                 }
             }
             other => anyhow::bail!("resource binding has unsupported property `{other}`"),
@@ -422,8 +422,9 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
         name.ok_or_else(|| anyhow::anyhow!("resource binding needs a string name"))?,
         RawResource {
             uri: uri.ok_or_else(|| anyhow::anyhow!("resource binding needs string `uri`"))?,
-            relation,
-            reason,
+            reason: reason
+                .ok_or_else(|| anyhow::anyhow!("resource binding needs string `reason`"))?,
+            inactive_reason,
         },
     ))
 }

@@ -201,17 +201,16 @@ pub struct AgentSpec {
 
 /// One agent-local semantic binding to an externally identified resource.
 ///
-/// `name` is the role the resource plays for this agent and `uri` is the exact absolute identity.
-/// The URI scheme selects the downstream resource profile. The envelope deliberately carries no
-/// policy.
+/// `name` is an agent-local label and `uri` is the exact absolute identity. `reason` explains why
+/// the reference belongs in this Agent Spec. `inactive_reason` preserves a reference that is no
+/// longer active for this agent without asserting anything about the resource itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Resource {
     name: String,
     uri: String,
+    reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    relation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
+    inactive_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -219,38 +218,38 @@ pub struct Resource {
 struct ResourceDescriptor {
     name: String,
     uri: String,
-    relation: Option<String>,
-    reason: Option<String>,
+    reason: String,
+    inactive_reason: Option<String>,
 }
 
 impl Resource {
     /// Construct a descriptor after enforcing the same invariants as catalog parsing.
-    pub fn new(name: String, uri: String) -> Result<Self, String> {
+    pub fn new(name: String, uri: String, reason: String) -> Result<Self, String> {
         if name.is_empty() {
             return Err("resource binding name cannot be empty".into());
         }
         validate_absolute_uri(&uri).map_err(|reason| {
             format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
         })?;
+        validate_resource_explanation(&name, "reason", &reason)?;
         Ok(Self {
             name,
             uri,
-            relation: None,
-            reason: None,
+            reason,
+            inactive_reason: None,
         })
     }
 
-    /// Construct a descriptor with an explicit semantic relation and human-facing rationale.
-    pub fn new_with_relation_reason(
+    /// Construct a preserved reference that is inactive for this agent.
+    pub fn new_inactive(
         name: String,
         uri: String,
-        relation: String,
         reason: String,
+        inactive_reason: String,
     ) -> Result<Self, String> {
-        let mut resource = Self::new(name, uri)?;
-        validate_relation_reason(&resource.name, &relation, &reason)?;
-        resource.relation = Some(relation);
-        resource.reason = Some(reason);
+        let mut resource = Self::new(name, uri, reason)?;
+        validate_resource_explanation(&resource.name, "inactive-reason", &inactive_reason)?;
+        resource.inactive_reason = Some(inactive_reason);
         Ok(resource)
     }
 
@@ -262,12 +261,12 @@ impl Resource {
         &self.uri
     }
 
-    pub fn relation(&self) -> Option<&str> {
-        self.relation.as_deref()
+    pub fn reason(&self) -> &str {
+        &self.reason
     }
 
-    pub fn reason(&self) -> Option<&str> {
-        self.reason.as_deref()
+    pub fn inactive_reason(&self) -> Option<&str> {
+        self.inactive_reason.as_deref()
     }
 }
 
@@ -277,19 +276,14 @@ impl<'de> Deserialize<'de> for Resource {
         D: serde::Deserializer<'de>,
     {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
-        let resource = match (descriptor.relation, descriptor.reason) {
-            (None, None) => Self::new(descriptor.name, descriptor.uri),
-            (Some(relation), Some(reason)) => {
-                Self::new_with_relation_reason(descriptor.name, descriptor.uri, relation, reason)
-            }
-            (Some(_), None) => Err(format!(
-                "resource binding '{}' with `relation` must also declare string `reason`",
-                descriptor.name
-            )),
-            (None, Some(_)) => Err(format!(
-                "resource binding '{}' with `reason` must also declare string `relation`",
-                descriptor.name
-            )),
+        let resource = match descriptor.inactive_reason {
+            None => Self::new(descriptor.name, descriptor.uri, descriptor.reason),
+            Some(inactive_reason) => Self::new_inactive(
+                descriptor.name,
+                descriptor.uri,
+                descriptor.reason,
+                inactive_reason,
+            ),
         };
         resource.map_err(de::Error::custom)
     }
@@ -606,8 +600,8 @@ pub(crate) struct RawResources(BTreeMap<String, RawResource>);
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawResource {
     pub(crate) uri: String,
-    pub(crate) relation: Option<String>,
-    pub(crate) reason: Option<String>,
+    pub(crate) reason: String,
+    pub(crate) inactive_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -667,17 +661,11 @@ impl RawResources {
         self.0
             .into_iter()
             .map(|(name, resource)| {
-                match (resource.relation, resource.reason) {
-                    (None, None) => Resource::new(name, resource.uri),
-                    (Some(relation), Some(reason)) => Resource::new_with_relation_reason(
-                        name, resource.uri, relation, reason,
-                    ),
-                    (Some(_), None) => Err(format!(
-                        "resource binding '{name}' with `relation` must also declare string `reason`"
-                    )),
-                    (None, Some(_)) => Err(format!(
-                        "resource binding '{name}' with `reason` must also declare string `relation`"
-                    )),
+                match resource.inactive_reason {
+                    None => Resource::new(name, resource.uri, resource.reason),
+                    Some(inactive_reason) => {
+                        Resource::new_inactive(name, resource.uri, resource.reason, inactive_reason)
+                    }
                 }
                 .map_err(anyhow::Error::msg)
             })
@@ -719,35 +707,19 @@ impl<'de> Deserialize<'de> for RawResources {
     }
 }
 
-fn validate_relation_reason(name: &str, relation: &str, reason: &str) -> Result<(), String> {
-    let relation_bytes = relation.as_bytes();
-    let valid_relation = (1..=64).contains(&relation_bytes.len())
-        && relation_bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-        && relation_bytes
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && relation_bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && !relation_bytes.windows(2).any(|pair| pair == b"--");
-    if !valid_relation {
+fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 160 {
         return Err(format!(
-            "resource binding '{name}' `relation` must be ASCII kebab-case of 1..64 bytes"
+            "resource binding '{name}' `{field}` must be 1..160 UTF-8 bytes"
         ));
     }
-
-    if reason.is_empty() || reason.len() > 160 {
-        return Err(format!(
-            "resource binding '{name}' `reason` must be 1..160 UTF-8 bytes"
-        ));
-    }
-    if reason.trim() != reason
-        || reason
+    if value.trim() != value
+        || value
             .chars()
             .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
     {
         return Err(format!(
-            "resource binding '{name}' `reason` must have no surrounding Unicode whitespace, controls, or line separators"
+            "resource binding '{name}' `{field}` must have no surrounding Unicode whitespace, controls, or line separators"
         ));
     }
     Ok(())

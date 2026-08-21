@@ -236,13 +236,14 @@ mod tests {
             Resource::new(
                 "work".into(),
                 "vendor+thing://authority/exact%20identity".into(),
+                "Current implementation task.".into(),
             )
             .unwrap(),
         );
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity"}],"desiredState":"running","desiredStateReason":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null}]"#
         );
     }
 }
