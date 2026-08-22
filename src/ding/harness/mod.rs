@@ -11,6 +11,7 @@
 
 pub(super) mod claude;
 pub(super) mod codex;
+pub(super) mod opencode;
 
 use super::composer::ComposerState;
 
@@ -99,6 +100,6 @@ pub(super) fn screen_has_accepted_notice(
 
 /// Every registered harness. Claude is last so that an exact row tie resolves to Claude, which is
 /// how the positional comparison behaved before the harnesses were split apart.
-pub(super) fn all() -> [&'static dyn Harness; 2] {
-    [&codex::Codex, &claude::Claude]
+pub(super) fn all() -> [&'static dyn Harness; 3] {
+    [&codex::Codex, &claude::Claude, &opencode::OpenCode]
 }
