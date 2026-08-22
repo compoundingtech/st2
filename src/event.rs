@@ -11,7 +11,7 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -672,7 +672,14 @@ fn archive_validated_file(
     };
     if result < 0 {
         let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            // A receipt for this predecessor already exists; the readback below proves it
+            // carries exactly the validated bytes.
+        } else if capability_link_unsupported(&error) {
+            // The platform cannot hardlink through the open-file descriptor path at all;
+            // degrade to a byte-copy receipt instead of failing publication.
+            write_archive_receipt_copy(file, &archive_dir, archive, filename)?;
+        } else {
             return Err(error).context("archive the validated predecessor capability");
         }
     }
@@ -687,6 +694,77 @@ fn archive_validated_file(
     archive_dir.sync_all()?;
     conditional_unlink_same_inode(file, file, inbox, filename)?;
     File::open(inbox)?.sync_all()?;
+    Ok(())
+}
+
+/// Whether linkat through the open-file capability path is unsupported by the platform rather
+/// than a real failure. macOS fdescfs answers linkat(AT_SYMLINK_FOLLOW) on /dev/fd/N with
+/// EPERM; ENOSYS/EOPNOTSUPP cover kernels lacking the syscall or its symlink-follow semantics.
+/// Everything else stays a hard error so genuine failures (permissions, cross-device, ...)
+/// surface instead of being silently degraded to a copy.
+fn capability_link_unsupported(error: &std::io::Error) -> bool {
+    #[cfg(debug_assertions)]
+    if TEST_FORCE_ARCHIVE_RECEIPT_COPY.load(Ordering::Relaxed) {
+        return true;
+    }
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPERM) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+/// Debug-only switch letting tests exercise the byte-copy fallback on platforms where the real
+/// capability linkat would succeed. Not a supported configuration knob. Flipping this mid-run
+/// is safe: the fallback receipt is verified against the validated bytes exactly like the
+/// hardlink path, and the same-inode unlink treats a copy receipt as "archived" regardless.
+#[cfg(debug_assertions)]
+pub(crate) static TEST_FORCE_ARCHIVE_RECEIPT_COPY: AtomicBool = AtomicBool::new(false);
+
+/// Materialize the archive receipt as a byte copy of the validated file, for platforms that
+/// cannot hardlink through the open-file descriptor path.
+///
+/// The staged temp keeps a concurrent archiver from observing a partial receipt, and
+/// rename_noreplace turns an install race into a no-op: whichever receipt wins, the caller's
+/// readback proves it carries exactly the validated bytes. The tradeoff against the hardlink
+/// fast path is inode identity -- a crash between the copy and the conditional unlink leaves
+/// the retained inbox entry in place until revalidation, which the same-inode checks read as
+/// "still present", never as data loss.
+fn write_archive_receipt_copy(
+    file: &File,
+    archive_dir: &File,
+    archive: &Path,
+    filename: &str,
+) -> anyhow::Result<()> {
+    let mut source = file.try_clone()?;
+    source.rewind()?;
+    let mut bytes = Vec::new();
+    source.read_to_end(&mut bytes)?;
+    drop(source);
+
+    let staged = archive.join(format!(
+        ".st2-archive-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut staged_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&staged)?;
+    staged_file.write_all(&bytes)?;
+    staged_file.sync_all()?;
+    drop(staged_file);
+
+    let target = archive.join(filename);
+    if let Err(error) = crate::catalog_transaction::rename_noreplace(&staged, &target) {
+        fs::remove_file(&staged).context("remove staging copy after failed receipt install")?;
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).context("install archived predecessor receipt");
+        }
+    }
+    archive_dir.sync_all()?;
     Ok(())
 }
 

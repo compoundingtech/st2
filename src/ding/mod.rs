@@ -3292,6 +3292,87 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
     }
 
+    /// Platforms that cannot hardlink through the open-file descriptor path (macOS fdescfs
+    /// rejects linkat(AT_SYMLINK_FOLLOW) on /dev/fd/N with EPERM) fall back to a byte-copy
+    /// archive receipt. The differentiated supersession semantics must hold unchanged on that
+    /// path, the receipt must carry exactly the validated bytes, and no staging file may leak
+    /// into the archive.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers() {
+        crate::event::TEST_FORCE_ARCHIVE_RECEIPT_COPY.store(true, Ordering::Relaxed);
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                crate::event::TEST_FORCE_ARCHIVE_RECEIPT_COPY.store(false, Ordering::Relaxed);
+            }
+        }
+        let _guard = ResetGuard;
+
+        let (catalog, inbox) = event_catalog();
+        let root = catalog.path();
+        let archive = crate::message::archive_dir(&root.join("hetz").join("worker"));
+
+        let failure_filename = emit_ci(root, "failure", true);
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<PendingNotice> = new_arrivals(&inbox, &mut seen)
+            .into_iter()
+            .map(PendingNotice::message)
+            .collect();
+        assert_eq!(pending.len(), 1);
+        let failure_bytes =
+            std::fs::read(inbox.join(&failure_filename)).expect("staged event bytes");
+        let failure_text = pending[0].text(
+            DingContext {
+                catalog_root: root,
+                this_host: "hetz",
+                recipient: "hetz.worker",
+            },
+            &mut None,
+        );
+
+        let poker = OwnershipPoker {
+            pokes: Mutex::new(Vec::new()),
+            retries: Mutex::new(Vec::new()),
+            poke_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+            retry_outcomes: Mutex::new(VecDeque::from([PokeOutcome::Staged])),
+        };
+        flush_in(root, &mut pending, &poker);
+
+        emit_ci(root, "success", true);
+        pending.extend(
+            new_arrivals(&inbox, &mut seen)
+                .into_iter()
+                .map(PendingNotice::message),
+        );
+        prune_archived_pending(&inbox, &mut pending);
+        flush_in(root, &mut pending, &poker);
+
+        assert_eq!(pending.len(), 2, "later FIFO work remains blocked");
+        assert_eq!(
+            poker.pokes.lock().unwrap().as_slice(),
+            [failure_text.as_str()],
+            "the successor is never pasted on top of a retained payload"
+        );
+        assert!(!inbox.join(&failure_filename).exists(), "head was archived");
+        let receipt = std::fs::read(archive.join(&failure_filename))
+            .expect("byte-copy archive receipt exists");
+        assert_eq!(
+            receipt, failure_bytes,
+            "the copy receipt carries exactly the validated bytes"
+        );
+        let staging_leftovers: Vec<_> = std::fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".st2-archive-"))
+            .collect();
+        assert!(
+            staging_leftovers.is_empty(),
+            "no staging files survive in the archive: {staging_leftovers:?}"
+        );
+    }
+
     #[test]
     fn archived_not_retained_releases_fifo_without_repasting_owned_notice() {
         let agent = tempfile::tempdir().unwrap();
