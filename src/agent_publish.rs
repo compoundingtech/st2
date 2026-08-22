@@ -21,6 +21,7 @@ use crate::catalog_transaction::sync_dir;
 const SCHEMA: &str = "st2.agent-publish.v2";
 const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
 const BUNDLE_DIGEST_DOMAIN: &[u8] = b"st2.agent-publish-bundle.v1\0";
+const CANONICAL_DECLARATION_MODE: u32 = 0o644;
 
 #[derive(Debug, Clone)]
 pub enum PublishSource {
@@ -80,6 +81,12 @@ struct Candidate {
     input_sha256: String,
 }
 
+#[derive(Debug)]
+struct ExistingSpec {
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
@@ -124,14 +131,6 @@ impl Candidate {
             }
         };
         let spec_path = stage.path().join("agent.kdl");
-        anyhow::ensure!(
-            match &source {
-                PublishSource::Spec(path) =>
-                    path.extension().and_then(|value| value.to_str()) == Some("kdl"),
-                PublishSource::Bundle(_) => true,
-            },
-            "published spec must be canonical KDL"
-        );
         let metadata = fs::symlink_metadata(&spec_path)
             .with_context(|| format!("read candidate spec {}", spec_path.display()))?;
         anyhow::ensure!(
@@ -236,16 +235,22 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         .join(&candidate.identity);
     let target_spec = target_dir.join("agent.kdl");
     validate_existing_ancestry(&catalog, &target_dir)?;
-    let before = read_regular_optional(&target_spec)?;
-    let same_spec = before.as_deref() == Some(candidate.bytes.as_slice());
-    let before_hash = before.as_deref().map(sha256);
+    let before = read_existing_spec(&target_spec)?;
+    let same_spec = before
+        .as_ref()
+        .is_some_and(|current| current.bytes == candidate.bytes);
+    let before_hash = before.as_ref().map(|current| sha256(&current.bytes));
+    let target_mode = before
+        .as_ref()
+        .map(|current| current.mode)
+        .unwrap_or(CANONICAL_DECLARATION_MODE);
     let after_hash = sha256(&candidate.bytes);
 
     match &request.expectation {
         PublishExpectation::Absent => {
             if let Some(current) = &before {
                 anyhow::ensure!(
-                    current == &candidate.bytes,
+                    current.bytes == candidate.bytes,
                     "publish precondition failed: {} already exists with sha256 {}",
                     target_spec.display(),
                     before_hash.as_deref().unwrap_or("<unreadable>")
@@ -331,6 +336,7 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
                 &target_spec,
                 &candidate.bytes,
                 before.is_some(),
+                target_mode,
             )?;
         }
         CandidateKind::Bundle => {
@@ -448,17 +454,24 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
+fn read_existing_spec(path: &Path) -> Result<Option<ExistingSpec>> {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
             anyhow::ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
+                metadata.is_file(),
                 "publication target is not a regular file: {}",
                 path.display()
             );
-            Ok(Some(
-                fs::read(path).with_context(|| format!("read {}", path.display()))?,
-            ))
+            let mode = metadata.permissions().mode() & 0o7777;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("read {}", path.display()))?;
+            Ok(Some(ExistingSpec { bytes, mode }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
@@ -674,6 +687,7 @@ fn atomic_write_spec(
     target: &Path,
     bytes: &[u8],
     replace: bool,
+    mode: u32,
 ) -> Result<()> {
     let parent = target.parent().context("spec target has no parent")?;
     let control = crate::catalog_transaction::retained_dir_path(control_file)?;
@@ -682,6 +696,8 @@ fn atomic_write_spec(
         .tempfile_in(&control)
         .with_context(|| format!("create temporary spec in {}", control.display()))?;
     temp.write_all(bytes)?;
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
     temp.as_file().sync_all()?;
     test_crash_after_temporary_write();
     if replace {

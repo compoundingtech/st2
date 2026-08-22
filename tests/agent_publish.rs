@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::process::ExitStatusExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -111,6 +112,121 @@ fn spec_create_is_typed_and_idempotent() {
     );
     let second: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second["status"], "unchanged");
+}
+
+#[test]
+fn spec_source_filename_is_not_semantic_after_strict_parsing() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let candidate = temp.path().join("agent.kdl.candidate");
+    fs::write(&candidate, valid_spec(false)).unwrap();
+
+    let digest = source_digest("--spec", &candidate);
+    let published = publish(&catalog, &candidate, &["--expect-absent"]);
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(digest, sha256(valid_spec(false).as_bytes()));
+
+    let malformed = temp.path().join("malformed.candidate");
+    fs::write(&malformed, "agent \"worker\" {").unwrap();
+    let rejected = st2()
+        .args(["agent", "digest", "--spec"])
+        .arg(&malformed)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("strict declaration parsing"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn spec_creation_uses_the_canonical_readable_declaration_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, valid_spec(false)).unwrap();
+    let input_sha256 = sha256(&fs::read(&candidate).unwrap());
+
+    let mut command = st2();
+    command.args([
+        "agent",
+        "publish",
+        "--catalog",
+        catalog.to_str().unwrap(),
+        "--spec",
+        candidate.to_str().unwrap(),
+        "--input-sha256",
+        &input_sha256,
+        "--expect-absent",
+    ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let published = command.output().unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(
+        fs::metadata(target(&catalog)).unwrap().mode() & 0o7777,
+        0o644
+    );
+}
+
+#[test]
+fn spec_replacement_preserves_the_accepted_target_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let current = valid_spec(false);
+    fs::write(agent.join("agent.kdl"), &current).unwrap();
+    fs::set_permissions(agent.join("agent.kdl"), fs::Permissions::from_mode(0o640)).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, valid_spec(true)).unwrap();
+    let input_sha256 = sha256(&fs::read(&candidate).unwrap());
+
+    let mut command = st2();
+    command.args([
+        "agent",
+        "publish",
+        "--catalog",
+        catalog.to_str().unwrap(),
+        "--spec",
+        candidate.to_str().unwrap(),
+        "--input-sha256",
+        &input_sha256,
+        "--expect-sha256",
+        &sha256(current.as_bytes()),
+    ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let published = command.output().unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(
+        fs::metadata(target(&catalog)).unwrap().mode() & 0o7777,
+        0o640
+    );
 }
 
 #[test]
