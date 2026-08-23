@@ -106,7 +106,7 @@ fn equivalent(observed: &str, expected: &str) -> bool {
             .filter(|ch| !ch.is_whitespace())
             .collect::<String>()
     };
-    compact(observed).contains(&compact(expected))
+    compact(observed) == compact(expected)
 }
 
 fn preceding_submitted_box(before_composer: &str, expected: &str) -> bool {
@@ -183,6 +183,26 @@ mod tests {
     }
 
     #[test]
+    fn human_modified_composer_is_never_exact() {
+        for draft in [
+            format!("human prefix {EXPECTED}"),
+            format!("{EXPECTED} human suffix"),
+        ] {
+            let modified = screen(&draft, "answer", "ctrl+p commands");
+            assert_eq!(
+                OpenCode.classify(
+                    &Screen {
+                        raw: &modified,
+                        plain: &modified
+                    },
+                    EXPECTED
+                ),
+                ComposerState::Changed
+            );
+        }
+    }
+
+    #[test]
     fn accepted_receipt_requires_history_and_an_empty_idle_composer() {
         let accepted = screen("", &format!("  ┃ {EXPECTED}\n\n"), "ctrl+p commands");
         assert_eq!(
@@ -214,5 +234,25 @@ mod tests {
             ),
             ReceiptState::NotRetained
         );
+    }
+
+    #[test]
+    fn modified_submitted_box_is_not_an_acceptance_receipt() {
+        for submitted in [
+            format!("human prefix {EXPECTED}"),
+            format!("{EXPECTED} human suffix"),
+        ] {
+            let modified = screen("", &format!("  ┃ {submitted}\n\n"), "ctrl+p commands");
+            assert_eq!(
+                OpenCode.receipt(
+                    &Screen {
+                        raw: &modified,
+                        plain: &modified
+                    },
+                    EXPECTED
+                ),
+                ReceiptState::NotRetained
+            );
+        }
     }
 }
