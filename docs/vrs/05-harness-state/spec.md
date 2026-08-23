@@ -118,24 +118,25 @@ Field rules, matching `src/harness_state.rs`:
   counter continued across writer restarts; with `writtenAtMs` it keeps every
   write byte-distinct.
 - Writes are session-owned by incarnation token, and ownership has a
-  DIRECTION through `seq`: only a session claim advances it, a claiming
-  takeover — even in the same millisecond — writes through, opens a fresh
-  transition, and takes heartbeat eligibility, while a straggler from a
-  superseded session (its claim below the on-disk sequence) is refused in
-  live and terminal paths alike; `sinceMs` never spans a restart and a
-  lingering predecessor can neither heartbeat nor overwrite its successor's
-  record. Heartbeats and coalescing never touch a record whose schema or
-  token the writer does not own; a foreign record is left byte-identical by
-  heartbeats and replaced only by a claiming observation. Two residuals,
-  stated: two wrappers claiming in the same instant (both reading the same
-  on-disk sequence before either writes) tie at equal sequences and fall back
-  to last-writer-wins — reaching that window requires two concurrently live
-  wrappers for one seat, which the supervisor's serialized replacement
-  already forbids; and Claude's exported ownership pair is visible to its
-  tool children like every other hook-environment value (`ST_AGENT`
-  included) — pi stashes and unexports instead because pi fronts its own
-  environment onto every bash child, an architectural difference, not an
-  oversight.
+  DIRECTION through `seq`. A claim is a WRITTEN act under the record lock —
+  an exitless `ended (superseded)` takeover record carrying the new token
+  and the on-disk sequence plus one — so racing claimers serialize and mint
+  DISTINCT sequences (no tie exists), and a predecessor's still-fresh live
+  record is superseded at relaunch; the seat reads `ended (superseded)`
+  until the session's first real observation. A straggler from a superseded
+  session (its claim below the on-disk sequence) is refused in live and
+  terminal paths alike, a token-only writer never claims (it adopts its own
+  session's records, starts virgin ones, and is refused against foreign
+  tokens), and terminal suppression applies only to exit-bearing records —
+  never the claim placeholder. `sinceMs` never spans a restart; a lingering
+  predecessor can neither heartbeat nor overwrite its successor's record.
+  Heartbeats and coalescing never touch a record whose schema or token the
+  writer does not own; a foreign record is left byte-identical by heartbeats
+  and replaced only by a claiming observation. One residual, stated:
+  Claude's exported ownership pair is visible to its tool children like
+  every other hook-environment value (`ST_AGENT` included) — pi stashes and
+  unexports instead because pi fronts its own environment onto every bash
+  child, an architectural difference, not an oversight.
 - Deserialization is additive-tolerant (no `deny_unknown_fields`): a reader
   may be older than its writer.
 
@@ -167,11 +168,17 @@ there is no path from any absence to a definite state.
 
 Two reader-side limits, stated before anyone finds them: `pty kill` removes
 the session pidfile, so the liveness probe reads *indeterminate* rather than
-*dead* after it — a record orphaned that way reads its last state until the
-staleness horizon even with the right pty root (measured; downgrade-safe,
-never wrong, but not instant). And hosts running codex-cli at or above 0.148
-produce no Codex observed state at all: `SUPPORTED_CODEX_CLI_VERSIONS`
-refuses the launch, correctly, until the pin moves (#267).
+*dead* after it — a seat that was `active` when killed genuinely reads
+`active` (measured), with Doctor silent, until the staleness horizon or the
+next session's written claim supersedes the orphan at relaunch, whichever
+comes first. The cross-check is a narrowing of the ungraceful-death window
+(provably dead sessions: pidfile present, process gone), not its closure —
+OHS-T04/OHS-R07 say exactly this, and no death tombstone is attempted: the
+kill that removes the registry entry leaves nothing behind to prove death
+with, and fabricating evidence is the one thing this design never does. And
+hosts running codex-cli at or above 0.148 produce no Codex observed state at
+all: `SUPPORTED_CODEX_CLI_VERSIONS` refuses the launch, correctly, until the
+pin moves (#267).
 
 ## Codex producer (OHS-R05)
 
