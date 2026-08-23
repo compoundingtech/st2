@@ -86,7 +86,7 @@ fn locate_composer(plain: &str) -> Option<Composer> {
         .map(|line| line.trim_start().strip_prefix('┃').unwrap_or(line).trim())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
     let start_byte = lines[..start].iter().map(|line| line.len()).sum();
     let tail = lines[footer..].concat();
     Some(Composer {
@@ -101,27 +101,31 @@ fn locate_composer(plain: &str) -> Option<Composer> {
 }
 
 fn equivalent(observed: &str, expected: &str) -> bool {
+    if observed.contains('\n') || expected.contains('\n') {
+        return observed == expected;
+    }
     let normalized = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
     normalized(observed) == normalized(expected)
 }
 
 fn preceding_submitted_box(before_composer: &str, expected: &str) -> bool {
-    let mut groups = Vec::<String>::new();
-    let mut current = Vec::<&str>::new();
-    for line in before_composer.lines() {
-        if let Some(content) = line.trim_start().strip_prefix('┃') {
-            current.push(content.trim());
-        } else if !current.is_empty() {
-            groups.push(current.join(" "));
-            current.clear();
-        }
+    let mut lines = before_composer.lines().rev();
+    let first = lines.find(|line| !line.trim().is_empty());
+    let Some(first) = first else {
+        return false;
+    };
+    let Some(content) = first.trim_start().strip_prefix('┃') else {
+        return false;
+    };
+    let mut box_lines = vec![content.trim()];
+    for line in lines {
+        let Some(content) = line.trim_start().strip_prefix('┃') else {
+            break;
+        };
+        box_lines.push(content.trim());
     }
-    if !current.is_empty() {
-        groups.push(current.join(" "));
-    }
-    groups
-        .last()
-        .is_some_and(|group| equivalent(group, expected))
+    box_lines.reverse();
+    equivalent(&box_lines.join("\n"), expected)
 }
 
 #[cfg(test)]
@@ -270,6 +274,44 @@ mod tests {
                 &Screen {
                     raw: &transcript,
                     plain: &transcript
+                },
+                EXPECTED
+            ),
+            ReceiptState::NotRetained
+        );
+    }
+
+    #[test]
+    fn hard_line_break_in_composer_is_not_exact() {
+        let multiline = screen(
+            &EXPECTED.replace(" from=", "\n  ┃ from="),
+            "answer",
+            "ctrl+p commands",
+        );
+        assert_eq!(
+            OpenCode.classify(
+                &Screen {
+                    raw: &multiline,
+                    plain: &multiline
+                },
+                EXPECTED
+            ),
+            ComposerState::Changed
+        );
+    }
+
+    #[test]
+    fn old_matching_box_separated_by_output_is_not_a_receipt() {
+        let old = screen(
+            "",
+            &format!("  ┃ {EXPECTED}\n\nassistant output\n"),
+            "ctrl+p commands",
+        );
+        assert_eq!(
+            OpenCode.receipt(
+                &Screen {
+                    raw: &old,
+                    plain: &old
                 },
                 EXPECTED
             ),
