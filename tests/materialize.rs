@@ -1,4 +1,6 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -548,6 +550,266 @@ fn byte_identical_tracked_target_is_allowed_without_modification() {
         .unwrap();
     assert!(report.is_clean(), "{:?}", report.errors);
     assert_eq!(before, after, "identical target was needlessly rewritten");
+}
+
+#[test]
+fn executable_copy_repairs_a_byte_identical_destination_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(&catalog.join("_templates/wrapper"), "#!/bin/sh\nexit 0\n");
+    let destination = workspace.join("bin/wrapper");
+    write(&destination, "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/wrapper" "bin/wrapper" executable=#true"#,
+        ),
+    );
+
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    assert!(report.is_clean(), "{:?}", report.errors);
+    assert_eq!(
+        fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn regular_copy_repairs_a_byte_identical_executable_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(&catalog.join("_templates/plain"), "same\n");
+    let destination = workspace.join("plain");
+    write(&destination, "same\n");
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o777)).unwrap();
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(&workspace, r#"    copy "_templates/plain" "plain""#),
+    );
+
+    let found = discover(&catalog);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert!(report.is_clean(), "{:?}", report.errors);
+    assert_eq!(
+        fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn content_directives_create_exact_modes_under_a_restrictive_umask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let template = catalog.join("_templates/tool");
+    write(&template, "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&template, fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r##"    copy "_templates/tool" "bin/copied" executable=#true
+    copy "_templates/tool" "plain-copy"
+    file "bin/written" "#!/bin/sh\nexit 0\n" executable=#true
+    json-upsert "bin/data.json" #"{"value":true}"# executable=#true
+    ensure-line "bin/lines" "line" executable=#true
+    file "plain" "plain"
+"##,
+        ),
+    );
+
+    let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
+    process.args(["up", "--catalog"]).arg(&catalog).args([
+        "--host",
+        "Silber",
+        "--materialize-only",
+    ]);
+    unsafe {
+        process.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let output = process.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in ["bin/copied", "bin/written", "bin/data.json", "bin/lines"] {
+        assert_eq!(
+            fs::metadata(workspace.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "{path}"
+        );
+    }
+    for path in ["plain", "plain-copy"] {
+        assert_eq!(
+            fs::metadata(workspace.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "{path}"
+        );
+    }
+    assert!(
+        Command::new(workspace.join("bin/copied"))
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn inline_executable_content_is_exact_runnable_and_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#####"    file "bin/probe" executable=#true {
+      content #"""
+#!/bin/sh
+printf 'hello:%s\n' "${ST_AGENT:-unknown}"
+
+"""#
+    }
+    file "empty" ""
+    file "quote-sequence" {
+      content ##"""
+before
+"""# remains content
+
+"""##
+    }
+"#####,
+        ),
+    );
+    let expected_probe = b"#!/bin/sh\nprintf 'hello:%s\\n' \"${ST_AGENT:-unknown}\"\n".as_slice();
+    let expected_quote = b"before\n\"\"\"# remains content\n".as_slice();
+
+    let found = discover(&catalog);
+    let first = materialize_catalog(&catalog, &found.specs, "Silber");
+    assert!(first.is_clean(), "{:?}", first.errors);
+    assert_eq!(first.materialized.len(), 3, "{:?}", first.materialized);
+
+    let probe = workspace.join("bin/probe");
+    assert_eq!(fs::read(&probe).unwrap(), expected_probe);
+    assert_eq!(fs::read(workspace.join("empty")).unwrap(), b"");
+    assert_eq!(
+        fs::read(workspace.join("quote-sequence")).unwrap(),
+        expected_quote
+    );
+    assert_eq!(
+        fs::metadata(&probe).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let executed = Command::new(&probe)
+        .env("ST_AGENT", "Silber.inline-proof")
+        .output()
+        .unwrap();
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    assert_eq!(executed.stdout, b"hello:Silber.inline-proof\n");
+
+    let second = materialize_catalog(&catalog, &found.specs, "Silber");
+    assert!(second.is_clean(), "{:?}", second.errors);
+    assert!(
+        second.materialized.is_empty(),
+        "unchanged operations were reported as materialized: {:?}",
+        second.materialized
+    );
+    assert_eq!(fs::read(probe).unwrap(), expected_probe);
+}
+
+#[test]
+fn one_inline_target_repairs_mode_toggles_in_both_directions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let declaration = |executable: bool| {
+        agent_kdl(
+            &workspace,
+            &format!(
+                "    file \"target\" \"same\" executable=#{}",
+                if executable { "true" } else { "false" }
+            ),
+        )
+    };
+
+    for (executable, expected_mode) in [(true, 0o755), (false, 0o644), (true, 0o755)] {
+        write(
+            &catalog.join("agents/Silber/cos/agent.kdl"),
+            declaration(executable),
+        );
+        let found = discover(&catalog);
+        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        assert!(report.is_clean(), "{:?}", report.errors);
+        assert_eq!(report.materialized.len(), 1, "{:?}", report.materialized);
+        assert_eq!(
+            fs::metadata(workspace.join("target"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode
+        );
+    }
+}
+
+#[test]
+fn invalid_render_mode_properties_fail_validation() {
+    for (directive, expected) in [
+        (
+            r#"copy "_templates/source" "target" executable="yes""#,
+            "property 'executable' must be a boolean",
+        ),
+        (
+            r#"file "target" "content" mode=#true"#,
+            "unknown property 'mode'",
+        ),
+        (
+            r#"git-exclude "target" executable=#true"#,
+            "unknown property 'executable'",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        write(&catalog.join("_templates/source"), "source\n");
+        write(
+            &catalog.join("agents/Silber/cos/agent.kdl"),
+            agent_kdl(&workspace, &format!("    {directive}")),
+        );
+        let found = discover(&catalog);
+        let error = parse_plan(&found.specs[0]).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]
