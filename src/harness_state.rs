@@ -3,14 +3,19 @@
 //! A `harness-state` file (sibling of `status` in the agent's dir) carries the latest observation a
 //! session wrapper made of its provider: whether the harness is working, blocked on a human, or
 //! ended, plus what its input buffer holds. This is the *observed* axis; `status` remains the
-//! *declared* one, and neither speaks for the other. The record is written only by the driver
-//! wrapper that owns the live session, on state transitions plus a slow heartbeat, and it follows
-//! the presence record's transport discipline: an embedded origin timestamp (never file mtime),
-//! atomic tmp+rename writes, byte-distinct content on every write, and a derived-only `unknown` —
-//! a writer that loses sight of its harness stops heartbeating and lets the record age out rather
-//! than refreshing a state it can no longer prove.
+//! *declared* one, and neither speaks for the other. The record is written only by the owning
+//! session's driver processes — the wrapper, its channel, or its hooks; one logical owner per
+//! record, and nothing outside the driver writes it. Writes happen on state transitions plus a
+//! slow heartbeat and follow the presence record's transport discipline: an embedded origin
+//! timestamp (never file mtime), atomic tmp+rename writes serialized by a cross-process lock,
+//! byte-distinct content on every write that lands, and a derived-only `unknown` — a writer that
+//! loses sight of its harness stops heartbeating and lets the record age out rather than
+//! refreshing a state it can no longer prove. Restating an unchanged state is free: it touches
+//! the record only when the refresh cadence is due, so a chatty producer cannot flood the
+//! transport.
 
 use std::fs;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -28,6 +33,7 @@ pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
 const SCHEMA: &str = "st2.harness-state.v1";
+const LOCK_NAME: &str = ".harness-state.lock";
 
 /// What the harness is observed doing. `Child` is reserved: it is part of the contract so a v1
 /// reader decodes it, but no producer emits it yet (the screen observer that would have was cut).
@@ -169,55 +175,128 @@ impl Observation {
     }
 }
 
-/// The writer a session wrapper owns. One writer per live session; it coalesces identical
-/// observations, stamps transitions, and re-stamps the heartbeat on the presence cadence. The
-/// caller's rule for indeterminacy: when evidence is lost (the observer no longer sees its
+/// The writer a driver process owns over one agent's record. Several driver processes may
+/// legitimately hold writers over the same record — a wrapper heartbeat beside hook-process
+/// transitions — so every operation takes the record's cross-process lock and treats the on-disk
+/// record as the authoritative current state: rename alone is atomic but not isolated, and
+/// without the re-read a stale process could resurrect the state it saw before a peer's write.
+/// The caller's rule for indeterminacy: when evidence is lost (the observer no longer sees its
 /// harness), call nothing — never heartbeat a state you cannot see, and never write `unknown`.
 pub struct Writer {
     path: PathBuf,
+    lock_path: PathBuf,
     agent: String,
     harness: &'static str,
     pty_session: Option<String>,
-    current: Option<Record>,
+    interrupted: bool,
+    session_start_ms: u64,
 }
 
 impl Writer {
-    /// A writer continues the transition counter of any readable predecessor record so restarts
-    /// keep writes byte-distinct; an unreadable predecessor starts the counter fresh.
+    /// The transition counter continues from any readable record already on disk, so restarts and
+    /// sibling writers keep writes byte-distinct; an unreadable predecessor starts the counter
+    /// fresh.
     pub fn new(
         agent_dir: &Path,
         agent: impl Into<String>,
         harness: &'static str,
         pty_session: Option<String>,
     ) -> Self {
-        let path = harness_state_path(agent_dir);
-        let current = read_record(&path);
         Self {
-            path,
+            path: harness_state_path(agent_dir),
+            lock_path: agent_dir.join(LOCK_NAME),
             agent: agent.into(),
             harness,
             pty_session,
-            current,
+            interrupted: false,
+            session_start_ms: crate::message::now_ms(),
         }
     }
 
-    /// Record an observation. Identical consecutive observations coalesce into a heartbeat
-    /// re-stamp; a genuine change writes a new transition with a fresh `since`. `Unknown` state is
-    /// derived and cannot be written.
+    /// Pin the session-start boundary used by the heartbeat-eligibility rule to an explicit
+    /// timestamp. A wrapper that constructs a fresh writer per operation passes one stable
+    /// timestamp so every writer agrees on where this session began.
+    pub fn session_started_at(mut self, session_start_ms: u64) -> Self {
+        self.session_start_ms = session_start_ms;
+        self
+    }
+
+    /// Mark this writer's observation stream discontinuous: its evidence was lost and has since
+    /// returned. The next observation opens a fresh transition even if it restates the
+    /// pre-interruption tuple — continuity (`sinceMs`, the counter) must never be claimed across
+    /// an interval the observer did not see.
+    pub fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// Hold the record's exclusive cross-process lock for one read→decide→rename cycle. The lock
+    /// file is a permanent sibling; the guard releases on drop (close).
+    fn locked(&self) -> anyhow::Result<fs::File> {
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&self.lock_path)?;
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        anyhow::ensure!(rc == 0, "locking {} failed", self.lock_path.display());
+        Ok(lock)
+    }
+
+    /// Record an observation. A genuine change writes a new transition with a fresh `since`. An
+    /// observation identical to the on-disk record is a no-op while that record is fresh —
+    /// producers may restate their state arbitrarily often (an SSE stream restates several times
+    /// per second, measured) and only the refresh cadence may reach the transport — and becomes a
+    /// heartbeat-equivalent re-stamp once the record is older than [`HARNESS_STATE_REFRESH`].
+    /// `Unknown` state is derived and cannot be written.
     pub fn observe(&mut self, observation: Observation) -> anyhow::Result<()> {
+        self.observe_inner(observation, false).map(|_wrote| ())
+    }
+
+    /// [`Writer::observe`], except a live-state frame is dropped (returning `false`) when the
+    /// on-disk record is already terminal. Not a general rule — a harness may legally report
+    /// activity after a terminal error, and Codex does — but a producer whose live frames and
+    /// terminal record come from different processes opts in so a queued live frame can never
+    /// overwrite the incarnation's last word.
+    pub fn observe_unless_ended(&mut self, observation: Observation) -> anyhow::Result<bool> {
+        self.observe_inner(observation, true)
+    }
+
+    fn observe_inner(
+        &mut self,
+        observation: Observation,
+        skip_if_ended: bool,
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             observation.state != Activity::Unknown,
             "unknown is derived and cannot be written"
         );
+        let _lock = self.locked()?;
+        let on_disk = read_record(&self.path);
+        if skip_if_ended
+            && on_disk
+                .as_ref()
+                .is_some_and(|current| current.state == Activity::Ended)
+        {
+            return Ok(false);
+        }
         let now_ms = crate::message::now_ms();
-        let unchanged = self.current.as_ref().is_some_and(|current| {
-            current.state == observation.state
-                && current.blocked_on == observation.blocked_on
-                && current.input_buffer == observation.input_buffer
-                && current.reason == observation.reason
-                && current.exit == observation.exit
-        });
-        let (since_ms, transitions) = match (&self.current, unchanged) {
+        let unchanged = !self.interrupted
+            && on_disk.as_ref().is_some_and(|current| {
+                current.state == observation.state
+                    && current.blocked_on == observation.blocked_on
+                    && current.input_buffer == observation.input_buffer
+                    && current.reason == observation.reason
+                    && current.exit == observation.exit
+            });
+        if unchanged
+            && let Some(current) = on_disk.as_ref()
+            && now_ms.saturating_sub(current.written_at_ms) < duration_ms(HARNESS_STATE_REFRESH)
+        {
+            return Ok(true);
+        }
+        let (since_ms, transitions) = match (&on_disk, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (now_ms, current.transitions.saturating_add(1)),
             (None, _) => (now_ms, 0),
@@ -237,21 +316,27 @@ impl Writer {
             transitions,
         };
         write_record(&self.path, &record)?;
-        self.current = Some(record);
-        Ok(())
+        self.interrupted = false;
+        Ok(true)
     }
 
-    /// Re-stamp the heartbeat for a state the writer still has evidence for. A writer that has not
-    /// observed anything yet, or whose last write was terminal, has nothing to keep fresh.
+    /// Re-stamp the heartbeat for whatever live state is on disk. Nothing on disk means nothing
+    /// to keep fresh, and a terminal record is never re-stamped. The on-disk record is
+    /// authoritative: a wrapper heartbeat re-stamps the newest state, including one a hook or
+    /// channel process wrote after this writer's last observation. A predecessor session's record
+    /// — one written before this session started — is preserved for counter continuity but is
+    /// never heartbeat-eligible: re-stamping it would keep a dead session's state fresh forever.
+    /// It becomes eligible once any writer of this session observes something.
     pub fn heartbeat(&mut self) -> anyhow::Result<()> {
-        let Some(current) = self.current.as_mut() else {
+        let _lock = self.locked()?;
+        let Some(mut current) = read_record(&self.path) else {
             return Ok(());
         };
-        if current.state == Activity::Ended {
+        if current.state == Activity::Ended || current.written_at_ms < self.session_start_ms {
             return Ok(());
         }
         current.written_at_ms = crate::message::now_ms();
-        write_record(&self.path, current)
+        write_record(&self.path, &current)
     }
 
     /// Write the terminal record for this session. Idempotent-shaped: callers on racing teardown
@@ -307,11 +392,14 @@ pub enum SessionLiveness {
 /// Read an agent's observed harness state. `None` means no record exists — no driver has ever
 /// observed this agent, which is different from `unknown`. `probe` is the optional same-host
 /// liveness cross-check for the record's pty session; pass `None` for cross-host reads.
-pub fn read(
-    path: &Path,
-    probe: Option<&dyn Fn(&str) -> SessionLiveness>,
-) -> Option<Observed> {
-    let raw = fs::read(path).ok()?;
+pub fn read(path: &Path, probe: Option<&dyn Fn(&str) -> SessionLiveness>) -> Option<Observed> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        // Only proven absence is absence; a record that exists but cannot be read is
+        // indeterminate, never silently "no observation".
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(Observed::indeterminate("unreadable-record", None)),
+    };
     Some(read_raw_at(&raw, probe, crate::message::now_ms()))
 }
 
@@ -324,6 +412,11 @@ fn read_raw_at(
         return Observed::indeterminate("malformed-record", None);
     };
     let harness = Some(record.harness.clone());
+    // The discriminator gates interpretation: a future schema's words may be spelled like this
+    // version's while meaning something else, so nothing definite may be derived from them.
+    if record.schema != SCHEMA {
+        return Observed::indeterminate("unsupported-schema", harness);
+    }
     if record.written_at_ms > now_ms {
         if record.written_at_ms - now_ms > duration_ms(HARNESS_STATE_FUTURE_SKEW) {
             return Observed::indeterminate("future-skew", harness);
@@ -429,18 +522,20 @@ mod tests {
     fn unknown_state_is_derived_and_cannot_be_written() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = writer(tmp.path());
-        assert!(writer
-            .observe(Observation::new(
-                Activity::Unknown,
-                BlockedOn::None,
-                InputBuffer::Unknown,
-            ))
-            .is_err());
+        assert!(
+            writer
+                .observe(Observation::new(
+                    Activity::Unknown,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .is_err()
+        );
         assert_eq!(read(&harness_state_path(tmp.path()), None), None);
     }
 
     #[test]
-    fn every_write_is_byte_distinct() {
+    fn every_landed_write_is_byte_distinct_and_fresh_restatements_do_not_write() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let mut writer = writer(tmp.path());
@@ -448,17 +543,126 @@ mod tests {
         writer.observe(active()).unwrap();
         let first = fs::read(&path).unwrap();
 
-        // A coalesced identical observation still re-stamps the heartbeat…
+        // Restating an unchanged state against a fresh record must not touch it…
         std::thread::sleep(Duration::from_millis(2));
         writer.observe(active()).unwrap();
-        let second = fs::read(&path).unwrap();
-        assert_ne!(first, second, "identical observation must re-stamp bytes");
+        assert_eq!(
+            first,
+            fs::read(&path).unwrap(),
+            "fresh identical observation must not write"
+        );
 
-        // …and an explicit heartbeat does the same.
+        // …while an explicit heartbeat and a genuine transition each land distinct bytes.
         std::thread::sleep(Duration::from_millis(2));
         writer.heartbeat().unwrap();
+        let second = fs::read(&path).unwrap();
+        assert_ne!(first, second, "heartbeat must change bytes");
+
+        std::thread::sleep(Duration::from_millis(2));
+        writer
+            .observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
         let third = fs::read(&path).unwrap();
-        assert_ne!(second, third, "heartbeat must change bytes");
+        assert_ne!(second, third, "transition must change bytes");
+    }
+
+    /// The measured failure mode this guards: an SSE-fed producer restating its state ~3×/second
+    /// turned into 679 byte-distinct replicated writes in 221 s. Restatements are free.
+    #[test]
+    fn a_chatty_producer_restating_its_state_causes_zero_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = writer(tmp.path());
+
+        writer.observe(active()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        for _ in 0..300 {
+            writer.observe(active()).unwrap();
+        }
+        assert_eq!(bytes, fs::read(&path).unwrap());
+        let record: Record = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record.transitions, 0);
+    }
+
+    #[test]
+    fn an_unchanged_observation_re_stamps_only_a_record_older_than_the_refresh_cadence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let stale = Record {
+            schema: SCHEMA.to_string(),
+            agent: "hetz.worker".to_string(),
+            harness: "codex".to_string(),
+            state: Activity::Active,
+            blocked_on: BlockedOn::None,
+            input_buffer: InputBuffer::Unknown,
+            reason: None,
+            exit: None,
+            pty_session: Some("worker".to_string()),
+            since_ms: 5,
+            written_at_ms: 5,
+            transitions: 3,
+        };
+        write_record(&path, &stale).unwrap();
+
+        let mut writer = writer(tmp.path());
+        writer.observe(active()).unwrap();
+        let restamped: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(restamped.written_at_ms > 5, "overdue record must re-stamp");
+        assert_eq!(restamped.since_ms, 5, "since survives the re-stamp");
+        assert_eq!(
+            restamped.transitions, 3,
+            "a restatement is not a transition"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_defer_to_the_on_disk_record_not_their_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut a = writer(tmp.path());
+        let mut b = writer(tmp.path());
+
+        a.observe(active()).unwrap();
+        b.observe(Observation::new(
+            Activity::Idle,
+            BlockedOn::None,
+            InputBuffer::Unknown,
+        ))
+        .unwrap();
+
+        // A's heartbeat re-stamps the newest state on disk — it must not resurrect `active`.
+        a.heartbeat().unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.state, Activity::Idle);
+        assert_eq!(record.transitions, 1);
+
+        // A re-observing its own last state is a genuine change against the disk record.
+        a.observe(active()).unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.state, Activity::Active);
+        assert_eq!(record.transitions, 2);
+    }
+
+    #[test]
+    fn a_heartbeat_never_resurrects_a_peer_processes_terminal_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut a = writer(tmp.path());
+        let mut b = writer(tmp.path());
+
+        a.observe(active()).unwrap();
+        b.ended("signal 9").unwrap();
+        let terminal = fs::read(&path).unwrap();
+
+        a.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), terminal);
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Ended);
+        assert_eq!(observed.exit.as_deref(), Some("signal 9"));
     }
 
     #[test]
@@ -472,7 +676,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         writer.observe(active()).unwrap();
         let restated: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(restated.since_ms, entered.since_ms, "since survives restating");
+        assert_eq!(
+            restated.since_ms, entered.since_ms,
+            "since survives restating"
+        );
         assert_eq!(restated.transitions, entered.transitions);
 
         writer
@@ -551,7 +758,11 @@ mod tests {
     fn malformed_record_is_unknown_without_mtime_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        for raw in [&b"garbage"[..], b"{}", b"{\"schema\":\"st2.harness-state.v1\"}"] {
+        for raw in [
+            &b"garbage"[..],
+            b"{}",
+            b"{\"schema\":\"st2.harness-state.v1\"}",
+        ] {
             fs::write(&path, raw).unwrap();
             let observed = read(&path, None).unwrap();
             assert_eq!(observed.state, Activity::Unknown);
@@ -572,7 +783,10 @@ mod tests {
         assert_eq!(observed.state, Activity::Unknown);
         assert_eq!(observed.reason.as_deref(), Some("session-dead"));
         // An unreadable registry proves nothing and downgrades nothing.
-        assert_eq!(read(&path, Some(indeterminate)).unwrap().state, Activity::Active);
+        assert_eq!(
+            read(&path, Some(indeterminate)).unwrap().state,
+            Activity::Active
+        );
 
         writer.ended("signal 9").unwrap();
         let observed = read(&path, Some(dead)).unwrap();
@@ -593,22 +807,120 @@ mod tests {
         writer.ended("exit 0").unwrap();
         let terminal = fs::read(&path).unwrap();
         writer.heartbeat().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), terminal, "ended is never re-stamped");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            terminal,
+            "ended is never re-stamped"
+        );
     }
 
     #[test]
     fn future_vocabulary_degrades_to_indeterminate_not_none() {
-        // A v2 writer's new words must not decode as anything definite in a v1 reader.
-        let raw = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"hibernating","blockedOn":"robot","inputBuffer":"overflowing","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
+        // A future schema gates interpretation entirely — even words spelled exactly like this
+        // version's must not decode as anything definite, because v2 may have changed what the
+        // same spelling means.
+        let raw = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
         let observed = read_raw_at(raw, None, 9_999_999_999_999);
         assert_eq!(observed.state, Activity::Unknown);
-        assert_eq!(observed.reason.as_deref(), Some("literal-unknown"));
+        assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
+        assert_eq!(observed.blocked_on, BlockedOn::Unknown);
 
-        // And on a fresh record with a known state, unknown axis words stay indeterminate.
+        // And on a v1 record with a known state, unknown axis words stay indeterminate.
         let raw = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"robot","inputBuffer":"overflowing","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#;
         let observed = read_raw_at(raw, None, 9_999_999_999_999);
         assert_eq!(observed.state, Activity::Active);
         assert_eq!(observed.blocked_on, BlockedOn::Unknown);
         assert_eq!(observed.input_buffer, InputBuffer::Unknown);
+    }
+
+    #[test]
+    fn interrupt_forces_a_fresh_transition_even_for_a_restated_fresh_tuple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = writer(tmp.path());
+
+        writer.observe(active()).unwrap();
+        let entered: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        // Evidence lost and returned: the restated tuple must not claim continuity, overriding
+        // both the coalesce branch and the fresh-restatement no-op guard.
+        writer.interrupt();
+        writer.observe(active()).unwrap();
+        let resumed: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(resumed.transitions, entered.transitions + 1);
+        assert!(resumed.since_ms >= entered.since_ms);
+
+        // The flag clears on the write: the next restatement coalesces again.
+        let bytes = fs::read(&path).unwrap();
+        writer.observe(active()).unwrap();
+        assert_eq!(bytes, fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn a_predecessor_sessions_record_is_never_heartbeat_eligible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let predecessor = Record {
+            schema: SCHEMA.to_string(),
+            agent: "hetz.worker".to_string(),
+            harness: "codex".to_string(),
+            state: Activity::Active,
+            blocked_on: BlockedOn::None,
+            input_buffer: InputBuffer::Unknown,
+            reason: None,
+            exit: None,
+            pty_session: Some("worker".to_string()),
+            since_ms: 5,
+            written_at_ms: 5,
+            transitions: 3,
+        };
+        write_record(&path, &predecessor).unwrap();
+        let stale_bytes = fs::read(&path).unwrap();
+
+        // A restarted wrapper must not keep a dead session's state fresh forever.
+        let mut writer = writer(tmp.path());
+        writer.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), stale_bytes);
+
+        // Once this session observes something, heartbeats re-stamp again.
+        writer.observe(active()).unwrap();
+        let observed_bytes = fs::read(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        writer.heartbeat().unwrap();
+        assert_ne!(fs::read(&path).unwrap(), observed_bytes);
+    }
+
+    #[test]
+    fn an_unreadable_record_is_indeterminate_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        fs::create_dir(&path).unwrap();
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Unknown);
+        assert_eq!(observed.reason.as_deref(), Some("unreadable-record"));
+    }
+
+    #[test]
+    fn observe_unless_ended_drops_live_frames_after_a_peer_terminal_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut channel = writer(tmp.path());
+        let mut wrapper = writer(tmp.path());
+
+        assert!(channel.observe_unless_ended(active()).unwrap());
+        wrapper.ended("signal 9").unwrap();
+        let terminal = fs::read(&path).unwrap();
+
+        // A queued live frame arriving after the terminal record must not resurrect the session.
+        assert!(
+            !channel
+                .observe_unless_ended(Observation::new(
+                    Activity::Idle,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .unwrap()
+        );
+        assert_eq!(fs::read(&path).unwrap(), terminal);
     }
 }
