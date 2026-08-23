@@ -64,7 +64,9 @@ pub fn run(
     let executable =
         std::env::current_exe().context("resolving st2 executable for the pi channel")?;
     let session = harness_state::session_token();
-    let seq = harness_state::claim_seq(&agent_dir);
+    // The claim is written: it supersedes whatever the predecessor left — including a
+    // still-fresh live record — before the channel or terminal writer act under it.
+    let seq = harness_state::claim(&agent_dir, identity.clone(), "pi", &session)?;
     let mut env = channel_env(
         &executable,
         catalog_root,

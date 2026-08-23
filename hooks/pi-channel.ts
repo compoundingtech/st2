@@ -111,7 +111,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** Open a channel and resolve with the hello's restored context (empty if none, or on timeout). */
-  const open = (ctx: ExtensionContext): Promise<string> => {
+  const open = async (ctx: ExtensionContext): Promise<string> => {
     if (!bin || !catalog || !identity) return Promise.resolve("");
     if (typeof ctx.isIdle !== "function") {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
@@ -124,9 +124,24 @@ export default function (pi: ExtensionAPI) {
       );
       return Promise.resolve("");
     }
-    // Closes the channel opened by the PREVIOUS session, whichever extension instance opened it.
-    closeChild(state.child);
+    // Closes the channel opened by the PREVIOUS session, whichever extension instance opened
+    // it — and WAITS (bounded) for it to exit before the replacement spawns: the successor
+    // shares the seat's record, and a predecessor draining its queued frames after the new
+    // session's seed would land stale state into fresh records.
+    const previous = state.child;
+    closeChild(previous);
+    await awaitExit(previous, 2000);
 
+    const awaitExit = (child: childProcess.ChildProcess | undefined, ms: number) =>
+      new Promise<void>((resolve) => {
+        if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
     if (session) channelEnv[SESSION] = session;
