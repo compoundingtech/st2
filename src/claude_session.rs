@@ -39,7 +39,12 @@ pub fn run(
     let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id);
     // The runtime ID reaches hook subprocesses through the provider environment, so their
     // transitions carry the same pty session the wrapper's records do.
-    let env = [(RUNTIME_ID_ENV.to_string(), runtime_id.clone())];
+    let env = [
+        (RUNTIME_ID_ENV.to_string(), runtime_id.clone()),
+        // Hook subprocesses adopt the wrapper's incarnation token, so their transitions are this
+        // session's records: the wrapper can re-stamp them, and its terminal record fences them.
+        (SESSION_ENV.to_string(), observer.session().to_string()),
+    ];
     run_provider(
         "Claude",
         &status::status_path(&agent_dir),
@@ -59,6 +64,8 @@ pub fn run(
 /// short-lived writer; the transition counter continues from disk.
 /// The env var carrying the wrapper's runtime/task ID into Claude's hook subprocesses.
 pub const RUNTIME_ID_ENV: &str = "ST2_CLAUDE_RUNTIME_ID";
+/// The env var carrying the wrapper's session incarnation token into Claude's hook subprocesses.
+pub const SESSION_ENV: &str = "ST2_CLAUDE_SESSION";
 
 pub fn run_observe(
     catalog_root: &Path,
@@ -76,12 +83,32 @@ pub fn run_observe(
     };
     let pty_session = runtime_id.unwrap_or(identity).to_string();
     let mut writer = harness_state::Writer::new(&agent_dir, identity, "claude", Some(pty_session));
+    // The wrapper's exported token makes hook writes this session's records. A wrapperless seat
+    // (hooks registered on a plain hand-authored launch) falls back to Claude's own session_id —
+    // stable across one Claude session's hooks, fresh on restart — so restatements still
+    // coalesce and a restart still opens a new transition; what such a seat lacks is a
+    // heartbeat/terminal owner, which is a documented hooks-only limitation.
+    let session = std::env::var(SESSION_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| format!("claude-session-{id}"))
+        });
+    if let Some(session) = session {
+        writer = writer.with_session(session);
+    }
     if event == "SessionStart" {
         // The one event that names a session boundary: even if the new session's first state
         // matches a fresh predecessor record, continuity must not be claimed across the restart.
         writer.interrupt();
     }
-    writer.observe(observation)
+    // A late hook finishing after the wrapper reaped Claude must not replace the terminal record
+    // with a live state: the wrapper's `ended` carries this same token and is the session's last
+    // word. (`false` = suppressed; the hook has nothing else to do with it.)
+    writer.observe_unless_ended(observation).map(|_wrote| ())
 }
 
 /// Map one Claude hook event to an observation, or `None` when the event says nothing about
@@ -286,13 +313,15 @@ mod tests {
         let record = harness_state_path(tmp.path());
         let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
 
-        // A hook process wrote a blocked observation between wrapper ticks.
+        // A hook process wrote a blocked observation between wrapper ticks — carrying the
+        // wrapper's exported token, exactly as the env plumbing arranges in a real seat.
         harness_state::Writer::new(
             tmp.path(),
             "hetz.worker",
             "claude",
             Some("hetz.worker".to_string()),
         )
+        .with_session(observer.session())
         .observe(observe_hook_event("PermissionRequest", &serde_json::Value::Null).unwrap())
         .unwrap();
         let before = fs::read(&record).unwrap();
@@ -386,5 +415,58 @@ mod tests {
         // Non-blocking events carry no ask.
         let idle = observe_hook_event("Stop", &serde_json::json!({})).unwrap();
         assert_eq!(idle.ask, Ask::None);
+    }
+
+    /// T2: a hook that finishes after the wrapper reaped Claude must not replace the terminal
+    /// record — the wrapper's `ended` carries the shared token and is the session's last word —
+    /// while a NEW session's boundary event still supersedes an old terminal record.
+    #[test]
+    fn a_late_hook_never_overwrites_this_sessions_terminal_record() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let record = harness_state_path(tmp.path());
+        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
+        observer.ended("exit 0");
+
+        // The straggler hook shares the session token (env plumbing) and is suppressed.
+        let mut late = harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        )
+        .with_session(observer.session());
+        assert!(
+            !late
+                .observe_unless_ended(
+                    observe_hook_event("PostToolUse", &serde_json::Value::Null).unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            harness_state::read(&record, None).unwrap().state,
+            Activity::Ended
+        );
+
+        // A new Claude session is a new incarnation: its SessionStart replaces the old terminal.
+        let mut fresh = harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        )
+        .with_session("claude-session-fresh");
+        fresh.interrupt();
+        assert!(
+            fresh
+                .observe_unless_ended(
+                    observe_hook_event("SessionStart", &serde_json::Value::Null).unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            harness_state::read(&record, None).unwrap().state,
+            Activity::Idle
+        );
     }
 }

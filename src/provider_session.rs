@@ -60,14 +60,17 @@ pub(crate) struct SessionObserver {
     identity: String,
     harness: &'static str,
     pty_session: String,
-    session_start_ms: u64,
+    session: String,
+    /// A terminal-only observer records how the session ended but never re-stamps live state —
+    /// for wrappers whose heartbeat belongs to another sibling process (pi's channel).
+    heartbeats: bool,
 }
 
 impl SessionObserver {
     /// `pty_session` is the wrapper's runtime/task ID — the registry entry whose liveness vouches
-    /// for the record. The session start is pinned once here so every per-operation fresh writer
-    /// agrees where this session began: a predecessor session's record stays heartbeat-ineligible
-    /// until something of this session is observed.
+    /// for the record. The observer mints the session incarnation token; the wrapper exports it
+    /// to its sibling writer processes (hooks, a channel) so ownership — coalescing, heartbeat
+    /// eligibility, terminal fencing — is decided by token equality across all of them.
     pub(crate) fn new(
         agent_dir: &Path,
         identity: &str,
@@ -79,8 +82,34 @@ impl SessionObserver {
             identity: identity.to_string(),
             harness,
             pty_session: pty_session.to_string(),
-            session_start_ms: crate::message::now_ms(),
+            session: harness_state::session_token(),
+            heartbeats: true,
         }
+    }
+
+    /// An observer that records only how the session ended: `heartbeat` is a no-op because a
+    /// sibling process owns the live record and its freshness. Adopts that sibling's token so
+    /// the terminal record fences exactly this session's records.
+    pub(crate) fn terminal_only(
+        agent_dir: &Path,
+        identity: &str,
+        harness: &'static str,
+        pty_session: &str,
+        session: &str,
+    ) -> Self {
+        Self {
+            agent_dir: agent_dir.to_path_buf(),
+            identity: identity.to_string(),
+            harness,
+            pty_session: pty_session.to_string(),
+            session: session.to_string(),
+            heartbeats: false,
+        }
+    }
+
+    /// The session incarnation token sibling writer processes must adopt.
+    pub(crate) fn session(&self) -> &str {
+        &self.session
     }
 
     fn writer(&self) -> harness_state::Writer {
@@ -90,13 +119,15 @@ impl SessionObserver {
             self.harness,
             Some(self.pty_session.clone()),
         )
-        .session_started_at(self.session_start_ms)
+        .with_session(self.session.clone())
     }
 
     /// Re-stamp whatever live state is on disk. The wrapper's evidence is the provider child it is
     /// polling, so this is called only while that child is alive.
     pub(crate) fn heartbeat(&self) {
-        let _ = self.writer().heartbeat();
+        if self.heartbeats {
+            let _ = self.writer().heartbeat();
+        }
     }
 
     /// Best-effort terminal record; observation must never turn a clean teardown into an error.

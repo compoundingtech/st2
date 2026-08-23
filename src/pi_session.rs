@@ -110,6 +110,17 @@ pub fn run(
         }
     };
     install_signal_handler();
+    // Terminal-only: the channel owns the live record and its heartbeat, but only this wrapper
+    // survives long enough to see the stop path — its pre-escalation `ended` write is the one
+    // that makes `Stopped(None)` observable at all. Same token as the channel, so the terminal
+    // record fences exactly this session's live records.
+    let observer = crate::provider_session::SessionObserver::terminal_only(
+        &agent_dir,
+        &identity,
+        "pi",
+        &runtime_id,
+        &session,
+    );
     let outcome = run_provider_observed(
         "pi",
         &status::status_path(&agent_dir),
@@ -118,7 +129,7 @@ pub fn run(
         status::STATUS_REFRESH,
         PROVIDER_POLL,
         &STOP,
-        None,
+        Some(&observer),
     )
     .with_context(|| format!("running pi driver '{runtime_id}'"))?;
     record_session_end(&agent_dir, &identity, &runtime_id, &session, seq, &outcome);
@@ -398,5 +409,41 @@ mod tests {
                 (CHANNEL_SEQ.to_string(), "7".to_string()),
             ]
         );
+    }
+
+    /// W6: the terminal-only observer records how the session ended but never re-stamps live
+    /// state — the channel owns the heartbeat — and its token makes the write this session's.
+    #[test]
+    fn the_terminal_only_observer_ends_but_never_heartbeats() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let record = harness_state::harness_state_path(tmp.path());
+        let session = harness_state::session_token();
+        let mut channel =
+            harness_state::Writer::new(tmp.path(), "h.worker", "pi", Some("h.worker".to_string()))
+                .with_session(session.clone());
+        channel
+            .observe(harness_state::Observation::new(
+                Activity::Active,
+                harness_state::BlockedOn::None,
+                harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let live = std::fs::read(&record).unwrap();
+
+        let observer = crate::provider_session::SessionObserver::terminal_only(
+            tmp.path(),
+            "h.worker",
+            "pi",
+            "h.worker",
+            &session,
+        );
+        observer.heartbeat();
+        assert_eq!(std::fs::read(&record).unwrap(), live, "no heartbeat");
+
+        observer.ended("signal 9");
+        let observed = harness_state::read(&record, None).unwrap();
+        assert_eq!(observed.state, Activity::Ended);
+        assert_eq!(observed.exit.as_deref(), Some("signal 9"));
     }
 }
