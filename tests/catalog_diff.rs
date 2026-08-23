@@ -479,6 +479,35 @@ fn render_operations_are_normalized_separately_from_core_agent_fields() {
 }
 
 #[test]
+fn render_executable_property_has_one_semantic_address() {
+    let (_temp, catalog, prepared, _root) = fixture();
+    fs::write(
+        catalog.join("agents/host/worker/agent.kdl"),
+        r#"agent "worker" { host "host"; workspace "/tmp"; argv "tool"; render { file "a" "same" } }
+"#,
+    )
+    .unwrap();
+    let replacement = prepared.parent().unwrap().join("render-mode-base");
+    let snap = snapshot(&catalog, &replacement);
+    let root = snap["rootSha256"].as_str().unwrap();
+    fs::remove_dir_all(&prepared).unwrap();
+    fs::rename(replacement, &prepared).unwrap();
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        r#"agent "worker" { host "host"; workspace "/tmp"; argv "tool"; render { file "a" "same" executable=#true } }
+"#,
+    )
+    .unwrap();
+
+    let receipt = parsed(&diff(&catalog, &prepared, root));
+
+    assert_eq!(
+        agent_fields(&receipt),
+        vec!["/agents/host/worker/render/0/executable"]
+    );
+}
+
+#[test]
 fn stale_root_malformed_ambiguous_and_special_prepared_inputs_fail_closed() {
     let (_temp, catalog, prepared, root) = fixture();
     let stale = diff(&catalog, &prepared, &"0".repeat(64));

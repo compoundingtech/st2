@@ -324,9 +324,29 @@ presence is checked only for the selected run host, which defaults to the local 
 bare identity or the fully-qualified `<host>.<identity>` bus id.
 
 Materialization simulates all content operations before writing. It refuses any real change to a
-Git-tracked target, including `AGENTS.md`; byte-identical tracked content is accepted. Inspect the
-declared targets and keep generated overlays untracked. Detection invokes `git` and fails closed if
-the executable is unavailable or a workspace that appears to be a worktree cannot be inspected.
+Git-tracked target, including a mode-only change; byte-identical content with the declared mode is
+accepted. Inspect the declared targets and keep generated overlays untracked. Detection invokes
+`git` and fails closed if the executable is unavailable or a workspace that appears to be a worktree
+cannot be inspected.
+
+Each content directive accepts `executable=#true`. st2 applies exact mode `0755` when the property is
+true and exact mode `0644` when it is absent or false. Materialization repairs a wrong existing mode
+even when the file bytes already match. A `copy` source mode does not affect the destination mode.
+An operation whose bytes and mode already match is not reported as materialized.
+
+Inline content uses the existing `file` directive. st2 writes the decoded KDL string without adding
+or removing a newline. A blank line before a multiline string's closing delimiter encodes one final
+newline:
+
+```kdl
+file ".st2/bin/probe" executable=#true {
+  content #"""
+#!/bin/sh
+printf 'ready\n'
+
+"""#
+}
+```
 
 `git-exclude` is advisory. `copy`, `file`, `json-upsert`, and `ensure-line` are boot-gating.
 

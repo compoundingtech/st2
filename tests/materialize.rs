@@ -211,6 +211,35 @@ fn shared_workspace_byte_identical_claims_are_idempotent() {
 }
 
 #[test]
+fn shared_workspace_mode_claims_must_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("shared-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let regular = r#"    copy "_templates/shared" "bin/tool""#;
+    let executable = r#"    copy "_templates/shared" "bin/tool" executable=#true"#;
+    write(
+        &catalog.join("agents/Silber/a/agent.kdl"),
+        agent_kdl(&workspace, regular),
+    );
+    write(
+        &catalog.join("agents/Silber/b/agent.kdl"),
+        agent_kdl(&workspace, executable)
+            .replace("agent \"cos\"", "agent \"b\"")
+            .replace("Silber.cos", "Silber.b"),
+    );
+    write(&catalog.join("_templates/shared"), "same\n");
+    let found = discover(&catalog);
+
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.errors[0].contains("conflicting render ownership"));
+    assert_eq!(report.failed_agents.len(), 2);
+    assert!(!workspace.join("bin/tool").exists());
+}
+
+#[test]
 fn task_selector_ambiguous_refuses_without_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
@@ -531,6 +560,11 @@ fn byte_identical_tracked_target_is_allowed_without_modification() {
     fs::create_dir_all(&workspace).unwrap();
     init_git(&workspace);
     write(&workspace.join("AGENTS.md"), "same\n");
+    fs::set_permissions(
+        workspace.join("AGENTS.md"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
     track(&workspace, "AGENTS.md");
     write(&catalog.join("_templates/AGENTS.md"), "same\n");
     write(
@@ -550,6 +584,39 @@ fn byte_identical_tracked_target_is_allowed_without_modification() {
         .unwrap();
     assert!(report.is_clean(), "{:?}", report.errors);
     assert_eq!(before, after, "identical target was needlessly rewritten");
+}
+
+#[test]
+fn mode_only_change_to_a_tracked_target_fails_before_any_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    init_git(&workspace);
+    let target = workspace.join("tool");
+    write(&target, "same\n");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    track(&workspace, "tool");
+    write(&catalog.join("_templates/tool"), "same\n");
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    copy "_templates/tool" "tool" executable=#true
+    file "must-not-exist" "blocked""#,
+        ),
+    );
+
+    let found = discover(&catalog);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.errors[0].contains("generated materialization would change Git-tracked target"));
+    assert_eq!(
+        fs::metadata(target).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert!(!workspace.join("must-not-exist").exists());
 }
 
 #[test]
