@@ -103,6 +103,50 @@ pub fn hookset_id() -> String {
     expected_manifest().hookset
 }
 
+/// The canonical Claude workspace hook registration: the exact
+/// `.claude/settings.local.json` payload a maintained Claude seat carries. The
+/// hand-authored example declaration and `expand_claude` both resolve to this one
+/// shape, so a driver-declared seat and a hand-authored seat register identical
+/// hooks and there is a single place a hook event can be added.
+pub fn claude_settings_registration() -> serde_json::Value {
+    fn observe(event: &str) -> serde_json::Value {
+        serde_json::json!([{ "hooks": [{
+            "type": "command",
+            "command": format!("$ST_HOOKS/claude-observe.sh {event}"),
+        }] }])
+    }
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/claude-code-settings.json",
+        "hooks": {
+            "SessionStart": [{ "hooks": [
+                {
+                    "type": "command",
+                    "async": true,
+                    "asyncRewake": true,
+                    "command": "$ST_HOOKS/claude-session-start.sh",
+                },
+                {
+                    "type": "command",
+                    "command": "$ST_HOOKS/claude-observe.sh SessionStart",
+                },
+            ] }],
+            "PreCompact": [{ "hooks": [{
+                "type": "command",
+                "command": "$ST_HOOKS/claude-pre-compact.sh",
+            }] }],
+            "StopFailure": [{ "hooks": [{
+                "type": "command",
+                "command": "$ST_HOOKS/claude-stop-failure.sh",
+            }] }],
+            "UserPromptSubmit": observe("UserPromptSubmit"),
+            "Stop": observe("Stop"),
+            "PermissionRequest": observe("PermissionRequest"),
+            "PreToolUse": observe("PreToolUse"),
+            "PostToolUse": observe("PostToolUse"),
+        }
+    })
+}
+
 /// Install-owned hook root. `$ST_HOOKS` can pin a scratch or custom state layout; otherwise use
 /// `$XDG_STATE_HOME/st2/hooks` or `~/.local/state/st2/hooks`.
 pub fn hooks_root() -> Result<PathBuf> {
@@ -514,6 +558,40 @@ pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example declaration is the hand-authored half of the one canonical Claude hook
+    /// registration; expansion emits the other half from [`claude_settings_registration`]. If the
+    /// two drift, a driver-declared and a hand-authored seat stop registering the same hooks.
+    #[test]
+    fn example_claude_declaration_registers_the_canonical_hook_settings() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/native/agent-claude.kdl"
+        );
+        let raw = std::fs::read_to_string(path).unwrap();
+        let document: kdl::KdlDocument = raw.parse().unwrap();
+        let agent = document.get("agent").unwrap();
+        let render = agent.children().unwrap().get("render").unwrap();
+        let content = render
+            .children()
+            .unwrap()
+            .nodes()
+            .iter()
+            .filter(|node| node.name().value() == "json-upsert")
+            .find_map(|node| {
+                let mut entries = node
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry.value() {
+                        kdl::KdlValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+                (entries.next() == Some(".claude/settings.local.json")).then(|| entries.next())?
+            })
+            .expect("example declares the settings.local.json upsert");
+        let registered: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(registered, claude_settings_registration());
+    }
 
     /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
     /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one

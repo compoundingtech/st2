@@ -167,13 +167,24 @@ classified from the payload's `tool_name` (`AskUserQuestion` → `question`,
 anything else → `permission`) — (its meaning is
 specifically "a human is about to be asked" — it fires only under permission
 modes that ask). Events carrying `agent_id` are subagent-nested and never move
-top-level state. The blocked *exit* edge under batched tool calls is
-unspecified until a capture proves a rule (`DQ-H1`); until then the spec
-states the limit rather than a rule that cannot hold. The wrapper side owns
-liveness: it re-stamps the heartbeat on its existing presence cadence while
-the child is alive, and writes the terminal record from its `try_wait` reap
-and its SIGTERM path — before any SIGKILL escalation into its own process
-group, which no in-process write survives (OHS-T04).
+top-level state. The blocked *exit* edge is the next `PreToolUse`,
+`PostToolUse`, or `Stop` — measured-correct, not merely conservative: the
+2026-08-23 batched-permission capture (`DQ-H1`) shows tool execution
+serializes around an open permission prompt, so no event can clear the
+blocked state early. The residual limit is the eventless deny path pinned in
+`DQ-H1`. The wrapper side owns liveness: it re-stamps the heartbeat on its
+existing presence cadence while the child is alive — through a fresh writer
+each time, so it never clobbers a state a hook process wrote in between —
+and writes the terminal record from its `try_wait` reap and its SIGTERM
+path, before any SIGKILL escalation into its own process group, which no
+in-process write survives (OHS-T04). Hook registration has one canonical
+shape (`hooks::claude_settings_registration`): the maintained example
+declaration (`examples/native/agent-claude.kdl`) carries it by hand, and
+`expand_claude` renders the same `.claude/settings.local.json` upsert for
+driver-declared seats, so both surfaces register identical hooks and a test
+fails if they drift. A live seat converges without disruption: render output
+is not part of the launch fingerprint, the merged settings land on the next
+materialization pass, and the hooks take effect at the next session start.
 
 ## pi producer (OHS-R05, OHS-R08)
 

@@ -1709,6 +1709,12 @@ mod tests {
     fn canonical_eval_runtime_inventory_compiles_driver_launches() {
         let catalog = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(catalog.path().join("worker")).unwrap();
+        // The Claude driver expansion registers `$ST_HOOKS` hooks, and materialization refuses an
+        // unverified hook set — the same contract an eval host satisfies with `st2 hooks install`.
+        // The root outlives the test (env stays set for the process), so it is kept, not dropped.
+        let hooks = tempfile::tempdir().unwrap().keep();
+        crate::hooks::install_at(&hooks, false).unwrap();
+        unsafe { std::env::set_var("ST_HOOKS", &hooks) };
         write_eval_agent(
             catalog.path(),
             "agents/evalhost/worker/agent.kdl",

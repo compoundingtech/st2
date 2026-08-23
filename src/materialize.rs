@@ -271,6 +271,12 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
         else {
             continue;
         };
+        // The hook registration ships verbatim: its `$ST_HOOKS` references are render
+        // variables the materializer resolves against the verified set, not an executable
+        // path this binary should rewrite.
+        if destination == ".claude/settings.local.json" {
+            continue;
+        }
         anyhow::ensure!(
             destination == ".mcp.json",
             "agent '{agent}' driver expansion produced an unexpected JSON destination"
