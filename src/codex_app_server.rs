@@ -18,6 +18,7 @@ use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -403,12 +404,14 @@ impl CodexInboxDelivery {
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
         let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
-        // An agent IS its pty: the session whose liveness vouches for the record is the identity.
+        // The pty session whose liveness vouches for the record is the wrapper's task: the
+        // runtime ID names the pty registry entry, and only aliases the identity on
+        // driver-expanded seats — a hand-authored seat may declare a different task ID.
         let harness_writer = harness_state::Writer::new(
             &config.agent_dir,
             config.identity.clone(),
             "codex",
-            Some(config.identity.clone()),
+            Some(runtime.runtime_id().to_string()),
         );
         Ok(Self {
             config,
@@ -437,7 +440,13 @@ impl CodexInboxDelivery {
                 let _ = self.harness_writer.observe(observation);
                 self.harness_evidence = true;
             }
-            None => self.harness_evidence = false,
+            None => {
+                // Evidence lost: stop heartbeating, and mark the stream discontinuous so a state
+                // restated after the gap opens a fresh transition instead of claiming continuity
+                // across an interval nothing observed.
+                self.harness_evidence = false;
+                self.harness_writer.interrupt();
+            }
         }
     }
 
@@ -1285,6 +1294,10 @@ fn run_connected(
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
+    // st2's own stop path SIGTERMs this wrapper. Without a handler the wrapper dies before the
+    // post-join terminal write below, so a stopped seat would read its last live state until the
+    // staleness horizon — the exact window the Claude wrapper's ordering closes.
+    crate::provider_session::install_signal_handler();
     let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
     let endpoint = format!("unix://{}", socket_path.display());
     let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
@@ -1350,7 +1363,7 @@ fn run_connected(
                 .with_context(|| format!("starting controlled {} TUI", codex_argv[0]));
         }
     };
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<TuiEnd> {
         diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
         if let Some(ready) = resume_ready_tx.take() {
             ready
@@ -1371,24 +1384,51 @@ fn run_connected(
     let _ = event_thread.join();
     // The pump is gone, so nothing can observe this session again: publish the terminal
     // observation with the outcome the wrapper actually saw, before any staleness horizon.
+    // Consumers must not branch on `reason`, so the observed exit always lands in `exit`.
     let mut harness_writer = harness_state::Writer::new(
         &harness_agent_dir,
         harness_identity.clone(),
         "codex",
-        Some(harness_identity),
+        Some(runtime.runtime_id().to_string()),
     );
     let _ = match &result {
-        Ok(()) => harness_writer.ended("exit 0"),
-        Err(error) => harness_writer.observe(
-            harness_state::Observation::new(
-                harness_state::Activity::Ended,
-                harness_state::BlockedOn::None,
-                harness_state::InputBuffer::Unknown,
+        Ok(TuiEnd::Exited(status)) => harness_writer.ended(describe_tui_exit(Some(*status))),
+        Ok(TuiEnd::Stopped(status)) => harness_writer.ended(describe_tui_exit(*status)),
+        Err(error) => {
+            let observed_exit = tui.try_wait().ok().flatten();
+            harness_writer.observe(
+                harness_state::Observation::new(
+                    harness_state::Activity::Ended,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Unknown,
+                )
+                .with_exit(describe_tui_exit(observed_exit))
+                .with_reason(format!("{error}")),
             )
-            .with_reason(format!("{error}")),
-        ),
+        }
     };
-    result
+    match result {
+        Ok(TuiEnd::Exited(status)) => completed_tui(status),
+        // The wrapper stopped its own session: not a failure, mirroring the shared wrapper body.
+        Ok(TuiEnd::Stopped(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// How the controlled TUI session came to an end, as the monitor saw it.
+enum TuiEnd {
+    /// The TUI exited on its own with this status.
+    Exited(ExitStatus),
+    /// The wrapper's stop flag ended the session; the reaped status when one was observable.
+    Stopped(Option<ExitStatus>),
+}
+
+fn describe_tui_exit(status: Option<ExitStatus>) -> String {
+    match status.map(|status| (status.code(), status.signal())) {
+        Some((Some(code), _)) => format!("exit {code}"),
+        Some((None, Some(signal))) => format!("signal {signal}"),
+        _ => "exit unknown".to_string(),
+    }
 }
 
 /// Start app-server with the authored global configuration inputs that its CLI supports.
@@ -2321,10 +2361,16 @@ fn wait_for_binding(
     }
 }
 
-fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result<()> {
+fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result<TuiEnd> {
     loop {
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            // st2's stop path: end the session and return through the ordinary terminal-write
+            // path so the record carries the observed outcome before the wrapper exits.
+            terminate_child(tui);
+            return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
+        }
         if let Some(status) = tui.try_wait()? {
-            return completed_tui(status);
+            return Ok(TuiEnd::Exited(status));
         }
         match events.recv_timeout(CONTROL_POLL) {
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
@@ -2912,6 +2958,39 @@ mod tests {
             fs::read(&record_path).unwrap(),
             before,
             "heartbeat resumes with evidence"
+        );
+    }
+
+    #[test]
+    fn evidence_loss_marks_the_stream_discontinuous_for_a_restated_state() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let record_path = harness_state::harness_state_path(&config.agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        let before = fs::read(&record_path).unwrap();
+
+        // The same tuple restated across an unproven interval must not coalesce into the
+        // pre-gap record — continuity was not observed, so a fresh transition opens.
+        delivery.observe_harness(&CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            turn_id: None,
+        });
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        assert_ne!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "a restated state after an evidence gap must open a fresh transition"
+        );
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Active
         );
     }
 
