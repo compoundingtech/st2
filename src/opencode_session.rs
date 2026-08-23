@@ -43,6 +43,7 @@ const DELIVERY_STATE_SCHEMA: &str = "st2.opencode-delivery-state.v1";
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
 const DELIVERY_RETRY: Duration = Duration::from_secs(2);
+const SEED_RETRY: Duration = Duration::from_millis(250);
 const SSE_RECONNECT: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -107,11 +108,13 @@ pub fn run(
         client,
         version_ok,
         status_path: status::status_path(&agent_dir),
+        // The pty session vouching for the record is the wrapper's task: the runtime ID names
+        // the registry entry, and only aliases the identity on driver-expanded seats.
         writer: Writer::new(
             &agent_dir,
             identity.clone(),
             "opencode",
-            Some(identity.clone()),
+            Some(runtime_id.clone()),
         ),
         delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
     };
@@ -137,7 +140,9 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
     let mut machine = EventMachine::default();
     let mut api_ok = false;
     let mut sse_started = false;
+    let mut sse_connected = false;
     let mut evidence = false;
+    let mut next_seed_attempt = Instant::now();
     let mut next_gate_attempt = Instant::now();
     let mut next_presence = Instant::now();
     let mut next_inbox = Instant::now();
@@ -178,10 +183,17 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             match event {
                 SseMessage::Connected => {
                     machine = EventMachine::default();
-                    seed_from_server(&session.client, &mut machine, &mut session.delivery);
-                    evidence = true;
+                    sse_connected = true;
+                    // Evidence turns on only once the level seed succeeds: resuming heartbeats
+                    // on a transiently failed seed would re-stamp whatever the disk last said.
+                    evidence =
+                        seed_from_server(&session.client, &mut machine, &mut session.delivery);
+                    next_seed_attempt = Instant::now() + SEED_RETRY;
                 }
-                SseMessage::Disconnected => evidence = false,
+                SseMessage::Disconnected => {
+                    sse_connected = false;
+                    evidence = false;
+                }
                 SseMessage::Event(value) => {
                     if let Some(sid) = event_session_id(&value) {
                         session.delivery.saw_session(sid);
@@ -189,6 +201,10 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                     machine.apply(&value);
                 }
             }
+        }
+        if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
+            evidence = seed_from_server(&session.client, &mut machine, &mut session.delivery);
+            next_seed_attempt = Instant::now() + SEED_RETRY;
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -504,9 +520,9 @@ fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc
 /// Re-seed observed state from the level surface after (re)connecting: events missed while
 /// disconnected are unrecoverable, and `/session/status` omits idle sessions, so an empty map over
 /// a live server is itself the idle proof.
-fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut Delivery) {
+fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut Delivery) -> bool {
     let Ok(statuses) = client.get_json("/session/status") else {
-        return;
+        return false;
     };
     machine.seed_idle();
     if let Some(map) = statuses.as_object() {
@@ -519,6 +535,24 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut 
             }
         }
     }
+    // An ask opened before this connection would otherwise be invisible until its exit event:
+    // re-seed pending permissions so blockedOn survives an SSE reconnect, with the id kept so
+    // the ordinary id-matched exit still releases it. Pending questions have no verified listing
+    // endpoint on 1.18.19, so only permission asks re-seed; the level seed above stays the gate.
+    if let Ok(pending) = client.get_json("/permission")
+        && let Some(items) = pending.as_array()
+    {
+        for item in items {
+            if let Some(id) = item
+                .get("id")
+                .or_else(|| item.get("requestID"))
+                .and_then(Value::as_str)
+            {
+                machine.seed_ask(id.to_string(), "permission");
+            }
+        }
+    }
+    true
 }
 
 // ---- event projection ------------------------------------------------------------------------
@@ -548,6 +582,12 @@ impl EventMachine {
     fn seed_busy(&mut self, session_id: String, retry: bool) {
         self.seen_level = true;
         self.busy.insert(session_id, retry);
+    }
+
+    /// Re-enter a human ask found pending at connect time, under its own id so the ordinary
+    /// id-matched exit event releases it.
+    fn seed_ask(&mut self, id: String, kind: &'static str) {
+        self.blocked.insert(id, kind);
     }
 
     fn apply(&mut self, event: &Value) {
@@ -689,6 +729,12 @@ fn event_session_id(event: &Value) -> Option<&str> {
 }
 
 // ---- native delivery -------------------------------------------------------------------------
+
+enum ReadBack {
+    Durable,
+    Absent,
+    Indeterminate,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -838,10 +884,17 @@ impl Delivery {
     }
 
     fn reconcile_or_retry(&mut self, client: &Client, state: DeliveryState) -> Result<()> {
-        if self.message_durable(client, &state)? {
-            let mut accepted = state;
-            accepted.phase = DeliveryPhase::Accepted;
-            return self.write_state(accepted);
+        match self.read_back(client, &state) {
+            ReadBack::Durable => {
+                let mut accepted = state;
+                accepted.phase = DeliveryPhase::Accepted;
+                return self.write_state(accepted);
+            }
+            // Measured on 1.18.19: a second POST with the same messageID appends its parts again
+            // into the same message, so an indeterminate read-back must never trigger a resend —
+            // the read-back itself is retried on a later pass.
+            ReadBack::Indeterminate => return Ok(()),
+            ReadBack::Absent => {}
         }
         if Instant::now() < self.next_attempt {
             return Ok(());
@@ -869,7 +922,7 @@ impl Delivery {
             (200..300).contains(&status),
             "POST {path} returned {status}"
         );
-        if self.message_durable(client, state)? {
+        if matches!(self.read_back(client, state), ReadBack::Durable) {
             let mut accepted = state.clone();
             accepted.phase = DeliveryPhase::Accepted;
             self.write_state(accepted)?;
@@ -878,9 +931,14 @@ impl Delivery {
     }
 
     /// The only receipt this transport accepts: the exact client message read back durably.
-    fn message_durable(&self, client: &Client, state: &DeliveryState) -> Result<bool> {
+    fn read_back(&self, client: &Client, state: &DeliveryState) -> ReadBack {
         let path = format!("/session/{}/message/{}", state.session_id, state.message_id);
-        Ok(client.status_of_get(&path)? == 200)
+        match client.status_of_get(&path) {
+            Ok(200) => ReadBack::Durable,
+            Ok(404) => ReadBack::Absent,
+            // A 5xx or a transport error proves nothing about the message either way.
+            Ok(_) | Err(_) => ReadBack::Indeterminate,
+        }
     }
 
     fn write_state(&mut self, state: DeliveryState) -> Result<()> {
@@ -1171,6 +1229,12 @@ mod tests {
         /// messageIDs the server will report durable.
         durable: Arc<Mutex<BTreeSet<String>>>,
         accept_posts: Arc<AtomicBool>,
+        /// When set, the message read-back answers 500: durable state is unknowable.
+        read_back_error: Arc<AtomicBool>,
+        /// When set, /session/status answers 500: the level seed fails.
+        status_error: Arc<AtomicBool>,
+        /// Ask ids /permission reports as pending.
+        pending_permissions: Arc<Mutex<Vec<String>>>,
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -1179,7 +1243,15 @@ mod tests {
         let posts = Arc::new(Mutex::new(Vec::new()));
         let durable = Arc::new(Mutex::new(BTreeSet::new()));
         let accept_posts = Arc::new(AtomicBool::new(true));
+        let read_back_error = Arc::new(AtomicBool::new(false));
+        let status_error = Arc::new(AtomicBool::new(false));
+        let pending_permissions = Arc::new(Mutex::new(Vec::<String>::new()));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
+        let (read_back_t, status_err_t, pending_t) = (
+            read_back_error.clone(),
+            status_error.clone(),
+            pending_permissions.clone(),
+        );
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -1227,20 +1299,40 @@ mod tests {
                     }
                 } else if method == "GET" && path.contains("/message/") {
                     let message_id = path.rsplit('/').next().unwrap_or("");
-                    if durable_t.lock().unwrap().contains(message_id) {
+                    if read_back_t.load(Ordering::SeqCst) {
+                        500
+                    } else if durable_t.lock().unwrap().contains(message_id) {
                         200
                     } else {
                         404
                     }
                 } else if method == "GET" && path == "/session/status" {
+                    if status_err_t.load(Ordering::SeqCst) {
+                        500
+                    } else {
+                        200
+                    }
+                } else if method == "GET" && path == "/permission" {
                     200
                 } else {
                     404
                 };
+                let body = if method == "GET" && path == "/permission" {
+                    let ids = pending_t.lock().unwrap();
+                    serde_json::to_string(
+                        &ids.iter()
+                            .map(|id| serde_json::json!({ "id": id }))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                } else {
+                    "{}".to_string()
+                };
                 let mut stream = reader.into_inner();
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
             }
         });
@@ -1249,7 +1341,76 @@ mod tests {
             posts,
             durable,
             accept_posts,
+            read_back_error,
+            status_error,
+            pending_permissions,
         }
+    }
+
+    /// Measured on 1.18.19: a second POST with the same messageID appends its parts again into
+    /// the same message, so an indeterminate read-back must retry the read-back, never the POST.
+    #[test]
+    fn an_indeterminate_read_back_retries_the_read_back_and_never_re_posts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path.clone());
+
+        server.read_back_error.store(true, Ordering::SeqCst);
+        delivery.pump(&client);
+        assert_eq!(server.posts.lock().unwrap().len(), 1, "one POST, attempted");
+        let state: DeliveryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state.phase, DeliveryPhase::Attempted);
+
+        // While the read-back stays indeterminate, no pass may re-POST.
+        delivery.pump(&client);
+        delivery.pump(&client);
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+
+        // The read-back recovering flips the same attempt to Accepted with no second POST.
+        server.read_back_error.store(false, Ordering::SeqCst);
+        delivery.pump(&client);
+        let state: DeliveryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
+    /// An ask opened before the SSE connection must survive the reconnect seed with its id, so
+    /// the ordinary id-matched exit still releases it.
+    #[test]
+    fn seeding_recovers_a_pending_ask_and_gates_evidence_on_the_level_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
+
+        // A transiently failing level seed yields no evidence at all.
+        server.status_error.store(true, Ordering::SeqCst);
+        let mut machine = EventMachine::default();
+        assert!(!seed_from_server(&client, &mut machine, &mut delivery));
+
+        // A successful seed recovers the pending ask under its own id.
+        server.status_error.store(false, Ordering::SeqCst);
+        server
+            .pending_permissions
+            .lock()
+            .unwrap()
+            .push("per_pending".to_string());
+        let mut machine = EventMachine::default();
+        assert!(seed_from_server(&client, &mut machine, &mut delivery));
+        let blocked = observed(&machine);
+        assert_eq!(blocked.state, Activity::Active);
+        assert_eq!(blocked.blocked_on, BlockedOn::Human);
+
+        // The id-matched exit releases exactly the recovered ask.
+        machine.apply(&event(
+            r#"{"type":"permission.replied","properties":{"requestID":"per_pending","reply":"once"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
     }
 
     fn delivery_fixture(tmp: &Path, state_path: PathBuf) -> (Delivery, String) {
