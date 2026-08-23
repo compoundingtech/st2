@@ -108,3 +108,112 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
     assert_eq!(record["state"], "ended", "record: {raw}");
     assert_eq!(record["exit"], "signal 9", "record: {raw}");
 }
+
+/// The OpenCode wrapper has its own stop implementation; its escalation cover must land before
+/// the group SIGKILL exactly like the shared wrapper's.
+#[test]
+fn opencode_stop_escalation_writes_the_cover_record_before_sigkill() {
+    let (record, mut wrapper, _tmp) = spawn_opencode_wrapper("trap '' TERM; : > \"$READY_MARKER\"; sleep 60");
+    unsafe {
+        libc::kill(wrapper.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if wrapper.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "wrapper survived its own escalation");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let raw = fs::read_to_string(&record).expect("cover record must land before the SIGKILL");
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["state"], "ended", "record: {raw}");
+    assert_eq!(value["exit"], "stopped", "record: {raw}");
+}
+
+/// A provider that yields inside the grace window leaves the wrapper alive, and the record is
+/// rewritten with the exit the reap actually observed — never left as the "stopped" cover.
+#[test]
+fn opencode_graceful_stop_records_the_real_reaped_exit() {
+    let (record, mut wrapper, _tmp) = spawn_opencode_wrapper(": > \"$READY_MARKER\"; sleep 60");
+    unsafe {
+        libc::kill(wrapper.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if wrapper.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "wrapper never finished its graceful stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let raw = fs::read_to_string(&record).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["state"], "ended", "record: {raw}");
+    assert_eq!(value["exit"], "signal 15", "record: {raw}");
+}
+
+/// Spawn the real opencode-session wrapper in its own process group over a shell provider (the
+/// API gate simply never opens — presence and the terminal path are what these prove), waiting on
+/// the provider's ready marker before returning.
+fn spawn_opencode_wrapper(
+    provider_script: &str,
+) -> (std::path::PathBuf, std::process::Child, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; command "true" }"#,
+    )
+    .unwrap();
+    let agent_dir = declaration.parent().unwrap().to_path_buf();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable(&bin.join("hostname"), "#!/bin/sh\necho h\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_st2"));
+    wrapper
+        .args(["--catalog"])
+        .arg(&catalog)
+        .args([
+            "driver",
+            "opencode-session",
+            "--identity",
+            "worker",
+            "--runtime-id",
+            "worker",
+            "--",
+            "sh",
+            "-c",
+            provider_script,
+        ])
+        .env("PATH", &path)
+        .env("READY_MARKER", tmp.path().join("provider-ready"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        wrapper.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let wrapper = wrapper.spawn().unwrap();
+    let ready = tmp.path().join("provider-ready");
+    let started = Instant::now();
+    while !ready.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "provider never signalled ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    (agent_dir.join("harness-state"), wrapper, tmp)
+}
+
