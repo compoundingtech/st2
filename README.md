@@ -187,7 +187,7 @@ The compact declaration shape is:
 agent "<identity>" {
   host "<host>"
   workspace "<workspace>"
-  resource "work" uri="github-issue://example/project/123"
+  resource "work" uri="github-issue://example/project/123" reason="release work item"
   // Optional metadata:
   // role "worker"
   // supervisor "<supervisor-bus-id>"
@@ -250,12 +250,13 @@ It neither registers schemes, owns profile schemas, nor resolves targets.
 Binding order is irrelevant and names must be unique within the agent:
 
 ```kdl
-resource "work" uri="github-issue://example/project/123"
-resource "source" uri="worktree://github.com/example/project/change"
-resource "delivery" uri="ding://host/agent"
+resource "work" uri="github-issue://example/project/123" reason="release work item"
+resource "source" uri="worktree://github.com/example/project/change" reason="primary checkout"
+resource "delivery" uri="ding://host/agent" reason="notification channel for this agent"
 ```
 
-The envelope is intentionally only `name` + `uri`. It carries no required/optional,
+The envelope is `name` + `uri` + a required human-facing `reason`, plus an optional
+`inactive-reason` that preserves a retired binding without deleting it. It carries no
 access, readiness, or lifecycle policy, and URI possession conveys no authority. A Resource URI may
 be referenced by any number of agent declarations. Resource-only declaration edits do not stop,
 replace, or relaunch a live task. Resource profiles and resolvers remain opaque to st2; catalog

@@ -191,10 +191,11 @@ the drift is fenced by
 An agent may directly declare zero or more generic Resource bindings:
 
 ```kdl
-resource "work" uri="github-issue://example/project/123"
+resource "work" uri="github-issue://example/project/123" reason="release work item"
 ```
 
-The positional name is an agent-local semantic role. `uri` is the exact RFC 3986 absolute resource
+The positional name is an agent-local semantic role. `reason` explains why the reference belongs
+to this agent (required; optional `inactive-reason` retains inactive bindings). `uri` is the exact RFC 3986 absolute resource
 identity, preserved byte-for-byte without normalization, and its scheme selects the open,
 downstream-owned Resource profile.
 Declaration order has no meaning and binding names are unique within one
