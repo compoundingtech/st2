@@ -108,6 +108,33 @@ impl InputBuffer {
     }
 }
 
+/// What kind of human ask holds the harness, machine-readably — consumers filter on this axis
+/// (`reason` stays diagnostic-only). Meaningful only while `blockedOn` is `human`; writers set
+/// `none` otherwise. `Unknown` decodes future words and is never written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Ask {
+    #[default]
+    None,
+    Permission,
+    Question,
+    Review,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Ask {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ask::None => "none",
+            Ask::Permission => "permission",
+            Ask::Question => "question",
+            Ask::Review => "review",
+            Ask::Unknown => "unknown",
+        }
+    }
+}
+
 /// The durable record. Additive-tolerant on read (no `deny_unknown_fields`): a reader pinned to an
 /// older crate may be older than the writer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +146,10 @@ struct Record {
     state: Activity,
     blocked_on: BlockedOn,
     input_buffer: InputBuffer,
+    /// The machine-readable kind of human ask while `blockedOn` is `human`; `none` otherwise.
+    /// Absent in records from writers predating the axis, which defaults to `none`.
+    #[serde(default)]
+    ask: Ask,
     /// Diagnostic only. No consumer branches on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -149,6 +180,7 @@ pub struct Observation {
     pub state: Activity,
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
+    pub ask: Ask,
     pub reason: Option<String>,
     pub exit: Option<String>,
 }
@@ -159,9 +191,15 @@ impl Observation {
             state,
             blocked_on,
             input_buffer,
+            ask: Ask::None,
             reason: None,
             exit: None,
         }
+    }
+
+    pub fn with_ask(mut self, ask: Ask) -> Self {
+        self.ask = ask;
+        self
     }
 
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
@@ -272,34 +310,56 @@ impl Writer {
             observation.state != Activity::Unknown,
             "unknown is derived and cannot be written"
         );
+        anyhow::ensure!(
+            observation.state == Activity::Ended || self.pty_session.is_some(),
+            "live observations require a pty session to vouch for them"
+        );
         let _lock = self.locked()?;
         let on_disk = read_record(&self.path);
+        // A record whose schema this writer does not own is never coalesced against and never
+        // treated as this session's terminal word — a genuine observation still replaces it
+        // wholesale (one logical owner per record), continuing the counter for byte-distinctness.
+        let own_record = on_disk.as_ref().filter(|current| current.schema == SCHEMA);
         if skip_if_ended
-            && on_disk
-                .as_ref()
-                .is_some_and(|current| current.state == Activity::Ended)
+            && own_record.is_some_and(|current| {
+                // Only a terminal record from this session suppresses queued live frames. A
+                // predecessor incarnation's `ended` is history, not this session's last word —
+                // suppressing against it would report a restarted seat as ended for its whole run.
+                current.state == Activity::Ended && current.written_at_ms >= self.session_start_ms
+            })
         {
             return Ok(false);
         }
         let now_ms = crate::message::now_ms();
         let unchanged = !self.interrupted
-            && on_disk.as_ref().is_some_and(|current| {
+            && own_record.is_some_and(|current| {
                 current.state == observation.state
                     && current.blocked_on == observation.blocked_on
                     && current.input_buffer == observation.input_buffer
+                    && current.ask == observation.ask
                     && current.reason == observation.reason
                     && current.exit == observation.exit
             });
         if unchanged
-            && let Some(current) = on_disk.as_ref()
+            && let Some(current) = own_record
+            // A restatement is a no-op only against a record this session already wrote. A
+            // matching record from before the session started must still be written through:
+            // otherwise the takeover never claims the record and every later heartbeat is
+            // rejected by the session gate while the state quietly ages out.
+            && current.written_at_ms >= self.session_start_ms
             && now_ms.saturating_sub(current.written_at_ms) < duration_ms(HARNESS_STATE_REFRESH)
         {
             return Ok(true);
         }
-        let (since_ms, transitions) = match (&on_disk, unchanged) {
+        let (since_ms, transitions) = match (own_record, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (now_ms, current.transitions.saturating_add(1)),
-            (None, _) => (now_ms, 0),
+            (None, _) => (
+                now_ms,
+                on_disk
+                    .as_ref()
+                    .map_or(0, |current| current.transitions.saturating_add(1)),
+            ),
         };
         let record = Record {
             schema: SCHEMA.to_string(),
@@ -308,6 +368,7 @@ impl Writer {
             state: observation.state,
             blocked_on: observation.blocked_on,
             input_buffer: observation.input_buffer,
+            ask: observation.ask,
             reason: observation.reason,
             exit: observation.exit,
             pty_session: self.pty_session.clone(),
@@ -332,7 +393,13 @@ impl Writer {
         let Some(mut current) = read_record(&self.path) else {
             return Ok(());
         };
-        if current.state == Activity::Ended || current.written_at_ms < self.session_start_ms {
+        // A schema this writer does not own must not be round-tripped through this version's
+        // record type — re-serializing would strip fields it cannot see and literalize enum words
+        // it decoded as `unknown`. The reader's discriminator gate covers foreign records.
+        if current.schema != SCHEMA
+            || current.state == Activity::Ended
+            || current.written_at_ms < self.session_start_ms
+        {
             return Ok(());
         }
         current.written_at_ms = crate::message::now_ms();
@@ -357,6 +424,7 @@ pub struct Observed {
     pub state: Activity,
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
+    pub ask: Ask,
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
     pub exit: Option<String>,
@@ -371,6 +439,7 @@ impl Observed {
             state: Activity::Unknown,
             blocked_on: BlockedOn::Unknown,
             input_buffer: InputBuffer::Unknown,
+            ask: Ask::Unknown,
             harness,
             since_ms: None,
             exit: None,
@@ -429,15 +498,26 @@ fn read_raw_at(
         return Observed::indeterminate("literal-unknown", harness);
     }
     if record.state != Activity::Ended
-        && let (Some(probe), Some(session)) = (probe, record.pty_session.as_deref())
-        && probe(session) == SessionLiveness::Dead
+        && let Some(probe) = probe
     {
-        return Observed::indeterminate("session-dead", harness);
+        // Same-host readers cross-check live states against the session registry. A live record
+        // that names no session offers nothing to check — without this rule it would stay
+        // definite through an external SIGKILL for the whole staleness horizon, which is exactly
+        // the window the cross-check exists to close. Writers therefore must fence live states
+        // (enforced in `observe`); a fenced record whose session is provably dead is downgraded,
+        // and an unreadable registry still downgrades nothing.
+        let Some(session) = record.pty_session.as_deref() else {
+            return Observed::indeterminate("unfenced-record", harness);
+        };
+        if probe(session) == SessionLiveness::Dead {
+            return Observed::indeterminate("session-dead", harness);
+        }
     }
     Observed {
         state: record.state,
         blocked_on: record.blocked_on,
         input_buffer: record.input_buffer,
+        ask: record.ask,
         harness,
         since_ms: Some(record.since_ms),
         exit: record.exit,
@@ -599,6 +679,7 @@ mod tests {
             state: Activity::Active,
             blocked_on: BlockedOn::None,
             input_buffer: InputBuffer::Unknown,
+            ask: Ask::None,
             reason: None,
             exit: None,
             pty_session: Some("worker".to_string()),
@@ -728,6 +809,7 @@ mod tests {
                 state: Activity::Active,
                 blocked_on: BlockedOn::None,
                 input_buffer: InputBuffer::Unknown,
+                ask: Ask::None,
                 reason: None,
                 exit: None,
                 pty_session: None,
@@ -867,6 +949,7 @@ mod tests {
             state: Activity::Active,
             blocked_on: BlockedOn::None,
             input_buffer: InputBuffer::Unknown,
+            ask: Ask::None,
             reason: None,
             exit: None,
             pty_session: Some("worker".to_string()),
@@ -922,5 +1005,158 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(fs::read(&path).unwrap(), terminal);
+    }
+
+    #[test]
+    fn a_new_sessions_first_observation_writes_through_a_matching_fresh_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut predecessor = writer(tmp.path());
+        predecessor.observe(active()).unwrap();
+        let before: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        // The successor's session begins strictly after the predecessor's write. Without the
+        // write-through, its matching first observation would be a no-op and the session gate
+        // would then reject every heartbeat while the record quietly aged out.
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .session_started_at(before.written_at_ms + 1);
+        std::thread::sleep(Duration::from_millis(2));
+        successor.observe(active()).unwrap();
+        let claimed: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            claimed.written_at_ms >= before.written_at_ms,
+            "takeover must write"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        successor.heartbeat().unwrap();
+        let stamped: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            stamped.written_at_ms > claimed.written_at_ms,
+            "heartbeat must be eligible after the takeover write"
+        );
+    }
+
+    #[test]
+    fn a_session_writer_marked_interrupted_opens_a_fresh_transition_on_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        writer(tmp.path()).observe(active()).unwrap();
+        let before: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        std::thread::sleep(Duration::from_millis(2));
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .session_started_at(before.written_at_ms + 1);
+        successor.interrupt();
+        successor.observe(active()).unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.transitions, before.transitions + 1);
+        assert!(
+            record.since_ms > before.since_ms,
+            "sinceMs must never span a session boundary"
+        );
+    }
+
+    #[test]
+    fn foreign_schemas_are_never_coalesced_restamped_or_treated_as_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let foreign = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
+        fs::write(&path, foreign).unwrap();
+
+        // Heartbeat leaves a foreign record byte-identical rather than stripping its fields.
+        let mut writer = writer(tmp.path());
+        writer.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), foreign.to_vec());
+
+        // A genuine observation replaces it wholesale (never coalesces, and a foreign `ended` is
+        // not this session's terminal word), continuing the counter for byte-distinctness.
+        assert!(writer.observe_unless_ended(active()).unwrap());
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.schema, SCHEMA);
+        assert_eq!(record.state, Activity::Active);
+        assert_eq!(record.transitions, 8);
+    }
+
+    #[test]
+    fn a_predecessor_terminal_record_does_not_suppress_a_new_sessions_live_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        writer(tmp.path()).ended("exit 0").unwrap();
+        let terminal: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()))
+            .session_started_at(terminal.written_at_ms + 1);
+        successor.interrupt();
+        assert!(
+            successor.observe_unless_ended(active()).unwrap(),
+            "a restarted seat must replace its predecessor's terminal record"
+        );
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.state, Activity::Active);
+    }
+
+    #[test]
+    fn live_observations_require_a_pty_session_and_unfenced_live_records_read_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut unfenced = Writer::new(tmp.path(), "hetz.worker", "codex", None);
+        assert!(
+            unfenced.observe(active()).is_err(),
+            "live states need a fence"
+        );
+        unfenced.ended("exit 0").unwrap();
+
+        // A live record that names no session offers the probe nothing to check: with a probe
+        // available it is indeterminate, while the terminal record stays definite.
+        let alive: &dyn Fn(&str) -> SessionLiveness = &|_| SessionLiveness::Alive;
+        assert_eq!(read(&path, Some(alive)).unwrap().state, Activity::Ended);
+        let live_unfenced = format!(
+            r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
+            crate::message::now_ms()
+        );
+        fs::write(&path, live_unfenced).unwrap();
+        let observed = read(&path, Some(alive)).unwrap();
+        assert_eq!(observed.state, Activity::Unknown);
+        assert_eq!(observed.reason.as_deref(), Some("unfenced-record"));
+        // Without a probe (a cross-host reader) the record keeps its staleness-only semantics.
+        assert_eq!(read(&path, None).unwrap().state, Activity::Active);
+    }
+
+    #[test]
+    fn ask_kind_roundtrips_and_unknown_words_decode_indeterminate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = writer(tmp.path());
+        writer
+            .observe(
+                Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                    .with_ask(Ask::Question)
+                    .with_reason("question"),
+            )
+            .unwrap();
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.ask, Ask::Question);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"ask\":\"question\"")
+        );
+
+        // A record predating the axis defaults to `none`; a future word decodes indeterminate.
+        let raw: String = fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"ask\":\"question\",", "");
+        fs::write(&path, &raw).unwrap();
+        assert_eq!(read(&path, None).unwrap().ask, Ask::None);
+        fs::write(
+            &path,
+            raw.replace(
+                "\"blockedOn\":\"human\"",
+                "\"blockedOn\":\"human\",\"ask\":\"telepathy\"",
+            ),
+        )
+        .unwrap();
+        assert_eq!(read(&path, None).unwrap().ask, Ask::Unknown);
     }
 }
