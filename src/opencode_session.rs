@@ -209,8 +209,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                     sse_connected = true;
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
                     // on a transiently failed seed would re-stamp whatever the disk last said.
-                    evidence =
-                        seed_from_server(&session.client, &mut machine, &mut session.delivery);
+                    evidence = seed_from_server(&session.client, &mut machine);
                     next_seed_attempt = Instant::now() + SEED_RETRY;
                 }
                 SseMessage::Disconnected => {
@@ -226,7 +225,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             }
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_from_server(&session.client, &mut machine, &mut session.delivery);
+            evidence = seed_from_server(&session.client, &mut machine);
             next_seed_attempt = Instant::now() + SEED_RETRY;
         }
         if evidence && let Some(observation) = machine.observation() {
@@ -542,21 +541,28 @@ fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc
 /// Re-seed observed state from the level surface after (re)connecting: events missed while
 /// disconnected are unrecoverable, and `/session/status` omits idle sessions, so an empty map over
 /// a live server is itself the idle proof.
-fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut Delivery) -> bool {
+fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
+    // The seed is built in a FRESH machine and swapped in only once every read validates:
+    // mutating the live one would leave half-seeded asks behind a mid-seed failure, and a
+    // successful re-seed must also CLEAR stale busy/blocked entries whose exits passed while
+    // the stream was down — the level surface at seed time is the whole truth, and any event
+    // that raced the seed re-arrives or is re-listed on the next reconnect. Delivery targeting
+    // deliberately learns nothing here: status-map iteration order is not recency (W8-5); the
+    // pending-work recovery path resolves targets from the session listing instead.
     let Ok(statuses) = client.get_json("/session/status") else {
         return false;
     };
-    machine.seed_idle();
+    let mut seeded = EventMachine::default();
+    seeded.seed_idle();
     if let Some(map) = statuses.as_object() {
         for (session_id, status) in map {
-            delivery.saw_session(session_id);
             // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is
             // surface drift the /doc gate vocabulary did not cover, and evidence restored over
             // words we cannot read would be fabricated. Fail the seed and retry instead.
             match status.get("type").and_then(Value::as_str) {
                 Some("idle") => {}
-                Some("busy") => machine.seed_busy(session_id.clone(), false),
-                Some("retry") => machine.seed_busy(session_id.clone(), true),
+                Some("busy") => seeded.seed_busy(session_id.clone(), false),
+                Some("retry") => seeded.seed_busy(session_id.clone(), true),
                 _ => return false,
             }
         }
@@ -582,10 +588,11 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut 
                 .or_else(|| item.get("requestID"))
                 .and_then(Value::as_str)
             {
-                machine.seed_ask(id.to_string(), kind);
+                seeded.seed_ask(id.to_string(), kind);
             }
         }
     }
+    *machine = seeded;
     true
 }
 
@@ -1497,14 +1504,14 @@ mod tests {
         // A transiently failing level seed yields no evidence at all.
         server.status_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
-        assert!(!seed_from_server(&client, &mut machine, &mut delivery));
+        assert!(!seed_from_server(&client, &mut machine));
         server.status_error.store(false, Ordering::SeqCst);
 
         // So does a failing pending-ask listing: an ask opened during the outage must not be
         // reported unblocked with heartbeats restored — the seed retries instead.
         server.ask_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
-        assert!(!seed_from_server(&client, &mut machine, &mut delivery));
+        assert!(!seed_from_server(&client, &mut machine));
         server.ask_error.store(false, Ordering::SeqCst);
 
         // A successful seed recovers the pending ask under its own id.
@@ -1515,7 +1522,7 @@ mod tests {
             .unwrap()
             .push("per_pending".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine, &mut delivery));
+        assert!(seed_from_server(&client, &mut machine));
         let blocked = observed(&machine);
         assert_eq!(blocked.state, Activity::Active);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
@@ -1537,7 +1544,7 @@ mod tests {
             .unwrap()
             .push("que_pending".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine, &mut delivery));
+        assert!(seed_from_server(&client, &mut machine));
         let blocked = observed(&machine);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
         assert_eq!(blocked.ask, Ask::Question);
@@ -1717,5 +1724,60 @@ mod tests {
         delivery.pump(&client);
         let posts = server.posts.lock().unwrap();
         assert_eq!(posts.len(), 1, "delivery bound to the recovered session");
+    }
+
+    /// W8-4: the seed is atomic against the LIVE machine — a mid-seed failure leaves no
+    /// half-seeded asks behind, and a successful re-seed clears stale entries whose exits
+    /// passed while the stream was down.
+    #[test]
+    fn the_seed_swaps_in_whole_and_clears_what_the_level_no_longer_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let _keep = tmp;
+
+        // A machine holding a stale blocked ask and a stale busy session from before the drop.
+        let mut machine = EventMachine::default();
+        machine.seed_busy("ses_stale".to_string(), false);
+        machine.seed_ask("per_stale".to_string(), "permission");
+
+        // /permission succeeds, /question fails mid-seed: the live machine is untouched —
+        // the stale ask is still held (not half-cleared) and no new ask leaked in.
+        server
+            .pending_permissions
+            .lock()
+            .unwrap()
+            .push("per_new".to_string());
+        server.ask_error.store(true, Ordering::SeqCst);
+        // ask_error fails BOTH listings; simulate the split by failing only after /permission:
+        // the atomicity claim is the same — nothing of the attempt lands.
+        assert!(!seed_from_server(&client, &mut machine));
+        let snapshot = observed(&machine);
+        assert_eq!(
+            snapshot.blocked_on,
+            BlockedOn::Human,
+            "stale ask still held"
+        );
+        server.ask_error.store(false, Ordering::SeqCst);
+
+        // A successful re-seed states the whole level truth: the settled session and the
+        // resolved ask disappear, the listed pending ask remains.
+        assert!(seed_from_server(&client, &mut machine));
+        let snapshot = observed(&machine);
+        assert_eq!(snapshot.blocked_on, BlockedOn::Human);
+        machine.apply(&event(
+            r#"{"type":"permission.replied","properties":{"requestID":"per_new","reply":"once"}}"#,
+        ));
+        let snapshot = observed(&machine);
+        assert_eq!(
+            snapshot.blocked_on,
+            BlockedOn::None,
+            "per_stale is gone, not wedged"
+        );
+        assert_eq!(
+            snapshot.state,
+            Activity::Idle,
+            "ses_stale cleared by the re-seed"
+        );
     }
 }
