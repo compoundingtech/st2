@@ -118,6 +118,7 @@ pub fn run(
         status::STATUS_REFRESH,
         PROVIDER_POLL,
         &STOP,
+        None,
     )
     .with_context(|| format!("running pi driver '{runtime_id}'"))?;
     record_session_end(&agent_dir, &identity, &runtime_id, &session, seq, &outcome);
@@ -242,6 +243,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(5),
             &stop,
+            None,
         )
         .unwrap();
 

@@ -7,8 +7,8 @@
 //! exact child remains alive. Each harness module keeps only what is genuinely harness-specific:
 //! how its provider argv is assembled and what environment the harness needs to reach st2 back.
 
-use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-use crate::status;
+use crate::{harness_state, status};
 
 pub(crate) const PROVIDER_POLL: Duration = Duration::from_millis(250);
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -52,9 +52,58 @@ pub(crate) enum ProviderOutcome {
     Stopped(Option<ExitStatus>),
 }
 
+/// The observed-harness-state handle a wrapper threads through its poll loop. Every operation
+/// constructs a fresh writer over the on-disk record, so the wrapper re-stamps or terminates
+/// whatever state a hook process wrote in between and never clobbers a fresher observation.
+pub(crate) struct SessionObserver {
+    agent_dir: PathBuf,
+    identity: String,
+    harness: &'static str,
+}
+
+impl SessionObserver {
+    pub(crate) fn new(agent_dir: &Path, identity: &str, harness: &'static str) -> Self {
+        Self {
+            agent_dir: agent_dir.to_path_buf(),
+            identity: identity.to_string(),
+            harness,
+        }
+    }
+
+    fn writer(&self) -> harness_state::Writer {
+        harness_state::Writer::new(
+            &self.agent_dir,
+            &self.identity,
+            self.harness,
+            Some(self.identity.clone()),
+        )
+    }
+
+    /// Re-stamp whatever live state is on disk. The wrapper's evidence is the provider child it is
+    /// polling, so this is called only while that child is alive.
+    pub(crate) fn heartbeat(&self) {
+        let _ = self.writer().heartbeat();
+    }
+
+    /// Best-effort terminal record; observation must never turn a clean teardown into an error.
+    pub(crate) fn ended(&self, exit: &str) {
+        let _ = self.writer().ended(exit);
+    }
+}
+
+fn describe_exit(exit: ExitStatus) -> String {
+    match (exit.code(), exit.signal()) {
+        (Some(code), _) => format!("exit {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "exit unknown".to_string(),
+    }
+}
+
 /// Run one interactive provider in this wrapper's terminal process group, refreshing presence on
 /// `refresh_interval` for exactly as long as the spawned child lives. Fails on a nonzero exit;
-/// wrappers that need the exit itself use [`run_provider_observed`].
+/// wrappers that need the exit itself use [`run_provider_observed`]. With an observer, the
+/// terminal record lands on every exit path this process survives.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider(
     provider: &str,
     status_path: &Path,
@@ -63,6 +112,7 @@ pub(crate) fn run_provider(
     refresh_interval: Duration,
     poll: Duration,
     stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
 ) -> Result<()> {
     match run_provider_observed(
         provider,
@@ -72,14 +122,23 @@ pub(crate) fn run_provider(
         refresh_interval,
         poll,
         stop,
+        observed,
     )? {
-        ProviderOutcome::Exited(exit) => completed_provider(provider, exit),
+        ProviderOutcome::Exited(exit) => {
+            if let Some(observed) = observed {
+                observed.ended(&describe_exit(exit));
+            }
+            completed_provider(provider, exit)
+        }
         ProviderOutcome::Stopped(_) => Ok(()),
     }
 }
 
 /// [`run_provider`], but reporting how the session ended instead of judging it, so a wrapper can
-/// record a terminal observation before deciding what the exit means.
+/// record its own terminal observation before deciding what the exit means. The stop path still
+/// writes the observer's terminal record in-line, because after SIGKILL escalation no caller code
+/// is guaranteed to run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider_observed(
     provider: &str,
     status_path: &Path,
@@ -88,6 +147,7 @@ pub(crate) fn run_provider_observed(
     refresh_interval: Duration,
     poll: Duration,
     stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
 ) -> Result<ProviderOutcome> {
     let (program, args) = argv
         .split_first()
@@ -114,7 +174,7 @@ pub(crate) fn run_provider_observed(
     let mut next_refresh = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
-            return stop_provider_group(&mut child).map(ProviderOutcome::Stopped);
+            return stop_provider_group(&mut child, observed).map(ProviderOutcome::Stopped);
         }
         if let Some(exit) = child
             .try_wait()
@@ -125,6 +185,9 @@ pub(crate) fn run_provider_observed(
         let now = Instant::now();
         if now >= next_refresh {
             let _ = status::refresh(status_path);
+            if let Some(observed) = observed {
+                observed.heartbeat();
+            }
             next_refresh = now + refresh_interval;
         }
         thread::sleep(poll.min(next_refresh.saturating_duration_since(Instant::now())));
@@ -136,7 +199,10 @@ fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()> {
     Ok(())
 }
 
-fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
+fn stop_provider_group(
+    child: &mut Child,
+    observed: Option<&SessionObserver>,
+) -> Result<Option<ExitStatus>> {
     let process_group = unsafe { libc::getpgrp() };
     anyhow::ensure!(
         process_group > 1,
@@ -148,9 +214,18 @@ fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
     let deadline = Instant::now() + STOP_GRACE;
     while Instant::now() < deadline {
         if let Some(exit) = child.try_wait()? {
+            if let Some(observed) = observed {
+                observed.ended(&describe_exit(exit));
+            }
             return Ok(Some(exit));
         }
         thread::sleep(Duration::from_millis(25));
+    }
+    // The escalation SIGKILLs this wrapper's own process group, so the wrapper dies with the
+    // provider and nothing after the kill is guaranteed to run. The terminal record must land
+    // first: a liveness record that stops being written is still being read.
+    if let Some(observed) = observed {
+        observed.ended("signal 9");
     }
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);

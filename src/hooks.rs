@@ -20,6 +20,7 @@ const CODEX_STOP: &[u8] = include_bytes!("../hooks/codex-stop.sh");
 const CLAUDE_SESSION_START: &[u8] = include_bytes!("../hooks/claude-session-start.sh");
 const CLAUDE_PRE_COMPACT: &[u8] = include_bytes!("../hooks/claude-pre-compact.sh");
 const CLAUDE_STOP_FAILURE: &[u8] = include_bytes!("../hooks/claude-stop-failure.sh");
+const CLAUDE_OBSERVE: &[u8] = include_bytes!("../hooks/claude-observe.sh");
 // pi has no lifecycle-hook mechanism of its own; an extension is where a pi session exposes the
 // same surface, so it is published and verified as part of the same immutable set.
 const PI_CHANNEL: &[u8] = include_bytes!("../hooks/pi-channel.ts");
@@ -28,13 +29,14 @@ const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
-const HOOKS: [(&str, &[u8]); 7] = [
+const HOOKS: [(&str, &[u8]); 8] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
     ("codex-stop.sh", CODEX_STOP),
     ("claude-session-start.sh", CLAUDE_SESSION_START),
     ("claude-pre-compact.sh", CLAUDE_PRE_COMPACT),
     ("claude-stop-failure.sh", CLAUDE_STOP_FAILURE),
+    ("claude-observe.sh", CLAUDE_OBSERVE),
     ("pi-channel.ts", PI_CHANNEL),
 ];
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -30,6 +30,10 @@ agent "<identity>" {
             "async": true,
             "asyncRewake": true,
             "command": "$ST_HOOKS/claude-session-start.sh"
+          },
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-observe.sh SessionStart"
           }
         ]
       }
@@ -50,6 +54,56 @@ agent "<identity>" {
           {
             "type": "command",
             "command": "$ST_HOOKS/claude-stop-failure.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-observe.sh UserPromptSubmit"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-observe.sh Stop"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-observe.sh PermissionRequest"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-observe.sh PreToolUse"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$ST_HOOKS/claude-observe.sh PostToolUse"
           }
         ]
       }

@@ -351,6 +351,14 @@ enum DriverCmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
+    /// Apply one Claude hook event (payload on stdin) to observed harness state.
+    ClaudeObserve {
+        #[arg(long)]
+        identity: String,
+        /// The Claude hook event name, e.g. `Stop` or `PermissionRequest`.
+        #[arg(long)]
+        event: String,
+    },
     /// Run pi under the session-owned presence wrapper.
     PiSession {
         #[arg(long)]
@@ -1052,6 +1060,11 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_session::run(&catalog, identity, runtime_id, argv)
+        }
+        Command::Driver(DriverCmd::ClaudeObserve { identity, event }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_session::run_observe(&catalog, &identity, &event)
         }
         Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
             let catalog = catalog_arg(None)?;
