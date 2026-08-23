@@ -170,13 +170,16 @@ impl CodexThreadBinding {
 
 /// The latest delivery-relevant state observed on the bound app-server control stream.
 ///
-/// `Active` is the only state that permits `turn/steer`: its turn ID came from the latest
-/// unmatched `turn/started` event. Every other non-idle state is an explicit hold.
+/// `Active` permits `turn/steer`: its turn ID came from the latest unmatched `turn/started` event.
+/// `Idle` and `TerminalError` permit `turn/start`. Every `Held` state blocks delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CodexObservedState {
     AwaitingStatus,
     Idle,
+    TerminalError {
+        reason: CodexTerminalError,
+    },
     Active {
         #[serde(rename = "turnId")]
         turn_id: String,
@@ -199,6 +202,12 @@ pub enum CodexHoldReason {
     SystemError,
     WaitingOnApproval,
     WaitingOnUserInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexTerminalError {
+    SystemError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,7 +435,9 @@ impl CodexInboxDelivery {
             return Ok(None);
         }
         let method = match &state.observed {
-            CodexObservedState::Idle => CodexDeliveryMethod::Start,
+            CodexObservedState::Idle | CodexObservedState::TerminalError { .. } => {
+                CodexDeliveryMethod::Start
+            }
             CodexObservedState::Active { turn_id } => CodexDeliveryMethod::Steer {
                 turn_id: turn_id.clone(),
             },
@@ -893,6 +904,7 @@ impl CodexControlState {
     fn observe_turn_completed(&mut self, turn_id: &str) {
         self.observed = match &self.observed {
             CodexObservedState::Idle => CodexObservedState::Idle,
+            CodexObservedState::TerminalError { .. } => self.observed.clone(),
             CodexObservedState::Active { turn_id: current } if current == turn_id => {
                 CodexObservedState::Idle
             }
@@ -914,10 +926,15 @@ impl CodexControlState {
                     | CodexHoldReason::ConflictingTurn
                     | CodexHoldReason::WaitingOnApproval
                     | CodexHoldReason::WaitingOnUserInput
-                    | CodexHoldReason::NotLoaded
-                    | CodexHoldReason::SystemError,
+                    | CodexHoldReason::NotLoaded,
                 ..
             } => self.observed.clone(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                ..
+            } => CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            },
             // A completion for a turn other than the one believed live is the only evidence here
             // that two turns exist. This match stays exhaustive so a new observed state cannot
             // silently arrive as a conflict it never was.
@@ -2726,6 +2743,115 @@ mod tests {
     }
 
     #[test]
+    fn failed_turn_without_idle_allows_next_native_delivery_and_preserves_system_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("after error"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::Idle);
+
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-main",
+                    "turn": { "id": "turn-failed" }
+                }
+            }))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-main",
+                    "status": { "type": "systemError" }
+                }
+            }))
+            .unwrap();
+        state
+            .observe(&json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-main",
+                    "turn": { "id": "turn-failed", "status": "failed" }
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            }
+        );
+
+        let request = delivery
+            .maybe_request(&state)
+            .unwrap()
+            .expect("a terminal system error must not block the next native delivery");
+        assert_eq!(request["method"], "turn/start");
+    }
+
+    #[test]
+    fn captured_usage_limit_boundary_allows_next_native_delivery() {
+        // This fixture is a payload-minimized projection of all 23 inbound frames from the
+        // #263 trivial capture. It preserves their order and methods while removing fields this
+        // observer never reads. The second capture has the same method sequence. The recorder
+        // stops at turn completion, so this test pins the boundary state only. The provider
+        // source establishes that no later idle notification follows the system error.
+        let frames = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 23);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("after capture"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+
+        for frame in &frames {
+            state.observe(frame).unwrap();
+        }
+
+        assert_eq!(
+            frames
+                .last()
+                .and_then(|frame| frame.get("method"))
+                .and_then(Value::as_str),
+            Some("turn/completed")
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            }
+        );
+        let request = delivery
+            .maybe_request(&state)
+            .unwrap()
+            .expect("a captured terminal system error must permit the next native delivery");
+        assert_eq!(request["method"], "turn/start");
+    }
+
+    #[test]
     fn idle_session_refreshes_stale_presence_without_inbox_activity() {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
@@ -4213,8 +4339,7 @@ mod tests {
         // `thread/status/changed -> systemError` immediately before the failed turn's
         // `turn/completed`. That completion reports one turn's lifecycle and carries no thread
         // status, so it is not evidence the thread recovered, and it is not evidence of a second
-        // live turn either. The honest resolution is the condition the thread itself reported,
-        // still held, until a thread status says otherwise.
+        // live turn either. The honest resolution is the condition the thread itself reported.
         for (status, reason) in [
             ("systemError", CodexHoldReason::SystemError),
             ("notLoaded", CodexHoldReason::NotLoaded),
@@ -4244,51 +4369,66 @@ mod tests {
                 }
             );
 
-            // The completion of the turn that just failed changes nothing. st2 never believed a
-            // second turn was live, so it must not begin reporting one.
-            assert!(
-                !state
-                    .observe(&json!({
-                        "method": "turn/completed",
-                        "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
-                    }))
-                    .unwrap()
-            );
-            assert_eq!(
-                state.observed(),
-                &CodexObservedState::Held {
-                    reason,
-                    turn_id: None
-                }
-            );
+            // Completion makes a reported system error terminal. It preserves `notLoaded`, whose
+            // owner is the later thread status that proves the thread loaded again.
+            let changed = state
+                .observe(&json!({
+                    "method": "turn/completed",
+                    "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+                }))
+                .unwrap();
 
-            // The hold gates delivery deliberately: a thread that just reported an error is not
-            // a thread st2 sends into, and the unread head stays unread.
+            if reason == CodexHoldReason::SystemError {
+                assert!(changed);
+                assert_eq!(
+                    state.observed(),
+                    &CodexObservedState::TerminalError {
+                        reason: CodexTerminalError::SystemError,
+                    }
+                );
+            } else {
+                assert!(!changed);
+                assert_eq!(
+                    state.observed(),
+                    &CodexObservedState::Held {
+                        reason,
+                        turn_id: None,
+                    }
+                );
+            }
+
             let tmp = tempfile::tempdir().unwrap();
             let config = delivery_config(tmp.path());
             let filename =
                 message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
                     .unwrap();
             let mut delivery = inbox_delivery(tmp.path(), config.clone());
-            assert_eq!(delivery.maybe_request(&state).unwrap(), None);
-            assert!(config.inbox.join(&filename).is_file());
-
-            // The gate is released by the signal that owns it: the next thread status.
-            assert!(
-                state
-                    .observe(&json!({
-                        "method": "thread/status/changed",
-                        "params": { "threadId": "thread-main", "status": { "type": "idle" } }
-                    }))
+            if reason == CodexHoldReason::SystemError {
+                let request = delivery
+                    .maybe_request(&state)
                     .unwrap()
-            );
-            assert_eq!(state.observed(), &CodexObservedState::Idle);
-            assert!(delivery.maybe_request(&state).unwrap().is_some());
+                    .expect("a terminal system error must permit the next turn");
+                assert_eq!(request["method"], "turn/start");
+            } else {
+                assert_eq!(delivery.maybe_request(&state).unwrap(), None);
+                assert!(
+                    state
+                        .observe(&json!({
+                            "method": "thread/status/changed",
+                            "params": {
+                                "threadId": "thread-main",
+                                "status": { "type": "idle" }
+                            }
+                        }))
+                        .unwrap()
+                );
+                assert_eq!(state.observed(), &CodexObservedState::Idle);
+                assert!(delivery.maybe_request(&state).unwrap().is_some());
+            }
+            assert!(config.inbox.join(&filename).is_file());
         }
 
-        // The truthful hold is not a new wedge. It has strictly more exits than the conflict it
-        // replaces: `active` does not preserve a system error the way it preserves a conflicting
-        // turn, so a thread that simply resumes work is live again on its next turn.
+        // The next provider turn replaces the terminal diagnostic with the exact live turn.
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let mut state = CodexControlState::new(&runtime, "thread-main".into());
         state.subscribed = true;
@@ -4310,9 +4450,8 @@ mod tests {
         }
         assert_eq!(
             state.observed(),
-            &CodexObservedState::Held {
-                reason: CodexHoldReason::SystemError,
-                turn_id: None
+            &CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
             }
         );
         state
@@ -4328,7 +4467,7 @@ mod tests {
             state.observed(),
             &CodexObservedState::Held {
                 reason: CodexHoldReason::ActiveWithoutTurn,
-                turn_id: None
+                turn_id: None,
             }
         );
         state
@@ -4340,7 +4479,7 @@ mod tests {
         assert_eq!(
             state.observed(),
             &CodexObservedState::Active {
-                turn_id: "turn-2".into()
+                turn_id: "turn-2".into(),
             }
         );
     }
