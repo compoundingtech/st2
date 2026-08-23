@@ -34,8 +34,10 @@ path reads this record.
   action, no reconciliation. A wrong-but-fresh record can mislead an operator;
   it cannot misdeliver a message.
 - **OHS-A03 Trusted writers:** The record is unauthenticated catalog state
-  under the trusted-fleet model (root `A02`). The writer is the session
-  wrapper that owns the presence lease; nothing verifies that claim.
+  under the trusted-fleet model (root `A02`). The writers are the owning
+  session's driver processes — the wrapper that owns the presence lease, and
+  the channel or hook subprocesses it shares its incarnation token with;
+  nothing verifies that claim.
 
 ## Acceptable Tradeoffs
 
@@ -65,8 +67,12 @@ path reads this record.
 
 - **OHS-R01 Observed envelope:** Each agent has at most one observed-state
   record, `<agent-dir>/harness-state`, schema `st2.harness-state.v1`, written
-  only by the driver wrapper owning the live session. It carries the full v1
-  tuple: `state ∈ idle | active | child | ended`, `blockedOn ∈ human | none`,
+  only by the owning session's driver processes — the wrapper, its channel,
+  or its hooks; one logical owner per record, sharing one incarnation token,
+  and nothing outside the driver writes it. It carries the full v1
+  tuple: `state ∈ idle | active | child | ended`, `blockedOn ∈ human | none`
+  (with `ask ∈ none | permission | question | review` naming the kind of
+  human ask machine-readably, so no consumer branches on `reason`),
   `inputBuffer ∈ empty | nonempty | unknown`, plus the observing harness, a
   diagnostic `reason` no consumer branches on, and fencing/freshness fields.
   `child` is reserved: part of the contract, decoded by v1 readers, no

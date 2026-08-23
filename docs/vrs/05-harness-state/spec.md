@@ -28,7 +28,7 @@ change (separate authority, root `DQ3`).
    control stream          wrapper child poll      (evented)           server surface
         |                        |                      |                  |
         v                        v                      v                  v
-   [driver-owned projection: idle/active/child/ended × blockedOn × inputBuffer]
+   [driver-owned projection: idle/active/child/ended × blockedOn (+ask) × inputBuffer]
         |
         v                                          declared axis (unchanged)
    <agent-dir>/harness-state                       <agent-dir>/status
@@ -53,6 +53,7 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
   "harness": "codex | claude | pi | opencode",
   "state": "idle | active | child | ended",
   "blockedOn": "none | human",
+  "ask": "none | permission | question | review",
   "inputBuffer": "empty | nonempty | unknown",
   "reason": "<diagnostic, optional>",
   "exit": "<ended only: e.g. 'exit 0', 'signal 9', optional>",
@@ -69,6 +70,14 @@ Field rules, matching `src/harness_state.rs`:
   (`DQ-H3`). Readers decode both, plus unrecognized future words as `unknown`.
 - `blockedOn` unrecognized words decode indeterminate, never `none` — a v2
   axis value must not read as "not blocked".
+- `ask` names the kind of human ask, machine-readably, while `blockedOn` is
+  `human` (`none` otherwise; unrecognized words decode indeterminate) — the
+  axis consumers filter on, so nothing branches on diagnostic `reason`.
+- `incarnation` is the writing session's token: ownership — coalescing,
+  heartbeat eligibility, terminal suppression — is token equality, never a
+  timestamp comparison. Sibling writer processes of one session share the
+  token; every landed write carries a strictly monotonic per-record stamp so
+  it stays byte-distinct even against a same-millisecond predecessor.
 - `reason` is diagnostic only; no consumer branches on it.
 - `sinceMs` is when the current state was entered and survives heartbeat
   re-stamps; `writtenAtMs` is the heartbeat. `transitions` is a monotonic
@@ -97,7 +106,7 @@ What a reader reports, in evaluation order:
 | `ended`, any probe result | `ended` | a terminal record outlives its writer |
 | Otherwise | the recorded tuple | — |
 
-Every `unknown` row routes through one constructor and blanks all three axes;
+Every `unknown` row routes through one constructor and blanks every axis;
 there is no path from any absence to a definite state.
 
 ## Codex producer (OHS-R05)
@@ -106,20 +115,20 @@ The projection reads the state the control pump already maintains; it adds no
 observation path. `Held` never enters the published vocabulary — it is the
 complement of steerable, a delivery predicate (decision 0001's boundary).
 
-| `CodexObservedState` | state | blockedOn | reason |
-| --- | --- | --- | --- |
-| `AwaitingStatus` | *withhold* | — | no evidence yet; the record ages |
-| `Idle` | `idle` | `none` | |
-| `Active { turnId }` | `active` | `none` | |
-| `TerminalError { systemError }` | `ended` | `none` | `systemError` |
-| `Held { ActiveWithoutTurn }` | `active` | `none` | `activeWithoutTurn` — Codex said active; st2 merely cannot name a steerable turn |
-| `Held { ConflictingTurn }` | `active` | `none` | `conflictingTurn` — two turns believed live is maximally active |
-| `Held { Review }` | `active` | `human` | `review` |
-| `Held { Compaction }` | `active` | `none` | `compaction` |
-| `Held { WaitingOnApproval }` | `active` | `human` | `waitingOnApproval` |
-| `Held { WaitingOnUserInput }` | `active` | `human` | `waitingOnUserInput` |
-| `Held { NotLoaded }` | *withhold* | — | thread not loaded proves nothing about work |
-| `Held { SystemError }` | *withhold* | — | see #264's catch-all defect |
+| `CodexObservedState` | state | blockedOn | ask | reason |
+| --- | --- | --- | --- | --- |
+| `AwaitingStatus` | *withhold* | — | — | no evidence yet; the record ages |
+| `Idle` | `idle` | `none` | `none` | |
+| `Active { turnId }` | `active` | `none` | `none` | |
+| `TerminalError { systemError }` | `ended` | `none` | `none` | `systemError` |
+| `Held { ActiveWithoutTurn }` | `active` | `none` | `none` | `activeWithoutTurn` — Codex said active; st2 merely cannot name a steerable turn |
+| `Held { ConflictingTurn }` | `active` | `none` | `none` | `conflictingTurn` — two turns believed live is maximally active |
+| `Held { Review }` | `active` | `human` | `review` | `review` |
+| `Held { Compaction }` | `active` | `none` | `none` | `compaction` |
+| `Held { WaitingOnApproval }` | `active` | `human` | `permission` | `waitingOnApproval` |
+| `Held { WaitingOnUserInput }` | `active` | `human` | `question` | `waitingOnUserInput` |
+| `Held { NotLoaded }` | *withhold* | — | — | thread not loaded proves nothing about work |
+| `Held { SystemError }` | *withhold* | — | — | see #264's catch-all defect |
 
 `inputBuffer` is `unknown` from this producer: the control stream does not see
 the composer. The projection test must be behavioral — a table that would pass
@@ -129,7 +138,9 @@ with every row mapped to `unknown` is not an oracle (#268 §B).
 
 Two cooperating writers. The hook side classifies turn lifecycle: a submitted
 prompt or tool activity writes `active`; `Stop` writes `idle`;
-`PermissionRequest` writes `active` + `blockedOn: human` (its meaning is
+`PermissionRequest` writes `active` + `blockedOn: human` with its ask kind
+classified from the payload's `tool_name` (`AskUserQuestion` → `question`,
+anything else → `permission`) — (its meaning is
 specifically "a human is about to be asked" — it fires only under permission
 modes that ask). Events carrying `agent_id` are subagent-nested and never move
 top-level state. The blocked *exit* edge under batched tool calls is
@@ -168,6 +179,7 @@ transport designed against #242's contract shape.
   "state": "active",
   "blockedOn": "human",
   "inputBuffer": "unknown",
+  "ask": "permission",
   "harness": "codex",
   "since": 1787690000000,
   "reason": "waitingOnApproval",
