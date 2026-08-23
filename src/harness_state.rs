@@ -344,6 +344,14 @@ impl Writer {
             observation.state == Activity::Ended || self.pty_session.is_some(),
             "live observations require a pty session to vouch for them"
         );
+        anyhow::ensure!(
+            observation.ask != Ask::Unknown,
+            "unknown is derived and cannot be written"
+        );
+        anyhow::ensure!(
+            observation.ask == Ask::None || observation.blocked_on == BlockedOn::Human,
+            "an ask kind is meaningful only while blocked on a human"
+        );
         let _lock = self.locked()?;
         let on_disk = read_record(&self.path);
         // Resolve this writer's ownership sequence, then enforce its direction. A claiming
@@ -366,6 +374,16 @@ impl Writer {
             },
         };
         if on_disk.as_ref().is_some_and(|current| current.seq > seq) {
+            return Ok(false);
+        }
+        // A foreign schema's `seq` decodes as serde-default zero, which every claim exceeds — a
+        // v1 straggler would otherwise replace a v2 record it cannot even read. Non-claiming
+        // writers refuse foreign schemas outright; only the explicit written [`claim`]
+        // supersedes an unsupported schema.
+        if on_disk
+            .as_ref()
+            .is_some_and(|current| current.schema != SCHEMA)
+        {
             return Ok(false);
         }
         self.claimed_seq = Some(seq);
@@ -404,8 +422,11 @@ impl Writer {
         if unchanged
             && let Some(current) = own_record
             // A restatement is a no-op only against a record this session already wrote (the
-            // token filter above); a matching record from any other incarnation is written
-            // through, so a takeover always claims the record and heartbeats stay eligible.
+            // token filter above) whose stamp a reader would trust: a stamp beyond the
+            // future-skew bound — a backward clock correction's leftover — would otherwise
+            // read "fresh" here forever while every reader derives future-skew unknown, so it
+            // falls through to the write below, whose next_stamp resets to the writer's clock.
+            && current.written_at_ms <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW))
             && now_ms.saturating_sub(current.written_at_ms) < duration_ms(HARNESS_STATE_REFRESH)
         {
             return Ok(true);
@@ -1533,5 +1554,88 @@ mod tests {
             .with_ownership(token, seq);
         successor.observe(active()).unwrap();
         assert_eq!(read(&path, None).unwrap().state, Activity::Active);
+    }
+
+    /// W8-6: a v2 record's serde-default sequence of zero is below every claim — but a v1
+    /// straggler must not replace a record it cannot read. Only the written claim supersedes.
+    #[test]
+    fn non_claiming_writers_refuse_foreign_schemas_outright() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let v2 = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"future","sinceMs":1,"writtenAtMs":1,"transitions":1}"#;
+        fs::write(&path, v2).unwrap();
+
+        let token = session_token();
+        let mut adopted = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .with_ownership(token, 5);
+        adopted.observe(active()).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            v2.to_vec(),
+            "adopted writer refused"
+        );
+        let mut token_only = writer(tmp.path());
+        token_only.observe(active()).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            v2.to_vec(),
+            "token-only writer refused"
+        );
+
+        let mut claimed = takeover(tmp.path(), "codex");
+        claimed.observe(active()).unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.schema, SCHEMA, "only the written claim supersedes");
+    }
+
+    /// W8-7: a beyond-skew future stamp (a backward clock correction's leftover) must not make
+    /// an unchanged restatement a no-op forever — the next restatement repairs the stamp.
+    #[test]
+    fn a_beyond_skew_stamp_is_repaired_by_the_next_restatement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = writer(tmp.path());
+        writer.observe(active()).unwrap();
+
+        let mut poisoned: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        poisoned.written_at_ms = crate::message::now_ms()
+            + duration_ms(HARNESS_STATE_FUTURE_SKEW)
+            + duration_ms(HARNESS_STATE_REFRESH);
+        write_record(&path, &poisoned).unwrap();
+        assert_eq!(
+            read(&path, None).unwrap().reason.as_deref(),
+            Some("future-skew")
+        );
+
+        writer.observe(active()).unwrap();
+        let repaired = read(&path, None).unwrap();
+        assert_eq!(
+            repaired.state,
+            Activity::Active,
+            "stamp repaired to the writer's clock"
+        );
+    }
+
+    /// W8-8: the ask axis is validated at the write boundary.
+    #[test]
+    fn ask_must_be_writable_and_coupled_to_a_human_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = writer(tmp.path());
+        assert!(
+            writer.observe(active().with_ask(Ask::Unknown)).is_err(),
+            "unknown ask is derived-only"
+        );
+        assert!(
+            writer.observe(active().with_ask(Ask::Permission)).is_err(),
+            "an ask without a human block is meaningless"
+        );
+        assert!(
+            writer
+                .observe(
+                    Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                        .with_ask(Ask::Permission)
+                )
+                .is_ok()
+        );
     }
 }
