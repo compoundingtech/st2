@@ -3301,19 +3301,31 @@ mod tests {
         ));
         server.join().unwrap();
         let _ = shutdown.shutdown(Shutdown::Both);
+        // The pump persists Accepted synchronously, but its final websocket
+        // frames race the fake server's exit under parallel-load
+        // descheduling. Await the outcome instead of requiring it to be
+        // settled the instant both threads have been joined.
+        let delivery_state_path = tmp.path().join("state/delivery-state.json");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let accepted = loop {
+            if load_delivery_state(&delivery_state_path, "h.worker", "h.worker")
+                .unwrap()
+                .is_some_and(|state| state.phase == CodexDeliveryPhase::Accepted)
+            {
+                break true;
+            }
+            if pump.is_finished() {
+                break false;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delivery never reached Accepted before shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         pump.join().unwrap();
+        assert!(accepted);
         assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
-        assert_eq!(
-            load_delivery_state(
-                &tmp.path().join("state/delivery-state.json"),
-                "h.worker",
-                "h.worker",
-            )
-            .unwrap()
-            .unwrap()
-            .phase,
-            CodexDeliveryPhase::Accepted
-        );
     }
 
     #[test]
@@ -4720,14 +4732,22 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut launcher = spawn_process_group(&mut command).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !descendant_pidfile.is_file() && Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The shell redirection creates the pidfile before the pid bytes land,
+        // so an immediate read after `is_file()` can observe an empty file
+        // under load. Wait for parseable content instead.
+        let descendant = loop {
+            if let Ok(content) = std::fs::read_to_string(&descendant_pidfile) {
+                if let Ok(pid) = content.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the launcher did not write its descendant pid"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let descendant = std::fs::read_to_string(&descendant_pidfile)
-            .expect("the launcher did not create its native descendant")
-            .parse::<i32>()
-            .unwrap();
+        };
         assert!(
             process_can_retain_cleanup_resources(descendant),
             "the native descendant was not alive before cleanup"
