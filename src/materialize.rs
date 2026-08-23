@@ -341,6 +341,15 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
             content,
             arrays: ArrayMerge::Replace,
         });
+        // The same canonical hook registration the typed driver renders: these seats run under
+        // claude-session too, and a wrapper that claims and ends a record nobody transitions is
+        // worse than no record at all.
+        plan.ops.push(RenderOp::JsonUpsert {
+            destination: ".claude/settings.local.json".into(),
+            content: serde_json::to_string(&crate::hooks::claude_settings_registration())
+                .context("serializing the canonical Claude hook registration")?,
+            arrays: ArrayMerge::Union,
+        });
     }
     Ok(plan)
 }
@@ -516,15 +525,11 @@ fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: 
             // file under any set-shaped path, or `$ST_HOOKS` at a token boundary) the patch no
             // longer states are removed, so a matcher group holding a user hook beside an st2
             // one keeps the user's; containers left with nothing but empty arrays are dropped.
-            let mut kept_leaves = Vec::new();
-            for element in patch.iter() {
-                collect_owned_leaves(element, &mut kept_leaves);
-            }
             target.retain_mut(|element| {
                 if patch.contains(element) || !contains_owned_string(element) {
                     return true;
                 }
-                keep_after_supersession(element, &kept_leaves)
+                keep_after_supersession(element)
             });
             for element in patch {
                 if !target.contains(&element) {
@@ -537,28 +542,30 @@ fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: 
 }
 
 /// Prune superseded managed entries INSIDE `element`, returning whether the element itself is
-/// still worth keeping. An owned leaf (no nested arrays) survives only if the patch still states
-/// it somewhere; containers are pruned recursively and dropped once every nested array is empty
-/// — a husk that only ever held superseded registrations.
-fn keep_after_supersession(element: &mut serde_json::Value, kept: &[serde_json::Value]) -> bool {
+/// still worth keeping. A managed leaf (no nested arrays) never survives here: it belongs only
+/// inside its canonical group, which the caller already retained by whole-element equality — a
+/// managed entry nested in a USER's group would otherwise register twice. Containers are pruned
+/// recursively and dropped once every nested array is empty — husks that only ever held
+/// superseded registrations.
+fn keep_after_supersession(element: &mut serde_json::Value) -> bool {
     if !has_nested_array(element) {
-        return !contains_owned_string(element) || kept.contains(element);
+        return !contains_owned_string(element);
     }
     let mut any_array_content = false;
     match element {
         serde_json::Value::Array(items) => {
-            items.retain_mut(|item| keep_after_supersession(item, kept));
+            items.retain_mut(|item| keep_after_supersession(item));
             any_array_content = !items.is_empty();
         }
         serde_json::Value::Object(map) => {
             for value in map.values_mut() {
                 if let serde_json::Value::Array(items) = value {
-                    items.retain_mut(|item| keep_after_supersession(item, kept));
+                    items.retain_mut(|item| keep_after_supersession(item));
                     if !items.is_empty() {
                         any_array_content = true;
                     }
                 } else if has_nested_array(value) {
-                    if keep_after_supersession(value, kept) {
+                    if keep_after_supersession(value) {
                         any_array_content = true;
                     }
                 }
@@ -567,29 +574,6 @@ fn keep_after_supersession(element: &mut serde_json::Value, kept: &[serde_json::
         _ => {}
     }
     any_array_content
-}
-
-/// Owned leaves — managed entries with no nested arrays — anywhere inside `value`.
-fn collect_owned_leaves(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
-    if !has_nested_array(value) {
-        if contains_owned_string(value) {
-            out.push(value.clone());
-        }
-        return;
-    }
-    match value {
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_owned_leaves(item, out);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values() {
-                collect_owned_leaves(item, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn has_nested_array(value: &serde_json::Value) -> bool {
@@ -1264,5 +1248,66 @@ mod tests {
                 ]}
             })
         );
+    }
+
+    /// W8-14: a CURRENT managed entry nested inside a USER's group is still superseded — the
+    /// canonical registration lives only in its own group, or Claude runs it twice.
+    #[test]
+    fn a_managed_leaf_survives_only_inside_its_canonical_group() {
+        let current = "/root/sets/sha256-bbb/claude-observe.sh Stop";
+        let mut target = serde_json::json!({
+            "hooks": {"Stop": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "user-guard.sh"},
+                    {"type": "command", "command": current}
+                ]}
+            ]}
+        });
+        let patch = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": current}]}]}
+        });
+        deep_merge(&mut target, patch.clone(), ArrayMerge::Union);
+        deep_merge(&mut target, patch, ArrayMerge::Union);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "hooks": {"Stop": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-guard.sh"}]},
+                    {"hooks": [{"type": "command", "command": current}]}
+                ]}
+            })
+        );
+    }
+
+    /// W8-13: legacy `deliver "mcp"` seats render the same canonical hook registration the typed
+    /// driver does — they run under claude-session too.
+    #[test]
+    fn legacy_mcp_seats_render_the_canonical_hook_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let declaration = tmp.path().join("agents/h/worker/agent.kdl");
+        std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" { host "h"; command "claude"; deliver "mcp"; workspace "$CATALOG" }"#,
+        )
+        .unwrap();
+        let found = crate::discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        let plan = effective_plan(tmp.path(), &found.specs[0], "h").unwrap();
+        let settings = plan
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                RenderOp::JsonUpsert {
+                    destination,
+                    content,
+                    arrays,
+                } if destination == ".claude/settings.local.json" => Some((content, arrays)),
+                _ => None,
+            })
+            .expect("legacy mcp seats register hooks");
+        assert_eq!(*settings.1, ArrayMerge::Union);
+        let rendered: serde_json::Value = serde_json::from_str(settings.0).unwrap();
+        assert_eq!(rendered, crate::hooks::claude_settings_registration());
     }
 }

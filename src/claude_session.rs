@@ -84,32 +84,17 @@ pub fn run_observe(
     let Some(observation) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
-    let pty_session = runtime_id.unwrap_or(identity).to_string();
-    let mut writer = harness_state::Writer::new(&agent_dir, identity, "claude", Some(pty_session));
-    // The wrapper's exported token makes hook writes this session's records. A wrapperless seat
-    // (hooks registered on a plain hand-authored launch) falls back to Claude's own session_id —
-    // stable across one Claude session's hooks, fresh on restart — so restatements still
-    // coalesce and a restart still opens a new transition; what such a seat lacks is a
-    // heartbeat/terminal owner, which is a documented hooks-only limitation.
-    let exported = std::env::var(SESSION_ENV)
-        .ok()
-        .filter(|token| !token.is_empty());
-    if let Some(session) = exported {
-        // Full adopted ownership when the wrapper exported it: the claimed sequence makes the
-        // token directional, so a hook straggling from a superseded session is refused.
-        writer = match std::env::var(SESSION_SEQ_ENV)
+    let mut writer = observe_writer(
+        &agent_dir,
+        identity,
+        runtime_id,
+        event,
+        &payload,
+        std::env::var(SESSION_ENV).ok().filter(|t| !t.is_empty()),
+        std::env::var(SESSION_SEQ_ENV)
             .ok()
-            .and_then(|seq| seq.parse::<u64>().ok())
-        {
-            Some(seq) => writer.with_ownership(session, seq),
-            None => writer.with_session(session),
-        };
-    } else if let Some(id) = payload
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-    {
-        writer = writer.with_session(format!("claude-session-{id}"));
-    }
+            .and_then(|seq| seq.parse::<u64>().ok()),
+    );
     if event == "SessionStart" {
         // The one event that names a session boundary: even if the new session's first state
         // matches a fresh predecessor record, continuity must not be claimed across the restart.
@@ -119,6 +104,52 @@ pub fn run_observe(
     // with a live state: the wrapper's `ended` carries this same token and is the session's last
     // word. (`false` = suppressed; the hook has nothing else to do with it.)
     writer.observe_unless_ended(observation).map(|_wrote| ())
+}
+
+/// Select the ownership a hook write acts under. The wrapper's exported token makes hook writes
+/// this session's records (adopted ownership when the claimed sequence travels beside it). A
+/// wrapperless seat falls back to Claude's own session_id — and because token-only writers never
+/// claim, the SessionStart arm IS that path's session boundary and performs the WRITTEN claim
+/// (degrading to token-only with a warning if the claim cannot be written); later hooks of the
+/// same session adopt its records by token. What such a seat still lacks is a heartbeat and
+/// terminal owner — the documented hooks-only limitation.
+#[allow(clippy::too_many_arguments)]
+fn observe_writer(
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+    payload: &serde_json::Value,
+    exported_session: Option<String>,
+    exported_seq: Option<u64>,
+) -> harness_state::Writer {
+    let pty_session = runtime_id.unwrap_or(identity).to_string();
+    let writer = harness_state::Writer::new(agent_dir, identity, "claude", Some(pty_session));
+    if let Some(session) = exported_session {
+        return match exported_seq {
+            Some(seq) => writer.with_ownership(session, seq),
+            None => writer.with_session(session),
+        };
+    }
+    if let Some(id) = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        let token = format!("claude-session-{id}");
+        if event == "SessionStart" {
+            return match harness_state::claim(agent_dir, identity, "claude", &token) {
+                Ok(seq) => writer.with_ownership(token, seq),
+                Err(error) => {
+                    eprintln!(
+                        "st2 claude-observe: observed-state claim failed; degrading to token-only: {error:#}"
+                    );
+                    writer.with_session(token)
+                }
+            };
+        }
+        return writer.with_session(token);
+    }
+    writer
 }
 
 /// Map one Claude hook event to an observation, or `None` when the event says nothing about
@@ -504,6 +535,43 @@ mod tests {
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Idle
+        );
+    }
+
+    /// W8-12: two sessions of a WRAPPERLESS seat. Session A's hooks write; session B's
+    /// SessionStart performs the written claim and takes over; A's straggler is refused and B's
+    /// later hooks adopt B's records.
+    #[test]
+    fn a_wrapperless_seat_survives_its_own_session_succession() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let record = harness_state_path(tmp.path());
+        let payload_a = serde_json::json!({ "session_id": "aaa" });
+        let payload_b = serde_json::json!({ "session_id": "bbb" });
+        let drive = |event: &str, payload: &serde_json::Value| {
+            let mut writer =
+                observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
+            writer
+                .observe_unless_ended(observe_hook_event(event, payload).unwrap())
+                .unwrap()
+        };
+
+        assert!(drive("SessionStart", &payload_a), "A claims");
+        assert!(drive("UserPromptSubmit", &payload_a), "A's hooks adopt");
+        assert_eq!(
+            harness_state::read(&record, None).unwrap().state,
+            Activity::Active
+        );
+
+        assert!(drive("SessionStart", &payload_b), "B claims over A");
+        assert!(
+            !drive("PostToolUse", &payload_a),
+            "A's straggler is refused"
+        );
+        assert!(drive("UserPromptSubmit", &payload_b), "B's hooks adopt");
+        assert_eq!(
+            harness_state::read(&record, None).unwrap().state,
+            Activity::Active
         );
     }
 }
