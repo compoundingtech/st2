@@ -395,9 +395,13 @@ impl Client {
         let mut stream = TcpStream::connect(&self.addr)
             .with_context(|| format!("connecting to opencode at {}", self.addr))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+        // HTTP/1.0 on purpose: over 1.1 the server chunk-encodes the stream (measured on
+        // 1.18.19), which interleaves chunk-size lines into the line-oriented SSE read and can
+        // split a `data:` line across chunks — a silently dropped event. Over 1.0 the same server
+        // streams raw SSE bytes until close, which is exactly the framing this reader parses.
         write!(
             stream,
-            "GET /event HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {}\r\nAccept: text/event-stream\r\n\r\n",
+            "GET /event HTTP/1.0\r\nHost: {}\r\nAuthorization: Basic {}\r\nAccept: text/event-stream\r\n\r\n",
             self.addr, self.auth
         )?;
         let mut reader = BufReader::new(stream);
@@ -662,9 +666,11 @@ impl EventMachine {
     }
 }
 
-/// A permission/question id, wherever this version of the event nests it.
+/// A permission/question id, wherever this version of the event nests it. Measured on 1.18.19:
+/// `permission.asked`/`question.asked` carry `/id`, while their `*.replied`/`*.rejected` exits
+/// carry `/requestID` — missing that spelling would hold `blockedOn: human` forever after a grant.
 fn ask_id(properties: &Value) -> Option<String> {
-    for pointer in ["/id", "/permission/id", "/question/id"] {
+    for pointer in ["/id", "/requestID", "/permission/id", "/question/id"] {
         if let Some(id) = properties.pointer(pointer).and_then(Value::as_str) {
             return Some(id.to_string());
         }
@@ -1020,17 +1026,58 @@ mod tests {
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
         assert_eq!(blocked.reason.as_deref(), Some("permission"));
 
-        // A different id resolving is not this ask's exit edge.
+        // A different id resolving is not this ask's exit edge. Replies spell the id `requestID`
+        // on the measured wire.
         machine.apply(&event(
-            r#"{"type":"permission.replied","properties":{"id":"per_other"}}"#,
+            r#"{"type":"permission.replied","properties":{"requestID":"per_other"}}"#,
         ));
         assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
 
         machine.apply(&event(
-            r#"{"type":"permission.replied","properties":{"id":"per_1"}}"#,
+            r#"{"type":"permission.replied","properties":{"requestID":"per_1"}}"#,
         ));
         assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
         assert_eq!(observed(&machine).state, Activity::Active);
+    }
+
+    /// The verbatim event pair captured live from opencode 1.18.19 (isolated server, config-file
+    /// `"permission":{"bash":"ask"}`, free model): entry carries `properties.id`, the grant carries
+    /// `properties.requestID`. A vocabulary drift on either side must fail here, not in the field.
+    #[test]
+    fn captured_permission_grant_pair_enters_and_exits_blocked() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"id":"evt_02fdc8e3f001djGGTdLwNiVJce","type":"session.status","properties":{"sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","status":{"type":"busy"}}}"#,
+        ));
+        machine.apply(&event(
+            r#"{"id":"evt_02fdc246b0020Xw65txB3nXBC4","type":"permission.asked","properties":{"id":"per_02fdc246b001BB5pclAd62tzpJ","sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","permission":"bash","patterns":["echo capture-test-42"],"metadata":{"command":"echo capture-test-42"},"always":["echo *"],"tool":{"messageID":"msg_02fdc0989001nfz93uTCTLeO6O","callID":"call_6614fd927fe74d86ab089078"}}}"#,
+        ));
+        let blocked = observed(&machine);
+        assert_eq!(blocked.state, Activity::Active);
+        assert_eq!(blocked.blocked_on, BlockedOn::Human);
+        assert_eq!(blocked.reason.as_deref(), Some("permission"));
+
+        machine.apply(&event(
+            r#"{"id":"evt_02fdc8342001TQBwhszchZw1U6","type":"permission.replied","properties":{"sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","requestID":"per_02fdc246b001BB5pclAd62tzpJ","reply":"once"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
+    }
+
+    /// The verbatim question pair captured in the same run: same id/requestID asymmetry.
+    #[test]
+    fn captured_question_reply_pair_enters_and_exits_blocked() {
+        let mut machine = EventMachine::default();
+        machine.seed_idle();
+        machine.apply(&event(
+            r#"{"type":"question.asked","properties":{"id":"que_02fdd3e83001GwptE1fgJam0jB","sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","questions":[{"question":"Do you want me to continue helping with a coding or shell task in this workspace?","header":"Next step","options":[{"label":"Yes","description":"You have a follow-up task you will describe next"},{"label":"No","description":"No further action needed for now"}],"multiple":true}],"tool":{"messageID":"msg_02fdd2672001Mr1YBNCe4YM5Ro","callID":"call_59b5baf00c9f4e248d48f04b"}}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
+        assert_eq!(observed(&machine).reason.as_deref(), Some("question"));
+
+        machine.apply(&event(
+            r#"{"type":"question.replied","properties":{"sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","requestID":"que_02fdd3e83001GwptE1fgJam0jB","answers":[["Yes"]]}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
     }
 
     #[test]
@@ -1043,7 +1090,7 @@ mod tests {
         assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
         assert_eq!(observed(&machine).reason.as_deref(), Some("question"));
         machine.apply(&event(
-            r#"{"type":"question.rejected","properties":{"id":"que_1"}}"#,
+            r#"{"type":"question.rejected","properties":{"requestID":"que_1"}}"#,
         ));
         assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
     }
