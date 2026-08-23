@@ -389,6 +389,9 @@ struct CodexInboxDelivery {
     /// and stop the heartbeat, so a state the pump can no longer see ages out instead of staying
     /// artificially fresh.
     harness_evidence: bool,
+    /// A projected transition whose write failed, retried on the next pump pass before any
+    /// heartbeat may re-stamp the contradicted on-disk state.
+    pending_observation: Option<harness_state::Observation>,
 }
 
 impl CodexInboxDelivery {
@@ -411,16 +414,17 @@ impl CodexInboxDelivery {
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
-        let mut harness_writer = harness_state::Writer::new(
+        // The session token is the runtime incarnation the wrapper already minted: the pump and
+        // the wrapper's terminal writer are the same session and must own the same records. A
+        // restarted pump is a new incarnation, so even a first observation matching a fresh
+        // predecessor record opens a new transition rather than claiming continuity.
+        let harness_writer = harness_state::Writer::new(
             &config.agent_dir,
             config.identity.clone(),
             "codex",
             Some(runtime.runtime_id().to_string()),
-        );
-        // A restarted pump is a new session: even a first observation that matches a fresh
-        // predecessor record must open a new transition rather than claim continuity across an
-        // interval nothing observed.
-        harness_writer.interrupt();
+        )
+        .with_session(runtime.incarnation());
         Ok(Self {
             config,
             state_path,
@@ -437,23 +441,39 @@ impl CodexInboxDelivery {
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
             harness_writer,
             harness_evidence: false,
+            pending_observation: None,
         })
     }
 
     /// Publish the generic observed-harness-state projection of a control-state change. Best-effort
-    /// like the presence refresh: a failed record write must not disturb delivery.
+    /// like the presence refresh: a failed record write must not disturb delivery — but it must
+    /// not count as evidence either. A transition whose write failed is retained as pending and
+    /// retried before any heartbeat, so a stale on-disk state is never kept fresh in
+    /// contradiction of the latest observation.
     fn observe_harness(&mut self, observed: &CodexObservedState) {
         match observed.harness_observation() {
-            Some(observation) => {
-                let _ = self.harness_writer.observe(observation);
-                self.harness_evidence = true;
-            }
+            Some(observation) => self.publish_observation(observation),
             None => {
-                // Evidence lost: stop heartbeating, and mark the stream discontinuous so a state
-                // restated after the gap opens a fresh transition instead of claiming continuity
-                // across an interval nothing observed.
+                // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
+                // and mark the stream discontinuous so a state restated after the gap opens a
+                // fresh transition instead of claiming continuity across an unobserved interval.
+                self.harness_evidence = false;
+                self.pending_observation = None;
+                self.harness_writer.interrupt();
+            }
+        }
+    }
+
+    fn publish_observation(&mut self, observation: harness_state::Observation) {
+        match self.harness_writer.observe(observation.clone()) {
+            Ok(()) => {
+                self.harness_evidence = true;
+                self.pending_observation = None;
+            }
+            Err(_) => {
                 self.harness_evidence = false;
                 self.harness_writer.interrupt();
+                self.pending_observation = Some(observation);
             }
         }
     }
@@ -476,6 +496,9 @@ impl CodexInboxDelivery {
             // This wrapper owns the live provider session. It therefore owns the presence lease.
             // Preserve busy or available, and let dnd age out.
             let _ = status::refresh(&status::status_path(&self.config.agent_dir));
+            if let Some(pending) = self.pending_observation.clone() {
+                self.publish_observation(pending);
+            }
             if self.harness_evidence {
                 let _ = self.harness_writer.heartbeat();
             }
@@ -1410,12 +1433,15 @@ fn run_connected(
     // The pump is gone, so nothing can observe this session again: publish the terminal
     // observation with the outcome the wrapper actually saw, before any staleness horizon.
     // Consumers must not branch on `reason`, so the observed exit always lands in `exit`.
+    // Same incarnation as the pump's writer: the terminal record must own — and thereby fence —
+    // exactly the records this session wrote.
     let mut harness_writer = harness_state::Writer::new(
         &harness_agent_dir,
         harness_identity.clone(),
         "codex",
         Some(runtime.runtime_id().to_string()),
-    );
+    )
+    .with_session(runtime.incarnation());
     let _ = match &result {
         Ok(TuiEnd::Exited(status)) => harness_writer.ended(describe_tui_exit(Some(*status))),
         Ok(TuiEnd::Stopped(status)) => harness_writer.ended(describe_tui_exit(*status)),
@@ -2955,6 +2981,46 @@ mod tests {
         .unwrap();
         assert_eq!(ended.state, Activity::Ended);
         assert_eq!(ended.reason.as_deref(), Some("systemError"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_transition_write_is_retried_before_any_heartbeat() {
+        use crate::harness_state::{self, Activity};
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let record_path = harness_state::harness_state_path(&agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-current".into(),
+        });
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Active
+        );
+
+        // The transition to idle fails to land: the agent dir is briefly unwritable.
+        let live = fs::metadata(&agent_dir).unwrap().permissions();
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        delivery.observe_harness(&CodexObservedState::Idle);
+        fs::set_permissions(&agent_dir, live).unwrap();
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Active,
+            "the failed write cannot have landed"
+        );
+
+        // No heartbeat may re-stamp the contradicted on-disk state; the retry lands the pending
+        // transition instead.
+        let stale_active = fs::read(&record_path).unwrap();
+        delivery.next_presence_refresh = Instant::now();
+        delivery.refresh_if_due().unwrap();
+        let after = harness_state::read(&record_path, None).unwrap();
+        assert_eq!(after.state, Activity::Idle, "pending transition retried");
+        assert_ne!(fs::read(&record_path).unwrap(), stale_active);
     }
 
     #[test]
