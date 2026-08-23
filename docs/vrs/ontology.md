@@ -350,7 +350,7 @@ explicit `unpark` recovery request.
   [session state](../../src/reconcile.rs#L16-L26) for runtime liveness. Avoid
   bare *agent status* when either could be meant.
 - Use [observed harness state](05-harness-state/requirements.md) for the
-  driver-observed working signal. It is a third axis beside presence and
+  driver-observed activity signal. It is a third axis beside presence and
   session state: R08's *activity status* stays the declared, agent-authored
   signal, and neither axis rewrites the other. Bare *activity* does not
   identify which is meant.

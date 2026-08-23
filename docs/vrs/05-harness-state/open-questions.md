@@ -25,13 +25,17 @@ hypotheses.
   waits on) and it under-reports nothing, but the state axis says `active`
   while the model is not running. Resolves by: a Claude build whose denial
   emits any hook event; until then the deny window is the pinned limit.
-- **DQ-H2 Transport cost of per-transition writes.** Presence refreshes every
-  five minutes; turn boundaries are far more frequent, and burst coalescing
-  measured 4 transitions per turn 0.1–0.4 ms apart. No measurement establishes
-  what per-transition replicated writes cost on a real catalog under a real
-  transport (OHS-T01 accepts this for v1). Resolves by: measuring write and
-  sync volume on a live catalog; if unacceptable, a minimum-interval
-  coalescing window is the tuning knob, at the cost of spinner latency.
+- **DQ-H2 Transport cost of per-transition writes — measured 2026-08-23,
+  resolved by the restatement guard.** The live smoke run caught the failure
+  mode: the OpenCode producer restated its state per SSE frame and the
+  envelope re-stamped every restatement — 679 byte-distinct writes in 221 s
+  (~2.7/s while idle). The envelope now makes an unchanged observation a
+  no-op until the refresh cadence is due, so a seat writes on transitions
+  plus at most one re-stamp per five minutes (a Claude turn measured 3
+  writes; a pi turn 2–3). What remains open is only the fleet-scale sync
+  question: nothing yet measures what transition-rate writes cost a
+  600-seat catalog's transport over a day. Resolves by: that measurement on
+  a live catalog.
 - **DQ-H3 `child` has no producer.** The word is reserved because the tuple's
   reasoning needs it (a long-running foreground command is neither the model
   working nor idle), but the producer that would have supplied it — the PTY

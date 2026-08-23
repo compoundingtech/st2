@@ -133,6 +133,14 @@ What a reader reports, in evaluation order:
 Every `unknown` row routes through one constructor and blanks every axis;
 there is no path from any absence to a definite state.
 
+Two reader-side limits, stated before anyone finds them: `pty kill` removes
+the session pidfile, so the liveness probe reads *indeterminate* rather than
+*dead* after it — a record orphaned that way reads its last state until the
+staleness horizon even with the right pty root (measured; downgrade-safe,
+never wrong, but not instant). And hosts running codex-cli at or above 0.148
+produce no Codex observed state at all: `SUPPORTED_CODEX_CLI_VERSIONS`
+refuses the launch, correctly, until the pin moves (#267).
+
 ## Codex producer (OHS-R05)
 
 The projection reads the state the control pump already maintains; it adds no
@@ -188,12 +196,19 @@ materialization pass, and the hooks take effect at the next session start.
 
 ## pi producer (OHS-R05, OHS-R08)
 
-The injected extension observes `agent_start`/`agent_end` — a positive,
-evented, in-process signal — and reports transitions over the existing
-channel; the wrapper writes the record and owns heartbeat and terminal writes.
-This is the first producer that satisfies root `DQ2`'s "stronger evented
-signal" clause for any harness. pi's composer offers nothing to scrape, so
-`inputBuffer` stays `unknown`.
+The injected extension observes `agent_start`/`agent_settled` — a positive,
+evented, in-process signal; the idle edge is deliberately `agent_settled`,
+because `ctx.isIdle()` is still false through `agent_end` and a queued
+follow-up turn starts exactly at that boundary (measured against the repo's
+own pi captures). Ownership splits by phase rather than living in one
+process: the channel owns the live record and its heartbeat, because it is
+the one process that sees pi's turn events and its stdio EOF bounds its
+evidence, while the wrapper owns only the terminal record, because it is the
+one process that sees the provider die — and the channel drops queued live
+frames once a terminal record is on disk, so the wrapper's write is the
+incarnation's last word. This is the first producer that satisfies root
+`DQ2`'s "stronger evented signal" clause for any harness. pi's composer
+offers nothing to scrape, so `inputBuffer` stays `unknown`.
 
 ## OpenCode producer (OHS-R08)
 
