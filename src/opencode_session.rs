@@ -163,9 +163,16 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
     let outcome = loop {
         if STOP.load(Ordering::SeqCst) {
             // The terminal record precedes the escalation: SIGKILL takes this wrapper with its
-            // group, so nothing after the kill can write (§D of the harness-state design).
+            // group, so nothing after the kill can write (§D of the harness-state design). When
+            // the group yields inside the grace window the wrapper survives, so the record is
+            // rewritten with the exit the reap actually observed — "stopped" remains only as
+            // escalation cover.
             let _ = session.writer.ended("stopped");
-            break stop_provider_group(child);
+            let reaped = stop_provider_group(child);
+            if let Ok(Some(exit)) = &reaped {
+                let _ = session.writer.ended(describe_exit(*exit));
+            }
+            break reaped.map(|_| ());
         }
         if let Some(exit) = child.try_wait().context("checking opencode provider")? {
             let _ = session.writer.ended(describe_exit(exit));
@@ -278,7 +285,7 @@ fn completed(exit: ExitStatus) -> Result<()> {
     Ok(())
 }
 
-fn stop_provider_group(child: &mut Child) -> Result<()> {
+fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
     let process_group = unsafe { libc::getpgrp() };
     anyhow::ensure!(
         process_group > 1,
@@ -289,16 +296,15 @@ fn stop_provider_group(child: &mut Child) -> Result<()> {
     }
     let deadline = Instant::now() + STOP_GRACE;
     while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
+        if let Some(exit) = child.try_wait()? {
+            return Ok(Some(exit));
         }
         thread::sleep(Duration::from_millis(25));
     }
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);
     }
-    let _ = child.wait();
-    Ok(())
+    Ok(child.wait().ok())
 }
 
 fn describe_exit(exit: ExitStatus) -> String {
@@ -541,10 +547,14 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut 
     if let Some(map) = statuses.as_object() {
         for (session_id, status) in map {
             delivery.saw_session(session_id);
-            if let Some(kind) = status.get("type").and_then(Value::as_str)
-                && kind != "idle"
-            {
-                machine.seed_busy(session_id.clone(), kind == "retry");
+            // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is
+            // surface drift the /doc gate vocabulary did not cover, and evidence restored over
+            // words we cannot read would be fabricated. Fail the seed and retry instead.
+            match status.get("type").and_then(Value::as_str) {
+                Some("idle") => {}
+                Some("busy") => machine.seed_busy(session_id.clone(), false),
+                Some("retry") => machine.seed_busy(session_id.clone(), true),
+                _ => return false,
             }
         }
     }
@@ -735,6 +745,24 @@ impl EventMachine {
     }
 }
 
+/// The most recently updated session id from `GET /session`, or the last listed when the entries
+/// carry no readable update time. `None` while the seat's TUI has not created a session yet.
+fn newest_listed_session(client: &Client) -> Option<String> {
+    let listed = client.get_json("/session").ok()?;
+    let sessions = listed.as_array()?;
+    sessions
+        .iter()
+        .max_by_key(|session| {
+            session
+                .pointer("/time/updated")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .or_else(|| sessions.last())
+        .and_then(|session| session.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 /// A permission/question id, wherever this version of the event nests it. Measured on 1.18.19:
 /// `permission.asked`/`question.asked` carry `/id`, while their `*.replied`/`*.rejected` exits
 /// carry `/requestID` — missing that spelling would hold `blockedOn: human` forever after a grant.
@@ -877,8 +905,19 @@ impl Delivery {
         let Some(head) = unread.into_iter().next() else {
             return Ok(());
         };
-        let Some(target) = self.target_session.clone() else {
-            return Ok(());
+        let target = match self.target_session.clone() {
+            Some(target) => target,
+            None => {
+                // A session that settled before this observer connected is invisible to both the
+                // event stream and `/session/status` (idle sessions are omitted), so a pending
+                // delivery would otherwise stall forever. With work waiting, recover the binding
+                // from the session listing — retried every pump pass until a session exists.
+                let Some(recovered) = newest_listed_session(client) else {
+                    return Ok(());
+                };
+                self.saw_session(&recovered);
+                recovered
+            }
         };
         if let Some(state) = self.state.as_ref()
             && state.session_id != target
@@ -1270,6 +1309,8 @@ mod tests {
         pending_questions: Arc<Mutex<Vec<String>>>,
         /// When set, both pending-ask listings answer 500: the ask seed fails.
         ask_error: Arc<AtomicBool>,
+        /// Session ids `GET /session` lists (idle sessions appear here and nowhere else).
+        listed_sessions: Arc<Mutex<Vec<String>>>,
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -1283,13 +1324,15 @@ mod tests {
         let pending_permissions = Arc::new(Mutex::new(Vec::<String>::new()));
         let pending_questions = Arc::new(Mutex::new(Vec::<String>::new()));
         let ask_error = Arc::new(AtomicBool::new(false));
+        let listed_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
-        let (read_back_t, status_err_t, pending_t, questions_t, ask_err_t) = (
+        let (read_back_t, status_err_t, pending_t, questions_t, ask_err_t, listed_t) = (
             read_back_error.clone(),
             status_error.clone(),
             pending_permissions.clone(),
             pending_questions.clone(),
             ask_error.clone(),
+            listed_sessions.clone(),
         );
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1345,6 +1388,8 @@ mod tests {
                     } else {
                         404
                     }
+                } else if method == "GET" && path == "/session" {
+                    200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
                         500
@@ -1360,7 +1405,15 @@ mod tests {
                 } else {
                     404
                 };
-                let body = if method == "GET" && (path == "/permission" || path == "/question") {
+                let body = if method == "GET" && path == "/session" {
+                    let ids = listed_t.lock().unwrap();
+                    serde_json::to_string(
+                        &ids.iter()
+                            .map(|id| serde_json::json!({ "id": id }))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                } else if method == "GET" && (path == "/permission" || path == "/question") {
                     let ids = if path == "/permission" {
                         pending_t.lock().unwrap()
                     } else {
@@ -1393,6 +1446,7 @@ mod tests {
             pending_permissions,
             pending_questions,
             ask_error,
+            listed_sessions,
         }
     }
 
@@ -1633,5 +1687,32 @@ mod tests {
             None,
             "no level evidence, no observation"
         );
+    }
+
+    /// O1: a seat whose session settled before the observer connected is invisible to the event
+    /// stream and to /session/status — with work pending, the delivery binding is recovered from
+    /// the session listing rather than stalling forever.
+    #[test]
+    fn a_pre_settled_session_is_recovered_from_the_listing_for_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
+        delivery.target_session = None;
+
+        // No listing yet: nothing to bind, nothing sent — and no wedge, it simply retries.
+        delivery.pump(&client);
+        assert!(server.posts.lock().unwrap().is_empty());
+
+        // The idle session exists only in the listing; the next pass binds and delivers.
+        server
+            .listed_sessions
+            .lock()
+            .unwrap()
+            .push("ses_settled".to_string());
+        delivery.pump(&client);
+        let posts = server.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "delivery bound to the recovered session");
     }
 }
