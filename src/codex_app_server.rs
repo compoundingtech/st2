@@ -492,13 +492,16 @@ impl CodexInboxDelivery {
 
     fn refresh_if_due(&mut self) -> Result<()> {
         let now = Instant::now();
+        // A pending transition retries on EVERY pump pass — its write failed once and the
+        // on-disk record contradicts the latest observation until it lands; only the heartbeat
+        // is presence-cadence work.
+        if let Some(pending) = self.pending_observation.clone() {
+            self.publish_observation(pending);
+        }
         if now >= self.next_presence_refresh {
             // This wrapper owns the live provider session. It therefore owns the presence lease.
             // Preserve busy or available, and let dnd age out.
             let _ = status::refresh(&status::status_path(&self.config.agent_dir));
-            if let Some(pending) = self.pending_observation.clone() {
-                self.publish_observation(pending);
-            }
             if self.harness_evidence {
                 let _ = self.harness_writer.heartbeat();
             }
@@ -1210,6 +1213,11 @@ fn run_controlled_owned(
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
+    // Installed before ANY child exists — the hook-trust preflight spawns a detached app-server
+    // first, and a SIGTERM landing in that window must set the stop flag its connect loop polls
+    // rather than killing this wrapper around a leaked server and a stale socket. (Installing
+    // resets the flag, so this must also run exactly once per launch.)
+    crate::provider_session::install_signal_handler();
     let binding_path = state_dir.join("binding.json");
     let resume_thread = load_resume_thread(&binding_path, &identity, &runtime_id)?;
 
@@ -1325,10 +1333,9 @@ fn run_connected(
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
-    // st2's own stop path SIGTERMs this wrapper. Without a handler the wrapper dies before the
-    // post-join terminal write below, so a stopped seat would read its last live state until the
-    // staleness horizon — the exact window the Claude wrapper's ordering closes.
-    crate::provider_session::install_signal_handler();
+    // The stop handler is installed by run_controlled_owned before any spawn (the preflight's
+    // detached app-server included); re-installing here would RESET a stop flag raised during
+    // startup, so this function only relies on it.
     let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
     let endpoint = format!("unix://{}", socket_path.display());
     let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
@@ -3014,9 +3021,10 @@ mod tests {
         );
 
         // No heartbeat may re-stamp the contradicted on-disk state; the retry lands the pending
-        // transition instead.
+        // transition on the NEXT pump pass — deliberately without advancing the presence
+        // cadence, which gates only heartbeats.
         let stale_active = fs::read(&record_path).unwrap();
-        delivery.next_presence_refresh = Instant::now();
+        delivery.next_presence_refresh = Instant::now() + status::STATUS_REFRESH;
         delivery.refresh_if_due().unwrap();
         let after = harness_state::read(&record_path, None).unwrap();
         assert_eq!(after.state, Activity::Idle, "pending transition retried");
