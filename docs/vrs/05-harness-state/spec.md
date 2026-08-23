@@ -73,11 +73,18 @@ Field rules, matching `src/harness_state.rs`:
 - `ask` names the kind of human ask, machine-readably, while `blockedOn` is
   `human` (`none` otherwise; unrecognized words decode indeterminate) — the
   axis consumers filter on, so nothing branches on diagnostic `reason`.
-- `incarnation` is the writing session's token: ownership — coalescing,
-  heartbeat eligibility, terminal suppression — is token equality, never a
-  timestamp comparison. Sibling writer processes of one session share the
-  token; every landed write carries a strictly monotonic per-record stamp so
-  it stays byte-distinct even against a same-millisecond predecessor.
+- `incarnation` is the writing session's token and `seq` its monotonic
+  ownership sequence: ownership — coalescing, heartbeat eligibility, terminal
+  suppression — is token equality, and only a session claim advances the
+  sequence (to the on-disk value plus one), which gives ownership a
+  direction: a straggler from a superseded session is refused in live and
+  terminal paths alike. Sibling writer processes of one session share the
+  claimer's exported token and sequence; records from writers predating
+  either field decode with an empty token and sequence zero, which no
+  session owns and any claim supersedes. Every landed write carries a
+  strictly monotonic per-record stamp (never inherited from beyond the
+  future-skew trust bound) so it stays byte-distinct even against a
+  same-millisecond predecessor.
 - `reason` is diagnostic only; no consumer branches on it.
 - `sinceMs` is when the current state was entered and survives heartbeat
   re-stamps; `writtenAtMs` is the heartbeat. `transitions` is a monotonic
