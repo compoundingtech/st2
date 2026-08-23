@@ -126,7 +126,16 @@ Field rules, matching `src/harness_state.rs`:
   lingering predecessor can neither heartbeat nor overwrite its successor's
   record. Heartbeats and coalescing never touch a record whose schema or
   token the writer does not own; a foreign record is left byte-identical by
-  heartbeats and replaced only by a claiming observation.
+  heartbeats and replaced only by a claiming observation. Two residuals,
+  stated: two wrappers claiming in the same instant (both reading the same
+  on-disk sequence before either writes) tie at equal sequences and fall back
+  to last-writer-wins — reaching that window requires two concurrently live
+  wrappers for one seat, which the supervisor's serialized replacement
+  already forbids; and Claude's exported ownership pair is visible to its
+  tool children like every other hook-environment value (`ST_AGENT`
+  included) — pi stashes and unexports instead because pi fronts its own
+  environment onto every bash child, an architectural difference, not an
+  oversight.
 - Deserialization is additive-tolerant (no `deny_unknown_fields`): a reader
   may be older than its writer.
 
