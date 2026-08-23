@@ -118,8 +118,8 @@ struct ObservedJson<'a> {
     ask: &'a str,
     harness: Option<&'a str>,
     since: Option<u64>,
-    exit: Option<&'a str>,
     reason: Option<&'a str>,
+    exit: Option<&'a str>,
 }
 
 impl<'a> ObservedJson<'a> {
@@ -131,8 +131,8 @@ impl<'a> ObservedJson<'a> {
             ask: observed.ask.as_str(),
             harness: observed.harness.as_deref(),
             since: observed.since_ms,
-            exit: observed.exit.as_deref(),
             reason: observed.reason.as_deref(),
+            exit: observed.exit.as_deref(),
         })
     }
 }
@@ -346,11 +346,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -366,7 +366,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"exit":null,"reason":"session-dead"}}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
         );
     }
 }
