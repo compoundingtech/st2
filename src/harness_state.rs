@@ -160,6 +160,11 @@ struct Record {
     /// it; a record whose session is provably dead reads `unknown` even while fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pty_session: Option<String>,
+    /// The writing session's incarnation token. Ownership is token equality, never a timestamp
+    /// comparison: same-millisecond takeovers and lingering predecessor writers are both real.
+    /// Empty in records from writers predating the field, which no session owns.
+    #[serde(default)]
+    incarnation: String,
     /// When the current state was entered. Survives heartbeat re-stamps.
     since_ms: u64,
     /// The heartbeat: when the writer last held evidence for this state.
@@ -227,7 +232,7 @@ pub struct Writer {
     harness: &'static str,
     pty_session: Option<String>,
     interrupted: bool,
-    session_start_ms: u64,
+    session: String,
 }
 
 impl Writer {
@@ -247,15 +252,17 @@ impl Writer {
             harness,
             pty_session,
             interrupted: false,
-            session_start_ms: crate::message::now_ms(),
+            session: session_token(),
         }
     }
 
-    /// Pin the session-start boundary used by the heartbeat-eligibility rule to an explicit
-    /// timestamp. A wrapper that constructs a fresh writer per operation passes one stable
-    /// timestamp so every writer agrees on where this session began.
-    pub fn session_started_at(mut self, session_start_ms: u64) -> Self {
-        self.session_start_ms = session_start_ms;
+    /// Adopt an explicit session incarnation token. Sibling writer processes of one session —
+    /// a wrapper beside its hook subprocesses, a channel beside its wrapper — must share one
+    /// token (typically minted by the wrapper and exported through the session environment), or
+    /// each writes as its own session: restatements open transitions and the wrapper can neither
+    /// re-stamp nor terminally fence its siblings' records.
+    pub fn with_session(mut self, token: impl Into<String>) -> Self {
+        self.session = token.into();
         self
     }
 
@@ -316,16 +323,22 @@ impl Writer {
         );
         let _lock = self.locked()?;
         let on_disk = read_record(&self.path);
-        // A record whose schema this writer does not own is never coalesced against and never
-        // treated as this session's terminal word — a genuine observation still replaces it
-        // wholesale (one logical owner per record), continuing the counter for byte-distinctness.
-        let own_record = on_disk.as_ref().filter(|current| current.schema == SCHEMA);
+        // Ownership is token equality: a record is this writer's only when it carries both this
+        // version's schema and this session's incarnation. Anything else — a foreign schema, a
+        // predecessor's or successor's token, the empty pre-token form — is never coalesced
+        // against and never treated as this session's terminal word; a genuine observation
+        // replaces it wholesale (one logical owner per record), continuing the counter for
+        // byte-distinctness. Timestamps deliberately play no part: a same-millisecond takeover
+        // and a lingering predecessor writer are both real and both ambiguous by clock.
+        let own_record = on_disk
+            .as_ref()
+            .filter(|current| current.schema == SCHEMA && current.incarnation == self.session);
         if skip_if_ended
             && own_record.is_some_and(|current| {
                 // Only a terminal record from this session suppresses queued live frames. A
                 // predecessor incarnation's `ended` is history, not this session's last word —
                 // suppressing against it would report a restarted seat as ended for its whole run.
-                current.state == Activity::Ended && current.written_at_ms >= self.session_start_ms
+                current.state == Activity::Ended
             })
         {
             return Ok(false);
@@ -342,20 +355,25 @@ impl Writer {
             });
         if unchanged
             && let Some(current) = own_record
-            // A restatement is a no-op only against a record this session already wrote. A
-            // matching record from before the session started must still be written through:
-            // otherwise the takeover never claims the record and every later heartbeat is
-            // rejected by the session gate while the state quietly ages out.
-            && current.written_at_ms >= self.session_start_ms
+            // A restatement is a no-op only against a record this session already wrote (the
+            // token filter above); a matching record from any other incarnation is written
+            // through, so a takeover always claims the record and heartbeats stay eligible.
             && now_ms.saturating_sub(current.written_at_ms) < duration_ms(HARNESS_STATE_REFRESH)
         {
             return Ok(true);
         }
+        // A landed write is byte-distinct even against a same-millisecond predecessor: the stamp
+        // is strictly monotonic per record, at the cost of a bounded forward skew of at most one
+        // millisecond per write (writes are transition-scale, so the skew never accumulates
+        // meaningfully against the staleness horizon).
+        let written_at_ms = on_disk
+            .as_ref()
+            .map_or(now_ms, |current| now_ms.max(current.written_at_ms + 1));
         let (since_ms, transitions) = match (own_record, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
-            (Some(current), false) => (now_ms, current.transitions.saturating_add(1)),
+            (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
             (None, _) => (
-                now_ms,
+                written_at_ms,
                 on_disk
                     .as_ref()
                     .map_or(0, |current| current.transitions.saturating_add(1)),
@@ -372,8 +390,9 @@ impl Writer {
             reason: observation.reason,
             exit: observation.exit,
             pty_session: self.pty_session.clone(),
+            incarnation: self.session.clone(),
             since_ms,
-            written_at_ms: now_ms,
+            written_at_ms,
             transitions,
         };
         write_record(&self.path, &record)?;
@@ -394,15 +413,17 @@ impl Writer {
             return Ok(());
         };
         // A schema this writer does not own must not be round-tripped through this version's
-        // record type — re-serializing would strip fields it cannot see and literalize enum words
-        // it decoded as `unknown`. The reader's discriminator gate covers foreign records.
+        // record type, and a record this *session* does not own must never be kept fresh: a
+        // lingering predecessor re-stamping its successor's record would keep a dead seat's
+        // state alive for cross-host readers, and a successor re-stamping a predecessor's would
+        // resurrect history. Token equality decides, in both directions.
         if current.schema != SCHEMA
             || current.state == Activity::Ended
-            || current.written_at_ms < self.session_start_ms
+            || current.incarnation != self.session
         {
             return Ok(());
         }
-        current.written_at_ms = crate::message::now_ms();
+        current.written_at_ms = crate::message::now_ms().max(current.written_at_ms + 1);
         write_record(&self.path, &current)
     }
 
@@ -548,6 +569,18 @@ fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A process-unique session incarnation token: pid, wall-clock, and a process-local counter.
+/// Uniqueness across the writers that can actually race on one record (processes on one host)
+/// is what matters; no cryptographic strength is implied or needed.
+pub fn session_token() -> String {
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        crate::message::now_ms(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_name() -> String {
@@ -672,32 +705,22 @@ mod tests {
     fn an_unchanged_observation_re_stamps_only_a_record_older_than_the_refresh_cadence() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let stale = Record {
-            schema: SCHEMA.to_string(),
-            agent: "hetz.worker".to_string(),
-            harness: "codex".to_string(),
-            state: Activity::Active,
-            blocked_on: BlockedOn::None,
-            input_buffer: InputBuffer::Unknown,
-            ask: Ask::None,
-            reason: None,
-            exit: None,
-            pty_session: Some("worker".to_string()),
-            since_ms: 5,
-            written_at_ms: 5,
-            transitions: 3,
-        };
-        write_record(&path, &stale).unwrap();
-
         let mut writer = writer(tmp.path());
         writer.observe(active()).unwrap();
+
+        // Age this session's own record past the refresh cadence without changing its owner.
+        let mut aged: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        aged.written_at_ms = crate::message::now_ms() - duration_ms(HARNESS_STATE_REFRESH) - 1;
+        aged.since_ms = aged.written_at_ms;
+        write_record(&path, &aged).unwrap();
+
+        // The unchanged restatement now lands as a heartbeat-equivalent re-stamp: same state,
+        // same transition, fresh stamp.
+        writer.observe(active()).unwrap();
         let restamped: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(restamped.written_at_ms > 5, "overdue record must re-stamp");
-        assert_eq!(restamped.since_ms, 5, "since survives the re-stamp");
-        assert_eq!(
-            restamped.transitions, 3,
-            "a restatement is not a transition"
-        );
+        assert_eq!(restamped.transitions, aged.transitions);
+        assert_eq!(restamped.since_ms, aged.since_ms);
+        assert!(restamped.written_at_ms > aged.written_at_ms);
     }
 
     #[test]
@@ -813,6 +836,7 @@ mod tests {
                 reason: None,
                 exit: None,
                 pty_session: None,
+                incarnation: String::new(),
                 since_ms: written_at_ms,
                 written_at_ms,
                 transitions: 0,
@@ -953,6 +977,7 @@ mod tests {
             reason: None,
             exit: None,
             pty_session: Some("worker".to_string()),
+            incarnation: String::new(),
             since_ms: 5,
             written_at_ms: 5,
             transitions: 3,
@@ -987,8 +1012,13 @@ mod tests {
     fn observe_unless_ended_drops_live_frames_after_a_peer_terminal_record() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let mut channel = writer(tmp.path());
-        let mut wrapper = writer(tmp.path());
+        // The channel and wrapper are sibling processes of ONE session and share its token —
+        // that sharing is what makes the wrapper's terminal record the session's last word.
+        let token = session_token();
+        let mut channel = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()))
+            .with_session(token.clone());
+        let mut wrapper =
+            Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into())).with_session(token);
 
         assert!(channel.observe_unless_ended(active()).unwrap());
         wrapper.ended("signal 9").unwrap();
@@ -1015,12 +1045,11 @@ mod tests {
         predecessor.observe(active()).unwrap();
         let before: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-        // The successor's session begins strictly after the predecessor's write. Without the
-        // write-through, its matching first observation would be a no-op and the session gate
-        // would then reject every heartbeat while the record quietly aged out.
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
-            .session_started_at(before.written_at_ms + 1);
-        std::thread::sleep(Duration::from_millis(2));
+        // The successor is a different incarnation — token inequality alone forces the
+        // write-through, even inside the same millisecond. Without it, its matching first
+        // observation would be a no-op and the ownership gate would then reject every heartbeat
+        // while the record quietly aged out.
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
         successor.observe(active()).unwrap();
         let claimed: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(
@@ -1044,10 +1073,7 @@ mod tests {
         writer(tmp.path()).observe(active()).unwrap();
         let before: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-        std::thread::sleep(Duration::from_millis(2));
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
-            .session_started_at(before.written_at_ms + 1);
-        successor.interrupt();
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
         successor.observe(active()).unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.transitions, before.transitions + 1);
@@ -1085,9 +1111,10 @@ mod tests {
         writer(tmp.path()).ended("exit 0").unwrap();
         let terminal: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()))
-            .session_started_at(terminal.written_at_ms + 1);
-        successor.interrupt();
+        // Deliberately no delay: a same-millisecond takeover is the ambiguous case a timestamp
+        // boundary got wrong, and token inequality decides it.
+        let _ = terminal;
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()));
         assert!(
             successor.observe_unless_ended(active()).unwrap(),
             "a restarted seat must replace its predecessor's terminal record"
@@ -1158,5 +1185,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(&path, None).unwrap().ask, Ask::Unknown);
+    }
+
+    #[test]
+    fn a_lingering_predecessor_cannot_heartbeat_its_successors_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut old = writer(tmp.path());
+        old.observe(active()).unwrap();
+
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        successor
+            .observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        // The old wrapper outlives its replacement briefly; its heartbeat must not keep the
+        // successor's record fresh — the successor's death would otherwise stay invisible to
+        // cross-host readers for as long as the straggler lives.
+        old.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn landed_heartbeats_are_byte_distinct_and_strictly_monotonic_even_same_millisecond() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = writer(tmp.path());
+        writer.observe(active()).unwrap();
+
+        let mut previous: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for _ in 0..5 {
+            let before_bytes = fs::read(&path).unwrap();
+            writer.heartbeat().unwrap();
+            let after_bytes = fs::read(&path).unwrap();
+            assert_ne!(
+                after_bytes, before_bytes,
+                "every landed heartbeat re-stamps bytes"
+            );
+            let current: Record = serde_json::from_slice(&after_bytes).unwrap();
+            assert!(
+                current.written_at_ms > previous.written_at_ms,
+                "stamps are strictly monotonic per record"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn sibling_writers_sharing_a_session_token_coalesce_and_heartbeat_each_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let token = session_token();
+        let mut wrapper = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+            .with_session(token.clone());
+        let mut hook = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+            .with_session(token);
+
+        hook.observe(active()).unwrap();
+        let entered: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        // A sibling's restatement coalesces (no transition churn across hook processes)…
+        let mut hook2 = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+            .with_session(entered.incarnation.clone());
+        hook2.observe(active()).unwrap();
+        let restated: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restated.transitions, entered.transitions);
+        assert_eq!(restated.since_ms, entered.since_ms);
+
+        // …and the wrapper's heartbeat re-stamps the sibling-written state.
+        wrapper.heartbeat().unwrap();
+        let stamped: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(stamped.written_at_ms > restated.written_at_ms);
+        assert_eq!(stamped.state, Activity::Active);
     }
 }
