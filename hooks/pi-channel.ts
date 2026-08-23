@@ -102,6 +102,17 @@ export default function (pi: ExtensionAPI) {
   // /resume, /fork) tears the old session down around the new one's start, so a teardown handler
   // that closed `current` would reap the successor it just opened — measured, and it silently
   // stopped all delivery after `/new`.
+  const awaitExit = (child: childProcess.ChildProcess | undefined, ms: number) =>
+    new Promise<void>((resolve) => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
   const closeChild = (child: childProcess.ChildProcess | undefined) => {
     if (!child) return;
     if (state.child === child) state.child = undefined;
@@ -132,16 +143,6 @@ export default function (pi: ExtensionAPI) {
     closeChild(previous);
     await awaitExit(previous, 2000);
 
-    const awaitExit = (child: childProcess.ChildProcess | undefined, ms: number) =>
-      new Promise<void>((resolve) => {
-        if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
-        const timer = setTimeout(resolve, ms);
-        timer.unref?.();
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
     if (session) channelEnv[SESSION] = session;
