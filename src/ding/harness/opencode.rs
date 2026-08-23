@@ -93,9 +93,10 @@ fn locate_composer(plain: &str) -> Option<Composer> {
         start,
         start_byte,
         input,
-        idle: !tail.contains("esc interrupt")
-            && !tail.contains("esc to interrupt")
-            && !tail.contains("esc again to interrupt"),
+        // Return is only safe when the pinned OpenCode idle shortcut chrome is
+        // positively present. Unknown modal/active states fail closed even if
+        // they happen not to render one of the known interrupt hints.
+        idle: tail.contains("ctrl+p commands"),
     })
 }
 
@@ -175,6 +176,34 @@ mod tests {
             ),
             ComposerState::ExactBlocked
         );
+    }
+
+    #[test]
+    fn unfamiliar_or_modal_chrome_never_enables_return() {
+        for status in ["select an option", "unknown footer"] {
+            let exact = screen(EXPECTED, "answer", status);
+            let empty = screen("", "answer", status);
+            assert_eq!(
+                OpenCode.classify(
+                    &Screen {
+                        raw: &exact,
+                        plain: &exact
+                    },
+                    EXPECTED
+                ),
+                ComposerState::ExactBlocked
+            );
+            assert_eq!(
+                OpenCode.classify(
+                    &Screen {
+                        raw: &empty,
+                        plain: &empty
+                    },
+                    EXPECTED
+                ),
+                ComposerState::Ambiguous
+            );
+        }
     }
 
     #[test]
