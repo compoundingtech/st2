@@ -66,18 +66,64 @@ curl -s -XPOST http://127.0.0.1:43123/tui/append-prompt -d '{"text":"x"}'   # tr
 Original captures: session `ses_fd078983affefGxfpkGr2u44LJ`, files `serve.log`, `openapi.json`,
 `events{,2,3,4}.sse`, `session.json`, `prompt-response.json` (session scratchpad, not committed).
 
+## Follow-up capture: the blocked-on-human pairs, live (2026-08-23, second run)
+
+The permission prompt fires headless after all — the first run's failure was the *write path*, not
+the surface: permissions set via `PATCH /config` did not take effect for asks, while the same
+`{"permission":{"bash":"ask","edit":"ask","webfetch":"ask"}}` in `$XDG_CONFIG_HOME/opencode/
+opencode.json` asks reliably with the free model and no TUI.
+
+Reproduction (isolated env as above, port 43217; session `ses_fd0241376ffe3KDznnEB55qvKi`):
+
+```
+# config file (not PATCH) carries the ask settings, then:
+curl -s -XPOST :43217/session/<id>/prompt_async -d '{"parts":[{"type":"text",
+  "text":"Use the bash tool to run exactly: echo capture-test-42. Do not answer without running it."}]}'
+curl -s :43217/permission          # pending: [{"id":"per_02fdc246b001BB5pclAd62tzpJ","permission":"bash",…}]
+curl -s -XPOST :43217/permission/per_…/reply -d '{"reply":"once"}'   # → true; pending clears; turn completes
+# question: prompt "you MUST use your question tool…", then
+curl -s :43217/question            # pending: [{"id":"que_02fdd3e83001GwptE1fgJam0jB",…}]
+curl -s -XPOST :43217/question/que_…/reply -d '{"answers":[["Yes"]]}'
+```
+
+Captured event frames (verbatim, now fixture tests in `src/opencode_session.rs`):
+
+```
+data: {"id":"evt_02fdc246b0020Xw65txB3nXBC4","type":"permission.asked","properties":{"id":"per_02fdc246b001BB5pclAd62tzpJ","sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","permission":"bash","patterns":["echo capture-test-42"],"metadata":{"command":"echo capture-test-42"},"always":["echo *"],"tool":{"messageID":"msg_02fdc0989001nfz93uTCTLeO6O","callID":"call_6614fd927fe74d86ab089078"}}}
+data: {"id":"evt_02fdc8342001TQBwhszchZw1U6","type":"permission.replied","properties":{"sessionID":"ses_fd0241376ffe3KDznnEB55qvKi","requestID":"per_02fdc246b001BB5pclAd62tzpJ","reply":"once"}}
+data: {"type":"question.asked","properties":{"id":"que_02fdd3e83001GwptE1fgJam0jB",…}}
+data: {"type":"question.replied","properties":{"sessionID":"…","requestID":"que_02fdd3e83001GwptE1fgJam0jB","answers":[["Yes"]]}}
+```
+
+**Two corrections to the schema-derived design, both shipped:**
+
+1. **Exit events spell the id `requestID`.** Entry events carry `properties.id`; `permission.replied`
+   and `question.replied|rejected` carry `properties.requestID`. The extraction that only knew `/id`
+   would have held `blockedOn: human` forever after a real grant.
+2. **`GET /event` over HTTP/1.1 is `Transfer-Encoding: chunked`** — chunk-size lines interleave into
+   the line-oriented SSE read and a `data:` line can split across chunks (silent event loss). The
+   same server streams raw SSE over an HTTP/1.0 request, so the producer requests HTTP/1.0.
+   JSON endpoints (`/config`, and `/doc` at 478 KB) responded `Content-Length` in every probe, so
+   the one-shot request path is unaffected.
+
+Also measured while live: `prompt_async` with a repeated caller `messageID` yields **one** user
+message (read-back receipt correlation holds; no duplicate delivery), but the second POST appends
+its `parts` again into that message — a resend after a *transiently failed* read-back duplicates
+text inside the message, not the message. The pump's read-back-before-resend rule is therefore
+load-bearing, not just polite.
+
 ## Limits
 
-- A live `permission.asked` has not been captured; the blocked edges are schema-backed only
-  (`DQ-H6` keeps this open until a TUI-seat capture with a real permission prompt exists).
 - A v2 surface (`/api/event`, `/api/session/{id}/wait`, `permission.v2.*`) coexists with the
   legacy one probed here; the driver pins the legacy arms via the `/doc` check.
 - Docs move fast (the site showed "Last updated Aug 23, 2026"); the `/doc` gate is the defense.
+- The chunked/1.0 behavior and the `requestID` spelling are measured on 1.18.19 only; both sit
+  behind `SUPPORTED_OPENCODE_VERSIONS` and the `/doc` subset gate.
 
 ## VRS Impact
 
-Resolves `DQ-H6`'s source question: the OpenCode producer is evented (server SSE), not screen
-observation, and uniquely offers an id-matched blocked-on-human exit edge. Feeds the OpenCode
-producer section of `spec.md` (mapping table, aggregate-session rule, receipt semantics, the
-two-gate fail-closed rule) and requirement `OHS-R08`. The un-captured permission edge stays fenced
-in `DQ-H6`.
+Resolves `DQ-H6` in full: the OpenCode producer is evented (server SSE), uniquely offers an
+id-matched blocked-on-human exit edge, and both blocked pairs are now captured live with the two
+wire corrections above landed as code plus verbatim fixture tests. Feeds the OpenCode producer
+section of `spec.md` (mapping table, aggregate-session rule, receipt semantics, the two-gate
+fail-closed rule) and requirement `OHS-R08`.

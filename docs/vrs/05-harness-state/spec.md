@@ -209,8 +209,8 @@ them, owns the presence lease and the observed-state record, and projects the
 | `session.status {type: busy}` | `active` | `none` | — |
 | `session.status {type: retry}` | `active` | `none` | `retry` |
 | `session.status {type: idle}` / `session.idle` | `idle` | `none` | — |
-| `permission.asked` … `permission.replied` (same id) | `active` | `human` | `permission` |
-| `question.asked` … `question.replied\|rejected` (same id) | `active` | `human` | `question` |
+| `permission.asked` … `permission.replied` (same ask id; spelled `id` on entry, `requestID` on exit — measured) | `active` | `human` | `permission` |
+| `question.asked` … `question.replied\|rejected` (same ask id, same spelling split) | `active` | `human` | `question` |
 | `session.error {ProviderAuthError}` | `ended` | `none` | `providerAuth` |
 | `session.error` (other arms) | `idle` | `none` | `error:<name>` |
 | child exit / stop path | `ended` | `none` | exit status |
