@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
 use crate::{ding, message, status};
 
@@ -110,12 +110,18 @@ pub fn run(
         status_path: status::status_path(&agent_dir),
         // The pty session vouching for the record is the wrapper's task: the runtime ID names
         // the registry entry, and only aliases the identity on driver-expanded seats.
-        writer: Writer::new(
-            &agent_dir,
-            identity.clone(),
-            "opencode",
-            Some(runtime_id.clone()),
-        ),
+        writer: {
+            let mut writer = Writer::new(
+                &agent_dir,
+                identity.clone(),
+                "opencode",
+                Some(runtime_id.clone()),
+            );
+            // A restarted wrapper is a new session: its first observation opens a fresh
+            // transition rather than claiming continuity with a predecessor's record.
+            writer.interrupt();
+            writer
+        },
         delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
     };
     run_session(session, &mut child, &agent_dir)
@@ -536,19 +542,22 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut 
         }
     }
     // An ask opened before this connection would otherwise be invisible until its exit event:
-    // re-seed pending permissions so blockedOn survives an SSE reconnect, with the id kept so
-    // the ordinary id-matched exit still releases it. Pending questions have no verified listing
-    // endpoint on 1.18.19, so only permission asks re-seed; the level seed above stays the gate.
-    if let Ok(pending) = client.get_json("/permission")
-        && let Some(items) = pending.as_array()
-    {
-        for item in items {
-            if let Some(id) = item
-                .get("id")
-                .or_else(|| item.get("requestID"))
-                .and_then(Value::as_str)
-            {
-                machine.seed_ask(id.to_string(), "permission");
+    // re-seed pending asks so blockedOn survives an SSE reconnect, with each id kept so the
+    // ordinary id-matched exit still releases it. Both listing endpoints are measured on 1.18.19
+    // (the committed capture drove them: `GET /permission` and `GET /question` return pending
+    // ids), so a question open across a reconnect is recovered exactly like a permission.
+    for (endpoint, kind) in [("/permission", "permission"), ("/question", "question")] {
+        if let Ok(pending) = client.get_json(endpoint)
+            && let Some(items) = pending.as_array()
+        {
+            for item in items {
+                if let Some(id) = item
+                    .get("id")
+                    .or_else(|| item.get("requestID"))
+                    .and_then(Value::as_str)
+                {
+                    machine.seed_ask(id.to_string(), kind);
+                }
             }
         }
     }
@@ -680,8 +689,13 @@ impl EventMachine {
             );
         }
         if let Some(kind) = self.blocked.values().next() {
+            let ask = match *kind {
+                "question" => Ask::Question,
+                _ => Ask::Permission,
+            };
             return Some(
                 Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                    .with_ask(ask)
                     .with_reason(*kind),
             );
         }
@@ -1082,6 +1096,7 @@ mod tests {
         let blocked = observed(&machine);
         assert_eq!(blocked.state, Activity::Active);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
+        assert_eq!(blocked.ask, Ask::Permission);
         assert_eq!(blocked.reason.as_deref(), Some("permission"));
 
         // A different id resolving is not this ask's exit edge. Replies spell the id `requestID`
@@ -1113,6 +1128,7 @@ mod tests {
         let blocked = observed(&machine);
         assert_eq!(blocked.state, Activity::Active);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
+        assert_eq!(blocked.ask, Ask::Permission);
         assert_eq!(blocked.reason.as_deref(), Some("permission"));
 
         machine.apply(&event(
@@ -1235,6 +1251,8 @@ mod tests {
         status_error: Arc<AtomicBool>,
         /// Ask ids /permission reports as pending.
         pending_permissions: Arc<Mutex<Vec<String>>>,
+        /// Ask ids /question reports as pending.
+        pending_questions: Arc<Mutex<Vec<String>>>,
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -1246,11 +1264,13 @@ mod tests {
         let read_back_error = Arc::new(AtomicBool::new(false));
         let status_error = Arc::new(AtomicBool::new(false));
         let pending_permissions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let pending_questions = Arc::new(Mutex::new(Vec::<String>::new()));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
-        let (read_back_t, status_err_t, pending_t) = (
+        let (read_back_t, status_err_t, pending_t, questions_t) = (
             read_back_error.clone(),
             status_error.clone(),
             pending_permissions.clone(),
+            pending_questions.clone(),
         );
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1312,13 +1332,17 @@ mod tests {
                     } else {
                         200
                     }
-                } else if method == "GET" && path == "/permission" {
+                } else if method == "GET" && (path == "/permission" || path == "/question") {
                     200
                 } else {
                     404
                 };
-                let body = if method == "GET" && path == "/permission" {
-                    let ids = pending_t.lock().unwrap();
+                let body = if method == "GET" && (path == "/permission" || path == "/question") {
+                    let ids = if path == "/permission" {
+                        pending_t.lock().unwrap()
+                    } else {
+                        questions_t.lock().unwrap()
+                    };
                     serde_json::to_string(
                         &ids.iter()
                             .map(|id| serde_json::json!({ "id": id }))
@@ -1344,6 +1368,7 @@ mod tests {
             read_back_error,
             status_error,
             pending_permissions,
+            pending_questions,
         }
     }
 
@@ -1406,9 +1431,29 @@ mod tests {
         assert_eq!(blocked.state, Activity::Active);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
 
+        assert_eq!(blocked.ask, Ask::Permission);
+
         // The id-matched exit releases exactly the recovered ask.
         machine.apply(&event(
             r#"{"type":"permission.replied","properties":{"requestID":"per_pending","reply":"once"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
+
+        // Pending questions are recovered from their own listing endpoint (measured on 1.18.19),
+        // classified as question asks, and released by the question's id-matched reply.
+        server.pending_permissions.lock().unwrap().clear();
+        server
+            .pending_questions
+            .lock()
+            .unwrap()
+            .push("que_pending".to_string());
+        let mut machine = EventMachine::default();
+        assert!(seed_from_server(&client, &mut machine, &mut delivery));
+        let blocked = observed(&machine);
+        assert_eq!(blocked.blocked_on, BlockedOn::Human);
+        assert_eq!(blocked.ask, Ask::Question);
+        machine.apply(&event(
+            r#"{"type":"question.replied","properties":{"requestID":"que_pending","answers":[["Yes"]]}}"#,
         ));
         assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
     }

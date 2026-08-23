@@ -931,6 +931,11 @@ impl RawSpec {
             || self.deliver.is_some()
             || self.driver.claude.is_some()
             || self.driver.codex.is_some()
+            // pi predates this predicate gaining driver awareness and was silently skipped too:
+            // an identity-omitting file whose only agent-shaped signal is its driver block must
+            // still be a candidate, whichever provider the block names.
+            || self.driver.pi.is_some()
+            || self.driver.opencode.is_some()
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -1306,6 +1311,20 @@ fn validate_launch(
 
 #[cfg(test)]
 mod tests {
+
+    /// A driver block alone is an agent-shaped signal for every provider: an identity-omitting
+    /// `agent.toml` whose only content is `[opencode]` (or `[pi]`) must stay a spec candidate,
+    /// or path-derived discovery silently skips the seat.
+    #[test]
+    fn a_lone_driver_block_of_any_provider_is_a_spec_candidate() {
+        for provider in ["claude", "codex", "pi", "opencode"] {
+            let block = format!("[{provider}]\nprompt = \"Start the assigned work.\"");
+            let raw: super::RawSpec = toml::from_str(&block).unwrap();
+            assert!(raw.looks_like_spec(), "[{provider}] must look like a spec");
+        }
+        let raw: super::RawSpec = toml::from_str("unrelated = true").unwrap();
+        assert!(!raw.looks_like_spec());
+    }
     use super::*;
 
     #[test]
