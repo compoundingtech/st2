@@ -12,14 +12,14 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
-use crate::{context, message};
+use crate::{context, harness_state, message};
 
 const POLL: Duration = Duration::from_millis(250);
 
@@ -88,32 +88,98 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
         }),
     )?;
     stdout.flush()?;
+    // The channel owns the live half of observed harness state: it is the one process that sees
+    // pi's own turn events, and its stdio connection to the extension is the evidence that those
+    // events are still being watched. The terminal half belongs to the outer session wrapper,
+    // which alone sees the provider die.
+    let mut writer =
+        harness_state::Writer::new(&agent_dir, identity, "pi", Some(identity.to_string()));
+    channel_loop(
+        &input_rx,
+        &mut stdout,
+        &inbox,
+        &mut writer,
+        identity,
+        POLL,
+        harness_state::HARNESS_STATE_REFRESH,
+    )
+}
+
+/// The channel's steady state: forward inbox entries out, fold extension frames in, and keep the
+/// observed-state heartbeat exactly as fresh as the stdio connection that justifies it. EOF is the
+/// session-lifetime boundary — the loop then returns without writing anything, so the record ages
+/// to `unknown` rather than asserting a state nobody is watching.
+fn channel_loop(
+    input: &Receiver<io::Result<String>>,
+    out: &mut impl Write,
+    inbox: &Path,
+    writer: &mut harness_state::Writer,
+    identity: &str,
+    poll: Duration,
+    heartbeat_every: Duration,
+) -> Result<()> {
     let mut delivered = HashSet::new();
+    let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
-        match input_rx.recv_timeout(POLL) {
+        match input.recv_timeout(poll) {
             Ok(line) => {
                 let line = line.context("reading pi channel input")?;
                 if line.trim().is_empty() {
                     continue;
                 }
-                // Frames from the extension are observational today. An unknown *or malformed*
+                // Frames from the extension are otherwise observational. An unknown *or malformed*
                 // frame is dropped rather than fatal: a newer asset, or one line of stray output,
-                // must not be able to take the channel down and stall an inbox.
-                let _ = serde_json::from_str::<Value>(&line);
+                // must not be able to take the channel down and stall an inbox. A failed record
+                // write degrades the same way — delivery never depends on observability.
+                if let Some(observation) = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .as_ref()
+                    .and_then(state_observation)
+                    && let Err(error) = writer.observe(observation)
+                {
+                    eprintln!("st2 pi channel: recording observed state failed: {error}");
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             // pi's extension owns this child over stdio. EOF is the session-lifetime boundary, so
             // do not leave a detached watcher behind.
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        for msg in message::list_inbox(&inbox)? {
+        let now = Instant::now();
+        if now >= next_heartbeat {
+            if let Err(error) = writer.heartbeat() {
+                eprintln!("st2 pi channel: refreshing observed state failed: {error}");
+            }
+            next_heartbeat = now + heartbeat_every;
+        }
+        for msg in message::list_inbox(inbox)? {
             if delivered.insert(msg.filename.clone()) {
-                write_json(&mut stdout, &message_frame(msg, identity))?;
+                write_json(out, &message_frame(msg, identity))?;
             }
         }
-        stdout.flush()?;
-        thread::sleep(POLL);
+        out.flush()?;
+        thread::sleep(poll);
     }
+}
+
+/// The observed-state frame the shipped extension emits on pi's own turn boundaries. Only
+/// positively recognized words become observations: an unrecognized state word is dropped like any
+/// other unknown frame, so a newer asset cannot make this channel record something it cannot vouch
+/// for. pi offers no waiting-on-a-human signal, so no frame sets `blockedOn` here.
+fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
+    if frame.get("type").and_then(Value::as_str) != Some("state") {
+        return None;
+    }
+    let state = match frame.get("state").and_then(Value::as_str)? {
+        "active" => harness_state::Activity::Active,
+        "idle" => harness_state::Activity::Idle,
+        _ => return None,
+    };
+    Some(harness_state::Observation::new(
+        state,
+        harness_state::BlockedOn::None,
+        harness_state::InputBuffer::Unknown,
+    ))
 }
 
 /// What a starting or restarting pi session is told about its own durable state.
@@ -170,6 +236,81 @@ fn write_json(out: &mut impl Write, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the two words pi's own turn boundaries can vouch for become observations. Everything
+    /// else — other frame types, unknown state words, missing fields — is dropped, so a newer
+    /// extension asset cannot push this channel into recording something it cannot prove.
+    #[test]
+    fn only_recognized_state_frames_become_observations() {
+        let active = state_observation(&json!({"type":"state","state":"active"})).unwrap();
+        assert_eq!(active.state, harness_state::Activity::Active);
+        assert_eq!(active.blocked_on, harness_state::BlockedOn::None);
+        assert_eq!(active.input_buffer, harness_state::InputBuffer::Unknown);
+        assert_eq!(
+            state_observation(&json!({"type":"state","state":"idle"}))
+                .unwrap()
+                .state,
+            harness_state::Activity::Idle
+        );
+
+        for frame in [
+            json!({"type":"state","state":"child"}),
+            json!({"type":"state","state":"unknown"}),
+            json!({"type":"state"}),
+            json!({"type":"delivered","state":"active"}),
+            json!({"state":"active"}),
+        ] {
+            assert_eq!(state_observation(&frame), None, "frame: {frame}");
+        }
+    }
+
+    /// The stdio connection is the evidence. While it lives, the record's heartbeat advances
+    /// without a new observation; when it ends, the loop returns having written nothing more, so
+    /// the last state is left to age to `unknown` instead of being asserted or terminated — the
+    /// terminal record belongs to the session wrapper, which sees the provider die.
+    #[test]
+    fn heartbeats_while_connected_then_leaves_the_record_to_age_on_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let record = harness_state::harness_state_path(agent_dir);
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let (tx, rx) = mpsc::channel();
+
+        tx.send(Ok(r#"{"type":"state","state":"active"}"#.to_string()))
+            .unwrap();
+        let disconnect = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(tx);
+        });
+        let mut out = Vec::new();
+        channel_loop(
+            &rx,
+            &mut out,
+            &message::inbox_dir(agent_dir),
+            &mut writer,
+            "h.worker",
+            Duration::from_millis(2),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        disconnect.join().unwrap();
+
+        let raw: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(raw["state"], "active", "EOF must not rewrite the state");
+        assert!(
+            raw["writtenAtMs"].as_u64().unwrap() > raw["sinceMs"].as_u64().unwrap(),
+            "a heartbeat re-stamped the record while the connection lived: {raw}"
+        );
+        let after_eof = std::fs::read(&record).unwrap();
+        thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            after_eof,
+            "nothing may write after the connection is gone"
+        );
+    }
 
     #[test]
     fn channel_content_reuses_the_claude_channel_envelope() {

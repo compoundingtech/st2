@@ -197,11 +197,30 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  // Observed harness state, extension side. pi's own turn boundaries are the positive signal:
+  // `ctx.isIdle()` is false for exactly the `agent_start`..`agent_end` span, so these two events
+  // carry the working/idle edge without inspecting anything. The frame is observational — st2
+  // decides what becomes of it — and a closed channel drops it silently, matching the fail-open
+  // rule this file already follows. pi 0.84.2 exposes no typed waiting-on-a-human event, so no
+  // frame here ever claims one.
+  const sendState = (word: "active" | "idle") => {
+    const child = state.child;
+    if (!child || !child.stdin || child.stdin.destroyed) return;
+    child.stdin.write(JSON.stringify({ type: "state", state: word }) + "\n");
+  };
+  pi.on("agent_start", async () => sendState("active"));
+  pi.on("agent_end", async () => sendState("idle"));
+
   pi.on("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
+    // Seed the observed state with the idle proof's answer at open time, so the record does not
+    // wait for the first turn boundary to exist.
+    if (opened && typeof ctx.isIdle === "function") {
+      sendState(ctx.isIdle() ? "idle" : "active");
+    }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own — the
       // closest pi equivalent to the other harnesses' `additionalContext` hook output.
