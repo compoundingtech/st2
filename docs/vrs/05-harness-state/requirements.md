@@ -57,9 +57,13 @@ path reads this record.
   truthful about dwell time. `transitions` and `sinceMs` keep a later history
   additive.
 - **OHS-T04 Ungraceful-death windows:** SIGKILL cannot be caught, so an
-  external forced kill — and nothing else — can leave a live-state record
-  whose writer is gone. Same-host readers close that window with the liveness
-  cross-check (OHS-R07); cross-host readers wait out the staleness horizon.
+  external forced kill can leave a live-state record whose writer is gone.
+  Same-host readers narrow that window with the liveness cross-check
+  (OHS-R07) where the session is PROVABLY dead — pidfile present, process
+  gone — while `pty kill` removes the pidfile and leaves the probe
+  indeterminate for the rest of the window; the next session's written
+  ownership claim supersedes the orphan at relaunch, and cross-host readers
+  wait out the staleness horizon.
 
 ## Requirements
 
@@ -115,10 +119,13 @@ path reads this record.
   and a terminal record is never re-stamped.
 - **OHS-R07 Liveness cross-check:** The record names the pty session whose
   liveness vouches for its live states. A same-host reader that positively
-  proves that session dead reads the record as `unknown` even while fresh; an
-  indeterminate probe (unreadable registry) downgrades nothing — unprovable
-  evidence is never reported as death. A fresh `ended` survives the check: a
-  terminal record is supposed to outlive its writer.
+  proves that session dead — its pidfile present, its process gone — reads
+  the record as `unknown` even while fresh; an indeterminate probe (an
+  unreadable registry, or a pidfile `pty kill` already removed) downgrades
+  nothing — unprovable evidence is never reported as death. The check is a
+  narrowing, not a closure: what it cannot prove, the relaunch-time written
+  claim supersedes and the staleness horizon bounds. A fresh `ended`
+  survives the check: a terminal record is supposed to outlive its writer.
 - **OHS-R08 All-harness coverage:** Codex, Claude, pi, and OpenCode each ship
   a producer. pi's is evented through the injected extension (the positive
   idle signal root `DQ2` asks for). OpenCode reaches driver parity first —

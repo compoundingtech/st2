@@ -74,17 +74,25 @@ Field rules, matching `src/harness_state.rs`:
   `human` (`none` otherwise; unrecognized words decode indeterminate) — the
   axis consumers filter on, so nothing branches on diagnostic `reason`.
 - `incarnation` is the writing session's token and `seq` its monotonic
-  ownership sequence: ownership — coalescing, heartbeat eligibility, terminal
-  suppression — is token equality, and only a session claim advances the
-  sequence (to the on-disk value plus one), which gives ownership a
-  direction: a straggler from a superseded session is refused in live and
-  terminal paths alike. Sibling writer processes of one session share the
-  claimer's exported token and sequence; records from writers predating
-  either field decode with an empty token and sequence zero, which no
-  session owns and any claim supersedes. Every landed write carries a
-  strictly monotonic per-record stamp (never inherited from beyond the
-  future-skew trust bound) so it stays byte-distinct even against a
-  same-millisecond predecessor.
+  ownership sequence. A claim is a WRITTEN act under the record lock: the
+  session starting up writes an exitless `ended (superseded)` takeover
+  record carrying its token and the on-disk sequence plus one — racing
+  claimers therefore mint distinct sequences, and a predecessor's
+  still-fresh live record is superseded at relaunch, where the
+  pty-name-based probe cannot tell sessions apart; the seat reads
+  `ended (superseded)` until the session's first real observation. Ownership
+  — coalescing, heartbeat eligibility, terminal suppression (which applies
+  only to exit-bearing terminal records, never the claim placeholder) — is
+  token equality with the claim's direction: a straggler whose claim is
+  below the on-disk sequence is refused in live and terminal paths alike,
+  and a token-only writer never claims — it adopts its own session's
+  records, starts virgin ones, and is refused against foreign tokens.
+  Sibling writer processes of one session share the claimer's exported
+  token and sequence; records predating either field decode with an empty
+  token and sequence zero, which no session owns and any claim supersedes.
+  Every landed write carries a strictly monotonic per-record stamp (never
+  inherited from beyond the future-skew trust bound) so it stays
+  byte-distinct even against a same-millisecond predecessor.
 - `reason` is diagnostic only; no consumer branches on it.
 - `sinceMs` is when the current state was entered and survives heartbeat
   re-stamps; `writtenAtMs` is the heartbeat. `transitions` is a monotonic
