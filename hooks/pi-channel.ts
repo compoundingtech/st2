@@ -132,6 +132,12 @@ export default function (pi: ExtensionAPI) {
         if (state.child === child) state.child = undefined;
         settle("");
       });
+      // An observability pipe must never take pi down: a channel that closed its stdin mid-write
+      // surfaces EPIPE on the stream, which without a listener is an uncaught exception in the
+      // host process. Retire the channel instead — frames simply stop, fail-open.
+      child.stdin.on("error", () => {
+        if (state.child === child) state.child = undefined;
+      });
       child.on("exit", () => settle(""));
 
       const send = (frame: Record<string, unknown>) => {

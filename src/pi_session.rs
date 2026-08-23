@@ -33,6 +33,9 @@ pub const CHANNEL_CATALOG: &str = "ST2_PI_CHANNEL_CATALOG";
 pub const CHANNEL_IDENTITY: &str = "ST2_PI_CHANNEL_IDENTITY";
 /// The wrapper's runtime/task ID — the pty session whose liveness vouches for observed state.
 pub const CHANNEL_RUNTIME_ID: &str = "ST2_PI_CHANNEL_RUNTIME_ID";
+/// The session incarnation token the wrapper mints. The channel adopts it so the wrapper's
+/// terminal record owns — and thereby fences — the live records the channel writes.
+pub const CHANNEL_SESSION: &str = "ST2_PI_CHANNEL_SESSION";
 
 /// pi's startup network work, which a supervised seat should not be doing.
 ///
@@ -57,7 +60,8 @@ pub fn run(
     );
     let executable =
         std::env::current_exe().context("resolving st2 executable for the pi channel")?;
-    let mut env = channel_env(&executable, catalog_root, &identity, &runtime_id)?;
+    let session = harness_state::session_token();
+    let mut env = channel_env(&executable, catalog_root, &identity, &runtime_id, &session)?;
     env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
     let set = hooks::verify_required_set().with_context(|| {
         format!(
@@ -76,7 +80,7 @@ pub fn run(
         &STOP,
     )
     .with_context(|| format!("running pi driver '{runtime_id}'"))?;
-    record_session_end(&agent_dir, &identity, &runtime_id, &outcome);
+    record_session_end(&agent_dir, &identity, &runtime_id, &session, &outcome);
     match outcome {
         ProviderOutcome::Exited(exit) => {
             anyhow::ensure!(exit.success(), "pi provider exited with {exit}");
@@ -96,6 +100,7 @@ fn record_session_end(
     agent_dir: &Path,
     identity: &str,
     runtime_id: &str,
+    session: &str,
     outcome: &ProviderOutcome,
 ) {
     let label = match outcome {
@@ -103,7 +108,8 @@ fn record_session_end(
         ProviderOutcome::Stopped(None) => "stopped".to_string(),
     };
     let mut writer =
-        harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()));
+        harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()))
+            .with_session(session);
     if let Err(error) = writer.ended(label) {
         eprintln!("st2 pi driver: recording session end failed: {error}");
     }
@@ -149,6 +155,7 @@ fn channel_env(
     catalog_root: &Path,
     identity: &str,
     runtime_id: &str,
+    session: &str,
 ) -> Result<Vec<(String, String)>> {
     let executable = executable
         .to_str()
@@ -159,6 +166,7 @@ fn channel_env(
         (CHANNEL_CATALOG.to_string(), catalog_root.to_string()),
         (CHANNEL_IDENTITY.to_string(), identity.to_string()),
         (CHANNEL_RUNTIME_ID.to_string(), runtime_id.to_string()),
+        (CHANNEL_SESSION.to_string(), session.to_string()),
     ])
 }
 
@@ -223,6 +231,7 @@ mod tests {
             agent_dir,
             "h.worker",
             "h.worker",
+            "session-test",
             &ProviderOutcome::Exited(ExitStatus::from_raw(3 << 8)),
         );
 
@@ -240,6 +249,7 @@ mod tests {
             agent_dir,
             "h.worker",
             "h.worker",
+            "session-test",
             &ProviderOutcome::Stopped(Some(ExitStatus::from_raw(9))),
         );
         let observed = crate::harness_state::read(&record, None).unwrap();
@@ -321,6 +331,7 @@ mod tests {
             &PathBuf::from("/catalog"),
             "host.worker",
             "host.worker-task",
+            "session-test",
         )
         .unwrap();
 
@@ -334,6 +345,7 @@ mod tests {
                     CHANNEL_RUNTIME_ID.to_string(),
                     "host.worker-task".to_string()
                 ),
+                (CHANNEL_SESSION.to_string(), "session-test".to_string()),
             ]
         );
     }

@@ -98,10 +98,16 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| identity.to_string());
+    // The wrapper mints the session token; adopting it makes the wrapper's terminal record own
+    // this channel's live records (so a queued frame after `ended` is suppressed) while a
+    // predecessor incarnation's records are foreign: the first frame opens a fresh transition
+    // and a predecessor's terminal record never silences this session.
     let mut writer = harness_state::Writer::new(&agent_dir, identity, "pi", Some(pty_session));
-    // A fresh channel is a new session: its first frame opens a new transition rather than
-    // claiming continuity with whatever a predecessor left behind — including a predecessor's
-    // terminal record, which (being pre-session) does not suppress this session's live frames.
+    if let Ok(session) = std::env::var(crate::pi_session::CHANNEL_SESSION)
+        && !session.is_empty()
+    {
+        writer = writer.with_session(session);
+    }
     writer.interrupt();
     channel_loop(
         &input_rx,
@@ -332,10 +338,15 @@ mod tests {
         let agent_dir = tmp.path();
         std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
         let record = harness_state::harness_state_path(agent_dir);
+        // The wrapper mints the session token and the channel adopts it — that sharing is what
+        // makes the wrapper's terminal record this session's last word.
+        let session = harness_state::session_token();
         let mut channel_writer =
-            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
+                .with_session(session.clone());
         let mut wrapper_writer =
-            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
+                .with_session(session);
         wrapper_writer.ended("signal 9").unwrap();
         let terminal = std::fs::read(&record).unwrap();
 
