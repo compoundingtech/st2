@@ -44,6 +44,7 @@ pub fn run(
         // Hook subprocesses adopt the wrapper's incarnation token, so their transitions are this
         // session's records: the wrapper can re-stamp them, and its terminal record fences them.
         (SESSION_ENV.to_string(), observer.session().to_string()),
+        (SESSION_SEQ_ENV.to_string(), observer.seq().to_string()),
     ];
     run_provider(
         "Claude",
@@ -66,6 +67,8 @@ pub fn run(
 pub const RUNTIME_ID_ENV: &str = "ST2_CLAUDE_RUNTIME_ID";
 /// The env var carrying the wrapper's session incarnation token into Claude's hook subprocesses.
 pub const SESSION_ENV: &str = "ST2_CLAUDE_SESSION";
+/// The env var carrying the wrapper's claimed ownership sequence beside the token.
+pub const SESSION_SEQ_ENV: &str = "ST2_CLAUDE_SESSION_SEQ";
 
 pub fn run_observe(
     catalog_root: &Path,
@@ -88,17 +91,24 @@ pub fn run_observe(
     // stable across one Claude session's hooks, fresh on restart — so restatements still
     // coalesce and a restart still opens a new transition; what such a seat lacks is a
     // heartbeat/terminal owner, which is a documented hooks-only limitation.
-    let session = std::env::var(SESSION_ENV)
+    let exported = std::env::var(SESSION_ENV)
         .ok()
-        .filter(|token| !token.is_empty())
-        .or_else(|| {
-            payload
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(|id| format!("claude-session-{id}"))
-        });
-    if let Some(session) = session {
-        writer = writer.with_session(session);
+        .filter(|token| !token.is_empty());
+    if let Some(session) = exported {
+        // Full adopted ownership when the wrapper exported it: the claimed sequence makes the
+        // token directional, so a hook straggling from a superseded session is refused.
+        writer = match std::env::var(SESSION_SEQ_ENV)
+            .ok()
+            .and_then(|seq| seq.parse::<u64>().ok())
+        {
+            Some(seq) => writer.with_ownership(session, seq),
+            None => writer.with_session(session),
+        };
+    } else if let Some(id) = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        writer = writer.with_session(format!("claude-session-{id}"));
     }
     if event == "SessionStart" {
         // The one event that names a session boundary: even if the new session's first state

@@ -147,6 +147,41 @@ pub fn claude_settings_registration() -> serde_json::Value {
     })
 }
 
+/// Whether one rendered string refers to a file of ANY st2 hook set, structurally — used by the
+/// union merge to supersede st2's own prior registrations without ever touching a foreign entry.
+/// Two spellings are owned: the `$ST_HOOKS` variable at a token boundary (`$ST_HOOKS/...`,
+/// `${ST_HOOKS}/...` — `$ST_HOOKS_SUFFIX` is somebody else's variable), and an expanded path
+/// whose basename is a managed hook file sitting under a set-shaped directory
+/// (`.../sets/sha256-.../<managed-file>`), which recognizes every set version under every past
+/// or relocated root without consulting the current environment.
+pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
+    let command = text.split_whitespace().next().unwrap_or("");
+    if let Some(rest) = command.strip_prefix("$ST_HOOKS") {
+        return rest.is_empty() || rest.starts_with('/');
+    }
+    if let Some(rest) = command.strip_prefix("${ST_HOOKS}") {
+        return rest.is_empty() || rest.starts_with('/');
+    }
+    let path = std::path::Path::new(command);
+    let managed_basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| HOOKS.iter().any(|(managed, _)| *managed == name));
+    if !managed_basename {
+        return false;
+    }
+    let mut components = path.components().rev().skip(1);
+    let set_shaped = components
+        .next()
+        .and_then(|segment| segment.as_os_str().to_str())
+        .is_some_and(|segment| segment.starts_with("sha256-"));
+    let sets_dir = components
+        .next()
+        .and_then(|segment| segment.as_os_str().to_str())
+        .is_some_and(|segment| segment == SETS_DIR);
+    set_shaped && sets_dir
+}
+
 /// Install-owned hook root. `$ST_HOOKS` can pin a scratch or custom state layout; otherwise use
 /// `$XDG_STATE_HOME/st2/hooks` or `~/.local/state/st2/hooks`.
 pub fn hooks_root() -> Result<PathBuf> {

@@ -120,6 +120,7 @@ pub fn run(
         "pi",
         &runtime_id,
         &session,
+        seq,
     );
     let outcome = run_provider_observed(
         "pi",
@@ -437,6 +438,7 @@ mod tests {
             "pi",
             "h.worker",
             &session,
+            harness_state::claim_seq(tmp.path()),
         );
         observer.heartbeat();
         assert_eq!(std::fs::read(&record).unwrap(), live, "no heartbeat");

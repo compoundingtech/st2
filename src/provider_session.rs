@@ -61,6 +61,7 @@ pub(crate) struct SessionObserver {
     harness: &'static str,
     pty_session: String,
     session: String,
+    seq: u64,
     /// A terminal-only observer records how the session ended but never re-stamps live state —
     /// for wrappers whose heartbeat belongs to another sibling process (pi's channel).
     heartbeats: bool,
@@ -78,6 +79,7 @@ impl SessionObserver {
         pty_session: &str,
     ) -> Self {
         Self {
+            seq: harness_state::claim_seq(agent_dir),
             agent_dir: agent_dir.to_path_buf(),
             identity: identity.to_string(),
             harness,
@@ -96,6 +98,7 @@ impl SessionObserver {
         harness: &'static str,
         pty_session: &str,
         session: &str,
+        seq: u64,
     ) -> Self {
         Self {
             agent_dir: agent_dir.to_path_buf(),
@@ -103,6 +106,7 @@ impl SessionObserver {
             harness,
             pty_session: pty_session.to_string(),
             session: session.to_string(),
+            seq,
             heartbeats: false,
         }
     }
@@ -112,6 +116,11 @@ impl SessionObserver {
         &self.session
     }
 
+    /// The ownership sequence this session claimed — exported beside the token.
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
     fn writer(&self) -> harness_state::Writer {
         harness_state::Writer::new(
             &self.agent_dir,
@@ -119,7 +128,7 @@ impl SessionObserver {
             self.harness,
             Some(self.pty_session.clone()),
         )
-        .with_session(self.session.clone())
+        .with_ownership(self.session.clone(), self.seq)
     }
 
     /// Re-stamp whatever live state is on disk. The wrapper's evidence is the provider child it is

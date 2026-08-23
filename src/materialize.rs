@@ -494,17 +494,12 @@ fn ensure_line(path: &Path, line: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn deep_merge(
-    target: &mut serde_json::Value,
-    patch: serde_json::Value,
-    arrays: ArrayMerge,
-    owned_prefixes: &[String],
-) {
+fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: ArrayMerge) {
     match (target, patch) {
         (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
             for (key, value) in patch {
                 match target.get_mut(&key) {
-                    Some(existing) => deep_merge(existing, value, arrays, owned_prefixes),
+                    Some(existing) => deep_merge(existing, value, arrays),
                     None => {
                         target.insert(key, value);
                     }
@@ -517,11 +512,10 @@ fn deep_merge(
             // Exact-equality union alone would accumulate st2's own entries across hook-set
             // upgrades: `$ST_HOOKS` expands content-addressed, so every upgrade renders each
             // entry with a new path and the old one would be retained beside it. An element
-            // recognizably st2's — one referencing the hook root — that the patch no longer
-            // states is therefore superseded and dropped; foreign entries are never touched.
-            target.retain(|element| {
-                !contains_owned_string(element, owned_prefixes) || patch.contains(element)
-            });
+            // recognizably st2's — structurally, a managed hook file under any set-shaped path
+            // or the `$ST_HOOKS` variable at a token boundary — that the patch no longer states
+            // is therefore superseded and dropped; foreign entries are never touched.
+            target.retain(|element| !contains_owned_string(element) || patch.contains(element));
             for element in patch {
                 if !target.contains(&element) {
                     target.push(element);
@@ -532,33 +526,15 @@ fn deep_merge(
     }
 }
 
-/// Whether any string inside `value` marks it as an st2-rendered element: a reference to the
-/// installed hook root (any set version) or the unexpanded `$ST_HOOKS` variable.
-fn contains_owned_string(value: &serde_json::Value, owned_prefixes: &[String]) -> bool {
+/// Whether any string inside `value` marks it as an st2-rendered element, structurally (see
+/// [`crate::hooks::is_managed_hook_reference`]).
+fn contains_owned_string(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::String(text) => owned_prefixes
-            .iter()
-            .any(|prefix| text.starts_with(prefix.as_str())),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .any(|item| contains_owned_string(item, owned_prefixes)),
-        serde_json::Value::Object(map) => map
-            .values()
-            .any(|item| contains_owned_string(item, owned_prefixes)),
+        serde_json::Value::String(text) => crate::hooks::is_managed_hook_reference(text),
+        serde_json::Value::Array(items) => items.iter().any(contains_owned_string),
+        serde_json::Value::Object(map) => map.values().any(contains_owned_string),
         _ => false,
     }
-}
-
-/// The string prefixes that mark a JSON element as st2-rendered for union supersession: the hook
-/// root that contains every installed set version, and the unexpanded variable spellings.
-fn owned_union_prefixes(env: &BTreeMap<String, String>) -> Vec<String> {
-    let mut prefixes = vec!["$ST_HOOKS".to_string(), "${ST_HOOKS}".to_string()];
-    if let Some(hooks) = env.get("ST_HOOKS")
-        && let Some(root) = Path::new(hooks).parent()
-    {
-        prefixes.push(format!("{}/", root.display()));
-    }
-    prefixes
 }
 
 fn git_exclude(workspace: &Path, line: &str) -> Result<bool> {
@@ -885,7 +861,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                             spec.identity
                         )
                     })?;
-                deep_merge(&mut target, patch, arrays, &owned_union_prefixes(&env));
+                deep_merge(&mut target, patch, arrays);
                 let mut bytes = serde_json::to_vec_pretty(&target)?;
                 bytes.push(b'\n');
                 let note = format!("{}: upserted {}", spec.identity, raw_destination);
@@ -1138,7 +1114,6 @@ mod tests {
                 "array": [2]
             }),
             ArrayMerge::Replace,
-            &[],
         );
         assert_eq!(
             target,
@@ -1160,8 +1135,8 @@ mod tests {
         let ours = serde_json::json!({
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "$ST_HOOKS/claude-observe.sh Stop"}]}]}
         });
-        deep_merge(&mut target, ours.clone(), ArrayMerge::Union, &[]);
-        deep_merge(&mut target, ours, ArrayMerge::Union, &[]);
+        deep_merge(&mut target, ours.clone(), ArrayMerge::Union);
+        deep_merge(&mut target, ours, ArrayMerge::Union);
         assert_eq!(
             target,
             serde_json::json!({
@@ -1178,28 +1153,31 @@ mod tests {
     /// them, while a user's entry under any other path survives every merge.
     #[test]
     fn union_supersedes_prior_hook_set_entries_but_never_foreign_ones() {
-        let owned = vec![
-            "$ST_HOOKS".to_string(),
-            "${ST_HOOKS}".to_string(),
-            "/state/st2/hooks/".to_string(),
-        ];
+        // The prior set lives under a RELOCATED root — recognition is structural (set-shaped
+        // path + managed basename), not derived from the current environment.
         let mut target = serde_json::json!({
             "hooks": {"Stop": [
                 {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
-                {"hooks": [{"type": "command", "command": "/state/st2/hooks/set-v1/claude-observe.sh Stop"}]}
+                {"hooks": [{"type": "command", "command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}]},
+                {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
+                {"hooks": [{"type": "command", "command": "$ST_HOOKS_SUFFIX/tool.sh"}]}
             ]}
         });
         let upgraded = serde_json::json!({
-            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/state/st2/hooks/set-v2/claude-observe.sh Stop"}]}]}
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/new/root/sets/sha256-bbb/claude-observe.sh Stop"}]}]}
         });
-        deep_merge(&mut target, upgraded.clone(), ArrayMerge::Union, &owned);
-        deep_merge(&mut target, upgraded, ArrayMerge::Union, &owned);
+        deep_merge(&mut target, upgraded.clone(), ArrayMerge::Union);
+        deep_merge(&mut target, upgraded, ArrayMerge::Union);
         assert_eq!(
             target,
             serde_json::json!({
                 "hooks": {"Stop": [
                     {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
-                    {"hooks": [{"type": "command", "command": "/state/st2/hooks/set-v2/claude-observe.sh Stop"}]}
+                    // A managed basename OUTSIDE a set-shaped path is a user's wrapper: foreign.
+                    {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
+                    // `$ST_HOOKS_SUFFIX` is somebody else's variable, not ours at a boundary.
+                    {"hooks": [{"type": "command", "command": "$ST_HOOKS_SUFFIX/tool.sh"}]},
+                    {"hooks": [{"type": "command", "command": "/new/root/sets/sha256-bbb/claude-observe.sh Stop"}]}
                 ]}
             })
         );
