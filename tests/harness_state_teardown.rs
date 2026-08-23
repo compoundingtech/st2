@@ -113,7 +113,8 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
 /// the group SIGKILL exactly like the shared wrapper's.
 #[test]
 fn opencode_stop_escalation_writes_the_cover_record_before_sigkill() {
-    let (record, mut wrapper, _tmp) = spawn_opencode_wrapper("trap '' TERM; : > \"$READY_MARKER\"; sleep 60");
+    let (record, mut wrapper, _tmp) =
+        spawn_opencode_wrapper("trap '' TERM; : > \"$READY_MARKER\"; sleep 60");
     unsafe {
         libc::kill(wrapper.id() as i32, libc::SIGTERM);
     }
@@ -122,7 +123,10 @@ fn opencode_stop_escalation_writes_the_cover_record_before_sigkill() {
         if wrapper.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(Instant::now() < deadline, "wrapper survived its own escalation");
+        assert!(
+            Instant::now() < deadline,
+            "wrapper survived its own escalation"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let raw = fs::read_to_string(&record).expect("cover record must land before the SIGKILL");
@@ -144,7 +148,10 @@ fn opencode_graceful_stop_records_the_real_reaped_exit() {
         if wrapper.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(Instant::now() < deadline, "wrapper never finished its graceful stop");
+        assert!(
+            Instant::now() < deadline,
+            "wrapper never finished its graceful stop"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let raw = fs::read_to_string(&record).unwrap();
@@ -216,4 +223,3 @@ fn spawn_opencode_wrapper(
     }
     (agent_dir.join("harness-state"), wrapper, tmp)
 }
-
