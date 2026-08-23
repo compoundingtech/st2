@@ -1813,6 +1813,35 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     "rotted to `unknown` — is its session owner refreshing presence?",
                 );
             }
+            // Observed harness state is advisory-only in doctor: absence names a driver gap and
+            // a derived `unknown` names its reason, but neither fails the exit code.
+            let observed_path = st2::harness_state::harness_state_path(dir);
+            let probe: &dyn Fn(&str) -> st2::harness_state::SessionLiveness =
+                &st2::ding::session_liveness;
+            match st2::harness_state::read(&observed_path, Some(probe)) {
+                None => report_advisory(
+                    &format!("{bus_id} observed harness state absent"),
+                    "no driver has published a harness-state record for this agent",
+                ),
+                Some(observed) if observed.state == st2::harness_state::Activity::Unknown => {
+                    report_advisory(
+                        &format!("{bus_id} observed harness state indeterminate"),
+                        &format!(
+                            "derived `unknown` ({}) — is its driver still observing the harness?",
+                            observed.reason.as_deref().unwrap_or("unstated")
+                        ),
+                    )
+                }
+                Some(observed) => report_check(
+                    &mut problems,
+                    true,
+                    &format!(
+                        "{bus_id} observed harness state fresh (is `{}`)",
+                        observed.state.as_str()
+                    ),
+                    "",
+                ),
+            }
         }
     }
 
@@ -2151,9 +2180,10 @@ fn agents_cmd(
                 )
             };
             println!(
-                "{}\t{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
+                observed_column(r.observed.as_ref()),
                 r.name.as_deref().unwrap_or(""),
                 r.description.as_deref().unwrap_or(""),
                 lifecycle,
@@ -2161,6 +2191,24 @@ fn agents_cmd(
         }
     }
     Ok(())
+}
+
+/// The compact observed-harness-state column for human `st2 agents` output. `-` means no record
+/// exists (no driver has published one), which is distinct from a derived `unknown`.
+fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
+    let Some(observed) = observed else {
+        return "-".to_string();
+    };
+    let mut column = observed.state.as_str().to_string();
+    if observed.blocked_on == st2::harness_state::BlockedOn::Human {
+        column.push_str("+human");
+    }
+    if observed.state == st2::harness_state::Activity::Unknown
+        && let Some(reason) = observed.reason.as_deref()
+    {
+        column = format!("unknown({reason})");
+    }
+    column
 }
 
 fn ding_cmd(

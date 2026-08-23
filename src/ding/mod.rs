@@ -709,6 +709,34 @@ pub fn session_alive(session: &str) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Positive-evidence session liveness for observed-harness-state readers. Unlike
+/// [`session_alive`], whose delivery callers must fail closed ("any miss means gone"), a reader
+/// deriving `unknown` needs proof of death: an unreadable or unparseable pidfile is
+/// `Indeterminate` — the reader may not share the writer's PTY root — and a pid that exists but
+/// is not signalable (EPERM) is still alive.
+pub fn session_liveness(session: &str) -> crate::harness_state::SessionLiveness {
+    use crate::harness_state::SessionLiveness;
+    let pidfile = pty_session_dir().join(format!("{session}.pid"));
+    let Ok(raw) = std::fs::read_to_string(&pidfile) else {
+        return SessionLiveness::Indeterminate;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return SessionLiveness::Indeterminate;
+    };
+    if pid <= 0 {
+        return SessionLiveness::Indeterminate;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return SessionLiveness::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::ESRCH => SessionLiveness::Dead,
+        // EPERM proves existence; anything else proves nothing.
+        Some(code) if code == libc::EPERM => SessionLiveness::Alive,
+        _ => SessionLiveness::Indeterminate,
+    }
+}
+
 /// The `pty` session registry dir. This must mirror the sibling tool's resolution order.
 fn pty_session_dir() -> PathBuf {
     for var in ["PTY_ROOT", "PTY_SESSION_DIR"] {
