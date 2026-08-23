@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, message, run, status};
+use crate::{ding, harness_state, message, run, status};
 
 /// Every admitted version has a delivery-critical schema comparison and live remote-TUI evidence.
 /// A later version stays rejected until both checks are repeated; semantic-version proximity is
@@ -210,6 +210,55 @@ pub enum CodexTerminalError {
     SystemError,
 }
 
+impl CodexObservedState {
+    /// Driver-side projection into the generic observed-harness-state vocabulary (#162). `Held` is
+    /// a delivery predicate — the complement of steerable — and never leaks into the published
+    /// record: holds Codex positively reported as work project to `active` (with the human-blocking
+    /// ones setting the blocked axis), while holds that only mean "st2 cannot currently prove
+    /// anything" project to `None`, the indeterminate observation that writes nothing.
+    pub fn harness_observation(&self) -> Option<harness_state::Observation> {
+        use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation};
+        let observation = |state, blocked_on| {
+            // This producer reads the app-server control stream and cannot see the composer.
+            Observation::new(state, blocked_on, InputBuffer::Unknown)
+        };
+        match self {
+            CodexObservedState::AwaitingStatus => None,
+            CodexObservedState::Idle => Some(observation(Activity::Idle, BlockedOn::None)),
+            CodexObservedState::TerminalError { .. } => {
+                Some(observation(Activity::Ended, BlockedOn::None).with_reason("systemError"))
+            }
+            CodexObservedState::Active { .. } => {
+                Some(observation(Activity::Active, BlockedOn::None))
+            }
+            CodexObservedState::Held { reason, .. } => match reason {
+                CodexHoldReason::Review => {
+                    Some(observation(Activity::Active, BlockedOn::Human).with_reason("review"))
+                }
+                CodexHoldReason::WaitingOnApproval => Some(
+                    observation(Activity::Active, BlockedOn::Human)
+                        .with_reason("waitingOnApproval"),
+                ),
+                CodexHoldReason::WaitingOnUserInput => Some(
+                    observation(Activity::Active, BlockedOn::Human)
+                        .with_reason("waitingOnUserInput"),
+                ),
+                CodexHoldReason::Compaction => {
+                    Some(observation(Activity::Active, BlockedOn::None).with_reason("compaction"))
+                }
+                // Codex positively reported active; st2 merely cannot name a steerable turn.
+                CodexHoldReason::ActiveWithoutTurn => Some(
+                    observation(Activity::Active, BlockedOn::None).with_reason("activeWithoutTurn"),
+                ),
+                CodexHoldReason::ConflictingTurn => Some(
+                    observation(Activity::Active, BlockedOn::None).with_reason("conflictingTurn"),
+                ),
+                CodexHoldReason::NotLoaded | CodexHoldReason::SystemError => None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodexControlState {
@@ -330,6 +379,11 @@ struct CodexInboxDelivery {
     pending: Option<PendingCodexDelivery>,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
+    harness_writer: harness_state::Writer,
+    /// Whether the latest projection carried evidence. Indeterminate observations write nothing
+    /// and stop the heartbeat, so a state the pump can no longer see ages out instead of staying
+    /// artificially fresh.
+    harness_evidence: bool,
 }
 
 impl CodexInboxDelivery {
@@ -345,8 +399,17 @@ impl CodexInboxDelivery {
             )
         })?;
         let (wake_tx, wake) = mpsc::channel();
-        let watcher = crate::watch::watch_recursive_mutations(&config.agent_dir, wake_tx);
+        // Scoped to inbox + status: this pump's own process group writes runtime records (presence
+        // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
+        let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
         let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
+        // An agent IS its pty: the session whose liveness vouches for the record is the identity.
+        let harness_writer = harness_state::Writer::new(
+            &config.agent_dir,
+            config.identity.clone(),
+            "codex",
+            Some(config.identity.clone()),
+        );
         Ok(Self {
             config,
             state_path,
@@ -361,7 +424,21 @@ impl CodexInboxDelivery {
             pending: None,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
+            harness_writer,
+            harness_evidence: false,
         })
+    }
+
+    /// Publish the generic observed-harness-state projection of a control-state change. Best-effort
+    /// like the presence refresh: a failed record write must not disturb delivery.
+    fn observe_harness(&mut self, observed: &CodexObservedState) {
+        match observed.harness_observation() {
+            Some(observation) => {
+                let _ = self.harness_writer.observe(observation);
+                self.harness_evidence = true;
+            }
+            None => self.harness_evidence = false,
+        }
     }
 
     fn write_state(&mut self, state: CodexDeliveryState) -> Result<()> {
@@ -382,6 +459,9 @@ impl CodexInboxDelivery {
             // This wrapper owns the live provider session. It therefore owns the presence lease.
             // Preserve busy or available, and let dnd age out.
             let _ = status::refresh(&status::status_path(&self.config.agent_dir));
+            if self.harness_evidence {
+                let _ = self.harness_writer.heartbeat();
+            }
             self.next_presence_refresh = now + status::STATUS_REFRESH;
         }
         let mut due = now >= self.next_inbox_refresh;
@@ -1226,6 +1306,8 @@ fn run_connected(
     } else {
         (None, None)
     };
+    let harness_agent_dir = delivery.agent_dir.clone();
+    let harness_identity = delivery.identity.clone();
     let event_thread = thread::spawn(move || {
         let resume = expected_resume
             .as_deref()
@@ -1287,6 +1369,25 @@ fn run_connected(
     drop(resume_ready_tx);
     let _ = shutdown.shutdown(Shutdown::Both);
     let _ = event_thread.join();
+    // The pump is gone, so nothing can observe this session again: publish the terminal
+    // observation with the outcome the wrapper actually saw, before any staleness horizon.
+    let mut harness_writer = harness_state::Writer::new(
+        &harness_agent_dir,
+        harness_identity.clone(),
+        "codex",
+        Some(harness_identity),
+    );
+    let _ = match &result {
+        Ok(()) => harness_writer.ended("exit 0"),
+        Err(error) => harness_writer.observe(
+            harness_state::Observation::new(
+                harness_state::Activity::Ended,
+                harness_state::BlockedOn::None,
+                harness_state::InputBuffer::Unknown,
+            )
+            .with_reason(format!("{error}")),
+        ),
+    };
     result
 }
 
@@ -2034,6 +2135,9 @@ fn pump_control(
                     .context("persisting Codex resume binding")?;
                     atomic_json(control_state_path, &bound)
                         .context("persisting Codex control state")?;
+                    if let Some(delivery) = delivery.as_mut() {
+                        delivery.observe_harness(&bound.observed);
+                    }
                     control_state = Some(bound);
                     let _ = events.send(ControlEvent::Bound);
                     continue;
@@ -2056,6 +2160,9 @@ fn pump_control(
                 bound.subscribed = true;
                 atomic_json(control_state_path, &bound)
                     .context("persisting Codex fresh control state")?;
+                if let Some(delivery) = delivery.as_mut() {
+                    delivery.observe_harness(&bound.observed);
+                }
                 control_state = Some(bound);
                 let _ = events.send(ControlEvent::Bound);
             }
@@ -2106,6 +2213,9 @@ fn pump_control(
             if changed {
                 atomic_json(control_state_path, state)
                     .context("persisting Codex observed control state")?;
+                if let Some(delivery) = delivery.as_mut() {
+                    delivery.observe_harness(&state.observed);
+                }
                 let _ = events.send(ControlEvent::Observed);
             }
             if !state.subscribed
@@ -2689,6 +2799,120 @@ mod tests {
         assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
         assert!(steer["params"].get("model").is_none());
         assert!(steer["params"].get("approvalPolicy").is_none());
+    }
+
+    /// Behavioral oracle for the #268 §B projection: a projection that withheld every row — or
+    /// that reported the two misclassified rows as indeterminate — fails here, because each
+    /// emitting row is asserted positively.
+    #[test]
+    fn harness_projection_is_faithful_and_withholds_only_unprovable_rows() {
+        use crate::harness_state::{Activity, BlockedOn, InputBuffer};
+        let held = |reason| CodexObservedState::Held {
+            reason,
+            turn_id: None,
+        };
+
+        // Rows with no provable observation are withheld — and no absence may derive idle.
+        for state in [
+            CodexObservedState::AwaitingStatus,
+            held(CodexHoldReason::NotLoaded),
+            held(CodexHoldReason::SystemError),
+        ] {
+            assert_eq!(state.harness_observation(), None, "{state:?}");
+        }
+
+        // Codex positively reported work: active, even where st2 cannot name a steerable turn
+        // (the two rows a naive steerability decomposition reported as unknown) or where the
+        // delivery gate holds.
+        for state in [
+            CodexObservedState::Active {
+                turn_id: "turn-current".into(),
+            },
+            held(CodexHoldReason::ActiveWithoutTurn),
+            held(CodexHoldReason::ConflictingTurn),
+            held(CodexHoldReason::Compaction),
+        ] {
+            let observation = state
+                .harness_observation()
+                .unwrap_or_else(|| panic!("{state:?} must emit"));
+            assert_eq!(observation.state, Activity::Active, "{state:?}");
+            assert_eq!(observation.blocked_on, BlockedOn::None, "{state:?}");
+            assert_eq!(observation.input_buffer, InputBuffer::Unknown, "{state:?}");
+        }
+
+        // The holds a human resolves set the blocked axis instead of disappearing into active.
+        for reason in [
+            CodexHoldReason::Review,
+            CodexHoldReason::WaitingOnApproval,
+            CodexHoldReason::WaitingOnUserInput,
+        ] {
+            let observation = held(reason)
+                .harness_observation()
+                .unwrap_or_else(|| panic!("{reason:?} must emit"));
+            assert_eq!(observation.state, Activity::Active, "{reason:?}");
+            assert_eq!(observation.blocked_on, BlockedOn::Human, "{reason:?}");
+        }
+
+        let idle = CodexObservedState::Idle.harness_observation().unwrap();
+        assert_eq!(idle.state, Activity::Idle);
+        assert_eq!(idle.blocked_on, BlockedOn::None);
+
+        let ended = CodexObservedState::TerminalError {
+            reason: CodexTerminalError::SystemError,
+        }
+        .harness_observation()
+        .unwrap();
+        assert_eq!(ended.state, Activity::Ended);
+        assert_eq!(ended.reason.as_deref(), Some("systemError"));
+    }
+
+    #[test]
+    fn pump_publishes_observations_and_stops_heartbeating_on_evidence_loss() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let record_path = harness_state::harness_state_path(&agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-current".into(),
+        });
+        let observed = harness_state::read(&record_path, None).expect("record written");
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(observed.harness.as_deref(), Some("codex"));
+
+        // An indeterminate projection writes nothing and stops the heartbeat: the presence
+        // refresh still runs, but the record's bytes stay untouched and age toward unknown.
+        delivery.observe_harness(&CodexObservedState::Held {
+            reason: CodexHoldReason::NotLoaded,
+            turn_id: None,
+        });
+        let before = fs::read(&record_path).unwrap();
+        delivery.refresh_if_due().unwrap();
+        assert!(
+            status::read_state(&status::status_path(&agent_dir)) != status::State::Offline,
+            "presence refresh must still run"
+        );
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "no heartbeat without evidence"
+        );
+
+        // Evidence returning resumes both observation and heartbeat.
+        delivery.observe_harness(&CodexObservedState::Idle);
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Idle
+        );
+        delivery.next_presence_refresh = Instant::now();
+        delivery.refresh_if_due().unwrap();
+        assert_ne!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "heartbeat resumes with evidence"
+        );
     }
 
     #[test]
