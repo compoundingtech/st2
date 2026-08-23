@@ -55,8 +55,12 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
             "--",
             "sh",
             "-c",
-            "trap '' TERM; sleep 60",
+            // The ready marker synchronizes the signal: SIGTERM may only fly once the trap is
+            // provably installed, or a slow scheduler lets the child die in the grace window and
+            // the escalation path goes untested.
+            "trap '' TERM; : > \"$READY_MARKER\"; sleep 60",
         ])
+        .env("READY_MARKER", tmp.path().join("provider-ready"))
         .env("PATH", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -71,13 +75,13 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
     }
     let mut wrapper = wrapper.spawn().unwrap();
 
-    // The wrapper proves it is running by taking the presence lease.
-    let status_path = agent_dir.join("status");
+    // The provider proves its TERM trap is installed before the wrapper is signaled.
+    let ready = tmp.path().join("provider-ready");
     let started = Instant::now();
-    while !status_path.exists() {
+    while !ready.exists() {
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "wrapper never took the presence lease"
+            "provider never installed its trap"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
