@@ -1092,12 +1092,22 @@ the resident supervisor continues to reconcile the complete local catalog.
   This measured screen heuristic is still not an evented proof and renderer
   changes may defer delivery. Resolve the remaining gap with a stronger evented
   signal or other measured classifier; a small on-device model is an optional
-  experiment, not a required architecture.
+  experiment, not a required architecture. The
+  [05-harness-state](05-harness-state/spec.md) pi producer is the first
+  evented signal for any harness (the injected extension's positive idle
+  observation); it informs observability only — delivery keeps its own
+  evidence, and no DING path reads the observed-state record.
 - **DQ3 Remaining catalog agent state:** The R08 presence record above
   defines the presence path, schema, freshness, and atomic update rules.
-  Activity status, current plan, and current plan step remain undefined. Prove
-  their stale-state and supervisor-following behavior before adding their shape
-  to `AGENT-SPEC.md`.
+  The *observed* axis is now specified in
+  [05-harness-state](05-harness-state/requirements.md) (decision 0006): a
+  driver-written record with its own staleness rules, distinct from declared
+  presence and from R08's declared activity status. *Declared* activity
+  status, current plan, and current plan step remain undefined. The
+  stale-state gate is addressed for the observed axis; the
+  supervisor-following gate is not
+  ([DQ-H5](05-harness-state/open-questions.md)) — prove both before adding
+  any of these shapes to `AGENT-SPEC.md`.
 - **DQ4 Relaunch boundary (R29-R30):** Preserve R11's nondisruptive adoption
   while making launch drift visible. For each declared task, derive the desired
   launch fingerprint from a deterministic, versioned encoding of only:

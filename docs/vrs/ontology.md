@@ -117,6 +117,20 @@ st2's runtime observation of whether a task record is alive.
 
 Authority: [`reconcile::Session`](../../src/reconcile.rs#L16-L26)
 
+### observed harness state
+
+The driver-written record of what a harness is seen doing: activity
+(`idle`/`active`/`child`/`ended`, with `unknown` derived and never written),
+who it is blocked on, and what its input buffer holds. The observed
+counterpart of the declared axes: it is not [presence](#presence) (agent-
+authored availability), not [session state](#session-state) (task-record
+liveness), not R08's *declared activity status*, and not R09's *working
+state* (restored context).
+
+Authority: [`harness_state`](../../src/harness_state.rs);
+[05-harness-state requirements](05-harness-state/requirements.md);
+[decision 0006](.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md)
+
 ### restart policy
 
 The declared rules that bound when and how an agent task may be relaunched
@@ -335,6 +349,14 @@ explicit `unpark` recovery request.
 - Use [presence](../../src/status.rs#L24-L45) for the agent-authored signal and
   [session state](../../src/reconcile.rs#L16-L26) for runtime liveness. Avoid
   bare *agent status* when either could be meant.
+- Use [observed harness state](05-harness-state/requirements.md) for the
+  driver-observed working signal. It is a third axis beside presence and
+  session state: R08's *activity status* stays the declared, agent-authored
+  signal, and neither axis rewrites the other. Bare *activity* does not
+  identify which is meant.
+- *Working state* remains R09's restored durable context and is never a
+  liveness or activity term; the observed signal is **observed harness
+  state**, not *working state*.
 - Use **parked task** or **park decision** for the owning supervisor's policy
   decision. Do not use *parked* as a session state or replace the runtime
   observation with it.
