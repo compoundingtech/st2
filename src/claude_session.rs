@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
-use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation};
+use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
 use crate::provider_session::{
     PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider,
 };
@@ -75,8 +75,13 @@ pub fn run_observe(
         return Ok(());
     };
     let pty_session = runtime_id.unwrap_or(identity).to_string();
-    harness_state::Writer::new(&agent_dir, identity, "claude", Some(pty_session))
-        .observe(observation)
+    let mut writer = harness_state::Writer::new(&agent_dir, identity, "claude", Some(pty_session));
+    if event == "SessionStart" {
+        // The one event that names a session boundary: even if the new session's first state
+        // matches a fresh predecessor record, continuity must not be claimed across the restart.
+        writer.interrupt();
+    }
+    writer.observe(observation)
 }
 
 /// Map one Claude hook event to an observation, or `None` when the event says nothing about
@@ -117,10 +122,23 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             BlockedOn::None,
             InputBuffer::Unknown,
         )),
-        "PermissionRequest" => Some(
-            Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
-                .with_reason("permissionRequest"),
-        ),
+        "PermissionRequest" => {
+            // Driver-side classification (#162): the payload's tool_name distinguishes Claude's
+            // question form from an ordinary permission prompt — the DQ-H1 captures show
+            // AskUserQuestion arriving as a PermissionRequest like any other tool.
+            let ask = if payload.get("tool_name").and_then(serde_json::Value::as_str)
+                == Some("AskUserQuestion")
+            {
+                Ask::Question
+            } else {
+                Ask::Permission
+            };
+            Some(
+                Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                    .with_ask(ask)
+                    .with_reason("permissionRequest"),
+            )
+        }
         _ => None,
     }
 }
@@ -269,9 +287,14 @@ mod tests {
         let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
 
         // A hook process wrote a blocked observation between wrapper ticks.
-        harness_state::Writer::new(tmp.path(), "hetz.worker", "claude", None)
-            .observe(observe_hook_event("PermissionRequest", &serde_json::Value::Null).unwrap())
-            .unwrap();
+        harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        )
+        .observe(observe_hook_event("PermissionRequest", &serde_json::Value::Null).unwrap())
+        .unwrap();
         let before = fs::read(&record).unwrap();
 
         std::thread::sleep(Duration::from_millis(2));
@@ -293,9 +316,14 @@ mod tests {
         let stop = AtomicBool::new(false);
 
         // A turn is in flight when the provider dies by signal.
-        harness_state::Writer::new(tmp.path(), "hetz.worker", "claude", None)
-            .observe(observe_hook_event("UserPromptSubmit", &serde_json::Value::Null).unwrap())
-            .unwrap();
+        harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        )
+        .observe(observe_hook_event("UserPromptSubmit", &serde_json::Value::Null).unwrap())
+        .unwrap();
 
         let result = run_provider(
             "Claude",
@@ -336,5 +364,27 @@ mod tests {
         let observed = harness_state::read(&harness_state_path(tmp.path()), None).unwrap();
         assert_eq!(observed.state, Activity::Ended);
         assert_eq!(observed.exit.as_deref(), Some("exit 0"));
+    }
+
+    #[test]
+    fn permission_requests_classify_their_ask_kind_from_the_tool_name() {
+        use crate::harness_state::Ask;
+        let permission = observe_hook_event(
+            "PermissionRequest",
+            &serde_json::json!({ "tool_name": "Bash", "tool_input": {} }),
+        )
+        .unwrap();
+        assert_eq!(permission.ask, Ask::Permission);
+
+        let question = observe_hook_event(
+            "PermissionRequest",
+            &serde_json::json!({ "tool_name": "AskUserQuestion", "tool_input": {} }),
+        )
+        .unwrap();
+        assert_eq!(question.ask, Ask::Question);
+
+        // Non-blocking events carry no ask.
+        let idle = observe_hook_event("Stop", &serde_json::json!({})).unwrap();
+        assert_eq!(idle.ask, Ask::None);
     }
 }

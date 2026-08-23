@@ -582,6 +582,9 @@ mod tests {
                 let mut entries = node
                     .entries()
                     .iter()
+                    // Positional arguments only: properties (e.g. `arrays="union"`) are merge
+                    // strategy, not payload.
+                    .filter(|entry| entry.name().is_none())
                     .filter_map(|entry| match entry.value() {
                         kdl::KdlValue::String(value) => Some(value.as_str()),
                         _ => None,

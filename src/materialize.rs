@@ -26,6 +26,7 @@ pub enum RenderOp {
     JsonUpsert {
         destination: String,
         content: String,
+        arrays: ArrayMerge,
     },
     EnsureLine {
         destination: String,
@@ -34,6 +35,17 @@ pub enum RenderOp {
     GitExclude {
         path: String,
     },
+}
+
+/// How a json-upsert treats an array both sides declare. `Replace` is the default and the
+/// original contract; `union` appends patch elements the target lacks (exact-equality dedupe), so
+/// registrations can join arrays other owners also write — user-declared entries survive and
+/// re-materialization is idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArrayMerge {
+    #[default]
+    Replace,
+    Union,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -68,6 +80,7 @@ impl RenderOp {
             | Self::JsonUpsert {
                 destination,
                 content,
+                ..
             } => {
                 references_variable(destination, variable) || references_variable(content, variable)
             }
@@ -162,9 +175,22 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
                 serde_json::from_str::<serde_json::Value>(&content).with_context(|| {
                     format!("agent '{agent}': json-upsert content is not valid JSON")
                 })?;
+                let arrays = match directive
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name().is_some_and(|name| name.value() == "arrays"))
+                    .and_then(|entry| entry.value().as_string())
+                {
+                    None | Some("replace") => ArrayMerge::Replace,
+                    Some("union") => ArrayMerge::Union,
+                    Some(other) => anyhow::bail!(
+                        "agent '{agent}': json-upsert arrays=\"{other}\" (expected replace|union)"
+                    ),
+                };
                 plan.ops.push(RenderOp::JsonUpsert {
                     destination: destination.clone(),
                     content,
+                    arrays,
                 });
             }
             "ensure-line" => {
@@ -267,6 +293,7 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
         let RenderOp::JsonUpsert {
             destination,
             content,
+            ..
         } = operation
         else {
             continue;
@@ -312,6 +339,7 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
         plan.ops.push(RenderOp::JsonUpsert {
             destination: ".mcp.json".into(),
             content,
+            arrays: ArrayMerge::Replace,
         });
     }
     Ok(plan)
@@ -466,15 +494,24 @@ fn ensure_line(path: &Path, line: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value) {
+fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: ArrayMerge) {
     match (target, patch) {
         (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
             for (key, value) in patch {
                 match target.get_mut(&key) {
-                    Some(existing) => deep_merge(existing, value),
+                    Some(existing) => deep_merge(existing, value, arrays),
                     None => {
                         target.insert(key, value);
                     }
+                }
+            }
+        }
+        (serde_json::Value::Array(target), serde_json::Value::Array(patch))
+            if arrays == ArrayMerge::Union =>
+        {
+            for element in patch {
+                if !target.contains(&element) {
+                    target.push(element);
                 }
             }
         }
@@ -563,7 +600,7 @@ enum PreparedOp {
 #[derive(Debug, Clone, PartialEq)]
 enum RenderClaim {
     Replace(Vec<u8>),
-    JsonUpsert(serde_json::Value),
+    JsonUpsert(serde_json::Value, ArrayMerge),
     EnsureLine(String),
 }
 
@@ -627,6 +664,7 @@ fn claims_for_agent(
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
+                arrays,
             } => {
                 let patch = serde_json::from_str(&expand(&content, &env)).with_context(|| {
                     format!(
@@ -636,7 +674,7 @@ fn claims_for_agent(
                 })?;
                 (
                     destination(&workspace, &raw_destination, &env)?,
-                    RenderClaim::JsonUpsert(patch),
+                    RenderClaim::JsonUpsert(patch, arrays),
                 )
             }
             RenderOp::EnsureLine {
@@ -784,6 +822,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
+                arrays,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
                 let current = virtual_files
@@ -804,7 +843,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                             spec.identity
                         )
                     })?;
-                deep_merge(&mut target, patch);
+                deep_merge(&mut target, patch, arrays);
                 let mut bytes = serde_json::to_vec_pretty(&target)?;
                 bytes.push(b'\n');
                 let note = format!("{}: upserted {}", spec.identity, raw_destination);
@@ -1056,6 +1095,7 @@ mod tests {
                 "nested": {"right": 2, "replace": "new"},
                 "array": [2]
             }),
+            ArrayMerge::Replace,
         );
         assert_eq!(
             target,
@@ -1063,6 +1103,29 @@ mod tests {
                 "keep": true,
                 "nested": {"left": 1, "right": 2, "replace": "new"},
                 "array": [2]
+            })
+        );
+    }
+
+    /// Union mode joins arrays idempotently: foreign entries survive and repeating the same
+    /// patch adds nothing — the contract the generated hook registration relies on.
+    #[test]
+    fn deep_merge_union_preserves_foreign_array_entries_and_is_idempotent() {
+        let mut target = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "user-audit.sh"}]}]}
+        });
+        let ours = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "$ST_HOOKS/claude-observe.sh Stop"}]}]}
+        });
+        deep_merge(&mut target, ours.clone(), ArrayMerge::Union);
+        deep_merge(&mut target, ours, ArrayMerge::Union);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "hooks": {"Stop": [
+                    {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
+                    {"hooks": [{"type": "command", "command": "$ST_HOOKS/claude-observe.sh Stop"}]}
+                ]}
             })
         );
     }

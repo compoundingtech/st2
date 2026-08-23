@@ -922,6 +922,7 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
             RenderOp::JsonUpsert {
                 destination,
                 content,
+                arrays,
             } => {
                 insert_value(
                     &mut fields,
@@ -945,6 +946,14 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
                     SemanticType::String,
                     &normalized,
                 );
+                if *arrays == crate::materialize::ArrayMerge::Union {
+                    insert_value(
+                        &mut fields,
+                        &format!("{root}/arrays"),
+                        SemanticType::String,
+                        "union",
+                    );
+                }
             }
             RenderOp::EnsureLine { destination, line } => {
                 insert_value(

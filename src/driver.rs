@@ -125,10 +125,18 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
     let mut render = KdlNode::new("render");
     render.set_children(document([
         node("json-upsert", vec![".mcp.json".to_string(), mcp]),
-        node(
-            "json-upsert",
-            vec![".claude/settings.local.json".to_string(), settings],
-        ),
+        {
+            // Hook arrays join whatever the workspace already declares: replacement would clobber
+            // user-registered hooks on every materialization, and union is idempotent.
+            let mut upsert = node(
+                "json-upsert",
+                vec![".claude/settings.local.json".to_string(), settings],
+            );
+            upsert
+                .entries_mut()
+                .push(KdlEntry::new_prop("arrays", "union"));
+            upsert
+        },
     ]));
 
     let mut provider = vec!["claude".to_string()];
