@@ -355,6 +355,9 @@ enum DriverCmd {
     ClaudeObserve {
         #[arg(long)]
         identity: String,
+        /// The wrapper's runtime/task ID; the record's pty session. Defaults to the identity.
+        #[arg(long)]
+        runtime_id: Option<String>,
         /// The Claude hook event name, e.g. `Stop` or `PermissionRequest`.
         #[arg(long)]
         event: String,
@@ -1061,10 +1064,14 @@ fn main() -> Result<()> {
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_session::run(&catalog, identity, runtime_id, argv)
         }
-        Command::Driver(DriverCmd::ClaudeObserve { identity, event }) => {
+        Command::Driver(DriverCmd::ClaudeObserve {
+            identity,
+            runtime_id,
+            event,
+        }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::claude_session::run_observe(&catalog, &identity, &event)
+            st2::claude_session::run_observe(&catalog, &identity, runtime_id.as_deref(), &event)
         }
         Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
             let catalog = catalog_arg(None)?;

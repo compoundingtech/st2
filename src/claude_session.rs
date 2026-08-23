@@ -36,12 +36,15 @@ pub fn run(
         "Claude driver '{runtime_id}' has no provider argv"
     );
     install_signal_handler();
-    let observer = SessionObserver::new(&agent_dir, &identity, "claude");
+    let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id);
+    // The runtime ID reaches hook subprocesses through the provider environment, so their
+    // transitions carry the same pty session the wrapper's records do.
+    let env = [(RUNTIME_ID_ENV.to_string(), runtime_id.clone())];
     run_provider(
         "Claude",
         &status::status_path(&agent_dir),
         &claude_argv,
-        &[],
+        &env,
         status::STATUS_REFRESH,
         PROVIDER_POLL,
         &STOP,
@@ -54,7 +57,15 @@ pub fn run(
 ///
 /// Invoked per event by the fail-open `claude-observe.sh` hook, so each invocation is its own
 /// short-lived writer; the transition counter continues from disk.
-pub fn run_observe(catalog_root: &Path, identity: &str, event: &str) -> Result<()> {
+/// The env var carrying the wrapper's runtime/task ID into Claude's hook subprocesses.
+pub const RUNTIME_ID_ENV: &str = "ST2_CLAUDE_RUNTIME_ID";
+
+pub fn run_observe(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+) -> Result<()> {
     let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     let mut raw = String::new();
@@ -63,7 +74,8 @@ pub fn run_observe(catalog_root: &Path, identity: &str, event: &str) -> Result<(
     let Some(observation) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
-    harness_state::Writer::new(&agent_dir, identity, "claude", Some(identity.to_string()))
+    let pty_session = runtime_id.unwrap_or(identity).to_string();
+    harness_state::Writer::new(&agent_dir, identity, "claude", Some(pty_session))
         .observe(observation)
 }
 
@@ -197,7 +209,7 @@ mod tests {
     fn wrapper_heartbeat_re_stamps_without_clobbering_hook_written_state() {
         let tmp = tempfile::tempdir().unwrap();
         let record = harness_state_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude");
+        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
 
         // A hook process wrote a blocked observation between wrapper ticks.
         harness_state::Writer::new(tmp.path(), "hetz.worker", "claude", None)
@@ -220,7 +232,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let presence = status::status_path(tmp.path());
         let record = harness_state_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude");
+        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
         let stop = AtomicBool::new(false);
 
         // A turn is in flight when the provider dies by signal.
@@ -249,7 +261,7 @@ mod tests {
     fn a_clean_provider_exit_writes_the_terminal_record() {
         let tmp = tempfile::tempdir().unwrap();
         let presence = status::status_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude");
+        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
         let stop = AtomicBool::new(false);
 
         run_provider(

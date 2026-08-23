@@ -317,6 +317,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_millis(5),
             &stop,
+            None,
         )
         .unwrap();
         match outcome {

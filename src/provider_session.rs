@@ -59,14 +59,27 @@ pub(crate) struct SessionObserver {
     agent_dir: PathBuf,
     identity: String,
     harness: &'static str,
+    pty_session: String,
+    session_start_ms: u64,
 }
 
 impl SessionObserver {
-    pub(crate) fn new(agent_dir: &Path, identity: &str, harness: &'static str) -> Self {
+    /// `pty_session` is the wrapper's runtime/task ID — the registry entry whose liveness vouches
+    /// for the record. The session start is pinned once here so every per-operation fresh writer
+    /// agrees where this session began: a predecessor session's record stays heartbeat-ineligible
+    /// until something of this session is observed.
+    pub(crate) fn new(
+        agent_dir: &Path,
+        identity: &str,
+        harness: &'static str,
+        pty_session: &str,
+    ) -> Self {
         Self {
             agent_dir: agent_dir.to_path_buf(),
             identity: identity.to_string(),
             harness,
+            pty_session: pty_session.to_string(),
+            session_start_ms: crate::message::now_ms(),
         }
     }
 
@@ -75,8 +88,9 @@ impl SessionObserver {
             &self.agent_dir,
             &self.identity,
             self.harness,
-            Some(self.identity.clone()),
+            Some(self.pty_session.clone()),
         )
+        .session_started_at(self.session_start_ms)
     }
 
     /// Re-stamp whatever live state is on disk. The wrapper's evidence is the provider child it is
