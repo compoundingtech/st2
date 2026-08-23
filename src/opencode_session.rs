@@ -49,7 +49,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Every API arm the wrapper depends on, as it appears in the served OpenAPI document. A missing
 /// marker names itself in the refusal, so a surface change is a diagnosis rather than a mystery.
-const REQUIRED_API_MARKERS: [&str; 8] = [
+const REQUIRED_API_MARKERS: [&str; 12] = [
     "prompt_async",
     "messageID",
     "session.status",
@@ -58,6 +58,13 @@ const REQUIRED_API_MARKERS: [&str; 8] = [
     "permission.asked",
     "permission.replied",
     "question.asked",
+    // The exit arms and pending listings are as load-bearing as the entries: a release renaming
+    // a question exit would otherwise pass the gate and then hold `blockedOn: human` forever,
+    // and the reconnect seed reads both listing endpoints.
+    "question.replied",
+    "question.rejected",
+    "/permission",
+    "/question",
 ];
 
 pub fn run(
@@ -546,18 +553,23 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut 
     // ordinary id-matched exit still releases it. Both listing endpoints are measured on 1.18.19
     // (the committed capture drove them: `GET /permission` and `GET /question` return pending
     // ids), so a question open across a reconnect is recovered exactly like a permission.
+    // Both listings must succeed for the seed to count: a transient failure here would restore
+    // evidence on an unblocked picture and silently wedge an ask opened during the outage —
+    // return false instead, keep heartbeats off, and let the seed retry.
     for (endpoint, kind) in [("/permission", "permission"), ("/question", "question")] {
-        if let Ok(pending) = client.get_json(endpoint)
-            && let Some(items) = pending.as_array()
-        {
-            for item in items {
-                if let Some(id) = item
-                    .get("id")
-                    .or_else(|| item.get("requestID"))
-                    .and_then(Value::as_str)
-                {
-                    machine.seed_ask(id.to_string(), kind);
-                }
+        let Ok(pending) = client.get_json(endpoint) else {
+            return false;
+        };
+        let Some(items) = pending.as_array() else {
+            return false;
+        };
+        for item in items {
+            if let Some(id) = item
+                .get("id")
+                .or_else(|| item.get("requestID"))
+                .and_then(Value::as_str)
+            {
+                machine.seed_ask(id.to_string(), kind);
             }
         }
     }
@@ -615,23 +627,26 @@ impl EventMachine {
                 let Some(session_id) = session_id() else {
                     return;
                 };
-                self.seen_level = true;
                 match properties
                     .pointer("/status/type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                 {
                     "busy" => {
+                        self.seen_level = true;
                         self.busy.insert(session_id, false);
                         self.last_error = None;
                     }
                     "retry" => {
+                        self.seen_level = true;
                         self.busy.insert(session_id, true);
                     }
                     "idle" => {
+                        self.seen_level = true;
                         self.busy.remove(&session_id);
                     }
-                    // A future status arm is not evidence of anything; leave state as it was.
+                    // A future status arm is not evidence of anything — not even level evidence:
+                    // counting it would let an unrecognized word prove `idle` on a quiet server.
                     _ => {}
                 }
             }
@@ -1253,6 +1268,8 @@ mod tests {
         pending_permissions: Arc<Mutex<Vec<String>>>,
         /// Ask ids /question reports as pending.
         pending_questions: Arc<Mutex<Vec<String>>>,
+        /// When set, both pending-ask listings answer 500: the ask seed fails.
+        ask_error: Arc<AtomicBool>,
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -1265,12 +1282,14 @@ mod tests {
         let status_error = Arc::new(AtomicBool::new(false));
         let pending_permissions = Arc::new(Mutex::new(Vec::<String>::new()));
         let pending_questions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ask_error = Arc::new(AtomicBool::new(false));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
-        let (read_back_t, status_err_t, pending_t, questions_t) = (
+        let (read_back_t, status_err_t, pending_t, questions_t, ask_err_t) = (
             read_back_error.clone(),
             status_error.clone(),
             pending_permissions.clone(),
             pending_questions.clone(),
+            ask_error.clone(),
         );
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1333,7 +1352,11 @@ mod tests {
                         200
                     }
                 } else if method == "GET" && (path == "/permission" || path == "/question") {
-                    200
+                    if ask_err_t.load(Ordering::SeqCst) {
+                        500
+                    } else {
+                        200
+                    }
                 } else {
                     404
                 };
@@ -1369,6 +1392,7 @@ mod tests {
             status_error,
             pending_permissions,
             pending_questions,
+            ask_error,
         }
     }
 
@@ -1417,6 +1441,14 @@ mod tests {
         server.status_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
         assert!(!seed_from_server(&client, &mut machine, &mut delivery));
+        server.status_error.store(false, Ordering::SeqCst);
+
+        // So does a failing pending-ask listing: an ask opened during the outage must not be
+        // reported unblocked with heartbeats restored — the seed retries instead.
+        server.ask_error.store(true, Ordering::SeqCst);
+        let mut machine = EventMachine::default();
+        assert!(!seed_from_server(&client, &mut machine, &mut delivery));
+        server.ask_error.store(false, Ordering::SeqCst);
 
         // A successful seed recovers the pending ask under its own id.
         server.status_error.store(false, Ordering::SeqCst);
@@ -1585,6 +1617,21 @@ mod tests {
         assert!(
             server.posts.lock().unwrap().is_empty(),
             "no session yet: wait, never create"
+        );
+    }
+
+    /// T5: an unrecognized future `session.status` word is no evidence at all — counting it as
+    /// level evidence would let a quiet server derive `idle` from a word we cannot read.
+    #[test]
+    fn an_unrecognized_status_word_is_not_level_evidence() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"hibernating"}}}"#,
+        ));
+        assert_eq!(
+            machine.observation(),
+            None,
+            "no level evidence, no observation"
         );
     }
 }
