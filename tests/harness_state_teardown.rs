@@ -89,18 +89,27 @@ fn stop_escalation_writes_the_terminal_record_before_sigkill() {
     unsafe {
         libc::kill(wrapper.id() as i32, libc::SIGTERM);
     }
-    // STOP_GRACE is 5 s; the wrapper dies with its own SIGKILL shortly after.
+    // STOP_GRACE is 5 s; the wrapper dies with its own SIGKILL shortly after — and the exit
+    // status must SHOW that: a wrapper that exited any other way never exercised escalation.
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if wrapper.try_wait().unwrap().is_some() {
-            break;
+    let wrapper_exit = loop {
+        if let Some(exit) = wrapper.try_wait().unwrap() {
+            break exit;
         }
         assert!(
             Instant::now() < deadline,
             "wrapper survived its own escalation"
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    assert_eq!(
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            wrapper_exit.signal()
+        },
+        Some(libc::SIGKILL),
+        "the wrapper must die to its own SIGKILL escalation, exit: {wrapper_exit:?}"
+    );
 
     let raw = fs::read_to_string(agent_dir.join("harness-state"))
         .expect("terminal record must land before the SIGKILL escalation");
@@ -119,16 +128,24 @@ fn opencode_stop_escalation_writes_the_cover_record_before_sigkill() {
         libc::kill(wrapper.id() as i32, libc::SIGTERM);
     }
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if wrapper.try_wait().unwrap().is_some() {
-            break;
+    let wrapper_exit = loop {
+        if let Some(exit) = wrapper.try_wait().unwrap() {
+            break exit;
         }
         assert!(
             Instant::now() < deadline,
             "wrapper survived its own escalation"
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    assert_eq!(
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            wrapper_exit.signal()
+        },
+        Some(libc::SIGKILL),
+        "the wrapper must die to its own SIGKILL escalation, exit: {wrapper_exit:?}"
+    );
     let raw = fs::read_to_string(&record).expect("cover record must land before the SIGKILL");
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(value["state"], "ended", "record: {raw}");
