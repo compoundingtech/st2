@@ -109,6 +109,20 @@ pub fn run(
     let client = Client::new(port, &password);
 
     install_signal_handler();
+    // The written claim comes BEFORE the provider spawns: a claim that cannot be written aborts
+    // the launch while there is still nothing to leak, and it supersedes whatever a predecessor
+    // left — a still-fresh live record included — before this wrapper's first observation.
+    let writer = {
+        let session = harness_state::session_token();
+        let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
+        Writer::new(
+            &agent_dir,
+            identity.clone(),
+            "opencode",
+            Some(runtime_id.clone()),
+        )
+        .with_ownership(session, seq)
+    };
     let mut child = spawn_provider(&argv, &password)?;
 
     let session = Session {
@@ -117,19 +131,7 @@ pub fn run(
         status_path: status::status_path(&agent_dir),
         // The pty session vouching for the record is the wrapper's task: the runtime ID names
         // the registry entry, and only aliases the identity on driver-expanded seats.
-        writer: {
-            // The written claim supersedes whatever a predecessor left — a still-fresh live
-            // record included — before this wrapper's first observation.
-            let session = harness_state::session_token();
-            let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
-            Writer::new(
-                &agent_dir,
-                identity.clone(),
-                "opencode",
-                Some(runtime_id.clone()),
-            )
-            .with_ownership(session, seq)
-        },
+        writer,
         delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
     };
     run_session(session, &mut child, &agent_dir)
