@@ -420,9 +420,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let record = harness_state::harness_state_path(tmp.path());
         let session = harness_state::session_token();
+        // Real wiring order: the wrapper's written claim first, then the channel adopts it.
+        let seq = harness_state::claim(tmp.path(), "h.worker", "pi", &session).unwrap();
         let mut channel =
             harness_state::Writer::new(tmp.path(), "h.worker", "pi", Some("h.worker".to_string()))
-                .with_session(session.clone());
+                .with_ownership(session.clone(), seq);
         channel
             .observe(harness_state::Observation::new(
                 Activity::Active,
@@ -438,7 +440,7 @@ mod tests {
             "pi",
             "h.worker",
             &session,
-            harness_state::claim_seq(tmp.path()),
+            seq,
         );
         observer.heartbeat();
         assert_eq!(std::fs::read(&record).unwrap(), live, "no heartbeat");

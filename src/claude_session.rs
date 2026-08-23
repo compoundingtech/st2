@@ -36,7 +36,7 @@ pub fn run(
         "Claude driver '{runtime_id}' has no provider argv"
     );
     install_signal_handler();
-    let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id);
+    let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id)?;
     // The runtime ID reaches hook subprocesses through the provider environment, so their
     // transitions carry the same pty session the wrapper's records do.
     let env = [
@@ -321,7 +321,8 @@ mod tests {
     fn wrapper_heartbeat_re_stamps_without_clobbering_hook_written_state() {
         let tmp = tempfile::tempdir().unwrap();
         let record = harness_state_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
+        let observer =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
 
         // A hook process wrote a blocked observation between wrapper ticks — carrying the
         // wrapper's exported token, exactly as the env plumbing arranges in a real seat.
@@ -351,7 +352,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let presence = status::status_path(tmp.path());
         let record = harness_state_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
+        let observer =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
         let stop = AtomicBool::new(false);
 
         // A turn is in flight when the provider dies by signal.
@@ -385,7 +387,8 @@ mod tests {
     fn a_clean_provider_exit_writes_the_terminal_record() {
         let tmp = tempfile::tempdir().unwrap();
         let presence = status::status_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
+        let observer =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
         let stop = AtomicBool::new(false);
 
         run_provider(
@@ -435,7 +438,8 @@ mod tests {
         use crate::harness_state::{self, Activity};
         let tmp = tempfile::tempdir().unwrap();
         let record = harness_state_path(tmp.path());
-        let observer = SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker");
+        let observer =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
         observer.ended("exit 0");
 
         // The straggler hook shares the session token (env plumbing) and is suppressed.
@@ -458,15 +462,38 @@ mod tests {
             Activity::Ended
         );
 
-        // A new Claude session is a new incarnation: its SessionStart replaces the old terminal.
-        let mut fresh = harness_state::Writer::new(
+        // A wrapperless fresh session (token-only, the session_id fallback) cannot take over a
+        // claimed record: only a written claim supersedes.
+        let mut fallback = harness_state::Writer::new(
             tmp.path(),
             "hetz.worker",
             "claude",
             Some("hetz.worker".to_string()),
         )
         .with_session("claude-session-fresh");
-        fresh.interrupt();
+        fallback.interrupt();
+        assert!(
+            !fallback
+                .observe_unless_ended(
+                    observe_hook_event("SessionStart", &serde_json::Value::Null).unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            harness_state::read(&record, None).unwrap().state,
+            Activity::Ended
+        );
+
+        // A claimed new session — the wrapper path — supersedes the old terminal record.
+        let next =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+        let mut fresh = harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        )
+        .with_ownership(next.session().to_string(), next.seq());
         assert!(
             fresh
                 .observe_unless_ended(

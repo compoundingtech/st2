@@ -511,11 +511,21 @@ fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: 
         {
             // Exact-equality union alone would accumulate st2's own entries across hook-set
             // upgrades: `$ST_HOOKS` expands content-addressed, so every upgrade renders each
-            // entry with a new path and the old one would be retained beside it. An element
-            // recognizably st2's — structurally, a managed hook file under any set-shaped path
-            // or the `$ST_HOOKS` variable at a token boundary — that the patch no longer states
-            // is therefore superseded and dropped; foreign entries are never touched.
-            target.retain(|element| !contains_owned_string(element) || patch.contains(element));
+            // entry with a new path and the old one would be retained beside it. Supersession
+            // DESCENDS: only the managed nested entries (structurally st2's — a managed hook
+            // file under any set-shaped path, or `$ST_HOOKS` at a token boundary) the patch no
+            // longer states are removed, so a matcher group holding a user hook beside an st2
+            // one keeps the user's; containers left with nothing but empty arrays are dropped.
+            let mut kept_leaves = Vec::new();
+            for element in patch.iter() {
+                collect_owned_leaves(element, &mut kept_leaves);
+            }
+            target.retain_mut(|element| {
+                if patch.contains(element) || !contains_owned_string(element) {
+                    return true;
+                }
+                keep_after_supersession(element, &kept_leaves)
+            });
             for element in patch {
                 if !target.contains(&element) {
                     target.push(element);
@@ -523,6 +533,70 @@ fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: 
             }
         }
         (target, patch) => *target = patch,
+    }
+}
+
+/// Prune superseded managed entries INSIDE `element`, returning whether the element itself is
+/// still worth keeping. An owned leaf (no nested arrays) survives only if the patch still states
+/// it somewhere; containers are pruned recursively and dropped once every nested array is empty
+/// — a husk that only ever held superseded registrations.
+fn keep_after_supersession(element: &mut serde_json::Value, kept: &[serde_json::Value]) -> bool {
+    if !has_nested_array(element) {
+        return !contains_owned_string(element) || kept.contains(element);
+    }
+    let mut any_array_content = false;
+    match element {
+        serde_json::Value::Array(items) => {
+            items.retain_mut(|item| keep_after_supersession(item, kept));
+            any_array_content = !items.is_empty();
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                if let serde_json::Value::Array(items) = value {
+                    items.retain_mut(|item| keep_after_supersession(item, kept));
+                    if !items.is_empty() {
+                        any_array_content = true;
+                    }
+                } else if has_nested_array(value) {
+                    if keep_after_supersession(value, kept) {
+                        any_array_content = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    any_array_content
+}
+
+/// Owned leaves — managed entries with no nested arrays — anywhere inside `value`.
+fn collect_owned_leaves(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    if !has_nested_array(value) {
+        if contains_owned_string(value) {
+            out.push(value.clone());
+        }
+        return;
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_owned_leaves(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_owned_leaves(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn has_nested_array(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(_) => true,
+        serde_json::Value::Object(map) => map.values().any(has_nested_array),
+        _ => false,
     }
 }
 
@@ -1154,9 +1228,14 @@ mod tests {
     #[test]
     fn union_supersedes_prior_hook_set_entries_but_never_foreign_ones() {
         // The prior set lives under a RELOCATED root — recognition is structural (set-shaped
-        // path + managed basename), not derived from the current environment.
+        // path + managed basename), not derived from the current environment — and a MIXED
+        // matcher group keeps its user hook while losing only the superseded st2 entry.
         let mut target = serde_json::json!({
             "hooks": {"Stop": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "user-guard.sh"},
+                    {"type": "command", "command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}
+                ]},
                 {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
                 {"hooks": [{"type": "command", "command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}]},
                 {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
@@ -1172,6 +1251,10 @@ mod tests {
             target,
             serde_json::json!({
                 "hooks": {"Stop": [
+                    // The mixed group survives with only its user hook.
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "user-guard.sh"}
+                    ]},
                     {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
                     // A managed basename OUTSIDE a set-shaped path is a user's wrapper: foreign.
                     {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},

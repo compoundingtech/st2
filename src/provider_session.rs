@@ -69,24 +69,29 @@ pub(crate) struct SessionObserver {
 
 impl SessionObserver {
     /// `pty_session` is the wrapper's runtime/task ID — the registry entry whose liveness vouches
-    /// for the record. The observer mints the session incarnation token; the wrapper exports it
-    /// to its sibling writer processes (hooks, a channel) so ownership — coalescing, heartbeat
-    /// eligibility, terminal fencing — is decided by token equality across all of them.
+    /// for the record. The observer mints the session incarnation token and performs the WRITTEN
+    /// ownership claim (superseding whatever a predecessor left, fresh live records included);
+    /// the wrapper exports both to its sibling writer processes (hooks, a channel) so ownership
+    /// — coalescing, heartbeat eligibility, terminal fencing — is decided by the claim across
+    /// all of them. A claim that cannot be written is fatal at construction: acting without
+    /// ownership would silently produce a writer every record refuses.
     pub(crate) fn new(
         agent_dir: &Path,
         identity: &str,
         harness: &'static str,
         pty_session: &str,
-    ) -> Self {
-        Self {
-            seq: harness_state::claim_seq(agent_dir),
+    ) -> anyhow::Result<Self> {
+        let session = harness_state::session_token();
+        let seq = harness_state::claim(agent_dir, identity, harness, &session)?;
+        Ok(Self {
+            seq,
             agent_dir: agent_dir.to_path_buf(),
             identity: identity.to_string(),
             harness,
             pty_session: pty_session.to_string(),
-            session: harness_state::session_token(),
+            session,
             heartbeats: true,
-        }
+        })
     }
 
     /// An observer that records only how the session ended: `heartbeat` is a no-op because a
