@@ -352,15 +352,19 @@ impl Writer {
         // holds whatever its session's claimer exported. Either way, a record whose sequence is
         // beyond the claim belongs to a LATER session: this writer is the straggler, and its
         // write — live or terminal — is refused rather than replacing its successor's record.
-        let seq = self.claimed_seq.unwrap_or_else(|| {
-            on_disk.as_ref().map_or(1, |current| {
-                if current.incarnation == self.session {
-                    current.seq
-                } else {
-                    current.seq.saturating_add(1)
-                }
-            })
-        });
+        let seq = match self.claimed_seq {
+            Some(seq) => seq,
+            // A token-only writer NEVER claims: it adopts the on-disk sequence when the record
+            // already carries its token, starts a virgin record at one, and is refused outright
+            // against a foreign token — a mixed-version straggler minting claims would fence
+            // the true successor out permanently. New sequences are minted only by [`claim`],
+            // the written act, and adopted from it.
+            None => match on_disk.as_ref() {
+                None => 1,
+                Some(current) if current.incarnation == self.session => current.seq,
+                Some(_) => return Ok(false),
+            },
+        };
         if on_disk.as_ref().is_some_and(|current| current.seq > seq) {
             return Ok(false);
         }
@@ -377,10 +381,12 @@ impl Writer {
             .filter(|current| current.schema == SCHEMA && current.incarnation == self.session);
         if skip_if_ended
             && own_record.is_some_and(|current| {
-                // Only a terminal record from this session suppresses queued live frames. A
-                // predecessor incarnation's `ended` is history, not this session's last word —
-                // suppressing against it would report a restarted seat as ended for its whole run.
-                current.state == Activity::Ended
+                // Only a REAL terminal record from this session suppresses queued live frames:
+                // one carrying an exit, which every wrapper's `ended` does. The claim record —
+                // this session's own `ended (superseded)` placeholder, deliberately exitless —
+                // must not suppress the session's first frames, and a predecessor incarnation's
+                // `ended` is history rather than this session's last word.
+                current.state == Activity::Ended && current.exit.is_some()
             })
         {
             return Ok(false);
@@ -411,13 +417,7 @@ impl Writer {
         // record a reader would trust: one already past the future-skew bound is somebody's
         // garbage (or an overflow probe), and inheriting it would poison every later write —
         // the writer's own clock wins instead.
-        let written_at_ms = on_disk
-            .as_ref()
-            .map(|current| current.written_at_ms)
-            .filter(|&previous| {
-                previous <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW))
-            })
-            .map_or(now_ms, |previous| now_ms.max(previous.saturating_add(1)));
+        let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
         let (since_ms, transitions) = match (own_record, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
@@ -627,11 +627,61 @@ fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The ownership sequence a NEW session of this agent should claim: the on-disk record's
-/// sequence plus one (one when no record exists or it cannot be read). A wrapper computes this
-/// once at startup and exports it, beside its token, to every sibling writer process it spawns.
-pub fn claim_seq(agent_dir: &Path) -> u64 {
-    read_record(&harness_state_path(agent_dir)).map_or(1, |record| record.seq.saturating_add(1))
+/// The per-record monotonic stamp: strictly beyond the on-disk stamp when that stamp is inside
+/// the future-skew trust bound (a stamp beyond it is somebody's garbage or an overflow probe,
+/// and inheriting it would poison every later write), and the writer's own clock otherwise.
+fn next_stamp(on_disk: Option<&Record>, now_ms: u64) -> u64 {
+    on_disk
+        .map(|current| current.written_at_ms)
+        .filter(|&previous| {
+            previous <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW))
+        })
+        .map_or(now_ms, |previous| now_ms.max(previous.saturating_add(1)))
+}
+
+/// Claim session ownership of an agent's record, as a WRITTEN act under the record's lock: the
+/// takeover record supersedes whatever is on disk — `ended` with reason `superseded`, no exit,
+/// the new session's token, and the next ownership sequence — and the claimed sequence is
+/// returned for the wrapper to adopt and export beside its token. Writing the claim makes it
+/// atomic: racing claimers serialize on the lock and mint DISTINCT sequences, and a
+/// predecessor's fresh live record is superseded at relaunch even though the pty-name-based
+/// probe cannot tell the sessions apart. The record reads `ended (superseded)` until the
+/// session's first real observation replaces it.
+pub fn claim(
+    agent_dir: &Path,
+    agent: impl Into<String>,
+    harness: &'static str,
+    token: &str,
+) -> anyhow::Result<u64> {
+    let writer = Writer::new(agent_dir, agent, harness, None);
+    let _lock = writer.locked()?;
+    let on_disk = read_record(&writer.path);
+    let seq = on_disk
+        .as_ref()
+        .map_or(1, |record| record.seq.saturating_add(1));
+    let now_ms = crate::message::now_ms();
+    let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+    let record = Record {
+        schema: SCHEMA.to_string(),
+        agent: writer.agent.clone(),
+        harness: harness.to_string(),
+        state: Activity::Ended,
+        blocked_on: BlockedOn::None,
+        input_buffer: InputBuffer::Unknown,
+        ask: Ask::None,
+        reason: Some("superseded".to_string()),
+        exit: None,
+        pty_session: None,
+        incarnation: token.to_string(),
+        seq,
+        since_ms: written_at_ms,
+        written_at_ms,
+        transitions: on_disk
+            .as_ref()
+            .map_or(0, |record| record.transitions.saturating_add(1)),
+    };
+    write_record(&writer.path, &record)?;
+    Ok(seq)
 }
 
 /// A process-unique session incarnation token: pid, wall-clock, and a process-local counter.
@@ -662,6 +712,14 @@ mod tests {
 
     fn writer(dir: &Path) -> Writer {
         Writer::new(dir, "hetz.worker", "codex", Some("worker".to_string()))
+    }
+
+    /// A new session arriving the way real wrappers do: a written claim, then adoption.
+    fn takeover(dir: &Path, harness: &'static str) -> Writer {
+        let token = session_token();
+        let seq = claim(dir, "hetz.worker", harness, &token).unwrap();
+        Writer::new(dir, "hetz.worker", harness, Some("worker".to_string()))
+            .with_ownership(token, seq)
     }
 
     fn active() -> Observation {
@@ -793,9 +851,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let mut a = writer(tmp.path());
-        let mut b = writer(tmp.path());
-
         a.observe(active()).unwrap();
+        let mut b = takeover(tmp.path(), "codex");
         b.observe(Observation::new(
             Activity::Idle,
             BlockedOn::None,
@@ -807,14 +864,14 @@ mod tests {
         a.heartbeat().unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.state, Activity::Idle);
-        assert_eq!(record.transitions, 1);
+        assert_eq!(record.transitions, 2);
 
         // B's write was a later session's claim, so A is now the straggler: its re-observation
         // is refused rather than treated as a fresh takeover of its successor's record.
         a.observe(active()).unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.state, Activity::Idle);
-        assert_eq!(record.transitions, 1);
+        assert_eq!(record.transitions, 2);
     }
 
     #[test]
@@ -822,9 +879,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let mut a = writer(tmp.path());
-        let mut b = writer(tmp.path());
-
         a.observe(active()).unwrap();
+        let mut b = takeover(tmp.path(), "codex");
         b.ended("signal 9").unwrap();
         let terminal = fs::read(&path).unwrap();
 
@@ -879,10 +935,13 @@ mod tests {
             .unwrap();
         drop(first);
 
-        let mut second = writer(tmp.path());
+        let mut second = takeover(tmp.path(), "codex");
         second.observe(active()).unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.transitions, 2);
+        assert_eq!(
+            record.transitions, 3,
+            "claim and first observation continue the counter"
+        );
     }
 
     #[test]
@@ -1054,9 +1113,14 @@ mod tests {
         let stale_bytes = fs::read(&path).unwrap();
 
         // A restarted wrapper must not keep a dead session's state fresh forever.
-        let mut writer = writer(tmp.path());
+        let mut writer = takeover(tmp.path(), "codex");
         writer.heartbeat().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), stale_bytes);
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            stale_bytes,
+            "the written claim itself supersedes the predecessor"
+        );
+        assert_eq!(read(&path, None).unwrap().state, Activity::Ended);
 
         // Once this session observes something, heartbeats re-stamp again.
         writer.observe(active()).unwrap();
@@ -1117,7 +1181,7 @@ mod tests {
         // write-through, even inside the same millisecond. Without it, its matching first
         // observation would be a no-op and the ownership gate would then reject every heartbeat
         // while the record quietly aged out.
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        let mut successor = takeover(tmp.path(), "codex");
         successor.observe(active()).unwrap();
         let claimed: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(
@@ -1141,10 +1205,14 @@ mod tests {
         writer(tmp.path()).observe(active()).unwrap();
         let before: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        let mut successor = takeover(tmp.path(), "codex");
         successor.observe(active()).unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.transitions, before.transitions + 1);
+        assert_eq!(
+            record.transitions,
+            before.transitions + 2,
+            "the written claim and the first observation each transition"
+        );
         assert!(
             record.since_ms > before.since_ms,
             "sinceMs must never span a session boundary"
@@ -1158,18 +1226,21 @@ mod tests {
         let foreign = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
         fs::write(&path, foreign).unwrap();
 
-        // Heartbeat leaves a foreign record byte-identical rather than stripping its fields.
-        let mut writer = writer(tmp.path());
-        writer.heartbeat().unwrap();
+        // Heartbeat leaves a foreign record byte-identical rather than stripping its fields —
+        // and a token-only writer cannot replace it either: supersession is a claim's job.
+        let mut unclaimed = writer(tmp.path());
+        unclaimed.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), foreign.to_vec());
+        assert!(!unclaimed.observe_unless_ended(active()).unwrap());
         assert_eq!(fs::read(&path).unwrap(), foreign.to_vec());
 
-        // A genuine observation replaces it wholesale (never coalesces, and a foreign `ended` is
-        // not this session's terminal word), continuing the counter for byte-distinctness.
+        // A claiming session replaces it wholesale, continuing the counter for byte-distinctness.
+        let mut writer = takeover(tmp.path(), "codex");
         assert!(writer.observe_unless_ended(active()).unwrap());
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.schema, SCHEMA);
         assert_eq!(record.state, Activity::Active);
-        assert_eq!(record.transitions, 8);
+        assert_eq!(record.transitions, 9);
     }
 
     #[test]
@@ -1182,7 +1253,7 @@ mod tests {
         // Deliberately no delay: a same-millisecond takeover is the ambiguous case a timestamp
         // boundary got wrong, and token inequality decides it.
         let _ = terminal;
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()));
+        let mut successor = takeover(tmp.path(), "pi");
         assert!(
             successor.observe_unless_ended(active()).unwrap(),
             "a restarted seat must replace its predecessor's terminal record"
@@ -1262,7 +1333,7 @@ mod tests {
         let mut old = writer(tmp.path());
         old.observe(active()).unwrap();
 
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        let mut successor = takeover(tmp.path(), "codex");
         successor
             .observe(Observation::new(
                 Activity::Idle,
@@ -1342,7 +1413,7 @@ mod tests {
         let mut predecessor = writer(tmp.path());
         predecessor.observe(active()).unwrap();
 
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        let mut successor = takeover(tmp.path(), "codex");
         successor
             .observe(Observation::new(
                 Activity::Idle,
@@ -1372,11 +1443,11 @@ mod tests {
         let path = harness_state_path(tmp.path());
         writer(tmp.path()).observe(active()).unwrap();
 
-        // The wrapper computes the claim and exports it; the hook performs the first write.
-        let claim = claim_seq(tmp.path());
+        // The wrapper writes the claim and exports it; the hook adopts the pair.
         let token = session_token();
+        let seq = claim(tmp.path(), "hetz.worker", "claude", &token).unwrap();
         let mut hook = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
-            .with_ownership(token.clone(), claim);
+            .with_ownership(token.clone(), seq);
         hook.observe(Observation::new(
             Activity::Idle,
             BlockedOn::None,
@@ -1410,7 +1481,7 @@ mod tests {
         );
         fs::write(&path, poisoned).unwrap();
 
-        let mut writer = writer(tmp.path());
+        let mut writer = takeover(tmp.path(), "codex");
         writer.observe(active()).unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let now = crate::message::now_ms();
@@ -1419,6 +1490,48 @@ mod tests {
             record.seq, 4,
             "the claim still advances past the poisoned record"
         );
+        assert_eq!(read(&path, None).unwrap().state, Activity::Active);
+    }
+
+    /// T2: the claim is a WRITTEN act under the record lock — racing claimers mint DISTINCT
+    /// sequences instead of tying, which dissolved the former dual-claim residual.
+    #[test]
+    fn racing_claims_serialize_on_the_lock_and_mint_distinct_sequences() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    claim(&dir, "hetz.worker", "codex", &session_token()).unwrap()
+                })
+            })
+            .collect();
+        let mut seqs: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 4, "every racing claim minted its own sequence");
+    }
+
+    /// T3: at relaunch the claim supersedes the predecessor's still-fresh live record — the
+    /// pty-name-based probe cannot tell the sessions apart, so the record itself must — and the
+    /// seat reads `ended (superseded)` until the new session's first real observation.
+    #[test]
+    fn a_relaunch_claim_supersedes_a_fresh_live_predecessor_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        writer(tmp.path()).observe(active()).unwrap();
+
+        let token = session_token();
+        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Ended);
+        assert_eq!(observed.reason.as_deref(), Some("superseded"));
+        assert_eq!(observed.exit, None);
+
+        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .with_ownership(token, seq);
+        successor.observe(active()).unwrap();
         assert_eq!(read(&path, None).unwrap().state, Activity::Active);
     }
 }
