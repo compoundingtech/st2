@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
+use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
 use crate::{ding, message, status};
 
@@ -118,16 +118,17 @@ pub fn run(
         // The pty session vouching for the record is the wrapper's task: the runtime ID names
         // the registry entry, and only aliases the identity on driver-expanded seats.
         writer: {
-            let mut writer = Writer::new(
+            // The written claim supersedes whatever a predecessor left — a still-fresh live
+            // record included — before this wrapper's first observation.
+            let session = harness_state::session_token();
+            let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
+            Writer::new(
                 &agent_dir,
                 identity.clone(),
                 "opencode",
                 Some(runtime_id.clone()),
-            );
-            // A restarted wrapper is a new session: its first observation opens a fresh
-            // transition rather than claiming continuity with a predecessor's record.
-            writer.interrupt();
-            writer
+            )
+            .with_ownership(session, seq)
         },
         delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
     };

@@ -44,6 +44,7 @@ pub use discovery::{
 };
 pub use spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX, Stream, StreamLaunch, Task,
-    TaskKind, TaskLifecycle, parse_duration, stream_name_of_task, validate_desired_state_reason,
+    OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX, Stream,
+    StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration, stream_name_of_task,
+    validate_desired_state_reason,
 };
