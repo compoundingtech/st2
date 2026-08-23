@@ -415,16 +415,22 @@ impl CodexInboxDelivery {
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
         // The session token is the runtime incarnation the wrapper already minted: the pump and
-        // the wrapper's terminal writer are the same session and must own the same records. A
-        // restarted pump is a new incarnation, so even a first observation matching a fresh
-        // predecessor record opens a new transition rather than claiming continuity.
+        // the wrapper's terminal writer are the same session and must own the same records. The
+        // claim is a WRITTEN act — it atomically supersedes whatever a predecessor left,
+        // including a still-fresh live record the pty-name probe cannot distinguish.
+        let claimed_seq = harness_state::claim(
+            &config.agent_dir,
+            config.identity.clone(),
+            "codex",
+            runtime.incarnation(),
+        )?;
         let harness_writer = harness_state::Writer::new(
             &config.agent_dir,
             config.identity.clone(),
             "codex",
             Some(runtime.runtime_id().to_string()),
         )
-        .with_session(runtime.incarnation());
+        .with_ownership(runtime.incarnation(), claimed_seq);
         Ok(Self {
             config,
             state_path,
@@ -1357,6 +1363,13 @@ fn run_connected(
         return Ok(());
     }
     let websocket = initialize_control(control)?;
+    // The handshake above can sit out its full read timeout; a stop raised during it must not
+    // proceed to spawn a TUI it would immediately tear down.
+    if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialized" }))?;
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Ok(());
+    }
     diagnostics.record("controlInitialized", json!({}))?;
     let (events_tx, events_rx) = mpsc::channel();
     let binding_path = state_dir.join("binding.json");
@@ -1440,8 +1453,9 @@ fn run_connected(
     // The pump is gone, so nothing can observe this session again: publish the terminal
     // observation with the outcome the wrapper actually saw, before any staleness horizon.
     // Consumers must not branch on `reason`, so the observed exit always lands in `exit`.
-    // Same incarnation as the pump's writer: the terminal record must own — and thereby fence —
-    // exactly the records this session wrote.
+    // Same incarnation as the pump's writer, adopting by token: the pump's written claim (or any
+    // of its writes) put this token on disk, so token-only adoption resolves to this session's
+    // claimed sequence — and the terminal record fences exactly the records this session wrote.
     let mut harness_writer = harness_state::Writer::new(
         &harness_agent_dir,
         harness_identity.clone(),
