@@ -197,9 +197,11 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  // Observed harness state, extension side. pi's own turn boundaries are the positive signal:
-  // `ctx.isIdle()` is false for exactly the `agent_start`..`agent_end` span, so these two events
-  // carry the working/idle edge without inspecting anything. The frame is observational — st2
+  // Observed harness state, extension side. pi's own turn boundaries are the positive signal,
+  // and the idle edge is `agent_settled`, not `agent_end`: measured against the repo's own pi
+  // captures, `ctx.isIdle()` is still false through `agent_end`, and a queued follow-up turn
+  // starts exactly at that boundary — an `agent_end` emit would blip a spurious idle before it.
+  // `agent_settled` is the first point pi is provably idle. The frame is observational — st2
   // decides what becomes of it — and a closed channel drops it silently, matching the fail-open
   // rule this file already follows. pi 0.84.2 exposes no typed waiting-on-a-human event, so no
   // frame here ever claims one.
@@ -209,7 +211,7 @@ export default function (pi: ExtensionAPI) {
     child.stdin.write(JSON.stringify({ type: "state", state: word }) + "\n");
   };
   pi.on("agent_start", async () => sendState("active"));
-  pi.on("agent_end", async () => sendState("idle"));
+  pi.on("agent_settled", async () => sendState("idle"));
 
   pi.on("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot

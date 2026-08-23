@@ -92,8 +92,13 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     // pi's own turn events, and its stdio connection to the extension is the evidence that those
     // events are still being watched. The terminal half belongs to the outer session wrapper,
     // which alone sees the provider die.
-    let mut writer =
-        harness_state::Writer::new(&agent_dir, identity, "pi", Some(identity.to_string()));
+    // The pty session vouching for the record is the wrapper's task: its runtime ID arrives in
+    // the channel environment, and only aliases the identity on driver-expanded seats.
+    let pty_session = std::env::var(crate::pi_session::CHANNEL_RUNTIME_ID)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| identity.to_string());
+    let mut writer = harness_state::Writer::new(&agent_dir, identity, "pi", Some(pty_session));
     channel_loop(
         &input_rx,
         &mut stdout,
@@ -135,7 +140,10 @@ fn channel_loop(
                     .ok()
                     .as_ref()
                     .and_then(state_observation)
-                    && let Err(error) = writer.observe(observation)
+                    // A queued live frame must never overwrite the wrapper's terminal record:
+                    // the channel and the wrapper are separate processes, so the flock alone
+                    // serializes but does not order their writes.
+                    && let Err(error) = writer.observe_unless_ended(observation)
                 {
                     eprintln!("st2 pi channel: recording observed state failed: {error}");
                 }
@@ -310,6 +318,40 @@ mod tests {
             after_eof,
             "nothing may write after the connection is gone"
         );
+    }
+
+    /// The wrapper's terminal record is the incarnation's last word: a live frame the extension
+    /// queued before dying must not resurrect the session after the wrapper reaped it.
+    #[test]
+    fn a_queued_live_frame_never_overwrites_the_wrappers_terminal_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let record = harness_state::harness_state_path(agent_dir);
+        let mut channel_writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let mut wrapper_writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        wrapper_writer.ended("signal 9").unwrap();
+        let terminal = std::fs::read(&record).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(r#"{"type":"state","state":"idle"}"#.to_string()))
+            .unwrap();
+        drop(tx);
+        let mut out = Vec::new();
+        channel_loop(
+            &rx,
+            &mut out,
+            &message::inbox_dir(agent_dir),
+            &mut channel_writer,
+            "h.worker",
+            Duration::from_millis(2),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&record).unwrap(), terminal);
     }
 
     #[test]
