@@ -61,6 +61,8 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
   "reason": "<diagnostic, optional>",
   "exit": "<ended only: e.g. 'exit 0', 'signal 9', optional>",
   "ptySession": "<the wrapper's runtime/task ID; required for live states>",
+  "incarnation": "<the writing session's token>",
+  "seq": 7,
   "sinceMs": 1787690000000,
   "writtenAtMs": 1787690300000,
   "transitions": 41
@@ -115,15 +117,16 @@ Field rules, matching `src/harness_state.rs`:
   re-stamps; `writtenAtMs` is the heartbeat. `transitions` is a monotonic
   counter continued across writer restarts; with `writtenAtMs` it keeps every
   write byte-distinct.
-- Writes are session-owned by incarnation token. A restatement is a no-op
-  only against a record carrying this session's token, so a takeover — even
-  in the same millisecond — always writes through, opens a fresh transition,
-  and claims heartbeat eligibility; `sinceMs` never spans a restart. In the
-  other direction a lingering predecessor's heartbeat is refused by the same
-  equality, so a straggler cannot keep its successor's record fresh.
-  Heartbeats and coalescing never touch a record whose schema or token the
-  writer does not own; a foreign record is left byte-identical by heartbeats
-  and replaced wholesale by a genuine observation.
+- Writes are session-owned by incarnation token, and ownership has a
+  DIRECTION through `seq`: only a session claim advances it, a claiming
+  takeover — even in the same millisecond — writes through, opens a fresh
+  transition, and takes heartbeat eligibility, while a straggler from a
+  superseded session (its claim below the on-disk sequence) is refused in
+  live and terminal paths alike; `sinceMs` never spans a restart and a
+  lingering predecessor can neither heartbeat nor overwrite its successor's
+  record. Heartbeats and coalescing never touch a record whose schema or
+  token the writer does not own; a foreign record is left byte-identical by
+  heartbeats and replaced only by a claiming observation.
 - Deserialization is additive-tolerant (no `deny_unknown_fields`): a reader
   may be older than its writer.
 
@@ -189,10 +192,13 @@ honors st2's stop signal through every startup phase (socket connect,
 initialize, thread binding), not only the bound monitor loop: a stop before
 the TUI exists ends the launch gracefully and leaves no record — nothing was
 observed — while a stop after it exits through the ordinary terminal-write
-path. A projected transition whose record write fails does not count as
-evidence: it is retained as pending and retried on the next pump pass before
-any heartbeat, so a stale on-disk state is never kept fresh in contradiction
-of the latest observation.
+path — and the stop handler installs before ANY child is spawned, the
+hook-trust preflight's detached app-server included, so a stop in that window
+cannot leak a server around a dead wrapper. A projected transition whose
+record write fails does not count as evidence: it is retained as pending and
+retried on EVERY pump pass (only the heartbeat is presence-cadence work), so
+a stale on-disk state is never kept fresh in contradiction of the latest
+observation.
 
 ## Claude producer (OHS-R05, OHS-R06)
 
@@ -298,8 +304,14 @@ reads back durably from the server. The `/tui/append-prompt` and
 two gates: a `SUPPORTED_OPENCODE_VERSIONS` pin and a live `/doc` OpenAPI
 subset check naming every arm st2 consumes; observation runs behind the
 `/doc` check alone, since its vocabulary already degrades to indeterminate.
-Deliveries target the most recently observed session; a seat whose TUI has not
-yet created one waits rather than creating sessions itself.
+Deliveries target the most recently observed session; a seat whose TUI has
+not yet created one waits rather than creating sessions itself, and a session
+that settled before the observer connected — invisible to events and to
+`/session/status` alike — is recovered from the session listing when work is
+pending. The status seed trusts exactly the pinned words (`busy`, `retry`,
+`idle`) and fails closed on anything else, and the stop path rewrites its
+pre-signal escalation cover with the exit the grace-window reap actually
+observed.
 
 ## Exposure (OHS-R09, OHS-R10)
 
