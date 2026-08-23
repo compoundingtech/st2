@@ -83,10 +83,13 @@ pub fn run_observe(
 /// top-level harness state.
 ///
 /// Claude gives no call identity on the event that enters `blocked` (`PermissionRequest` carries
-/// no `tool_use_id`), so the exit edge is the next `PreToolUse`/`PostToolUse`/`Stop`. Under
-/// batched tool calls that can clear `blocked` while a later call in the batch still holds a
-/// prompt; the limit is accepted and fenced in the VRS rather than papered over with a temporal
-/// heuristic that fails for exactly the parallel case it would need to handle.
+/// no `tool_use_id`; its `prompt_id` is turn-scoped), so the exit edge is the next
+/// `PreToolUse`/`PostToolUse`/`Stop`. Measured 2026-08-23 (Claude Code 2.1.237, DQ-H1): tool
+/// execution serializes around an open permission prompt — no hook event fires while a prompt is
+/// up, even for a parallel-batched allowlisted call — so that next event is the blocked call's own
+/// resolution and the batched false-clear #268 §C predicted cannot occur. The residual limit is
+/// denial: "No" ends the turn with zero further events (no Stop, and no PermissionDenied even when
+/// registered), so `blocked` stands until the next `UserPromptSubmit`/`SessionStart`.
 pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Observation> {
     // Any event carrying an agent identity is a subagent's and must never move top-level state:
     // a phantom `SubagentStop` trails every completed turn, 1.5-2.9s after `Stop`. That phantom
@@ -203,6 +206,60 @@ mod tests {
         // An empty agent_id is the top-level shape.
         let top = serde_json::json!({"agent_id": ""});
         assert!(observe_hook_event("Stop", &top).is_some());
+    }
+
+    /// The measured grant-path sequence from the DQ-H1 capture (2026-08-23, Claude Code 2.1.237,
+    /// `docs/vrs/05-harness-state/.experiments/2026-08-23-claude-batched-permission.md`): in a
+    /// two-call batch where the first call needs permission, execution serializes around the open
+    /// prompt, so the event after `PermissionRequest` is the granted call's own `PostToolUse` and
+    /// the exit rule clears `blocked` at exactly the right moment. Replayed verbatim so a future
+    /// mapping change that breaks the measured sequence fails here, not in the field.
+    #[test]
+    fn measured_batched_grant_sequence_holds_blocked_until_the_granted_calls_own_post() {
+        let pre_touch = serde_json::json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "touch scratch2.txt"},
+            "tool_use_id": "toolu_01HK5aLKavjdbrCk48cfd58k",
+            "prompt_id": "0ea832de-ece1-4575-900f-4dab5e2f6849",
+        });
+        let permission_request = serde_json::json!({
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "touch scratch2.txt"},
+            "permission_suggestions": [],
+            "prompt_id": "0ea832de-ece1-4575-900f-4dab5e2f6849",
+        });
+        let post_touch = serde_json::json!({
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "touch scratch2.txt"},
+            "tool_use_id": "toolu_01HK5aLkavjdbrCk48cfd58k",
+            "prompt_id": "0ea832de-ece1-4575-900f-4dab5e2f6849",
+        });
+        // The phantom SubagentStop trailing the turn: non-empty agent_id, EMPTY agent_type, no
+        // subagent ran — the exact emergent shape the guard keys on, reproduced in this build.
+        let phantom_subagent_stop = serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a5c61ec4ef268c3cc", "agent_type": "",
+            "prompt_id": "0ea832de-ece1-4575-900f-4dab5e2f6849",
+        });
+
+        let entered = observe_hook_event("PermissionRequest", &permission_request).unwrap();
+        assert_eq!(
+            (entered.state, entered.blocked_on),
+            (Activity::Active, BlockedOn::Human)
+        );
+        // 33 s of open prompt produced no intervening event in the capture; the very next event
+        // is the granted call's own PostToolUse, which correctly releases the block.
+        let released = observe_hook_event("PostToolUse", &post_touch).unwrap();
+        assert_eq!(
+            (released.state, released.blocked_on),
+            (Activity::Active, BlockedOn::None)
+        );
+        let _ = observe_hook_event("PreToolUse", &pre_touch);
+        assert_eq!(
+            observe_hook_event("SubagentStop", &phantom_subagent_stop),
+            None,
+            "the phantom SubagentStop must not resurrect activity after Stop"
+        );
     }
 
     #[test]
