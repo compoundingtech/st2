@@ -99,17 +99,11 @@ fn observed_state(
     }
 }
 
-/// The pty registry root the probe reads. Operator shells rarely export PTY_ROOT, while
-/// supervised tasks run under the catalog's own pty root — so the reader derives the runner's
-/// default from the catalog, with the ambient overrides still winning.
+/// The pty registry root the probe reads: exactly the runner's own resolution, so the reader and
+/// the sessions it probes can never disagree. The runner honors `PTY_ROOT` and nothing else — a
+/// legacy `PTY_SESSION_DIR` here would point the probe at a directory st2-managed sessions never
+/// use, turning provable deaths into indeterminate reads.
 pub fn probe_pty_root(catalog_root: &Path) -> PathBuf {
-    for var in ["PTY_ROOT", "PTY_SESSION_DIR"] {
-        if let Some(dir) = std::env::var_os(var)
-            && !dir.is_empty()
-        {
-            return PathBuf::from(dir);
-        }
-    }
     crate::run::effective_pty_root(catalog_root)
 }
 
@@ -121,6 +115,7 @@ struct ObservedJson<'a> {
     state: &'a str,
     blocked_on: &'a str,
     input_buffer: &'a str,
+    ask: &'a str,
     harness: Option<&'a str>,
     since: Option<u64>,
     exit: Option<&'a str>,
@@ -133,6 +128,7 @@ impl<'a> ObservedJson<'a> {
             state: observed.state.as_str(),
             blocked_on: observed.blocked_on.as_str(),
             input_buffer: observed.input_buffer.as_str(),
+            ask: observed.ask.as_str(),
             harness: observed.harness.as_deref(),
             since: observed.since_ms,
             exit: observed.exit.as_deref(),
@@ -341,6 +337,7 @@ mod tests {
             state: harness_state::Activity::Idle,
             blocked_on: harness_state::BlockedOn::None,
             input_buffer: harness_state::InputBuffer::Empty,
+            ask: harness_state::Ask::None,
             harness: Some("codex".to_string()),
             since_ms: Some(1784653000000),
             exit: None,
@@ -349,11 +346,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -361,6 +358,7 @@ mod tests {
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
             input_buffer: harness_state::InputBuffer::Unknown,
+            ask: harness_state::Ask::Unknown,
             harness: Some("codex".to_string()),
             since_ms: None,
             exit: None,
@@ -368,7 +366,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","harness":"codex","since":null,"exit":null,"reason":"session-dead"}}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"exit":null,"reason":"session-dead"}}]"#
         );
     }
 }

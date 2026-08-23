@@ -475,7 +475,12 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     );
 
     // A fresh live record is a passing check.
-    let mut writer = Writer::new(&agent_dir, "h.worker", "codex", None);
+    let mut writer = Writer::new(
+        &agent_dir,
+        "h.worker",
+        "codex",
+        Some("h.worker".to_string()),
+    );
     writer
         .observe(Observation::new(
             Activity::Active,
