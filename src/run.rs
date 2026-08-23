@@ -21,7 +21,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -2000,6 +2000,21 @@ fn drain(rx: &Receiver<()>) {
     while rx.try_recv().is_ok() {}
 }
 
+fn best_effort_catalog_watcher(
+    root: &Path,
+    tx: Sender<()>,
+) -> Option<crate::watch::CatalogDeclarationWatcher> {
+    match crate::watch::watch_catalog_declarations(root, tx) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!(
+                "st2: cannot watch catalog declarations: {error}; immediate catalog changes are unavailable, continuing with timer polling."
+            );
+            None
+        }
+    }
+}
+
 /// The supervisor loop: reconcile on a timer AND on folder changes until interrupted. The fs-watch is
 /// best-effort; the `interval` timer is the always-on fallback. `on_report` is called once per pass
 /// (e.g. to log a summary). Returns when a stop signal arrives — agents are left running.
@@ -2026,7 +2041,7 @@ fn up_loop_until(
         .context("publish machine-local stream owner binding")?;
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
-    let _watcher = crate::watch::watch_catalog_declarations(root, tx);
+    let mut watcher = best_effort_catalog_watcher(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
@@ -2053,6 +2068,9 @@ fn up_loop_until(
         );
         pre.absorb(report);
         report = pre;
+        if let Some(watcher) = &mut watcher {
+            watcher.refresh();
+        }
         // A recovered task that crash-loops again is a new crash-loop, so it must be able to surface
         // again. Leaving the id in the dedup set would make every park after the first one silent.
         for id in &report.unparked {
@@ -2440,6 +2458,18 @@ mod tests {
         assert!(
             passes <= 2,
             "idle supervisor must wait instead of reconciling its own read events: {passes} passes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn catalog_watcher_failure_selects_timer_fallback() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing_catalog = parent.path().join("missing");
+        let (tx, _rx) = channel();
+        assert!(
+            best_effort_catalog_watcher(&missing_catalog, tx).is_none(),
+            "watch installation failure must leave the timer-only path selected"
         );
     }
 

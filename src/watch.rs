@@ -5,10 +5,13 @@
 //! read emits another event, and the next timed wait returns immediately. Only mutations are useful
 //! wakeups; timer polling remains the fallback for anything a backend cannot classify.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::event::{ModifyKind, RenameMode};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Watch a directory recursively, forwarding only events that can change reconciled state.
 pub(crate) fn watch_recursive_mutations(
@@ -25,28 +28,140 @@ pub(crate) fn watch_recursive_mutations(
     Some(watcher)
 }
 
+/// A shallow subscription over the directories that can contain declarations.
+///
+/// `notify` implements a recursive Linux watch by eagerly walking the entire tree and allocating
+/// one inotify watch per directory. The catalog also contains unbounded Resource payloads, so a
+/// recursive subscription can spend all startup time walking data that the callback would later
+/// ignore. Keep one non-recursive watch per declaration-space directory instead. [`refresh`] is
+/// called after each reconciliation pass so a newly created directory becomes watched before
+/// later edits inside it.
+///
+/// The boundary intentionally inherits [`agent_spec::is_catalog_path`]: outside the canonical
+/// `agents/<host>/<identity>` layout, a `resources`-named directory remains declaration space until
+/// an adjacent `agent.kdl` establishes that it is Agent state.
+pub(crate) struct CatalogDeclarationWatcher {
+    root: PathBuf,
+    watcher: RecommendedWatcher,
+    watched: BTreeSet<PathBuf>,
+    failed: BTreeSet<PathBuf>,
+}
+
+impl CatalogDeclarationWatcher {
+    fn new(root: &Path, tx: Sender<()>) -> notify::Result<Self> {
+        let callback_root = root.to_path_buf();
+        let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            if result.is_ok_and(|event| should_wake_catalog(&callback_root, &event)) {
+                let _ = tx.send(());
+            }
+        })?;
+        let mut this = Self {
+            root: root.to_path_buf(),
+            watcher,
+            watched: BTreeSet::new(),
+            failed: BTreeSet::new(),
+        };
+        this.watcher.watch(root, RecursiveMode::NonRecursive)?;
+        this.watched.insert(root.to_path_buf());
+        this.refresh();
+        Ok(this)
+    }
+
+    /// Reconcile the shallow subscriptions with the current declaration namespace.
+    pub(crate) fn refresh(&mut self) {
+        let desired = declaration_watch_dirs(&self.root);
+
+        for stale in self
+            .watched
+            .difference(&desired)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            // Backends normally discard a watch when its directory disappears. An explicit
+            // best-effort unwatch also handles moves that leave the watched inode alive elsewhere.
+            let _ = self.watcher.unwatch(&stale);
+            self.watched.remove(&stale);
+        }
+        for added in desired
+            .difference(&self.watched)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            match self.watcher.watch(&added, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    self.failed.remove(&added);
+                    self.watched.insert(added);
+                }
+                Err(error) if self.failed.insert(added.clone()) => {
+                    eprintln!(
+                        "st2: cannot watch catalog declaration directory '{}': {error}; immediate changes below it are unavailable, continuing with timer polling.",
+                        added.display()
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn watched_count(&self) -> usize {
+        self.watched.len()
+    }
+}
+
 /// Watch only declaration inputs for the supervisor. Runtime state (PTY registry, bus, logs,
-/// locks, inboxes, and generated materializations) must never wake reconciliation.
+/// locks, inboxes, and generated materializations) must never be traversed or wake reconciliation.
 pub(crate) fn watch_catalog_declarations(
     root: &Path,
     tx: Sender<()>,
-) -> Option<notify::RecommendedWatcher> {
-    let root = root.to_path_buf();
-    let callback_root = root.clone();
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-        if result.is_ok_and(|event| {
-            is_mutation(&event)
-                && event
-                    .paths
-                    .iter()
-                    .any(|path| is_declaration_path(&callback_root, path))
-        }) {
-            let _ = tx.send(());
+) -> notify::Result<CatalogDeclarationWatcher> {
+    CatalogDeclarationWatcher::new(root, tx)
+}
+
+fn declaration_watch_dirs(root: &Path) -> BTreeSet<PathBuf> {
+    fn collect(root: &Path, dir: &Path, out: &mut BTreeSet<PathBuf>) {
+        out.insert(dir.to_path_buf());
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && agent_spec::is_catalog_path(root, &path)
+            {
+                collect(root, &path, out);
+            }
         }
+    }
+
+    let mut dirs = BTreeSet::new();
+    collect(root, root, &mut dirs);
+    dirs
+}
+
+fn should_wake_catalog(root: &Path, event: &Event) -> bool {
+    if !is_mutation(event) {
+        return false;
+    }
+    event.paths.iter().any(|path| {
+        is_declaration_path(root, path)
+            || (is_directory_topology_mutation(event) && agent_spec::is_catalog_path(root, path))
     })
-    .ok()?;
-    watcher.watch(&root, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
+}
+
+fn is_directory_topology_mutation(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(
+                RenameMode::Any
+                    | RenameMode::From
+                    | RenameMode::To
+                    | RenameMode::Both
+                    | RenameMode::Other
+            ))
+    )
 }
 
 fn is_declaration_path(root: &Path, path: &Path) -> bool {
@@ -156,6 +271,56 @@ mod tests {
         assert!(!is_declaration_path(root, &root.join("team/rendered.kdl")));
     }
 
+    #[test]
+    fn declaration_watch_tree_stops_before_resource_payloads() {
+        let catalog = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = catalog.path();
+        let agent = root.join("agents/h/live");
+        std::fs::create_dir_all(agent.join("resources/cache/a/b/c/d/e")).unwrap();
+        std::fs::create_dir_all(agent.join("inbox/archive/a/b/c")).unwrap();
+        std::fs::create_dir_all(outside.path().join("worktree/node_modules/a/b/c/d/e")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.path().join("worktree"),
+            agent.join("resources/worktree"),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" { host "h"; command "x" }"#,
+        )
+        .unwrap();
+
+        let watched = declaration_watch_dirs(root);
+        assert_eq!(
+            watched,
+            [
+                root.to_path_buf(),
+                root.join("agents"),
+                root.join("agents/h"),
+                agent,
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(
+            watched.iter().all(|path| !path.starts_with(outside.path())),
+            "Resource worktree links must not escape the catalog watch boundary"
+        );
+    }
+
+    #[test]
+    fn watcher_installation_preserves_backend_errors() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing_catalog = parent.path().join("missing");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert!(
+            watch_catalog_declarations(&missing_catalog, tx).is_err(),
+            "a missing root must return the installation error"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_reads_are_silent_but_real_mutations_wake() {
@@ -207,5 +372,65 @@ mod tests {
             |dir| std::fs::write(dir.join("removed"), "value").unwrap(),
             |dir| std::fs::remove_file(dir.join("removed")).unwrap(),
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn catalog_watch_is_bounded_and_refreshes_new_declaration_directories() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let root = catalog.path();
+        let agent = root.join("agents/h/live");
+        std::fs::create_dir_all(agent.join("resources/cache/a/b/c/d/e")).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" { host "h"; command "x" }"#,
+        )
+        .unwrap();
+
+        let (tx, rx) = channel();
+        let mut watcher = watch_catalog_declarations(root, tx).expect("start catalog watcher");
+        assert_eq!(
+            watcher.watched_count(),
+            4,
+            "Resource depth must not add watches"
+        );
+
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" { host "h"; command "changed" }"#,
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("declaration update must wake");
+        while rx.try_recv().is_ok() {}
+
+        let nested = root.join("teams/new/live");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("agent.kdl"),
+            r#"agent "live" { host "new"; command "x" }"#,
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("new declaration directory must wake its watched ancestor");
+        while rx.try_recv().is_ok() {}
+        watcher.refresh();
+        assert!(watcher.watched.contains(&nested));
+
+        std::fs::write(
+            nested.join("agent.kdl"),
+            r#"agent "live" { host "new"; command "changed" }"#,
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("declaration update after refresh must wake");
+        while rx.try_recv().is_ok() {}
+
+        std::fs::remove_file(nested.join("agent.kdl")).unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("declaration removal must wake");
     }
 }
