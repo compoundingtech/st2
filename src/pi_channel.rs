@@ -99,6 +99,10 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| identity.to_string());
     let mut writer = harness_state::Writer::new(&agent_dir, identity, "pi", Some(pty_session));
+    // A fresh channel is a new session: its first frame opens a new transition rather than
+    // claiming continuity with whatever a predecessor left behind — including a predecessor's
+    // terminal record, which (being pre-session) does not suppress this session's live frames.
+    writer.interrupt();
     channel_loop(
         &input_rx,
         &mut stdout,
