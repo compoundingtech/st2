@@ -2000,6 +2000,36 @@ fn drain(rx: &Receiver<()>) {
     while rx.try_recv().is_ok() {}
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileWake {
+    Change,
+    Interval,
+    Stop,
+}
+
+fn wait_for_reconcile(rx: &Receiver<()>, interval: Duration, stop: &AtomicBool) -> ReconcileWake {
+    let deadline = Instant::now() + interval;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return ReconcileWake::Stop;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return ReconcileWake::Interval;
+        };
+        let slice = remaining.min(Duration::from_millis(250));
+        match rx.recv_timeout(slice) {
+            Ok(()) => {
+                drain(rx); // coalesce a burst of events into one pass
+                return ReconcileWake::Change;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // A failed best-effort watcher drops the channel's sender. Disconnection must preserve
+            // timer polling rather than turning the outer supervisor loop into a busy loop.
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(slice),
+        }
+    }
+}
+
 fn best_effort_catalog_watcher(
     root: &Path,
     tx: Sender<()>,
@@ -2092,22 +2122,8 @@ fn up_loop_until(
             break;
         }
 
-        // Sleep the interval in 250ms slices, waking early on a folder change or a stop signal.
-        let slices = (interval.as_millis() / 250).max(1);
-        for _ in 0..slices {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(()) => {
-                    drain(&rx); // coalesce a burst of events into one pass
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        if stop.load(Ordering::SeqCst) {
+        // Wait for a declaration change or the timer fallback in stop-responsive slices.
+        if wait_for_reconcile(&rx, interval, stop) == ReconcileWake::Stop {
             break;
         }
     }
@@ -2463,13 +2479,42 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn catalog_watcher_failure_selects_timer_fallback() {
+    fn catalog_watcher_failure_waits_for_timer_while_changes_still_wake_early() {
         let parent = tempfile::tempdir().unwrap();
         let missing_catalog = parent.path().join("missing");
-        let (tx, _rx) = channel();
+        let (tx, rx) = channel();
         assert!(
             best_effort_catalog_watcher(&missing_catalog, tx).is_none(),
             "watch installation failure must leave the timer-only path selected"
+        );
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_reconcile(&rx, Duration::from_millis(20), &AtomicBool::new(false)),
+            ReconcileWake::Interval,
+            "a disconnected watcher channel must wait for the timer instead of spinning"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(15),
+            "timer fallback must consume the interval instead of returning immediately"
+        );
+
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        let spec = agent.join("agent.kdl");
+        std::fs::write(&spec, r#"agent "live" { host "test-host"; command "x" }"#).unwrap();
+        let (tx, rx) = channel();
+        let _watcher = best_effort_catalog_watcher(catalog.path(), tx)
+            .expect("valid declaration catalog must be watched");
+        std::fs::write(
+            &spec,
+            r#"agent "live" { host "test-host"; command "changed" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            wait_for_reconcile(&rx, Duration::from_secs(1), &AtomicBool::new(false)),
+            ReconcileWake::Change,
+            "an ordinary declaration mutation must wake before the timer"
         );
     }
 
