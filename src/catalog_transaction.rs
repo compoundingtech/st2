@@ -767,6 +767,18 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
             SemanticType::String,
             resource.uri(),
         );
+        insert_value(
+            &mut fields,
+            &format!("{root}/reason"),
+            SemanticType::String,
+            resource.reason(),
+        );
+        insert_optional(
+            &mut fields,
+            &format!("{root}/inactive-reason"),
+            SemanticType::String,
+            resource.inactive_reason(),
+        );
     }
     for task in &spec.tasks {
         let kind = match task.kind {
