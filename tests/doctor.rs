@@ -442,3 +442,74 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
         "{stdout}"
     );
 }
+
+#[test]
+fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
+    use st2::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; command "true"; deliver "mcp" }"#,
+    )
+    .unwrap();
+    let agent_dir = declaration.parent().unwrap().to_path_buf();
+    fs::write(agent_dir.join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    // No record: a driver gap is an advisory, never a failing check.
+    let absent = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&absent.stdout);
+    assert!(absent.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("⚠ h.worker observed harness state absent"),
+        "{stdout}"
+    );
+
+    // A fresh live record is a passing check.
+    let mut writer = Writer::new(&agent_dir, "h.worker", "codex", None);
+    writer
+        .observe(Observation::new(
+            Activity::Active,
+            BlockedOn::None,
+            InputBuffer::Unknown,
+        ))
+        .unwrap();
+    let live = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&live.stdout);
+    assert!(live.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("h.worker observed harness state fresh (is `active`)"),
+        "{stdout}"
+    );
+
+    // A terminal record while the declaration wants the seat running is the crashed-seat signal.
+    writer.ended("signal 9").unwrap();
+    let ended = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&ended.stdout);
+    assert!(ended.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("⚠ h.worker observed harness state ended"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("session ended (signal 9)"), "{stdout}");
+
+    // A record that derives `unknown` names its reason, still advisory.
+    fs::write(agent_dir.join("harness-state"), "garbage").unwrap();
+    let indeterminate = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&indeterminate.stdout);
+    assert!(indeterminate.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("⚠ h.worker observed harness state indeterminate"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("(malformed-record)"), "{stdout}");
+}

@@ -1816,9 +1816,9 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             // Observed harness state is advisory-only in doctor: absence names a driver gap and
             // a derived `unknown` names its reason, but neither fails the exit code.
             let observed_path = st2::harness_state::harness_state_path(dir);
-            let probe: &dyn Fn(&str) -> st2::harness_state::SessionLiveness =
-                &st2::ding::session_liveness;
-            match st2::harness_state::read(&observed_path, Some(probe)) {
+            let pty_root = st2::agents::probe_pty_root(&catalog);
+            let probe = |session: &str| st2::ding::session_liveness_in(&pty_root, session);
+            match st2::harness_state::read(&observed_path, Some(&probe)) {
                 None => report_advisory(
                     &format!("{bus_id} observed harness state absent"),
                     "no driver has published a harness-state record for this agent",
@@ -1829,6 +1829,18 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                         &format!(
                             "derived `unknown` ({}) — is its driver still observing the harness?",
                             observed.reason.as_deref().unwrap_or("unstated")
+                        ),
+                    )
+                }
+                Some(observed)
+                    if observed.state == st2::harness_state::Activity::Ended
+                        && spec.desired_state.as_str() == "running" =>
+                {
+                    report_advisory(
+                        &format!("{bus_id} observed harness state ended"),
+                        &format!(
+                            "session ended ({}) while desired state is running — crashed seat?",
+                            observed.exit.as_deref().unwrap_or("exit unstated")
                         ),
                     )
                 }
@@ -2145,7 +2157,7 @@ fn agents_cmd(
             found.errors.len()
         );
     }
-    let mut rows = st2::agents::roster_from_discovered(&found, &host);
+    let mut rows = st2::agents::roster_from_discovered(&found, &root, &host);
     if let Some(identity) = &identity {
         rows.retain(|row| row.identity == *identity);
         anyhow::ensure!(
@@ -2196,8 +2208,10 @@ fn agents_cmd(
 /// The compact observed-harness-state column for human `st2 agents` output. `-` means no record
 /// exists (no driver has published one), which is distinct from a derived `unknown`.
 fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
+    // Prefixed so the observed word is never mistaken for the declared presence beside it —
+    // two bare state words in one row is the exact ambiguity the ontology's collision rules name.
     let Some(observed) = observed else {
-        return "-".to_string();
+        return "obs:-".to_string();
     };
     let mut column = observed.state.as_str().to_string();
     if observed.blocked_on == st2::harness_state::BlockedOn::Human {
@@ -2208,7 +2222,7 @@ fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
     {
         column = format!("unknown({reason})");
     }
-    column
+    format!("obs:{column}")
 }
 
 fn ding_cmd(

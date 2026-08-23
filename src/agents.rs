@@ -46,12 +46,17 @@ pub struct AgentRow {
 /// walks discovered specs and each agent's resources, mutating nothing.
 pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
     let found = crate::discover(catalog_root);
-    roster_from_discovered(&found, this_host)
+    roster_from_discovered(&found, catalog_root, this_host)
 }
 
 /// Project a roster from one immutable discovery result. Exact selectors use this after proving
 /// discovery complete so the uniqueness check and returned metadata describe the same snapshot.
-pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentRow> {
+pub fn roster_from_discovered(
+    found: &Discovered,
+    catalog_root: &Path,
+    this_host: &str,
+) -> Vec<AgentRow> {
+    let pty_root = probe_pty_root(catalog_root);
     let mut rows: Vec<AgentRow> = found
         .specs
         .iter()
@@ -68,7 +73,7 @@ pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentR
                 resources: s.resources.clone(),
                 last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
-                observed: observed_state(s, agent_dir, this_host),
+                observed: observed_state(s, agent_dir, &pty_root, this_host),
             })
         })
         .collect();
@@ -82,15 +87,30 @@ pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentR
 fn observed_state(
     spec: &AgentSpec,
     agent_dir: &Path,
+    pty_root: &Path,
     this_host: &str,
 ) -> Option<harness_state::Observed> {
     let path = harness_state::harness_state_path(agent_dir);
     if spec.resolved_host(this_host) == this_host {
-        let probe: &dyn Fn(&str) -> harness_state::SessionLiveness = &crate::ding::session_liveness;
-        harness_state::read(&path, Some(probe))
+        let probe = |session: &str| crate::ding::session_liveness_in(pty_root, session);
+        harness_state::read(&path, Some(&probe))
     } else {
         harness_state::read(&path, None)
     }
+}
+
+/// The pty registry root the probe reads. Operator shells rarely export PTY_ROOT, while
+/// supervised tasks run under the catalog's own pty root — so the reader derives the runner's
+/// default from the catalog, with the ambient overrides still winning.
+pub fn probe_pty_root(catalog_root: &Path) -> PathBuf {
+    for var in ["PTY_ROOT", "PTY_SESSION_DIR"] {
+        if let Some(dir) = std::env::var_os(var)
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir);
+        }
+    }
+    crate::run::effective_pty_root(catalog_root)
 }
 
 /// The `observedState` object inside a roster row. Vocabulary words are the record's own
@@ -103,9 +123,7 @@ struct ObservedJson<'a> {
     input_buffer: &'a str,
     harness: Option<&'a str>,
     since: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     exit: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
 }
 
@@ -331,11 +349,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","harness":"codex","since":1784653000000}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","harness":"codex","since":1784653000000}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","harness":"codex","since":1784653000000,"exit":null,"reason":null}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -350,7 +368,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","harness":"codex","since":null,"reason":"session-dead"}}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","harness":"codex","since":null,"exit":null,"reason":"session-dead"}}]"#
         );
     }
 }

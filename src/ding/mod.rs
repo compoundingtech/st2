@@ -715,8 +715,18 @@ pub fn session_alive(session: &str) -> bool {
 /// `Indeterminate` — the reader may not share the writer's PTY root — and a pid that exists but
 /// is not signalable (EPERM) is still alive.
 pub fn session_liveness(session: &str) -> crate::harness_state::SessionLiveness {
+    session_liveness_in(&pty_session_dir(), session)
+}
+
+/// [`session_liveness`], probing an explicit registry root instead of the ambient environment —
+/// readers that know the catalog derive the runner's own root rather than requiring PTY_ROOT in
+/// the shell.
+pub fn session_liveness_in(
+    root: &std::path::Path,
+    session: &str,
+) -> crate::harness_state::SessionLiveness {
     use crate::harness_state::SessionLiveness;
-    let pidfile = pty_session_dir().join(format!("{session}.pid"));
+    let pidfile = root.join(format!("{session}.pid"));
     let Ok(raw) = std::fs::read_to_string(&pidfile) else {
         return SessionLiveness::Indeterminate;
     };
@@ -3777,6 +3787,44 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(
             poker.probes.load(Ordering::SeqCst) <= 20,
             "idle DING must sleep at its configured cadence"
+        );
+    }
+
+    #[test]
+    fn session_liveness_probe_reports_only_positive_evidence() {
+        use crate::harness_state::SessionLiveness;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // An unreadable registry proves nothing: missing or garbled pidfiles downgrade nothing.
+        assert_eq!(
+            session_liveness_in(tmp.path(), "absent"),
+            SessionLiveness::Indeterminate
+        );
+        std::fs::write(tmp.path().join("garbled.pid"), "not-a-pid\n").unwrap();
+        assert_eq!(
+            session_liveness_in(tmp.path(), "garbled"),
+            SessionLiveness::Indeterminate
+        );
+
+        // Our own pid is positive evidence of life.
+        std::fs::write(
+            tmp.path().join("live.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(
+            session_liveness_in(tmp.path(), "live"),
+            SessionLiveness::Alive
+        );
+
+        // A reaped child is positive evidence of death (ESRCH).
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(tmp.path().join("dead.pid"), format!("{pid}\n")).unwrap();
+        assert_eq!(
+            session_liveness_in(tmp.path(), "dead"),
+            SessionLiveness::Dead
         );
     }
 }
