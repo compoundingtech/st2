@@ -106,7 +106,15 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     if let Ok(session) = std::env::var(crate::pi_session::CHANNEL_SESSION)
         && !session.is_empty()
     {
-        writer = writer.with_session(session);
+        // Full adopted ownership when the wrapper exported it: the claimed sequence gives the
+        // token a direction, so a straggler channel from a superseded session is refused.
+        writer = match std::env::var(crate::pi_session::CHANNEL_SEQ)
+            .ok()
+            .and_then(|seq| seq.parse::<u64>().ok())
+        {
+            Some(seq) => writer.with_ownership(session, seq),
+            None => writer.with_session(session),
+        };
     }
     writer.interrupt();
     channel_loop(

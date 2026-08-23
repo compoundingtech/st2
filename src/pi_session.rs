@@ -36,6 +36,9 @@ pub const CHANNEL_RUNTIME_ID: &str = "ST2_PI_CHANNEL_RUNTIME_ID";
 /// The session incarnation token the wrapper mints. The channel adopts it so the wrapper's
 /// terminal record owns — and thereby fences — the live records the channel writes.
 pub const CHANNEL_SESSION: &str = "ST2_PI_CHANNEL_SESSION";
+/// The ownership sequence the wrapper claimed at startup — exported beside the token so the
+/// channel's writes act under the same directional claim.
+pub const CHANNEL_SEQ: &str = "ST2_PI_CHANNEL_SEQ";
 
 /// pi's startup network work, which a supervised seat should not be doing.
 ///
@@ -61,7 +64,15 @@ pub fn run(
     let executable =
         std::env::current_exe().context("resolving st2 executable for the pi channel")?;
     let session = harness_state::session_token();
-    let mut env = channel_env(&executable, catalog_root, &identity, &runtime_id, &session)?;
+    let seq = harness_state::claim_seq(&agent_dir);
+    let mut env = channel_env(
+        &executable,
+        catalog_root,
+        &identity,
+        &runtime_id,
+        &session,
+        seq,
+    )?;
     env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
     let set = hooks::verify_required_set().with_context(|| {
         format!(
@@ -80,7 +91,7 @@ pub fn run(
         &STOP,
     )
     .with_context(|| format!("running pi driver '{runtime_id}'"))?;
-    record_session_end(&agent_dir, &identity, &runtime_id, &session, &outcome);
+    record_session_end(&agent_dir, &identity, &runtime_id, &session, seq, &outcome);
     match outcome {
         ProviderOutcome::Exited(exit) => {
             anyhow::ensure!(exit.success(), "pi provider exited with {exit}");
@@ -101,6 +112,7 @@ fn record_session_end(
     identity: &str,
     runtime_id: &str,
     session: &str,
+    seq: u64,
     outcome: &ProviderOutcome,
 ) {
     let label = match outcome {
@@ -109,7 +121,7 @@ fn record_session_end(
     };
     let mut writer =
         harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()))
-            .with_session(session);
+            .with_ownership(session, seq);
     if let Err(error) = writer.ended(label) {
         eprintln!("st2 pi driver: recording session end failed: {error}");
     }
@@ -156,6 +168,7 @@ fn channel_env(
     identity: &str,
     runtime_id: &str,
     session: &str,
+    seq: u64,
 ) -> Result<Vec<(String, String)>> {
     let executable = executable
         .to_str()
@@ -167,6 +180,7 @@ fn channel_env(
         (CHANNEL_IDENTITY.to_string(), identity.to_string()),
         (CHANNEL_RUNTIME_ID.to_string(), runtime_id.to_string()),
         (CHANNEL_SESSION.to_string(), session.to_string()),
+        (CHANNEL_SEQ.to_string(), seq.to_string()),
     ])
 }
 
@@ -232,6 +246,7 @@ mod tests {
             "h.worker",
             "h.worker",
             "session-test",
+            1,
             &ProviderOutcome::Exited(ExitStatus::from_raw(3 << 8)),
         );
 
@@ -250,6 +265,7 @@ mod tests {
             "h.worker",
             "h.worker",
             "session-test",
+            1,
             &ProviderOutcome::Stopped(Some(ExitStatus::from_raw(9))),
         );
         let observed = crate::harness_state::read(&record, None).unwrap();
@@ -332,6 +348,7 @@ mod tests {
             "host.worker",
             "host.worker-task",
             "session-test",
+            7,
         )
         .unwrap();
 
@@ -346,6 +363,7 @@ mod tests {
                     "host.worker-task".to_string()
                 ),
                 (CHANNEL_SESSION.to_string(), "session-test".to_string()),
+                (CHANNEL_SEQ.to_string(), "7".to_string()),
             ]
         );
     }

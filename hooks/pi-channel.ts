@@ -25,6 +25,9 @@ const PROTOCOL = 1;
 const BIN = "ST2_PI_CHANNEL_BIN";
 const CATALOG = "ST2_PI_CHANNEL_CATALOG";
 const IDENTITY = "ST2_PI_CHANNEL_IDENTITY";
+const RUNTIME_ID = "ST2_PI_CHANNEL_RUNTIME_ID";
+const SESSION = "ST2_PI_CHANNEL_SESSION";
+const SEQ = "ST2_PI_CHANNEL_SEQ";
 
 // pi starts the session even if st2 is slow to answer. Restored context is worth a short wait and
 // never worth a hung agent.
@@ -51,6 +54,9 @@ type Stash = {
   bin?: string;
   catalog?: string;
   identity?: string;
+  runtimeId?: string;
+  session?: string;
+  seq?: string;
   child?: childProcess.ChildProcess;
 };
 
@@ -67,21 +73,30 @@ type Stash = {
 const stash = (): Stash => {
   const globals = globalThis as { __st2PiChannel?: Stash };
   if (!globals.__st2PiChannel) {
+    // EVERY ST2_PI_CHANNEL_* value is stashed and unexported — the ownership pair included: a
+    // leaked runtime id or session token would hand a nested pi (or any tool child) this seat's
+    // registry key and record ownership. The channel subprocess receives them explicitly below.
     globals.__st2PiChannel = {
       bin: process.env[BIN],
       catalog: process.env[CATALOG],
       identity: process.env[IDENTITY],
+      runtimeId: process.env[RUNTIME_ID],
+      session: process.env[SESSION],
+      seq: process.env[SEQ],
     };
     delete process.env[BIN];
     delete process.env[CATALOG];
     delete process.env[IDENTITY];
+    delete process.env[RUNTIME_ID];
+    delete process.env[SESSION];
+    delete process.env[SEQ];
   }
   return globals.__st2PiChannel;
 };
 
 export default function (pi: ExtensionAPI) {
   const state = stash();
-  const { bin, catalog, identity } = state;
+  const { bin, catalog, identity, runtimeId, session, seq } = state;
 
   // Always close a NAMED channel, never "whatever is current". A session replacement (/new,
   // /resume, /fork) tears the old session down around the new one's start, so a teardown handler
@@ -112,10 +127,14 @@ export default function (pi: ExtensionAPI) {
     // Closes the channel opened by the PREVIOUS session, whichever extension instance opened it.
     closeChild(state.child);
 
+    const channelEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
+    if (session) channelEnv[SESSION] = session;
+    if (seq) channelEnv[SEQ] = seq;
     const child = childProcess.spawn(
       bin,
       ["--catalog", catalog, "driver", "pi-channel", "--identity", identity],
-      { stdio: ["pipe", "pipe", "inherit"] },
+      { stdio: ["pipe", "pipe", "inherit"], env: channelEnv },
     );
     state.child = child;
 
