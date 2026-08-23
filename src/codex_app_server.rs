@@ -218,7 +218,7 @@ impl CodexObservedState {
     /// ones setting the blocked axis), while holds that only mean "st2 cannot currently prove
     /// anything" project to `None`, the indeterminate observation that writes nothing.
     pub fn harness_observation(&self) -> Option<harness_state::Observation> {
-        use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation};
+        use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
         let observation = |state, blocked_on| {
             // This producer reads the app-server control stream and cannot see the composer.
             Observation::new(state, blocked_on, InputBuffer::Unknown)
@@ -233,15 +233,19 @@ impl CodexObservedState {
                 Some(observation(Activity::Active, BlockedOn::None))
             }
             CodexObservedState::Held { reason, .. } => match reason {
-                CodexHoldReason::Review => {
-                    Some(observation(Activity::Active, BlockedOn::Human).with_reason("review"))
-                }
+                CodexHoldReason::Review => Some(
+                    observation(Activity::Active, BlockedOn::Human)
+                        .with_ask(Ask::Review)
+                        .with_reason("review"),
+                ),
                 CodexHoldReason::WaitingOnApproval => Some(
                     observation(Activity::Active, BlockedOn::Human)
+                        .with_ask(Ask::Permission)
                         .with_reason("waitingOnApproval"),
                 ),
                 CodexHoldReason::WaitingOnUserInput => Some(
                     observation(Activity::Active, BlockedOn::Human)
+                        .with_ask(Ask::Question)
                         .with_reason("waitingOnUserInput"),
                 ),
                 CodexHoldReason::Compaction => {
@@ -407,12 +411,16 @@ impl CodexInboxDelivery {
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
-        let harness_writer = harness_state::Writer::new(
+        let mut harness_writer = harness_state::Writer::new(
             &config.agent_dir,
             config.identity.clone(),
             "codex",
             Some(runtime.runtime_id().to_string()),
         );
+        // A restarted pump is a new session: even a first observation that matches a fresh
+        // predecessor record must open a new transition rather than claim continuity across an
+        // interval nothing observed.
+        harness_writer.interrupt();
         Ok(Self {
             config,
             state_path,
@@ -1304,9 +1312,20 @@ fn run_connected(
     let expected_resume =
         expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
     diagnostics.record("waitingForControlSocket", json!({ "pid": server.id() }))?;
-    let control = connect_control(server, socket_path, STARTUP_TIMEOUT)?;
+    // A stop during startup ends the launch before anything was observed: no TUI exists, the
+    // caller reaps the app-server, and this session leaves no record — its predecessor's ages
+    // out on its own.
+    let Some(control) = connect_control(server, socket_path, STARTUP_TIMEOUT)? else {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "connect" }))?;
+        return Ok(());
+    };
     diagnostics.record("controlSocketConnected", json!({}))?;
     let shutdown = control.try_clone()?;
+    if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialize" }))?;
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Ok(());
+    }
     let websocket = initialize_control(control)?;
     diagnostics.record("controlInitialized", json!({}))?;
     let (events_tx, events_rx) = mpsc::channel();
@@ -1371,10 +1390,16 @@ fn run_connected(
                 .context("starting Codex control resume after the TUI launched")?;
         }
         diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-        wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics).and_then(|_| {
-            diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-            monitor_bound_tui(&mut tui, &events_rx)
-        })
+        match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
+            BindingWait::Bound => {
+                diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+                monitor_bound_tui(&mut tui, &events_rx)
+            }
+            BindingWait::Stopped => {
+                terminate_child(&mut tui);
+                Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()))
+            }
+        }
     })();
     if result.is_err() {
         terminate_child(&mut tui);
@@ -1593,7 +1618,11 @@ fn preflight_hook_trust(
     let result = diagnostics
         .record("hookTrustPreflightStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
-            let control = connect_control(&mut server, socket_path, STARTUP_TIMEOUT)?;
+            let Some(control) = connect_control(&mut server, socket_path, STARTUP_TIMEOUT)? else {
+                // Stop requested mid-preflight: skip the projection — the launch proceeds to the
+                // connect stage, whose own stop check exits gracefully before the TUI starts.
+                return Ok(None);
+            };
             let mut websocket = initialize_control(control)?;
             query_hook_trust_projection(&mut websocket, cwd)
         });
@@ -1887,11 +1916,16 @@ fn connect_control(
     server: &mut Child,
     socket_path: &Path,
     timeout: Duration,
-) -> Result<UnixStream> {
+) -> Result<Option<UnixStream>> {
     let deadline = Instant::now() + timeout;
     loop {
+        // st2's stop path may fire before the control socket ever connects; without this check
+        // the wrapper would sit out the whole startup timeout with SIGTERM already delivered.
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
         match UnixStream::connect(socket_path) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => return Ok(Some(stream)),
             Err(error) if Instant::now() < deadline => {
                 if let Some(status) = server.try_wait()? {
                     anyhow::bail!("Codex app-server exited before control connected: {status}");
@@ -2320,14 +2354,23 @@ fn binding_candidate(message: &Value) -> Result<Option<&str>> {
     }
 }
 
+/// How the binding wait ended: the thread bound, or st2's stop flag ended the session first.
+enum BindingWait {
+    Bound,
+    Stopped,
+}
+
 fn wait_for_binding(
     tui: &mut Child,
     events: &Receiver<ControlEvent>,
     timeout: Duration,
     diagnostics: &mut WrapperDiagnostics,
-) -> Result<()> {
+) -> Result<BindingWait> {
     let deadline = Instant::now() + timeout;
     loop {
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(BindingWait::Stopped);
+        }
         if let Some(status) = tui.try_wait()? {
             anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
         }
@@ -2345,7 +2388,7 @@ fn wait_for_binding(
                 diagnostics.record("tuiThreadLoaded", json!({ "pid": tui.id() }))?;
                 let _ = acknowledge.send(());
             }
-            Ok(ControlEvent::Bound) => return Ok(()),
+            Ok(ControlEvent::Bound) => return Ok(BindingWait::Bound),
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
                 anyhow::bail!("Codex control connection closed before thread binding")
@@ -2852,7 +2895,7 @@ mod tests {
     /// emitting row is asserted positively.
     #[test]
     fn harness_projection_is_faithful_and_withholds_only_unprovable_rows() {
-        use crate::harness_state::{Activity, BlockedOn, InputBuffer};
+        use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer};
         let held = |reason| CodexObservedState::Held {
             reason,
             turn_id: None,
@@ -2886,17 +2929,19 @@ mod tests {
             assert_eq!(observation.input_buffer, InputBuffer::Unknown, "{state:?}");
         }
 
-        // The holds a human resolves set the blocked axis instead of disappearing into active.
-        for reason in [
-            CodexHoldReason::Review,
-            CodexHoldReason::WaitingOnApproval,
-            CodexHoldReason::WaitingOnUserInput,
+        // The holds a human resolves set the blocked axis instead of disappearing into active,
+        // and each names its machine-readable ask kind so consumers never branch on `reason`.
+        for (reason, ask) in [
+            (CodexHoldReason::Review, Ask::Review),
+            (CodexHoldReason::WaitingOnApproval, Ask::Permission),
+            (CodexHoldReason::WaitingOnUserInput, Ask::Question),
         ] {
             let observation = held(reason)
                 .harness_observation()
                 .unwrap_or_else(|| panic!("{reason:?} must emit"));
             assert_eq!(observation.state, Activity::Active, "{reason:?}");
             assert_eq!(observation.blocked_on, BlockedOn::Human, "{reason:?}");
+            assert_eq!(observation.ask, ask, "{reason:?}");
         }
 
         let idle = CodexObservedState::Idle.harness_observation().unwrap();
