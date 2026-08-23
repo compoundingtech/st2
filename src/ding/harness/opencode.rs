@@ -75,7 +75,7 @@ fn locate_composer(plain: &str) -> Option<Composer> {
     })?;
     let footer = (0..closure).rev().find(|index| {
         let line = lines[*index].trim();
-        line.starts_with('┃') && line.contains(" · ") && line.contains("OpenCode")
+        line.starts_with('┃') && line.contains(" · ")
     })?;
     let start = (0..=footer)
         .rev()
@@ -100,13 +100,8 @@ fn locate_composer(plain: &str) -> Option<Composer> {
 }
 
 fn equivalent(observed: &str, expected: &str) -> bool {
-    let compact = |value: &str| {
-        value
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect::<String>()
-    };
-    compact(observed) == compact(expected)
+    let normalized = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized(observed) == normalized(expected)
 }
 
 fn preceding_submitted_box(before_composer: &str, expected: &str) -> bool {
@@ -187,6 +182,7 @@ mod tests {
         for draft in [
             format!("human prefix {EXPECTED}"),
             format!("{EXPECTED} human suffix"),
+            EXPECTED.replace(" from=", "from="),
         ] {
             let modified = screen(&draft, "answer", "ctrl+p commands");
             assert_eq!(
@@ -200,6 +196,22 @@ mod tests {
                 ComposerState::Changed
             );
         }
+    }
+
+    #[test]
+    fn provider_name_does_not_identify_the_opencode_composer() {
+        let anthropic = screen(EXPECTED, "answer", "ctrl+p commands")
+            .replace("MiMo V2.5 Free OpenCode Zen", "Claude Opus 4.1 Anthropic");
+        assert_eq!(
+            OpenCode.classify(
+                &Screen {
+                    raw: &anthropic,
+                    plain: &anthropic
+                },
+                EXPECTED
+            ),
+            ComposerState::ExactSafe
+        );
     }
 
     #[test]
