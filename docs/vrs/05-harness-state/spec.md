@@ -7,10 +7,13 @@ spec's R08 section; terminal delivery remains in
 
 ## Status
 
-Draft. The envelope below is implemented (`src/harness_state.rs`); producers
-and exposure land incrementally under
-[`DELTA-005`](../.delta/DELTA-005-harness-state-specified-ahead-of-full-implementation.md).
-Open questions are tracked in [open-questions.md](./open-questions.md).
+Draft. The envelope (`src/harness_state.rs`), all four producers, the scoped
+delivery-input watcher, and the roster/Doctor exposure are implemented; the
+former DELTA-005 fence is resolved and deleted, and the DQ-H1 and DQ-H6
+captures are taken and folded in. Draft status remains for the genuinely
+unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
+Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
+are tracked in [open-questions.md](./open-questions.md).
 
 ## Scope
 
@@ -112,16 +115,15 @@ Field rules, matching `src/harness_state.rs`:
   re-stamps; `writtenAtMs` is the heartbeat. `transitions` is a monotonic
   counter continued across writer restarts; with `writtenAtMs` it keeps every
   write byte-distinct.
-- Writes are session-owned. A restatement is a no-op only against a record
-  the same session already wrote: a new session's first observation always
-  writes through a matching fresh predecessor (otherwise the takeover never
-  claims the record and the heartbeat-eligibility gate lets it quietly age
-  out mid-turn), and every producer marks its session boundary discontinuous
-  — a long-lived writer starts interrupted, Claude's `SessionStart` hook
-  interrupts — so `sinceMs` never spans a restart. Heartbeats and coalescing
-  never touch a record whose schema or session the writer does not own; a
-  foreign-schema record is left byte-identical by heartbeats and replaced
-  wholesale by a genuine observation.
+- Writes are session-owned by incarnation token. A restatement is a no-op
+  only against a record carrying this session's token, so a takeover — even
+  in the same millisecond — always writes through, opens a fresh transition,
+  and claims heartbeat eligibility; `sinceMs` never spans a restart. In the
+  other direction a lingering predecessor's heartbeat is refused by the same
+  equality, so a straggler cannot keep its successor's record fresh.
+  Heartbeats and coalescing never touch a record whose schema or token the
+  writer does not own; a foreign record is left byte-identical by heartbeats
+  and replaced wholesale by a genuine observation.
 - Deserialization is additive-tolerant (no `deny_unknown_fields`): a reader
   may be older than its writer.
 
@@ -187,7 +189,10 @@ honors st2's stop signal through every startup phase (socket connect,
 initialize, thread binding), not only the bound monitor loop: a stop before
 the TUI exists ends the launch gracefully and leaves no record — nothing was
 observed — while a stop after it exits through the ordinary terminal-write
-path.
+path. A projected transition whose record write fails does not count as
+evidence: it is retained as pending and retried on the next pump pass before
+any heartbeat, so a stale on-disk state is never kept fresh in contradiction
+of the latest observation.
 
 ## Claude producer (OHS-R05, OHS-R06)
 
@@ -217,6 +222,17 @@ driver-declared seats, so both surfaces register identical hooks and a test
 fails if they drift. A live seat converges without disruption: render output
 is not part of the launch fingerprint, the merged settings land on the next
 materialization pass, and the hooks take effect at the next session start.
+The registration merges with `arrays="union"`: user-declared hook entries
+survive every materialization, while st2's own prior entries — recognizable
+by the hook root they reference — are superseded on a hook-set upgrade
+rather than accumulated. Hook writes carry the wrapper's exported
+incarnation token, so a hook finishing after the wrapper reaped Claude
+cannot replace the terminal record. A hooks-only seat (the maintained
+hand-authored example launches claude directly) gets transitions and
+blocked-on-you but no heartbeat owner and no terminal record: a live-but-
+idle seat ages to `unknown` and an exit leaves its last state to age out —
+indeterminate, never wrong — until the seat is routed through the session
+wrapper.
 
 ## pi producer (OHS-R05, OHS-R08)
 
@@ -227,7 +243,10 @@ follow-up turn starts exactly at that boundary (measured against the repo's
 own pi captures). Ownership splits by phase rather than living in one
 process: the channel owns the live record and its heartbeat, because it is
 the one process that sees pi's turn events and its stdio EOF bounds its
-evidence, while the wrapper owns only the terminal record, because it is the
+evidence, while the wrapper owns only the terminal record — through a terminal-only
+observer that never heartbeats but does write `ended` *before* the stop
+path's SIGKILL escalation of its own group, the one write that makes an
+escalated stop observable at all — because it is the
 one process that sees the provider die — and the channel drops queued live
 frames once a terminal record is on disk, so the wrapper's write is the
 incarnation's last word. This is the first producer that satisfies root
@@ -260,7 +279,13 @@ evidence (`/session/status` omits idle sessions, so an empty map over a live
 server is the idle proof, re-read on every SSE (re)connect). Asks open across
 a reconnect are recovered from both pending listings — `GET /permission` and
 `GET /question`, each measured on 1.18.19 — with their ids kept so the
-id-matched exits still release them. A dropped stream stops the heartbeat;
+id-matched exits still release them; the seed counts as successful only when
+the status level and both listings all succeed, otherwise evidence stays off
+and the seed retries, and an unrecognized `session.status` word is not level
+evidence (a future word must not prove idle on a quiet server). The `/doc`
+subset gate names every consumed arm, exit events and pending listings
+included, so a release renaming an exit is refused up front rather than
+holding `blockedOn: human` forever. A dropped stream stops the heartbeat;
 `inputBuffer` stays `unknown` — the `/tui/*` surface is write-only.
 
 The native delivery transport mirrors the Codex FIFO discipline: an
