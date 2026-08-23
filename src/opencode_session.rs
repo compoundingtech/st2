@@ -1,0 +1,1337 @@
+//! Controlled OpenCode launch: presence, observed harness state, and native server delivery.
+//!
+//! OpenCode's interactive TUI is also a server: the wrapper allocates a loopback port and a
+//! per-seat password, launches the TUI bound to them, and speaks plain HTTP to its own child. Two
+//! consumers hang off that surface. The observed-state producer subscribes to the `/event` SSE
+//! stream and projects session status, permission asks, and questions into the generic
+//! `harness-state` record — evidence-gated, so a dropped stream stops the heartbeat and the record
+//! ages out rather than restating a state nobody is watching. The delivery pump mirrors the Codex
+//! FIFO discipline: an `Attempted` receipt is persisted before transport, the transport is
+//! `POST /session/<id>/prompt_async` with a caller-derived stable `messageID`, and the only
+//! accepted receipt is the message read back from the server — never the `/tui/*` endpoints, which
+//! acknowledge input even when no TUI is attached.
+//!
+//! Fail-closed gate: delivery requires both a supported `opencode --version` and a live `/doc`
+//! subset check proving the exact API arms st2 depends on. Observation requires only the `/doc`
+//! check — its vocabulary already degrades to indeterminate on anything unrecognized.
+
+use std::collections::BTreeMap;
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::ExitStatusExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+
+use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
+use crate::{ding, message, status};
+
+/// OpenCode versions whose `/event`, `/session`, and `prompt_async` surfaces were verified.
+/// The live `/doc` check below guards the shape; this list guards the semantics behind it.
+const SUPPORTED_OPENCODE_VERSIONS: [&str; 1] = ["1.18.19"];
+
+const DELIVERY_STATE_SCHEMA: &str = "st2.opencode-delivery-state.v1";
+const STOP_GRACE: Duration = Duration::from_secs(5);
+const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
+const DELIVERY_RETRY: Duration = Duration::from_secs(2);
+const SSE_RECONNECT: Duration = Duration::from_secs(2);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Every API arm the wrapper depends on, as it appears in the served OpenAPI document. A missing
+/// marker names itself in the refusal, so a surface change is a diagnosis rather than a mystery.
+const REQUIRED_API_MARKERS: [&str; 8] = [
+    "prompt_async",
+    "messageID",
+    "session.status",
+    "session.idle",
+    "session.error",
+    "permission.asked",
+    "permission.replied",
+    "question.asked",
+];
+
+pub fn run(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    opencode_argv: Vec<String>,
+) -> Result<()> {
+    let this_host = crate::run::detect_host();
+    let agent_dir = message::resolve_agent_dir(catalog_root, &identity, &this_host)?
+        .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
+    anyhow::ensure!(
+        !opencode_argv.is_empty(),
+        "opencode driver '{runtime_id}' has no provider argv"
+    );
+    let version_ok = match supported_version(&opencode_argv[0]) {
+        Ok(version) => {
+            let ok = SUPPORTED_OPENCODE_VERSIONS.contains(&version.as_str());
+            if !ok {
+                eprintln!(
+                    "st2 opencode-session: version {version} is unverified (supported: {}); native delivery disabled",
+                    SUPPORTED_OPENCODE_VERSIONS.join(", ")
+                );
+            }
+            ok
+        }
+        Err(error) => {
+            eprintln!("st2 opencode-session: cannot read opencode version: {error:#}");
+            false
+        }
+    };
+
+    let port = allocate_port()?;
+    let password = random_password()?;
+    let mut argv = opencode_argv;
+    argv.extend([
+        "--port".to_string(),
+        port.to_string(),
+        "--hostname".to_string(),
+        "127.0.0.1".to_string(),
+    ]);
+    let client = Client::new(port, &password);
+
+    install_signal_handler();
+    let mut child = spawn_provider(&argv, &password)?;
+
+    let session = Session {
+        client,
+        version_ok,
+        status_path: status::status_path(&agent_dir),
+        writer: Writer::new(
+            &agent_dir,
+            identity.clone(),
+            "opencode",
+            Some(identity.clone()),
+        ),
+        delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+    };
+    run_session(session, &mut child, &agent_dir)
+}
+
+// ---- wrapper session loop --------------------------------------------------------------------
+
+struct Session {
+    client: Client,
+    version_ok: bool,
+    status_path: PathBuf,
+    writer: Writer,
+    delivery: Delivery,
+}
+
+fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Result<()> {
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let _watcher = crate::watch::watch_delivery_inputs(agent_dir, wake_tx);
+    let (event_tx, event_rx) = mpsc::channel();
+    let sse_stop = std::sync::Arc::new(AtomicBool::new(false));
+
+    let mut machine = EventMachine::default();
+    let mut api_ok = false;
+    let mut sse_started = false;
+    let mut evidence = false;
+    let mut next_gate_attempt = Instant::now();
+    let mut next_presence = Instant::now();
+    let mut next_inbox = Instant::now();
+
+    let outcome = loop {
+        if STOP.load(Ordering::SeqCst) {
+            // The terminal record precedes the escalation: SIGKILL takes this wrapper with its
+            // group, so nothing after the kill can write (§D of the harness-state design).
+            let _ = session.writer.ended("stopped");
+            break stop_provider_group(child);
+        }
+        if let Some(exit) = child.try_wait().context("checking opencode provider")? {
+            let _ = session.writer.ended(describe_exit(exit));
+            break completed(exit);
+        }
+
+        // The API gate needs the child's server to answer; retry until it does.
+        if !api_ok && Instant::now() >= next_gate_attempt {
+            match session.client.get_json("/doc") {
+                Ok(doc) => match check_openapi_subset(&doc) {
+                    Ok(()) => api_ok = true,
+                    Err(error) => {
+                        eprintln!("st2 opencode-session: API gate failed: {error:#}");
+                        // A failed shape check is terminal for this launch: the surface will not
+                        // change until the binary does. Stop probing; run presence-only.
+                        next_gate_attempt = Instant::now() + Duration::from_secs(3600);
+                    }
+                },
+                Err(_) => next_gate_attempt = Instant::now() + Duration::from_millis(250),
+            }
+        }
+        if api_ok && !sse_started {
+            spawn_sse_reader(session.client.clone(), event_tx.clone(), sse_stop.clone());
+            sse_started = true;
+        }
+
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                SseMessage::Connected => {
+                    machine = EventMachine::default();
+                    seed_from_server(&session.client, &mut machine, &mut session.delivery);
+                    evidence = true;
+                }
+                SseMessage::Disconnected => evidence = false,
+                SseMessage::Event(value) => {
+                    if let Some(sid) = event_session_id(&value) {
+                        session.delivery.saw_session(sid);
+                    }
+                    machine.apply(&value);
+                }
+            }
+        }
+        if evidence && let Some(observation) = machine.observation() {
+            let _ = session.writer.observe(observation);
+        }
+
+        let now = Instant::now();
+        if now >= next_presence {
+            let _ = status::refresh(&session.status_path);
+            if evidence {
+                let _ = session.writer.heartbeat();
+            }
+            next_presence = now + status::STATUS_REFRESH;
+        }
+
+        let mut inbox_due = now >= next_inbox;
+        while wake_rx.try_recv().is_ok() {
+            inbox_due = true;
+        }
+        if inbox_due {
+            if session.version_ok && api_ok {
+                session.delivery.pump(&session.client);
+            }
+            next_inbox = Instant::now() + INBOX_REFRESH_FALLBACK;
+        }
+
+        thread::sleep(PROVIDER_POLL);
+    };
+    sse_stop.store(true, Ordering::SeqCst);
+    outcome
+}
+
+fn spawn_provider(argv: &[String], password: &str) -> Result<Child> {
+    use std::os::unix::process::CommandExt as _;
+    let (program, args) = argv
+        .split_first()
+        .context("opencode provider argv is empty")?;
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .env("OPENCODE_SERVER_PASSWORD", password)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .with_context(|| format!("starting opencode provider {program}"))
+}
+
+fn completed(exit: ExitStatus) -> Result<()> {
+    anyhow::ensure!(exit.success(), "opencode provider exited with {exit}");
+    Ok(())
+}
+
+fn stop_provider_group(child: &mut Child) -> Result<()> {
+    let process_group = unsafe { libc::getpgrp() };
+    anyhow::ensure!(
+        process_group > 1,
+        "refusing to signal process group {process_group}"
+    );
+    unsafe {
+        libc::kill(-process_group, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + STOP_GRACE;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
+fn describe_exit(exit: ExitStatus) -> String {
+    match (exit.code(), exit.signal()) {
+        (Some(code), _) => format!("exit {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "exit unknown".to_string(),
+    }
+}
+
+fn supported_version(binary: &str) -> Result<String> {
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {binary} --version"))?;
+    anyhow::ensure!(output.status.success(), "{binary} --version failed");
+    let version = String::from_utf8_lossy(&output.stdout);
+    let version = version
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    anyhow::ensure!(!version.is_empty(), "{binary} --version printed nothing");
+    Ok(version)
+}
+
+/// Verify the served OpenAPI document still carries every arm st2 consumes. Substring markers are
+/// deliberate: the document nests these identifiers at unstable depths across versions, and the
+/// check must name what went missing rather than fail on structure.
+fn check_openapi_subset(doc: &Value) -> Result<()> {
+    let serialized = serde_json::to_string(doc).unwrap_or_default();
+    let missing: Vec<&str> = REQUIRED_API_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| !serialized.contains(marker))
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "OpenCode /doc no longer offers: {}",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+fn allocate_port() -> Result<u16> {
+    // Bind-then-release: the child rebinds the port. The race window is real but tiny, loopback
+    // only, and a lost race fails the launch loudly at spawn.
+    let listener = TcpListener::bind("127.0.0.1:0").context("allocating opencode port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn random_password() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .context("reading /dev/urandom for the opencode server password")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+// ---- minimal loopback HTTP client ------------------------------------------------------------
+
+/// Plain HTTP/1.1 over loopback with basic auth; one connection per request, `Connection: close`.
+/// The tree ships no HTTP client and the runner is sync by design, so this stays hand-rolled and
+/// exactly as small as the four requests the wrapper makes.
+#[derive(Clone)]
+struct Client {
+    addr: String,
+    auth: String,
+}
+
+impl Client {
+    fn new(port: u16, password: &str) -> Self {
+        Self {
+            addr: format!("127.0.0.1:{port}"),
+            auth: base64(format!("opencode:{password}").as_bytes()),
+        }
+    }
+
+    fn get_json(&self, path: &str) -> Result<Value> {
+        let (status, body) = self.request("GET", path, None)?;
+        anyhow::ensure!(status == 200, "GET {path} returned {status}");
+        serde_json::from_slice(&body).with_context(|| format!("GET {path} returned invalid JSON"))
+    }
+
+    fn status_of_get(&self, path: &str) -> Result<u16> {
+        Ok(self.request("GET", path, None)?.0)
+    }
+
+    fn post_json(&self, path: &str, payload: &Value) -> Result<u16> {
+        Ok(self.request("POST", path, Some(payload))?.0)
+    }
+
+    fn request(&self, method: &str, path: &str, payload: Option<&Value>) -> Result<(u16, Vec<u8>)> {
+        let mut stream = TcpStream::connect(&self.addr)
+            .with_context(|| format!("connecting to opencode at {}", self.addr))?;
+        stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
+        stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+        let body = payload.map(|value| value.to_string()).unwrap_or_default();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            self.addr,
+            self.auth,
+            body.len()
+        )?;
+        let mut reader = BufReader::new(stream);
+        let status = read_http_status(&mut reader)?;
+        let mut line = String::new();
+        while reader.read_line(&mut line)? > 0 {
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            line.clear();
+        }
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body)?;
+        Ok((status, body))
+    }
+
+    fn open_sse(&self) -> Result<BufReader<TcpStream>> {
+        let mut stream = TcpStream::connect(&self.addr)
+            .with_context(|| format!("connecting to opencode at {}", self.addr))?;
+        stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+        write!(
+            stream,
+            "GET /event HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {}\r\nAccept: text/event-stream\r\n\r\n",
+            self.addr, self.auth
+        )?;
+        let mut reader = BufReader::new(stream);
+        let status = read_http_status(&mut reader)?;
+        anyhow::ensure!(status == 200, "GET /event returned {status}");
+        let mut line = String::new();
+        while reader.read_line(&mut line)? > 0 {
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            line.clear();
+        }
+        Ok(reader)
+    }
+}
+
+fn read_http_status(reader: &mut BufReader<TcpStream>) -> Result<u16> {
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .with_context(|| format!("invalid HTTP status line {status_line:?}"))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let buffer = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let combined = u32::from_be_bytes([0, buffer[0], buffer[1], buffer[2]]);
+        for position in 0..4 {
+            if position <= chunk.len() {
+                let index = ((combined >> (18 - 6 * position)) & 0x3f) as usize;
+                out.push(ALPHABET[index] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+// ---- SSE subscription ------------------------------------------------------------------------
+
+enum SseMessage {
+    Connected,
+    Event(Value),
+    Disconnected,
+}
+
+fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc<AtomicBool>) {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match client.open_sse() {
+                Ok(mut reader) => {
+                    if tx.send(SseMessage::Connected).is_err() {
+                        return;
+                    }
+                    let mut data = String::new();
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if let Some(chunk) = trimmed.strip_prefix("data:") {
+                            data.push_str(chunk.trim_start());
+                        } else if trimmed.is_empty() && !data.is_empty() {
+                            if let Ok(event) = serde_json::from_str::<Value>(&data)
+                                && tx.send(SseMessage::Event(event)).is_err()
+                            {
+                                return;
+                            }
+                            data.clear();
+                        }
+                    }
+                    if tx.send(SseMessage::Disconnected).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    if tx.send(SseMessage::Disconnected).is_err() {
+                        return;
+                    }
+                }
+            }
+            thread::sleep(SSE_RECONNECT);
+        }
+    });
+}
+
+/// Re-seed observed state from the level surface after (re)connecting: events missed while
+/// disconnected are unrecoverable, and `/session/status` omits idle sessions, so an empty map over
+/// a live server is itself the idle proof.
+fn seed_from_server(client: &Client, machine: &mut EventMachine, delivery: &mut Delivery) {
+    let Ok(statuses) = client.get_json("/session/status") else {
+        return;
+    };
+    machine.seed_idle();
+    if let Some(map) = statuses.as_object() {
+        for (session_id, status) in map {
+            delivery.saw_session(session_id);
+            if let Some(kind) = status.get("type").and_then(Value::as_str)
+                && kind != "idle"
+            {
+                machine.seed_busy(session_id.clone(), kind == "retry");
+            }
+        }
+    }
+}
+
+// ---- event projection ------------------------------------------------------------------------
+
+/// The pure projection from OpenCode's event stream to one seat-level observation. A dedicated
+/// seat aggregates across the server's sessions: any busy session is activity, any open
+/// permission or question is a human block, and idle is only derived from positive level evidence.
+#[derive(Default)]
+struct EventMachine {
+    /// sessionID → currently retrying (vs plainly busy).
+    busy: BTreeMap<String, bool>,
+    /// permission/question id → what kind of human ask holds it open.
+    blocked: BTreeMap<String, &'static str>,
+    /// Level evidence seen: idle is a proof, never a default.
+    seen_level: bool,
+    /// Terminal reason, once observed.
+    ended: Option<&'static str>,
+    /// The most recent non-terminal session error, surfaced as the idle reason once.
+    last_error: Option<String>,
+}
+
+impl EventMachine {
+    fn seed_idle(&mut self) {
+        self.seen_level = true;
+    }
+
+    fn seed_busy(&mut self, session_id: String, retry: bool) {
+        self.seen_level = true;
+        self.busy.insert(session_id, retry);
+    }
+
+    fn apply(&mut self, event: &Value) {
+        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        let properties = event.get("properties").unwrap_or(&Value::Null);
+        let session_id = || {
+            properties
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        match kind {
+            "session.status" => {
+                let Some(session_id) = session_id() else {
+                    return;
+                };
+                self.seen_level = true;
+                match properties
+                    .pointer("/status/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                {
+                    "busy" => {
+                        self.busy.insert(session_id, false);
+                        self.last_error = None;
+                    }
+                    "retry" => {
+                        self.busy.insert(session_id, true);
+                    }
+                    "idle" => {
+                        self.busy.remove(&session_id);
+                    }
+                    // A future status arm is not evidence of anything; leave state as it was.
+                    _ => {}
+                }
+            }
+            "session.idle" => {
+                if let Some(session_id) = session_id() {
+                    self.seen_level = true;
+                    self.busy.remove(&session_id);
+                }
+            }
+            "session.error" => {
+                let name = properties
+                    .pointer("/error/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if name == "ProviderAuthError" {
+                    self.ended = Some("providerAuth");
+                } else {
+                    if let Some(session_id) = session_id() {
+                        self.busy.remove(&session_id);
+                    }
+                    self.seen_level = true;
+                    self.last_error = Some(format!("error:{name}"));
+                }
+            }
+            "permission.asked" => {
+                if let Some(id) = ask_id(properties) {
+                    self.blocked.insert(id, "permission");
+                }
+            }
+            "permission.replied" => {
+                if let Some(id) = ask_id(properties) {
+                    self.blocked.remove(&id);
+                }
+            }
+            "question.asked" => {
+                if let Some(id) = ask_id(properties) {
+                    self.blocked.insert(id, "question");
+                }
+            }
+            "question.replied" | "question.rejected" => {
+                if let Some(id) = ask_id(properties) {
+                    self.blocked.remove(&id);
+                }
+            }
+            // server.connected, server.heartbeat, plugin.added replay, message.*, … — not state.
+            _ => {}
+        }
+    }
+
+    fn observation(&self) -> Option<Observation> {
+        if let Some(reason) = self.ended {
+            return Some(
+                Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
+                    .with_reason(reason),
+            );
+        }
+        if let Some(kind) = self.blocked.values().next() {
+            return Some(
+                Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                    .with_reason(*kind),
+            );
+        }
+        if !self.busy.is_empty() {
+            let observation =
+                Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Unknown);
+            return Some(if self.busy.values().all(|retry| *retry) {
+                observation.with_reason("retry")
+            } else {
+                observation
+            });
+        }
+        if self.seen_level {
+            let observation =
+                Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown);
+            return Some(match &self.last_error {
+                Some(reason) => observation.with_reason(reason.clone()),
+                None => observation,
+            });
+        }
+        None
+    }
+}
+
+/// A permission/question id, wherever this version of the event nests it.
+fn ask_id(properties: &Value) -> Option<String> {
+    for pointer in ["/id", "/permission/id", "/question/id"] {
+        if let Some(id) = properties.pointer(pointer).and_then(Value::as_str) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn event_session_id(event: &Value) -> Option<&str> {
+    let kind = event.get("type").and_then(Value::as_str)?;
+    if !kind.starts_with("session.") {
+        return None;
+    }
+    event
+        .pointer("/properties/sessionID")
+        .and_then(Value::as_str)
+}
+
+// ---- native delivery -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum DeliveryPhase {
+    Attempted,
+    Accepted,
+}
+
+/// One durable FIFO delivery attempt, written before transport (the Codex discipline). The stable
+/// `messageID` makes a replayed attempt reconcilable: the server either shows the message durably
+/// (accepted) or does not (retry the same identity, never a second one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeliveryState {
+    schema: String,
+    agent: String,
+    runtime_id: String,
+    session_id: String,
+    filename: String,
+    message_id: String,
+    phase: DeliveryPhase,
+}
+
+struct Delivery {
+    catalog_root: PathBuf,
+    inbox: PathBuf,
+    status_path: PathBuf,
+    this_host: String,
+    identity: String,
+    runtime_id: String,
+    state_path: PathBuf,
+    state: Option<DeliveryState>,
+    /// The session a new delivery binds to: the most recently observed one.
+    target_session: Option<String>,
+    next_attempt: Instant,
+}
+
+impl Delivery {
+    fn new(
+        catalog_root: &Path,
+        agent_dir: &Path,
+        this_host: &str,
+        identity: &str,
+        runtime_id: &str,
+    ) -> Self {
+        let state_path = state_dir(catalog_root, identity).join("delivery-state.json");
+        Self::with_state_path(
+            catalog_root,
+            agent_dir,
+            this_host,
+            identity,
+            runtime_id,
+            state_path,
+        )
+    }
+
+    fn with_state_path(
+        catalog_root: &Path,
+        agent_dir: &Path,
+        this_host: &str,
+        identity: &str,
+        runtime_id: &str,
+        state_path: PathBuf,
+    ) -> Self {
+        let state = std::fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DeliveryState>(&bytes).ok())
+            .filter(|state| {
+                state.schema == DELIVERY_STATE_SCHEMA
+                    && state.agent == identity
+                    && message::is_message_filename(&state.filename)
+                    && state.message_id
+                        == stable_message_id(identity, &state.session_id, &state.filename)
+            });
+        Self {
+            catalog_root: catalog_root.to_path_buf(),
+            inbox: message::inbox_dir(agent_dir),
+            status_path: status::status_path(agent_dir),
+            this_host: this_host.to_string(),
+            identity: identity.to_string(),
+            runtime_id: runtime_id.to_string(),
+            state_path,
+            state,
+            target_session: None,
+            next_attempt: Instant::now(),
+        }
+    }
+
+    fn saw_session(&mut self, session_id: &str) {
+        self.target_session = Some(session_id.to_string());
+    }
+
+    fn pump(&mut self, client: &Client) {
+        if let Err(error) = self.pump_inner(client) {
+            eprintln!("st2 opencode-session: delivery: {error:#}");
+        }
+    }
+
+    fn pump_inner(&mut self, client: &Client) -> Result<()> {
+        let unread = message::list_inbox(&self.inbox)?;
+        if let Some(state) = self.state.as_ref()
+            && unread
+                .iter()
+                .all(|message| message.filename != state.filename)
+        {
+            self.clear_state()?;
+        }
+        if status::read_state(&self.status_path) == status::State::Dnd {
+            return Ok(());
+        }
+        let Some(head) = unread.into_iter().next() else {
+            return Ok(());
+        };
+        let Some(target) = self.target_session.clone() else {
+            return Ok(());
+        };
+        if let Some(state) = self.state.as_ref()
+            && state.session_id != target
+        {
+            // A newly selected session is a different delivery binding (the Codex thread rule).
+            self.clear_state()?;
+        }
+
+        if let Some(state) = self.state.clone() {
+            if state.filename != head.filename {
+                return Ok(()); // The bound message is behind the head; archive precedence resolves it.
+            }
+            match state.phase {
+                DeliveryPhase::Accepted => return Ok(()),
+                DeliveryPhase::Attempted => return self.reconcile_or_retry(client, state),
+            }
+        }
+
+        let message_id = stable_message_id(&self.identity, &target, &head.filename);
+        let state = DeliveryState {
+            schema: DELIVERY_STATE_SCHEMA.to_string(),
+            agent: self.identity.clone(),
+            runtime_id: self.runtime_id.clone(),
+            session_id: target,
+            filename: head.filename.clone(),
+            message_id,
+            phase: DeliveryPhase::Attempted,
+        };
+        self.write_state(state.clone())?;
+        let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
+        self.send(client, &state, &text)
+    }
+
+    fn reconcile_or_retry(&mut self, client: &Client, state: DeliveryState) -> Result<()> {
+        if self.message_durable(client, &state)? {
+            let mut accepted = state;
+            accepted.phase = DeliveryPhase::Accepted;
+            return self.write_state(accepted);
+        }
+        if Instant::now() < self.next_attempt {
+            return Ok(());
+        }
+        let unread = message::list_inbox(&self.inbox)?;
+        let Some(head) = unread
+            .into_iter()
+            .find(|message| message.filename == state.filename)
+        else {
+            return Ok(());
+        };
+        let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
+        self.send(client, &state, &text)
+    }
+
+    fn send(&mut self, client: &Client, state: &DeliveryState, text: &str) -> Result<()> {
+        self.next_attempt = Instant::now() + DELIVERY_RETRY;
+        let payload = json!({
+            "messageID": state.message_id,
+            "parts": [{ "type": "text", "text": text }],
+        });
+        let path = format!("/session/{}/prompt_async", state.session_id);
+        let status = client.post_json(&path, &payload)?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "POST {path} returned {status}"
+        );
+        if self.message_durable(client, state)? {
+            let mut accepted = state.clone();
+            accepted.phase = DeliveryPhase::Accepted;
+            self.write_state(accepted)?;
+        }
+        Ok(())
+    }
+
+    /// The only receipt this transport accepts: the exact client message read back durably.
+    fn message_durable(&self, client: &Client, state: &DeliveryState) -> Result<bool> {
+        let path = format!("/session/{}/message/{}", state.session_id, state.message_id);
+        Ok(client.status_of_get(&path)? == 200)
+    }
+
+    fn write_state(&mut self, state: DeliveryState) -> Result<()> {
+        atomic_json(&self.state_path, &state)?;
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn clear_state(&mut self) -> Result<()> {
+        match std::fs::remove_file(&self.state_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.state = None;
+        Ok(())
+    }
+}
+
+fn stable_message_id(recipient: &str, session_id: &str, filename: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"st2.opencode-client-message.v1");
+    for value in [
+        recipient.as_bytes(),
+        session_id.as_bytes(),
+        filename.as_bytes(),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    // OpenCode message ids match `^msg`; a hex tail keeps the identity stable and grammatical.
+    format!("msg{:.26}", format!("{:x}", hash.finalize()))
+}
+
+fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut hash = Sha256::new();
+    for value in [
+        catalog_root.as_os_str().as_encoded_bytes(),
+        identity.as_bytes(),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let digest = format!("{:x}", hash.finalize());
+    base.join("st2").join("opencode").join(&digest[..24])
+}
+
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path.parent().context("state file has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".{}.tmp", std::process::id()));
+    std::fs::write(&temp, serde_json::to_vec(value)?)?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    fn event(raw: &str) -> Value {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn observed(machine: &EventMachine) -> Observation {
+        machine.observation().expect("an observation")
+    }
+
+    #[test]
+    fn no_evidence_yields_no_observation_so_nothing_is_written() {
+        let mut machine = EventMachine::default();
+        assert_eq!(machine.observation(), None);
+        // Replay noise on connect is not evidence either.
+        for noise in [
+            r#"{"type":"server.connected","properties":{}}"#,
+            r#"{"type":"server.heartbeat","properties":{}}"#,
+            r#"{"type":"plugin.added","properties":{"name":"x"}}"#,
+            r#"{"type":"message.updated","properties":{"sessionID":"ses_a"}}"#,
+        ] {
+            machine.apply(&event(noise));
+        }
+        assert_eq!(machine.observation(), None);
+    }
+
+    #[test]
+    fn session_status_drives_active_and_idle_across_sessions() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+        ));
+        assert_eq!(observed(&machine).state, Activity::Active);
+
+        // A second idle session does not mask the busy one (aggregate rule)…
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_b","status":{"type":"idle"}}}"#,
+        ));
+        assert_eq!(observed(&machine).state, Activity::Active);
+
+        // …and duplicates are idempotent.
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+        ));
+        machine.apply(&event(
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#,
+        ));
+        let idle = observed(&machine);
+        assert_eq!(idle.state, Activity::Idle);
+        assert_eq!(idle.blocked_on, BlockedOn::None);
+    }
+
+    #[test]
+    fn retry_reads_active_with_a_reason() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"retry","attempt":2}}}"#,
+        ));
+        let retrying = observed(&machine);
+        assert_eq!(retrying.state, Activity::Active);
+        assert_eq!(retrying.reason.as_deref(), Some("retry"));
+    }
+
+    #[test]
+    fn permission_blocks_until_the_same_id_is_replied() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+        ));
+        machine.apply(&event(
+            r#"{"type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_a"}}"#,
+        ));
+        let blocked = observed(&machine);
+        assert_eq!(blocked.state, Activity::Active);
+        assert_eq!(blocked.blocked_on, BlockedOn::Human);
+        assert_eq!(blocked.reason.as_deref(), Some("permission"));
+
+        // A different id resolving is not this ask's exit edge.
+        machine.apply(&event(
+            r#"{"type":"permission.replied","properties":{"id":"per_other"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
+
+        machine.apply(&event(
+            r#"{"type":"permission.replied","properties":{"id":"per_1"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
+        assert_eq!(observed(&machine).state, Activity::Active);
+    }
+
+    #[test]
+    fn questions_block_like_permissions_and_rejection_releases() {
+        let mut machine = EventMachine::default();
+        machine.seed_idle();
+        machine.apply(&event(
+            r#"{"type":"question.asked","properties":{"id":"que_1","sessionID":"ses_a"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
+        assert_eq!(observed(&machine).reason.as_deref(), Some("question"));
+        machine.apply(&event(
+            r#"{"type":"question.rejected","properties":{"id":"que_1"}}"#,
+        ));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
+    }
+
+    #[test]
+    fn provider_auth_error_is_terminal_and_other_errors_settle_to_idle_with_a_reason() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+        ));
+        machine.apply(&event(
+            r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"MessageAbortedError"}}}"#,
+        ));
+        let idle = observed(&machine);
+        assert_eq!(idle.state, Activity::Idle);
+        assert_eq!(idle.reason.as_deref(), Some("error:MessageAbortedError"));
+
+        machine.apply(&event(
+            r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ProviderAuthError"}}}"#,
+        ));
+        let ended = observed(&machine);
+        assert_eq!(ended.state, Activity::Ended);
+        assert_eq!(ended.reason.as_deref(), Some("providerAuth"));
+    }
+
+    #[test]
+    fn openapi_gate_names_every_missing_marker() {
+        let complete: Value = serde_json::from_str(&format!(
+            r#"{{"paths":{{}},"markers":{:?}}}"#,
+            REQUIRED_API_MARKERS
+        ))
+        .unwrap();
+        check_openapi_subset(&complete).unwrap();
+
+        let error = check_openapi_subset(&serde_json::json!({"paths": {"/session": {}}}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prompt_async"), "{error}");
+        assert!(error.contains("permission.asked"), "{error}");
+    }
+
+    #[test]
+    fn stable_message_ids_are_grammatical_and_distinct_per_binding() {
+        let id = stable_message_id("h.worker", "ses_a", "1786380000000-abc123.md");
+        assert!(id.starts_with("msg"));
+        assert_eq!(
+            id,
+            stable_message_id("h.worker", "ses_a", "1786380000000-abc123.md")
+        );
+        for other in [
+            stable_message_id("h.other", "ses_a", "1786380000000-abc123.md"),
+            stable_message_id("h.worker", "ses_b", "1786380000000-abc123.md"),
+            stable_message_id("h.worker", "ses_a", "1786380000000-def456.md"),
+        ] {
+            assert_ne!(id, other);
+        }
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        for (input, expected) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"opencode:pw", "b3BlbmNvZGU6cHc="),
+        ] {
+            assert_eq!(base64(input), expected, "{input:?}");
+        }
+    }
+
+    // ---- fake-server delivery tests ----------------------------------------------------------
+
+    struct FakeServer {
+        port: u16,
+        /// Every messageID a prompt_async POST carried, accepted or not.
+        posts: Arc<Mutex<Vec<String>>>,
+        /// messageIDs the server will report durable.
+        durable: Arc<Mutex<BTreeSet<String>>>,
+        accept_posts: Arc<AtomicBool>,
+    }
+
+    fn spawn_fake_server() -> FakeServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let durable = Arc::new(Mutex::new(BTreeSet::new()));
+        let accept_posts = Arc::new(AtomicBool::new(true));
+        let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0_usize;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                    line.clear();
+                }
+                let mut body = vec![0_u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let mut parts = request_line.split_whitespace();
+                let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let status = if method == "POST" && path.ends_with("/prompt_async") {
+                    let message_id =
+                        serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("messageID")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            });
+                    match message_id {
+                        Some(message_id) => {
+                            posts_t.lock().unwrap().push(message_id.clone());
+                            if accept_t.load(Ordering::SeqCst) {
+                                durable_t.lock().unwrap().insert(message_id);
+                                200
+                            } else {
+                                500
+                            }
+                        }
+                        None => 400,
+                    }
+                } else if method == "GET" && path.contains("/message/") {
+                    let message_id = path.rsplit('/').next().unwrap_or("");
+                    if durable_t.lock().unwrap().contains(message_id) {
+                        200
+                    } else {
+                        404
+                    }
+                } else if method == "GET" && path == "/session/status" {
+                    200
+                } else {
+                    404
+                };
+                let mut stream = reader.into_inner();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        FakeServer {
+            port,
+            posts,
+            durable,
+            accept_posts,
+        }
+    }
+
+    fn delivery_fixture(tmp: &Path, state_path: PathBuf) -> (Delivery, String) {
+        let agent_dir = tmp.join("agents/h/worker");
+        let inbox = message::inbox_dir(&agent_dir);
+        std::fs::create_dir_all(&inbox).unwrap();
+        let filename =
+            message::send_to_inbox(&inbox, "h.sender", Some("subject"), None, &[], "body").unwrap();
+        let mut delivery =
+            Delivery::with_state_path(tmp, &agent_dir, "h", "h.worker", "h.worker", state_path);
+        delivery.saw_session("ses_target");
+        (delivery, filename)
+    }
+
+    #[test]
+    fn delivery_attempts_before_transport_and_accepts_only_the_read_back_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+
+        delivery.pump(&client);
+        let expected_id = stable_message_id("h.worker", "ses_target", &filename);
+        assert_eq!(
+            server.posts.lock().unwrap().as_slice(),
+            [expected_id.clone()]
+        );
+        let state: DeliveryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(state.message_id, expected_id);
+
+        // Accepted is terminal for this file: further pumps send nothing.
+        delivery.pump(&client);
+        delivery.pump(&client);
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stale_attempt_reconciles_by_reading_back_instead_of_resending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (_, filename) = delivery_fixture(tmp.path(), state_path.clone());
+
+        // A prior incarnation attempted this exact delivery and the server made it durable.
+        let message_id = stable_message_id("h.worker", "ses_target", &filename);
+        server.durable.lock().unwrap().insert(message_id.clone());
+        atomic_json(
+            &state_path,
+            &DeliveryState {
+                schema: DELIVERY_STATE_SCHEMA.to_string(),
+                agent: "h.worker".to_string(),
+                runtime_id: "h.worker".to_string(),
+                session_id: "ses_target".to_string(),
+                filename,
+                message_id: message_id.clone(),
+                phase: DeliveryPhase::Attempted,
+            },
+        )
+        .unwrap();
+
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let mut delivery = Delivery::with_state_path(
+            tmp.path(),
+            &agent_dir,
+            "h",
+            "h.worker",
+            "h.worker",
+            state_path.clone(),
+        );
+        delivery.saw_session("ses_target");
+        delivery.pump(&client);
+
+        assert!(server.posts.lock().unwrap().is_empty(), "must not resend");
+        let state: DeliveryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state.phase, DeliveryPhase::Accepted);
+    }
+
+    #[test]
+    fn a_failed_transport_retries_the_same_identity_never_a_second_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        server.accept_posts.store(false, Ordering::SeqCst);
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+
+        delivery.pump(&client);
+        let state: DeliveryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state.phase, DeliveryPhase::Attempted);
+
+        server.accept_posts.store(true, Ordering::SeqCst);
+        delivery.next_attempt = Instant::now();
+        delivery.pump(&client);
+
+        let expected_id = stable_message_id("h.worker", "ses_target", &filename);
+        assert_eq!(
+            server.posts.lock().unwrap().as_slice(),
+            [expected_id.clone(), expected_id]
+        );
+        let state: DeliveryState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state.phase, DeliveryPhase::Accepted);
+    }
+
+    #[test]
+    fn dnd_suppresses_delivery_and_a_missing_target_session_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _) = delivery_fixture(tmp.path(), state_path);
+
+        let agent_dir = tmp.path().join("agents/h/worker");
+        status::set_state(&status::status_path(&agent_dir), status::State::Dnd).unwrap();
+        delivery.pump(&client);
+        assert!(server.posts.lock().unwrap().is_empty());
+
+        status::set_state(&status::status_path(&agent_dir), status::State::Available).unwrap();
+        delivery.target_session = None;
+        delivery.pump(&client);
+        assert!(
+            server.posts.lock().unwrap().is_empty(),
+            "no session yet: wait, never create"
+        );
+    }
+}

@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_spec::spec::{
-    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, PiDriver, TaskKind, TaskLifecycle,
+    ClaudeDriver, CodexDriver, DeliveryTransport, Driver, OpenCodeDriver, PiDriver, TaskKind,
+    TaskLifecycle,
 };
 use agent_spec::{
     AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
@@ -675,6 +676,41 @@ args = ["--tools", "read,bash,edit,write"]
 }"#,
     );
 
+    write(
+        tmp.path(),
+        "agents/h/opencode-kdl/agent.kdl",
+        r#"agent "opencode-kdl" {
+  opencode {
+    model "anthropic/claude-opus-5"
+    prompt "Start the assigned work."
+    args "--agent" "build"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/opencode-toml/agent.toml",
+        r#"identity = "opencode-toml"
+
+[opencode]
+model = "anthropic/claude-opus-5"
+prompt = "Start the assigned work."
+args = ["--agent", "build"]
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/opencode-json/agent.json",
+        r#"{
+  "identity": "opencode-json",
+  "opencode": {
+    "model": "anthropic/claude-opus-5",
+    "prompt": "Start the assigned work.",
+    "args": ["--agent", "build"]
+  }
+}"#,
+    );
+
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let claude = Driver::Claude(ClaudeDriver {
@@ -711,6 +747,16 @@ args = ["--tools", "read,bash,edit,write"]
         assert_eq!(spec.driver.as_ref(), Some(&pi));
         assert!(!spec.is_runnable());
     }
+    let opencode = Driver::OpenCode(OpenCodeDriver {
+        model: Some("anthropic/claude-opus-5".into()),
+        prompt: "Start the assigned work.".into(),
+        args: vec!["--agent".into(), "build".into()],
+    });
+    for identity in ["opencode-kdl", "opencode-toml", "opencode-json"] {
+        let spec = find(&found.specs, identity);
+        assert_eq!(spec.driver.as_ref(), Some(&opencode));
+        assert!(!spec.is_runnable());
+    }
 }
 
 #[test]
@@ -734,6 +780,19 @@ fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
         ),
         ("codex-dev", r#"codex { dev-channels #true; prompt "go" }"#),
         ("unknown", r#"claude { presence #true; prompt "go" }"#),
+        (
+            "pi-and-opencode",
+            r#"pi { prompt "go" }; opencode { prompt "go" }"#,
+        ),
+        (
+            "opencode-effort",
+            r#"opencode { effort "high"; prompt "go" }"#,
+        ),
+        (
+            "opencode-dev",
+            r#"opencode { dev-channels #true; prompt "go" }"#,
+        ),
+        ("opencode-missing-prompt", r#"opencode { model "x/y" }"#),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         write(

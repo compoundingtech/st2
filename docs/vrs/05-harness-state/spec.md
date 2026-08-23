@@ -197,13 +197,43 @@ signal" clause for any harness. pi's composer offers nothing to scrape, so
 
 ## OpenCode producer (OHS-R08)
 
-OpenCode currently has only a DING composer adapter — no typed driver, no
-session wrapper, no presence lease. Parity lands in dependency order: the
-`Driver` variant and expansion, an `opencode-session` wrapper owning presence
-and the observed-state record, the producer from whatever source experiments
-verify (`DQ-H6` — the server/SDK event surface is the candidate; screen
-observation with documented limits is the fallback), and a native delivery
-transport designed against #242's contract shape.
+OpenCode's interactive TUI is also a server, so the driver needs no screen
+observation at all (measured on 1.18.19 —
+`.experiments/2026-08-23-opencode-surface.md`). The `opencode-session` wrapper
+allocates a loopback port and a per-seat password, launches the TUI bound to
+them, owns the presence lease and the observed-state record, and projects the
+`/event` SSE stream:
+
+| Signal | state | blockedOn | reason |
+|---|---|---|---|
+| `session.status {type: busy}` | `active` | `none` | — |
+| `session.status {type: retry}` | `active` | `none` | `retry` |
+| `session.status {type: idle}` / `session.idle` | `idle` | `none` | — |
+| `permission.asked` … `permission.replied` (same id) | `active` | `human` | `permission` |
+| `question.asked` … `question.replied\|rejected` (same id) | `active` | `human` | `question` |
+| `session.error {ProviderAuthError}` | `ended` | `none` | `providerAuth` |
+| `session.error` (other arms) | `idle` | `none` | `error:<name>` |
+| child exit / stop path | `ended` | `none` | exit status |
+
+A dedicated seat aggregates across the server's sessions: any busy session is
+activity, any open ask is a human block, and idle requires positive level
+evidence (`/session/status` omits idle sessions, so an empty map over a live
+server is the idle proof, re-read on every SSE (re)connect). A dropped stream
+stops the heartbeat; `inputBuffer` stays `unknown` — the `/tui/*` surface is
+write-only.
+
+The native delivery transport mirrors the Codex FIFO discipline: an
+`Attempted` receipt persisted before transport, `POST
+/session/<id>/prompt_async` with a stable caller `messageID` derived from
+(identity, session, filename), and acceptance only when the exact message
+reads back durably from the server. The `/tui/append-prompt` and
+`/tui/submit-prompt` endpoints acknowledge input even with no TUI attached
+(measured) and are therefore never a receipt. Delivery is fail-closed behind
+two gates: a `SUPPORTED_OPENCODE_VERSIONS` pin and a live `/doc` OpenAPI
+subset check naming every arm st2 consumes; observation runs behind the
+`/doc` check alone, since its vocabulary already degrades to indeterminate.
+Deliveries target the most recently observed session; a seat whose TUI has not
+yet created one waits rather than creating sessions itself.
 
 ## Exposure (OHS-R09, OHS-R10)
 

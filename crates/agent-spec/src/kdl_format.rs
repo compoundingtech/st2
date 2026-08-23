@@ -8,7 +8,9 @@
 //! ignored.
 
 use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
-use crate::spec::{ClaudeDriver, CodexDriver, PiDriver, RawResource, RawRestart, RawSpec, RawTask};
+use crate::spec::{
+    ClaudeDriver, CodexDriver, OpenCodeDriver, PiDriver, RawResource, RawRestart, RawSpec, RawTask,
+};
 
 /// Lower an already parsed declaration document into the runner's raw representation.
 pub(crate) fn lower_declared_document(document: &DeclaredDocument) -> anyhow::Result<Vec<RawSpec>> {
@@ -163,6 +165,13 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                     "agent declares `pi` more than once"
                 );
                 raw.driver.pi = Some(pi_driver_node_to_raw(child)?);
+            }
+            "opencode" => {
+                anyhow::ensure!(
+                    raw.driver.opencode.is_none(),
+                    "agent declares `opencode` more than once"
+                );
+                raw.driver.opencode = Some(opencode_driver_node_to_raw(child)?);
             }
             "env" => {}
             "pty" => {
@@ -338,6 +347,19 @@ fn pi_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<PiDriver> {
     Ok(PiDriver {
         model,
         effort,
+        prompt,
+        args,
+    })
+}
+
+fn opencode_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<OpenCodeDriver> {
+    let (model, effort, _, prompt, args) = common_driver_fields(node, "opencode", false)?;
+    anyhow::ensure!(
+        effort.is_none(),
+        "agent `opencode` has unsupported field `effort` (OpenCode has no effort axis)"
+    );
+    Ok(OpenCodeDriver {
+        model,
         prompt,
         args,
     })

@@ -376,6 +376,16 @@ enum DriverCmd {
         #[arg(long)]
         identity: String,
     },
+    /// Run OpenCode under the session-owned wrapper: presence, observed harness state, and native
+    /// server delivery over the wrapper-allocated local port.
+    OpencodeSession {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1072,6 +1082,15 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_session::run_observe(&catalog, &identity, runtime_id.as_deref(), &event)
+        }
+        Command::Driver(DriverCmd::OpencodeSession {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::opencode_session::run(&catalog, identity, runtime_id, argv)
         }
         Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
             let catalog = catalog_arg(None)?;

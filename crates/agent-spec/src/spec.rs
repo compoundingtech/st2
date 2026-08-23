@@ -78,6 +78,7 @@ pub enum Driver {
     Claude(ClaudeDriver),
     Codex(CodexDriver),
     Pi(PiDriver),
+    OpenCode(OpenCodeDriver),
 }
 
 impl Driver {
@@ -86,6 +87,7 @@ impl Driver {
             Self::Claude(_) => "claude",
             Self::Codex(_) => "codex",
             Self::Pi(_) => "pi",
+            Self::OpenCode(_) => "opencode",
         }
     }
 }
@@ -123,6 +125,19 @@ pub struct PiDriver {
 pub struct CodexDriver {
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Typed fields accepted by an `opencode {}` driver block.
+///
+/// OpenCode has no effort axis; its permission policy lives in its config file rather than a
+/// launch flag, so neither appears here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OpenCodeDriver {
+    pub model: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -563,6 +578,7 @@ pub(crate) struct RawDriver {
     pub(crate) claude: Option<ClaudeDriver>,
     pub(crate) codex: Option<CodexDriver>,
     pub(crate) pi: Option<PiDriver>,
+    pub(crate) opencode: Option<OpenCodeDriver>,
 }
 
 impl RawDriver {
@@ -577,6 +593,9 @@ impl RawDriver {
         }
         if let Some(driver) = self.pi {
             declared.push(("pi", Driver::Pi(driver)));
+        }
+        if let Some(driver) = self.opencode {
+            declared.push(("opencode", Driver::OpenCode(driver)));
         }
         match declared.len() {
             0 => Ok(None),

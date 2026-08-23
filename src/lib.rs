@@ -28,6 +28,7 @@ pub mod host_lock;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
+pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
 pub mod pi_session;
