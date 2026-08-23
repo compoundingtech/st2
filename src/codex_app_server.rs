@@ -418,19 +418,31 @@ impl CodexInboxDelivery {
         // the wrapper's terminal writer are the same session and must own the same records. The
         // claim is a WRITTEN act — it atomically supersedes whatever a predecessor left,
         // including a still-fresh live record the pty-name probe cannot distinguish.
-        let claimed_seq = harness_state::claim(
-            &config.agent_dir,
-            config.identity.clone(),
-            "codex",
-            runtime.incarnation(),
-        )?;
-        let harness_writer = harness_state::Writer::new(
-            &config.agent_dir,
-            config.identity.clone(),
-            "codex",
-            Some(runtime.runtime_id().to_string()),
-        )
-        .with_ownership(runtime.incarnation(), claimed_seq);
+        // Observability must never kill the launch: a claim that cannot be written degrades to
+        // a token-only writer (refused by records it does not own, so it can only under-report)
+        // with a warning, and delivery proceeds.
+        let harness_writer = {
+            let writer = harness_state::Writer::new(
+                &config.agent_dir,
+                config.identity.clone(),
+                "codex",
+                Some(runtime.runtime_id().to_string()),
+            );
+            match harness_state::claim(
+                &config.agent_dir,
+                config.identity.clone(),
+                "codex",
+                runtime.incarnation(),
+            ) {
+                Ok(claimed_seq) => writer.with_ownership(runtime.incarnation(), claimed_seq),
+                Err(error) => {
+                    eprintln!(
+                        "st2 codex: observed-state claim failed; degrading to token-only: {error:#}"
+                    );
+                    writer.with_session(runtime.incarnation())
+                }
+            }
+        };
         Ok(Self {
             config,
             state_path,
@@ -1421,6 +1433,26 @@ fn run_connected(
             drop(resume_ready_tx);
             let _ = shutdown.shutdown(Shutdown::Both);
             let _ = event_thread.join();
+            // The claim already wrote its ended(superseded) placeholder; leaving that as the
+            // last word would read as "another session took over". The launch failure is this
+            // session's real terminal outcome — token-only adoption resolves to the claim's
+            // sequence, since the claim put this token on disk.
+            let mut writer = harness_state::Writer::new(
+                &harness_agent_dir,
+                harness_identity.clone(),
+                "codex",
+                Some(runtime.runtime_id().to_string()),
+            )
+            .with_session(runtime.incarnation());
+            let _ = writer.observe(
+                harness_state::Observation::new(
+                    harness_state::Activity::Ended,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Unknown,
+                )
+                .with_reason("launch-error")
+                .with_exit("exit unknown"),
+            );
             return Err(error)
                 .with_context(|| format!("starting controlled {} TUI", codex_argv[0]));
         }
