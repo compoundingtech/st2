@@ -120,7 +120,10 @@ Field rules, matching `src/harness_state.rs`:
 - Writes are session-owned by incarnation token, and ownership has a
   DIRECTION through `seq`. A claim is a WRITTEN act under the record lock —
   an exitless `ended (superseded)` takeover record carrying the new token
-  and the on-disk sequence plus one — so racing claimers serialize and mint
+  and a sequence one above the highest the seat has seen (the on-disk
+  record's or the `.harness-state.seq` floor sidecar's, whichever is
+  higher, so an unreadable record does not restart the sequence) — so
+  racing claimers serialize and mint
   DISTINCT sequences (no tie exists), and a predecessor's still-fresh live
   record is superseded at relaunch; the seat reads `ended (superseded)`
   until the session's first real observation. A straggler from a superseded
