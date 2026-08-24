@@ -136,7 +136,7 @@ fn observe_writer(
         .and_then(serde_json::Value::as_str)
     {
         let token = format!("claude-session-{id}");
-        if event == "SessionStart" {
+        if event == "SessionStart" && harness_state::wrapperless_claim_allowed(agent_dir) {
             return match harness_state::claim(agent_dir, identity, "claude", &token) {
                 Ok(seq) => writer.with_ownership(token, seq),
                 Err(error) => {
