@@ -2106,7 +2106,7 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
         &json!({ "method": "initialized", "params": {} }),
     )?;
     websocket.get_ref().set_read_timeout(None)?;
-    Ok(websocket)
+    Ok(Some(websocket))
 }
 
 /// Wait until the owning TUI has loaded the preserved thread before this control connection
@@ -2806,6 +2806,7 @@ fn read_startup_message(
     }
 }
 
+#[cfg(test)] // Production startup reads moved to the stop-aware read_startup_message.
 fn read_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<Option<Value>> {
     // Darwin reports a timed Unix-socket read as EAGAIN/EWOULDBLOCK.  During
     // handshake the peer may briefly be descheduled; treat that transient as
@@ -3827,7 +3828,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3959,7 +3962,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -4066,7 +4071,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let state = tmp.path().join("state");
         let binding_path = state.join("binding.json");
         let control_state_path = state.join("control-state.json");
@@ -4201,7 +4208,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -4285,7 +4294,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -4377,7 +4388,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let (tx, rx) = mpsc::channel();
         let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
