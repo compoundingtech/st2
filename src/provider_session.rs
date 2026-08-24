@@ -148,6 +148,20 @@ impl SessionObserver {
     pub(crate) fn ended(&self, exit: &str) {
         let _ = self.writer().ended(exit);
     }
+
+    /// The terminal record for a session whose provider never ran (or could no longer be
+    /// checked): a real ended record, so the claim placeholder is not the last word.
+    pub(crate) fn launch_error(&self) {
+        let _ = self.writer().observe(
+            harness_state::Observation::new(
+                harness_state::Activity::Ended,
+                harness_state::BlockedOn::None,
+                harness_state::InputBuffer::Unknown,
+            )
+            .with_reason("launch-error")
+            .with_exit("exit unknown"),
+        );
+    }
 }
 
 fn describe_exit(exit: ExitStatus) -> String {
@@ -227,19 +241,32 @@ pub(crate) fn run_provider_observed(
             Ok(())
         });
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("starting {provider} provider {program}"))?;
+    // The error arms are terminal outcomes too: the claim placeholder must not stand as the
+    // visible state after a launch that never ran — while the ordinary nonzero-exit path keeps
+    // its real exit and is deliberately not covered here.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(observed) = observed {
+                observed.launch_error();
+            }
+            return Err(error).with_context(|| format!("starting {provider} provider {program}"));
+        }
+    };
     let mut next_refresh = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
             return stop_provider_group(&mut child, observed).map(ProviderOutcome::Stopped);
         }
-        if let Some(exit) = child
-            .try_wait()
-            .with_context(|| format!("checking {provider} provider"))?
-        {
-            return Ok(ProviderOutcome::Exited(exit));
+        match child.try_wait() {
+            Ok(Some(exit)) => return Ok(ProviderOutcome::Exited(exit)),
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(observed) = observed {
+                    observed.launch_error();
+                }
+                return Err(error).with_context(|| format!("checking {provider} provider"));
+            }
         }
         let now = Instant::now();
         if now >= next_refresh {
@@ -290,4 +317,35 @@ fn stop_provider_group(
         libc::kill(-process_group, libc::SIGKILL);
     }
     Ok(child.wait().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// n6: an unspawnable provider is a terminal outcome — the claim placeholder must not stand.
+    #[test]
+    fn an_unspawnable_provider_writes_a_real_terminal_record() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let observer =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+        let stop = AtomicBool::new(false);
+        let result = run_provider_observed(
+            "test",
+            &crate::status::status_path(tmp.path()),
+            &["/nonexistent/provider-binary".to_string()],
+            &[],
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+            &stop,
+            Some(&observer),
+        );
+        assert!(result.is_err());
+        let record =
+            harness_state::read(&harness_state::harness_state_path(tmp.path()), None).unwrap();
+        assert_eq!(record.state, Activity::Ended);
+        assert_eq!(record.exit.as_deref(), Some("exit unknown"));
+        assert_eq!(record.reason.as_deref(), Some("launch-error"));
+    }
 }
