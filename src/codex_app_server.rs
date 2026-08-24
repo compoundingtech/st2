@@ -3059,6 +3059,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_socket_refusal_names_the_holder_without_recommending_a_group_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = "h.worker";
+        let runtime_id = "h.worker";
+        let state = state_dir_in(tmp.path(), tmp.path(), identity);
+        secure_dir(&state).unwrap();
+        let socket = socket_path(tmp.path(), identity).unwrap();
+        secure_dir(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let mut diagnostics = WrapperDiagnostics::open(&state, identity, runtime_id).unwrap();
+
+        let error = run_controlled_owned(
+            tmp.path(),
+            &state,
+            identity.into(),
+            runtime_id.into(),
+            vec!["unused-codex".into()],
+            delivery_config(tmp.path()),
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        fs::remove_file(&socket).unwrap();
+        let message = format!("{error:#}");
+        let owner_pid = std::process::id();
+        let parent_pid = unsafe { libc::getppid() };
+        let session_id = unsafe { libc::getsid(0) };
+
+        assert!(
+            message.contains(&format!("owner PID {owner_pid}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("parent PID {parent_pid}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("session ID {session_id}")),
+            "{message}"
+        );
+        assert!(
+            message.contains("managed-holder"),
+            "{message}"
+        );
+        assert!(
+            message.contains("do not signal owner PID"),
+            "{message}"
+        );
+        assert!(
+            message.contains("walk the ancestry"),
+            "{message}"
+        );
+        assert!(
+            message.contains("never signal a process group"),
+            "{message}"
+        );
+    }
+
     fn subscribed_state(observed: CodexObservedState) -> CodexControlState {
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let mut state = CodexControlState::new(&runtime, "thread-main".into());
