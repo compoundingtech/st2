@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -13,24 +14,31 @@ use kdl::{KdlDocument, KdlNode};
 
 use agent_spec::spec::AgentSpec;
 
+const REGULAR_FILE_MODE: u32 = 0o644;
+const EXECUTABLE_FILE_MODE: u32 = 0o755;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderOp {
     Copy {
         source: String,
         destination: String,
+        executable: bool,
     },
     File {
         destination: String,
         content: String,
+        executable: bool,
     },
     JsonUpsert {
         destination: String,
         content: String,
         arrays: ArrayMerge,
+        executable: bool,
     },
     EnsureLine {
         destination: String,
         line: String,
+        executable: bool,
     },
     GitExclude {
         path: String,
@@ -70,12 +78,14 @@ impl RenderOp {
             Self::Copy {
                 source,
                 destination,
+                ..
             } => {
                 references_variable(source, variable) || references_variable(destination, variable)
             }
             Self::File {
                 destination,
                 content,
+                ..
             }
             | Self::JsonUpsert {
                 destination,
@@ -84,9 +94,9 @@ impl RenderOp {
             } => {
                 references_variable(destination, variable) || references_variable(content, variable)
             }
-            Self::EnsureLine { destination, line } => {
-                references_variable(destination, variable) || references_variable(line, variable)
-            }
+            Self::EnsureLine {
+                destination, line, ..
+            } => references_variable(destination, variable) || references_variable(line, variable),
             Self::GitExclude { path } => references_variable(path, variable),
         }
     }
@@ -135,6 +145,44 @@ fn content_arg(node: &KdlNode) -> Option<String> {
     })
 }
 
+fn executable_property(node: &KdlNode, agent: &str, other_properties: &[&str]) -> Result<bool> {
+    let mut executable = None;
+    for entry in node.entries().iter().filter(|entry| entry.name().is_some()) {
+        let name = entry.name().unwrap().value();
+        if other_properties.contains(&name) {
+            continue;
+        }
+        anyhow::ensure!(
+            name == "executable",
+            "agent '{agent}': {} has unknown property '{name}'",
+            node.name().value()
+        );
+        anyhow::ensure!(
+            executable.is_none(),
+            "agent '{agent}': {} has duplicate property 'executable'",
+            node.name().value()
+        );
+        executable = Some(entry.value().as_bool().with_context(|| {
+            format!(
+                "agent '{agent}': {} property 'executable' must be a boolean",
+                node.name().value()
+            )
+        })?);
+    }
+    Ok(executable.unwrap_or(false))
+}
+
+fn reject_properties(node: &KdlNode, agent: &str) -> Result<()> {
+    if let Some(entry) = node.entries().iter().find(|entry| entry.name().is_some()) {
+        anyhow::bail!(
+            "agent '{agent}': {} has unknown property '{}'",
+            node.name().value(),
+            entry.name().unwrap().value()
+        );
+    }
+    Ok(())
+}
+
 fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
     let mut plan = RenderPlan::default();
     let Some(children) = node.children() else {
@@ -145,6 +193,7 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
         let args = string_args(directive);
         match name {
             "copy" => {
+                let executable = executable_property(directive, agent, &[])?;
                 let [source, destination] = args.as_slice() else {
                     anyhow::bail!(
                         "agent '{agent}': copy expects `copy \"<source>\" \"<destination>\"`"
@@ -153,9 +202,11 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
                 plan.ops.push(RenderOp::Copy {
                     source: source.clone(),
                     destination: destination.clone(),
+                    executable,
                 });
             }
             "file" => {
+                let executable = executable_property(directive, agent, &[])?;
                 let Some(destination) = args.first() else {
                     anyhow::bail!("agent '{agent}': file needs a destination");
                 };
@@ -164,9 +215,11 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
                 plan.ops.push(RenderOp::File {
                     destination: destination.clone(),
                     content,
+                    executable,
                 });
             }
             "json-upsert" => {
+                let executable = executable_property(directive, agent, &["arrays"])?;
                 let Some(destination) = args.first() else {
                     anyhow::bail!("agent '{agent}': json-upsert needs a destination");
                 };
@@ -191,9 +244,11 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
                     destination: destination.clone(),
                     content,
                     arrays,
+                    executable,
                 });
             }
             "ensure-line" => {
+                let executable = executable_property(directive, agent, &[])?;
                 let [destination, line] = args.as_slice() else {
                     anyhow::bail!(
                         "agent '{agent}': ensure-line expects `ensure-line \"<file>\" \"<line>\"`"
@@ -202,9 +257,11 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
                 plan.ops.push(RenderOp::EnsureLine {
                     destination: destination.clone(),
                     line: line.clone(),
+                    executable,
                 });
             }
             "git-exclude" => {
+                reject_properties(directive, agent)?;
                 if args.is_empty() {
                     anyhow::bail!("agent '{agent}': git-exclude needs at least one path");
                 }
@@ -340,6 +397,7 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
             destination: ".mcp.json".into(),
             content,
             arrays: ArrayMerge::Replace,
+            executable: false,
         });
         // The same canonical hook registration the typed driver renders: these seats run under
         // claude-session too, and a wrapper that claims and ends a record nobody transitions is
@@ -349,6 +407,7 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
             content: serde_json::to_string(&crate::hooks::claude_settings_registration())
                 .context("serializing the canonical Claude hook registration")?,
             arrays: ArrayMerge::Union,
+            executable: false,
         });
     }
     Ok(plan)
@@ -468,6 +527,32 @@ fn write_owned(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
+fn desired_mode(executable: bool) -> u32 {
+    if executable {
+        EXECUTABLE_FILE_MODE
+    } else {
+        REGULAR_FILE_MODE
+    }
+}
+
+fn read_optional_mode(path: &Path) -> Result<Option<u32>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions().mode() & 0o7777)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading mode for {}", path.display())),
+    }
+}
+
+fn set_owned_mode(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode {mode:04o} on {}", path.display()))
+}
+
+fn write_owned_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    write_owned(path, bytes)?;
+    set_owned_mode(path, mode)
+}
+
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -531,7 +616,8 @@ fn deep_merge(
             // longer states are removed, so a matcher group holding a user hook beside an st2
             // one keeps the user's; containers left with nothing but empty arrays are dropped.
             target.retain_mut(|element| {
-                if patch.contains(element) || !supersede_managed_hooks
+                if patch.contains(element)
+                    || !supersede_managed_hooks
                     || !contains_owned_string(element)
                 {
                     return true;
@@ -671,20 +757,89 @@ enum PreparedOp {
     Write {
         destination: PathBuf,
         bytes: Vec<u8>,
+        mode: u32,
         note: String,
     },
-    Note(String),
+    SetMode {
+        destination: PathBuf,
+        mode: u32,
+        note: String,
+    },
     GitExclude {
         path: String,
         expanded: String,
     },
 }
 
+#[derive(Default)]
+struct Preparation {
+    virtual_files: BTreeMap<PathBuf, Vec<u8>>,
+    virtual_modes: BTreeMap<PathBuf, u32>,
+    changed_targets: BTreeMap<PathBuf, String>,
+    ops: Vec<PreparedOp>,
+}
+
+impl Preparation {
+    fn current_bytes(&self, destination: &Path) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .virtual_files
+            .get(destination)
+            .cloned()
+            .map(Some)
+            .unwrap_or(read_optional(destination)?))
+    }
+
+    fn push_content(
+        &mut self,
+        destination: PathBuf,
+        raw_destination: String,
+        bytes: Vec<u8>,
+        executable: bool,
+        note: String,
+        current: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let current_mode = match self.virtual_modes.get(&destination) {
+            Some(mode) => Some(*mode),
+            None => read_optional_mode(&destination)?,
+        };
+        let mode = desired_mode(executable);
+        if current.as_deref() == Some(bytes.as_slice()) {
+            if current_mode != Some(mode) {
+                self.changed_targets
+                    .insert(destination.clone(), raw_destination);
+                self.ops.push(PreparedOp::SetMode {
+                    destination: destination.clone(),
+                    mode,
+                    note,
+                });
+            }
+        } else {
+            self.changed_targets
+                .insert(destination.clone(), raw_destination);
+            self.ops.push(PreparedOp::Write {
+                destination: destination.clone(),
+                bytes: bytes.clone(),
+                mode,
+                note,
+            });
+        }
+        self.virtual_files.insert(destination.clone(), bytes);
+        self.virtual_modes.insert(destination, mode);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-enum RenderClaim {
+enum RenderContentClaim {
     Replace(Vec<u8>),
     JsonUpsert(serde_json::Value, ArrayMerge),
     EnsureLine(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RenderClaim {
+    content: RenderContentClaim,
+    executable: bool,
 }
 
 #[derive(Debug)]
@@ -696,7 +851,7 @@ pub struct RenderOwnershipConflict {
 impl RenderOwnershipConflict {
     fn error(&self) -> String {
         format!(
-            "conflicting render ownership for '{}': active agents {} declare incompatible content for one shared workspace target",
+            "conflicting render ownership for '{}': active agents {} declare incompatible content or mode for one shared workspace target",
             self.destination.display(),
             self.owners.iter().cloned().collect::<Vec<_>>().join(", ")
         )
@@ -728,26 +883,35 @@ fn claims_for_agent(
             RenderOp::Copy {
                 source: raw_source,
                 destination: raw_destination,
+                executable,
             } => {
                 let source = source(root, spec_dir, &raw_source, &env)?;
                 let bytes = fs::read(&source)
                     .with_context(|| format!("reading copy source {}", source.display()))?;
                 (
                     destination(&workspace, &raw_destination, &env)?,
-                    RenderClaim::Replace(bytes),
+                    RenderClaim {
+                        content: RenderContentClaim::Replace(bytes),
+                        executable,
+                    },
                 )
             }
             RenderOp::File {
                 destination: raw_destination,
                 content,
+                executable,
             } => (
                 destination(&workspace, &raw_destination, &env)?,
-                RenderClaim::Replace(expand(&content, &env).into_bytes()),
+                RenderClaim {
+                    content: RenderContentClaim::Replace(expand(&content, &env).into_bytes()),
+                    executable,
+                },
             ),
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
                 arrays,
+                executable,
             } => {
                 let patch = serde_json::from_str(&expand(&content, &env)).with_context(|| {
                     format!(
@@ -757,15 +921,22 @@ fn claims_for_agent(
                 })?;
                 (
                     destination(&workspace, &raw_destination, &env)?,
-                    RenderClaim::JsonUpsert(patch, arrays),
+                    RenderClaim {
+                        content: RenderContentClaim::JsonUpsert(patch, arrays),
+                        executable,
+                    },
                 )
             }
             RenderOp::EnsureLine {
                 destination: raw_destination,
                 line,
+                executable,
             } => (
                 destination(&workspace, &raw_destination, &env)?,
-                RenderClaim::EnsureLine(expand(&line, &env)),
+                RenderClaim {
+                    content: RenderContentClaim::EnsureLine(expand(&line, &env)),
+                    executable,
+                },
             ),
             // Every git-exclude is additive by contract and resolves through Git's own shared
             // metadata path rather than a declared workspace-relative render destination.
@@ -847,72 +1018,55 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         );
     }
     let spec_dir = spec.path.parent().unwrap_or(root);
-    let mut virtual_files = BTreeMap::<PathBuf, Vec<u8>>::new();
-    let mut changed_targets = BTreeMap::<PathBuf, String>::new();
-    let mut prepared = Vec::new();
+    let mut preparation = Preparation::default();
     for op in plan.ops {
         match op {
             RenderOp::Copy {
                 source: raw_source,
                 destination: raw_destination,
+                executable,
             } => {
                 let source = source(root, spec_dir, &raw_source, &env)?;
                 let destination = destination(&workspace, &raw_destination, &env)?;
                 let bytes = fs::read(&source)
                     .with_context(|| format!("reading copy source {}", source.display()))?;
-                let current = virtual_files
-                    .get(&destination)
-                    .cloned()
-                    .map(Some)
-                    .unwrap_or(read_optional(&destination)?);
+                let current = preparation.current_bytes(&destination)?;
                 let note = format!("{}: copied {}", spec.identity, raw_destination);
-                if current.as_deref() == Some(bytes.as_slice()) {
-                    prepared.push(PreparedOp::Note(note));
-                } else {
-                    changed_targets.insert(destination.clone(), raw_destination);
-                    prepared.push(PreparedOp::Write {
-                        destination: destination.clone(),
-                        bytes: bytes.clone(),
-                        note,
-                    });
-                }
-                virtual_files.insert(destination, bytes);
+                preparation.push_content(
+                    destination,
+                    raw_destination,
+                    bytes,
+                    executable,
+                    note,
+                    current,
+                )?;
             }
             RenderOp::File {
                 destination: raw_destination,
                 content,
+                executable,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
                 let bytes = expand(&content, &env).into_bytes();
-                let current = virtual_files
-                    .get(&destination)
-                    .cloned()
-                    .map(Some)
-                    .unwrap_or(read_optional(&destination)?);
+                let current = preparation.current_bytes(&destination)?;
                 let note = format!("{}: wrote {}", spec.identity, raw_destination);
-                if current.as_deref() == Some(bytes.as_slice()) {
-                    prepared.push(PreparedOp::Note(note));
-                } else {
-                    changed_targets.insert(destination.clone(), raw_destination);
-                    prepared.push(PreparedOp::Write {
-                        destination: destination.clone(),
-                        bytes: bytes.clone(),
-                        note,
-                    });
-                }
-                virtual_files.insert(destination, bytes);
+                preparation.push_content(
+                    destination,
+                    raw_destination,
+                    bytes,
+                    executable,
+                    note,
+                    current,
+                )?;
             }
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
                 arrays,
+                executable,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
-                let current = virtual_files
-                    .get(&destination)
-                    .cloned()
-                    .map(Some)
-                    .unwrap_or(read_optional(&destination)?);
+                let current = preparation.current_bytes(&destination)?;
                 let mut target = match current.as_deref() {
                     Some(existing) => serde_json::from_slice(existing).with_context(|| {
                         format!("existing {} is not valid JSON", destination.display())
@@ -934,45 +1088,36 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                 let mut bytes = serde_json::to_vec_pretty(&target)?;
                 bytes.push(b'\n');
                 let note = format!("{}: upserted {}", spec.identity, raw_destination);
-                if current.as_deref() == Some(bytes.as_slice()) {
-                    prepared.push(PreparedOp::Note(note));
-                } else {
-                    changed_targets.insert(destination.clone(), raw_destination);
-                    prepared.push(PreparedOp::Write {
-                        destination: destination.clone(),
-                        bytes: bytes.clone(),
-                        note,
-                    });
-                }
-                virtual_files.insert(destination, bytes);
+                preparation.push_content(
+                    destination,
+                    raw_destination,
+                    bytes,
+                    executable,
+                    note,
+                    current,
+                )?;
             }
             RenderOp::EnsureLine {
                 destination: raw_destination,
                 line,
+                executable,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
-                let current = virtual_files
-                    .get(&destination)
-                    .cloned()
-                    .map(Some)
-                    .unwrap_or(read_optional(&destination)?);
+                let current = preparation.current_bytes(&destination)?;
                 let bytes =
                     ensure_line_bytes(current.as_deref(), &expand(&line, &env), &destination)?;
                 let note = format!("{}: ensured {}", spec.identity, raw_destination);
-                if current.as_deref() == Some(bytes.as_slice()) {
-                    prepared.push(PreparedOp::Note(note));
-                } else {
-                    changed_targets.insert(destination.clone(), raw_destination);
-                    prepared.push(PreparedOp::Write {
-                        destination: destination.clone(),
-                        bytes: bytes.clone(),
-                        note,
-                    });
-                }
-                virtual_files.insert(destination, bytes);
+                preparation.push_content(
+                    destination,
+                    raw_destination,
+                    bytes,
+                    executable,
+                    note,
+                    current,
+                )?;
             }
             RenderOp::GitExclude { path } => {
-                prepared.push(PreparedOp::GitExclude {
+                preparation.ops.push(PreparedOp::GitExclude {
                     expanded: expand(&path, &env),
                     path,
                 });
@@ -980,7 +1125,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         }
     }
 
-    for (target, raw_destination) in &changed_targets {
+    for (target, raw_destination) in &preparation.changed_targets {
         let relative = target.strip_prefix(&workspace).with_context(|| {
             format!(
                 "render destination {} escaped workspace {}",
@@ -991,8 +1136,8 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         if is_git_tracked(&workspace, relative)? {
             anyhow::bail!(
                 "agent '{}': generated materialization would change Git-tracked target '{}' ({}); \
-                 keep the tracked file byte-identical, choose an untracked overlay target, or edit \
-                 the tracked file intentionally outside st2",
+                 keep the tracked file byte- and mode-identical, choose an untracked overlay target, \
+                 or edit the tracked file intentionally outside st2",
                 spec.identity,
                 raw_destination,
                 target.display()
@@ -1001,21 +1146,30 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
     }
 
     let mut notes = Vec::new();
-    for op in prepared {
+    for op in preparation.ops {
         match op {
             PreparedOp::Write {
                 destination,
                 bytes,
+                mode,
                 note,
             } => {
-                write_owned(&destination, &bytes)?;
+                write_owned_with_mode(&destination, &bytes, mode)?;
                 notes.push(note);
             }
-            PreparedOp::Note(note) => notes.push(note),
+            PreparedOp::SetMode {
+                destination,
+                mode,
+                note,
+            } => {
+                set_owned_mode(&destination, mode)?;
+                notes.push(note);
+            }
             PreparedOp::GitExclude { path, expanded } => {
-                // Advisory by contract: leave a visible note, but never fail materialization/boot.
+                // Advisory by contract: report a real change, but never fail materialization/boot.
                 match git_exclude(&workspace, &expanded) {
-                    Ok(_) => notes.push(format!("{}: excluded {path}", spec.identity)),
+                    Ok(true) => notes.push(format!("{}: excluded {path}", spec.identity)),
+                    Ok(false) => {}
                     Err(error) => notes.push(format!(
                         "WARN {}: could not git-exclude '{path}': {error}",
                         spec.identity
@@ -1046,6 +1200,7 @@ pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<
             RenderOp::Copy {
                 source: raw_source,
                 destination: raw_destination,
+                ..
             } => {
                 source(root, spec_dir, &raw_source, &env)?;
                 destination(&workspace, &raw_destination, &env)?;
@@ -1147,6 +1302,7 @@ mod tests {
             ops: vec![RenderOp::File {
                 destination: "settings".to_string(),
                 content: "${ST_HOOKS}/claude-stop-failure.sh".to_string(),
+                executable: false,
             }],
         };
         assert!(plan.references_variable("ST_HOOKS"));
@@ -1160,6 +1316,7 @@ mod tests {
                 ops: vec![RenderOp::File {
                     destination: "settings".to_string(),
                     content: literal.to_string(),
+                    executable: false,
                 }],
             };
             assert!(
@@ -1343,6 +1500,7 @@ mod tests {
                     destination,
                     content,
                     arrays,
+                    ..
                 } if destination == ".claude/settings.local.json" => Some((content, arrays)),
                 _ => None,
             })

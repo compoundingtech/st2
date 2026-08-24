@@ -876,6 +876,7 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
             RenderOp::Copy {
                 source,
                 destination,
+                executable,
             } => {
                 insert_value(
                     &mut fields,
@@ -895,10 +896,17 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
                     SemanticType::String,
                     destination,
                 );
+                insert_default_bool(
+                    &mut fields,
+                    &format!("{root}/executable"),
+                    *executable,
+                    false,
+                );
             }
             RenderOp::File {
                 destination,
                 content,
+                executable,
             } => {
                 insert_value(
                     &mut fields,
@@ -918,11 +926,18 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
                     SemanticType::String,
                     content,
                 );
+                insert_default_bool(
+                    &mut fields,
+                    &format!("{root}/executable"),
+                    *executable,
+                    false,
+                );
             }
             RenderOp::JsonUpsert {
                 destination,
                 content,
                 arrays,
+                executable,
             } => {
                 insert_value(
                     &mut fields,
@@ -954,8 +969,18 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
                         "union",
                     );
                 }
+                insert_default_bool(
+                    &mut fields,
+                    &format!("{root}/executable"),
+                    *executable,
+                    false,
+                );
             }
-            RenderOp::EnsureLine { destination, line } => {
+            RenderOp::EnsureLine {
+                destination,
+                line,
+                executable,
+            } => {
                 insert_value(
                     &mut fields,
                     &format!("{root}/kind"),
@@ -973,6 +998,12 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
                     &format!("{root}/line"),
                     SemanticType::String,
                     line,
+                );
+                insert_default_bool(
+                    &mut fields,
+                    &format!("{root}/executable"),
+                    *executable,
+                    false,
                 );
             }
             RenderOp::GitExclude { path } => {

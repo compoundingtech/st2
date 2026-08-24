@@ -525,6 +525,29 @@ fn a_missing_render_source_is_an_error() {
 }
 
 #[test]
+fn a_non_boolean_render_executable_property_is_an_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let agent = format!(
+        r#"agent "w" {{
+  host "hetz"
+  workspace "{}"
+  command "x"
+  render {{ file "tool" "content" executable="yes" }}
+}}"#,
+        workspace.path().display()
+    );
+    let c = catalog(&[("hetz/w/agent.kdl", &agent)]);
+    let report = validate(c.path());
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "render-error")
+        .expect("invalid executable property must fail render validation");
+    assert_eq!(issue.severity, Severity::Error);
+    assert!(issue.message.contains("must be a boolean"), "{issue:?}");
+}
+
+#[test]
 fn a_nameless_task_is_an_error() {
     // A `pty` block with no name is silently dropped by the parser — the task never runs.
     let c = catalog(&[(

@@ -264,9 +264,14 @@ st2 `9887b28` predate Resource bindings. Current st2 source:
 <h3 id="f08">F08 <code>render {}</code> operation, template, or resolved target</h3>
 
 Prove ownership for every affected local owner before writing. Conflicts refuse
-all affected owners. Write only changed bytes, then notify survivors that can
-see the committed target. Unchanged bytes do not notify. Deletion needs explicit
-desired state and ownership and never removes a catalog source declaration.
+all affected owners. Write changed bytes and enforce the declared mode. The
+`executable=#true` property selects exact mode `0755`; absence or false selects
+exact mode `0644`. A copy source mode has no effect. Mode-only drift is a
+change. Notify survivors that can see the committed target. Matching bytes and
+mode do not notify and do not report a materialization. Inline `file` content
+uses the decoded KDL string without an added or removed newline. Deletion needs
+explicit desired state and ownership and never removes a catalog source
+declaration.
 
 Authoring: [pinned render contract][evals-render]. st2 implementation and
 evidence: [materializer](../../../src/materialize.rs).

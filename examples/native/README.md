@@ -55,9 +55,15 @@ composer heuristic.
 
 The `render { ... }` block is ordered. `copy`, `file`, `json-upsert`, and `ensure-line` are
 boot-gating operations; a failure prevents that agent from starting. Materialization refuses any
-real change to a Git-tracked target before its first workspace write. A byte-identical tracked
-target is safe and idempotent; untracked and non-Git targets remain writable. `git-exclude` is
-advisory, so a non-Git workspace or exclusion failure does not prevent a boot.
+content or mode change to a Git-tracked target before its first workspace write. A byte-identical
+tracked target with the declared mode is safe and idempotent. Untracked and non-Git targets remain
+writable. `git-exclude` is advisory, so a non-Git workspace or exclusion failure does not prevent a
+boot.
+
+Each content directive accepts `executable=#true`. The property selects exact mode `0755`; its
+absence or false value selects exact mode `0644`. Materialization corrects mode drift even when the
+bytes already match. A `copy` source mode does not affect the destination mode. An unchanged
+operation is not reported as materialized.
 
 Tracked-target detection invokes `git` and fails closed if it cannot inspect a workspace that appears
 to belong to a Git worktree.
