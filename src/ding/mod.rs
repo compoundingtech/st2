@@ -709,6 +709,44 @@ pub fn session_alive(session: &str) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Positive-evidence session liveness for observed-harness-state readers. Unlike
+/// [`session_alive`], whose delivery callers must fail closed ("any miss means gone"), a reader
+/// deriving `unknown` needs proof of death: an unreadable or unparseable pidfile is
+/// `Indeterminate` — the reader may not share the writer's PTY root — and a pid that exists but
+/// is not signalable (EPERM) is still alive.
+pub fn session_liveness(session: &str) -> crate::harness_state::SessionLiveness {
+    session_liveness_in(&pty_session_dir(), session)
+}
+
+/// [`session_liveness`], probing an explicit registry root instead of the ambient environment —
+/// readers that know the catalog derive the runner's own root rather than requiring PTY_ROOT in
+/// the shell.
+pub fn session_liveness_in(
+    root: &std::path::Path,
+    session: &str,
+) -> crate::harness_state::SessionLiveness {
+    use crate::harness_state::SessionLiveness;
+    let pidfile = root.join(format!("{session}.pid"));
+    let Ok(raw) = std::fs::read_to_string(&pidfile) else {
+        return SessionLiveness::Indeterminate;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return SessionLiveness::Indeterminate;
+    };
+    if pid <= 0 {
+        return SessionLiveness::Indeterminate;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return SessionLiveness::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::ESRCH => SessionLiveness::Dead,
+        // EPERM proves existence; anything else proves nothing.
+        Some(code) if code == libc::EPERM => SessionLiveness::Alive,
+        _ => SessionLiveness::Indeterminate,
+    }
+}
+
 /// The `pty` session registry dir. This must mirror the sibling tool's resolution order.
 fn pty_session_dir() -> PathBuf {
     for var in ["PTY_ROOT", "PTY_SESSION_DIR"] {
@@ -3749,6 +3787,44 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(
             poker.probes.load(Ordering::SeqCst) <= 20,
             "idle DING must sleep at its configured cadence"
+        );
+    }
+
+    #[test]
+    fn session_liveness_probe_reports_only_positive_evidence() {
+        use crate::harness_state::SessionLiveness;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // An unreadable registry proves nothing: missing or garbled pidfiles downgrade nothing.
+        assert_eq!(
+            session_liveness_in(tmp.path(), "absent"),
+            SessionLiveness::Indeterminate
+        );
+        std::fs::write(tmp.path().join("garbled.pid"), "not-a-pid\n").unwrap();
+        assert_eq!(
+            session_liveness_in(tmp.path(), "garbled"),
+            SessionLiveness::Indeterminate
+        );
+
+        // Our own pid is positive evidence of life.
+        std::fs::write(
+            tmp.path().join("live.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(
+            session_liveness_in(tmp.path(), "live"),
+            SessionLiveness::Alive
+        );
+
+        // A reaped child is positive evidence of death (ESRCH).
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(tmp.path().join("dead.pid"), format!("{pid}\n")).unwrap();
+        assert_eq!(
+            session_liveness_in(tmp.path(), "dead"),
+            SessionLiveness::Dead
         );
     }
 }

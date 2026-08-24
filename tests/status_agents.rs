@@ -286,7 +286,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     );
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "h.live\tavailable\t\t\nh.retired\tbusy\t\t\t[retired]\n"
+        "h.live\tavailable\tobs:-\t\t\nh.retired\tbusy\tobs:-\t\t\t[retired]\n"
     );
 }
 

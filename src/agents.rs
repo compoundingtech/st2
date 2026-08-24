@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::message;
 use crate::status::{self, State};
-use crate::{Discovered, Resource};
+use crate::{AgentSpec, Discovered, Resource, harness_state};
 
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
@@ -36,18 +36,27 @@ pub struct AgentRow {
     pub last_activity_ms: Option<f64>,
     /// Count of canonical message files in the agent's inbox. `--enrich` only.
     pub inbox: usize,
+    /// Observed harness state — the driver-owned signal of what the harness is seen doing, a third
+    /// axis independent from declared presence and from desired lifecycle. `None` means no driver
+    /// has ever published a record for this agent, which is different from a derived `unknown`.
+    pub observed: Option<harness_state::Observed>,
 }
 
 /// Every agent in the catalog, sorted by bus id, with presence + enrich data computed. Read-only:
 /// walks discovered specs and each agent's resources, mutating nothing.
 pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
     let found = crate::discover(catalog_root);
-    roster_from_discovered(&found, this_host)
+    roster_from_discovered(&found, catalog_root, this_host)
 }
 
 /// Project a roster from one immutable discovery result. Exact selectors use this after proving
 /// discovery complete so the uniqueness check and returned metadata describe the same snapshot.
-pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentRow> {
+pub fn roster_from_discovered(
+    found: &Discovered,
+    catalog_root: &Path,
+    this_host: &str,
+) -> Vec<AgentRow> {
+    let pty_root = probe_pty_root(catalog_root);
     let mut rows: Vec<AgentRow> = found
         .specs
         .iter()
@@ -64,11 +73,68 @@ pub fn roster_from_discovered(found: &Discovered, this_host: &str) -> Vec<AgentR
                 resources: s.resources.clone(),
                 last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
+                observed: observed_state(s, agent_dir, &pty_root, this_host),
             })
         })
         .collect();
     rows.sort_by(|a, b| a.identity.cmp(&b.identity));
     rows
+}
+
+/// Read the observed-harness-state record beside `status`. The session-liveness cross-check is
+/// host-local by construction: it applies only to agents this host runs, and an unreadable
+/// registry downgrades nothing.
+fn observed_state(
+    spec: &AgentSpec,
+    agent_dir: &Path,
+    pty_root: &Path,
+    this_host: &str,
+) -> Option<harness_state::Observed> {
+    let path = harness_state::harness_state_path(agent_dir);
+    if spec.resolved_host(this_host) == this_host {
+        let probe = |session: &str| crate::ding::session_liveness_in(pty_root, session);
+        harness_state::read(&path, Some(&probe))
+    } else {
+        harness_state::read(&path, None)
+    }
+}
+
+/// The pty registry root the probe reads: exactly the runner's own resolution, so the reader and
+/// the sessions it probes can never disagree. The runner honors `PTY_ROOT` and nothing else — a
+/// legacy `PTY_SESSION_DIR` here would point the probe at a directory st2-managed sessions never
+/// use, turning provable deaths into indeterminate reads.
+pub fn probe_pty_root(catalog_root: &Path) -> PathBuf {
+    crate::run::effective_pty_root(catalog_root)
+}
+
+/// The `observedState` object inside a roster row. Vocabulary words are the record's own
+/// (`as_str`), never Rust identifier spellings.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedJson<'a> {
+    state: &'a str,
+    blocked_on: &'a str,
+    input_buffer: &'a str,
+    ask: &'a str,
+    harness: Option<&'a str>,
+    since: Option<u64>,
+    reason: Option<&'a str>,
+    exit: Option<&'a str>,
+}
+
+impl<'a> ObservedJson<'a> {
+    fn from_row(observed: Option<&'a harness_state::Observed>) -> Option<Self> {
+        observed.map(|observed| ObservedJson {
+            state: observed.state.as_str(),
+            blocked_on: observed.blocked_on.as_str(),
+            input_buffer: observed.input_buffer.as_str(),
+            ask: observed.ask.as_str(),
+            harness: observed.harness.as_deref(),
+            since: observed.since_ms,
+            reason: observed.reason.as_deref(),
+            exit: observed.exit.as_deref(),
+        })
+    }
 }
 
 /// `st2 agents --json` row. Field order and names are the stable wire contract.
@@ -84,6 +150,8 @@ struct SummaryJson<'a> {
     desired_state: &'a str,
     #[serde(rename = "desiredStateReason")]
     desired_state_reason: Option<&'a str>,
+    #[serde(rename = "observedState")]
+    observed_state: Option<ObservedJson<'a>>,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -102,6 +170,8 @@ struct EnrichedJson<'a> {
     desired_state: &'a str,
     #[serde(rename = "desiredStateReason")]
     desired_state_reason: Option<&'a str>,
+    #[serde(rename = "observedState")]
+    observed_state: Option<ObservedJson<'a>>,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -120,6 +190,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 desired_state_reason: r.desired_state_reason.as_deref(),
                 last_activity: r.last_activity_ms,
                 inbox: r.inbox,
+                observed_state: ObservedJson::from_row(r.observed.as_ref()),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -135,6 +206,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 resources: &r.resources,
                 desired_state: &r.desired_state,
                 desired_state_reason: r.desired_state_reason.as_deref(),
+                observed_state: ObservedJson::from_row(r.observed.as_ref()),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -199,6 +271,7 @@ mod tests {
             resources: Vec::new(),
             last_activity_ms: last,
             inbox,
+            observed: None,
         }
     }
 
@@ -219,11 +292,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -243,7 +316,57 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null,"observedState":null}]"#
+        );
+    }
+
+    /// Declared presence and observed harness state are independent axes in one payload: a
+    /// declared `busy` sits beside an observed `idle` (the wedged-agent signal), and
+    /// `lastActivity` keeps its existing meaning untouched by the new field.
+    #[test]
+    fn observed_state_joins_declared_presence_without_touching_either() {
+        let mut wedged = row(
+            "hetz.worker",
+            State::Busy,
+            None,
+            false,
+            Some(1784653027733.6138),
+            0,
+        );
+        wedged.observed = Some(harness_state::Observed {
+            state: harness_state::Activity::Idle,
+            blocked_on: harness_state::BlockedOn::None,
+            input_buffer: harness_state::InputBuffer::Empty,
+            ask: harness_state::Ask::None,
+            harness: Some("codex".to_string()),
+            since_ms: Some(1784653000000),
+            exit: None,
+            reason: None,
+        });
+
+        assert_eq!(
+            to_json(&[wedged.clone()], false),
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+        );
+        assert_eq!(
+            to_json(&[wedged], true),
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+        );
+
+        let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
+        derived.observed = Some(harness_state::Observed {
+            state: harness_state::Activity::Unknown,
+            blocked_on: harness_state::BlockedOn::Unknown,
+            input_buffer: harness_state::InputBuffer::Unknown,
+            ask: harness_state::Ask::Unknown,
+            harness: Some("codex".to_string()),
+            since_ms: None,
+            exit: None,
+            reason: Some("session-dead".to_string()),
+        });
+        assert_eq!(
+            to_json(&[derived], false),
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
         );
     }
 }
