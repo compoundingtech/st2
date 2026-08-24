@@ -377,6 +377,8 @@ fn random_password() -> Result<String> {
 struct Client {
     addr: String,
     auth: String,
+    /// The SSE silence horizon; [`SSE_SILENCE`] in production, shrunk only by tests.
+    sse_silence: Duration,
 }
 
 impl Client {
@@ -384,6 +386,7 @@ impl Client {
         Self {
             addr: format!("127.0.0.1:{port}"),
             auth: base64(format!("opencode:{password}").as_bytes()),
+            sse_silence: SSE_SILENCE,
         }
     }
 
@@ -432,6 +435,11 @@ impl Client {
         let mut stream = TcpStream::connect(&self.addr)
             .with_context(|| format!("connecting to opencode at {}", self.addr))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+        // A stalled socket must not keep evidence alive forever: the server emits periodic
+        // `server.heartbeat` events (measured well inside a minute on 1.18.19), so a read that
+        // sees NOTHING for the silence horizon — comfortably more than twice that cadence — is a
+        // dead stream, surfaced as a disconnect (evidence off, reconnect and reseed).
+        stream.set_read_timeout(Some(self.sse_silence))?;
         // HTTP/1.0 on purpose: over 1.1 the server chunk-encodes the stream (measured on
         // 1.18.19), which interleaves chunk-size lines into the line-oriented SSE read and can
         // split a `data:` line across chunks — a silently dropped event. Over 1.0 the same server
@@ -454,6 +462,10 @@ impl Client {
         Ok(reader)
     }
 }
+
+/// The SSE silence horizon: at least twice the measured `server.heartbeat` cadence, so a healthy
+/// stream can never trip it while a stalled socket cannot outlive it.
+const SSE_SILENCE: Duration = Duration::from_secs(120);
 
 fn read_http_status(reader: &mut BufReader<TcpStream>) -> Result<u16> {
     let mut status_line = String::new();
@@ -552,9 +564,15 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
     let Ok(statuses) = client.get_json("/session/status") else {
         return false;
     };
+    // A response that is not the documented object shape proves nothing: seeding definite idle
+    // from a null or an array would fabricate level evidence out of a shape this version cannot
+    // read. Fail the seed and retry.
+    let Some(map) = statuses.as_object() else {
+        return false;
+    };
     let mut seeded = EventMachine::default();
     seeded.seed_idle();
-    if let Some(map) = statuses.as_object() {
+    {
         for (session_id, status) in map {
             // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is
             // surface drift the /doc gate vocabulary did not cover, and evidence restored over
@@ -1321,6 +1339,8 @@ mod tests {
         ask_error: Arc<AtomicBool>,
         /// Session ids `GET /session` lists (idle sessions appear here and nowhere else).
         listed_sessions: Arc<Mutex<Vec<String>>>,
+        /// When set, /session/status serves this raw body instead of an object.
+        status_body: Arc<Mutex<Option<String>>>,
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -1335,14 +1355,16 @@ mod tests {
         let pending_questions = Arc::new(Mutex::new(Vec::<String>::new()));
         let ask_error = Arc::new(AtomicBool::new(false));
         let listed_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let status_body = Arc::new(Mutex::new(None::<String>));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
-        let (read_back_t, status_err_t, pending_t, questions_t, ask_err_t, listed_t) = (
+        let (read_back_t, status_err_t, pending_t, questions_t, ask_err_t, listed_t, status_body_t) = (
             read_back_error.clone(),
             status_error.clone(),
             pending_permissions.clone(),
             pending_questions.clone(),
             ask_error.clone(),
             listed_sessions.clone(),
+            status_body.clone(),
         );
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1423,6 +1445,12 @@ mod tests {
                             .collect::<Vec<_>>(),
                     )
                     .unwrap()
+                } else if method == "GET" && path == "/session/status" {
+                    if let Some(body) = status_body_t.lock().unwrap().clone() {
+                        body
+                    } else {
+                        "{}".to_string()
+                    }
                 } else if method == "GET" && (path == "/permission" || path == "/question") {
                     let ids = if path == "/permission" {
                         pending_t.lock().unwrap()
@@ -1457,6 +1485,7 @@ mod tests {
             pending_questions,
             ask_error,
             listed_sessions,
+            status_body,
         }
     }
 
@@ -1779,5 +1808,67 @@ mod tests {
             Activity::Idle,
             "ses_stale cleared by the re-seed"
         );
+    }
+
+    /// Cluster 3: a /session/status response that is not the documented object shape proves
+    /// nothing — null and array shapes must fail the seed, never read as definite idle.
+    #[test]
+    fn non_object_status_shapes_fail_the_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let _keep = tmp;
+        for shape in ["null", "[]", "[\"ses_a\"]", "3"] {
+            *server.status_body.lock().unwrap() = Some(shape.to_string());
+            let mut machine = EventMachine::default();
+            assert!(
+                !seed_from_server(&client, &mut machine),
+                "shape {shape} must fail the seed"
+            );
+            assert_eq!(
+                machine.observation(),
+                None,
+                "no level evidence from {shape}"
+            );
+        }
+        *server.status_body.lock().unwrap() = None;
+        let mut machine = EventMachine::default();
+        assert!(seed_from_server(&client, &mut machine));
+    }
+
+    /// n8: a server that accepts the stream and then goes silent must surface as a disconnect
+    /// within the silence horizon — a stalled socket cannot keep evidence alive forever.
+    #[test]
+    fn a_silent_sse_stream_disconnects_at_the_silence_horizon() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+            // Say nothing, forever; hold the socket open.
+            thread::sleep(Duration::from_secs(30));
+        });
+        let mut client = Client::new(port, "pw");
+        client.sse_silence = Duration::from_millis(200);
+
+        let (tx, rx) = mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        spawn_sse_reader(client, tx, stop.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_disconnect = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(SseMessage::Disconnected) => {
+                    saw_disconnect = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(saw_disconnect, "silence must surface as a disconnect");
     }
 }
