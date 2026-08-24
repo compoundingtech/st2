@@ -353,7 +353,14 @@ impl Writer {
             "an ask kind is meaningful only while blocked on a human"
         );
         let _lock = self.locked()?;
-        let on_disk = read_record(&self.path);
+        let on_disk = match read_stored(&self.path) {
+            StoredRecord::Parsed(record) => Some(record),
+            StoredRecord::Absent => None,
+            // Bytes this version cannot parse are somebody's record, not a virgin seat: a
+            // non-claiming writer refuses rather than restarting the sequence and counter over
+            // foreign state. Only the explicit written claim supersedes.
+            StoredRecord::Unreadable => return Ok(false),
+        };
         // Resolve this writer's ownership sequence, then enforce its direction. A claiming
         // writer adopts the on-disk sequence when the record already carries its token (a
         // sibling wrote first) and claims on-disk + 1 otherwise; an adopted-ownership writer
@@ -629,8 +636,30 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What the record file holds, tri-state: absence, bytes this version cannot parse, or a parsed
+/// record. Collapsing `Unreadable` into `Absent` would let a writer treat an undeserializable
+/// v2 record as a virgin seat — restarting the sequence and counter over live foreign state.
+enum StoredRecord {
+    Absent,
+    Unreadable,
+    Parsed(Record),
+}
+
+fn read_stored(path: &Path) -> StoredRecord {
+    match fs::read(path) {
+        Err(_) => StoredRecord::Absent,
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(record) => StoredRecord::Parsed(record),
+            Err(_) => StoredRecord::Unreadable,
+        },
+    }
+}
+
 fn read_record(path: &Path) -> Option<Record> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    match read_stored(path) {
+        StoredRecord::Parsed(record) => Some(record),
+        StoredRecord::Absent | StoredRecord::Unreadable => None,
+    }
 }
 
 fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
@@ -676,7 +705,25 @@ pub fn claim(
 ) -> anyhow::Result<u64> {
     let writer = Writer::new(agent_dir, agent, harness, None);
     let _lock = writer.locked()?;
-    let on_disk = read_record(&writer.path);
+    claim_locked(&writer, token)
+}
+
+/// The claim's body, under an already-held record lock.
+fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
+    // Unreadable bytes are superseded like anything else — that is exactly what the claim is
+    // for — but nothing of them can be continued: the sequence and counter restart, documented,
+    // because a record this version cannot parse offers no number worth trusting.
+    let on_disk = match read_stored(&writer.path) {
+        StoredRecord::Parsed(record) => Some(record),
+        StoredRecord::Absent | StoredRecord::Unreadable => None,
+    };
+    // A saturated sequence would mint SHARED ownership forever after: every later claim would
+    // return the same MAX, and two sessions holding equal claims are exactly the ambiguity the
+    // sequence exists to remove. Fail loudly; producers degrade to token-only and stay alive.
+    anyhow::ensure!(
+        on_disk.as_ref().is_none_or(|record| record.seq < u64::MAX),
+        "ownership sequence exhausted; refusing a shared claim"
+    );
     let seq = on_disk
         .as_ref()
         .map_or(1, |record| record.seq.saturating_add(1));
@@ -685,7 +732,7 @@ pub fn claim(
     let record = Record {
         schema: SCHEMA.to_string(),
         agent: writer.agent.clone(),
-        harness: harness.to_string(),
+        harness: writer.harness.to_string(),
         state: Activity::Ended,
         blocked_on: BlockedOn::None,
         input_buffer: InputBuffer::Unknown,
@@ -705,26 +752,46 @@ pub fn claim(
     Ok(seq)
 }
 
-/// Whether a WRAPPERLESS session boundary may claim this record. A wrapper's claim is always
-/// legitimate — it owns the seat's lifecycle — but a wrapperless claimer (a hook fired by any
-/// interactive session that inherited the project-scoped registration) must not supersede a
-/// live wrapper-owned record: a human running the harness inside a managed seat's workspace
-/// would otherwise fence the wrapper out until its restart. Wrapperless claims are allowed over
-/// nothing, over records no wrapper minted (fellow wrapperless tokens), and over records that
-/// are terminal or no longer fresh — never over a live record a wrapper is keeping fresh.
-pub fn wrapperless_claim_allowed(agent_dir: &Path) -> bool {
-    const WRAPPERLESS_PREFIX: &str = "claude-session-";
-    let Some(record) = read_record(&harness_state_path(agent_dir)) else {
-        return true;
+/// The token prefix wrapperless Claude sessions derive from Claude's own session id.
+pub const WRAPPERLESS_PREFIX: &str = "claude-session-";
+
+/// A WRAPPERLESS session boundary's claim — eligibility and the written takeover as ONE act
+/// under the record lock, because check-then-act across two acquisitions is a race: a
+/// hooks-only SessionStart landing between a wrapper's startup reads could otherwise steal the
+/// sequence the wrapper was about to export. A wrapper's claim is always legitimate — it owns
+/// the seat's lifecycle — but a wrapperless claimer (a hook fired by any interactive session
+/// that inherited the project-scoped registration) must not supersede live wrapper state. It
+/// claims over nothing, over records no wrapper minted (fellow wrapperless tokens), over REAL
+/// terminal records (exit-bearing), and over staleness — never over a live wrapper record, and
+/// never over a wrapper's FRESH claim placeholder (`ended (superseded)`, exitless,
+/// wrapper-shaped token): that placeholder is a session mid-startup, not an ended one, though
+/// an abandoned placeholder past the staleness horizon is claimable like any orphan.
+/// `Ok(None)` = ineligible; unreadable bytes are also ineligible for this cautious path.
+pub fn claim_wrapperless(
+    agent_dir: &Path,
+    agent: impl Into<String>,
+    harness: &'static str,
+    token: &str,
+) -> anyhow::Result<Option<u64>> {
+    let writer = Writer::new(agent_dir, agent, harness, None);
+    let _lock = writer.locked()?;
+    let eligible = match read_stored(&writer.path) {
+        StoredRecord::Absent => true,
+        StoredRecord::Unreadable => false,
+        StoredRecord::Parsed(record) => {
+            let now_ms = crate::message::now_ms();
+            let stale =
+                now_ms.saturating_sub(record.written_at_ms) >= duration_ms(HARNESS_STATE_STALE);
+            let wrapperless_owner =
+                record.incarnation.is_empty() || record.incarnation.starts_with(WRAPPERLESS_PREFIX);
+            let real_terminal = record.state == Activity::Ended && record.exit.is_some();
+            wrapperless_owner || real_terminal || stale
+        }
     };
-    if record.incarnation.is_empty() || record.incarnation.starts_with(WRAPPERLESS_PREFIX) {
-        return true;
+    if !eligible {
+        return Ok(None);
     }
-    if record.state == Activity::Ended {
-        return true;
-    }
-    let now_ms = crate::message::now_ms();
-    now_ms.saturating_sub(record.written_at_ms) >= duration_ms(HARNESS_STATE_STALE)
+    claim_locked(&writer, token).map(Some)
 }
 
 /// A process-unique session incarnation token: pid, wall-clock, and a process-local counter.
@@ -1640,64 +1707,101 @@ mod tests {
 
     /// W8-8: the ask axis is validated at the write boundary.
     #[test]
-    fn ask_must_be_writable_and_coupled_to_a_human_block() {
+    fn wrapperless_claims_are_atomic_and_never_supersede_a_live_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut writer = writer(tmp.path());
-        assert!(
-            writer.observe(active().with_ask(Ask::Unknown)).is_err(),
-            "unknown ask is derived-only"
-        );
-        assert!(
-            writer.observe(active().with_ask(Ask::Permission)).is_err(),
-            "an ask without a human block is meaningless"
-        );
-        assert!(
-            writer
-                .observe(
-                    Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
-                        .with_ask(Ask::Permission)
-                )
-                .is_ok()
-        );
-    }
+        let wl =
+            |token: &str| claim_wrapperless(tmp.path(), "hetz.worker", "claude", token).unwrap();
+        assert!(wl("claude-session-a").is_some(), "virgin dir");
 
-    /// A wrapperless claimer may take over its own kind, terminal records, and staleness — but
-    /// never a live record a wrapper keeps fresh.
-    #[test]
-    fn wrapperless_claims_never_supersede_a_live_wrapper_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(wrapperless_claim_allowed(tmp.path()), "virgin dir");
-
-        let mut wrapper = takeover(tmp.path(), "claude");
-        wrapper.observe(active()).unwrap();
+        // A wrapper's FRESH claim placeholder is a session mid-startup, not an ended one: the
+        // check-and-write is one act under the lock, so the racing hooks-only SessionStart
+        // cannot steal the sequence between the wrapper's read and its write.
+        let wrapper_token = session_token();
+        let wrapper_seq = claim(tmp.path(), "hetz.worker", "claude", &wrapper_token).unwrap();
         assert!(
-            !wrapperless_claim_allowed(tmp.path()),
-            "a live wrapper-owned record is off limits"
+            wl("claude-session-b").is_none(),
+            "fresh placeholder is owned"
         );
 
-        wrapper.ended("exit 0").unwrap();
-        assert!(
-            wrapperless_claim_allowed(tmp.path()),
-            "terminal records may be claimed"
-        );
-
-        let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "claude", &token).unwrap();
-        let mut wrapperless = Writer::new(
+        // A live wrapper record stays off limits; a REAL terminal record is claimable.
+        let mut wrapper = Writer::new(
             tmp.path(),
             "hetz.worker",
             "claude",
             Some("worker".to_string()),
         )
-        .with_ownership("claude-session-x".to_string(), {
-            let _ = seq;
-            claim(tmp.path(), "hetz.worker", "claude", "claude-session-x").unwrap()
-        });
-        wrapperless.observe(active()).unwrap();
+        .with_ownership(wrapper_token.clone(), wrapper_seq);
+        wrapper.observe(active()).unwrap();
         assert!(
-            wrapperless_claim_allowed(tmp.path()),
-            "fellow wrapperless records may be claimed"
+            wl("claude-session-c").is_none(),
+            "live wrapper record is off limits"
         );
-        let _ = token;
+        wrapper.ended("exit 0").unwrap();
+        assert!(
+            wl("claude-session-d").is_some(),
+            "real terminal records may be claimed"
+        );
+    }
+
+    /// An abandoned placeholder — a wrapper that claimed and then died before observing —
+    /// ages past the staleness horizon and becomes claimable like any orphan.
+    #[test]
+    fn an_abandoned_wrapper_placeholder_is_claimable_once_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        claim(tmp.path(), "hetz.worker", "claude", &session_token()).unwrap();
+        assert!(
+            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+                .unwrap()
+                .is_none()
+        );
+
+        let mut aged: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        aged.written_at_ms = crate::message::now_ms() - duration_ms(HARNESS_STATE_STALE) - 1;
+        write_record(&path, &aged).unwrap();
+        assert!(
+            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// n2: a saturated on-disk sequence would mint shared ownership; the claim fails loudly
+    /// instead, and unreadable bytes are never a virgin seat for non-claiming writers.
+    #[test]
+    fn saturated_sequences_refuse_claims_and_unreadable_bytes_refuse_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let saturated = format!(
+            r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"idle","blockedOn":"none","inputBuffer":"unknown","ptySession":"worker","incarnation":"other","seq":{},"sinceMs":1,"writtenAtMs":1,"transitions":1}}"#,
+            u64::MAX
+        );
+        fs::write(&path, saturated).unwrap();
+        assert!(claim(tmp.path(), "hetz.worker", "codex", "t").is_err());
+
+        fs::write(&path, b"{not json").unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut writer = writer(tmp.path());
+        writer.observe(active()).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "non-claiming writers refuse"
+        );
+        let mut adopted = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .with_ownership(session_token(), 7);
+        adopted.observe(active()).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "adopted writers refuse too"
+        );
+
+        // The written claim supersedes even bytes it cannot parse; sequence and counter restart.
+        let token = session_token();
+        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        assert_eq!(seq, 1);
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.transitions, 0);
     }
 }
