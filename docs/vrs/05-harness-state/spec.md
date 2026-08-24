@@ -7,10 +7,13 @@ spec's R08 section; terminal delivery remains in
 
 ## Status
 
-Draft. The envelope below is implemented (`src/harness_state.rs`); producers
-and exposure land incrementally under
-[`DELTA-005`](../.delta/DELTA-005-harness-state-specified-ahead-of-full-implementation.md).
-Open questions are tracked in [open-questions.md](./open-questions.md).
+Draft. The envelope (`src/harness_state.rs`), all four producers, the scoped
+delivery-input watcher, and the roster/Doctor exposure are implemented; the
+former DELTA-005 fence is resolved and deleted, and the DQ-H1 and DQ-H6
+captures are taken and folded in. Draft status remains for the genuinely
+unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
+Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
+are tracked in [open-questions.md](./open-questions.md).
 
 ## Scope
 
@@ -57,7 +60,9 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
   "inputBuffer": "empty | nonempty | unknown",
   "reason": "<diagnostic, optional>",
   "exit": "<ended only: e.g. 'exit 0', 'signal 9', optional>",
-  "ptySession": "<session name for the liveness cross-check, optional>",
+  "ptySession": "<the wrapper's runtime/task ID; required for live states>",
+  "incarnation": "<the writing session's token>",
+  "seq": 7,
   "sinceMs": 1787690000000,
   "writtenAtMs": 1787690300000,
   "transitions": 41
@@ -70,9 +75,11 @@ Field rules, matching `src/harness_state.rs`:
   (`DQ-H3`). Readers decode both, plus unrecognized future words as `unknown`.
 - `blockedOn` unrecognized words decode indeterminate, never `none` — a v2
   axis value must not read as "not blocked".
-- `ask` names the kind of human ask, machine-readably, while `blockedOn` is
-  `human` (`none` otherwise; unrecognized words decode indeterminate) — the
-  axis consumers filter on, so nothing branches on diagnostic `reason`.
+- `ask` names what kind of human ask holds the harness, machine-readably —
+  the axis consumers filter on (`reason` stays diagnostic). Meaningful only
+  while `blockedOn` is `human`; writers emit `none` otherwise, records from
+  writers predating the axis default to `none`, and unrecognized future words
+  decode indeterminate.
 - `incarnation` is the writing session's token and `seq` its monotonic
   ownership sequence. A claim is a WRITTEN act under the record lock: the
   session starting up writes an exitless `ended (superseded)` takeover
@@ -83,8 +90,9 @@ Field rules, matching `src/harness_state.rs`:
   monotonic even when the record itself is unreadable. Racing
   claimers therefore mint distinct sequences, and a predecessor's
   still-fresh live record is superseded at relaunch, where the
-  pty-name-based probe cannot tell sessions apart; the seat reads
-  `ended (superseded)` until the session's first real observation. Ownership
+  pty-name-based probe cannot tell sessions apart; readers derive
+  indeterminate (`claimed`) from the fresh placeholder — a fence is not an
+  observation — until the session's first real observation. Ownership
   — coalescing, heartbeat eligibility, terminal suppression (which applies
   only to exit-bearing terminal records, never the claim placeholder) — is
   token equality with the claim's direction: a straggler whose claim is
@@ -103,10 +111,37 @@ Field rules, matching `src/harness_state.rs`:
   inherited from beyond the future-skew trust bound) so it stays
   byte-distinct even against a same-millisecond predecessor.
 - `reason` is diagnostic only; no consumer branches on it.
+- `ptySession` fences every live state: a writer refuses a live observation
+  that names no session (only `ended` may omit it), because a live record the
+  probe cannot check would stay definite straight through an external SIGKILL.
 - `sinceMs` is when the current state was entered and survives heartbeat
   re-stamps; `writtenAtMs` is the heartbeat. `transitions` is a monotonic
   counter continued across writer restarts; with `writtenAtMs` it keeps every
   write byte-distinct.
+- Writes are session-owned by incarnation token, and ownership has a
+  DIRECTION through `seq`. A claim is a WRITTEN act under the record lock —
+  an exitless `ended (superseded)` takeover record carrying the new token
+  and a sequence one above the highest the seat has seen (the on-disk
+  record's or the `.harness-state.seq` floor sidecar's, whichever is
+  higher, so an unreadable record does not restart the sequence) — so
+  racing claimers serialize and mint
+  DISTINCT sequences (no tie exists), and a predecessor's still-fresh live
+  record is superseded at relaunch; readers derive indeterminate (`claimed`)
+  from the fresh placeholder until the session's first real observation. A
+  straggler from a superseded session (its claim below the on-disk sequence)
+  is refused in live and terminal paths alike, a token-only writer never
+  claims (it adopts its own session's records, starts virgin ones, and is
+  refused against foreign tokens), and terminal suppression applies only to
+  exit-bearing records — never the claim placeholder. `sinceMs` never spans
+  a restart; a lingering predecessor can neither heartbeat nor overwrite its
+  successor's record.
+  Heartbeats and coalescing never touch a record whose schema or token the
+  writer does not own; a foreign record is left byte-identical by heartbeats
+  and replaced only by a claiming observation. One residual, stated:
+  Claude's exported ownership pair is visible to its tool children like
+  every other hook-environment value (`ST_AGENT` included) — pi stashes and
+  unexports instead because pi fronts its own environment onto every bash
+  child, an architectural difference, not an oversight.
 - Deserialization is additive-tolerant (no `deny_unknown_fields`): a reader
   may be older than its writer.
 
@@ -121,17 +156,35 @@ What a reader reports, in evaluation order:
 | Evidence | Reads as | Reason |
 | --- | --- | --- |
 | No record file | no observation (`null`) | never observed ≠ `unknown` |
+| File exists but cannot be read | `unknown` | `unreadable-record`; an IO error is indeterminate, never absence |
 | Unparseable / non-v1-shaped bytes | `unknown` | `malformed-record`; never falls back to mtime |
+| `schema` is not `st2.harness-state.v1` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
 | `writtenAtMs` > now + 60 s | `unknown` | `future-skew` |
 | `writtenAtMs` ≤ now − 15 min | `unknown` | `stale` |
 | Literal `unknown` state (never written by this crate) | `unknown` | `literal-unknown` |
 | Live state, same-host probe proves `ptySession` dead | `unknown` | `session-dead` |
+| Live state, probe available, record names no `ptySession` | `unknown` | `unfenced-record`; nothing to check is not the same as checked |
 | Live state, probe indeterminate | the recorded state | unprovable evidence downgrades nothing |
+| Fresh claim placeholder (`ended`, exitless, reason `superseded`) | `unknown` | `claimed`; a fence is not an observation |
 | `ended`, any probe result | `ended` | a terminal record outlives its writer |
 | Otherwise | the recorded tuple | — |
 
 Every `unknown` row routes through one constructor and blanks every axis;
 there is no path from any absence to a definite state.
+
+Two reader-side limits, stated before anyone finds them: `pty kill` removes
+the session pidfile, so the liveness probe reads *indeterminate* rather than
+*dead* after it — a seat that was `active` when killed genuinely reads
+`active` (measured), with Doctor silent, until the staleness horizon or the
+next session's written claim supersedes the orphan at relaunch, whichever
+comes first. The cross-check is a narrowing of the ungraceful-death window
+(provably dead sessions: pidfile present, process gone), not its closure —
+OHS-T04/OHS-R07 say exactly this, and no death tombstone is attempted: the
+kill that removes the registry entry leaves nothing behind to prove death
+with, and fabricating evidence is the one thing this design never does. And
+hosts running codex-cli at or above 0.148 produce no Codex observed state at
+all: `SUPPORTED_CODEX_CLI_VERSIONS` refuses the launch, correctly, until the
+pin moves (#267).
 
 ## Codex producer (OHS-R05)
 
@@ -156,7 +209,24 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 
 `inputBuffer` is `unknown` from this producer: the control stream does not see
 the composer. The projection test must be behavioral — a table that would pass
-with every row mapped to `unknown` is not an oracle (#268 §B).
+with every row mapped to `unknown` is not an oracle (#268 §B). The wrapper
+honors st2's stop signal through every startup phase (socket connect,
+initialize, thread binding), not only the bound monitor loop: a stop before
+the TUI exists ends the launch gracefully and leaves no record — nothing was
+observed — while a stop after it exits through the ordinary terminal-write
+path — and the stop handler installs before ANY child is spawned, the
+hook-trust preflight's detached app-server included, with the stop flag
+polled between short socket timeouts through every startup wait (connect,
+the initialize handshake, thread binding, and the preflight's projection
+read), so a stop in that window cannot leak a server around a dead wrapper
+or sit out a 30-second handshake. Observability never kills a
+launch: a claim that cannot be written degrades to a token-only writer with
+a warning, a TUI that fails to spawn writes a real terminal record (ended,
+launch-error) over the claim placeholder, and a projected transition whose
+record write fails does not count as evidence: it is retained as pending and
+retried on EVERY pump pass (only the heartbeat is presence-cadence work), so
+a stale on-disk state is never kept fresh in contradiction of the latest
+observation.
 
 ## Claude producer (OHS-R05, OHS-R06)
 
@@ -166,7 +236,8 @@ prompt or tool activity writes `active`; `Stop` writes `idle`;
 classified from the payload's `tool_name` (`AskUserQuestion` → `question`,
 anything else → `permission`) — (its meaning is
 specifically "a human is about to be asked" — it fires only under permission
-modes that ask). Events carrying `agent_id` are subagent-nested and never move
+modes that ask), classifying its ask kind from the payload's `tool_name`:
+`AskUserQuestion` is a `question`, anything else a `permission`. Events carrying `agent_id` are subagent-nested and never move
 top-level state. The blocked *exit* edge is the next `PreToolUse`,
 `PostToolUse`, or `Stop` — measured-correct, not merely conservative: the
 2026-08-23 batched-permission capture (`DQ-H1`) shows tool execution
@@ -185,15 +256,44 @@ driver-declared seats, so both surfaces register identical hooks and a test
 fails if they drift. A live seat converges without disruption: render output
 is not part of the launch fingerprint, the merged settings land on the next
 materialization pass, and the hooks take effect at the next session start.
+The registration merges with `arrays="union"`: user-declared hook entries
+survive every materialization, while st2's own prior entries — recognizable
+by the hook root they reference — are superseded on a hook-set upgrade
+rather than accumulated. Hook writes carry the wrapper's exported
+incarnation token, so a hook finishing after the wrapper reaped Claude
+cannot replace the terminal record. Legacy `deliver "mcp"` seats render the same
+canonical registration — they run under claude-session too, and a wrapper
+that claims and ends a record nobody transitions would be worse than no
+record. A hooks-only seat (the maintained hand-authored example launches
+claude directly) gets transitions and blocked-on-you but no heartbeat owner
+and no terminal record: its `SessionStart` performs the written claim so
+session succession works — eligibility and the takeover are ONE act under
+the record lock, so a hooks-only SessionStart racing a wrapper's startup
+cannot steal its sequence, and a wrapper's fresh claim placeholder counts
+as owned (an abandoned one ages into claimability); a wrapperless claimer
+otherwise supersedes only fellow wrapperless tokens, real exit-bearing
+terminal records, and staleness — while a live-but-idle seat still ages to
+`unknown` and an exit leaves its last state to age out — indeterminate,
+never wrong.
 
 ## pi producer (OHS-R05, OHS-R08)
 
-The injected extension observes `agent_start`/`agent_end` — a positive,
-evented, in-process signal — and reports transitions over the existing
-channel; the wrapper writes the record and owns heartbeat and terminal writes.
-This is the first producer that satisfies root `DQ2`'s "stronger evented
-signal" clause for any harness. pi's composer offers nothing to scrape, so
-`inputBuffer` stays `unknown`.
+The injected extension observes `agent_start`/`agent_settled` — a positive,
+evented, in-process signal; the idle edge is deliberately `agent_settled`,
+because `ctx.isIdle()` is still false through `agent_end` and a queued
+follow-up turn starts exactly at that boundary (measured against the repo's
+own pi captures). Ownership splits by phase rather than living in one
+process: the channel owns the live record and its heartbeat, because it is
+the one process that sees pi's turn events and its stdio EOF bounds its
+evidence, while the wrapper owns only the terminal record — through a terminal-only
+observer that never heartbeats but does write `ended` *before* the stop
+path's SIGKILL escalation of its own group, the one write that makes an
+escalated stop observable at all — because it is the
+one process that sees the provider die — and the channel drops queued live
+frames once a terminal record is on disk, so the wrapper's write is the
+incarnation's last word. This is the first producer that satisfies root
+`DQ2`'s "stronger evented signal" clause for any harness. pi's composer
+offers nothing to scrape, so `inputBuffer` stays `unknown`.
 
 ## OpenCode producer (OHS-R08)
 
@@ -204,23 +304,46 @@ allocates a loopback port and a per-seat password, launches the TUI bound to
 them, owns the presence lease and the observed-state record, and projects the
 `/event` SSE stream:
 
-| Signal | state | blockedOn | reason |
-|---|---|---|---|
-| `session.status {type: busy}` | `active` | `none` | — |
-| `session.status {type: retry}` | `active` | `none` | `retry` |
-| `session.status {type: idle}` / `session.idle` | `idle` | `none` | — |
-| `permission.asked` … `permission.replied` (same ask id; spelled `id` on entry, `requestID` on exit — measured) | `active` | `human` | `permission` |
-| `question.asked` … `question.replied\|rejected` (same ask id, same spelling split) | `active` | `human` | `question` |
-| `session.error {ProviderAuthError}` | `ended` | `none` | `providerAuth` |
-| `session.error` (other arms) | `idle` | `none` | `error:<name>` |
-| child exit / stop path | `ended` | `none` | exit status |
+| Signal | state | blockedOn | ask | reason |
+|---|---|---|---|---|
+| `session.status {type: busy}` | `active` | `none` | `none` | — |
+| `session.status {type: retry}` | `active` | `none` | `none` | `retry` |
+| `session.status {type: idle}` / `session.idle` | `idle` | `none` | `none` | — |
+| `permission.asked` … `permission.replied` (same ask id; spelled `id` on entry, `requestID` on exit — measured) | `active` | `human` | `permission` | `permission` |
+| `question.asked` … `question.replied\|rejected` (same ask id, same spelling split) | `active` | `human` | `question` | `question` |
+| `session.error {ProviderAuthError}` | `ended` | `none` | `none` | `providerAuth` |
+| `session.error` (other arms) | `idle` | `none` | `none` | `error:<name>` |
+| child exit / stop path | `ended` | `none` | `none` | exit status |
 
 A dedicated seat aggregates across the server's sessions: any busy session is
 activity, any open ask is a human block, and idle requires positive level
 evidence (`/session/status` omits idle sessions, so an empty map over a live
-server is the idle proof, re-read on every SSE (re)connect). A dropped stream
-stops the heartbeat; `inputBuffer` stays `unknown` — the `/tui/*` surface is
-write-only.
+server is the idle proof, re-read on every SSE (re)connect). Asks open across
+a reconnect are recovered from both pending listings — `GET /permission` and
+`GET /question`, each measured on 1.18.19 — with their ids kept so the
+id-matched exits still release them; the seed builds a fresh projection and
+swaps it in whole only when the status level (which must be the documented
+object shape — null or an array proves nothing), every status word, and both
+listings all read cleanly — a listing entry without a readable id is a
+pending ask the id-matched exit could never release, so it fails the seed
+rather than being skipped. A mid-seed failure leaves nothing half-seeded, a
+successful re-seed clears stale entries whose exits passed during the
+outage, and otherwise evidence stays off and the seed retries. An
+unrecognized `session.status` word on ANY session poisons the projection
+outright — a tracked-busy entry can no longer be trusted to clear, and an
+untracked session in a state this version cannot read makes standing idle
+evidence a fabrication — so non-terminal observations are withheld (a
+sticky terminal still outranks the poison) and evidence drops until a fresh
+seed replaces the picture. An SSE drop marks the observation
+stream interrupted, so the first post-reseed observation opens a fresh
+transition rather than claiming continuity across the outage. The `/doc`
+subset gate names every consumed arm, exit events and pending listings
+included, so a release renaming an exit is refused up front rather than
+holding `blockedOn: human` forever. A dropped stream stops the heartbeat, the
+stream carries a silence horizon of at least twice the measured heartbeat
+cadence so a stalled socket surfaces as a disconnect instead of keeping
+evidence alive forever, and `inputBuffer` stays `unknown` — the `/tui/*`
+surface is write-only.
 
 The native delivery transport mirrors the Codex FIFO discipline: an
 `Attempted` receipt persisted before transport, `POST
@@ -232,8 +355,14 @@ reads back durably from the server. The `/tui/append-prompt` and
 two gates: a `SUPPORTED_OPENCODE_VERSIONS` pin and a live `/doc` OpenAPI
 subset check naming every arm st2 consumes; observation runs behind the
 `/doc` check alone, since its vocabulary already degrades to indeterminate.
-Deliveries target the most recently observed session; a seat whose TUI has not
-yet created one waits rather than creating sessions itself.
+Deliveries target the most recently observed session; a seat whose TUI has
+not yet created one waits rather than creating sessions itself, and a session
+that settled before the observer connected — invisible to events and to
+`/session/status` alike — is recovered from the session listing when work is
+pending. The status seed trusts exactly the pinned words (`busy`, `retry`,
+`idle`) and fails closed on anything else, and the stop path rewrites its
+pre-signal escalation cover with the exit the grace-window reap actually
+observed.
 
 ## Exposure (OHS-R09, OHS-R10)
 
@@ -254,7 +383,11 @@ yet created one waits rather than creating sessions itself.
 
 `null` when no record exists. The derivation above is already applied — a
 consumer never re-implements staleness. Roster reads pass the same-host
-liveness probe only for agents whose resolved host is this host. `status`,
+liveness probe only for agents whose resolved host is this host, resolving
+the pty root exactly as the runner does (`PTY_ROOT`, else the catalog's own
+pty root; the legacy `PTY_SESSION_DIR` is deliberately not honored — the
+runner never uses it, and probing a directory st2-managed sessions never
+touch turns provable deaths into indeterminate reads). `status`,
 `desiredState`, and `lastActivity` keep their exact meanings; the three
 full-string pinned assertions and the stable-roster invariant wording are
 updated deliberately in the change that adds the field. Doctor prints an

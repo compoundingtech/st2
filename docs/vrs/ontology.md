@@ -121,7 +121,8 @@ Authority: [`reconcile::Session`](../../src/reconcile.rs#L16-L26)
 
 The driver-written record of what a harness is seen doing: activity
 (`idle`/`active`/`child`/`ended`, with `unknown` derived and never written),
-who it is blocked on, and what its input buffer holds. The observed
+who it is blocked on — and, when blocked on a human, what kind of ask holds
+it (`permission`/`question`/`review`) — and what its input buffer holds. The observed
 counterpart of the declared axes: it is not [presence](#presence) (agent-
 authored availability), not [session state](#session-state) (task-record
 liveness), not R08's *declared activity status*, and not R09's *working
@@ -350,7 +351,7 @@ explicit `unpark` recovery request.
   [session state](../../src/reconcile.rs#L16-L26) for runtime liveness. Avoid
   bare *agent status* when either could be meant.
 - Use [observed harness state](05-harness-state/requirements.md) for the
-  driver-observed working signal. It is a third axis beside presence and
+  driver-observed activity signal. It is a third axis beside presence and
   session state: R08's *activity status* stays the declared, agent-authored
   signal, and neither axis rewrites the other. Bare *activity* does not
   identify which is meant.
