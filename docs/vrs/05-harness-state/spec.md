@@ -76,7 +76,11 @@ Field rules, matching `src/harness_state.rs`:
 - `incarnation` is the writing session's token and `seq` its monotonic
   ownership sequence. A claim is a WRITTEN act under the record lock: the
   session starting up writes an exitless `ended (superseded)` takeover
-  record carrying its token and the on-disk sequence plus one — racing
+  record carrying its token and a sequence one above the highest this seat
+  has seen — the maximum of the on-disk record's sequence and the
+  `.harness-state.seq` floor sidecar, a sibling file (written
+  stage-and-rename under the same lock on every claim) that keeps claims
+  monotonic even when the record itself is unreadable. Racing
   claimers therefore mint distinct sequences, and a predecessor's
   still-fresh live record is superseded at relaunch, where the
   pty-name-based probe cannot tell sessions apart; the seat reads
@@ -90,6 +94,11 @@ Field rules, matching `src/harness_state.rs`:
   Sibling writer processes of one session share the claimer's exported
   token and sequence; records predating either field decode with an empty
   token and sequence zero, which no session owns and any claim supersedes.
+  The residual: with the record unreadable AND the floor sidecar missing or
+  damaged, a claim restarts at sequence one and a lingering predecessor
+  holding a higher sequence could fence it — accepted, because it takes
+  both files independently damaged, and refusing the claim instead would
+  wedge the seat permanently.
   Every landed write carries a strictly monotonic per-record stamp (never
   inherited from beyond the future-skew trust bound) so it stays
   byte-distinct even against a same-millisecond predecessor.
