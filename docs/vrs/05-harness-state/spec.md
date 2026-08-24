@@ -90,8 +90,9 @@ Field rules, matching `src/harness_state.rs`:
   monotonic even when the record itself is unreadable. Racing
   claimers therefore mint distinct sequences, and a predecessor's
   still-fresh live record is superseded at relaunch, where the
-  pty-name-based probe cannot tell sessions apart; the seat reads
-  `ended (superseded)` until the session's first real observation. Ownership
+  pty-name-based probe cannot tell sessions apart; readers derive
+  indeterminate (`claimed`) from the fresh placeholder — a fence is not an
+  observation — until the session's first real observation. Ownership
   — coalescing, heartbeat eligibility, terminal suppression (which applies
   only to exit-bearing terminal records, never the claim placeholder) — is
   token equality with the claim's direction: a straggler whose claim is
@@ -125,14 +126,15 @@ Field rules, matching `src/harness_state.rs`:
   higher, so an unreadable record does not restart the sequence) — so
   racing claimers serialize and mint
   DISTINCT sequences (no tie exists), and a predecessor's still-fresh live
-  record is superseded at relaunch; the seat reads `ended (superseded)`
-  until the session's first real observation. A straggler from a superseded
-  session (its claim below the on-disk sequence) is refused in live and
-  terminal paths alike, a token-only writer never claims (it adopts its own
-  session's records, starts virgin ones, and is refused against foreign
-  tokens), and terminal suppression applies only to exit-bearing records —
-  never the claim placeholder. `sinceMs` never spans a restart; a lingering
-  predecessor can neither heartbeat nor overwrite its successor's record.
+  record is superseded at relaunch; readers derive indeterminate (`claimed`)
+  from the fresh placeholder until the session's first real observation. A
+  straggler from a superseded session (its claim below the on-disk sequence)
+  is refused in live and terminal paths alike, a token-only writer never
+  claims (it adopts its own session's records, starts virgin ones, and is
+  refused against foreign tokens), and terminal suppression applies only to
+  exit-bearing records — never the claim placeholder. `sinceMs` never spans
+  a restart; a lingering predecessor can neither heartbeat nor overwrite its
+  successor's record.
   Heartbeats and coalescing never touch a record whose schema or token the
   writer does not own; a foreign record is left byte-identical by heartbeats
   and replaced only by a claiming observation. One residual, stated:
@@ -163,6 +165,7 @@ What a reader reports, in evaluation order:
 | Live state, same-host probe proves `ptySession` dead | `unknown` | `session-dead` |
 | Live state, probe available, record names no `ptySession` | `unknown` | `unfenced-record`; nothing to check is not the same as checked |
 | Live state, probe indeterminate | the recorded state | unprovable evidence downgrades nothing |
+| Fresh claim placeholder (`ended`, exitless, reason `superseded`) | `unknown` | `claimed`; a fence is not an observation |
 | `ended`, any probe result | `ended` | a terminal record outlives its writer |
 | Otherwise | the recorded tuple | — |
 
@@ -326,11 +329,12 @@ pending ask the id-matched exit could never release, so it fails the seed
 rather than being skipped. A mid-seed failure leaves nothing half-seeded, a
 successful re-seed clears stale entries whose exits passed during the
 outage, and otherwise evidence stays off and the seed retries. An
-unrecognized `session.status` word is not level evidence (a future word must
-not prove idle on a quiet server), and on a session the projection tracks as
-busy it poisons the projection outright — observations are withheld and
-evidence drops until a fresh seed replaces the picture, since that busy
-entry could no longer be trusted to clear. An SSE drop marks the observation
+unrecognized `session.status` word on ANY session poisons the projection
+outright — a tracked-busy entry can no longer be trusted to clear, and an
+untracked session in a state this version cannot read makes standing idle
+evidence a fabrication — so non-terminal observations are withheld (a
+sticky terminal still outranks the poison) and evidence drops until a fresh
+seed replaces the picture. An SSE drop marks the observation
 stream interrupted, so the first post-reseed observation opens a fresh
 transition rather than claiming continuity across the outage. The `/doc`
 subset gate names every consumed arm, exit events and pending listings
