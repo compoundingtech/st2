@@ -6,9 +6,11 @@
 //! "the model received it" are exactly the two things that must not be conflated.
 
 use std::fs;
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use st2::context;
 
@@ -72,6 +74,10 @@ impl Fixture {
 
     /// `overrides` are applied last, so a test can drop `PATH` entries or retune staleness.
     fn run_with(&self, script: &str, overrides: &[(&str, &str)]) -> Output {
+        self.run_with_input(script, overrides, "")
+    }
+
+    fn run_with_input(&self, script: &str, overrides: &[(&str, &str)], input: &str) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("hooks")
             .join(script);
@@ -87,7 +93,24 @@ impl Fixture {
         for (key, value) in overrides {
             command.env(key, value);
         }
-        command.output().unwrap()
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn stop_failure_record(&self) -> PathBuf {
+        self.state
+            .join("st2/hook-events/stop-failure/Silber.cos.jsonl")
     }
 }
 
@@ -216,4 +239,125 @@ fn session_start_fails_open_without_required_commands() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn stop_failure_appends_a_private_redacted_record_without_a_supervisor() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Claude hook");
+        return;
+    }
+    let fixture = Fixture::new();
+    let payload = r#"{
+  "session_id": "session-safe",
+  "hook_event_name": "StopFailure",
+  "error": "authentication_failed",
+  "error_details": "Login expired: Bearer bearer-secret-1234567890 and sk-ant-api03-abcdefghijklmnop",
+  "last_assistant_message": "API Error: Login expired",
+  "api_key": "secret-key-value",
+  "nested": {
+    "authorization": "Bearer nested-secret-1234567890",
+    "safe": "retry in 60 seconds"
+  }
+}"#;
+
+    let output = fixture.run_with_input("claude-stop-failure.sh", &[], payload);
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let record_path = fixture.stop_failure_record();
+    let contents = fs::read_to_string(&record_path).unwrap();
+    let lines = contents.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "one hook call must append one JSONL line");
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["schema"], 1);
+    assert_eq!(record["event"], "StopFailure");
+    assert_eq!(record["identity"], "Silber.cos");
+    assert_eq!(record["error_type"], "authentication_failed");
+    assert!(
+        record["timestamp"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z'))
+    );
+    assert_eq!(record["payload"]["session_id"], "session-safe");
+    assert_eq!(record["payload"]["error"], "authentication_failed");
+    assert_eq!(record["payload"]["api_key"], "[REDACTED]");
+    assert_eq!(record["payload"]["nested"]["authorization"], "[REDACTED]");
+    assert_eq!(record["payload"]["nested"]["safe"], "retry in 60 seconds");
+    assert!(
+        record["payload"]["error_details"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED]")
+    );
+    assert!(!contents.contains("bearer-secret"));
+    assert!(!contents.contains("sk-ant-api03"));
+    assert!(!contents.contains("secret-key-value"));
+    assert!(!contents.contains("nested-secret"));
+    assert_eq!(
+        fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn stop_failure_records_old_and_new_error_fields_before_reaction_filtering() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Claude hook");
+        return;
+    }
+    let fixture = Fixture::new();
+
+    let first = fixture.run_with_input(
+        "claude-stop-failure.sh",
+        &[],
+        r#"{"hook_event_name":"StopFailure","error_type":"max_output_tokens"}"#,
+    );
+    let second = fixture.run_with_input(
+        "claude-stop-failure.sh",
+        &[],
+        r#"{"hook_event_name":"StopFailure","error":"overloaded"}"#,
+    );
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+    let contents = fs::read_to_string(fixture.stop_failure_record()).unwrap();
+    let records = contents
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["error_type"], "max_output_tokens");
+    assert_eq!(records[1]["error_type"], "overloaded");
+}
+
+#[test]
+fn stop_failure_remains_fail_open_when_the_record_path_is_unwritable() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Claude hook");
+        return;
+    }
+    let fixture = Fixture::new();
+    let blocked = fixture._tmp.path().join("blocked-state");
+    fs::write(&blocked, "not a directory").unwrap();
+
+    let output = fixture.run_with_input(
+        "claude-stop-failure.sh",
+        &[("XDG_STATE_HOME", blocked.to_str().unwrap())],
+        r#"{"hook_event_name":"StopFailure","error":"server_error"}"#,
+    );
+
+    assert!(
+        output.status.success(),
+        "record failure must not block Claude. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
