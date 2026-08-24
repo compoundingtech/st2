@@ -78,6 +78,7 @@ pub enum Driver {
     Claude(ClaudeDriver),
     Codex(CodexDriver),
     Pi(PiDriver),
+    OpenCode(OpenCodeDriver),
 }
 
 impl Driver {
@@ -86,6 +87,7 @@ impl Driver {
             Self::Claude(_) => "claude",
             Self::Codex(_) => "codex",
             Self::Pi(_) => "pi",
+            Self::OpenCode(_) => "opencode",
         }
     }
 }
@@ -123,6 +125,19 @@ pub struct PiDriver {
 pub struct CodexDriver {
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Typed fields accepted by an `opencode {}` driver block.
+///
+/// OpenCode has no effort axis; its permission policy lives in its config file rather than a
+/// launch flag, so neither appears here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OpenCodeDriver {
+    pub model: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -563,6 +578,7 @@ pub(crate) struct RawDriver {
     pub(crate) claude: Option<ClaudeDriver>,
     pub(crate) codex: Option<CodexDriver>,
     pub(crate) pi: Option<PiDriver>,
+    pub(crate) opencode: Option<OpenCodeDriver>,
 }
 
 impl RawDriver {
@@ -577,6 +593,9 @@ impl RawDriver {
         }
         if let Some(driver) = self.pi {
             declared.push(("pi", Driver::Pi(driver)));
+        }
+        if let Some(driver) = self.opencode {
+            declared.push(("opencode", Driver::OpenCode(driver)));
         }
         match declared.len() {
             0 => Ok(None),
@@ -912,6 +931,11 @@ impl RawSpec {
             || self.deliver.is_some()
             || self.driver.claude.is_some()
             || self.driver.codex.is_some()
+            // pi predates this predicate gaining driver awareness and was silently skipped too:
+            // an identity-omitting file whose only agent-shaped signal is its driver block must
+            // still be a candidate, whichever provider the block names.
+            || self.driver.pi.is_some()
+            || self.driver.opencode.is_some()
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -1287,6 +1311,20 @@ fn validate_launch(
 
 #[cfg(test)]
 mod tests {
+
+    /// A driver block alone is an agent-shaped signal for every provider: an identity-omitting
+    /// `agent.toml` whose only content is `[opencode]` (or `[pi]`) must stay a spec candidate,
+    /// or path-derived discovery silently skips the seat.
+    #[test]
+    fn a_lone_driver_block_of_any_provider_is_a_spec_candidate() {
+        for provider in ["claude", "codex", "pi", "opencode"] {
+            let block = format!("[{provider}]\nprompt = \"Start the assigned work.\"");
+            let raw: super::RawSpec = toml::from_str(&block).unwrap();
+            assert!(raw.looks_like_spec(), "[{provider}] must look like a spec");
+        }
+        let raw: super::RawSpec = toml::from_str("unrelated = true").unwrap();
+        assert!(!raw.looks_like_spec());
+    }
     use super::*;
 
     #[test]

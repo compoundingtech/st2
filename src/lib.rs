@@ -28,6 +28,7 @@ pub mod host_lock;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
+pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
 pub mod pi_session;
@@ -52,7 +53,8 @@ pub use agent_spec::{discovery, spec};
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    PiDriver, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle, parse_duration,
+    OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
+    parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

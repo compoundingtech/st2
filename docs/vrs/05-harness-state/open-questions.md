@@ -59,13 +59,17 @@ hypotheses.
   `unknown` is no fresh observation, never proof of ill health, and never
   gates local work. Resolves by: specifying remote-reader semantics with a
   proof, or explicitly scoping the record same-host advisory.
-- **DQ-H6 OpenCode blocked-entry capture.** The state source itself is
-  resolved: the server's SSE event surface, measured on 1.18.19
-  (`.experiments/2026-08-23-opencode-surface.md`) and gated by
-  `SUPPORTED_OPENCODE_VERSIONS` plus the live `/doc` subset check. What
-  remains open is the blocked-on-human pair: `permission.asked` /
-  `permission.replied` are schema-backed with explicit `^per` ids — the exit
-  edge is clean by construction, unlike Claude's — but no live capture of a
-  real permission prompt exists (headless runs with `{"bash":"ask"}` never
-  asked). Resolves by: one capture from a TUI seat with a real permission
-  prompt, confirming the events fire and carry the id the producer matches.
+- **DQ-H6 OpenCode blocked-entry capture — resolved 2026-08-23.** Both pairs
+  were captured live on a headless 1.18.19 server (the earlier failure to get
+  a prompt came from setting permissions via `PATCH /config`; the same
+  `{"permission":{"bash":"ask"}}` in the *config file* asks reliably, no TUI
+  needed). The capture corrected the producer twice: the entry events carry
+  `properties.id` but the exit events spell it `properties.requestID`
+  (`permission.replied`, `question.replied|rejected`) — the schema-derived
+  extraction would have held `blockedOn: human` forever after a real grant —
+  and `GET /event` over HTTP/1.1 is chunk-encoded, which the line-oriented
+  SSE reader cannot parse safely, so the producer requests it over HTTP/1.0,
+  which the server streams raw. Verbatim captured pairs are fixture tests
+  (`src/opencode_session.rs::captured_permission_grant_pair_enters_and_exits_blocked`,
+  `::captured_question_reply_pair_enters_and_exits_blocked`); the raw frames
+  and commands are in `.experiments/2026-08-23-opencode-surface.md`.

@@ -3,7 +3,7 @@
 //! Expansion does not read files, inspect a harness, mutate a declaration, or execute a process.
 //! Print, reconcile, and materialization use this same expansion.
 
-use agent_spec::spec::{AgentSpec, ClaudeDriver, CodexDriver, Driver, PiDriver};
+use agent_spec::spec::{AgentSpec, ClaudeDriver, CodexDriver, Driver, OpenCodeDriver, PiDriver};
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 
@@ -38,6 +38,7 @@ pub fn expand_driver(spec: &AgentSpec, this_host: &str) -> Result<KdlDocument> {
         Driver::Claude(driver) => expand_claude(driver, &bus_id)?,
         Driver::Codex(driver) => expand_codex(driver, &bus_id),
         Driver::Pi(driver) => expand_pi(driver, &bus_id),
+        Driver::OpenCode(driver) => expand_opencode(driver, &bus_id),
     };
     output.autoformat();
     Ok(output)
@@ -91,6 +92,34 @@ fn expand_pi(driver: &PiDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "pi-session".to_string(),
+        "--identity".to_string(),
+        bus_id.to_string(),
+        "--runtime-id".to_string(),
+        bus_id.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(provider);
+    document([node("argv", argv)])
+}
+
+/// OpenCode's server surface is wrapper-owned runtime state: the wrapper allocates the port and
+/// password at launch, so the expansion stays a pure declaration with no machine-local values.
+fn expand_opencode(driver: &OpenCodeDriver, bus_id: &str) -> KdlDocument {
+    let mut provider = vec!["opencode".to_string()];
+    if let Some(model) = &driver.model {
+        provider.extend(["--model".to_string(), model.clone()]);
+    }
+    provider.extend(driver.args.iter().cloned());
+    // Unlike the sibling harnesses, OpenCode's positional argument is a project directory; the
+    // startup prompt is a named flag.
+    provider.extend(["--prompt".to_string(), driver.prompt.clone()]);
+
+    let mut argv = vec![
+        ST2.to_string(),
+        "--catalog".to_string(),
+        CATALOG.to_string(),
+        "driver".to_string(),
+        "opencode-session".to_string(),
         "--identity".to_string(),
         bus_id.to_string(),
         "--runtime-id".to_string(),
@@ -256,6 +285,43 @@ mod tests {
                 "model_reasoning_effort=xhigh",
                 "--model",
                 "override",
+                "Start work."
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_expands_to_the_session_wrapper_with_a_prompt_flag() {
+        let output = expand_driver(
+            &spec(Driver::OpenCode(OpenCodeDriver {
+                model: Some("anthropic/claude-opus-5".into()),
+                prompt: "Start work.".into(),
+                args: vec!["--agent".into(), "build".into()],
+            })),
+            "unused",
+        )
+        .unwrap();
+
+        assert_eq!(output.nodes().len(), 1);
+        assert_eq!(
+            strings(output.get("argv").unwrap()),
+            [
+                "st2",
+                "--catalog",
+                "$CATALOG",
+                "driver",
+                "opencode-session",
+                "--identity",
+                "host.worker",
+                "--runtime-id",
+                "host.worker",
+                "--",
+                "opencode",
+                "--model",
+                "anthropic/claude-opus-5",
+                "--agent",
+                "build",
+                "--prompt",
                 "Start work."
             ]
         );
