@@ -242,7 +242,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 }
             }
         }
-        if machine.poisoned && evidence {
+        if machine.poisoned && machine.ended.is_none() && evidence {
             // The projection went untrustworthy mid-stream: stop heartbeating over it and let
             // the level seed rebuild the whole picture from the server's own truth.
             evidence = false;
@@ -774,14 +774,17 @@ impl EventMachine {
     }
 
     fn observation(&self) -> Option<Observation> {
-        if self.poisoned {
-            return None;
-        }
+        // A sticky terminal outranks poison: `ended` does not depend on the busy map the
+        // unknown word made untrustworthy, and withholding it would lose the terminal to the
+        // forced reseed's fresh machine.
         if let Some(reason) = self.ended {
             return Some(
                 Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
                     .with_reason(reason),
             );
+        }
+        if self.poisoned {
+            return None;
         }
         if let Some(kind) = self.blocked.values().next() {
             let ask = match *kind {
@@ -1896,6 +1899,15 @@ mod tests {
             Activity::Idle,
             "an unknown word on an untracked session leaves the projection standing"
         );
+
+        // A sticky terminal outranks the poison: it does not depend on the busy map the
+        // unknown word made untrustworthy, and withholding it would lose the terminal.
+        machine.apply(&event(
+            r#"{"type":"session.error","properties":{"sessionID":"ses_1","error":{"name":"ProviderAuthError"}}}"#,
+        ));
+        let terminal = observed(&machine);
+        assert_eq!(terminal.state, Activity::Ended);
+        assert_eq!(terminal.reason.as_deref(), Some("providerAuth"));
     }
 
     /// A pending listing entry whose id this version cannot read must fail the whole seed:
