@@ -2943,8 +2943,22 @@ fn terminate_child(child: &mut Child) {
 mod tests {
     use super::*;
 
+    /// The stop flag is process-global, so every test that exercises a reader of it —
+    /// [`initialize_control`] above all — holds this lock against the one test that flips
+    /// the flag: parallel readers would otherwise observe the raised flag and fail their
+    /// `no stop raised in tests` expectations.
+    fn stop_flag_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+            std::sync::LazyLock::new(std::sync::Mutex::default);
+        match LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     #[test]
     fn a_stop_during_the_websocket_handshake_ends_startup_gracefully() {
+        let _stop_exclusive = stop_flag_tests();
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("control.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -3790,6 +3804,7 @@ mod tests {
     #[test]
     fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let config = delivery_config(tmp.path());
         let filename =
             message::send_to_inbox(&config.inbox, "h.sender", Some("wired"), None, &[], "body")
@@ -3924,6 +3939,7 @@ mod tests {
     #[test]
     fn subscribed_control_pump_reconciles_an_ambiguous_attempt_without_replay() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let config = delivery_config(tmp.path());
         let filename = message::send_to_inbox(
             &config.inbox,
@@ -4060,6 +4076,7 @@ mod tests {
     #[test]
     fn control_initializes_before_recording_the_first_thread_only() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -4173,6 +4190,7 @@ mod tests {
     #[test]
     fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let (pre_gate_checked_tx, pre_gate_checked_rx) = mpsc::channel();
@@ -4312,6 +4330,7 @@ mod tests {
     #[test]
     fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -4387,6 +4406,7 @@ mod tests {
     #[test]
     fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
