@@ -1874,7 +1874,15 @@ pub fn up_loop_specs(
         for id in &report.unparked {
             reported_flapping.remove(id);
         }
-        park_channel.publish(&cap, &mut report);
+        for cl in &report.crash_loops {
+            if reported_flapping.insert(cl.pty_id.clone()) {
+                eprintln!(
+                    "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
+                    id = cl.pty_id
+                );
+                surface_crash_loop(root, this_host, cl);
+            }
+        }
         recurring_warnings.filter(&mut report);
         on_report(&report);
         if STOP.load(Ordering::SeqCst) {
