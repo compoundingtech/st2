@@ -2956,8 +2956,10 @@ mod tests {
         });
         let started = Instant::now();
         let result = initialize_control(stream);
-        crate::provider_session::STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Join before resetting: on an early failure return the stopper has not fired yet,
+        // and resetting first would let it re-poison the global flag for every later test.
         stopper.join().unwrap();
+        crate::provider_session::STOP.store(false, std::sync::atomic::Ordering::SeqCst);
         let _held_open = silent_server.join().unwrap().unwrap();
         assert!(
             result.unwrap().is_none(),
