@@ -25,6 +25,9 @@ const PROTOCOL = 1;
 const BIN = "ST2_PI_CHANNEL_BIN";
 const CATALOG = "ST2_PI_CHANNEL_CATALOG";
 const IDENTITY = "ST2_PI_CHANNEL_IDENTITY";
+const RUNTIME_ID = "ST2_PI_CHANNEL_RUNTIME_ID";
+const SESSION = "ST2_PI_CHANNEL_SESSION";
+const SEQ = "ST2_PI_CHANNEL_SEQ";
 
 // pi starts the session even if st2 is slow to answer. Restored context is worth a short wait and
 // never worth a hung agent.
@@ -51,6 +54,9 @@ type Stash = {
   bin?: string;
   catalog?: string;
   identity?: string;
+  runtimeId?: string;
+  session?: string;
+  seq?: string;
   child?: childProcess.ChildProcess;
 };
 
@@ -67,26 +73,46 @@ type Stash = {
 const stash = (): Stash => {
   const globals = globalThis as { __st2PiChannel?: Stash };
   if (!globals.__st2PiChannel) {
+    // EVERY ST2_PI_CHANNEL_* value is stashed and unexported — the ownership pair included: a
+    // leaked runtime id or session token would hand a nested pi (or any tool child) this seat's
+    // registry key and record ownership. The channel subprocess receives them explicitly below.
     globals.__st2PiChannel = {
       bin: process.env[BIN],
       catalog: process.env[CATALOG],
       identity: process.env[IDENTITY],
+      runtimeId: process.env[RUNTIME_ID],
+      session: process.env[SESSION],
+      seq: process.env[SEQ],
     };
     delete process.env[BIN];
     delete process.env[CATALOG];
     delete process.env[IDENTITY];
+    delete process.env[RUNTIME_ID];
+    delete process.env[SESSION];
+    delete process.env[SEQ];
   }
   return globals.__st2PiChannel;
 };
 
 export default function (pi: ExtensionAPI) {
   const state = stash();
-  const { bin, catalog, identity } = state;
+  const { bin, catalog, identity, runtimeId, session, seq } = state;
 
   // Always close a NAMED channel, never "whatever is current". A session replacement (/new,
   // /resume, /fork) tears the old session down around the new one's start, so a teardown handler
   // that closed `current` would reap the successor it just opened — measured, and it silently
   // stopped all delivery after `/new`.
+  const awaitExit = (child: childProcess.ChildProcess | undefined, ms: number) =>
+    new Promise<void>((resolve) => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
   const closeChild = (child: childProcess.ChildProcess | undefined) => {
     if (!child) return;
     if (state.child === child) state.child = undefined;
@@ -96,7 +122,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** Open a channel and resolve with the hello's restored context (empty if none, or on timeout). */
-  const open = (ctx: ExtensionContext): Promise<string> => {
+  const open = async (ctx: ExtensionContext): Promise<string> => {
     if (!bin || !catalog || !identity) return Promise.resolve("");
     if (typeof ctx.isIdle !== "function") {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
@@ -109,13 +135,22 @@ export default function (pi: ExtensionAPI) {
       );
       return Promise.resolve("");
     }
-    // Closes the channel opened by the PREVIOUS session, whichever extension instance opened it.
-    closeChild(state.child);
+    // Closes the channel opened by the PREVIOUS session, whichever extension instance opened
+    // it — and WAITS (bounded) for it to exit before the replacement spawns: the successor
+    // shares the seat's record, and a predecessor draining its queued frames after the new
+    // session's seed would land stale state into fresh records.
+    const previous = state.child;
+    closeChild(previous);
+    await awaitExit(previous, 2000);
 
+    const channelEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
+    if (session) channelEnv[SESSION] = session;
+    if (seq) channelEnv[SEQ] = seq;
     const child = childProcess.spawn(
       bin,
       ["--catalog", catalog, "driver", "pi-channel", "--identity", identity],
-      { stdio: ["pipe", "pipe", "inherit"] },
+      { stdio: ["pipe", "pipe", "inherit"], env: channelEnv },
     );
     state.child = child;
 
@@ -131,6 +166,12 @@ export default function (pi: ExtensionAPI) {
       child.on("error", () => {
         if (state.child === child) state.child = undefined;
         settle("");
+      });
+      // An observability pipe must never take pi down: a channel that closed its stdin mid-write
+      // surfaces EPIPE on the stream, which without a listener is an uncaught exception in the
+      // host process. Retire the channel instead — frames simply stop, fail-open.
+      child.stdin.on("error", () => {
+        if (state.child === child) state.child = undefined;
       });
       child.on("exit", () => settle(""));
 
@@ -197,11 +238,32 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  // Observed harness state, extension side. pi's own turn boundaries are the positive signal,
+  // and the idle edge is `agent_settled`, not `agent_end`: measured against the repo's own pi
+  // captures, `ctx.isIdle()` is still false through `agent_end`, and a queued follow-up turn
+  // starts exactly at that boundary — an `agent_end` emit would blip a spurious idle before it.
+  // `agent_settled` is the first point pi is provably idle. The frame is observational — st2
+  // decides what becomes of it — and a closed channel drops it silently, matching the fail-open
+  // rule this file already follows. pi 0.84.2 exposes no typed waiting-on-a-human event, so no
+  // frame here ever claims one.
+  const sendState = (word: "active" | "idle") => {
+    const child = state.child;
+    if (!child || !child.stdin || child.stdin.destroyed) return;
+    child.stdin.write(JSON.stringify({ type: "state", state: word }) + "\n");
+  };
+  pi.on("agent_start", async () => sendState("active"));
+  pi.on("agent_settled", async () => sendState("idle"));
+
   pi.on("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
+    // Seed the observed state with the idle proof's answer at open time, so the record does not
+    // wait for the first turn boundary to exist.
+    if (opened && typeof ctx.isIdle === "function") {
+      sendState(ctx.isIdle() ? "idle" : "active");
+    }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own — the
       // closest pi equivalent to the other harnesses' `additionalContext` hook output.

@@ -41,8 +41,20 @@ pub(crate) fn install_signal_handler() {
     }
 }
 
+/// How one provider session ended, as the wrapper saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderOutcome {
+    /// The child exited on its own, with this status.
+    Exited(ExitStatus),
+    /// The wrapper stopped its process group; the reaped status when the group yielded inside the
+    /// grace window. `None` means the SIGKILL escalation ran — and since that kill targets the
+    /// wrapper's own group, code after it usually never runs at all.
+    Stopped(Option<ExitStatus>),
+}
+
 /// Run one interactive provider in this wrapper's terminal process group, refreshing presence on
-/// `refresh_interval` for exactly as long as the spawned child lives.
+/// `refresh_interval` for exactly as long as the spawned child lives. Fails on a nonzero exit;
+/// wrappers that need the exit itself use [`run_provider_observed`].
 pub(crate) fn run_provider(
     provider: &str,
     status_path: &Path,
@@ -52,6 +64,31 @@ pub(crate) fn run_provider(
     poll: Duration,
     stop: &AtomicBool,
 ) -> Result<()> {
+    match run_provider_observed(
+        provider,
+        status_path,
+        argv,
+        env,
+        refresh_interval,
+        poll,
+        stop,
+    )? {
+        ProviderOutcome::Exited(exit) => completed_provider(provider, exit),
+        ProviderOutcome::Stopped(_) => Ok(()),
+    }
+}
+
+/// [`run_provider`], but reporting how the session ended instead of judging it, so a wrapper can
+/// record a terminal observation before deciding what the exit means.
+pub(crate) fn run_provider_observed(
+    provider: &str,
+    status_path: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+) -> Result<ProviderOutcome> {
     let (program, args) = argv
         .split_first()
         .with_context(|| format!("{provider} provider argv is empty"))?;
@@ -77,13 +114,13 @@ pub(crate) fn run_provider(
     let mut next_refresh = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
-            return stop_provider_group(&mut child);
+            return stop_provider_group(&mut child).map(ProviderOutcome::Stopped);
         }
         if let Some(exit) = child
             .try_wait()
             .with_context(|| format!("checking {provider} provider"))?
         {
-            return completed_provider(provider, exit);
+            return Ok(ProviderOutcome::Exited(exit));
         }
         let now = Instant::now();
         if now >= next_refresh {
@@ -99,7 +136,7 @@ fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()> {
     Ok(())
 }
 
-fn stop_provider_group(child: &mut Child) -> Result<()> {
+fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
     let process_group = unsafe { libc::getpgrp() };
     anyhow::ensure!(
         process_group > 1,
@@ -110,14 +147,13 @@ fn stop_provider_group(child: &mut Child) -> Result<()> {
     }
     let deadline = Instant::now() + STOP_GRACE;
     while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
+        if let Some(exit) = child.try_wait()? {
+            return Ok(Some(exit));
         }
         thread::sleep(Duration::from_millis(25));
     }
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);
     }
-    let _ = child.wait();
-    Ok(())
+    Ok(child.wait().ok())
 }

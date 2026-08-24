@@ -13,11 +13,14 @@
 //! staleness, exactly as for the other harnesses.
 
 use std::path::Path;
+use std::process::ExitStatus;
 
 use anyhow::{Context as _, Result};
 
-use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler, run_provider};
-use crate::{hooks, message, status};
+use crate::provider_session::{
+    PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
+};
+use crate::{harness_state, hooks, message, status};
 
 /// The extension file inside this binary's immutable hook set.
 const EXTENSION: &str = "pi-channel.ts";
@@ -28,6 +31,14 @@ pub const CHANNEL_BIN: &str = "ST2_PI_CHANNEL_BIN";
 pub const CHANNEL_CATALOG: &str = "ST2_PI_CHANNEL_CATALOG";
 /// The host-qualified bus identity the channel binds.
 pub const CHANNEL_IDENTITY: &str = "ST2_PI_CHANNEL_IDENTITY";
+/// The wrapper's runtime/task ID — the pty session whose liveness vouches for observed state.
+pub const CHANNEL_RUNTIME_ID: &str = "ST2_PI_CHANNEL_RUNTIME_ID";
+/// The session incarnation token the wrapper mints. The channel adopts it so the wrapper's
+/// terminal record owns — and thereby fences — the live records the channel writes.
+pub const CHANNEL_SESSION: &str = "ST2_PI_CHANNEL_SESSION";
+/// The ownership sequence the wrapper claimed at startup — exported beside the token so the
+/// channel's writes act under the same directional claim.
+pub const CHANNEL_SEQ: &str = "ST2_PI_CHANNEL_SEQ";
 
 /// pi's startup network work, which a supervised seat should not be doing.
 ///
@@ -52,16 +63,54 @@ pub fn run(
     );
     let executable =
         std::env::current_exe().context("resolving st2 executable for the pi channel")?;
-    let mut env = channel_env(&executable, catalog_root, &identity)?;
-    env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
-    let set = hooks::verify_required_set().with_context(|| {
-        format!(
-            "pi driver '{runtime_id}' needs this binary's verified hook set for {EXTENSION}; run `st2 hooks install`"
-        )
-    })?;
-    let pi_argv = with_channel_extension(pi_argv, &set)?;
+    let session = harness_state::session_token();
+    // The claim is written: it supersedes whatever the predecessor left — including a
+    // still-fresh live record — before the channel or terminal writer act under it.
+    let seq = harness_state::claim(&agent_dir, identity.clone(), "pi", &session)?;
+    // Every fallible step past the claim must end the record honestly on failure — the claim
+    // placeholder standing as the last word would read as a takeover, not a launch that never
+    // ran.
+    let prepared = (|| -> Result<(Vec<(String, String)>, Vec<String>)> {
+        let mut env = channel_env(
+            &executable,
+            catalog_root,
+            &identity,
+            &runtime_id,
+            &session,
+            seq,
+        )?;
+        env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
+        let set = hooks::verify_required_set().with_context(|| {
+            format!(
+                "pi driver '{runtime_id}' needs this binary's verified hook set for {EXTENSION}; run `st2 hooks install`"
+            )
+        })?;
+        Ok((env, with_channel_extension(pi_argv, &set)?))
+    })();
+    let (env, pi_argv) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut writer = harness_state::Writer::new(
+                &agent_dir,
+                identity.clone(),
+                "pi",
+                Some(runtime_id.clone()),
+            )
+            .with_ownership(session.clone(), seq);
+            let _ = writer.observe(
+                harness_state::Observation::new(
+                    harness_state::Activity::Ended,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Unknown,
+                )
+                .with_reason("launch-error")
+                .with_exit("exit unknown"),
+            );
+            return Err(error);
+        }
+    };
     install_signal_handler();
-    run_provider(
+    let outcome = run_provider_observed(
         "pi",
         &status::status_path(&agent_dir),
         &pi_argv,
@@ -70,7 +119,50 @@ pub fn run(
         PROVIDER_POLL,
         &STOP,
     )
-    .with_context(|| format!("running pi driver '{runtime_id}'"))
+    .with_context(|| format!("running pi driver '{runtime_id}'"))?;
+    record_session_end(&agent_dir, &identity, &runtime_id, &session, seq, &outcome);
+    match outcome {
+        ProviderOutcome::Exited(exit) => {
+            anyhow::ensure!(exit.success(), "pi provider exited with {exit}");
+            Ok(())
+        }
+        ProviderOutcome::Stopped(_) => Ok(()),
+    }
+}
+
+/// The wrapper's one write into observed harness state: the terminal record. Live states and
+/// heartbeats belong to the pi channel, which sees pi's own turn events over stdio; the wrapper
+/// sees exactly one fact the channel cannot — that the provider process is gone — so that is the
+/// one fact it records. The `Writer` is constructed at the terminal edge on purpose: it re-reads
+/// whatever the channel last wrote and continues its transition counter, and by the time the
+/// wrapper has reaped pi the extension (and with it the channel) is already gone.
+fn record_session_end(
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    session: &str,
+    seq: u64,
+    outcome: &ProviderOutcome,
+) {
+    let label = match outcome {
+        ProviderOutcome::Exited(exit) | ProviderOutcome::Stopped(Some(exit)) => exit_label(*exit),
+        ProviderOutcome::Stopped(None) => "stopped".to_string(),
+    };
+    let mut writer =
+        harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()))
+            .with_ownership(session, seq);
+    if let Err(error) = writer.ended(label) {
+        eprintln!("st2 pi driver: recording session end failed: {error}");
+    }
+}
+
+fn exit_label(exit: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+    match (exit.code(), exit.signal()) {
+        (Some(code), _) => format!("exit {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "exited".to_string(),
+    }
 }
 
 /// Load the channel extension from the verified set, immediately after the provider program.
@@ -103,6 +195,9 @@ fn channel_env(
     executable: &Path,
     catalog_root: &Path,
     identity: &str,
+    runtime_id: &str,
+    session: &str,
+    seq: u64,
 ) -> Result<Vec<(String, String)>> {
     let executable = executable
         .to_str()
@@ -112,6 +207,9 @@ fn channel_env(
         (CHANNEL_BIN.to_string(), executable.to_string()),
         (CHANNEL_CATALOG.to_string(), catalog_root.to_string()),
         (CHANNEL_IDENTITY.to_string(), identity.to_string()),
+        (CHANNEL_RUNTIME_ID.to_string(), runtime_id.to_string()),
+        (CHANNEL_SESSION.to_string(), session.to_string()),
+        (CHANNEL_SEQ.to_string(), seq.to_string()),
     ])
 }
 
@@ -123,6 +221,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::provider_session::run_provider;
 
     #[test]
     fn idle_pi_provider_refreshes_presence_without_channel_input() {
@@ -149,6 +248,79 @@ mod tests {
         let after = fs::read_to_string(&presence).unwrap();
         assert_ne!(after, before);
         assert_eq!(status::read_state(&presence), status::State::Available);
+    }
+
+    /// The wrapper writes the one observation the channel cannot: the terminal record, carrying
+    /// the exit. It continues the transition counter of whatever the channel last wrote, so the
+    /// death of a session is a transition in the same record, not a new history.
+    #[test]
+    fn provider_exit_writes_the_terminal_record_with_its_status() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        let mut channel_writer =
+            crate::harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        channel_writer
+            .observe(crate::harness_state::Observation::new(
+                crate::harness_state::Activity::Active,
+                crate::harness_state::BlockedOn::None,
+                crate::harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        drop(channel_writer);
+
+        record_session_end(
+            agent_dir,
+            "h.worker",
+            "h.worker",
+            "session-test",
+            1,
+            &ProviderOutcome::Exited(ExitStatus::from_raw(3 << 8)),
+        );
+
+        let record = crate::harness_state::harness_state_path(agent_dir);
+        let observed = crate::harness_state::read(&record, None).unwrap();
+        assert_eq!(observed.state, crate::harness_state::Activity::Ended);
+        assert_eq!(observed.exit.as_deref(), Some("exit 3"));
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_eq!(
+            raw["transitions"], 1,
+            "counter continues the channel's record"
+        );
+
+        record_session_end(
+            agent_dir,
+            "h.worker",
+            "h.worker",
+            "session-test",
+            1,
+            &ProviderOutcome::Stopped(Some(ExitStatus::from_raw(9))),
+        );
+        let observed = crate::harness_state::read(&record, None).unwrap();
+        assert_eq!(observed.exit.as_deref(), Some("signal 9"));
+    }
+
+    /// The observed variant reports a nonzero exit instead of judging it, which is what lets the
+    /// wrapper record the terminal state before failing the launch.
+    #[test]
+    fn run_provider_observed_reports_the_child_exit_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = AtomicBool::new(false);
+        let outcome = crate::provider_session::run_provider_observed(
+            "pi",
+            &status::status_path(tmp.path()),
+            &["sh".into(), "-c".into(), "exit 3".into()],
+            &[],
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+            &stop,
+        )
+        .unwrap();
+        match outcome {
+            ProviderOutcome::Exited(exit) => assert_eq!(exit.code(), Some(3)),
+            other => panic!("expected an exit outcome, got {other:?}"),
+        }
     }
 
     #[test]
@@ -203,6 +375,9 @@ mod tests {
             &PathBuf::from("/opt/st2/bin/st2"),
             &PathBuf::from("/catalog"),
             "host.worker",
+            "host.worker-task",
+            "session-test",
+            7,
         )
         .unwrap();
 
@@ -212,6 +387,12 @@ mod tests {
                 (CHANNEL_BIN.to_string(), "/opt/st2/bin/st2".to_string()),
                 (CHANNEL_CATALOG.to_string(), "/catalog".to_string()),
                 (CHANNEL_IDENTITY.to_string(), "host.worker".to_string()),
+                (
+                    CHANNEL_RUNTIME_ID.to_string(),
+                    "host.worker-task".to_string()
+                ),
+                (CHANNEL_SESSION.to_string(), "session-test".to_string()),
+                (CHANNEL_SEQ.to_string(), "7".to_string()),
             ]
         );
     }

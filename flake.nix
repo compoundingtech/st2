@@ -287,6 +287,15 @@
             grep -q '@earendil-works/pi-coding-agent' hooks/pi-channel.ts
 
             tsc --noEmit -p hooks/typecheck/tsconfig.json
+
+            # Runtime smoke: the type gate is provably blind to execution-order defects (a TDZ
+            # use-before-declaration shipped green through it), so the asset is transpiled and
+            # actually driven through its open path.
+            ${pkgs.esbuild}/bin/esbuild hooks/pi-channel.ts \
+              --format=esm --platform=node --target=es2022 \
+              --outfile=hooks/typecheck/smoke-out/pi-channel.mjs
+            SMOKE_TRUE_BIN=${pkgs.coreutils}/bin/true \
+              ${pkgs.nodejs}/bin/node hooks/typecheck/smoke.mjs
             touch $out
           '';
 
