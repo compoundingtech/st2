@@ -31,8 +31,11 @@ hypotheses.
 - **DQ-H4 Ungraceful-death coverage.** The wrapper's terminal write covers
   child-reap and SIGTERM; nothing in-process covers SIGKILL escalation into
   the wrapper's own group or an external forced kill (invariant row 11's
-  case). Same-host readers close the window via the liveness cross-check;
-  cross-host readers wait out the fifteen-minute horizon. Resolves by: either
+  case). Same-host readers NARROW the window via the liveness cross-check —
+  only for provably dead sessions; `pty kill` removes the pidfile and leaves
+  the probe indeterminate, so a same-host reader then shares the
+  fifteen-minute horizon (or waits for the next relaunch claim) exactly like
+  a cross-host one. Resolves by: either
   accepting the horizon (documenting it as the cross-host bound) or a
   supervisor-side terminal write derived from reconcile's session state —
   which would need its own fencing rules to avoid a supervisor overwriting a

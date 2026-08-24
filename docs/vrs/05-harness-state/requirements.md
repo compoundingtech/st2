@@ -26,7 +26,10 @@ path reads this record.
 - **OHS-A01 Drivers can observe their harness:** Every maintained harness
   offers a positive observation source — the Codex app-server control stream,
   Claude lifecycle hooks plus the wrapper's child poll, pi's injected
-  extension, OpenCode's server surface. Where a source exists the driver
+  extension, and — conditionally, until `DQ-H6`'s capture confirms its event
+  semantics — OpenCode's server surface, which at this layer is the candidate
+  an experiment must validate before the producer trusts it. Where a source
+  exists the driver
   projects it; where none exists the driver writes nothing, and the absence of
   a record is itself honest ("never observed"), never a fabricated state.
 - **OHS-A02 Advisory surface:** Consumers are humans, supervisors, Doctor, and
