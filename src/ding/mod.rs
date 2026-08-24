@@ -951,13 +951,13 @@ pub fn run_ding(
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     // Arm the watcher before seeding. The timer remains the correctness fallback if watching fails.
+    // The subscription is the inbox itself, never a recursive walk over the agent dir: Resource
+    // payload trees live under `resources/` beside the inbox, and eager registration would pay
+    // one inotify watch per payload directory before any filtering ever ran. The inbox is
+    // created up front so the watch anchors on it directly (senders create it on demand anyway).
+    let _ = std::fs::create_dir_all(inbox_dir);
     let (tx, rx) = channel::<()>();
-    let watch_at = if inbox_dir.exists() {
-        inbox_dir
-    } else {
-        inbox_dir.parent().unwrap_or(inbox_dir)
-    };
-    let _watcher = crate::watch::watch_recursive_mutations(watch_at, tx);
+    let _watcher = crate::watch::watch_recursive_mutations(inbox_dir, tx);
 
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);

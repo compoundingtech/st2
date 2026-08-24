@@ -15,11 +15,15 @@ use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Watch a directory recursively, forwarding only events that can change reconciled state.
+///
+/// Recursive registration eagerly walks the tree (one inotify watch per directory), so this is
+/// only sound over st2-owned, payload-free directories. Symlink following is disabled: a link
+/// must never carry traversal outside the watched boundary.
 pub(crate) fn watch_recursive_mutations(
     dir: &Path,
     tx: Sender<()>,
 ) -> Option<notify::RecommendedWatcher> {
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+    let mut watcher = recommended_watcher(move |result: notify::Result<Event>| {
         if result.is_ok_and(|event| is_mutation(&event)) {
             let _ = tx.send(());
         }
@@ -38,21 +42,41 @@ pub(crate) fn watch_delivery_inputs(
     tx: Sender<()>,
 ) -> Option<notify::RecommendedWatcher> {
     let inbox = agent_dir.join("resources").join("inbox");
+    let inbox_for_callback = inbox.clone();
     let status = agent_dir.join("status");
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+    let mut watcher = recommended_watcher(move |result: notify::Result<Event>| {
         if result.is_ok_and(|event| {
             is_mutation(&event)
                 && event
                     .paths
                     .iter()
-                    .any(|path| path.starts_with(&inbox) || *path == status)
+                    .any(|path| path.starts_with(&inbox_for_callback) || *path == status)
         }) {
             let _ = tx.send(());
         }
     })
     .ok()?;
-    watcher.watch(agent_dir, RecursiveMode::Recursive).ok()?;
+    // Two shallow subscriptions instead of one recursive walk over the agent dir: Resource
+    // payload trees live beside the inbox under `resources/`, and a recursive subscription pays
+    // one inotify watch per payload directory before any filtering ever runs. The agent-dir watch
+    // stays shallow because everything beside `status` is runtime state; the inbox itself is
+    // st2-owned and message-flat, so its recursion is bounded by delivery traffic, not payloads.
+    let inbox_for_watch = inbox;
+    watcher.watch(agent_dir, RecursiveMode::NonRecursive).ok()?;
+    watcher
+        .watch(&inbox_for_watch, RecursiveMode::Recursive)
+        .ok()?;
     Some(watcher)
+}
+
+/// A [`notify::RecommendedWatcher`] that never follows symlinks while walking.
+fn recommended_watcher(
+    handler: impl FnMut(notify::Result<Event>) + Send + 'static,
+) -> notify::Result<notify::RecommendedWatcher> {
+    notify::RecommendedWatcher::new(
+        handler,
+        notify::Config::default().with_follow_symlinks(false),
+    )
 }
 
 /// A shallow subscription over the directories that can contain declarations.
@@ -406,6 +430,40 @@ mod tests {
         std::fs::rename(agent_dir.join(".status.tmp-1-0"), agent_dir.join("status")).unwrap();
         rx.recv_timeout(Duration::from_secs(1))
             .expect("status rename must wake");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delivery_watch_is_bounded_by_inputs_not_payload_depth() {
+        use std::sync::mpsc::channel;
+
+        fn inotify_watch_count() -> usize {
+            std::fs::read_dir("/proc/self/fdinfo")
+                .unwrap()
+                .flatten()
+                .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+                .filter(|content| content.contains("inotify wd:"))
+                .map(|content| content.lines().count())
+                .sum()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path();
+        let payload = agent_dir.join("resources/worktree/node_modules");
+        for i in 0..300 {
+            std::fs::create_dir_all(payload.join(format!("pkg-{i}/dist/sub"))).unwrap();
+        }
+        std::fs::create_dir_all(agent_dir.join("resources/inbox")).unwrap();
+
+        let before = inotify_watch_count();
+        let (tx, _rx) = channel();
+        let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start delivery watcher");
+        let delta = inotify_watch_count() - before;
+        assert!(
+            delta < 32,
+            "payload depth must not drive watch allocation: {delta} watches for a \
+             900-directory payload tree"
+        );
     }
 
     #[cfg(target_os = "linux")]
