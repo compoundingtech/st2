@@ -110,9 +110,12 @@ path reads this record.
 
 - **OHS-R05 Driver-owned projection:** Classification is driver work. The
   Codex producer projects the existing control state with the corrected rows:
-  `ActiveWithoutTurn` and `ConflictingTurn` report `active` (Codex positively
-  reported activity), `Review`, `WaitingOnApproval`, and `WaitingOnUserInput`
-  report `active` with `blockedOn: human`, `Compaction` reports `active`, and
+  `ActiveWithoutTurn`, `ConflictingTurn`, and `Review` report `active` —
+  review's enter and exit are model-emitted items inside a running turn, so
+  nothing there awaits a human (matching the projection's
+  `Held { Review }` → `active` / `blockedOn: none` row) — while
+  `WaitingOnApproval` and `WaitingOnUserInput` report `active` with
+  `blockedOn: human`. `Compaction` reports `active`, and
   `NotLoaded`/`SystemError`/`AwaitingStatus` withhold rather than write.
   `Held` — a delivery predicate — never appears in the published vocabulary.
 - **OHS-R06 Heartbeat only on evidence:** A writer re-stamps the record on the
