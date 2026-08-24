@@ -1840,7 +1840,17 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                         &format!("{bus_id} observed harness state ended"),
                         &format!(
                             "session ended ({}) while desired state is running — crashed seat?",
-                            observed.exit.as_deref().unwrap_or("exit unstated")
+                            observed
+                                .exit
+                                .as_deref()
+                                .map(|exit| format!("exit {exit}"))
+                                // A terminal record can carry only a reason — Codex's
+                                // observed systemError writes reason without an exit — and
+                                // discarding it leaves the operator nothing to act on.
+                                .or_else(|| {
+                                    observed.reason.as_deref().map(|reason| format!("{reason}"))
+                                })
+                                .unwrap_or_else(|| "exit unstated".to_string())
                         ),
                     )
                 }
