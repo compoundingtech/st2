@@ -9,7 +9,7 @@
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -1225,6 +1225,322 @@ pub fn run_controlled(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessFacts {
+    pid: i32,
+    parent_pid: i32,
+    session_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessAncestry {
+    processes: Vec<ProcessFacts>,
+    complete: bool,
+    error: Option<String>,
+}
+
+impl ProcessAncestry {
+    fn contains(&self, pid: i32) -> bool {
+        self.processes.iter().any(|process| process.pid == pid)
+    }
+
+    fn display(&self) -> String {
+        let mut chain = self
+            .processes
+            .iter()
+            .map(|process| process.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        if let Some(error) = &self.error {
+            chain.push_str(&format!(" -> unknown ({error})"));
+        }
+        chain
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SocketHolderRelation {
+    Detached { runtime_pid: i32 },
+    Managed { reason: String },
+}
+
+fn live_socket_refusal(
+    catalog_root: &Path,
+    socket_path: &Path,
+    stream: &UnixStream,
+    runtime_id: &str,
+) -> String {
+    let owner_pid = match socket_peer_pid(stream) {
+        Ok(pid) => pid,
+        Err(error) => {
+            return format!(
+                "Codex app-server socket {} is already live; owner PID unavailable; parent PID \
+                 unavailable; session ID unavailable; owner ancestry unavailable: {error}.\n\
+                 managed-holder: st2 could not prove detachment. Do not signal the socket owner. \
+                 Walk the ancestry, name every live process, and report the chain. Never signal a \
+                 process group.",
+                socket_path.display()
+            );
+        }
+    };
+    let owner = match process_facts(owner_pid) {
+        Ok(owner) => owner,
+        Err(error) => {
+            return format!(
+                "Codex app-server socket {} is already live; owner PID {owner_pid}; parent PID \
+                 unavailable; session ID unavailable; owner ancestry unavailable: {error:#}.\n\
+                 managed-holder: st2 could not prove detachment. Do not signal owner PID \
+                 {owner_pid}. Walk the ancestry, name every live process, and report the chain. \
+                 Never signal a process group.",
+                socket_path.display()
+            );
+        }
+    };
+    let owner_ancestry = process_ancestry(owner_pid);
+    let pty_root = run::effective_pty_root(catalog_root);
+    let relation = classify_socket_holder(&owner_ancestry, &pty_root, runtime_id);
+    format_live_socket_refusal(socket_path, owner, &owner_ancestry, relation)
+}
+
+fn format_live_socket_refusal(
+    socket_path: &Path,
+    owner: ProcessFacts,
+    owner_ancestry: &ProcessAncestry,
+    relation: SocketHolderRelation,
+) -> String {
+    let facts = format!(
+        "Codex app-server socket {} is already live; owner PID {}; parent PID {}; session ID {}; \
+         owner ancestry: {}.",
+        socket_path.display(),
+        owner.pid,
+        owner.parent_pid,
+        owner.session_id,
+        owner_ancestry.display()
+    );
+    match relation {
+        SocketHolderRelation::Detached { runtime_pid } => format!(
+            "{facts}\ndetached-holder: the owner ancestry does not reach registered runtime PID \
+             {runtime_pid}. After cleanup is authorized, send TERM to exact owner PID {} only. \
+             Wait and re-check the socket. Escalate only that same PID if TERM is ignored. Never \
+             signal a process group.",
+            owner.pid
+        ),
+        SocketHolderRelation::Managed { reason } => format!(
+            "{facts}\nmanaged-holder: {reason}. Do not signal owner PID {}. Walk the ancestry, \
+             name every live process, and report the chain. The live runtime at the top must \
+             release the socket. Never signal a process group.",
+            owner.pid
+        ),
+    }
+}
+
+fn classify_socket_holder(
+    owner_ancestry: &ProcessAncestry,
+    pty_root: &Path,
+    runtime_id: &str,
+) -> SocketHolderRelation {
+    // A detached app server can remain the leader of its operating-system session. Compare its
+    // ancestry with the registered PTY runtime instead of treating SID or PPID as ownership.
+    // Incomplete evidence stays managed because this diagnostic never earns cleanup authority.
+    if !owner_ancestry.complete {
+        return SocketHolderRelation::Managed {
+            reason: owner_ancestry
+                .error
+                .as_deref()
+                .map(|error| format!("owner ancestry is incomplete ({error})"))
+                .unwrap_or_else(|| "owner ancestry is incomplete".into()),
+        };
+    }
+    let pid_path = pty_root.join(format!("{runtime_id}.pid"));
+    let runtime_pid = match fs::read_to_string(&pid_path)
+        .with_context(|| format!("reading {}", pid_path.display()))
+        .and_then(|raw| {
+            raw.trim()
+                .parse::<i32>()
+                .with_context(|| format!("parsing {}", pid_path.display()))
+        }) {
+        Ok(pid) if crate::host_lock::process_alive(pid) => pid,
+        Ok(pid) => {
+            return SocketHolderRelation::Managed {
+                reason: format!("registered runtime PID {pid} is not live"),
+            };
+        }
+        Err(error) => {
+            return SocketHolderRelation::Managed {
+                reason: format!("registered runtime PID is unavailable ({error:#})"),
+            };
+        }
+    };
+    let current_ancestry = process_ancestry(std::process::id() as i32);
+    if !current_ancestry.complete || !current_ancestry.contains(runtime_pid) {
+        return SocketHolderRelation::Managed {
+            reason: format!(
+                "registered runtime PID {runtime_pid} is not a proved ancestor of this driver"
+            ),
+        };
+    }
+    classify_holder_ancestries(owner_ancestry, runtime_pid)
+}
+
+fn classify_holder_ancestries(
+    owner_ancestry: &ProcessAncestry,
+    runtime_pid: i32,
+) -> SocketHolderRelation {
+    if owner_ancestry.contains(runtime_pid) {
+        SocketHolderRelation::Managed {
+            reason: format!("owner ancestry reaches registered runtime PID {runtime_pid}"),
+        }
+    } else {
+        SocketHolderRelation::Detached { runtime_pid }
+    }
+}
+
+fn process_ancestry(pid: i32) -> ProcessAncestry {
+    const MAX_ANCESTORS: usize = 64;
+    let mut processes = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut next = pid;
+    for _ in 0..MAX_ANCESTORS {
+        if next <= 0 {
+            return ProcessAncestry {
+                processes,
+                complete: true,
+                error: None,
+            };
+        }
+        if !seen.insert(next) {
+            return ProcessAncestry {
+                processes,
+                complete: false,
+                error: Some(format!("process ancestry repeats PID {next}")),
+            };
+        }
+        let facts = match process_facts(next) {
+            Ok(facts) => facts,
+            Err(error) => {
+                return ProcessAncestry {
+                    processes,
+                    complete: false,
+                    error: Some(format!("reading PID {next}: {error:#}")),
+                };
+            }
+        };
+        processes.push(facts);
+        if facts.pid == 1 || facts.parent_pid <= 0 {
+            return ProcessAncestry {
+                processes,
+                complete: true,
+                error: None,
+            };
+        }
+        next = facts.parent_pid;
+    }
+    ProcessAncestry {
+        processes,
+        complete: false,
+        error: Some(format!("process ancestry exceeds {MAX_ANCESTORS} entries")),
+    }
+}
+
+fn process_facts(pid: i32) -> Result<ProcessFacts> {
+    anyhow::ensure!(pid > 0, "process PID must be positive");
+    let parent_pid = process_parent_pid(pid)?;
+    let session_id = unsafe { libc::getsid(pid) };
+    if session_id == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading session ID for PID {pid}"));
+    }
+    Ok(ProcessFacts {
+        pid,
+        parent_pid,
+        session_id,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid(pid: i32) -> Result<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(") ")
+        .context("process stat has no command boundary")?
+        .1
+        .split_whitespace()
+        .nth(1)
+        .context("process stat has no parent PID")?
+        .parse()
+        .with_context(|| format!("parsing parent PID for process {pid}"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_parent_pid(pid: i32) -> Result<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    anyhow::ensure!(
+        read == expected,
+        "proc_pidinfo({pid}) returned {read}, expected {expected}"
+    );
+    Ok(unsafe { info.assume_init() }.pbi_ppid as i32)
+}
+
+#[cfg(target_os = "linux")]
+fn socket_peer_pid(stream: &UnixStream) -> std::io::Result<i32> {
+    // The kernel supplies the connected server's credentials. Do not infer an owner from paths,
+    // process names, or a scan that can race a replacement listener.
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(std::io::Error::other(format!(
+            "SO_PEERCRED returned {length} bytes"
+        )));
+    }
+    Ok(unsafe { credentials.assume_init() }.pid)
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_pid(stream: &UnixStream) -> std::io::Result<i32> {
+    // LOCAL_PEERPID is the Darwin equivalent of Linux SO_PEERCRED for this connected socket.
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::pid_t>() {
+        return Err(std::io::Error::other(format!(
+            "LOCAL_PEERPID returned {length} bytes"
+        )));
+    }
+    Ok(pid)
+}
+
 fn run_controlled_owned(
     catalog_root: &Path,
     state_dir: &Path,
@@ -1255,10 +1571,14 @@ fn run_controlled_owned(
                 socket_path.display()
             );
             match UnixStream::connect(&socket_path) {
-                Ok(_) => anyhow::bail!(
-                    "Codex app-server socket {} is already live; refusing a second control owner",
-                    socket_path.display()
-                ),
+                Ok(stream) => {
+                    anyhow::bail!(live_socket_refusal(
+                        catalog_root,
+                        &socket_path,
+                        &stream,
+                        &runtime_id
+                    ))
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -3099,22 +3419,142 @@ mod tests {
             message.contains(&format!("session ID {session_id}")),
             "{message}"
         );
+        assert!(message.contains("managed-holder"), "{message}");
+        assert!(message.contains("Do not signal owner PID"), "{message}");
+        assert!(message.contains("Walk the ancestry"), "{message}");
         assert!(
-            message.contains("managed-holder"),
+            message.contains("Never signal a process group"),
+            "{message}"
+        );
+    }
+
+    fn complete_ancestry(processes: &[(i32, i32, i32)]) -> ProcessAncestry {
+        ProcessAncestry {
+            processes: processes
+                .iter()
+                .map(|&(pid, parent_pid, session_id)| ProcessFacts {
+                    pid,
+                    parent_pid,
+                    session_id,
+                })
+                .collect(),
+            complete: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn holder_classification_uses_registered_runtime_ancestry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_pid = std::process::id() as i32;
+        fs::write(tmp.path().join("h.worker.pid"), runtime_pid.to_string()).unwrap();
+        let detached = complete_ancestry(&[(40, 30, 30), (30, 1, 30), (1, 0, 1)]);
+        assert_eq!(
+            classify_socket_holder(&detached, tmp.path(), "h.worker"),
+            SocketHolderRelation::Detached { runtime_pid }
+        );
+
+        let managed = complete_ancestry(&[
+            (40, runtime_pid, runtime_pid),
+            (runtime_pid, 1, runtime_pid),
+            (1, 0, 1),
+        ]);
+        assert_eq!(
+            classify_socket_holder(&managed, tmp.path(), "h.worker"),
+            SocketHolderRelation::Managed {
+                reason: format!("owner ancestry reaches registered runtime PID {runtime_pid}")
+            }
+        );
+    }
+
+    #[test]
+    fn incomplete_holder_evidence_fails_safe_as_managed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let incomplete = ProcessAncestry {
+            processes: vec![ProcessFacts {
+                pid: 40,
+                parent_pid: 30,
+                session_id: 30,
+            }],
+            complete: false,
+            error: Some("reading PID 30 failed".into()),
+        };
+
+        assert_eq!(
+            classify_socket_holder(&incomplete, tmp.path(), "h.worker"),
+            SocketHolderRelation::Managed {
+                reason: "owner ancestry is incomplete (reading PID 30 failed)".into()
+            }
+        );
+    }
+
+    #[test]
+    fn detached_holder_guidance_uses_one_exact_pid_and_requires_a_recheck() {
+        let ancestry = complete_ancestry(&[(40, 30, 30), (30, 1, 30), (1, 0, 1)]);
+        let message = format_live_socket_refusal(
+            Path::new("/tmp/control.sock"),
+            ancestry.processes[0],
+            &ancestry,
+            SocketHolderRelation::Detached { runtime_pid: 20 },
+        );
+
+        assert!(message.contains("detached-holder"), "{message}");
+        assert!(
+            message.contains("send TERM to exact owner PID 40 only"),
             "{message}"
         );
         assert!(
-            message.contains("do not signal owner PID"),
+            message.contains("Wait and re-check the socket"),
             "{message}"
         );
         assert!(
-            message.contains("walk the ancestry"),
+            message.contains("Escalate only that same PID if TERM is ignored"),
             "{message}"
         );
         assert!(
-            message.contains("never signal a process group"),
+            message.contains("Never signal a process group"),
             "{message}"
         );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for socket_peer_pid_reports_the_listener_process"]
+    fn socket_peer_pid_test_server() {
+        let Some(socket) = std::env::var_os("ST2_TEST_SOCKET_PEER_PATH").map(PathBuf::from) else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var_os("ST2_TEST_SOCKET_PEER_READY").unwrap());
+        let listener = UnixListener::bind(socket).unwrap();
+        fs::write(ready, b"ready").unwrap();
+        let (_stream, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn socket_peer_pid_reports_the_listener_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("control.sock");
+        let ready = tmp.path().join("ready");
+        let mut server = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "codex_app_server::tests::socket_peer_pid_test_server",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ST2_TEST_SOCKET_PEER_PATH", &socket)
+            .env("ST2_TEST_SOCKET_PEER_READY", &ready)
+            .spawn()
+            .unwrap();
+        let expected = server.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = UnixStream::connect(&socket).and_then(|stream| socket_peer_pid(&stream));
+        terminate_child(&mut server);
+
+        assert_eq!(result.unwrap(), expected);
     }
 
     fn subscribed_state(observed: CodexObservedState) -> CodexControlState {
