@@ -229,6 +229,10 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 SseMessage::Disconnected => {
                     sse_connected = false;
                     evidence = false;
+                    // Everything from here until a successful reseed happened unobserved: the
+                    // next observation must open a fresh transition even if it restates the
+                    // pre-outage tuple.
+                    session.writer.interrupt();
                 }
                 SseMessage::Event(value) => {
                     if let Some(sid) = event_session_id(&value) {
@@ -237,6 +241,13 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                     machine.apply(&value);
                 }
             }
+        }
+        if machine.poisoned && evidence {
+            // The projection went untrustworthy mid-stream: stop heartbeating over it and let
+            // the level seed rebuild the whole picture from the server's own truth.
+            evidence = false;
+            session.writer.interrupt();
+            next_seed_attempt = Instant::now();
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
             evidence = seed_from_server(&session.client, &mut machine);
@@ -615,13 +626,17 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
             return false;
         };
         for item in items {
-            if let Some(id) = item
+            // An entry whose id this version cannot read is a pending ask that could never be
+            // released by its id-matched exit: seeding around it would restore evidence on a
+            // picture that silently drops a human block. Fail the seed and retry.
+            let Some(id) = item
                 .get("id")
                 .or_else(|| item.get("requestID"))
                 .and_then(Value::as_str)
-            {
-                seeded.seed_ask(id.to_string(), kind);
-            }
+            else {
+                return false;
+            };
+            seeded.seed_ask(id.to_string(), kind);
         }
     }
     *machine = seeded;
@@ -641,6 +656,9 @@ struct EventMachine {
     blocked: BTreeMap<String, &'static str>,
     /// Level evidence seen: idle is a proof, never a default.
     seen_level: bool,
+    /// A tracked-busy session moved to a status word this version cannot read: every projection
+    /// is withheld until a fresh level seed replaces this machine.
+    poisoned: bool,
     /// Terminal reason, once observed.
     ended: Option<&'static str>,
     /// The most recent non-terminal session error, surfaced as the idle reason once.
@@ -699,7 +717,14 @@ impl EventMachine {
                     }
                     // A future status arm is not evidence of anything — not even level evidence:
                     // counting it would let an unrecognized word prove `idle` on a quiet server.
-                    _ => {}
+                    // On a session this machine believes busy it is worse than nothing: the busy
+                    // entry can no longer be trusted to clear, so the whole projection is poisoned
+                    // until a level seed rebuilds it.
+                    _ => {
+                        if self.busy.contains_key(&session_id) {
+                            self.poisoned = true;
+                        }
+                    }
                 }
             }
             "session.idle" => {
@@ -749,6 +774,9 @@ impl EventMachine {
     }
 
     fn observation(&self) -> Option<Observation> {
+        if self.poisoned {
+            return None;
+        }
         if let Some(reason) = self.ended {
             return Some(
                 Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
@@ -1355,6 +1383,8 @@ mod tests {
         listed_sessions: Arc<Mutex<Vec<String>>>,
         /// When set, /session/status serves this raw body instead of an object.
         status_body: Arc<Mutex<Option<String>>>,
+        /// When set, /permission serves this raw body instead of the pending ids.
+        ask_body: Arc<Mutex<Option<String>>>,
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -1368,6 +1398,7 @@ mod tests {
         let pending_permissions = Arc::new(Mutex::new(Vec::<String>::new()));
         let pending_questions = Arc::new(Mutex::new(Vec::<String>::new()));
         let ask_error = Arc::new(AtomicBool::new(false));
+        let ask_body = Arc::new(Mutex::new(None::<String>));
         let listed_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
         let status_body = Arc::new(Mutex::new(None::<String>));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
@@ -1380,6 +1411,7 @@ mod tests {
             listed_sessions.clone(),
             status_body.clone(),
         );
+        let ask_body_t = ask_body.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -1466,6 +1498,17 @@ mod tests {
                         "{}".to_string()
                     }
                 } else if method == "GET" && (path == "/permission" || path == "/question") {
+                    if path == "/permission"
+                        && let Some(body) = ask_body_t.lock().unwrap().clone()
+                    {
+                        let mut stream = reader.into_inner();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        continue;
+                    }
                     let ids = if path == "/permission" {
                         pending_t.lock().unwrap()
                     } else {
@@ -1500,6 +1543,7 @@ mod tests {
             ask_error,
             listed_sessions,
             status_body,
+            ask_body,
         }
     }
 
@@ -1822,6 +1866,63 @@ mod tests {
             Activity::Idle,
             "ses_stale cleared by the re-seed"
         );
+    }
+
+    /// An unknown status word on a session this machine tracks as busy poisons the whole
+    /// projection until a level seed replaces the machine; on an untracked session the word
+    /// stays inert — it proves nothing and poisons nothing.
+    #[test]
+    fn an_unreadable_status_word_on_a_tracked_busy_session_poisons_the_projection() {
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}"#,
+        ));
+        assert_eq!(observed(&machine).state, Activity::Active);
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"hibernating"}}}"#,
+        ));
+        assert!(
+            machine.observation().is_none(),
+            "a busy entry that can no longer be trusted to clear must withhold every projection"
+        );
+
+        let mut untracked = EventMachine::default();
+        untracked.seed_idle();
+        untracked.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_9","status":{"type":"hibernating"}}}"#,
+        ));
+        assert_eq!(
+            observed(&untracked).state,
+            Activity::Idle,
+            "an unknown word on an untracked session leaves the projection standing"
+        );
+    }
+
+    /// A pending listing entry whose id this version cannot read must fail the whole seed:
+    /// seeding around it would restore evidence on a picture that silently drops a human block.
+    #[test]
+    fn an_unreadable_pending_entry_fails_the_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let _keep = tmp;
+
+        *server.ask_body.lock().unwrap() = Some(r#"[{"id":"per_ok"},{"token":42}]"#.to_string());
+        let mut machine = EventMachine::default();
+        assert!(
+            !seed_from_server(&client, &mut machine),
+            "an entry without a readable id must fail the seed, not be skipped"
+        );
+
+        *server.ask_body.lock().unwrap() = None;
+        server
+            .pending_permissions
+            .lock()
+            .unwrap()
+            .push("per_ok".to_string());
+        let mut machine = EventMachine::default();
+        assert!(seed_from_server(&client, &mut machine));
+        assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
     }
 
     /// Cluster 3: a /session/status response that is not the documented object shape proves
