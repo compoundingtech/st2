@@ -1856,6 +1856,7 @@ pub fn up_loop_specs(
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
     let mut reported_flapping: HashSet<String> = HashSet::new();
+    let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
     loop {
         let mut pre = UpReport::default();
@@ -1874,15 +1875,7 @@ pub fn up_loop_specs(
             reported_flapping.remove(id);
         }
         park_channel.publish(&cap, &mut report);
-        for cl in &report.crash_loops {
-            if reported_flapping.insert(cl.pty_id.clone()) {
-                eprintln!(
-                    "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
-                    id = cl.pty_id
-                );
-                surface_crash_loop(root, this_host, cl);
-            }
-        }
+        recurring_warnings.filter(&mut report);
         on_report(&report);
         if STOP.load(Ordering::SeqCst) {
             break;
@@ -2048,6 +2041,24 @@ fn best_effort_catalog_watcher(
     }
 }
 
+/// Suppresses warnings that persist across passes while still re-surfacing one that clears and
+/// returns. An unchanged advisory failure (a non-Git workspace failing its git-exclude, say) must
+/// be diagnosed once, not once per reconcile pass.
+#[derive(Default)]
+struct RecurringWarnings {
+    emitted: HashSet<String>,
+}
+
+impl RecurringWarnings {
+    fn filter(&mut self, report: &mut UpReport) {
+        let current: HashSet<_> = report.warnings.iter().cloned().collect();
+        self.emitted.retain(|warning| current.contains(warning));
+        report
+            .warnings
+            .retain(|warning| self.emitted.insert(warning.clone()));
+    }
+}
+
 /// The supervisor loop: reconcile on a timer AND on folder changes until interrupted. The fs-watch is
 /// best-effort; the `interval` timer is the always-on fallback. `on_report` is called once per pass
 pub fn up_loop(
@@ -2093,6 +2104,7 @@ fn up_loop_until(
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
     let mut reported_flapping: HashSet<String> = HashSet::new();
+    let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
 
     loop {
@@ -2114,9 +2126,10 @@ fn up_loop_until(
         }
         // A recovered task that crash-loops again is a new crash-loop, so it must be able to surface
         // again. Leaving the id in the dedup set would make every park after the first one silent.
-        for id in &report.unparked {
+        for id in report.unparked.iter() {
             reported_flapping.remove(id);
         }
+        recurring_warnings.filter(&mut report);
         park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
@@ -2707,6 +2720,56 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_advisory_warnings_surface_once_not_per_pass() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(catalog.path().join("workspace")).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" {
+  host "test-host"
+  command "true"
+  workspace "$CATALOG/workspace"
+  render { git-exclude "scratch.txt" }
+}"#,
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let mut passes = 0usize;
+        let mut warnings_seen = 0usize;
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                stop.store(true, Ordering::SeqCst);
+            });
+            up_loop_until(
+                catalog.path(),
+                "test-host",
+                &SpawnCountingRunner::default(),
+                Duration::from_millis(50),
+                &stop,
+                |_, _| None,
+                |report| {
+                    passes += 1;
+                    warnings_seen += report.warnings.len();
+                },
+            )
+            .unwrap();
+        });
+
+        assert!(
+            passes >= 3,
+            "the loop must have run several passes for this to say anything: {passes}"
+        );
+        assert_eq!(
+            warnings_seen, 1,
+            "an unchanged advisory failure must be diagnosed once across {passes} passes"
+        );
+    }
     /// A pass can execute a plan the task was never in: `up_once` drops an owner whose
     /// materialization failed, `gate_harness_launches_on_hooks` strips gated launches, and
     /// `defer_flickers` removes debounced ones — each after the pass is already committed to

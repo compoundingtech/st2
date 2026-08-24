@@ -531,7 +531,8 @@ fn deep_merge(
             // longer states are removed, so a matcher group holding a user hook beside an st2
             // one keeps the user's; containers left with nothing but empty arrays are dropped.
             target.retain_mut(|element| {
-                if patch.contains(element) || !supersede_managed_hooks
+                if patch.contains(element)
+                    || !supersede_managed_hooks
                     || !contains_owned_string(element)
                 {
                     return true;
@@ -602,7 +603,23 @@ fn contains_owned_string(value: &serde_json::Value) -> bool {
     }
 }
 
+fn has_git_marker(workspace: &Path) -> bool {
+    workspace
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+
 fn git_exclude(workspace: &Path, line: &str) -> Result<bool> {
+    // A failed `git rev-parse` costs a process spawn per op per pass. On catalogs whose
+    // workspaces are plain directories this repeats every reconcile (measured live: ~28 spawns
+    // plus stderr captures per pass on dev3). The marker probe answers "not a repo" for free;
+    // `.git` may be a directory or a file (linked worktrees), which `exists` covers either way.
+    if !has_git_marker(workspace) {
+        anyhow::bail!(
+            "{} is not a Git worktree (no .git marker)",
+            workspace.display()
+        );
+    }
     let output = Command::new("git")
         .args(["-C"])
         .arg(workspace)
@@ -1167,6 +1184,25 @@ mod tests {
                 "{literal} is not an expandable ST_HOOKS reference"
             );
         }
+    }
+
+    #[test]
+    fn git_exclude_reports_missing_repo_without_spawning_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        assert!(!has_git_marker(&workspace));
+        let error = git_exclude(&workspace, ".st2/").unwrap_err();
+        assert!(
+            error.to_string().contains("no .git marker"),
+            "the no-repo case must be answered by the marker probe: {error:#}"
+        );
+
+        // A `.git` entry anywhere above the workspace (directory or file form, as linked
+        // worktrees use) re-enables the real git path.
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert!(has_git_marker(&workspace));
     }
 
     #[test]
