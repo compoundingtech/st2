@@ -378,7 +378,14 @@ impl Writer {
             // the true successor out permanently. New sequences are minted only by [`claim`],
             // the written act, and adopted from it.
             None => match on_disk.as_ref() {
-                None => 1,
+                // A virgin seat's first write mints sequence one — initial ownership,
+                // exactly what [`claim_locked`] establishes — so it persists the floor
+                // sidecar too: if this record later goes unreadable, a replacement claim
+                // must continue past it instead of colliding with this lingering writer.
+                None => {
+                    persist_floor(&self.path, 1);
+                    1
+                }
                 Some(current) if current.incarnation == self.session => current.seq,
                 Some(_) => return Ok(false),
             },
@@ -763,10 +770,19 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
             .map_or(0, |record| record.transitions.saturating_add(1)),
     };
     write_record(&writer.path, &record)?;
-    // The floor is the safety net for the record itself going unreadable, so its own failure
-    // modes must not be quiet ones: stage-and-rename keeps a torn write from corrupting the
-    // current floor, and a failed write is logged — the claim still stands (losing the floor
-    // only matters if the record later becomes unreadable), but never silently.
+    // The floor accompanies every act that establishes ownership; its own failure
+    // modes must never be quiet ones.
+    persist_floor(&writer.path, seq);
+    Ok(seq)
+}
+
+/// Persist the sequence-floor sidecar for `seq`. The floor is the safety net for the record
+/// itself going unreadable, so its own failure modes must not be quiet ones: stage-and-rename
+/// keeps a torn write from corrupting the current floor, and a failed write is logged — the
+/// ownership still stands (losing the floor only matters if the record later becomes
+/// unreadable), but never silently.
+fn persist_floor(record_path: &Path, seq: u64) {
+    let floor_path = record_path.with_file_name(SEQ_FLOOR_NAME);
     let staged = floor_path.with_file_name(".harness-state.seq.tmp");
     if let Err(error) =
         fs::write(&staged, format!("{seq}\n")).and_then(|()| fs::rename(&staged, &floor_path))
@@ -776,7 +792,6 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
             floor_path.display()
         );
     }
-    Ok(seq)
 }
 
 /// The token prefix wrapperless Claude sessions derive from Claude's own session id.
@@ -1857,6 +1872,38 @@ mod tests {
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.incarnation, token);
         assert_eq!(record.reason.as_deref(), Some("superseded"));
+    }
+
+    /// The virgin token-only path also establishes initial ownership (sequence one), so it
+    /// persists the floor sidecar too: if that first record later goes unreadable, a
+    /// replacement claim continues PAST the lingering writer instead of colliding with it.
+    #[test]
+    fn a_virgin_token_only_write_persists_the_sequence_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut predecessor = writer(tmp.path());
+        predecessor.observe(active()).unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.seq, 1);
+        let floor = fs::read_to_string(tmp.path().join(SEQ_FLOOR_NAME)).unwrap();
+        assert_eq!(
+            floor.trim(),
+            "1",
+            "the virgin write persists the floor beside its sequence"
+        );
+
+        // The record goes unreadable; the claim must continue past sequence one, and the
+        // lingering token-only predecessor stays fenced out.
+        fs::write(&path, b"{corrupted").unwrap();
+        let token = session_token();
+        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        assert!(
+            seq > 1,
+            "the persisted floor carries the claim past sequence one ({seq})"
+        );
+        predecessor.observe(active()).unwrap();
+        let after: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after.incarnation, token);
     }
 
     /// jUUq: an unreadable (not merely absent) record refuses token-only writes and wrapperless
