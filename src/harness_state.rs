@@ -614,6 +614,16 @@ fn read_raw_at(
         // A literal `unknown` is never written by this crate; treat one like malformation.
         return Observed::indeterminate("literal-unknown", harness);
     }
+    if record.state == Activity::Ended
+        && record.exit.is_none()
+        && record.reason.as_deref() == Some("superseded")
+    {
+        // The claim placeholder is a fence, not an observation: the session wrote it at startup
+        // and has observed nothing yet. Reading it as definite `ended` would flip a live seat
+        // to dead for every consumer whose harness never publishes its first frame promptly —
+        // indeterminate, distinctly, until the first real observation or the ordinary horizon.
+        return Observed::indeterminate("claimed", harness);
+    }
     if record.state != Activity::Ended
         && let Some(probe) = probe
     {
@@ -709,8 +719,9 @@ fn next_stamp(on_disk: Option<&Record>, now_ms: u64) -> u64 {
 /// returned for the wrapper to adopt and export beside its token. Writing the claim makes it
 /// atomic: racing claimers serialize on the lock and mint DISTINCT sequences, and a
 /// predecessor's fresh live record is superseded at relaunch even though the pty-name-based
-/// probe cannot tell the sessions apart. The record reads `ended (superseded)` until the
-/// session's first real observation replaces it.
+/// probe cannot tell the sessions apart. Readers derive indeterminate (`claimed`) from the
+/// fresh placeholder — a fence, not an observation — until the session's first real
+/// observation replaces it.
 pub fn claim(
     agent_dir: &Path,
     agent: impl Into<String>,
@@ -1272,7 +1283,11 @@ mod tests {
             stale_bytes,
             "the written claim itself supersedes the predecessor"
         );
-        assert_eq!(read(&path, None).unwrap().state, Activity::Ended);
+        assert_eq!(
+            read(&path, None).unwrap().reason.as_deref(),
+            Some("claimed"),
+            "the fresh placeholder reads indeterminate, never definite ended"
+        );
 
         // Once this session observes something, heartbeats re-stamp again.
         writer.observe(active()).unwrap();
@@ -1667,7 +1682,7 @@ mod tests {
 
     /// T3: at relaunch the claim supersedes the predecessor's still-fresh live record — the
     /// pty-name-based probe cannot tell the sessions apart, so the record itself must — and the
-    /// seat reads `ended (superseded)` until the new session's first real observation.
+    /// seat reads indeterminate (`claimed`) until the new session's first real observation.
     #[test]
     fn a_relaunch_claim_supersedes_a_fresh_live_predecessor_record() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1677,8 +1692,12 @@ mod tests {
         let token = session_token();
         let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
         let observed = read(&path, None).unwrap();
-        assert_eq!(observed.state, Activity::Ended);
-        assert_eq!(observed.reason.as_deref(), Some("superseded"));
+        assert_eq!(
+            observed.state,
+            Activity::Unknown,
+            "the fresh placeholder is a fence, not a definite ended"
+        );
+        assert_eq!(observed.reason.as_deref(), Some("claimed"));
         assert_eq!(observed.exit, None);
 
         let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
