@@ -177,9 +177,23 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             }
             break reaped.map(|_| ());
         }
-        if let Some(exit) = child.try_wait().context("checking opencode provider")? {
-            let _ = session.writer.ended(describe_exit(exit));
-            break completed(exit);
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                let _ = session.writer.ended(describe_exit(exit));
+                break completed(exit);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // The liveness check failing is a terminal outcome too: without this write the
+                // claim placeholder stands as the visible state (the self-review's error-arm
+                // class).
+                let _ = session.writer.observe(
+                    Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
+                        .with_reason("launch-error")
+                        .with_exit("exit unknown"),
+                );
+                return Err(error).context("checking opencode provider");
+            }
         }
 
         // The API gate needs the child's server to answer; retry until it does.
