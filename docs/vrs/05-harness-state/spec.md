@@ -53,7 +53,7 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
   "harness": "codex | claude | pi | opencode",
   "state": "idle | active | child | ended",
   "blockedOn": "none | human",
-  "ask": "none | permission | question | review",
+  "ask": "none | permission | question | review (reserved; no producer emits it)",
   "inputBuffer": "empty | nonempty | unknown",
   "reason": "<diagnostic, optional>",
   "exit": "<ended only: e.g. 'exit 0', 'signal 9', optional>",
@@ -138,7 +138,7 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `TerminalError { systemError }` | `ended` | `none` | `none` | `systemError` |
 | `Held { ActiveWithoutTurn }` | `active` | `none` | `none` | `activeWithoutTurn` — Codex said active; st2 merely cannot name a steerable turn |
 | `Held { ConflictingTurn }` | `active` | `none` | `none` | `conflictingTurn` — two turns believed live is maximally active |
-| `Held { Review }` | `active` | `human` | `review` | `review` |
+| `Held { Review }` | `active` | `none` | `none` | `review` — review's enter and exit are model-emitted items inside a running turn; nothing awaits a human |
 | `Held { Compaction }` | `active` | `none` | `none` | `compaction` |
 | `Held { WaitingOnApproval }` | `active` | `human` | `permission` | `waitingOnApproval` |
 | `Held { WaitingOnUserInput }` | `active` | `human` | `question` | `waitingOnUserInput` |

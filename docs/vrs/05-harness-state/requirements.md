@@ -76,7 +76,8 @@ path reads this record.
   and nothing outside the driver writes it. It carries the full v1
   tuple: `state ∈ idle | active | child | ended`, `blockedOn ∈ human | none`
   (with `ask ∈ none | permission | question | review` naming the kind of
-  human ask machine-readably, so no consumer branches on `reason`),
+  human ask machine-readably, so no consumer branches on `reason`; `review`
+  is reserved — no maintained producer emits it),
   `inputBuffer ∈ empty | nonempty | unknown`, plus the observing harness, a
   diagnostic `reason` no consumer branches on, and fencing/freshness fields.
   `child` is reserved: part of the contract, decoded by v1 readers, no
