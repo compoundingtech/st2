@@ -2050,9 +2050,32 @@ fn connect_control(
 
 /// `Ok(None)` = a stop was raised mid-initialize; the caller exits gracefully.
 fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>>> {
-    stream.set_read_timeout(Some(STARTUP_TIMEOUT))?;
-    let (mut websocket, response) = tungstenite::client("ws://localhost/", stream)
-        .map_err(|error| anyhow::anyhow!("Codex WebSocket handshake failed: {error}"))?;
+    // A short read timeout surfaces the handshake's blocking reads as resumable
+    // `Interrupted` states (a timed-out socket read is `WouldBlock`, which the
+    // handshake machine parks on), so a stop raised while the app-server sits
+    // silent mid-handshake unblocks within a poll interval instead of holding
+    // the launch for the whole startup timeout.
+    stream.set_read_timeout(Some(CONTROL_POLL))?;
+    let handshake_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut pending = tungstenite::client("ws://localhost/", stream);
+    let (mut websocket, response) = loop {
+        match pending {
+            Ok(done) => break done,
+            Err(tungstenite::HandshakeError::Interrupted(resumable)) => {
+                if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                anyhow::ensure!(
+                    Instant::now() < handshake_deadline,
+                    "Codex WebSocket handshake timed out"
+                );
+                pending = resumable.handshake();
+            }
+            Err(tungstenite::HandshakeError::Failure(error)) => {
+                anyhow::bail!("Codex WebSocket handshake failed: {error}")
+            }
+        }
+    };
     anyhow::ensure!(
         response.status().as_u16() == 101,
         "Codex WebSocket handshake returned {}",
@@ -2919,6 +2942,32 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_during_the_websocket_handshake_ends_startup_gracefully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let silent_server = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let stream = UnixStream::connect(&socket_path).unwrap();
+        let stopper = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            crate::provider_session::STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = initialize_control(stream);
+        crate::provider_session::STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        stopper.join().unwrap();
+        let _held_open = silent_server.join().unwrap().unwrap();
+        assert!(
+            result.unwrap().is_none(),
+            "a stop while the server sits silent mid-handshake must return the graceful None"
+        );
+        assert!(
+            started.elapsed() < STARTUP_TIMEOUT,
+            "the stop must unblock the handshake well before the startup timeout"
+        );
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
