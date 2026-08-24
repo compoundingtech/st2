@@ -763,8 +763,19 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
             .map_or(0, |record| record.transitions.saturating_add(1)),
     };
     write_record(&writer.path, &record)?;
-    // Best-effort: losing the floor write only matters if the record later becomes unreadable.
-    let _ = fs::write(&floor_path, format!("{seq}\n"));
+    // The floor is the safety net for the record itself going unreadable, so its own failure
+    // modes must not be quiet ones: stage-and-rename keeps a torn write from corrupting the
+    // current floor, and a failed write is logged — the claim still stands (losing the floor
+    // only matters if the record later becomes unreadable), but never silently.
+    let staged = floor_path.with_file_name(".harness-state.seq.tmp");
+    if let Err(error) =
+        fs::write(&staged, format!("{seq}\n")).and_then(|()| fs::rename(&staged, &floor_path))
+    {
+        eprintln!(
+            "st2 harness-state: writing the sequence floor {} failed: {error}",
+            floor_path.display()
+        );
+    }
     Ok(seq)
 }
 
