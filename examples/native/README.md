@@ -41,6 +41,11 @@ Hook installation is explicit and receipt-bearing. `up` and materialization only
 selected immutable hook set; they never refresh shared scripts. Managed settings resolve
 `$ST_HOOKS/<script>` into that versioned set.
 
+The Claude `StopFailure` hook records every API-error turn in the machine-local st2 state directory.
+Each agent appends to `st2/hook-events/stop-failure/<identity>.jsonl`. The hook records before it
+applies notification filters, and it records even when the declaration has no supervisor. The JSONL
+payload is redacted before it reaches disk. All record failures remain fail-open.
+
 ## Status discipline
 
 All three maintained declarations load the shipped bus contract. Agents must declare `busy` before

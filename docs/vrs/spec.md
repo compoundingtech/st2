@@ -916,6 +916,35 @@ and context larger than a platform argument limit without truncation. The open
 verification delta is recorded in
 [DELTA-001](./.delta/DELTA-001-session-start-hook-evidence.md).
 
+## Provider StopFailure records (R17)
+
+The Claude `StopFailure` hook reads the provider input once. It appends one
+compact JSON object to the agent's machine-local file:
+
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/st2/hook-events/stop-failure/<safe-identity>.jsonl
+```
+
+The file mode is `0600`, and its directory mode is `0700`. Each record has
+schema `1`, a UTC timestamp, event `StopFailure`, the original st2 identity,
+a normalized `error_type`, and the sanitized provider payload. The normalized
+field accepts the current provider `error` field and the legacy `error_type`
+field.
+
+The sanitizer replaces sensitive field values and token-shaped strings before
+the append. A sanitized payload larger than 16,384 characters becomes a bounded
+preview. Invalid JSON produces `payload: null` and `payload_error: invalid_json`;
+the hook never copies the invalid raw input.
+
+The hook records before it applies presence or supervisor-notification filters.
+Thus, filtered errors and agents without supervisors still produce records.
+Directory, append, permission, presence, and notification failures do not alter
+the hook's successful exit.
+
+Executable acceptance in `tests/claude_hooks.rs` covers append behavior, exact
+permissions, current and legacy error fields, redaction, invalid input, filtered
+errors, missing supervisors, and an unwritable record path.
+
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
 requires Nathan's explicit approval.

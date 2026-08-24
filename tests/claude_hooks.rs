@@ -253,8 +253,9 @@ fn stop_failure_appends_a_private_redacted_record_without_a_supervisor() {
   "hook_event_name": "StopFailure",
   "error": "authentication_failed",
   "error_details": "Login expired: Bearer bearer-secret-1234567890 and sk-ant-api03-abcdefghijklmnop",
-  "last_assistant_message": "API Error: Login expired",
+  "last_assistant_message": "API Error: Login expired with abcdef0123456789abcdef0123456789abcdef0123456789",
   "api_key": "secret-key-value",
+  "headers": {"X-Api-Key": "header-secret-value"},
   "nested": {
     "authorization": "Bearer nested-secret-1234567890",
     "safe": "retry in 60 seconds"
@@ -288,6 +289,7 @@ fn stop_failure_appends_a_private_redacted_record_without_a_supervisor() {
     assert_eq!(record["payload"]["session_id"], "session-safe");
     assert_eq!(record["payload"]["error"], "authentication_failed");
     assert_eq!(record["payload"]["api_key"], "[REDACTED]");
+    assert_eq!(record["payload"]["headers"]["X-Api-Key"], "[REDACTED]");
     assert_eq!(record["payload"]["nested"]["authorization"], "[REDACTED]");
     assert_eq!(record["payload"]["nested"]["safe"], "retry in 60 seconds");
     assert!(
@@ -299,11 +301,21 @@ fn stop_failure_appends_a_private_redacted_record_without_a_supervisor() {
     assert!(!contents.contains("bearer-secret"));
     assert!(!contents.contains("sk-ant-api03"));
     assert!(!contents.contains("secret-key-value"));
+    assert!(!contents.contains("header-secret-value"));
     assert!(!contents.contains("nested-secret"));
+    assert!(!contents.contains("abcdef0123456789abcdef"));
     assert_eq!(
         fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["status", "Silber.cos", "--root"])
+        .arg(&fixture.catalog)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8(status.stdout).unwrap(), "offline\n");
 }
 
 #[test]
@@ -338,6 +350,28 @@ fn stop_failure_records_old_and_new_error_fields_before_reaction_filtering() {
 }
 
 #[test]
+fn stop_failure_never_copies_an_invalid_raw_payload_to_disk() {
+    if !jq_available() {
+        eprintln!("SKIP: jq is required by the shipped Claude hook");
+        return;
+    }
+    let fixture = Fixture::new();
+    let raw = "not-json Bearer raw-secret-1234567890";
+
+    let output = fixture.run_with_input("claude-stop-failure.sh", &[], raw);
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    let contents = fs::read_to_string(fixture.stop_failure_record()).unwrap();
+    let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+    assert_eq!(record["error_type"], "unknown");
+    assert_eq!(record["payload"], serde_json::Value::Null);
+    assert_eq!(record["payload_error"], "invalid_json");
+    assert!(!contents.contains("raw-secret"));
+}
+
+#[test]
 fn stop_failure_remains_fail_open_when_the_record_path_is_unwritable() {
     if !jq_available() {
         eprintln!("SKIP: jq is required by the shipped Claude hook");
@@ -360,4 +394,12 @@ fn stop_failure_remains_fail_open_when_the_record_path_is_unwritable() {
     );
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+
+    let status = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["status", "Silber.cos", "--root"])
+        .arg(&fixture.catalog)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8(status.stdout).unwrap(), "away\n");
 }

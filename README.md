@@ -94,6 +94,13 @@ current inbox; pre-compact preserves a recovery breadcrumb when no context was w
 failure hooks surface newly arrived work or a harness failure. They fail open so hook trouble does
 not prevent the harness from starting or stopping.
 
+The Claude `StopFailure` hook appends one private JSON object per failure to
+`${XDG_STATE_HOME:-$HOME/.local/state}/st2/hook-events/stop-failure/<identity>.jsonl`. It records a
+UTC timestamp, the st2 identity, a normalized `error_type`, and the sanitized provider payload.
+The hook redacts sensitive fields and token-shaped strings before the append. It records invalid
+JSON without copying the raw input. A missing supervisor does not disable the record. Record,
+presence, and notification failures remain fail-open.
+
 The same immutable set also carries `pi-channel.ts`. pi has no hook mechanism of its own — an
 extension is where a pi session exposes that surface — so st2 ships one and `st2 driver pi-session`
 splices it into the launch from the set this binary verified. A declaration never names it, and a
