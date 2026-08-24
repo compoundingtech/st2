@@ -210,7 +210,10 @@ the TUI exists ends the launch gracefully and leaves no record — nothing was
 observed — while a stop after it exits through the ordinary terminal-write
 path — and the stop handler installs before ANY child is spawned, the
 hook-trust preflight's detached app-server included, so a stop in that window
-cannot leak a server around a dead wrapper. A projected transition whose
+cannot leak a server around a dead wrapper. Observability never kills a
+launch: a claim that cannot be written degrades to a token-only writer with
+a warning, a TUI that fails to spawn writes a real terminal record (ended,
+launch-error) over the claim placeholder, and a projected transition whose
 record write fails does not count as evidence: it is retained as pending and
 retried on EVERY pump pass (only the heartbeat is presence-cadence work), so
 a stale on-disk state is never kept fresh in contradiction of the latest
@@ -249,12 +252,16 @@ survive every materialization, while st2's own prior entries — recognizable
 by the hook root they reference — are superseded on a hook-set upgrade
 rather than accumulated. Hook writes carry the wrapper's exported
 incarnation token, so a hook finishing after the wrapper reaped Claude
-cannot replace the terminal record. A hooks-only seat (the maintained
-hand-authored example launches claude directly) gets transitions and
-blocked-on-you but no heartbeat owner and no terminal record: a live-but-
-idle seat ages to `unknown` and an exit leaves its last state to age out —
-indeterminate, never wrong — until the seat is routed through the session
-wrapper.
+cannot replace the terminal record. Legacy `deliver "mcp"` seats render the same
+canonical registration — they run under claude-session too, and a wrapper
+that claims and ends a record nobody transitions would be worse than no
+record. A hooks-only seat (the maintained hand-authored example launches
+claude directly) gets transitions and blocked-on-you but no heartbeat owner
+and no terminal record: its `SessionStart` performs the written claim so
+session succession works (guarded — a wrapperless claimer never supersedes
+a live wrapper-kept record, only fellow wrapperless tokens, terminal
+records, and staleness), while a live-but-idle seat still ages to `unknown`
+and an exit leaves its last state to age out — indeterminate, never wrong.
 
 ## pi producer (OHS-R05, OHS-R08)
 
@@ -301,9 +308,11 @@ evidence (`/session/status` omits idle sessions, so an empty map over a live
 server is the idle proof, re-read on every SSE (re)connect). Asks open across
 a reconnect are recovered from both pending listings — `GET /permission` and
 `GET /question`, each measured on 1.18.19 — with their ids kept so the
-id-matched exits still release them; the seed counts as successful only when
-the status level and both listings all succeed, otherwise evidence stays off
-and the seed retries, and an unrecognized `session.status` word is not level
+id-matched exits still release them; the seed builds a fresh projection and
+swaps it in whole only when the status level and both listings all succeed —
+a mid-seed failure leaves nothing half-seeded, a successful re-seed clears
+stale entries whose exits passed during the outage, and otherwise evidence
+stays off and the seed retries — and an unrecognized `session.status` word is not level
 evidence (a future word must not prove idle on a quiet server). The `/doc`
 subset gate names every consumed arm, exit events and pending listings
 included, so a release renaming an exit is refused up front rather than
