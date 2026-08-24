@@ -209,8 +209,11 @@ initialize, thread binding), not only the bound monitor loop: a stop before
 the TUI exists ends the launch gracefully and leaves no record — nothing was
 observed — while a stop after it exits through the ordinary terminal-write
 path — and the stop handler installs before ANY child is spawned, the
-hook-trust preflight's detached app-server included, so a stop in that window
-cannot leak a server around a dead wrapper. Observability never kills a
+hook-trust preflight's detached app-server included, with the stop flag
+polled between short socket timeouts through every startup wait (connect,
+the initialize handshake, thread binding, and the preflight's projection
+read), so a stop in that window cannot leak a server around a dead wrapper
+or sit out a 30-second handshake. Observability never kills a
 launch: a claim that cannot be written degrades to a token-only writer with
 a warning, a TUI that fails to spawn writes a real terminal record (ended,
 launch-error) over the claim placeholder, and a projected transition whose
@@ -258,10 +261,14 @@ that claims and ends a record nobody transitions would be worse than no
 record. A hooks-only seat (the maintained hand-authored example launches
 claude directly) gets transitions and blocked-on-you but no heartbeat owner
 and no terminal record: its `SessionStart` performs the written claim so
-session succession works (guarded — a wrapperless claimer never supersedes
-a live wrapper-kept record, only fellow wrapperless tokens, terminal
-records, and staleness), while a live-but-idle seat still ages to `unknown`
-and an exit leaves its last state to age out — indeterminate, never wrong.
+session succession works — eligibility and the takeover are ONE act under
+the record lock, so a hooks-only SessionStart racing a wrapper's startup
+cannot steal its sequence, and a wrapper's fresh claim placeholder counts
+as owned (an abandoned one ages into claimability); a wrapperless claimer
+otherwise supersedes only fellow wrapperless tokens, real exit-bearing
+terminal records, and staleness — while a live-but-idle seat still ages to
+`unknown` and an exit leaves its last state to age out — indeterminate,
+never wrong.
 
 ## pi producer (OHS-R05, OHS-R08)
 
@@ -309,15 +316,20 @@ server is the idle proof, re-read on every SSE (re)connect). Asks open across
 a reconnect are recovered from both pending listings — `GET /permission` and
 `GET /question`, each measured on 1.18.19 — with their ids kept so the
 id-matched exits still release them; the seed builds a fresh projection and
-swaps it in whole only when the status level and both listings all succeed —
+swaps it in whole only when the status level (which must be the documented
+object shape — null or an array proves nothing) and both listings all
+succeed —
 a mid-seed failure leaves nothing half-seeded, a successful re-seed clears
 stale entries whose exits passed during the outage, and otherwise evidence
 stays off and the seed retries — and an unrecognized `session.status` word is not level
 evidence (a future word must not prove idle on a quiet server). The `/doc`
 subset gate names every consumed arm, exit events and pending listings
 included, so a release renaming an exit is refused up front rather than
-holding `blockedOn: human` forever. A dropped stream stops the heartbeat;
-`inputBuffer` stays `unknown` — the `/tui/*` surface is write-only.
+holding `blockedOn: human` forever. A dropped stream stops the heartbeat, the
+stream carries a silence horizon of at least twice the measured heartbeat
+cadence so a stalled socket surfaces as a disconnect instead of keeping
+evidence alive forever, and `inputBuffer` stays `unknown` — the `/tui/*`
+surface is write-only.
 
 The native delivery transport mirrors the Codex FIFO discipline: an
 `Attempted` receipt persisted before transport, `POST
