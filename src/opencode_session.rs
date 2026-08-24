@@ -112,28 +112,41 @@ pub fn run(
     // The written claim comes BEFORE the provider spawns: a claim that cannot be written aborts
     // the launch while there is still nothing to leak, and it supersedes whatever a predecessor
     // left — a still-fresh live record included — before this wrapper's first observation.
-    let writer = {
+    let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
-        Writer::new(
-            &agent_dir,
-            identity.clone(),
-            "opencode",
-            Some(runtime_id.clone()),
-        )
-        .with_ownership(session, seq)
+        Session {
+            client,
+            version_ok,
+            status_path: status::status_path(&agent_dir),
+            // The pty session vouching for the record is the wrapper's task: the runtime ID
+            // names the registry entry, and only aliases the identity on driver-expanded seats.
+            writer: Writer::new(
+                &agent_dir,
+                identity.clone(),
+                "opencode",
+                Some(runtime_id.clone()),
+            )
+            .with_ownership(session, seq),
+            delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+        }
     };
-    let mut child = spawn_provider(&argv, &password)?;
+    let mut child = match spawn_provider(&argv, &password) {
+        Ok(child) => child,
+        Err(error) => {
+            // The claim already replaced whatever the predecessor left; returning through `?`
+            // would leave the exitless `ended (superseded)` placeholder standing as a false
+            // takeover. The launch failed under THIS session's ownership, so the record ends
+            // honestly here instead (the same contract pi's launch path keeps).
+            let _ = session.writer.observe(
+                Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
+                    .with_reason("launch-error")
+                    .with_exit("exit unknown"),
+            );
+            return Err(error);
+        }
+    };
 
-    let session = Session {
-        client,
-        version_ok,
-        status_path: status::status_path(&agent_dir),
-        // The pty session vouching for the record is the wrapper's task: the runtime ID names
-        // the registry entry, and only aliases the identity on driver-expanded seats.
-        writer,
-        delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
-    };
     run_session(session, &mut child, &agent_dir)
 }
 
@@ -717,13 +730,13 @@ impl EventMachine {
                     }
                     // A future status arm is not evidence of anything — not even level evidence:
                     // counting it would let an unrecognized word prove `idle` on a quiet server.
-                    // On a session this machine believes busy it is worse than nothing: the busy
-                    // entry can no longer be trusted to clear, so the whole projection is poisoned
-                    // until a level seed rebuilds it.
+                    // It poisons the whole projection on ANY session, tracked or not: a
+                    // tracked-busy entry can no longer be trusted to clear, and an untracked
+                    // session in a state this version cannot read makes standing idle evidence
+                    // a fabrication — that session may already be mid-turn. Withholding until
+                    // a level seed rebuilds the picture is the only honest reading.
                     _ => {
-                        if self.busy.contains_key(&session_id) {
-                            self.poisoned = true;
-                        }
+                        self.poisoned = true;
                     }
                 }
             }
@@ -1135,10 +1148,20 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("state file has no parent")?;
     std::fs::create_dir_all(parent)?;
     let temp = parent.join(format!(".{}.tmp", std::process::id()));
-    std::fs::write(&temp, serde_json::to_vec(value)?)?;
+    // Durability, not just atomicity: a crash between the rename and OpenCode's acceptance of
+    // the prompt_async would lose the Attempted receipt and make the pump re-POST duplicate
+    // parts. The bytes reach disk before the rename and the directory entry afterwards, so
+    // once delivery proceeds the receipt survives.
+    let mut file = std::fs::File::create(&temp)?;
+    file.write_all(&serde_json::to_vec(value)?)?;
+    file.sync_all()?;
+    drop(file);
     if let Err(error) = std::fs::rename(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(error.into());
+    }
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -1871,9 +1894,10 @@ mod tests {
         );
     }
 
-    /// An unknown status word on a session this machine tracks as busy poisons the whole
-    /// projection until a level seed replaces the machine; on an untracked session the word
-    /// stays inert — it proves nothing and poisons nothing.
+    /// An unknown status word on ANY session poisons the whole projection until a level seed
+    /// replaces the machine: a tracked-busy entry can no longer be trusted to clear, and an
+    /// untracked session in a state this version cannot read makes standing idle evidence a
+    /// fabrication — that session may already be mid-turn.
     #[test]
     fn an_unreadable_status_word_on_a_tracked_busy_session_poisons_the_projection() {
         let mut machine = EventMachine::default();
@@ -1889,15 +1913,17 @@ mod tests {
             "a busy entry that can no longer be trusted to clear must withhold every projection"
         );
 
+        // The same word on a session the projection does NOT track: standing idle evidence
+        // must not keep heartbeating on top of unreadable activity.
         let mut untracked = EventMachine::default();
         untracked.seed_idle();
+        assert_eq!(observed(&untracked).state, Activity::Idle);
         untracked.apply(&event(
             r#"{"type":"session.status","properties":{"sessionID":"ses_9","status":{"type":"hibernating"}}}"#,
         ));
-        assert_eq!(
-            observed(&untracked).state,
-            Activity::Idle,
-            "an unknown word on an untracked session leaves the projection standing"
+        assert!(
+            untracked.observation().is_none(),
+            "an unknown word on an untracked session withholds the definite idle"
         );
 
         // A sticky terminal outranks the poison: it does not depend on the busy map the
