@@ -18,6 +18,7 @@ use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -30,7 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, message, run, status};
+use crate::{ding, harness_state, message, run, status};
 
 /// Every admitted version has a delivery-critical schema comparison and live remote-TUI evidence.
 /// A later version stays rejected until both checks are repeated; semantic-version proximity is
@@ -210,6 +211,62 @@ pub enum CodexTerminalError {
     SystemError,
 }
 
+impl CodexObservedState {
+    /// Driver-side projection into the generic observed-harness-state vocabulary (#162). `Held` is
+    /// a delivery predicate — the complement of steerable — and never leaks into the published
+    /// record: holds Codex positively reported as work project to `active` (with the human-blocking
+    /// ones setting the blocked axis), while holds that only mean "st2 cannot currently prove
+    /// anything" project to `None`, the indeterminate observation that writes nothing.
+    pub fn harness_observation(&self) -> Option<harness_state::Observation> {
+        use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
+        let observation = |state, blocked_on| {
+            // This producer reads the app-server control stream and cannot see the composer.
+            Observation::new(state, blocked_on, InputBuffer::Unknown)
+        };
+        match self {
+            CodexObservedState::AwaitingStatus => None,
+            CodexObservedState::Idle => Some(observation(Activity::Idle, BlockedOn::None)),
+            CodexObservedState::TerminalError { .. } => {
+                Some(observation(Activity::Ended, BlockedOn::None).with_reason("systemError"))
+            }
+            CodexObservedState::Active { .. } => {
+                Some(observation(Activity::Active, BlockedOn::None))
+            }
+            CodexObservedState::Held { reason, .. } => match reason {
+                // Review's enter and exit are MODEL-emitted items inside a running turn
+                // (`enteredReviewMode`/`exitedReviewMode`, released by `observe_hold_released`):
+                // nothing awaits a human, so the observed record reports plain activity. The
+                // delivery hold is untouched — `Held` still blocks steer — and `review` stays a
+                // reserved ask word no producer emits.
+                CodexHoldReason::Review => {
+                    Some(observation(Activity::Active, BlockedOn::None).with_reason("review"))
+                }
+                CodexHoldReason::WaitingOnApproval => Some(
+                    observation(Activity::Active, BlockedOn::Human)
+                        .with_ask(Ask::Permission)
+                        .with_reason("waitingOnApproval"),
+                ),
+                CodexHoldReason::WaitingOnUserInput => Some(
+                    observation(Activity::Active, BlockedOn::Human)
+                        .with_ask(Ask::Question)
+                        .with_reason("waitingOnUserInput"),
+                ),
+                CodexHoldReason::Compaction => {
+                    Some(observation(Activity::Active, BlockedOn::None).with_reason("compaction"))
+                }
+                // Codex positively reported active; st2 merely cannot name a steerable turn.
+                CodexHoldReason::ActiveWithoutTurn => Some(
+                    observation(Activity::Active, BlockedOn::None).with_reason("activeWithoutTurn"),
+                ),
+                CodexHoldReason::ConflictingTurn => Some(
+                    observation(Activity::Active, BlockedOn::None).with_reason("conflictingTurn"),
+                ),
+                CodexHoldReason::NotLoaded | CodexHoldReason::SystemError => None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodexControlState {
@@ -330,6 +387,14 @@ struct CodexInboxDelivery {
     pending: Option<PendingCodexDelivery>,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
+    harness_writer: harness_state::Writer,
+    /// Whether the latest projection carried evidence. Indeterminate observations write nothing
+    /// and stop the heartbeat, so a state the pump can no longer see ages out instead of staying
+    /// artificially fresh.
+    harness_evidence: bool,
+    /// A projected transition whose write failed, retried on the next pump pass before any
+    /// heartbeat may re-stamp the contradicted on-disk state.
+    pending_observation: Option<harness_state::Observation>,
 }
 
 impl CodexInboxDelivery {
@@ -345,8 +410,42 @@ impl CodexInboxDelivery {
             )
         })?;
         let (wake_tx, wake) = mpsc::channel();
-        let watcher = crate::watch::watch_recursive_mutations(&config.agent_dir, wake_tx);
+        // Scoped to inbox + status: this pump's own process group writes runtime records (presence
+        // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
+        let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
         let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
+        // The pty session whose liveness vouches for the record is the wrapper's task: the
+        // runtime ID names the pty registry entry, and only aliases the identity on
+        // driver-expanded seats — a hand-authored seat may declare a different task ID.
+        // The session token is the runtime incarnation the wrapper already minted: the pump and
+        // the wrapper's terminal writer are the same session and must own the same records. The
+        // claim is a WRITTEN act — it atomically supersedes whatever a predecessor left,
+        // including a still-fresh live record the pty-name probe cannot distinguish.
+        // Observability must never kill the launch: a claim that cannot be written degrades to
+        // a token-only writer (refused by records it does not own, so it can only under-report)
+        // with a warning, and delivery proceeds.
+        let harness_writer = {
+            let writer = harness_state::Writer::new(
+                &config.agent_dir,
+                config.identity.clone(),
+                "codex",
+                Some(runtime.runtime_id().to_string()),
+            );
+            match harness_state::claim(
+                &config.agent_dir,
+                config.identity.clone(),
+                "codex",
+                runtime.incarnation(),
+            ) {
+                Ok(claimed_seq) => writer.with_ownership(runtime.incarnation(), claimed_seq),
+                Err(error) => {
+                    eprintln!(
+                        "st2 codex: observed-state claim failed; degrading to token-only: {error:#}"
+                    );
+                    writer.with_session(runtime.incarnation())
+                }
+            }
+        };
         Ok(Self {
             config,
             state_path,
@@ -361,7 +460,43 @@ impl CodexInboxDelivery {
             pending: None,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
+            harness_writer,
+            harness_evidence: false,
+            pending_observation: None,
         })
+    }
+
+    /// Publish the generic observed-harness-state projection of a control-state change. Best-effort
+    /// like the presence refresh: a failed record write must not disturb delivery — but it must
+    /// not count as evidence either. A transition whose write failed is retained as pending and
+    /// retried before any heartbeat, so a stale on-disk state is never kept fresh in
+    /// contradiction of the latest observation.
+    fn observe_harness(&mut self, observed: &CodexObservedState) {
+        match observed.harness_observation() {
+            Some(observation) => self.publish_observation(observation),
+            None => {
+                // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
+                // and mark the stream discontinuous so a state restated after the gap opens a
+                // fresh transition instead of claiming continuity across an unobserved interval.
+                self.harness_evidence = false;
+                self.pending_observation = None;
+                self.harness_writer.interrupt();
+            }
+        }
+    }
+
+    fn publish_observation(&mut self, observation: harness_state::Observation) {
+        match self.harness_writer.observe(observation.clone()) {
+            Ok(()) => {
+                self.harness_evidence = true;
+                self.pending_observation = None;
+            }
+            Err(_) => {
+                self.harness_evidence = false;
+                self.harness_writer.interrupt();
+                self.pending_observation = Some(observation);
+            }
+        }
     }
 
     fn write_state(&mut self, state: CodexDeliveryState) -> Result<()> {
@@ -378,10 +513,19 @@ impl CodexInboxDelivery {
 
     fn refresh_if_due(&mut self) -> Result<()> {
         let now = Instant::now();
+        // A pending transition retries on EVERY pump pass — its write failed once and the
+        // on-disk record contradicts the latest observation until it lands; only the heartbeat
+        // is presence-cadence work.
+        if let Some(pending) = self.pending_observation.clone() {
+            self.publish_observation(pending);
+        }
         if now >= self.next_presence_refresh {
             // This wrapper owns the live provider session. It therefore owns the presence lease.
             // Preserve busy or available, and let dnd age out.
             let _ = status::refresh(&status::status_path(&self.config.agent_dir));
+            if self.harness_evidence {
+                let _ = self.harness_writer.heartbeat();
+            }
             self.next_presence_refresh = now + status::STATUS_REFRESH;
         }
         let mut due = now >= self.next_inbox_refresh;
@@ -1090,6 +1234,11 @@ fn run_controlled_owned(
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
+    // Installed before ANY child exists — the hook-trust preflight spawns a detached app-server
+    // first, and a SIGTERM landing in that window must set the stop flag its connect loop polls
+    // rather than killing this wrapper around a leaked server and a stale socket. (Installing
+    // resets the flag, so this must also run exactly once per launch.)
+    crate::provider_session::install_signal_handler();
     let binding_path = state_dir.join("binding.json");
     let resume_thread = load_resume_thread(&binding_path, &identity, &runtime_id)?;
 
@@ -1205,16 +1354,41 @@ fn run_connected(
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
+    // The stop handler is installed by run_controlled_owned before any spawn (the preflight's
+    // detached app-server included); re-installing here would RESET a stop flag raised during
+    // startup, so this function only relies on it.
     let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
     let endpoint = format!("unix://{}", socket_path.display());
     let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
     let expected_resume =
         expected_resume_thread(&codex_argv[1..], resume_thread)?.map(str::to_owned);
     diagnostics.record("waitingForControlSocket", json!({ "pid": server.id() }))?;
-    let control = connect_control(server, socket_path, STARTUP_TIMEOUT)?;
+    // A stop during startup ends the launch before anything was observed: no TUI exists, the
+    // caller reaps the app-server, and this session leaves no record — its predecessor's ages
+    // out on its own.
+    let Some(control) = connect_control(server, socket_path, STARTUP_TIMEOUT)? else {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "connect" }))?;
+        return Ok(());
+    };
     diagnostics.record("controlSocketConnected", json!({}))?;
     let shutdown = control.try_clone()?;
-    let websocket = initialize_control(control)?;
+    if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialize" }))?;
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Ok(());
+    }
+    // The initialize wait itself polls the stop flag between short socket timeouts and returns
+    // None on a stop; the recheck below covers a stop raised in the remaining gaps.
+    let Some(websocket) = initialize_control(control)? else {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialize" }))?;
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Ok(());
+    };
+    if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialized" }))?;
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Ok(());
+    }
     diagnostics.record("controlInitialized", json!({}))?;
     let (events_tx, events_rx) = mpsc::channel();
     let binding_path = state_dir.join("binding.json");
@@ -1226,6 +1400,8 @@ fn run_connected(
     } else {
         (None, None)
     };
+    let harness_agent_dir = delivery.agent_dir.clone();
+    let harness_identity = delivery.identity.clone();
     let event_thread = thread::spawn(move || {
         let resume = expected_resume
             .as_deref()
@@ -1264,11 +1440,31 @@ fn run_connected(
             drop(resume_ready_tx);
             let _ = shutdown.shutdown(Shutdown::Both);
             let _ = event_thread.join();
+            // The claim already wrote its ended(superseded) placeholder; leaving that as the
+            // last word would read as "another session took over". The launch failure is this
+            // session's real terminal outcome — token-only adoption resolves to the claim's
+            // sequence, since the claim put this token on disk.
+            let mut writer = harness_state::Writer::new(
+                &harness_agent_dir,
+                harness_identity.clone(),
+                "codex",
+                Some(runtime.runtime_id().to_string()),
+            )
+            .with_session(runtime.incarnation());
+            let _ = writer.observe(
+                harness_state::Observation::new(
+                    harness_state::Activity::Ended,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Unknown,
+                )
+                .with_reason("launch-error")
+                .with_exit("exit unknown"),
+            );
             return Err(error)
                 .with_context(|| format!("starting controlled {} TUI", codex_argv[0]));
         }
     };
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<TuiEnd> {
         diagnostics.record("tuiStarted", json!({ "pid": tui.id() }))?;
         if let Some(ready) = resume_ready_tx.take() {
             ready
@@ -1276,10 +1472,16 @@ fn run_connected(
                 .context("starting Codex control resume after the TUI launched")?;
         }
         diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
-        wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics).and_then(|_| {
-            diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
-            monitor_bound_tui(&mut tui, &events_rx)
-        })
+        match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
+            BindingWait::Bound => {
+                diagnostics.record("threadBound", json!({ "pid": tui.id() }))?;
+                monitor_bound_tui(&mut tui, &events_rx)
+            }
+            BindingWait::Stopped => {
+                terminate_child(&mut tui);
+                Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()))
+            }
+        }
     })();
     if result.is_err() {
         terminate_child(&mut tui);
@@ -1287,7 +1489,57 @@ fn run_connected(
     drop(resume_ready_tx);
     let _ = shutdown.shutdown(Shutdown::Both);
     let _ = event_thread.join();
-    result
+    // The pump is gone, so nothing can observe this session again: publish the terminal
+    // observation with the outcome the wrapper actually saw, before any staleness horizon.
+    // Consumers must not branch on `reason`, so the observed exit always lands in `exit`.
+    // Same incarnation as the pump's writer, adopting by token: the pump's written claim (or any
+    // of its writes) put this token on disk, so token-only adoption resolves to this session's
+    // claimed sequence — and the terminal record fences exactly the records this session wrote.
+    let mut harness_writer = harness_state::Writer::new(
+        &harness_agent_dir,
+        harness_identity.clone(),
+        "codex",
+        Some(runtime.runtime_id().to_string()),
+    )
+    .with_session(runtime.incarnation());
+    let _ = match &result {
+        Ok(TuiEnd::Exited(status)) => harness_writer.ended(describe_tui_exit(Some(*status))),
+        Ok(TuiEnd::Stopped(status)) => harness_writer.ended(describe_tui_exit(*status)),
+        Err(error) => {
+            let observed_exit = tui.try_wait().ok().flatten();
+            harness_writer.observe(
+                harness_state::Observation::new(
+                    harness_state::Activity::Ended,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Unknown,
+                )
+                .with_exit(describe_tui_exit(observed_exit))
+                .with_reason(format!("{error}")),
+            )
+        }
+    };
+    match result {
+        Ok(TuiEnd::Exited(status)) => completed_tui(status),
+        // The wrapper stopped its own session: not a failure, mirroring the shared wrapper body.
+        Ok(TuiEnd::Stopped(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// How the controlled TUI session came to an end, as the monitor saw it.
+enum TuiEnd {
+    /// The TUI exited on its own with this status.
+    Exited(ExitStatus),
+    /// The wrapper's stop flag ended the session; the reaped status when one was observable.
+    Stopped(Option<ExitStatus>),
+}
+
+fn describe_tui_exit(status: Option<ExitStatus>) -> String {
+    match status.map(|status| (status.code(), status.signal())) {
+        Some((Some(code), _)) => format!("exit {code}"),
+        Some((None, Some(signal))) => format!("signal {signal}"),
+        _ => "exit unknown".to_string(),
+    }
 }
 
 /// Start app-server with the authored global configuration inputs that its CLI supports.
@@ -1452,8 +1704,14 @@ fn preflight_hook_trust(
     let result = diagnostics
         .record("hookTrustPreflightStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
-            let control = connect_control(&mut server, socket_path, STARTUP_TIMEOUT)?;
-            let mut websocket = initialize_control(control)?;
+            let Some(control) = connect_control(&mut server, socket_path, STARTUP_TIMEOUT)? else {
+                // Stop requested mid-preflight: skip the projection — the launch proceeds to the
+                // connect stage, whose own stop check exits gracefully before the TUI starts.
+                return Ok(None);
+            };
+            let Some(mut websocket) = initialize_control(control)? else {
+                return Ok(None);
+            };
             query_hook_trust_projection(&mut websocket, cwd)
         });
     terminate_process_group(&mut server);
@@ -1478,14 +1736,22 @@ fn query_hook_trust_projection(
             "params": { "cwds": [cwd.to_string_lossy()] },
         }),
     )?;
-    websocket
-        .get_ref()
-        .set_read_timeout(Some(STARTUP_TIMEOUT))?;
+    websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     let response = loop {
-        let message = read_json_message(websocket)?
-            .context("Codex app-server closed during hook-trust preflight")?;
-        if message.get("id") == Some(&Value::from(HOOK_TRUST_PREFLIGHT_REQUEST_ID)) {
-            break message;
+        match read_startup_message(websocket, deadline)? {
+            StartupRead::Message(message)
+                if message.get("id") == Some(&Value::from(HOOK_TRUST_PREFLIGHT_REQUEST_ID)) =>
+            {
+                break message;
+            }
+            StartupRead::Message(_) => continue,
+            // A stop mid-preflight skips the projection; the launch's own stop checks exit
+            // gracefully before the real server spawns anything further.
+            StartupRead::Stopped => return Ok(None),
+            StartupRead::Closed => {
+                anyhow::bail!("Codex app-server closed during hook-trust preflight")
+            }
         }
     };
     if let Some(error) = response.get("error") {
@@ -1746,11 +2012,16 @@ fn connect_control(
     server: &mut Child,
     socket_path: &Path,
     timeout: Duration,
-) -> Result<UnixStream> {
+) -> Result<Option<UnixStream>> {
     let deadline = Instant::now() + timeout;
     loop {
+        // st2's stop path may fire before the control socket ever connects; without this check
+        // the wrapper would sit out the whole startup timeout with SIGTERM already delivered.
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
         match UnixStream::connect(socket_path) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => return Ok(Some(stream)),
             Err(error) if Instant::now() < deadline => {
                 if let Some(status) = server.try_wait()? {
                     anyhow::bail!("Codex app-server exited before control connected: {status}");
@@ -1777,10 +2048,34 @@ fn connect_control(
     }
 }
 
-fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
-    stream.set_read_timeout(Some(STARTUP_TIMEOUT))?;
-    let (mut websocket, response) = tungstenite::client("ws://localhost/", stream)
-        .map_err(|error| anyhow::anyhow!("Codex WebSocket handshake failed: {error}"))?;
+/// `Ok(None)` = a stop was raised mid-initialize; the caller exits gracefully.
+fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>>> {
+    // A short read timeout surfaces the handshake's blocking reads as resumable
+    // `Interrupted` states (a timed-out socket read is `WouldBlock`, which the
+    // handshake machine parks on), so a stop raised while the app-server sits
+    // silent mid-handshake unblocks within a poll interval instead of holding
+    // the launch for the whole startup timeout.
+    stream.set_read_timeout(Some(CONTROL_POLL))?;
+    let handshake_deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut pending = tungstenite::client("ws://localhost/", stream);
+    let (mut websocket, response) = loop {
+        match pending {
+            Ok(done) => break done,
+            Err(tungstenite::HandshakeError::Interrupted(resumable)) => {
+                if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                anyhow::ensure!(
+                    Instant::now() < handshake_deadline,
+                    "Codex WebSocket handshake timed out"
+                );
+                pending = resumable.handshake();
+            }
+            Err(tungstenite::HandshakeError::Failure(error)) => {
+                anyhow::bail!("Codex WebSocket handshake failed: {error}")
+            }
+        }
+    };
     anyhow::ensure!(
         response.status().as_u16() == 101,
         "Codex WebSocket handshake returned {}",
@@ -1802,9 +2097,18 @@ fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
         }),
     )?;
 
+    // Short socket timeouts make the stop flag observable through the up-to-30s wait; the
+    // startup timeout is restored below so later control reads keep their semantics.
+    websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        let message = read_json_message(&mut websocket)?
-            .context("Codex app-server closed the control connection during initialize")?;
+        let message = match read_startup_message(&mut websocket, deadline)? {
+            StartupRead::Message(message) => message,
+            StartupRead::Stopped => return Ok(None),
+            StartupRead::Closed => {
+                anyhow::bail!("Codex app-server closed the control connection during initialize")
+            }
+        };
         if message.get("id") != Some(&Value::from(0)) {
             continue;
         }
@@ -1817,12 +2121,15 @@ fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
         );
         break;
     }
+    websocket
+        .get_ref()
+        .set_read_timeout(Some(STARTUP_TIMEOUT))?;
     write_json_message(
         &mut websocket,
         &json!({ "method": "initialized", "params": {} }),
     )?;
     websocket.get_ref().set_read_timeout(None)?;
-    Ok(websocket)
+    Ok(Some(websocket))
 }
 
 /// Wait until the owning TUI has loaded the preserved thread before this control connection
@@ -2034,6 +2341,9 @@ fn pump_control(
                     .context("persisting Codex resume binding")?;
                     atomic_json(control_state_path, &bound)
                         .context("persisting Codex control state")?;
+                    if let Some(delivery) = delivery.as_mut() {
+                        delivery.observe_harness(&bound.observed);
+                    }
                     control_state = Some(bound);
                     let _ = events.send(ControlEvent::Bound);
                     continue;
@@ -2056,6 +2366,9 @@ fn pump_control(
                 bound.subscribed = true;
                 atomic_json(control_state_path, &bound)
                     .context("persisting Codex fresh control state")?;
+                if let Some(delivery) = delivery.as_mut() {
+                    delivery.observe_harness(&bound.observed);
+                }
                 control_state = Some(bound);
                 let _ = events.send(ControlEvent::Bound);
             }
@@ -2106,6 +2419,9 @@ fn pump_control(
             if changed {
                 atomic_json(control_state_path, state)
                     .context("persisting Codex observed control state")?;
+                if let Some(delivery) = delivery.as_mut() {
+                    delivery.observe_harness(&state.observed);
+                }
                 let _ = events.send(ControlEvent::Observed);
             }
             if !state.subscribed
@@ -2170,14 +2486,23 @@ fn binding_candidate(message: &Value) -> Result<Option<&str>> {
     }
 }
 
+/// How the binding wait ended: the thread bound, or st2's stop flag ended the session first.
+enum BindingWait {
+    Bound,
+    Stopped,
+}
+
 fn wait_for_binding(
     tui: &mut Child,
     events: &Receiver<ControlEvent>,
     timeout: Duration,
     diagnostics: &mut WrapperDiagnostics,
-) -> Result<()> {
+) -> Result<BindingWait> {
     let deadline = Instant::now() + timeout;
     loop {
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(BindingWait::Stopped);
+        }
         if let Some(status) = tui.try_wait()? {
             anyhow::bail!("controlled Codex TUI exited before thread binding: {status}");
         }
@@ -2195,7 +2520,7 @@ fn wait_for_binding(
                 diagnostics.record("tuiThreadLoaded", json!({ "pid": tui.id() }))?;
                 let _ = acknowledge.send(());
             }
-            Ok(ControlEvent::Bound) => return Ok(()),
+            Ok(ControlEvent::Bound) => return Ok(BindingWait::Bound),
             Ok(ControlEvent::Observed) => {}
             Ok(ControlEvent::Closed) => {
                 anyhow::bail!("Codex control connection closed before thread binding")
@@ -2211,10 +2536,16 @@ fn wait_for_binding(
     }
 }
 
-fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result<()> {
+fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result<TuiEnd> {
     loop {
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            // st2's stop path: end the session and return through the ordinary terminal-write
+            // path so the record carries the observed outcome before the wrapper exits.
+            terminate_child(tui);
+            return Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()));
+        }
         if let Some(status) = tui.try_wait()? {
-            return completed_tui(status);
+            return Ok(TuiEnd::Exited(status));
         }
         match events.recv_timeout(CONTROL_POLL) {
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
@@ -2447,6 +2778,58 @@ fn write_json_message(websocket: &mut WebSocket<UnixStream>, value: &Value) -> R
     Ok(())
 }
 
+/// One startup-phase read: polls the stop flag between short socket timeouts so a stop raised
+/// during a slow handshake peer cannot sit out the full startup timeout (the caller sets a
+/// short socket read timeout first).
+enum StartupRead {
+    Message(Value),
+    Stopped,
+    Closed,
+}
+
+fn read_startup_message(
+    websocket: &mut WebSocket<UnixStream>,
+    deadline: Instant,
+) -> Result<StartupRead> {
+    loop {
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(StartupRead::Stopped);
+        }
+        let message = match websocket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(StartupRead::Closed);
+            }
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "Codex app-server startup read timed out"
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match message {
+            WebSocketMessage::Text(text) => {
+                let value = serde_json::from_str(&text)
+                    .context("decoding Codex app-server WebSocket JSON")?;
+                return Ok(StartupRead::Message(value));
+            }
+            WebSocketMessage::Close(_) => return Ok(StartupRead::Closed),
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => continue,
+            WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
+                anyhow::bail!("Codex app-server sent a non-text WebSocket message")
+            }
+        }
+    }
+}
+
+#[cfg(test)] // Production startup reads moved to the stop-aware read_startup_message.
 fn read_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<Option<Value>> {
     // Darwin reports a timed Unix-socket read as EAGAIN/EWOULDBLOCK.  During
     // handshake the peer may briefly be descheduled; treat that transient as
@@ -2559,6 +2942,48 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stop flag is process-global, so every test that exercises a reader of it —
+    /// [`initialize_control`] above all — holds this lock against the one test that flips
+    /// the flag: parallel readers would otherwise observe the raised flag and fail their
+    /// `no stop raised in tests` expectations.
+    fn stop_flag_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+            std::sync::LazyLock::new(std::sync::Mutex::default);
+        match LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[test]
+    fn a_stop_during_the_websocket_handshake_ends_startup_gracefully() {
+        let _stop_exclusive = stop_flag_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let silent_server = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let stream = UnixStream::connect(&socket_path).unwrap();
+        let stopper = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            crate::provider_session::STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = initialize_control(stream);
+        // Join before resetting: on an early failure return the stopper has not fired yet,
+        // and resetting first would let it re-poison the global flag for every later test.
+        stopper.join().unwrap();
+        crate::provider_session::STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _held_open = silent_server.join().unwrap().unwrap();
+        assert!(
+            result.unwrap().is_none(),
+            "a stop while the server sits silent mid-handshake must return the graceful None"
+        );
+        assert!(
+            started.elapsed() < STARTUP_TIMEOUT,
+            "the stop must unblock the handshake well before the startup timeout"
+        );
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -2689,6 +3114,198 @@ mod tests {
         assert_eq!(steer["params"]["expectedTurnId"], "turn-current");
         assert!(steer["params"].get("model").is_none());
         assert!(steer["params"].get("approvalPolicy").is_none());
+    }
+
+    /// Behavioral oracle for the #268 §B projection: a projection that withheld every row — or
+    /// that reported the two misclassified rows as indeterminate — fails here, because each
+    /// emitting row is asserted positively.
+    #[test]
+    fn harness_projection_is_faithful_and_withholds_only_unprovable_rows() {
+        use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer};
+        let held = |reason| CodexObservedState::Held {
+            reason,
+            turn_id: None,
+        };
+
+        // Rows with no provable observation are withheld — and no absence may derive idle.
+        for state in [
+            CodexObservedState::AwaitingStatus,
+            held(CodexHoldReason::NotLoaded),
+            held(CodexHoldReason::SystemError),
+        ] {
+            assert_eq!(state.harness_observation(), None, "{state:?}");
+        }
+
+        // Codex positively reported work: active, even where st2 cannot name a steerable turn
+        // (the two rows a naive steerability decomposition reported as unknown) or where the
+        // delivery gate holds.
+        for state in [
+            CodexObservedState::Active {
+                turn_id: "turn-current".into(),
+            },
+            held(CodexHoldReason::ActiveWithoutTurn),
+            held(CodexHoldReason::ConflictingTurn),
+            held(CodexHoldReason::Compaction),
+            // Review's edges are model-emitted items inside a running turn: plain activity,
+            // no human, no ask — the delivery hold is a separate axis.
+            held(CodexHoldReason::Review),
+        ] {
+            let observation = state
+                .harness_observation()
+                .unwrap_or_else(|| panic!("{state:?} must emit"));
+            assert_eq!(observation.state, Activity::Active, "{state:?}");
+            assert_eq!(observation.blocked_on, BlockedOn::None, "{state:?}");
+            assert_eq!(observation.input_buffer, InputBuffer::Unknown, "{state:?}");
+        }
+
+        // The holds a human resolves set the blocked axis instead of disappearing into active,
+        // and each names its machine-readable ask kind so consumers never branch on `reason`.
+        for (reason, ask) in [
+            (CodexHoldReason::WaitingOnApproval, Ask::Permission),
+            (CodexHoldReason::WaitingOnUserInput, Ask::Question),
+        ] {
+            let observation = held(reason)
+                .harness_observation()
+                .unwrap_or_else(|| panic!("{reason:?} must emit"));
+            assert_eq!(observation.state, Activity::Active, "{reason:?}");
+            assert_eq!(observation.blocked_on, BlockedOn::Human, "{reason:?}");
+            assert_eq!(observation.ask, ask, "{reason:?}");
+        }
+
+        let idle = CodexObservedState::Idle.harness_observation().unwrap();
+        assert_eq!(idle.state, Activity::Idle);
+        assert_eq!(idle.blocked_on, BlockedOn::None);
+
+        let ended = CodexObservedState::TerminalError {
+            reason: CodexTerminalError::SystemError,
+        }
+        .harness_observation()
+        .unwrap();
+        assert_eq!(ended.state, Activity::Ended);
+        assert_eq!(ended.reason.as_deref(), Some("systemError"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_transition_write_is_retried_before_any_heartbeat() {
+        use crate::harness_state::{self, Activity};
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let record_path = harness_state::harness_state_path(&agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-current".into(),
+        });
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Active
+        );
+
+        // The transition to idle fails to land: the agent dir is briefly unwritable.
+        let live = fs::metadata(&agent_dir).unwrap().permissions();
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        delivery.observe_harness(&CodexObservedState::Idle);
+        fs::set_permissions(&agent_dir, live).unwrap();
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Active,
+            "the failed write cannot have landed"
+        );
+
+        // No heartbeat may re-stamp the contradicted on-disk state; the retry lands the pending
+        // transition on the NEXT pump pass — deliberately without advancing the presence
+        // cadence, which gates only heartbeats.
+        let stale_active = fs::read(&record_path).unwrap();
+        delivery.next_presence_refresh = Instant::now() + status::STATUS_REFRESH;
+        delivery.refresh_if_due().unwrap();
+        let after = harness_state::read(&record_path, None).unwrap();
+        assert_eq!(after.state, Activity::Idle, "pending transition retried");
+        assert_ne!(fs::read(&record_path).unwrap(), stale_active);
+    }
+
+    #[test]
+    fn pump_publishes_observations_and_stops_heartbeating_on_evidence_loss() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let record_path = harness_state::harness_state_path(&agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-current".into(),
+        });
+        let observed = harness_state::read(&record_path, None).expect("record written");
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(observed.harness.as_deref(), Some("codex"));
+
+        // An indeterminate projection writes nothing and stops the heartbeat: the presence
+        // refresh still runs, but the record's bytes stay untouched and age toward unknown.
+        delivery.observe_harness(&CodexObservedState::Held {
+            reason: CodexHoldReason::NotLoaded,
+            turn_id: None,
+        });
+        let before = fs::read(&record_path).unwrap();
+        delivery.refresh_if_due().unwrap();
+        assert!(
+            status::read_state(&status::status_path(&agent_dir)) != status::State::Offline,
+            "presence refresh must still run"
+        );
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "no heartbeat without evidence"
+        );
+
+        // Evidence returning resumes both observation and heartbeat.
+        delivery.observe_harness(&CodexObservedState::Idle);
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Idle
+        );
+        delivery.next_presence_refresh = Instant::now();
+        delivery.refresh_if_due().unwrap();
+        assert_ne!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "heartbeat resumes with evidence"
+        );
+    }
+
+    #[test]
+    fn evidence_loss_marks_the_stream_discontinuous_for_a_restated_state() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let record_path = harness_state::harness_state_path(&config.agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        let before = fs::read(&record_path).unwrap();
+
+        // The same tuple restated across an unproven interval must not coalesce into the
+        // pre-gap record — continuity was not observed, so a fresh transition opens.
+        delivery.observe_harness(&CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            turn_id: None,
+        });
+        delivery.observe_harness(&CodexObservedState::Active {
+            turn_id: "turn-a".into(),
+        });
+        assert_ne!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "a restated state after an evidence gap must open a fresh transition"
+        );
+        assert_eq!(
+            harness_state::read(&record_path, None).unwrap().state,
+            Activity::Active
+        );
     }
 
     #[test]
@@ -3187,6 +3804,7 @@ mod tests {
     #[test]
     fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let config = delivery_config(tmp.path());
         let filename =
             message::send_to_inbox(&config.inbox, "h.sender", Some("wired"), None, &[], "body")
@@ -3276,7 +3894,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3319,6 +3939,7 @@ mod tests {
     #[test]
     fn subscribed_control_pump_reconciles_an_ambiguous_attempt_without_replay() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let config = delivery_config(tmp.path());
         let filename = message::send_to_inbox(
             &config.inbox,
@@ -3408,7 +4029,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3453,6 +4076,7 @@ mod tests {
     #[test]
     fn control_initializes_before_recording_the_first_thread_only() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -3515,7 +4139,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let state = tmp.path().join("state");
         let binding_path = state.join("binding.json");
         let control_state_path = state.join("control-state.json");
@@ -3564,6 +4190,7 @@ mod tests {
     #[test]
     fn expected_resume_waits_for_tui_loaded_thread_and_binds_from_control_response() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let (pre_gate_checked_tx, pre_gate_checked_rx) = mpsc::channel();
@@ -3650,7 +4277,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3701,6 +4330,7 @@ mod tests {
     #[test]
     fn tui_loaded_timeout_reports_the_specific_failure_before_outer_binding_timeout() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -3734,7 +4364,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3774,6 +4406,7 @@ mod tests {
     #[test]
     fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
         let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
         let binding_path = tmp.path().join("state/binding.json");
         let control_state_path = tmp.path().join("state/control-state.json");
         let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3826,7 +4459,9 @@ mod tests {
 
         let stream = UnixStream::connect(&socket).unwrap();
         let shutdown = stream.try_clone().unwrap();
-        let websocket = initialize_control(stream).unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
         let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let (tx, rx) = mpsc::channel();
         let (resume_ready_tx, resume_ready_rx) = mpsc::channel();

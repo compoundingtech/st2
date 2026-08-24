@@ -25,6 +25,32 @@ pub(crate) fn watch_recursive_mutations(
     Some(watcher)
 }
 
+/// Watch only the inputs a native delivery pump consumes: the agent's `resources/inbox` subtree
+/// and its `status` file. Runtime records written beside them by the pump's own process group —
+/// the presence refresh's temp siblings, `harness-state`, stream state — must never wake delivery,
+/// or a writer that observes on every turn boundary pumps itself continuously.
+pub(crate) fn watch_delivery_inputs(
+    agent_dir: &Path,
+    tx: Sender<()>,
+) -> Option<notify::RecommendedWatcher> {
+    let inbox = agent_dir.join("resources").join("inbox");
+    let status = agent_dir.join("status");
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        if result.is_ok_and(|event| {
+            is_mutation(&event)
+                && event
+                    .paths
+                    .iter()
+                    .any(|path| path.starts_with(&inbox) || *path == status)
+        }) {
+            let _ = tx.send(());
+        }
+    })
+    .ok()?;
+    watcher.watch(agent_dir, RecursiveMode::Recursive).ok()?;
+    Some(watcher)
+}
+
 /// Watch only declaration inputs for the supervisor. Runtime state (PTY registry, bus, logs,
 /// locks, inboxes, and generated materializations) must never wake reconciliation.
 pub(crate) fn watch_catalog_declarations(
@@ -154,6 +180,43 @@ mod tests {
             ));
         }
         assert!(!is_declaration_path(root, &root.join("team/rendered.kdl")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delivery_watcher_ignores_runtime_records_but_wakes_on_inbox_and_status() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path();
+        std::fs::create_dir_all(agent_dir.join("resources/inbox")).unwrap();
+
+        let (tx, rx) = channel();
+        let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start inotify watcher");
+
+        // Runtime records the pump's own process group writes must stay silent: the observed
+        // harness state, its atomic temp siblings, the presence temp sibling, stream state.
+        std::fs::write(agent_dir.join("harness-state"), "{}").unwrap();
+        std::fs::write(agent_dir.join(".harness-state.tmp-1-0"), "{}").unwrap();
+        std::fs::write(agent_dir.join(".status.tmp-1-0"), "available\n").unwrap();
+        std::fs::create_dir_all(agent_dir.join("resources/streams/s")).unwrap();
+        std::fs::write(agent_dir.join("resources/streams/s/state.json"), "{}").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "runtime-record writes must not wake the delivery pump"
+        );
+
+        // The two genuine delivery inputs wake it: an inbox arrival…
+        std::fs::write(agent_dir.join("resources/inbox/0001-msg.md"), "hi").unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("inbox write must wake");
+        while rx.try_recv().is_ok() {}
+
+        // …and a presence change, including one landing via atomic tmp+rename.
+        std::fs::rename(agent_dir.join(".status.tmp-1-0"), agent_dir.join("status")).unwrap();
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("status rename must wake");
     }
 
     #[cfg(target_os = "linux")]
