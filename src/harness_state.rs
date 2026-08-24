@@ -705,6 +705,28 @@ pub fn claim(
     Ok(seq)
 }
 
+/// Whether a WRAPPERLESS session boundary may claim this record. A wrapper's claim is always
+/// legitimate — it owns the seat's lifecycle — but a wrapperless claimer (a hook fired by any
+/// interactive session that inherited the project-scoped registration) must not supersede a
+/// live wrapper-owned record: a human running the harness inside a managed seat's workspace
+/// would otherwise fence the wrapper out until its restart. Wrapperless claims are allowed over
+/// nothing, over records no wrapper minted (fellow wrapperless tokens), and over records that
+/// are terminal or no longer fresh — never over a live record a wrapper is keeping fresh.
+pub fn wrapperless_claim_allowed(agent_dir: &Path) -> bool {
+    const WRAPPERLESS_PREFIX: &str = "claude-session-";
+    let Some(record) = read_record(&harness_state_path(agent_dir)) else {
+        return true;
+    };
+    if record.incarnation.is_empty() || record.incarnation.starts_with(WRAPPERLESS_PREFIX) {
+        return true;
+    }
+    if record.state == Activity::Ended {
+        return true;
+    }
+    let now_ms = crate::message::now_ms();
+    now_ms.saturating_sub(record.written_at_ms) >= duration_ms(HARNESS_STATE_STALE)
+}
+
 /// A process-unique session incarnation token: pid, wall-clock, and a process-local counter.
 /// Uniqueness across the writers that can actually race on one record (processes on one host)
 /// is what matters; no cryptographic strength is implied or needed.
@@ -1637,5 +1659,45 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    /// A wrapperless claimer may take over its own kind, terminal records, and staleness — but
+    /// never a live record a wrapper keeps fresh.
+    #[test]
+    fn wrapperless_claims_never_supersede_a_live_wrapper_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(wrapperless_claim_allowed(tmp.path()), "virgin dir");
+
+        let mut wrapper = takeover(tmp.path(), "claude");
+        wrapper.observe(active()).unwrap();
+        assert!(
+            !wrapperless_claim_allowed(tmp.path()),
+            "a live wrapper-owned record is off limits"
+        );
+
+        wrapper.ended("exit 0").unwrap();
+        assert!(
+            wrapperless_claim_allowed(tmp.path()),
+            "terminal records may be claimed"
+        );
+
+        let token = session_token();
+        let seq = claim(tmp.path(), "hetz.worker", "claude", &token).unwrap();
+        let mut wrapperless = Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("worker".to_string()),
+        )
+        .with_ownership("claude-session-x".to_string(), {
+            let _ = seq;
+            claim(tmp.path(), "hetz.worker", "claude", "claude-session-x").unwrap()
+        });
+        wrapperless.observe(active()).unwrap();
+        assert!(
+            wrapperless_claim_allowed(tmp.path()),
+            "fellow wrapperless records may be claimed"
+        );
+        let _ = token;
     }
 }
