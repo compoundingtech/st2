@@ -67,21 +67,48 @@ pub fn run(
     // The claim is written: it supersedes whatever the predecessor left — including a
     // still-fresh live record — before the channel or terminal writer act under it.
     let seq = harness_state::claim(&agent_dir, identity.clone(), "pi", &session)?;
-    let mut env = channel_env(
-        &executable,
-        catalog_root,
-        &identity,
-        &runtime_id,
-        &session,
-        seq,
-    )?;
-    env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
-    let set = hooks::verify_required_set().with_context(|| {
-        format!(
-            "pi driver '{runtime_id}' needs this binary's verified hook set for {EXTENSION}; run `st2 hooks install`"
-        )
-    })?;
-    let pi_argv = with_channel_extension(pi_argv, &set)?;
+    // Every fallible step past the claim must end the record honestly on failure — the claim
+    // placeholder standing as the last word would read as a takeover, not a launch that never
+    // ran.
+    let prepared = (|| -> Result<(Vec<(String, String)>, Vec<String>)> {
+        let mut env = channel_env(
+            &executable,
+            catalog_root,
+            &identity,
+            &runtime_id,
+            &session,
+            seq,
+        )?;
+        env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
+        let set = hooks::verify_required_set().with_context(|| {
+            format!(
+                "pi driver '{runtime_id}' needs this binary's verified hook set for {EXTENSION}; run `st2 hooks install`"
+            )
+        })?;
+        Ok((env, with_channel_extension(pi_argv, &set)?))
+    })();
+    let (env, pi_argv) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut writer = harness_state::Writer::new(
+                &agent_dir,
+                identity.clone(),
+                "pi",
+                Some(runtime_id.clone()),
+            )
+            .with_ownership(session.clone(), seq);
+            let _ = writer.observe(
+                harness_state::Observation::new(
+                    harness_state::Activity::Ended,
+                    harness_state::BlockedOn::None,
+                    harness_state::InputBuffer::Unknown,
+                )
+                .with_reason("launch-error")
+                .with_exit("exit unknown"),
+            );
+            return Err(error);
+        }
+    };
     install_signal_handler();
     let outcome = run_provider_observed(
         "pi",
