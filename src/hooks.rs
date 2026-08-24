@@ -112,7 +112,9 @@ pub fn claude_settings_registration() -> serde_json::Value {
     fn observe(event: &str) -> serde_json::Value {
         serde_json::json!([{ "hooks": [{
             "type": "command",
-            "command": format!("$ST_HOOKS/claude-observe.sh {event}"),
+            // Quoted so a whitespace-containing `$ST_HOOKS` root — a custom or XDG state
+            // layout — still resolves to one executable when Claude runs the command.
+            "command": format!("\"$ST_HOOKS/claude-observe.sh\" {event}"),
         }] }])
     }
     serde_json::json!({
@@ -123,20 +125,20 @@ pub fn claude_settings_registration() -> serde_json::Value {
                     "type": "command",
                     "async": true,
                     "asyncRewake": true,
-                    "command": "$ST_HOOKS/claude-session-start.sh",
+                    "command": "\"$ST_HOOKS/claude-session-start.sh\"",
                 },
                 {
                     "type": "command",
-                    "command": "$ST_HOOKS/claude-observe.sh SessionStart",
+                    "command": "\"$ST_HOOKS/claude-observe.sh\" SessionStart",
                 },
             ] }],
             "PreCompact": [{ "hooks": [{
                 "type": "command",
-                "command": "$ST_HOOKS/claude-pre-compact.sh",
+                "command": "\"$ST_HOOKS/claude-pre-compact.sh\"",
             }] }],
             "StopFailure": [{ "hooks": [{
                 "type": "command",
-                "command": "$ST_HOOKS/claude-stop-failure.sh",
+                "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
             }] }],
             "UserPromptSubmit": observe("UserPromptSubmit"),
             "Stop": observe("Stop"),
@@ -153,9 +155,16 @@ pub fn claude_settings_registration() -> serde_json::Value {
 /// `${ST_HOOKS}/...` — `$ST_HOOKS_SUFFIX` is somebody else's variable), and an expanded path
 /// whose basename is a managed hook file sitting under a set-shaped directory
 /// (`.../sets/sha256-.../<managed-file>`), which recognizes every set version under every past
-/// or relocated root without consulting the current environment.
+/// or relocated root without consulting the current environment. Each spelling may be
+/// double-quoted — the generated commands quote the executable so whitespace-containing roots
+/// survive the shell — and the quoted executable token (not the first whitespace token) is
+/// what is inspected.
 pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
-    let command = text.split_whitespace().next().unwrap_or("");
+    let command = if let Some(quoted) = text.strip_prefix('"') {
+        quoted.split('"').next().unwrap_or("")
+    } else {
+        text.split_whitespace().next().unwrap_or("")
+    };
     if let Some(rest) = command.strip_prefix("$ST_HOOKS") {
         return rest.is_empty() || rest.starts_with('/');
     }

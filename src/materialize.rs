@@ -503,12 +503,17 @@ fn ensure_line(path: &Path, line: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: ArrayMerge) {
+fn deep_merge(
+    target: &mut serde_json::Value,
+    patch: serde_json::Value,
+    arrays: ArrayMerge,
+    supersede_managed_hooks: bool,
+) {
     match (target, patch) {
         (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
             for (key, value) in patch {
                 match target.get_mut(&key) {
-                    Some(existing) => deep_merge(existing, value, arrays),
+                    Some(existing) => deep_merge(existing, value, arrays, supersede_managed_hooks),
                     None => {
                         target.insert(key, value);
                     }
@@ -526,7 +531,9 @@ fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value, arrays: 
             // longer states are removed, so a matcher group holding a user hook beside an st2
             // one keeps the user's; containers left with nothing but empty arrays are dropped.
             target.retain_mut(|element| {
-                if patch.contains(element) || !contains_owned_string(element) {
+                if patch.contains(element) || !supersede_managed_hooks
+                    || !contains_owned_string(element)
+                {
                     return true;
                 }
                 keep_after_supersession(element)
@@ -919,7 +926,11 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                             spec.identity
                         )
                     })?;
-                deep_merge(&mut target, patch, arrays);
+                // st2-hook supersession is the CANONICAL Claude registration's maintenance
+                // rule, not a property of union merges: an unrelated union merge must never
+                // delete user array elements that merely match the managed-path heuristic.
+                let supersede_managed_hooks = raw_destination == ".claude/settings.local.json";
+                deep_merge(&mut target, patch, arrays, supersede_managed_hooks);
                 let mut bytes = serde_json::to_vec_pretty(&target)?;
                 bytes.push(b'\n');
                 let note = format!("{}: upserted {}", spec.identity, raw_destination);
@@ -1172,6 +1183,7 @@ mod tests {
                 "array": [2]
             }),
             ArrayMerge::Replace,
+            false,
         );
         assert_eq!(
             target,
@@ -1193,8 +1205,8 @@ mod tests {
         let ours = serde_json::json!({
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "$ST_HOOKS/claude-observe.sh Stop"}]}]}
         });
-        deep_merge(&mut target, ours.clone(), ArrayMerge::Union);
-        deep_merge(&mut target, ours, ArrayMerge::Union);
+        deep_merge(&mut target, ours.clone(), ArrayMerge::Union, false);
+        deep_merge(&mut target, ours, ArrayMerge::Union, false);
         assert_eq!(
             target,
             serde_json::json!({
@@ -1229,8 +1241,8 @@ mod tests {
         let upgraded = serde_json::json!({
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/new/root/sets/sha256-bbb/claude-observe.sh Stop"}]}]}
         });
-        deep_merge(&mut target, upgraded.clone(), ArrayMerge::Union);
-        deep_merge(&mut target, upgraded, ArrayMerge::Union);
+        deep_merge(&mut target, upgraded.clone(), ArrayMerge::Union, true);
+        deep_merge(&mut target, upgraded, ArrayMerge::Union, true);
         assert_eq!(
             target,
             serde_json::json!({
@@ -1266,14 +1278,43 @@ mod tests {
         let patch = serde_json::json!({
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": current}]}]}
         });
-        deep_merge(&mut target, patch.clone(), ArrayMerge::Union);
-        deep_merge(&mut target, patch, ArrayMerge::Union);
+        deep_merge(&mut target, patch.clone(), ArrayMerge::Union, true);
+        deep_merge(&mut target, patch, ArrayMerge::Union, true);
         assert_eq!(
             target,
             serde_json::json!({
                 "hooks": {"Stop": [
                     {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-guard.sh"}]},
                     {"hooks": [{"type": "command", "command": current}]}
+                ]}
+            })
+        );
+    }
+
+    /// Supersession is the CANONICAL Claude registration's maintenance rule, not a property
+    /// of union merges: the same merge against any other destination must never delete user
+    /// array elements that merely match the managed-path heuristic.
+    #[test]
+    fn union_outside_the_canonical_settings_never_prunes_managed_shaped_entries() {
+        let mut target = serde_json::json!({
+            "tools": {"audit": [
+                {"command": "user-audit.sh"},
+                {"command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}
+            ]}
+        });
+        let patch = serde_json::json!({
+            "tools": {"audit": [{"command": "vendor-check.sh"}]}
+        });
+        deep_merge(&mut target, patch, ArrayMerge::Union, false);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "tools": {"audit": [
+                    {"command": "user-audit.sh"},
+                    // A managed-SHAPED path is only superseded where st2 owns the file;
+                    // here it is somebody's data.
+                    {"command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"},
+                    {"command": "vendor-check.sh"}
                 ]}
             })
         );
