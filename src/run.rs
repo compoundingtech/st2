@@ -21,7 +21,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -2000,9 +2000,56 @@ fn drain(rx: &Receiver<()>) {
     while rx.try_recv().is_ok() {}
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileWake {
+    Change,
+    Interval,
+    Stop,
+}
+
+/// Wait for the next reconciliation trigger: a declaration change, the timer fallback, or a stop.
+/// Stop stays responsive in bounded slices; a disconnected watcher channel must never masquerade
+/// as a change — that turned the nominal timer fallback into a tight full-catalog reconcile loop.
+fn wait_for_reconcile(rx: &Receiver<()>, interval: Duration, stop: &AtomicBool) -> ReconcileWake {
+    let deadline = Instant::now() + interval;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return ReconcileWake::Stop;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return ReconcileWake::Interval;
+        };
+        let slice = remaining.min(Duration::from_millis(250));
+        match rx.recv_timeout(slice) {
+            Ok(()) => {
+                drain(rx); // coalesce a burst of events into one pass
+                return ReconcileWake::Change;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(slice),
+        }
+    }
+}
+
+/// Best-effort supervisor watch: installation failure is diagnosed once, then reconciliation
+/// continues on the timer alone instead of silently losing immediate wakeups forever.
+fn best_effort_catalog_watcher(
+    root: &Path,
+    tx: Sender<()>,
+) -> Option<crate::watch::CatalogDeclarationWatcher> {
+    match crate::watch::watch_catalog_declarations(root, tx) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!(
+                "st2: cannot watch catalog declarations: {error}; immediate catalog changes are unavailable, continuing with timer polling."
+            );
+            None
+        }
+    }
+}
+
 /// The supervisor loop: reconcile on a timer AND on folder changes until interrupted. The fs-watch is
 /// best-effort; the `interval` timer is the always-on fallback. `on_report` is called once per pass
-/// (e.g. to log a summary). Returns when a stop signal arrives — agents are left running.
 pub fn up_loop(
     root: &Path,
     this_host: &str,
@@ -2011,7 +2058,15 @@ pub fn up_loop(
     on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     install_signal_handler();
-    up_loop_until(root, this_host, runner, interval, &STOP, on_report)
+    up_loop_until(
+        root,
+        this_host,
+        runner,
+        interval,
+        &STOP,
+        best_effort_catalog_watcher,
+        on_report,
+    )
 }
 
 fn up_loop_until(
@@ -2020,13 +2075,14 @@ fn up_loop_until(
     runner: &dyn Runner,
     interval: Duration,
     stop: &AtomicBool,
+    install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogDeclarationWatcher>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     crate::event::publish_owner_binding(root, this_host)
         .context("publish machine-local stream owner binding")?;
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
-    let _watcher = crate::watch::watch_catalog_declarations(root, tx);
+    let mut watcher = install_watcher(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
     // destructively GC'd (R21c). Fresh throwaway in `up_once` — a single pass has no flicker to absorb.
@@ -2053,6 +2109,9 @@ fn up_loop_until(
         );
         pre.absorb(report);
         report = pre;
+        if let Some(watcher) = &mut watcher {
+            watcher.refresh();
+        }
         // A recovered task that crash-loops again is a new crash-loop, so it must be able to surface
         // again. Leaving the id in the dedup set would make every park after the first one silent.
         for id in &report.unparked {
@@ -2074,22 +2133,8 @@ fn up_loop_until(
             break;
         }
 
-        // Sleep the interval in 250ms slices, waking early on a folder change or a stop signal.
-        let slices = (interval.as_millis() / 250).max(1);
-        for _ in 0..slices {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(()) => {
-                    drain(&rx); // coalesce a burst of events into one pass
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        if stop.load(Ordering::SeqCst) {
+        // Wait for a declaration change or the timer fallback in stop-responsive slices.
+        if wait_for_reconcile(&rx, interval, stop) == ReconcileWake::Stop {
             break;
         }
     }
@@ -2171,6 +2216,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
+    use std::sync::atomic::AtomicUsize;
 
     #[cfg(target_os = "linux")]
     fn linux_process_state(pid: i32) -> Option<char> {
@@ -2432,6 +2478,7 @@ mod tests {
                 },
                 Duration::from_secs(60),
                 &stop,
+                best_effort_catalog_watcher,
                 |_| passes += 1,
             )
             .unwrap();
@@ -2441,6 +2488,114 @@ mod tests {
             passes <= 2,
             "idle supervisor must wait instead of reconciling its own read events: {passes} passes"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_watch_installation_keeps_supervisor_on_timer_cadence() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" { host "test-host"; command "x" }"#,
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let mut passes = 0usize;
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(350));
+                stop.store(true, Ordering::SeqCst);
+            });
+            up_loop_until(
+                catalog.path(),
+                "test-host",
+                &SpawnCountingRunner::default(),
+                Duration::from_millis(100),
+                &stop,
+                |_, _| None, // watcher installation fails, as it did on dev3's oversized catalog
+                |_| passes += 1,
+            )
+            .unwrap();
+        });
+
+        assert!(
+            (2..=6).contains(&passes),
+            "a disconnected watcher channel must fall back to timer cadence, not spin: \
+             {passes} passes in ~350ms at a 100ms interval"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_still_wakes_on_declaration_change_with_live_watcher() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        let spec = agent.join("agent.kdl");
+        std::fs::write(&spec, r#"agent "live" { host "test-host"; command "x" }"#).unwrap();
+        let stop = AtomicBool::new(false);
+        let passes = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = passes.clone();
+        let started = Instant::now();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::write(
+                    &spec,
+                    r#"agent "live" { host "test-host"; command "changed" }"#,
+                )
+                .unwrap();
+            });
+            scope.spawn({
+                let stop = &stop;
+                let passes = &passes;
+                move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while passes.load(Ordering::SeqCst) < 2
+                        && !stop.load(Ordering::SeqCst)
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                }
+            });
+            up_loop_until(
+                catalog.path(),
+                "test-host",
+                &SpawnCountingRunner::default(),
+                Duration::from_secs(60),
+                &stop,
+                best_effort_catalog_watcher,
+                |_| {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a declaration mutation must wake the supervisor long before the 60s timer"
+        );
+        assert!(observed.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disconnected_watcher_channel_waits_out_the_interval_instead_of_spinning() {
+        let (_tx, rx) = channel::<()>();
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_reconcile(&rx, Duration::from_millis(80), &AtomicBool::new(false)),
+            ReconcileWake::Interval,
+            "disconnection must be treated as silence, not as a change"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(75));
     }
 
     // ── liveness debounce (R21c): a transient `pty list` not-alive flicker under load must not
