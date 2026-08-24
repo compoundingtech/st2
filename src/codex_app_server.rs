@@ -233,11 +233,14 @@ impl CodexObservedState {
                 Some(observation(Activity::Active, BlockedOn::None))
             }
             CodexObservedState::Held { reason, .. } => match reason {
-                CodexHoldReason::Review => Some(
-                    observation(Activity::Active, BlockedOn::Human)
-                        .with_ask(Ask::Review)
-                        .with_reason("review"),
-                ),
+                // Review's enter and exit are MODEL-emitted items inside a running turn
+                // (`enteredReviewMode`/`exitedReviewMode`, released by `observe_hold_released`):
+                // nothing awaits a human, so the observed record reports plain activity. The
+                // delivery hold is untouched — `Held` still blocks steer — and `review` stays a
+                // reserved ask word no producer emits.
+                CodexHoldReason::Review => {
+                    Some(observation(Activity::Active, BlockedOn::None).with_reason("review"))
+                }
                 CodexHoldReason::WaitingOnApproval => Some(
                     observation(Activity::Active, BlockedOn::Human)
                         .with_ask(Ask::Permission)
@@ -1374,9 +1377,13 @@ fn run_connected(
         let _ = shutdown.shutdown(Shutdown::Both);
         return Ok(());
     }
-    let websocket = initialize_control(control)?;
-    // The handshake above can sit out its full read timeout; a stop raised during it must not
-    // proceed to spawn a TUI it would immediately tear down.
+    // The initialize wait itself polls the stop flag between short socket timeouts and returns
+    // None on a stop; the recheck below covers a stop raised in the remaining gaps.
+    let Some(websocket) = initialize_control(control)? else {
+        diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialize" }))?;
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Ok(());
+    };
     if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
         diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialized" }))?;
         let _ = shutdown.shutdown(Shutdown::Both);
@@ -1702,7 +1709,9 @@ fn preflight_hook_trust(
                 // connect stage, whose own stop check exits gracefully before the TUI starts.
                 return Ok(None);
             };
-            let mut websocket = initialize_control(control)?;
+            let Some(mut websocket) = initialize_control(control)? else {
+                return Ok(None);
+            };
             query_hook_trust_projection(&mut websocket, cwd)
         });
     terminate_process_group(&mut server);
@@ -1727,14 +1736,22 @@ fn query_hook_trust_projection(
             "params": { "cwds": [cwd.to_string_lossy()] },
         }),
     )?;
-    websocket
-        .get_ref()
-        .set_read_timeout(Some(STARTUP_TIMEOUT))?;
+    websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     let response = loop {
-        let message = read_json_message(websocket)?
-            .context("Codex app-server closed during hook-trust preflight")?;
-        if message.get("id") == Some(&Value::from(HOOK_TRUST_PREFLIGHT_REQUEST_ID)) {
-            break message;
+        match read_startup_message(websocket, deadline)? {
+            StartupRead::Message(message)
+                if message.get("id") == Some(&Value::from(HOOK_TRUST_PREFLIGHT_REQUEST_ID)) =>
+            {
+                break message;
+            }
+            StartupRead::Message(_) => continue,
+            // A stop mid-preflight skips the projection; the launch's own stop checks exit
+            // gracefully before the real server spawns anything further.
+            StartupRead::Stopped => return Ok(None),
+            StartupRead::Closed => {
+                anyhow::bail!("Codex app-server closed during hook-trust preflight")
+            }
         }
     };
     if let Some(error) = response.get("error") {
@@ -2031,7 +2048,8 @@ fn connect_control(
     }
 }
 
-fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
+/// `Ok(None)` = a stop was raised mid-initialize; the caller exits gracefully.
+fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>>> {
     stream.set_read_timeout(Some(STARTUP_TIMEOUT))?;
     let (mut websocket, response) = tungstenite::client("ws://localhost/", stream)
         .map_err(|error| anyhow::anyhow!("Codex WebSocket handshake failed: {error}"))?;
@@ -2056,9 +2074,18 @@ fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
         }),
     )?;
 
+    // Short socket timeouts make the stop flag observable through the up-to-30s wait; the
+    // startup timeout is restored below so later control reads keep their semantics.
+    websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        let message = read_json_message(&mut websocket)?
-            .context("Codex app-server closed the control connection during initialize")?;
+        let message = match read_startup_message(&mut websocket, deadline)? {
+            StartupRead::Message(message) => message,
+            StartupRead::Stopped => return Ok(None),
+            StartupRead::Closed => {
+                anyhow::bail!("Codex app-server closed the control connection during initialize")
+            }
+        };
         if message.get("id") != Some(&Value::from(0)) {
             continue;
         }
@@ -2071,6 +2098,9 @@ fn initialize_control(stream: UnixStream) -> Result<WebSocket<UnixStream>> {
         );
         break;
     }
+    websocket
+        .get_ref()
+        .set_read_timeout(Some(STARTUP_TIMEOUT))?;
     write_json_message(
         &mut websocket,
         &json!({ "method": "initialized", "params": {} }),
@@ -2725,6 +2755,57 @@ fn write_json_message(websocket: &mut WebSocket<UnixStream>, value: &Value) -> R
     Ok(())
 }
 
+/// One startup-phase read: polls the stop flag between short socket timeouts so a stop raised
+/// during a slow handshake peer cannot sit out the full startup timeout (the caller sets a
+/// short socket read timeout first).
+enum StartupRead {
+    Message(Value),
+    Stopped,
+    Closed,
+}
+
+fn read_startup_message(
+    websocket: &mut WebSocket<UnixStream>,
+    deadline: Instant,
+) -> Result<StartupRead> {
+    loop {
+        if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(StartupRead::Stopped);
+        }
+        let message = match websocket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(StartupRead::Closed);
+            }
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "Codex app-server startup read timed out"
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match message {
+            WebSocketMessage::Text(text) => {
+                let value = serde_json::from_str(&text)
+                    .context("decoding Codex app-server WebSocket JSON")?;
+                return Ok(StartupRead::Message(value));
+            }
+            WebSocketMessage::Close(_) => return Ok(StartupRead::Closed),
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => continue,
+            WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
+                anyhow::bail!("Codex app-server sent a non-text WebSocket message")
+            }
+        }
+    }
+}
+
 fn read_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<Option<Value>> {
     // Darwin reports a timed Unix-socket read as EAGAIN/EWOULDBLOCK.  During
     // handshake the peer may briefly be descheduled; treat that transient as
@@ -2999,6 +3080,9 @@ mod tests {
             held(CodexHoldReason::ActiveWithoutTurn),
             held(CodexHoldReason::ConflictingTurn),
             held(CodexHoldReason::Compaction),
+            // Review's edges are model-emitted items inside a running turn: plain activity,
+            // no human, no ask — the delivery hold is a separate axis.
+            held(CodexHoldReason::Review),
         ] {
             let observation = state
                 .harness_observation()
@@ -3011,7 +3095,6 @@ mod tests {
         // The holds a human resolves set the blocked axis instead of disappearing into active,
         // and each names its machine-readable ask kind so consumers never branch on `reason`.
         for (reason, ask) in [
-            (CodexHoldReason::Review, Ask::Review),
             (CodexHoldReason::WaitingOnApproval, Ask::Permission),
             (CodexHoldReason::WaitingOnUserInput, Ask::Question),
         ] {
