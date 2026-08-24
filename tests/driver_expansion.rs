@@ -250,6 +250,11 @@ fn claude_driver_matches_deliver_after_normalizing_the_legacy_command_namespace(
     );
     assert_eq!(driver_task, legacy_task);
 
+    // The driver expansion registers `$ST_HOOKS` hooks, and materialization refuses an unverified
+    // hook set — install one in a scratch root, as `st2 hooks install` does on a real host.
+    let hooks = tempfile::tempdir().unwrap().keep();
+    st2::hooks::install_at(&hooks, false).unwrap();
+    unsafe { std::env::set_var("ST_HOOKS", &hooks) };
     materialize_agent(&catalog, &legacy, "h").unwrap();
     materialize_agent(&catalog, &driver, "h").unwrap();
     let legacy_mcp: serde_json::Value =

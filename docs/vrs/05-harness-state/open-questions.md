@@ -4,16 +4,27 @@ Each entry links a spec `DQ-H*`. Questions leave this file when resolved —
 into [spec.md](./spec.md) as decisions or `.experiments/` as tested
 hypotheses.
 
-- **DQ-H1 Claude blocked-exit edge.** `PermissionRequest` carries no
-  `tool_use_id`, so leaving `blockedOn: human` can only match on tool *name* —
-  and Claude batches tool calls (`PostToolBatch` carries plural `tool_calls`),
-  so the first call's `PostToolUse` would clear `blocked` while the human still
-  faces the second call's prompt. The corpus enters `blocked` in 2 of 9
-  captures and exits in 1, with one tool and no batching: a rule validated on
-  a single exit path is not validated. Until then the producer holds
-  `blockedOn: human` until turn end (`Stop`) rather than encoding an exit rule
-  that cannot hold. Resolves by: a capture with batched tool calls where the
-  second call needs permission, then specifying the exit edge against it.
+- **DQ-H1 Claude blocked-exit edge.** The batched capture #268 §C asked for
+  was taken on 2026-08-23 against Claude Code 2.1.237
+  (`.experiments/2026-08-23-claude-batched-permission.md`), and it resolves
+  the predicted false-clear in the rule's favor: **tool execution is
+  serialized around an open permission prompt.** In both batch orderings
+  (allowlisted-first and permission-first), no hook event of any kind fires
+  while the prompt is open — a parallel-batched allowlisted call renders on
+  screen but its `PreToolUse` waits 33 s for the grant — so the next
+  `PreToolUse`/`PostToolUse`/`Stop` after `PermissionRequest` is precisely the
+  blocked call's own resolution, and the shipped rule
+  (`src/claude_session.rs::observe_hook_event`) is correct, not merely
+  conservative. `PermissionRequest` still carries no `tool_use_id` (its
+  `prompt_id` is turn-scoped, shared by every event in the turn — not a call
+  correlator). The residual limit is the **deny path**: selecting "No" ends
+  the turn with *zero* further events — no `PostToolUse`, no `Stop`, and no
+  `PermissionDenied` even when that hook is registered — so `blockedOn: human`
+  stands until the next `UserPromptSubmit` or `SessionStart`. That reading is
+  semantically half-true (a human's direction is still what the session
+  waits on) and it under-reports nothing, but the state axis says `active`
+  while the model is not running. Resolves by: a Claude build whose denial
+  emits any hook event; until then the deny window is the pinned limit.
 - **DQ-H2 Transport cost of per-transition writes.** Presence refreshes every
   five minutes; turn boundaries are far more frequent, and burst coalescing
   measured 4 transitions per turn 0.1–0.4 ms apart. No measurement establishes
@@ -48,12 +59,13 @@ hypotheses.
   `unknown` is no fresh observation, never proof of ill health, and never
   gates local work. Resolves by: specifying remote-reader semantics with a
   proof, or explicitly scoping the record same-host advisory.
-- **DQ-H6 OpenCode state source.** The producer needs a verified source.
-  Candidate: OpenCode's server/SDK event surface (session state, message
-  lifecycle); fallback: the shipped composer adapter's positive markers
-  (`ctrl+p commands` footer) with documented limits. Nothing is measured yet —
-  the DING adapter (#313) proves only composer classification. Resolves by:
-  an `.experiments/` capture of OpenCode's event surface on a pinned version,
-  then choosing the source and its skew policy — the repo's standing rule
-  (pin where version skew fails silently, as `checks.pi-extension-types` and
-  `SUPPORTED_CODEX_CLI_VERSIONS` do) applies.
+- **DQ-H6 OpenCode blocked-entry capture.** The state source itself is
+  resolved: the server's SSE event surface, measured on 1.18.19
+  (`.experiments/2026-08-23-opencode-surface.md`) and gated by
+  `SUPPORTED_OPENCODE_VERSIONS` plus the live `/doc` subset check. What
+  remains open is the blocked-on-human pair: `permission.asked` /
+  `permission.replied` are schema-backed with explicit `^per` ids — the exit
+  edge is clean by construction, unlike Claude's — but no live capture of a
+  real permission prompt exists (headless runs with `{"bash":"ask"}` never
+  asked). Resolves by: one capture from a TUI seat with a real permission
+  prompt, confirming the events fire and carry the id the producer matches.

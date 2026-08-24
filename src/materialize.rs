@@ -26,6 +26,7 @@ pub enum RenderOp {
     JsonUpsert {
         destination: String,
         content: String,
+        arrays: ArrayMerge,
     },
     EnsureLine {
         destination: String,
@@ -34,6 +35,17 @@ pub enum RenderOp {
     GitExclude {
         path: String,
     },
+}
+
+/// How a json-upsert treats an array both sides declare. `Replace` is the default and the
+/// original contract; `union` appends patch elements the target lacks (exact-equality dedupe), so
+/// registrations can join arrays other owners also write — user-declared entries survive and
+/// re-materialization is idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArrayMerge {
+    #[default]
+    Replace,
+    Union,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -68,6 +80,7 @@ impl RenderOp {
             | Self::JsonUpsert {
                 destination,
                 content,
+                ..
             } => {
                 references_variable(destination, variable) || references_variable(content, variable)
             }
@@ -162,9 +175,22 @@ fn parse_render_node(node: &KdlNode, agent: &str) -> Result<RenderPlan> {
                 serde_json::from_str::<serde_json::Value>(&content).with_context(|| {
                     format!("agent '{agent}': json-upsert content is not valid JSON")
                 })?;
+                let arrays = match directive
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name().is_some_and(|name| name.value() == "arrays"))
+                    .and_then(|entry| entry.value().as_string())
+                {
+                    None | Some("replace") => ArrayMerge::Replace,
+                    Some("union") => ArrayMerge::Union,
+                    Some(other) => anyhow::bail!(
+                        "agent '{agent}': json-upsert arrays=\"{other}\" (expected replace|union)"
+                    ),
+                };
                 plan.ops.push(RenderOp::JsonUpsert {
                     destination: destination.clone(),
                     content,
+                    arrays,
                 });
             }
             "ensure-line" => {
@@ -267,10 +293,17 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
         let RenderOp::JsonUpsert {
             destination,
             content,
+            ..
         } = operation
         else {
             continue;
         };
+        // The hook registration ships verbatim: its `$ST_HOOKS` references are render
+        // variables the materializer resolves against the verified set, not an executable
+        // path this binary should rewrite.
+        if destination == ".claude/settings.local.json" {
+            continue;
+        }
         anyhow::ensure!(
             destination == ".mcp.json",
             "agent '{agent}' driver expansion produced an unexpected JSON destination"
@@ -306,6 +339,16 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
         plan.ops.push(RenderOp::JsonUpsert {
             destination: ".mcp.json".into(),
             content,
+            arrays: ArrayMerge::Replace,
+        });
+        // The same canonical hook registration the typed driver renders: these seats run under
+        // claude-session too, and a wrapper that claims and ends a record nobody transitions is
+        // worse than no record at all.
+        plan.ops.push(RenderOp::JsonUpsert {
+            destination: ".claude/settings.local.json".into(),
+            content: serde_json::to_string(&crate::hooks::claude_settings_registration())
+                .context("serializing the canonical Claude hook registration")?,
+            arrays: ArrayMerge::Union,
         });
     }
     Ok(plan)
@@ -460,19 +503,102 @@ fn ensure_line(path: &Path, line: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn deep_merge(target: &mut serde_json::Value, patch: serde_json::Value) {
+fn deep_merge(
+    target: &mut serde_json::Value,
+    patch: serde_json::Value,
+    arrays: ArrayMerge,
+    supersede_managed_hooks: bool,
+) {
     match (target, patch) {
         (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
             for (key, value) in patch {
                 match target.get_mut(&key) {
-                    Some(existing) => deep_merge(existing, value),
+                    Some(existing) => deep_merge(existing, value, arrays, supersede_managed_hooks),
                     None => {
                         target.insert(key, value);
                     }
                 }
             }
         }
+        (serde_json::Value::Array(target), serde_json::Value::Array(patch))
+            if arrays == ArrayMerge::Union =>
+        {
+            // Exact-equality union alone would accumulate st2's own entries across hook-set
+            // upgrades: `$ST_HOOKS` expands content-addressed, so every upgrade renders each
+            // entry with a new path and the old one would be retained beside it. Supersession
+            // DESCENDS: only the managed nested entries (structurally st2's — a managed hook
+            // file under any set-shaped path, or `$ST_HOOKS` at a token boundary) the patch no
+            // longer states are removed, so a matcher group holding a user hook beside an st2
+            // one keeps the user's; containers left with nothing but empty arrays are dropped.
+            target.retain_mut(|element| {
+                if patch.contains(element) || !supersede_managed_hooks
+                    || !contains_owned_string(element)
+                {
+                    return true;
+                }
+                keep_after_supersession(element)
+            });
+            for element in patch {
+                if !target.contains(&element) {
+                    target.push(element);
+                }
+            }
+        }
         (target, patch) => *target = patch,
+    }
+}
+
+/// Prune superseded managed entries INSIDE `element`, returning whether the element itself is
+/// still worth keeping. A managed leaf (no nested arrays) never survives here: it belongs only
+/// inside its canonical group, which the caller already retained by whole-element equality — a
+/// managed entry nested in a USER's group would otherwise register twice. Containers are pruned
+/// recursively and dropped once every nested array is empty — husks that only ever held
+/// superseded registrations.
+fn keep_after_supersession(element: &mut serde_json::Value) -> bool {
+    if !has_nested_array(element) {
+        return !contains_owned_string(element);
+    }
+    let mut any_array_content = false;
+    match element {
+        serde_json::Value::Array(items) => {
+            items.retain_mut(|item| keep_after_supersession(item));
+            any_array_content = !items.is_empty();
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                if let serde_json::Value::Array(items) = value {
+                    items.retain_mut(|item| keep_after_supersession(item));
+                    if !items.is_empty() {
+                        any_array_content = true;
+                    }
+                } else if has_nested_array(value) {
+                    if keep_after_supersession(value) {
+                        any_array_content = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    any_array_content
+}
+
+fn has_nested_array(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(_) => true,
+        serde_json::Value::Object(map) => map.values().any(has_nested_array),
+        _ => false,
+    }
+}
+
+/// Whether any string inside `value` marks it as an st2-rendered element, structurally (see
+/// [`crate::hooks::is_managed_hook_reference`]).
+fn contains_owned_string(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => crate::hooks::is_managed_hook_reference(text),
+        serde_json::Value::Array(items) => items.iter().any(contains_owned_string),
+        serde_json::Value::Object(map) => map.values().any(contains_owned_string),
+        _ => false,
     }
 }
 
@@ -557,7 +683,7 @@ enum PreparedOp {
 #[derive(Debug, Clone, PartialEq)]
 enum RenderClaim {
     Replace(Vec<u8>),
-    JsonUpsert(serde_json::Value),
+    JsonUpsert(serde_json::Value, ArrayMerge),
     EnsureLine(String),
 }
 
@@ -621,6 +747,7 @@ fn claims_for_agent(
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
+                arrays,
             } => {
                 let patch = serde_json::from_str(&expand(&content, &env)).with_context(|| {
                     format!(
@@ -630,7 +757,7 @@ fn claims_for_agent(
                 })?;
                 (
                     destination(&workspace, &raw_destination, &env)?,
-                    RenderClaim::JsonUpsert(patch),
+                    RenderClaim::JsonUpsert(patch, arrays),
                 )
             }
             RenderOp::EnsureLine {
@@ -778,6 +905,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
             RenderOp::JsonUpsert {
                 destination: raw_destination,
                 content,
+                arrays,
             } => {
                 let destination = destination(&workspace, &raw_destination, &env)?;
                 let current = virtual_files
@@ -798,7 +926,11 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
                             spec.identity
                         )
                     })?;
-                deep_merge(&mut target, patch);
+                // st2-hook supersession is the CANONICAL Claude registration's maintenance
+                // rule, not a property of union merges: an unrelated union merge must never
+                // delete user array elements that merely match the managed-path heuristic.
+                let supersede_managed_hooks = raw_destination == ".claude/settings.local.json";
+                deep_merge(&mut target, patch, arrays, supersede_managed_hooks);
                 let mut bytes = serde_json::to_vec_pretty(&target)?;
                 bytes.push(b'\n');
                 let note = format!("{}: upserted {}", spec.identity, raw_destination);
@@ -1050,6 +1182,8 @@ mod tests {
                 "nested": {"right": 2, "replace": "new"},
                 "array": [2]
             }),
+            ArrayMerge::Replace,
+            false,
         );
         assert_eq!(
             target,
@@ -1059,5 +1193,162 @@ mod tests {
                 "array": [2]
             })
         );
+    }
+
+    /// Union mode joins arrays idempotently: foreign entries survive and repeating the same
+    /// patch adds nothing — the contract the generated hook registration relies on.
+    #[test]
+    fn deep_merge_union_preserves_foreign_array_entries_and_is_idempotent() {
+        let mut target = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "user-audit.sh"}]}]}
+        });
+        let ours = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "$ST_HOOKS/claude-observe.sh Stop"}]}]}
+        });
+        deep_merge(&mut target, ours.clone(), ArrayMerge::Union, false);
+        deep_merge(&mut target, ours, ArrayMerge::Union, false);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "hooks": {"Stop": [
+                    {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
+                    {"hooks": [{"type": "command", "command": "$ST_HOOKS/claude-observe.sh Stop"}]}
+                ]}
+            })
+        );
+    }
+
+    /// A hook-set upgrade renders every entry under a new content-addressed path. Union must
+    /// supersede st2's prior entries — recognizable by the hook root — rather than accumulate
+    /// them, while a user's entry under any other path survives every merge.
+    #[test]
+    fn union_supersedes_prior_hook_set_entries_but_never_foreign_ones() {
+        // The prior set lives under a RELOCATED root — recognition is structural (set-shaped
+        // path + managed basename), not derived from the current environment — and a MIXED
+        // matcher group keeps its user hook while losing only the superseded st2 entry.
+        let mut target = serde_json::json!({
+            "hooks": {"Stop": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "user-guard.sh"},
+                    {"type": "command", "command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}
+                ]},
+                {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
+                {"hooks": [{"type": "command", "command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}]},
+                {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
+                {"hooks": [{"type": "command", "command": "$ST_HOOKS_SUFFIX/tool.sh"}]}
+            ]}
+        });
+        let upgraded = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/new/root/sets/sha256-bbb/claude-observe.sh Stop"}]}]}
+        });
+        deep_merge(&mut target, upgraded.clone(), ArrayMerge::Union, true);
+        deep_merge(&mut target, upgraded, ArrayMerge::Union, true);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "hooks": {"Stop": [
+                    // The mixed group survives with only its user hook.
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "user-guard.sh"}
+                    ]},
+                    {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
+                    // A managed basename OUTSIDE a set-shaped path is a user's wrapper: foreign.
+                    {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
+                    // `$ST_HOOKS_SUFFIX` is somebody else's variable, not ours at a boundary.
+                    {"hooks": [{"type": "command", "command": "$ST_HOOKS_SUFFIX/tool.sh"}]},
+                    {"hooks": [{"type": "command", "command": "/new/root/sets/sha256-bbb/claude-observe.sh Stop"}]}
+                ]}
+            })
+        );
+    }
+
+    /// W8-14: a CURRENT managed entry nested inside a USER's group is still superseded — the
+    /// canonical registration lives only in its own group, or Claude runs it twice.
+    #[test]
+    fn a_managed_leaf_survives_only_inside_its_canonical_group() {
+        let current = "/root/sets/sha256-bbb/claude-observe.sh Stop";
+        let mut target = serde_json::json!({
+            "hooks": {"Stop": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "user-guard.sh"},
+                    {"type": "command", "command": current}
+                ]}
+            ]}
+        });
+        let patch = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": current}]}]}
+        });
+        deep_merge(&mut target, patch.clone(), ArrayMerge::Union, true);
+        deep_merge(&mut target, patch, ArrayMerge::Union, true);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "hooks": {"Stop": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-guard.sh"}]},
+                    {"hooks": [{"type": "command", "command": current}]}
+                ]}
+            })
+        );
+    }
+
+    /// Supersession is the CANONICAL Claude registration's maintenance rule, not a property
+    /// of union merges: the same merge against any other destination must never delete user
+    /// array elements that merely match the managed-path heuristic.
+    #[test]
+    fn union_outside_the_canonical_settings_never_prunes_managed_shaped_entries() {
+        let mut target = serde_json::json!({
+            "tools": {"audit": [
+                {"command": "user-audit.sh"},
+                {"command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}
+            ]}
+        });
+        let patch = serde_json::json!({
+            "tools": {"audit": [{"command": "vendor-check.sh"}]}
+        });
+        deep_merge(&mut target, patch, ArrayMerge::Union, false);
+        assert_eq!(
+            target,
+            serde_json::json!({
+                "tools": {"audit": [
+                    {"command": "user-audit.sh"},
+                    // A managed-SHAPED path is only superseded where st2 owns the file;
+                    // here it is somebody's data.
+                    {"command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"},
+                    {"command": "vendor-check.sh"}
+                ]}
+            })
+        );
+    }
+
+    /// W8-13: legacy `deliver "mcp"` seats render the same canonical hook registration the typed
+    /// driver does — they run under claude-session too.
+    #[test]
+    fn legacy_mcp_seats_render_the_canonical_hook_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let declaration = tmp.path().join("agents/h/worker/agent.kdl");
+        std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" { host "h"; command "claude"; deliver "mcp"; workspace "$CATALOG" }"#,
+        )
+        .unwrap();
+        let found = crate::discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        let plan = effective_plan(tmp.path(), &found.specs[0], "h").unwrap();
+        let settings = plan
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                RenderOp::JsonUpsert {
+                    destination,
+                    content,
+                    arrays,
+                } if destination == ".claude/settings.local.json" => Some((content, arrays)),
+                _ => None,
+            })
+            .expect("legacy mcp seats register hooks");
+        assert_eq!(*settings.1, ArrayMerge::Union);
+        let rendered: serde_json::Value = serde_json::from_str(settings.0).unwrap();
+        assert_eq!(rendered, crate::hooks::claude_settings_registration());
     }
 }

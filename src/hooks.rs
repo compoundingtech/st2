@@ -20,6 +20,7 @@ const CODEX_STOP: &[u8] = include_bytes!("../hooks/codex-stop.sh");
 const CLAUDE_SESSION_START: &[u8] = include_bytes!("../hooks/claude-session-start.sh");
 const CLAUDE_PRE_COMPACT: &[u8] = include_bytes!("../hooks/claude-pre-compact.sh");
 const CLAUDE_STOP_FAILURE: &[u8] = include_bytes!("../hooks/claude-stop-failure.sh");
+const CLAUDE_OBSERVE: &[u8] = include_bytes!("../hooks/claude-observe.sh");
 // pi has no lifecycle-hook mechanism of its own; an extension is where a pi session exposes the
 // same surface, so it is published and verified as part of the same immutable set.
 const PI_CHANNEL: &[u8] = include_bytes!("../hooks/pi-channel.ts");
@@ -28,13 +29,14 @@ const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
-const HOOKS: [(&str, &[u8]); 7] = [
+const HOOKS: [(&str, &[u8]); 8] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
     ("codex-stop.sh", CODEX_STOP),
     ("claude-session-start.sh", CLAUDE_SESSION_START),
     ("claude-pre-compact.sh", CLAUDE_PRE_COMPACT),
     ("claude-stop-failure.sh", CLAUDE_STOP_FAILURE),
+    ("claude-observe.sh", CLAUDE_OBSERVE),
     ("pi-channel.ts", PI_CHANNEL),
 ];
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +101,94 @@ fn expected_receipt() -> InstallReceipt {
 /// Stable content identity of this binary's embedded hook set.
 pub fn hookset_id() -> String {
     expected_manifest().hookset
+}
+
+/// The canonical Claude workspace hook registration: the exact
+/// `.claude/settings.local.json` payload a maintained Claude seat carries. The
+/// hand-authored example declaration and `expand_claude` both resolve to this one
+/// shape, so a driver-declared seat and a hand-authored seat register identical
+/// hooks and there is a single place a hook event can be added.
+pub fn claude_settings_registration() -> serde_json::Value {
+    fn observe(event: &str) -> serde_json::Value {
+        serde_json::json!([{ "hooks": [{
+            "type": "command",
+            // Quoted so a whitespace-containing `$ST_HOOKS` root — a custom or XDG state
+            // layout — still resolves to one executable when Claude runs the command.
+            "command": format!("\"$ST_HOOKS/claude-observe.sh\" {event}"),
+        }] }])
+    }
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/claude-code-settings.json",
+        "hooks": {
+            "SessionStart": [{ "hooks": [
+                {
+                    "type": "command",
+                    "async": true,
+                    "asyncRewake": true,
+                    "command": "\"$ST_HOOKS/claude-session-start.sh\"",
+                },
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-observe.sh\" SessionStart",
+                },
+            ] }],
+            "PreCompact": [{ "hooks": [{
+                "type": "command",
+                "command": "\"$ST_HOOKS/claude-pre-compact.sh\"",
+            }] }],
+            "StopFailure": [{ "hooks": [{
+                "type": "command",
+                "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
+            }] }],
+            "UserPromptSubmit": observe("UserPromptSubmit"),
+            "Stop": observe("Stop"),
+            "PermissionRequest": observe("PermissionRequest"),
+            "PreToolUse": observe("PreToolUse"),
+            "PostToolUse": observe("PostToolUse"),
+        }
+    })
+}
+
+/// Whether one rendered string refers to a file of ANY st2 hook set, structurally — used by the
+/// union merge to supersede st2's own prior registrations without ever touching a foreign entry.
+/// Two spellings are owned: the `$ST_HOOKS` variable at a token boundary (`$ST_HOOKS/...`,
+/// `${ST_HOOKS}/...` — `$ST_HOOKS_SUFFIX` is somebody else's variable), and an expanded path
+/// whose basename is a managed hook file sitting under a set-shaped directory
+/// (`.../sets/sha256-.../<managed-file>`), which recognizes every set version under every past
+/// or relocated root without consulting the current environment. Each spelling may be
+/// double-quoted — the generated commands quote the executable so whitespace-containing roots
+/// survive the shell — and the quoted executable token (not the first whitespace token) is
+/// what is inspected.
+pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
+    let command = if let Some(quoted) = text.strip_prefix('"') {
+        quoted.split('"').next().unwrap_or("")
+    } else {
+        text.split_whitespace().next().unwrap_or("")
+    };
+    if let Some(rest) = command.strip_prefix("$ST_HOOKS") {
+        return rest.is_empty() || rest.starts_with('/');
+    }
+    if let Some(rest) = command.strip_prefix("${ST_HOOKS}") {
+        return rest.is_empty() || rest.starts_with('/');
+    }
+    let path = std::path::Path::new(command);
+    let managed_basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| HOOKS.iter().any(|(managed, _)| *managed == name));
+    if !managed_basename {
+        return false;
+    }
+    let mut components = path.components().rev().skip(1);
+    let set_shaped = components
+        .next()
+        .and_then(|segment| segment.as_os_str().to_str())
+        .is_some_and(|segment| segment.starts_with("sha256-"));
+    let sets_dir = components
+        .next()
+        .and_then(|segment| segment.as_os_str().to_str())
+        .is_some_and(|segment| segment == SETS_DIR);
+    set_shaped && sets_dir
 }
 
 /// Install-owned hook root. `$ST_HOOKS` can pin a scratch or custom state layout; otherwise use
@@ -512,6 +602,43 @@ pub fn install_at(root: &Path, replace: bool) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example declaration is the hand-authored half of the one canonical Claude hook
+    /// registration; expansion emits the other half from [`claude_settings_registration`]. If the
+    /// two drift, a driver-declared and a hand-authored seat stop registering the same hooks.
+    #[test]
+    fn example_claude_declaration_registers_the_canonical_hook_settings() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/native/agent-claude.kdl"
+        );
+        let raw = std::fs::read_to_string(path).unwrap();
+        let document: kdl::KdlDocument = raw.parse().unwrap();
+        let agent = document.get("agent").unwrap();
+        let render = agent.children().unwrap().get("render").unwrap();
+        let content = render
+            .children()
+            .unwrap()
+            .nodes()
+            .iter()
+            .filter(|node| node.name().value() == "json-upsert")
+            .find_map(|node| {
+                let mut entries = node
+                    .entries()
+                    .iter()
+                    // Positional arguments only: properties (e.g. `arrays="union"`) are merge
+                    // strategy, not payload.
+                    .filter(|entry| entry.name().is_none())
+                    .filter_map(|entry| match entry.value() {
+                        kdl::KdlValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+                (entries.next() == Some(".claude/settings.local.json")).then(|| entries.next())?
+            })
+            .expect("example declares the settings.local.json upsert");
+        let registered: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(registered, claude_settings_registration());
+    }
 
     /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
     /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one

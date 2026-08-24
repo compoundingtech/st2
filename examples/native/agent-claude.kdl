@@ -18,7 +18,13 @@ agent "<identity>" {
     copy "assets/bus.st2.md" ".st2/bus.md"
     ensure-line ".claude/rules/st2.md" "@../../.st2/PERSONA.md"
     ensure-line ".claude/rules/st2.md" "@../../.st2/bus.md"
-    json-upsert ".claude/settings.local.json" #"""
+    // Hooks-only observability: this seat launches claude directly (no session wrapper), so the
+    // registrations below give it transitions and blocked-on-you — but no heartbeat owner and no
+    // terminal record. A live-but-idle seat ages to `unknown` after the staleness horizon and an
+    // exit leaves the last state to age out; both read indeterminate, never wrong. The full
+    // producer (heartbeats, terminal exits) comes with the session wrapper, i.e. a typed
+    // `claude {}` driver seat or `deliver "mcp"`.
+    json-upsert ".claude/settings.local.json" arrays="union" #"""
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
@@ -29,7 +35,11 @@ agent "<identity>" {
             "type": "command",
             "async": true,
             "asyncRewake": true,
-            "command": "$ST_HOOKS/claude-session-start.sh"
+            "command": "\"$ST_HOOKS/claude-session-start.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" SessionStart"
           }
         ]
       }
@@ -39,7 +49,7 @@ agent "<identity>" {
         "hooks": [
           {
             "type": "command",
-            "command": "$ST_HOOKS/claude-pre-compact.sh"
+            "command": "\"$ST_HOOKS/claude-pre-compact.sh\""
           }
         ]
       }
@@ -49,7 +59,57 @@ agent "<identity>" {
         "hooks": [
           {
             "type": "command",
-            "command": "$ST_HOOKS/claude-stop-failure.sh"
+            "command": "\"$ST_HOOKS/claude-stop-failure.sh\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" UserPromptSubmit"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" Stop"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" PermissionRequest"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" PreToolUse"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" PostToolUse"
           }
         ]
       }

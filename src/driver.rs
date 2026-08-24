@@ -119,11 +119,25 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
         }
     });
     let mcp = serde_json::to_string_pretty(&mcp)?;
+    // The same registration a hand-authored seat carries: without it a driver-declared
+    // seat has no observed-state producer and no lifecycle hooks at all.
+    let settings = serde_json::to_string_pretty(&crate::hooks::claude_settings_registration())?;
     let mut render = KdlNode::new("render");
-    render.set_children(document([node(
-        "json-upsert",
-        vec![".mcp.json".to_string(), mcp],
-    )]));
+    render.set_children(document([
+        node("json-upsert", vec![".mcp.json".to_string(), mcp]),
+        {
+            // Hook arrays join whatever the workspace already declares: replacement would clobber
+            // user-registered hooks on every materialization, and union is idempotent.
+            let mut upsert = node(
+                "json-upsert",
+                vec![".claude/settings.local.json".to_string(), settings],
+            );
+            upsert
+                .entries_mut()
+                .push(KdlEntry::new_prop("arrays", "union"));
+            upsert
+        },
+    ]));
 
     let mut provider = vec!["claude".to_string()];
     if let Some(model) = &driver.model {
@@ -263,8 +277,15 @@ mod tests {
 
         assert_eq!(output.nodes().len(), 2);
         let render = output.get("render").unwrap();
-        let upsert = render.children().unwrap().get("json-upsert").unwrap();
-        let upsert = strings(upsert);
+        let upserts: Vec<&KdlNode> = render
+            .children()
+            .unwrap()
+            .nodes()
+            .iter()
+            .filter(|node| node.name().value() == "json-upsert")
+            .collect();
+        assert_eq!(upserts.len(), 2);
+        let upsert = strings(upserts[0]);
         assert_eq!(upsert[0], ".mcp.json");
         let mcp: serde_json::Value = serde_json::from_str(upsert[1]).unwrap();
         assert_eq!(mcp["mcpServers"]["st2"]["type"], "stdio");
@@ -280,6 +301,10 @@ mod tests {
                 "host.worker"
             ])
         );
+        let settings = strings(upserts[1]);
+        assert_eq!(settings[0], ".claude/settings.local.json");
+        let settings: serde_json::Value = serde_json::from_str(settings[1]).unwrap();
+        assert_eq!(settings, crate::hooks::claude_settings_registration());
         assert_eq!(
             strings(output.get("argv").unwrap()),
             [
