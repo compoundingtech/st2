@@ -33,6 +33,9 @@ pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
 const SCHEMA: &str = "st2.harness-state.v1";
+/// The claim-sequence floor sidecar, beside the record: claims stay monotonic even across a
+/// record this version cannot parse.
+const SEQ_FLOOR_NAME: &str = ".harness-state.seq";
 const LOCK_NAME: &str = ".harness-state.lock";
 
 /// What the harness is observed doing. `Child` is reserved: it is part of the contract so a v1
@@ -647,7 +650,11 @@ enum StoredRecord {
 
 fn read_stored(path: &Path) -> StoredRecord {
     match fs::read(path) {
-        Err(_) => StoredRecord::Absent,
+        // Only proven absence is absence: a file that exists but cannot be read (permissions,
+        // IO) is somebody's record — treating it as a virgin seat would let a token-only write
+        // or a wrapperless claim rename over live state it never saw.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoredRecord::Absent,
+        Err(_) => StoredRecord::Unreadable,
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(record) => StoredRecord::Parsed(record),
             Err(_) => StoredRecord::Unreadable,
@@ -711,22 +718,29 @@ pub fn claim(
 /// The claim's body, under an already-held record lock.
 fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // Unreadable bytes are superseded like anything else — that is exactly what the claim is
-    // for — but nothing of them can be continued: the sequence and counter restart, documented,
-    // because a record this version cannot parse offers no number worth trusting.
+    // for — but their CONTENT cannot be continued (the counter restarts). The SEQUENCE must
+    // survive them regardless: a claim restarting at one would sit below a lingering
+    // predecessor's claim, whose next write would replace the new claim and then permanently
+    // fence the new session out. The floor sidecar, written under this same lock on every
+    // claim, preserves monotonicity across records this version cannot parse; only both files
+    // being damaged loses the floor, and that residual is documented.
     let on_disk = match read_stored(&writer.path) {
         StoredRecord::Parsed(record) => Some(record),
         StoredRecord::Absent | StoredRecord::Unreadable => None,
     };
+    let floor_path = writer.path.with_file_name(SEQ_FLOOR_NAME);
+    let floor = fs::read_to_string(&floor_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok());
+    let highest = on_disk.as_ref().map(|record| record.seq).max(floor);
     // A saturated sequence would mint SHARED ownership forever after: every later claim would
     // return the same MAX, and two sessions holding equal claims are exactly the ambiguity the
     // sequence exists to remove. Fail loudly; producers degrade to token-only and stay alive.
     anyhow::ensure!(
-        on_disk.as_ref().is_none_or(|record| record.seq < u64::MAX),
+        highest.is_none_or(|seq| seq < u64::MAX),
         "ownership sequence exhausted; refusing a shared claim"
     );
-    let seq = on_disk
-        .as_ref()
-        .map_or(1, |record| record.seq.saturating_add(1));
+    let seq = highest.map_or(1, |seq| seq.saturating_add(1));
     let now_ms = crate::message::now_ms();
     let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
     let record = Record {
@@ -749,6 +763,8 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
             .map_or(0, |record| record.transitions.saturating_add(1)),
     };
     write_record(&writer.path, &record)?;
+    // Best-effort: losing the floor write only matters if the record later becomes unreadable.
+    let _ = fs::write(&floor_path, format!("{seq}\n"));
     Ok(seq)
 }
 
@@ -1803,5 +1819,65 @@ mod tests {
         assert_eq!(seq, 1);
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.transitions, 0);
+    }
+
+    /// jUUo: the sequence floor survives a record this version cannot parse — a claim after
+    /// damage continues past the damaged sequence instead of restarting below a lingering
+    /// predecessor, who stays fenced out.
+    #[test]
+    fn the_sequence_floor_keeps_claims_monotonic_across_unreadable_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut predecessor = takeover(tmp.path(), "codex");
+        predecessor.observe(active()).unwrap();
+        let damaged_seq: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        fs::write(&path, b"{corrupted").unwrap();
+        let token = session_token();
+        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        assert!(
+            seq > damaged_seq.seq,
+            "the floor carries the sequence past the damage ({seq} vs {})",
+            damaged_seq.seq
+        );
+
+        // The lingering predecessor is below the new claim and stays refused.
+        predecessor.observe(active()).unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.incarnation, token);
+        assert_eq!(record.reason.as_deref(), Some("superseded"));
+    }
+
+    /// jUUq: an unreadable (not merely absent) record refuses token-only writes and wrapperless
+    /// claims — a permissions failure is never a virgin seat.
+    #[test]
+    fn io_failures_are_unreadable_not_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        writer(tmp.path()).observe(active()).unwrap();
+        let live = fs::read(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut token_only = writer(tmp.path());
+        token_only
+            .observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        assert!(
+            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+                .unwrap()
+                .is_none(),
+            "wrapperless claims refuse unreadable records"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            live,
+            "nothing renamed over the live record"
+        );
     }
 }
