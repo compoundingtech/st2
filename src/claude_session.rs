@@ -135,10 +135,16 @@ fn observe_writer(
         .get("session_id")
         .and_then(serde_json::Value::as_str)
     {
-        let token = format!("claude-session-{id}");
-        if event == "SessionStart" && harness_state::wrapperless_claim_allowed(agent_dir) {
-            return match harness_state::claim(agent_dir, identity, "claude", &token) {
-                Ok(seq) => writer.with_ownership(token, seq),
+        let token = format!("{}{id}", harness_state::WRAPPERLESS_PREFIX);
+        if event == "SessionStart" {
+            // Eligibility and the written takeover are ONE act under the record lock: a
+            // hooks-only SessionStart racing a wrapper's startup can no longer steal the
+            // sequence between the wrapper's read and its write. Ineligible (a live wrapper or
+            // its fresh claim placeholder owns the record) or unwritable both degrade to
+            // token-only.
+            return match harness_state::claim_wrapperless(agent_dir, identity, "claude", &token) {
+                Ok(Some(seq)) => writer.with_ownership(token, seq),
+                Ok(None) => writer.with_session(token),
                 Err(error) => {
                     eprintln!(
                         "st2 claude-observe: observed-state claim failed; degrading to token-only: {error:#}"
