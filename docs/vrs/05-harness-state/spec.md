@@ -317,12 +317,19 @@ a reconnect are recovered from both pending listings — `GET /permission` and
 `GET /question`, each measured on 1.18.19 — with their ids kept so the
 id-matched exits still release them; the seed builds a fresh projection and
 swaps it in whole only when the status level (which must be the documented
-object shape — null or an array proves nothing) and both listings all
-succeed —
-a mid-seed failure leaves nothing half-seeded, a successful re-seed clears
-stale entries whose exits passed during the outage, and otherwise evidence
-stays off and the seed retries — and an unrecognized `session.status` word is not level
-evidence (a future word must not prove idle on a quiet server). The `/doc`
+object shape — null or an array proves nothing), every status word, and both
+listings all read cleanly — a listing entry without a readable id is a
+pending ask the id-matched exit could never release, so it fails the seed
+rather than being skipped. A mid-seed failure leaves nothing half-seeded, a
+successful re-seed clears stale entries whose exits passed during the
+outage, and otherwise evidence stays off and the seed retries. An
+unrecognized `session.status` word is not level evidence (a future word must
+not prove idle on a quiet server), and on a session the projection tracks as
+busy it poisons the projection outright — observations are withheld and
+evidence drops until a fresh seed replaces the picture, since that busy
+entry could no longer be trusted to clear. An SSE drop marks the observation
+stream interrupted, so the first post-reseed observation opens a fresh
+transition rather than claiming continuity across the outage. The `/doc`
 subset gate names every consumed arm, exit events and pending listings
 included, so a release renaming an exit is refused up front rather than
 holding `blockedOn: human` forever. A dropped stream stops the heartbeat, the
