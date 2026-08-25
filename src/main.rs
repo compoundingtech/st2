@@ -376,6 +376,20 @@ enum DriverCmd {
         #[arg(long)]
         identity: String,
     },
+    /// Run omp under the session-owned presence wrapper with a hard version gate.
+    OmpSession {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Run the omp native message channel over stdio, owned by the shipped omp extension.
+    OmpChannel {
+        #[arg(long)]
+        identity: String,
+    },
     /// Run OpenCode under the session-owned wrapper: presence, observed harness state, and native
     /// server delivery over the wrapper-allocated local port.
     OpencodeSession {
@@ -1040,11 +1054,6 @@ fn main() -> Result<()> {
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
         }
-        Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
-            let catalog = catalog_arg(None)?;
-            let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::claude_mcp::run(&catalog, &identity)
-        }
         Command::Driver(DriverCmd::PiChannel { identity }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
@@ -1058,6 +1067,25 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::pi_session::run(&catalog, identity, runtime_id, argv)
+        }
+        Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::OmpChannel { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::pi_channel::run_omp(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::OmpSession {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::omp_session::run(&catalog, identity, runtime_id, argv)
         }
         Command::Driver(DriverCmd::Claude { identity }) => {
             eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");

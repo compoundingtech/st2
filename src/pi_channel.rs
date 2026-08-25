@@ -62,9 +62,42 @@ fn channel_content(subject: Option<&str>, body: &str) -> String {
     }
 }
 
+/// The harness-specific facts the shared channel loop needs: which env names carry the wrapper's
+/// exported ownership triple, and what label goes on records and errors.
+pub struct ChannelKind {
+    pub label: &'static str,
+    pub runtime_id_env: &'static str,
+    pub session_env: &'static str,
+    pub seq_env: &'static str,
+}
+
+const PI_KIND: ChannelKind = ChannelKind {
+    label: "pi",
+    runtime_id_env: crate::pi_session::CHANNEL_RUNTIME_ID,
+    session_env: crate::pi_session::CHANNEL_SESSION,
+    seq_env: crate::pi_session::CHANNEL_SEQ,
+};
+
+const OMP_KIND: ChannelKind = ChannelKind {
+    label: "omp",
+    runtime_id_env: crate::omp_session::CHANNEL_RUNTIME_ID,
+    session_env: crate::omp_session::CHANNEL_SESSION,
+    seq_env: crate::omp_session::CHANNEL_SEQ,
+};
+
+/// Run the pi native message channel over stdio.
 pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
+    run_for(catalog_root, identity, &PI_KIND)
+}
+
+/// Run the omp native message channel over stdio (the omp extension's child).
+pub fn run_omp(catalog_root: &Path, identity: &str) -> Result<()> {
+    run_for(catalog_root, identity, &OMP_KIND)
+}
+
+fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()> {
     let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
-        .with_context(|| format!("pi channel agent '{identity}' is not declared"))?;
+        .with_context(|| format!("{} channel agent '{identity}' is not declared", kind.label))?;
     let inbox = message::inbox_dir(&agent_dir);
     // Composed here rather than in the extension: what a restarted agent is told is st2's contract,
     // not the asset's, and the Codex and Claude hooks compose the same three blocks in bash.
@@ -89,12 +122,12 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     )?;
     stdout.flush()?;
     // The channel owns the live half of observed harness state: it is the one process that sees
-    // pi's own turn events, and its stdio connection to the extension is the evidence that those
-    // events are still being watched. The terminal half belongs to the outer session wrapper,
-    // which alone sees the provider die.
+    // the harness's own turn events, and its stdio connection to the extension is the evidence
+    // that those events are still being watched. The terminal half belongs to the outer session
+    // wrapper, which alone sees the provider die.
     // The pty session vouching for the record is the wrapper's task: its runtime ID arrives in
     // the channel environment, and only aliases the identity on driver-expanded seats.
-    let pty_session = std::env::var(crate::pi_session::CHANNEL_RUNTIME_ID)
+    let pty_session = std::env::var(kind.runtime_id_env)
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| identity.to_string());
@@ -102,13 +135,14 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     // this channel's live records (so a queued frame after `ended` is suppressed) while a
     // predecessor incarnation's records are foreign: the first frame opens a fresh transition
     // and a predecessor's terminal record never silences this session.
-    let mut writer = harness_state::Writer::new(&agent_dir, identity, "pi", Some(pty_session));
-    if let Ok(session) = std::env::var(crate::pi_session::CHANNEL_SESSION)
+    let mut writer =
+        harness_state::Writer::new(&agent_dir, identity, kind.label, Some(pty_session));
+    if let Ok(session) = std::env::var(kind.session_env)
         && !session.is_empty()
     {
         // Full adopted ownership when the wrapper exported it: the claimed sequence gives the
         // token a direction, so a straggler channel from a superseded session is refused.
-        writer = match std::env::var(crate::pi_session::CHANNEL_SEQ)
+        writer = match std::env::var(kind.seq_env)
             .ok()
             .and_then(|seq| seq.parse::<u64>().ok())
         {
@@ -123,6 +157,7 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
         &inbox,
         &mut writer,
         identity,
+        kind.label,
         POLL,
         harness_state::HARNESS_STATE_REFRESH,
     )
@@ -138,6 +173,7 @@ fn channel_loop(
     inbox: &Path,
     writer: &mut harness_state::Writer,
     identity: &str,
+    label: &str,
     poll: Duration,
     heartbeat_every: Duration,
 ) -> Result<()> {
@@ -146,7 +182,7 @@ fn channel_loop(
     loop {
         match input.recv_timeout(poll) {
             Ok(line) => {
-                let line = line.context("reading pi channel input")?;
+                let line = line.with_context(|| format!("reading {label} channel input"))?;
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -163,7 +199,7 @@ fn channel_loop(
                     // serializes but does not order their writes.
                     && let Err(error) = writer.observe_unless_ended(observation)
                 {
-                    eprintln!("st2 pi channel: recording observed state failed: {error}");
+                    eprintln!("st2 {label} channel: recording observed state failed: {error}");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -174,7 +210,7 @@ fn channel_loop(
         let now = Instant::now();
         if now >= next_heartbeat {
             if let Err(error) = writer.heartbeat() {
-                eprintln!("st2 pi channel: refreshing observed state failed: {error}");
+                eprintln!("st2 {label} channel: refreshing observed state failed: {error}");
             }
             next_heartbeat = now + heartbeat_every;
         }
@@ -188,10 +224,12 @@ fn channel_loop(
     }
 }
 
-/// The observed-state frame the shipped extension emits on pi's own turn boundaries. Only
-/// positively recognized words become observations: an unrecognized state word is dropped like any
-/// other unknown frame, so a newer asset cannot make this channel record something it cannot vouch
-/// for. pi offers no waiting-on-a-human signal, so no frame sets `blockedOn` here.
+/// The observed-state frame the shipped extension emits on the harness's own turn boundaries.
+/// Only positively recognized words become observations: an unrecognized state word is dropped
+/// like any other unknown frame, so a newer asset cannot make this channel record something it
+/// cannot vouch for. pi offers no waiting-on-a-human signal, so pi frames never carry
+/// `blockedOn`; the omp extension does (`tool_approval_requested`/`_resolved`), and its optional
+/// axes are parsed here for both channels — a frame without them decodes exactly as before.
 fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
     if frame.get("type").and_then(Value::as_str) != Some("state") {
         return None;
@@ -201,11 +239,32 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
         "idle" => harness_state::Activity::Idle,
         _ => return None,
     };
-    Some(harness_state::Observation::new(
-        state,
-        harness_state::BlockedOn::None,
-        harness_state::InputBuffer::Unknown,
-    ))
+    let blocked_on = match frame.get("blockedOn").and_then(Value::as_str) {
+        Some("human") => harness_state::BlockedOn::Human,
+        _ => harness_state::BlockedOn::None,
+    };
+    let mut observation =
+        harness_state::Observation::new(state, blocked_on, harness_state::InputBuffer::Unknown);
+    if blocked_on == harness_state::BlockedOn::Human
+        && let Some(ask) = frame.get("ask").and_then(Value::as_str)
+    {
+        observation = observation.with_ask(parse_ask(ask));
+    }
+    if let Some(reason) = frame.get("reason").and_then(Value::as_str) {
+        observation = observation.with_reason(reason);
+    }
+    Some(observation)
+}
+
+/// The machine-readable ask word on a blocked frame. An unrecognized word decodes as unknown —
+/// indeterminate, never silently reclassified — matching the record's own decode rule.
+fn parse_ask(word: &str) -> harness_state::Ask {
+    match word {
+        "permission" => harness_state::Ask::Permission,
+        "question" => harness_state::Ask::Question,
+        "review" => harness_state::Ask::Review,
+        _ => harness_state::Ask::Unknown,
+    }
 }
 
 /// What a starting or restarting pi session is told about its own durable state.
@@ -290,6 +349,34 @@ mod tests {
         }
     }
 
+    /// The omp extension's approval frames carry the blocked-on-human axis pi never emits. The
+    /// optional axes must decode for either channel's frames, an unrecognized ask word decodes
+    /// unknown (never silently reclassified), and a blocked frame without the extras decodes as
+    /// before.
+    #[test]
+    fn blocked_frames_carry_the_human_axes() {
+        let blocked = state_observation(&json!({
+            "type":"state","state":"active","blockedOn":"human",
+            "ask":"permission","reason":"bash"
+        }))
+        .unwrap();
+        assert_eq!(blocked.blocked_on, harness_state::BlockedOn::Human);
+        assert_eq!(blocked.ask, harness_state::Ask::Permission);
+        assert_eq!(blocked.reason.as_deref(), Some("bash"));
+
+        let unknown_ask = state_observation(&json!({
+            "type":"state","state":"active","blockedOn":"human",
+            "ask":"sacrifice"
+        }))
+        .unwrap();
+        assert_eq!(unknown_ask.blocked_on, harness_state::BlockedOn::Human);
+        assert_eq!(unknown_ask.ask, harness_state::Ask::Unknown);
+
+        let plain = state_observation(&json!({"type":"state","state":"idle"})).unwrap();
+        assert_eq!(plain.blocked_on, harness_state::BlockedOn::None);
+        assert_eq!(plain.ask, harness_state::Ask::None);
+    }
+
     /// The stdio connection is the evidence. While it lives, the record's heartbeat advances
     /// without a new observation; when it ends, the loop returns having written nothing more, so
     /// the last state is left to age to `unknown` instead of being asserted or terminated — the
@@ -317,10 +404,12 @@ mod tests {
             &message::inbox_dir(agent_dir),
             &mut writer,
             "h.worker",
+            "pi",
             Duration::from_millis(2),
             Duration::from_millis(5),
         )
         .unwrap();
+
         disconnect.join().unwrap();
 
         let raw: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
@@ -369,6 +458,7 @@ mod tests {
             &message::inbox_dir(agent_dir),
             &mut channel_writer,
             "h.worker",
+            "pi",
             Duration::from_millis(2),
             Duration::from_millis(5),
         )

@@ -79,6 +79,7 @@ pub enum Driver {
     Codex(CodexDriver),
     Pi(PiDriver),
     OpenCode(OpenCodeDriver),
+    Omp(OmpDriver),
 }
 
 impl Driver {
@@ -88,6 +89,7 @@ impl Driver {
             Self::Codex(_) => "codex",
             Self::Pi(_) => "pi",
             Self::OpenCode(_) => "opencode",
+            Self::Omp(_) => "omp",
         }
     }
 }
@@ -138,6 +140,20 @@ pub struct CodexDriver {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct OpenCodeDriver {
     pub model: Option<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Typed fields accepted by an `omp {}` driver block.
+///
+/// omp is pi-family and exposes the same two axes under the same flags: `effort` carries omp's
+/// thinking level verbatim (`--thinking`), exactly as [`PiDriver`] does for pi.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OmpDriver {
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -579,6 +595,7 @@ pub(crate) struct RawDriver {
     pub(crate) codex: Option<CodexDriver>,
     pub(crate) pi: Option<PiDriver>,
     pub(crate) opencode: Option<OpenCodeDriver>,
+    pub(crate) omp: Option<OmpDriver>,
 }
 
 impl RawDriver {
@@ -596,6 +613,9 @@ impl RawDriver {
         }
         if let Some(driver) = self.opencode {
             declared.push(("opencode", Driver::OpenCode(driver)));
+        }
+        if let Some(driver) = self.omp {
+            declared.push(("omp", Driver::Omp(driver)));
         }
         match declared.len() {
             0 => Ok(None),

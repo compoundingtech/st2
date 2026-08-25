@@ -9,7 +9,8 @@
 
 use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
 use crate::spec::{
-    ClaudeDriver, CodexDriver, OpenCodeDriver, PiDriver, RawResource, RawRestart, RawSpec, RawTask,
+    ClaudeDriver, CodexDriver, OmpDriver, OpenCodeDriver, PiDriver, RawResource, RawRestart,
+    RawSpec, RawTask,
 };
 
 /// Lower an already parsed declaration document into the runner's raw representation.
@@ -172,6 +173,13 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                     "agent declares `opencode` more than once"
                 );
                 raw.driver.opencode = Some(opencode_driver_node_to_raw(child)?);
+            }
+            "omp" => {
+                anyhow::ensure!(
+                    raw.driver.omp.is_none(),
+                    "agent declares `omp` more than once"
+                );
+                raw.driver.omp = Some(omp_driver_node_to_raw(child)?);
             }
             "env" => {}
             "pty" => {
@@ -345,6 +353,16 @@ fn codex_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<CodexDriver> 
 fn pi_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<PiDriver> {
     let (model, effort, _, prompt, args) = common_driver_fields(node, "pi", false)?;
     Ok(PiDriver {
+        model,
+        effort,
+        prompt,
+        args,
+    })
+}
+
+fn omp_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<OmpDriver> {
+    let (model, effort, _, prompt, args) = common_driver_fields(node, "omp", false)?;
+    Ok(OmpDriver {
         model,
         effort,
         prompt,

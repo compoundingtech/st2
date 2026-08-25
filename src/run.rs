@@ -1601,7 +1601,8 @@ fn reconcile_pass(
     // `$ST_HOOKS`, while `st2 driver pi-session` cannot start without the channel extension. So a
     // pi agent contributes to this verification without having its materialization deferred.
     let needs_hooks = crate::hooks::required_by_codex(&found.specs, this_host, root)
-        || crate::hooks::required_by_pi(&found.specs, this_host, root);
+        || crate::hooks::required_by_pi(&found.specs, this_host, root)
+        || crate::hooks::required_by_omp(&found.specs, this_host, root);
     let hook_error = needs_hooks
         .then(crate::hooks::verify_required_set)
         .transpose()
@@ -1695,7 +1696,8 @@ fn gate_harness_launches_on_hooks<'a, V>(
         let Some(_) = launch.tasks.iter().find(|target| {
             target.name == "agent"
                 && (crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
-                    || crate::hooks::launch_invokes_pi(&target.launch, catalog_root))
+                    || crate::hooks::launch_invokes_pi(&target.launch, catalog_root)
+                    || crate::hooks::launch_invokes_omp(&target.launch, catalog_root))
         }) else {
             continue;
         };

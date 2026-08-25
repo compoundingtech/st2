@@ -285,6 +285,8 @@
             # result here would mean nothing.
             test -f hooks/pi-channel.ts
             grep -q '@earendil-works/pi-coding-agent' hooks/pi-channel.ts
+            test -f hooks/omp-channel.ts
+            grep -q '@earendil-works/pi-coding-agent' hooks/omp-channel.ts
 
             tsc --noEmit -p hooks/typecheck/tsconfig.json
 
@@ -296,6 +298,11 @@
               --outfile=hooks/typecheck/smoke-out/pi-channel.mjs
             SMOKE_TRUE_BIN=${pkgs.coreutils}/bin/true \
               ${pkgs.nodejs}/bin/node hooks/typecheck/smoke.mjs
+            ${pkgs.esbuild}/bin/esbuild hooks/omp-channel.ts \
+              --format=esm --platform=node --target=es2022 \
+              --outfile=hooks/typecheck/smoke-out/omp-channel.mjs
+            SMOKE_TRUE_BIN=${pkgs.coreutils}/bin/true \
+              ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
             touch $out
           '';
 
