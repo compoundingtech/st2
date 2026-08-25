@@ -61,7 +61,7 @@ pub struct AgentWatchSet {
 /// Resolve one spec's watch set: the declaration file plus every active resource binding whose
 /// URI denotes a local file (`RESYNC-R01`). Bindings with an inactive reason are skipped;
 /// schemes without a local denotation and silent stores are simply absent.
-pub fn watch_set_for(spec: &AgentSpec) -> AgentWatchSet {
+pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
     let agent_dir = spec.path.parent().unwrap_or(Path::new("."));
     let mut carriers = vec![WatchableCarrier {
         label: "declaration".to_owned(),
@@ -84,14 +84,13 @@ pub fn watch_set_for(spec: &AgentSpec) -> AgentWatchSet {
             class,
         });
     }
+    // The supervisor's resolved logical host — not the OS hostname — decides the bus id, so an
+    // agent supervised under `st2 up --host <alias>` without an explicit declaration host still
+    // produces a recipient `resolve_stream` can resolve.
     AgentWatchSet {
-        bus_id: spec.bus_id(&default_host()),
+        bus_id: spec.bus_id(this_host),
         carriers,
     }
-}
-
-fn default_host() -> String {
-    crate::run::detect_host()
 }
 
 /// A URI denotes a local file when it is an absolute `file://` URI or a scheme-less
@@ -174,7 +173,7 @@ impl ResyncSupervisor {
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
-            .map(watch_set_for)
+            .map(|spec| watch_set_for(spec, this_host))
             .collect();
         if let Some(tx) = &self.tx {
             let _ = tx.send(Msg::WatchSet(sets));
@@ -234,7 +233,7 @@ fn is_mutation(event: &notify::Event) -> bool {
 struct Worker {
     root: PathBuf,
     this_host: String,
-    carriers: BTreeMap<PathBuf, Entry>,
+    carriers: BTreeMap<PathBuf, Vec<Entry>>,
     deadlines: BTreeMap<CarrierClass, Instant>,
     watched: BTreeMap<PathBuf, Option<DirIdentity>>,
     /// `None` degrades to digest polling at refresh cadence (each reconcile pass) instead of
@@ -286,60 +285,91 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
 
 impl Worker {
     fn apply_watch_sets(&mut self, sets: Vec<AgentWatchSet>) {
-        let mut next = BTreeMap::new();
+        let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
         for set in sets {
             for carrier in set.carriers {
-                // Carriers already on record keep their digest and pending dirty state: a
-                // reconcile pass can land between a mutation and its flush window, and reseeding
-                // here would silently erase that event (`RESYNC-R03` protects the baseline, not
-                // mid-flight transitions). Only genuinely unknown paths seed silently.
-                let carried_over = self.carriers.remove(&carrier.path).filter(|existing| {
-                    existing.bus_id == set.bus_id
-                        && existing.label == carrier.label
-                        && existing.class == carrier.class
+                // Several agents may bind the same local file: every `(bus_id, label)`
+                // subscription at a path is retained, not replaced (`RESYNC-R01`). Subscribers
+                // already on record keep their digest and pending dirty state: a reconcile pass
+                // can land between a mutation and its flush window, and reseeding here would
+                // silently erase that event (`RESYNC-R03` protects the baseline, not mid-flight
+                // transitions). Only genuinely unknown subscriptions seed silently.
+                let mut existing = self.carriers.remove(&carrier.path).unwrap_or_default();
+                let (kept, dropped): (Vec<_>, Vec<_>) = existing.drain(..).partition(|entry| {
+                    entry.bus_id == set.bus_id
+                        && entry.label == carrier.label
+                        && entry.class == carrier.class
                 });
-                let entry = carried_over.unwrap_or_else(|| Entry {
-                    bus_id: set.bus_id.clone(),
-                    label: carrier.label.clone(),
-                    class: carrier.class,
-                    digest: read_digest(&carrier.path),
-                    dirty: false,
-                });
-                next.insert(carrier.path.clone(), entry);
+                drop(dropped);
+                if kept.is_empty() {
+                    next.entry(carrier.path.clone()).or_default().push(Entry {
+                        bus_id: set.bus_id.clone(),
+                        label: carrier.label.clone(),
+                        class: carrier.class,
+                        digest: read_digest(&carrier.path),
+                        dirty: false,
+                    });
+                } else {
+                    next.entry(carrier.path.clone()).or_default().extend(kept);
+                }
             }
         }
         if self.watcher.is_none() {
-            self.poll_digests(&mut next);
+            self.diff_emit(&mut next);
         }
         self.carriers = next;
         self.refresh_watches();
+        // Directories that could not be registered stay blind to events; their carriers fall
+        // back to digest polling at refresh cadence (`RESYNC-R01`).
+        self.poll_unwatched();
     }
 
-    /// Degraded-mode digest poll: emit every watch-set transition observed between refreshes.
-    /// Seeding stays silent because each entry's baseline was captured at creation above.
-    fn poll_digests(&mut self, next: &mut BTreeMap<PathBuf, Entry>) {
+    /// Digest-diff every entry in `next`, emitting observed transitions. Seeding stays silent
+    /// because each baseline was captured when its subscription was created.
+    fn diff_emit(&mut self, next: &mut BTreeMap<PathBuf, Vec<Entry>>) {
         let paths: Vec<PathBuf> = next.keys().cloned().collect();
         for path in paths {
-            let Some(new_digest) = read_digest(&path) else {
+            let Some(entries) = next.get_mut(&path) else {
                 continue;
             };
-            let Some(entry) = next.get_mut(&path) else {
-                continue;
-            };
-            if entry.digest.as_deref() == Some(new_digest.as_str()) {
-                continue;
+            let root = self.root.clone();
+            let this_host = self.this_host.clone();
+            for entry in entries.iter_mut() {
+                let Some(new_digest) = read_digest(&path) else {
+                    continue;
+                };
+                if entry.digest.as_deref() == Some(new_digest.as_str()) {
+                    continue;
+                }
+                let old = entry.digest.take();
+                emit_resync(
+                    &root,
+                    &this_host,
+                    &entry.bus_id,
+                    &entry.label,
+                    &path,
+                    old.as_deref(),
+                    &new_digest,
+                );
+                entry.digest = Some(new_digest);
             }
-            let old = entry.digest.take();
-            emit_resync(
-                &self.root,
-                &self.this_host,
-                &entry.bus_id,
-                &entry.label,
-                &path,
-                old.as_deref(),
-                &new_digest,
-            );
-            entry.digest = Some(new_digest);
+        }
+    }
+
+    /// Poll carriers whose parent directory carries no registered watch right now.
+    fn poll_unwatched(&mut self) {
+        let unwatched: Vec<PathBuf> = self
+            .carriers
+            .keys()
+            .filter(|path| {
+                !self
+                    .watched
+                    .contains_key(path.parent().unwrap_or(Path::new(".")))
+            })
+            .cloned()
+            .collect();
+        for path in unwatched {
+            self.flush_path(&path);
         }
     }
 
@@ -393,35 +423,32 @@ impl Worker {
             // refresh time and so carries no watch of its own. Its creation surfaces on the
             // nearest watched ancestor; carriers beneath it must be re-dirtied because their own
             // creation events landed inside the unwatched subtree.
-            if self
+            let subtree = self
                 .carriers
                 .keys()
-                .any(|carrier| carrier.starts_with(&path) && *carrier != path)
-            {
+                .any(|carrier| carrier.starts_with(&path) && *carrier != path);
+            if subtree {
                 extend = true;
-                for (carrier, entry) in &mut self.carriers {
-                    if carrier.starts_with(&path) {
-                        if !entry.dirty {
-                            let deadline = now + entry.class.window();
-                            self.deadlines
-                                .entry(entry.class)
-                                .and_modify(|existing| *existing = (*existing).min(deadline))
-                                .or_insert(deadline);
-                        }
-                        entry.dirty = true;
+            }
+            let mut dirty_here: Vec<CarrierClass> = Vec::new();
+            for (carrier, entries) in &mut self.carriers {
+                let hit = *carrier == path || (subtree && carrier.starts_with(&path));
+                if !hit {
+                    continue;
+                }
+                for entry in entries.iter_mut() {
+                    if !entry.dirty {
+                        let deadline = now + entry.class.window();
+                        self.deadlines
+                            .entry(entry.class)
+                            .and_modify(|existing| *existing = (*existing).min(deadline))
+                            .or_insert(deadline);
                     }
+                    entry.dirty = true;
+                    dirty_here.push(entry.class);
                 }
             }
-            if let Some(entry) = self.carriers.get_mut(&path) {
-                if !entry.dirty {
-                    let deadline = now + entry.class.window();
-                    self.deadlines
-                        .entry(entry.class)
-                        .and_modify(|existing| *existing = (*existing).min(deadline))
-                        .or_insert(deadline);
-                }
-                entry.dirty = true;
-            }
+            drop(dirty_here);
         }
         if extend {
             self.refresh_watches();
@@ -440,40 +467,59 @@ impl Worker {
             let targets: Vec<PathBuf> = self
                 .carriers
                 .iter()
-                .filter(|(_, entry)| entry.dirty && entry.class == class)
+                .filter(|(_, entries)| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.dirty && entry.class == class)
+                })
                 .map(|(path, _)| path.clone())
                 .collect();
             for path in targets {
-                self.emit_if_changed(&path);
+                self.flush_path(&path);
             }
         }
     }
 
-    fn emit_if_changed(&mut self, path: &Path) {
-        let Some(entry) = self.carriers.get_mut(path) else {
+    /// Flush every subscriber of one path: clear dirty flags, diff digests, emit transitions.
+    fn flush_path(&mut self, path: &Path) {
+        let Some(entries) = self.carriers.get_mut(path) else {
             return;
         };
-        entry.dirty = false;
-        let Some(new_digest) = read_digest(path) else {
-            // Unreadable right now (deleted mid-window): stay quiet and keep the previous digest,
-            // so a later reappearance still counts as a change. The next mutation re-dirties.
-            return;
-        };
-        if entry.digest.as_deref() == Some(new_digest.as_str()) {
-            return;
+        for entry in entries.iter_mut() {
+            entry.dirty = false;
+            let Some(new_digest) = read_digest(path) else {
+                // Unreadable right now (deleted mid-window): stay quiet and keep the previous
+                // digest, so a later reappearance still counts as a change. The next mutation
+                // re-dirties.
+                continue;
+            };
+            if entry.digest.as_deref() == Some(new_digest.as_str()) {
+                continue;
+            }
+            let old = entry.digest.take();
+            emit_resync(
+                &self.root,
+                &self.this_host,
+                &entry.bus_id,
+                &entry.label,
+                path,
+                old.as_deref(),
+                &new_digest,
+            );
+            entry.digest = Some(new_digest);
         }
-        let old = entry.digest.take();
-        emit_resync(
-            &self.root,
-            &self.this_host,
-            &entry.bus_id,
-            &entry.label,
-            path,
-            old.as_deref(),
-            &new_digest,
-        );
-        entry.digest = Some(new_digest);
     }
+}
+
+/// The event identity covers the whole rendered transition, not just the new bytes: an
+/// A→B→A oscillation reuses B's content digest as the `new` half but always pairs it with the
+/// previous digest here, so every distinct transition is one immutable `(stream, event-id)`
+/// identity and repeated identities render byte-identical bodies.
+fn transition_identity(old: Option<&str>, new_digest: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{new_digest}", old.unwrap_or("seeded")))
+    )
 }
 
 /// One superseded resync event through the unchanged stream ingress (`RESYNC-R06`).
@@ -487,12 +533,13 @@ fn emit_resync(
     new_digest: &str,
 ) {
     let subject = format!("resource {label} changed");
+    let event_id = transition_identity(old, new_digest);
     let receipt = crate::event::emit(
         root,
         this_host,
         bus_id,
         RESYNC_STREAM,
-        new_digest,
+        &event_id,
         Some(label),
         Some(subject.as_str()),
         &render_body(label, path, old, new_digest),
@@ -544,7 +591,7 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let set = watch_set_for(&discover(tmp.path()));
+        let set = watch_set_for(&discover(tmp.path()), "hetz");
         assert_eq!(set.bus_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
@@ -552,6 +599,43 @@ mod tests {
         let goal = set.carriers.iter().find(|c| c.label == "goal").unwrap();
         assert_eq!(goal.class, CarrierClass::Immediate);
         assert_eq!(goal.path, dir.join("resources/goal.md"));
+    }
+
+    #[test]
+    fn bus_id_uses_the_supervisor_host_not_the_os_hostname() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A root-level declaration file supplies neither content nor path host: host stays
+        // None, so the supervisor's logical alias must decide the recipient.
+        std::fs::write(
+            tmp.path().join("worker.kdl"),
+            r#"agent "worker" {
+  command "true"
+}"#,
+        )
+        .unwrap();
+        let spec = discover(tmp.path());
+        assert_eq!(watch_set_for(&spec, "alias").bus_id, "alias.worker");
+        assert_eq!(watch_set_for(&spec, "other").bus_id, "other.worker");
+    }
+
+    #[test]
+    fn transition_identity_is_unique_per_transition_and_stable_per_replay() {
+        let a = "aaaa";
+        let b = "bbbb";
+        assert_ne!(
+            transition_identity(Some(a), b),
+            transition_identity(Some(b), a)
+        );
+        assert_eq!(
+            transition_identity(Some(b), a),
+            transition_identity(Some(b), a)
+        );
+        // The rollback leg of an oscillation differs from the original arrival even though the
+        // new-bytes digest is the same — the body's `old` field matches the pairing here.
+        assert_ne!(
+            transition_identity(None, a),
+            transition_identity(Some(b), a)
+        );
     }
 
     #[test]
