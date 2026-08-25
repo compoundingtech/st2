@@ -259,8 +259,8 @@ impl Resource {
         if name.is_empty() {
             return Err("resource binding name cannot be empty".into());
         }
-        validate_absolute_uri(&uri).map_err(|reason| {
-            format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
+        validate_resource_uri(&uri).map_err(|reason| {
+            format!("resource binding '{name}' `uri` must be an exact absolute URI or a catalog-relative path: {reason}")
         })?;
         validate_resource_explanation(&name, "reason", &reason)?;
         Ok(Self {
@@ -585,6 +585,10 @@ fn validate_stream_name(identity: &str, name: &str) -> anyhow::Result<()> {
             && !name.ends_with('-'),
         "agent '{identity}' stream name '{name}' must match [a-z0-9]([a-z0-9-]*[a-z0-9])?"
     );
+    anyhow::ensure!(
+        name != "resync",
+        "agent '{identity}' stream name '{name}' is reserved for built-in resync events"
+    );
     Ok(())
 }
 
@@ -762,6 +766,28 @@ fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result
         ));
     }
     Ok(())
+}
+
+/// A resource URI is either an exact absolute URI (any scheme) or a catalog-relative path with no
+/// scheme at all, resolved by the consumer against the declaration directory. Relative carriers
+/// are an st2 extension pending canonical Agent Spec adoption (see 06-resync).
+fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
+    match uri.split_once(':') {
+        Some((scheme, _))
+            if !scheme.contains('/')
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            validate_absolute_uri(uri)
+        }
+        _ => {
+            if uri.is_empty() || uri.starts_with('/') || uri.contains("..") {
+                return Err("catalog-relative uri must be a non-empty relative path without `..`");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {

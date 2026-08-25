@@ -1149,10 +1149,6 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
         ),
         ("missing-uri", r#"resource "work" reason="Task.""#),
         (
-            "relative-uri",
-            r#"resource "work" uri="./issue/1" reason="Task.""#,
-        ),
-        (
             "policy",
             r#"resource "work" uri="issue://example/1" reason="Task." required=#true"#,
         ),
@@ -1170,7 +1166,7 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
 
     let found = discover(tmp.path());
     assert!(found.specs.is_empty(), "{:?}", found.specs);
-    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    assert_eq!(found.errors.len(), 5, "{:?}", found.errors);
     let errors = found
         .errors
         .iter()
@@ -1189,12 +1185,6 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("needs string `uri`"))
-    );
-    assert!(errors.iter().any(|error| error.contains("absolute URI")));
-    assert!(
-        errors
-            .iter()
             .any(|error| error.contains("unsupported property `required`"))
     );
     assert!(
@@ -1202,6 +1192,44 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
             .iter()
             .any(|error| error.contains("cannot have children"))
     );
+}
+
+#[test]
+fn catalog_relative_resource_uris_are_an_st2_extension_resolved_against_the_declaration_dir() {
+    // Catalog-relative carrier paths are an st2 extension pending canonical Agent Spec adoption
+    // (see docs/vrs/06-resync): accepted here, resolved by the consumer against the declaration
+    // directory.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/relative/agent.kdl",
+        r#"agent "relative" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/goal.md" reason="Task."
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert!(
+        found.specs.iter().any(|spec| spec.identity == "relative"
+            && spec
+                .resources
+                .iter()
+                .any(|r| r.uri() == "resources/goal.md")),
+        "{:?}",
+        found.errors
+    );
+    let descriptor: Resource =
+        serde_json::from_str(r#"{"name":"work","uri":"resources/goal.md","reason":"Task."}"#)
+            .expect("catalog-relative uri is valid");
+    assert_eq!(descriptor.uri(), "resources/goal.md");
+
+    let absolute = Resource::new(
+        "work".into(),
+        "/etc/absolute".into(),
+        "Still refused.".into(),
+    );
+    assert!(absolute.is_err(), "absolute paths must keep a scheme");
 }
 
 #[test]
@@ -1233,7 +1261,7 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
 fn public_resource_json_deserialization_enforces_the_catalog_invariants() {
     for descriptor in [
         r#"{"name":"","uri":"issue://one","reason":"Task."}"#,
-        r#"{"name":"work","uri":"./relative","reason":"Task."}"#,
+        r#"{"name":"work","uri":"/etc/absolute","reason":"Task."}"#,
         r#"{"name":"work","uri":"issue://one","reason":"Task.","_tag":"issue"}"#,
         r#"{"name":"work","uri":"issue://one","reason":"Task.","required":true}"#,
     ] {
