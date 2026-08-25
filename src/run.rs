@@ -69,9 +69,65 @@ impl PresentationPatchCursor {
     }
 }
 
-/// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
-/// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
+/// Per-stream cap for captured child diagnostics. Tail-preserving: when output exceeds the cap,
+/// the LAST [`CAPTURE_CAP_BYTES`] bytes are kept — recent output is what a failure message needs,
+/// and an uncapped capture lets one chatty child balloon sidecar memory without bound.
+pub(crate) const CAPTURE_CAP_BYTES: usize = 256 * 1024;
+
+/// One captured child stream capped to [`CAPTURE_CAP_BYTES`], keeping the tail.
+pub(crate) struct BoundedStream {
+    pub bytes: Vec<u8>, // last <= cap bytes
+    pub total: u64,     // complete stream size before capping
+}
+
+impl BoundedStream {
+    pub fn truncated(&self) -> bool {
+        self.total as usize > self.bytes.len()
+    }
+}
+
+/// Read back at most `cap` bytes of a temp-file capture, preserving the tail. The file is stat'ed
+/// and seek'ed straight to `len - cap`, so the cost is O(cap) no matter how much the child wrote.
+pub(crate) fn read_bounded_tail(
+    file: &mut std::fs::File,
+    cap: usize,
+) -> std::io::Result<BoundedStream> {
+    let total = file.metadata()?.len();
+    let skip = total.saturating_sub(cap as u64);
+    file.seek(std::io::SeekFrom::Start(skip))?;
+    let mut bytes = Vec::with_capacity((total - skip) as usize);
+    file.take(cap as u64).read_to_end(&mut bytes)?;
+    Ok(BoundedStream { bytes, total })
+}
+
+/// Send an already-killed child to ONE shared reaper thread instead of spawning a detached thread
+/// per timed-out child: under a timeout storm one-thread-per-child accumulates without bound.
+/// The thread starts lazily on first use.
+pub(crate) fn reap_detached(child: std::process::Child) {
+    static REAPER: std::sync::LazyLock<std::sync::mpsc::Sender<Child>> =
+        std::sync::LazyLock::new(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<Child>();
+            // Thread-spawn exhaustion is the only failure mode; panicking here surfaces it at the
+            // call site instead of silently leaking unreaped children.
+            std::thread::Builder::new()
+                .name("st2-child-reaper".to_string())
+                .spawn(move || {
+                    for mut child in receiver {
+                        let _ = child.wait();
+                    }
+                })
+                .expect("spawn shared child reaper thread");
+            sender
+        });
+    let _ = REAPER.send(child);
+}
+
+/// Run a non-interactive child with bounded output capture: each stream keeps at most its last
+/// [`CAPTURE_CAP_BYTES`] bytes (tail-preserving, with a diagnostic line on truncation). Regular
+/// temporary files keep an escaped descendant that inherited stdout/stderr from blocking cleanup
+/// after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
+#[cfg(test)]
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
     output_with_input_timeout(command, timeout, None)
 }
@@ -92,9 +148,7 @@ fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
                 );
             }
             Ok(None) | Err(_) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                reap_detached(child);
                 return;
             }
         }
@@ -159,6 +213,30 @@ fn output_with_input_timeout_observed(
     input: Option<Vec<u8>>,
     on_spawn: impl FnOnce(i32),
 ) -> anyhow::Result<Output> {
+    run_captured(command, timeout, input, on_spawn, false)
+}
+
+/// Like [`output_with_timeout`], but returns the COMPLETE stdout: callers parse structured data
+/// (e.g. `pty list --json`) that must be whole, and capping it would corrupt the parse for large
+/// fleets. Stdout is therefore intentionally uncapped — one chatty child can balloon this buffer.
+/// Stderr stays tail-capped at [`CAPTURE_CAP_BYTES`] with a diagnostic line on truncation,
+/// because stderr is only surfaced inside error messages.
+pub(crate) fn output_full_stdout_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> anyhow::Result<Output> {
+    run_captured(command, timeout, None, |_| {}, true)
+}
+
+/// Shared spawn/wait/read-back core. The child is `setsid`, so its pid is also its process group
+/// id — the group this function signals on every failure path.
+fn run_captured(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+    on_spawn: impl FnOnce(i32),
+    full_stdout: bool,
+) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -209,16 +287,33 @@ fn output_with_input_timeout_observed(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    stdout.rewind()?;
-    stderr.rewind()?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout.read_to_end(&mut stdout_bytes)?;
-    stderr.read_to_end(&mut stderr_bytes)?;
+    let stdout_stream = if full_stdout {
+        // Intentionally uncapped: callers parse structured data that must be whole.
+        stdout.rewind()?;
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+        BoundedStream {
+            total: bytes.len() as u64,
+            bytes,
+        }
+    } else {
+        read_bounded_tail(&mut stdout, CAPTURE_CAP_BYTES)?
+    };
+    let stderr_stream = read_bounded_tail(&mut stderr, CAPTURE_CAP_BYTES)?;
+    let program = command.get_program().to_string_lossy();
+    for (stream, name) in [(&stdout_stream, "stdout"), (&stderr_stream, "stderr")] {
+        if stream.truncated() {
+            eprintln!(
+                "st2: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
+                stream.bytes.len(),
+                stream.total,
+            );
+        }
+    }
     Ok(Output {
         status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+        stdout: stdout_stream.bytes,
+        stderr: stderr_stream.bytes,
     })
 }
 
@@ -647,7 +742,7 @@ impl PtyCli {
     }
 
     fn list_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyListEntry>> {
-        let out = output_with_timeout(
+        let out = output_full_stdout_with_timeout(
             Command::new(&self.bin)
                 .args(["list", "--json"])
                 .env("PTY_ROOT", root),
@@ -3349,6 +3444,96 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!crate::host_lock::process_alive(pid));
+    }
+
+    #[test]
+    fn bounded_capture_keeps_the_tail_of_an_oversized_stream() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("flood");
+        // Start marker, 1 MiB of filler (4x the cap, so both streams truncate), end marker.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf START; head -c 1048576 /dev/zero; printf END\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = output_with_timeout(
+            &mut Command::new(&executable),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(output.stdout.len(), CAPTURE_CAP_BYTES);
+        assert!(
+            output.stdout.ends_with(b"END"),
+            "capped stdout lost the tail"
+        );
+        assert!(
+            !output.stdout.starts_with(b"START"),
+            "capped stdout kept the head instead of the tail"
+        );
+        // stderr is empty here, so only the stdout read-back may have been capped.
+    }
+
+    #[test]
+    fn full_stdout_variant_returns_complete_output_larger_than_the_cap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("flood");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf START; head -c 1048576 /dev/zero; printf END\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output =
+            output_full_stdout_with_timeout(&mut Command::new(&executable), Duration::from_secs(5))
+                .unwrap();
+
+        assert!(output.stdout.len() > CAPTURE_CAP_BYTES);
+        assert!(
+            output.stdout.starts_with(b"START") && output.stdout.ends_with(b"END"),
+            "full-stdout variant truncated structured output: {} bytes",
+            output.stdout.len()
+        );
+    }
+
+    /// Proves the shared reaper actually waits: the killed child is observed as a zombie BEFORE
+    /// `reap_detached` runs, so only the reaper's `wait()` can clear that state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_shared_reaper_reaps_a_killed_child() {
+        let mut child = Command::new("sh").arg("-c").arg("sleep 60").spawn().unwrap();
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while linux_process_state(pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            linux_process_state(pid),
+            Some('Z'),
+            "fixture did not produce a zombie"
+        );
+
+        reap_detached(child);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while linux_process_state(pid) == Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            linux_process_state(pid),
+            Some('Z'),
+            "the shared reaper did not reap the killed child {pid}"
+        );
     }
 
     #[cfg(target_os = "linux")]

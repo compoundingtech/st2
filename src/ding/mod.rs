@@ -14,7 +14,6 @@
 //! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{Read as _, Seek as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -27,7 +26,9 @@ mod composer;
 mod harness;
 
 use crate::message::{self, Message};
+use crate::run::{CAPTURE_CAP_BYTES, reap_detached, read_bounded_tail};
 use crate::status;
+
 use composer::{ComposerState, classify_composer, classify_receipt};
 use harness::ReceiptState;
 
@@ -329,6 +330,9 @@ impl PtyPoker {
         Ok(())
     }
 
+    /// Reads the terminal screen of the session. Output capture is tail-capped at
+    /// [`crate::run::CAPTURE_CAP_BYTES`]; semantics are preserved because a terminal screen is
+    /// far below that bound.
     fn peek(&self) -> anyhow::Result<String> {
         let out = output_with_timeout(
             Command::new(&self.bin).args(["peek", self.session.as_str()]),
@@ -391,8 +395,10 @@ impl Poker for PtyPoker {
     }
 }
 
-/// Run a non-interactive child with bounded output capture. Temporary files keep an escaped
-/// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
+/// Run a non-interactive child with bounded output capture: each stream keeps at most its last
+/// [`crate::run::CAPTURE_CAP_BYTES`] bytes (tail-preserving, with a diagnostic line on
+/// truncation). Temporary files keep an escaped descendant that inherited stdout/stderr from
+/// blocking cleanup after the direct child times out.
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
@@ -421,23 +427,27 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
                 libc::kill(-pid, libc::SIGKILL);
             }
             let _ = child.kill();
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
+            reap_detached(child);
             anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
         }
         thread::sleep(Duration::from_millis(10));
     };
-    stdout.rewind()?;
-    stderr.rewind()?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout.read_to_end(&mut stdout_bytes)?;
-    stderr.read_to_end(&mut stderr_bytes)?;
+    let stdout_stream = read_bounded_tail(&mut stdout, CAPTURE_CAP_BYTES)?;
+    let stderr_stream = read_bounded_tail(&mut stderr, CAPTURE_CAP_BYTES)?;
+    let program = command.get_program().to_string_lossy();
+    for (stream, name) in [(&stdout_stream, "stdout"), (&stderr_stream, "stderr")] {
+        if stream.truncated() {
+            eprintln!(
+                "st2: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
+                stream.bytes.len(),
+                stream.total,
+            );
+        }
+    }
     Ok(Output {
         status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+        stdout: stdout_stream.bytes,
+        stderr: stderr_stream.bytes,
     })
 }
 

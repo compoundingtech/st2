@@ -911,7 +911,7 @@ fn run_steps(
     catalog: &Path,
     top_env: &BTreeMap<String, String>,
 ) -> (Vec<JudgeResult>, BTreeMap<String, String>) {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     let mut results = Vec::new();
     // The env the JUDGES also get: $RUNS_DIR + each step's $RUN_<id>_EXIT (so a bash judge can read the
     // captures). Empty when there are no run steps.
@@ -947,7 +947,8 @@ fn run_steps(
             .unwrap_or((1, Duration::ZERO));
 
         let mut exit = -1;
-        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let out_path = runs_dir.join(format!("{}.out", step.id));
+        let err_path = runs_dir.join(format!("{}.err", step.id));
         for attempt in 0..attempts {
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
@@ -961,15 +962,22 @@ fn run_steps(
             for (k, v) in &runtime {
                 cmd.env(k, v);
             }
-            match cmd.output() {
-                Ok(o) => {
-                    exit = o.status.code().unwrap_or(-1);
-                    out = o.stdout;
-                    err = o.stderr;
-                }
+            // The child's stdout/stderr stream STRAIGHT into the capture files: a run step can emit
+            // arbitrarily much output and it must never be buffered wholesale in this process. Each
+            // attempt re-truncates, so the files hold the LAST attempt's output — the same bytes the
+            // old buffer-then-write path produced.
+            let attempt_exit = (|| -> std::io::Result<i32> {
+                let out_file = std::fs::File::create(&out_path)?;
+                let err_file = std::fs::File::create(&err_path)?;
+                cmd.stdout(Stdio::from(out_file))
+                    .stderr(Stdio::from(err_file));
+                Ok(cmd.status()?.code().unwrap_or(-1))
+            })();
+            match attempt_exit {
+                Ok(code) => exit = code,
                 Err(e) => {
                     exit = -1;
-                    err = format!("run step spawn failed: {e}").into_bytes();
+                    let _ = std::fs::write(&err_path, format!("run step spawn failed: {e}"));
                 }
             }
             if exit == 0 {
@@ -980,13 +988,19 @@ fn run_steps(
             }
         }
 
-        let _ = std::fs::write(runs_dir.join(format!("{}.out", step.id)), &out);
-        let _ = std::fs::write(runs_dir.join(format!("{}.err", step.id)), &err);
-        let _ = std::fs::write(runs_dir.join(format!("{}.exit", step.id)), exit.to_string());
-        // Also a unified, judge-greppable combined log (stdout then stderr) named after the run label.
-        let mut combined = out.clone();
-        combined.extend_from_slice(&err);
-        let _ = std::fs::write(logs_dir.join(format!("{}.log", step.id)), &combined);
+        let _ =
+            std::fs::write(runs_dir.join(format!("{}.exit", step.id)), exit.to_string());
+        // Also a unified, judge-greppable combined log (stdout then stderr), copied from the two
+        // capture files so neither ever has to fit in memory.
+        let combined_path = logs_dir.join(format!("{}.log", step.id));
+        let _ = (|| -> std::io::Result<()> {
+            let mut log = std::fs::File::create(&combined_path)?;
+            let mut out = std::fs::File::open(&out_path)?;
+            std::io::copy(&mut out, &mut log)?;
+            let mut err = std::fs::File::open(&err_path)?;
+            std::io::copy(&mut err, &mut log)?;
+            Ok(())
+        })();
         runtime.insert(format!("RUN_{}_EXIT", env_key(&step.id)), exit.to_string());
         eval_log!(
             "== run step {} → exit {}{} ==",
@@ -1020,6 +1034,7 @@ fn run_steps(
 /// continuous plain-text log, so this is the scrollback captured at judge time — enough to inspect a
 /// wedged/finished agent's history. A truly continuous agent log would need a `pty` feature.
 fn dump_agent_logs(pty_task_ids: &[String], catalog: &Path) {
+    use std::process::Stdio;
     if pty_task_ids.is_empty() {
         return;
     }
@@ -1027,15 +1042,24 @@ fn dump_agent_logs(pty_task_ids: &[String], catalog: &Path) {
     let _ = std::fs::create_dir_all(&logs_dir);
     let pty_root = crate::run::effective_pty_root(catalog);
     for task_id in pty_task_ids {
-        let out = std::process::Command::new("pty")
-            .args(["peek", "--full", "--plain", task_id])
-            .env("PTY_ROOT", &pty_root)
-            .output();
-        if let Ok(o) = out
-            && o.status.success()
-            && !o.stdout.is_empty()
-        {
-            let _ = std::fs::write(logs_dir.join(format!("{task_id}.log")), &o.stdout);
+        let log_path = logs_dir.join(format!("{task_id}.log"));
+        // Stream the peek's stdout straight into the log file: the full scrollback can be large and
+        // must never be buffered wholesale in this process. The old contract — keep the log only
+        // when the peek succeeded AND produced output — is kept by deleting the (possibly empty)
+        // file otherwise.
+        let dumped = (|| -> std::io::Result<bool> {
+            let mut child = std::process::Command::new("pty")
+                .args(["peek", "--full", "--plain", task_id])
+                .env("PTY_ROOT", &pty_root)
+                .stdout(Stdio::from(std::fs::File::create(&log_path)?))
+                .stderr(Stdio::null())
+                .spawn()?;
+            child.wait().map(|s| s.success())
+        })();
+        let keep =
+            dumped.unwrap_or(false) && std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 0);
+        if !keep {
+            let _ = std::fs::remove_file(&log_path);
         }
     }
 }
@@ -1552,8 +1576,11 @@ fn run_bash_judge(
         .env("CATALOG", catalog)
         .env("ST_ROOT", bus)
         .env("SPEC_DIR", &physical_spec_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // Only the status/exit detail is consumed. Piping stdout/stderr and never draining them
+        // deadlocks a chatty judge: once its pipe buffers fill, the child blocks forever while the
+        // parent keeps polling try_wait.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     // $RUNS_DIR + each $RUN_<id>_EXIT, so a judge can read the run steps' captured stdout/stderr/exit.
     for (k, v) in run_env {
         command.env(k, v);
@@ -2928,6 +2955,47 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             text: "x".into(),
         }];
         assert!(!run_declarative(&missing, cat.path()).0);
+    }
+
+    #[test]
+    fn run_steps_streams_large_step_output_to_files_without_corruption() {
+        let catalog = tempfile::tempdir().unwrap();
+        let cat = catalog.path();
+        // ~64 KiB each of stdout and stderr — far beyond any pipe buffer. This round-trips byte
+        // for byte only if the child streams straight into the capture files, and the combined log
+        // keeps the stdout-then-stderr ordering.
+        let marker_out = "O".repeat(64 * 1024);
+        let marker_err = "E".repeat(64 * 1024);
+        let step = RunStep {
+            id: "big".into(),
+            workspace: None,
+            command: "printf '%s' \"$BIG_OUT\"; printf '%s' \"$BIG_ERR\" >&2".into(),
+            env: BTreeMap::from([
+                ("BIG_OUT".to_string(), marker_out.clone()),
+                ("BIG_ERR".to_string(), marker_err.clone()),
+            ]),
+            unset: vec![],
+            retry: None,
+            allow_nonzero: false,
+        };
+        let (results, judge_env) = run_steps(&[step], cat, &BTreeMap::new());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed);
+        assert_eq!(judge_env.get("RUN_big_EXIT").map(String::as_str), Some("0"));
+        let runs = cat.join(".runs");
+        assert_eq!(
+            std::fs::read(runs.join("big.out")).unwrap(),
+            marker_out.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(runs.join("big.err")).unwrap(),
+            marker_err.as_bytes()
+        );
+        assert_eq!(std::fs::read_to_string(runs.join("big.exit")).unwrap(), "0");
+        // Combined log = stdout fully followed by stderr.
+        let mut expected = marker_out.into_bytes();
+        expected.extend_from_slice(marker_err.as_bytes());
+        assert_eq!(std::fs::read(cat.join("logs/big.log")).unwrap(), expected);
     }
 
     #[test]

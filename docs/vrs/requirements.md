@@ -72,6 +72,13 @@ accepted.
   that outlive that child. st2 either reaps the direct child before returning or
   transfers wait ownership to a background reaper; the failure remains bounded
   and reports its originating input error or timeout.
+- **R34 Bounded helper output capture:** Capturing a spawned non-interactive
+  helper's stdout/stderr consumes memory bounded by a fixed per-stream cap
+  independent of the child's output volume and of how many captures run
+  concurrently. When a stream exceeds the cap, the retained bytes are that
+  stream's tail, and truncation is observable. A caller that must consume a
+  stream whole (structured data for parsing) opts in through an explicitly
+  named capture path, so an unbounded read is always visible at its call site.
 - **R22 Quiet coordination after events:** A network with minimal or default
   personas stays quiet while useful work continues. Agents coordinate only after
   an inbox DING, a durable failure, a real blocker, a completion or decision
