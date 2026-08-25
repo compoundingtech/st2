@@ -25,6 +25,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use opentelemetry::trace::Span as _;
+use opentelemetry::trace::Tracer as _;
 use serde::{Deserialize, Serialize};
 
 use crate::exec_backend::ExecBackend;
@@ -1723,7 +1725,12 @@ fn gate_harness_launches_on_hooks<'a, V>(
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    Ok(reconcile_pass(
+    let tracer = opentelemetry::global::tracer("st2");
+    let mut span = tracer
+        .span_builder("st2.reconcile_pass")
+        .with_attributes(vec![opentelemetry::KeyValue::new("st2.host", this_host.to_string())])
+        .start(&tracer);
+    let report = reconcile_pass(
         root,
         this_host,
         &task_context,
@@ -1731,7 +1738,9 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
         &mut FlappingCap::default(),
         &mut debounce,
         &mut PresentationPatchCursor::default(),
-    ))
+    );
+    span.end();
+    Ok(report)
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -2215,15 +2224,34 @@ fn up_loop_until(
     loop {
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
-        let mut report = reconcile_pass(
-            root,
-            this_host,
-            &task_context,
-            runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-        );
+        let mut report = {
+            let tracer = opentelemetry::global::tracer("st2");
+            let mut span = tracer
+                .span_builder("st2.reconcile_pass")
+                .with_attributes(vec![
+                    opentelemetry::KeyValue::new("st2.host", this_host.to_string()),
+                ])
+                .start(&tracer);
+            let pass = reconcile_pass(
+                root,
+                this_host,
+                &task_context,
+                runner,
+                &mut cap,
+                &mut debounce,
+                &mut presentation_cursor,
+            );
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "st2.crash_loops",
+                i64::try_from(pass.crash_loops.len()).unwrap_or(i64::MAX),
+            ));
+            span.set_attribute(opentelemetry::KeyValue::new(
+                "st2.unparked",
+                i64::try_from(pass.unparked.len()).unwrap_or(i64::MAX),
+            ));
+            span.end();
+            pass
+        };
         pre.absorb(report);
         report = pre;
         if let Some(watcher) = &mut watcher {

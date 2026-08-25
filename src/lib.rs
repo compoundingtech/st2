@@ -42,6 +42,7 @@ pub mod run;
 pub mod service;
 pub mod status;
 pub mod task_inventory;
+pub mod telemetry;
 pub mod validate;
 pub mod version;
 mod watch;

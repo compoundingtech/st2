@@ -36,6 +36,9 @@ sha2 = "0.10"
 st2-wire = { path = "crates/st2-wire" }
 tempfile = "3"
 toml = "0.9"
+opentelemetry = "0.30"
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry_sdk = "0.30"
 tungstenite = "0.30"
 
 [dev-dependencies]

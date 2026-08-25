@@ -8,6 +8,11 @@
     # fleet-observation guarantees required by st2 reconciliation.
     pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
     pty.inputs.nixpkgs.follows = "nixpkgs";
+    # Shared tooling packages from overengineering: provides the `otelite`
+    # OTLP collector binary that the OTel export integration gate
+    # (`tests/otel_export.rs`, exposed as `checks.otel-export`) drives to
+    # prove real span export end-to-end.
+    effect-utils.url = "github:overengineeringstudio/effect-utils/main";
   };
 
   outputs =
@@ -16,6 +21,7 @@
       nixpkgs,
       flake-utils,
       pty,
+      effect-utils,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -198,6 +204,29 @@
           ];
         });
 
+        # OTLP export integration gate. `tests/otel_export.rs` is skipped
+        # unless `ST2_OTELITE_BIN` points at a real collector, so the package's
+        # own test boundary never exercises span export — this dedicated
+        # derivation is what makes the contract non-vacuous: it pins the exact
+        # `otelite` build from effect-utils and does NOT set
+        # `ST2_ALLOW_OTEL_SKIP`, so a broken export path fails the gate instead
+        # of silently skipping.
+        st2OtelExport = st2.overrideAttrs (old: {
+          pname = "st2-otel-export-check";
+          # The test drives `st2 up --once`, whose reconcile pass shells out to
+          # `pty list --json` — the same real-producer requirement as
+          # st2ParkedRecovery, so the packaged pty must be on the check's PATH.
+          nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
+            pty.packages.${system}.default
+            effect-utils.packages.${system}.otelite
+          ];
+          ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
+          cargoTestFlags = [
+            "--test"
+            "otel_export"
+          ];
+        });
+
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
           chmod -R u+w $out
@@ -234,6 +263,7 @@
         checks.catalog-bootstrap = st2CatalogBootstrap;
         checks.message-cli = st2MessageCli;
         checks.parked-recovery = st2ParkedRecovery;
+        checks.otel-export = st2OtelExport;
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
@@ -448,7 +478,14 @@
             pkgs.rust-analyzer
             pkgs.git
             pty.packages.${system}.default
+            # Local runs of the OTLP export integration gate
+            # (`cargo test --test otel_export`) need the same collector the
+            # Nix check pins; `ST2_OTELITE_BIN` points at it.
+            effect-utils.packages.${system}.otelite
           ];
+          # Same collector the Nix gate pins, so a bare
+          # `cargo test --test otel_export` in this shell runs against it.
+          ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
         };
       }
     );
