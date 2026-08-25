@@ -23,7 +23,7 @@ fn write(root: &Path, rel: &str, contents: &str) {
 fn agent_kdl(identity: &str, host: &str) -> String {
     format!(
         "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"{host}\"\n  \
-         type \"service\"\n  resource \"work\" uri=\"issue://example/{identity}\" reason=\"example work item\"\n  \
+         type \"service\"\n  role \"worker\"\n  resource \"work\" uri=\"issue://example/{identity}\" reason=\"example work item\"\n  \
          pty \"agent\" {{ command \"exec claude boot\" }}\n}}\n"
     )
 }
@@ -142,6 +142,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
     assert_eq!(st2c.status, State::Busy);
     assert_eq!(st2c.name.as_deref(), Some("st2 owner"));
     assert_eq!(st2c.description.as_deref(), Some("Own st2 delivery"));
+    assert_eq!(st2c.role.as_deref(), Some("worker"));
     assert!(!st2c.retired);
     assert_eq!(
         st2c.inbox, 1,
@@ -213,6 +214,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     );
     let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(rows[0]["identity"], "h.live");
+    assert_eq!(rows[0]["role"], "worker");
     assert_eq!(rows[0]["retired"], false);
     assert_eq!(
         rows[0]["resources"],
@@ -240,6 +242,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(selected.as_array().unwrap().len(), 1);
     assert_eq!(selected[0]["identity"], "h.live");
+    assert_eq!(selected[0]["role"], "worker");
 
     let absent = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("agents")

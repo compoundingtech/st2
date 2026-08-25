@@ -459,13 +459,13 @@ st2 context read --full
 
 The roster includes suspended and retired declarations instead of silently conflating desired
 lifecycle with runtime presence. Both JSON shapes keep stable `identity` separate from optional
-`name` and `description`, and contain the compatibility `retired` projection, `desiredState`,
+`name`, `description`, and `role`. They contain the compatibility `retired` projection, `desiredState`,
 `desiredStateReason`, plus the declaration's ordered `resources` descriptors. `--enrich`
 additionally supplies `lastActivity` and `inbox`. Human output prints the same presentation fields
 as separate columns and appends the non-running state and rationale.
 `--identity <host>.<identity>` selects exactly one qualified Agent Spec or fails,
-so external harness hooks can read its current name and description without parsing KDL or relying
-on a duplicate state file.
+so external consumers can read its current name, description, and role without parsing KDL or
+relying on a duplicate state file.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
 the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and

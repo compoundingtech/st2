@@ -16,7 +16,7 @@
 //!
 //! st2 consumes this crate, which is what keeps it a reference implementation rather than a copy:
 //! a second reader (a TUI, a linter) sees exactly the fields the runner sees, including the ones
-//! the runner's roster JSON does not carry (`supervisor`, `role`, `workspace`, `host`).
+//! the runner's roster JSON does not carry (`supervisor`, `workspace`, `host`).
 //!
 //! The runner-normalized model deliberately drops render-only fields. [`DeclaredDocument`] retains
 //! them without assigning policy, so st2 stays render-agnostic while policy consumers do not need a

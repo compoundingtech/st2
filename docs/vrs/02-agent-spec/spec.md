@@ -230,11 +230,13 @@ Evidence: [validation](../../../src/validate.rs).
 <h3 id="f05">F05 <code>role</code></h3>
 
 Update observable declaration metadata only. Do not change the fingerprint,
-workspace files, notification state, or a healthy task.
+workspace files, notification state, or a healthy task. Both JSON roster shapes
+expose the exact free-form value as nullable `role`.
 
 Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::role`](../../../crates/agent-spec/src/spec.rs). Evidence:
-[KDL lowering](../../../crates/agent-spec/src/kdl_format.rs).
+[KDL lowering](../../../crates/agent-spec/src/kdl_format.rs) and
+[roster projection](../../../src/agents.rs).
 
 <h3 id="f06">F06 <code>workspace</code></h3>
 

@@ -23,6 +23,8 @@ pub struct AgentRow {
     pub name: Option<String>,
     /// Optional enduring responsibility boundary from the Agent Spec declaration.
     pub description: Option<String>,
+    /// Optional free-form role from the Agent Spec declaration.
+    pub role: Option<String>,
     /// Whether the declaration is explicitly retired. Presence remains a separate runtime signal.
     pub retired: bool,
     /// Declarative whole-agent lifecycle intent.
@@ -67,6 +69,7 @@ pub fn roster_from_discovered(
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: s.name.clone(),
                 description: s.description.clone(),
+                role: s.role.clone(),
                 retired: s.desired_state.is_retired(),
                 desired_state: s.desired_state.as_str().to_owned(),
                 desired_state_reason: s.desired_state.reason().map(str::to_owned),
@@ -144,6 +147,7 @@ struct SummaryJson<'a> {
     status: &'a str,
     name: Option<&'a str>,
     description: Option<&'a str>,
+    role: Option<&'a str>,
     retired: bool,
     resources: &'a [Resource],
     #[serde(rename = "desiredState")]
@@ -161,6 +165,7 @@ struct EnrichedJson<'a> {
     status: &'a str,
     name: Option<&'a str>,
     description: Option<&'a str>,
+    role: Option<&'a str>,
     retired: bool,
     resources: &'a [Resource],
     #[serde(rename = "lastActivity")]
@@ -184,6 +189,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 status: r.status.as_str(),
                 name: r.name.as_deref(),
                 description: r.description.as_deref(),
+                role: r.role.as_deref(),
                 retired: r.retired,
                 resources: &r.resources,
                 desired_state: &r.desired_state,
@@ -202,6 +208,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 status: r.status.as_str(),
                 name: r.name.as_deref(),
                 description: r.description.as_deref(),
+                role: r.role.as_deref(),
                 retired: r.retired,
                 resources: &r.resources,
                 desired_state: &r.desired_state,
@@ -265,6 +272,7 @@ mod tests {
             status,
             name: name.map(str::to_string),
             description: None,
+            role: None,
             retired,
             desired_state: if retired { "retired" } else { "running" }.to_owned(),
             desired_state_reason: None,
@@ -292,11 +300,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"role":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"role":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"role":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"role":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -316,7 +324,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"role":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null,"observedState":null}]"#
         );
     }
 
@@ -346,11 +354,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"role":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"role":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -366,7 +374,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"role":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
         );
     }
 }
