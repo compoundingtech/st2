@@ -289,23 +289,29 @@ impl Worker {
         let mut next = BTreeMap::new();
         for set in sets {
             for carrier in set.carriers {
-                next.insert(
-                    carrier.path.clone(),
-                    Entry {
-                        bus_id: set.bus_id.clone(),
-                        label: carrier.label,
-                        class: carrier.class,
-                        digest: read_digest(&carrier.path),
-                        dirty: false,
-                    },
-                );
+                // Carriers already on record keep their digest and pending dirty state: a
+                // reconcile pass can land between a mutation and its flush window, and reseeding
+                // here would silently erase that event (`RESYNC-R03` protects the baseline, not
+                // mid-flight transitions). Only genuinely unknown paths seed silently.
+                let carried_over = self.carriers.remove(&carrier.path).filter(|existing| {
+                    existing.bus_id == set.bus_id
+                        && existing.label == carrier.label
+                        && existing.class == carrier.class
+                });
+                let entry = carried_over.unwrap_or_else(|| Entry {
+                    bus_id: set.bus_id.clone(),
+                    label: carrier.label.clone(),
+                    class: carrier.class,
+                    digest: read_digest(&carrier.path),
+                    dirty: false,
+                });
+                next.insert(carrier.path.clone(), entry);
             }
         }
         if self.watcher.is_none() {
             self.poll_digests(&mut next);
         }
         self.carriers = next;
-        self.deadlines.clear();
         self.refresh_watches();
     }
 
