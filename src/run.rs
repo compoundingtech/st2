@@ -1619,6 +1619,7 @@ fn reconcile_pass(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
+    resync: Option<&crate::resync::ResyncSupervisor>,
 ) -> UpReport {
     let _catalog_lock = {
         let span = catalog_lock_span();
@@ -1652,6 +1653,9 @@ fn reconcile_pass(
         drop(entered);
         found
     };
+    if let Some(resync) = resync {
+        resync.refresh(&found.specs, this_host);
+    }
     let mut report = UpReport {
         warnings: found.warnings.clone(),
         errors: found
@@ -2053,6 +2057,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
             &mut FlappingCap::default(),
             &mut debounce,
             &mut PresentationPatchCursor::default(),
+            None,
         );
         finish_reconcile_pass(&span, &report);
         report
@@ -2675,6 +2680,7 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
+    let resync = crate::resync::ResyncSupervisor::spawn(root.to_path_buf(), this_host.to_owned());
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
@@ -2695,6 +2701,7 @@ fn up_loop_until(
                     &mut cap,
                     &mut debounce,
                     &mut presentation_cursor,
+                    Some(&resync),
                 );
                 finish_reconcile_pass(&span, &pass);
                 pass
@@ -2706,11 +2713,6 @@ fn up_loop_until(
         report = pre;
         if let Some(watcher) = &mut watcher {
             watcher.refresh();
-        }
-        // A recovered task that crash-loops again is a new crash-loop, so it must be able to surface
-        // again. Leaving the id in the dedup set would make every park after the first one silent.
-        for id in report.unparked.iter() {
-            reported_flapping.remove(id);
         }
         recurring_warnings.filter(&mut report);
         park_channel.publish(&cap, &mut report);

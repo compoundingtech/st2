@@ -228,9 +228,10 @@ fn resolve_stream(
         spec.resolved_host(this_host)
     );
     anyhow::ensure!(
-        spec.streams.iter().any(|declared| declared.name == stream),
+        stream == crate::resync::RESYNC_STREAM
+            || spec.streams.iter().any(|declared| declared.name == stream),
         "agent '{}' does not declare stream '{stream}'",
-        spec.bus_id(this_host)
+        spec.bus_id(this_host),
     );
     anyhow::ensure!(
         spec.desired_state.is_running(),
