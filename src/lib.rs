@@ -22,6 +22,7 @@ pub mod event;
 pub mod exec_backend;
 pub mod expand;
 pub mod flapping;
+pub mod harness_sessions;
 pub mod harness_state;
 pub mod hooks;
 pub mod host_lock;

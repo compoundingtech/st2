@@ -95,6 +95,9 @@ enum Command {
     /// Provider-native harness drivers and read-only typed-block expansion.
     #[command(subcommand)]
     Driver(DriverCmd),
+    /// Read-only, metadata-only inspection of provider-owned harness session files.
+    #[command(subcommand)]
+    Harness(HarnessCmd),
     /// The ding sidecar: watch an agent's `resources/inbox` and poke its pty (`[DING] …`) on each new
     /// message. Busy does not suppress delivery; only fresh dnd defers FIFO. A startup backlog is
     /// coalesced into one recovery notice. Long-running — st2 keeps it alive as a task alongside the
@@ -385,6 +388,19 @@ enum DriverCmd {
         runtime_id: String,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HarnessCmd {
+    /// Inspect candidate session files authorized by one exact native driver declaration.
+    Sessions {
+        /// Select one exact local Agent Spec by its fully qualified `<host>.<identity>`.
+        #[arg(long, value_name = "HOST.IDENTITY")]
+        identity: String,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1095,6 +1111,13 @@ fn main() -> Result<()> {
         Command::Driver(DriverCmd::Expand { spec, agent, host }) => {
             let catalog = catalog_arg(None)?;
             driver_expand_cmd(&catalog, &spec, agent.as_deref(), host.as_deref())
+        }
+        Command::Harness(HarnessCmd::Sessions { identity, json }) => {
+            if !json {
+                anyhow::bail!("`st2 harness sessions` v1 requires --json");
+            }
+            let catalog = catalog_arg(None)?;
+            harness_sessions_cmd(&catalog, &identity)
         }
         Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
@@ -1968,6 +1991,27 @@ fn tasks_cmd(root: &Path, host: Option<String>) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("task inventory incomplete")
+    }
+}
+
+fn harness_sessions_cmd(catalog: &Path, identity: &str) -> Result<()> {
+    let host = detect_host();
+    let inventory = match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => {
+            st2::harness_sessions::inspect(catalog, &host, identity, Path::new(&home))
+        }
+        _ => st2::harness_sessions::HarnessSessions::incomplete(
+            catalog.to_path_buf(),
+            host,
+            identity.to_owned(),
+            "HOME is not set",
+        ),
+    };
+    println!("{}", inventory.to_json());
+    if inventory.complete() {
+        Ok(())
+    } else {
+        anyhow::bail!("harness session inventory incomplete")
     }
 }
 
