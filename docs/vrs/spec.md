@@ -710,6 +710,26 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   closed instead of hanging reconciliation. The deadline is containment, not
   the mechanism for admitting a larger fleet.
 
+### Child-process execution (R32, R34)
+
+Non-interactive helper shells-outs (`src/run.rs`, `src/ding/mod.rs`) share one
+shape: the child is `setsid` so its pid is its process group, stdout/stderr go
+to unlinked tempfiles (an escaped descendant that inherited them cannot block
+cleanup), and deadline expiry kills the whole group. Wait ownership for a
+killed child transfers to one shared reaper thread draining a channel — never
+one detached thread per timed-out child, which accumulates without bound under
+timeout storms.
+
+Read-back is tail-capped at `CAPTURE_CAP_BYTES` (256 KiB) per stream: over-cap
+streams keep their last 256 KiB and emit one diagnostic line naming the
+command, stream, kept/total bytes, and cap. Memory per capture is therefore
+bounded by calls × 2 × cap regardless of child behavior. `pty list --json`
+parses structured output that must be whole, so it uses the explicitly named
+full-stdout variant; that read is intentionally uncapped and visible at its
+call site. Eval run steps and agent log dumps stream child output straight to
+their catalog log files without buffering it. Rationale and rejected
+alternatives: [decision 0007](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
+
 ## Message lifecycle
 
 ```text
