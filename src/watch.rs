@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -66,7 +67,7 @@ pub(crate) fn watch_delivery_inputs(
 pub(crate) struct CatalogDeclarationWatcher {
     root: PathBuf,
     watcher: RecommendedWatcher,
-    watched: BTreeMap<PathBuf, DirIdentity>,
+    watched: Arc<Mutex<BTreeMap<PathBuf, Option<DirIdentity>>>>,
     failed: BTreeSet<PathBuf>,
 }
 
@@ -92,21 +93,29 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
 impl CatalogDeclarationWatcher {
     fn new(root: &Path, tx: Sender<()>) -> notify::Result<Self> {
         let callback_root = root.to_path_buf();
+        let watched = Arc::new(Mutex::new(BTreeMap::new()));
+        let invalidator = Arc::clone(&watched);
         let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-            if result.is_ok_and(|event| should_wake_catalog(&callback_root, &event)) {
-                let _ = tx.send(());
+            if let Ok(event) = result {
+                invalidate_removed_dirs(&invalidator, &event);
+                if should_wake_catalog(&callback_root, &event) {
+                    let _ = tx.send(());
+                }
             }
         })?;
         let mut this = Self {
             root: root.to_path_buf(),
             watcher,
-            watched: BTreeMap::new(),
+            watched,
             failed: BTreeSet::new(),
         };
         this.watcher.watch(root, RecursiveMode::NonRecursive)?;
-        if let Some(identity) = dir_identity(root) {
-            this.watched.insert(root.to_path_buf(), identity);
-        }
+        let mut watched = this
+            .watched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        watched.insert(root.to_path_buf(), dir_identity(root));
+        drop(watched);
         this.refresh();
         Ok(this)
     }
@@ -114,26 +123,26 @@ impl CatalogDeclarationWatcher {
     /// Reconcile the shallow subscriptions with the current declaration namespace.
     pub(crate) fn refresh(&mut self) {
         let desired = declaration_watch_dirs(&self.root);
+        let mut watched = self.watched.lock().unwrap_or_else(|p| p.into_inner());
 
         // An inotify watch dies with its inode. A directory deleted and recreated at the same
-        // pathname keeps its key here, so compare identities, not names: a replacement directory
-        // must be force-registered or edits below it would wait for the timer fallback.
+        // pathname can even reuse the identity, so `invalidate_removed_dirs` drops removals from
+        // this set eagerly; identity comparison here then catches anything the events missed.
         let mut stale = Vec::new();
-        self.watched
-            .retain(|path, identity| match desired.get(path) {
-                Some(fresh) if *fresh == Some(*identity) => true,
-                _ => {
-                    stale.push(path.clone());
-                    false
-                }
-            });
+        watched.retain(|path, identity| match desired.get(path) {
+            Some(fresh) if *fresh == *identity => true,
+            _ => {
+                stale.push(path.clone());
+                false
+            }
+        });
         for path in &stale {
             // Backends normally discard a watch when its directory disappears. An explicit
             // best-effort unwatch also handles moves that leave the watched inode alive elsewhere.
             let _ = self.watcher.unwatch(path);
         }
         for added in desired.into_keys() {
-            if self.watched.contains_key(&added) {
+            if watched.contains_key(&added) {
                 continue;
             }
             match self.watcher.watch(&added, RecursiveMode::NonRecursive) {
@@ -141,7 +150,7 @@ impl CatalogDeclarationWatcher {
                     self.failed.remove(&added);
                     match dir_identity(&added) {
                         Some(identity) => {
-                            self.watched.insert(added, identity);
+                            watched.insert(added, Some(identity));
                         }
                         // Vanished between registration and stat: leave it unrecorded so the
                         // next refresh retries from scratch.
@@ -163,7 +172,35 @@ impl CatalogDeclarationWatcher {
 
     #[cfg(test)]
     fn watched_dirs(&self) -> BTreeSet<PathBuf> {
-        self.watched.keys().cloned().collect()
+        self.watched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Eagerly drop tracked directories the moment the backend reports them removed or renamed
+/// away — an inotify watch dies with its inode, and a same-pathname replacement can reuse the
+/// old identity, so only event-time invalidation makes the next [`refresh`] re-register
+/// deterministically instead of trusting a stat race.
+fn invalidate_removed_dirs(watched: &Mutex<BTreeMap<PathBuf, Option<DirIdentity>>>, event: &Event) {
+    let torn_down = matches!(
+        &event.kind,
+        EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
+            | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+    );
+    if !torn_down {
+        return;
+    }
+    let mut watched = watched
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in &event.paths {
+        watched.remove(path);
+        // Removing or moving away a parent retires every watch beneath it too.
+        watched.retain(|tracked, _| !tracked.starts_with(path));
     }
 }
 
