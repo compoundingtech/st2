@@ -31,7 +31,7 @@ catalog-relative, non-local schemes), classification (goal immediate,
 agent-authored stores excluded), and the built-in-stream carve-out is covered
 by tests 1–2 passing through real `emit`.
 
-Two design constraints were discovered by running the code, not by reasoning:
+Three design constraints were discovered by running the code, not by reasoning:
 
 - **Directory-creation blind spot.** Writing a file into a newly created
   subdirectory generates events on the new directory's inode, which carries no
@@ -42,6 +42,12 @@ Two design constraints were discovered by running the code, not by reasoning:
 - **Shutdown self-deadlock.** The worker's own watcher holds the last mailbox
   `Sender`, so channel disconnection could never fire while `join` waits. The
   worker exits on an explicit `Msg::Shutdown` sent by `Drop`.
+- **Refresh reseeding erases in-flight events.** A reconcile pass can land
+  between a carrier mutation and its flush window — declaration changes wake
+  reconcile immediately, so this fires every time a declaration is replaced.
+  Reseeding digests on watch-set application silently dropped that event; the
+  eval cell caught what the Rust tests missed because only the resident
+  supervisor loop races refresh against mutation processing.
 
 ## Result
 
