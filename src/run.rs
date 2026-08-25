@@ -2714,6 +2714,11 @@ fn up_loop_until(
         if let Some(watcher) = &mut watcher {
             watcher.refresh();
         }
+        // A recovered task that crash-loops again is a new crash-loop, so it must be able to surface
+        // again. Leaving the id in the dedup set would make every park after the first one silent.
+        for id in report.unparked.iter() {
+            reported_flapping.remove(id);
+        }
         recurring_warnings.filter(&mut report);
         park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
