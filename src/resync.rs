@@ -104,8 +104,8 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
 
 /// A URI denotes a local file when it is an absolute, authority-free `file://` URI or a
 /// scheme-less catalog-relative path resolved against the agent directory. Unsupported file URI
-/// authorities, query/fragment components, malformed escapes, and encoded path separators have no
-/// local denotation.
+/// authorities, query/fragment components, malformed escapes, encoded path separators, and
+/// encoded parent components have no local denotation.
 fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     if let Some(encoded_path) = uri.strip_prefix("file://") {
         if !encoded_path.starts_with('/')
@@ -114,27 +114,7 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
         {
             return None;
         }
-        let bytes = encoded_path.as_bytes();
-        let mut decoded = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] != b'%' {
-                decoded.push(bytes[index]);
-                index += 1;
-                continue;
-            }
-            let high = hex_value(*bytes.get(index + 1)?)?;
-            let low = hex_value(*bytes.get(index + 2)?)?;
-            let byte = (high << 4) | low;
-            // A decoded separator changes URI path segmentation, and NUL cannot be a filesystem
-            // path byte. Reject both rather than silently resolving a different carrier.
-            if matches!(byte, b'/' | b'\\' | b'\0') {
-                return None;
-            }
-            decoded.push(byte);
-            index += 3;
-        }
-        let path = PathBuf::from(String::from_utf8(decoded).ok()?);
+        let path = decode_percent_path(encoded_path)?;
         return path.is_absolute().then(|| lexical_clean(&path));
     }
     let has_uri_scheme = uri.split_once(':').is_some_and(|(scheme, _)| {
@@ -147,7 +127,48 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     if has_uri_scheme {
         return None;
     }
-    Some(lexical_clean(&agent_dir.join(uri)))
+    let path = decode_percent_path(uri)?;
+    Some(lexical_clean(&agent_dir.join(path)))
+}
+
+fn decode_percent_path(encoded_path: &str) -> Option<PathBuf> {
+    let bytes = encoded_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut component_start = 0;
+    let mut component_had_escape = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'/' {
+            if component_had_escape && decoded[component_start..] == *b".." {
+                return None;
+            }
+            decoded.push(b'/');
+            component_start = decoded.len();
+            component_had_escape = false;
+            index += 1;
+            continue;
+        }
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = hex_value(*bytes.get(index + 1)?)?;
+        let low = hex_value(*bytes.get(index + 2)?)?;
+        let byte = (high << 4) | low;
+        // A decoded separator changes URI path segmentation, and NUL cannot be a filesystem path
+        // byte. Reject both rather than silently resolving a different carrier.
+        if matches!(byte, b'/' | b'\\' | b'\0') {
+            return None;
+        }
+        decoded.push(byte);
+        component_had_escape = true;
+        index += 3;
+    }
+    if component_had_escape && decoded[component_start..] == *b".." {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf8(decoded).ok()?))
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -339,6 +360,8 @@ struct Entry {
     pending_transition: Option<PendingTransition>,
     dirty: bool,
 }
+type SubscriptionIdentity = (PathBuf, String);
+
 
 #[cfg(unix)]
 type DirIdentity = (u64, u64);
@@ -369,6 +392,10 @@ struct Worker {
     root: PathBuf,
     this_host: String,
     carriers: BTreeMap<PathBuf, Vec<Entry>>,
+    /// Last sequence reserved for each declaration/binding identity seen by this supervisor.
+    /// Inactive subscriptions stay here so a reinstall cannot collide with an earlier occurrence.
+    /// Its lifetime is the worker's and its cardinality is bounded by identities observed there.
+    subscription_sequences: BTreeMap<SubscriptionIdentity, u64>,
     deadlines: BTreeMap<CarrierClass, Instant>,
     watched: BTreeMap<PathBuf, Option<DirIdentity>>,
     /// `None` degrades to digest polling at refresh cadence (each reconcile pass) instead of
@@ -404,6 +431,7 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
         root,
         this_host,
         carriers: BTreeMap::new(),
+        subscription_sequences: BTreeMap::new(),
         deadlines: BTreeMap::new(),
         watched: BTreeMap::new(),
         watcher,
@@ -445,6 +473,7 @@ fn take_retained_entry(
 fn rebuild_carriers(
     mut previous: BTreeMap<PathBuf, Vec<Entry>>,
     refresh: WatchRefresh,
+    subscription_sequences: &BTreeMap<SubscriptionIdentity, u64>,
 ) -> BTreeMap<PathBuf, Vec<Entry>> {
     let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
     for set in refresh.sets {
@@ -453,11 +482,19 @@ fn rebuild_carriers(
             // routing metadata. Rebuild every retained entry from the current declaration while
             // carrying its baseline and immutable delivery snapshot. Looking across path buckets
             // also lets a binding's re-resolved path/class metadata become current.
+            let identity = (set.declaration_path.clone(), carrier.label.clone());
             let retained =
                 take_retained_entry(&mut previous, &set.declaration_path, &carrier.label);
             let (digest, occurrence_sequence, pending_transition, dirty) =
                 retained.map_or_else(
-                    || (read_digest(&carrier.path), 0, None, false),
+                    || {
+                        (
+                            read_digest(&carrier.path),
+                            subscription_sequences.get(&identity).copied().unwrap_or(0),
+                            None,
+                            false,
+                        )
+                    },
                     |entry| {
                         (
                             entry.digest,
@@ -507,6 +544,16 @@ fn rebuild_carriers(
 impl Worker {
     fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
         let previous = std::mem::take(&mut self.carriers);
+        // The active entries can disappear entirely while an agent is suspended. Retain only the
+        // scalar sequence floor per declaration/binding identity for this supervisor lifetime;
+        // watches and carrier baselines remain exclusively in the active carrier map.
+        for entry in previous.values().flatten() {
+            let identity = (entry.declaration_path.clone(), entry.label.clone());
+            self.subscription_sequences
+                .entry(identity)
+                .and_modify(|sequence| *sequence = (*sequence).max(entry.occurrence_sequence))
+                .or_insert(entry.occurrence_sequence);
+        }
         let previous_paths = previous
             .iter()
             .flat_map(|(path, entries)| {
@@ -518,7 +565,8 @@ impl Worker {
                 })
             })
             .collect::<BTreeMap<_, _>>();
-        self.carriers = rebuild_carriers(previous, refresh);
+        self.carriers =
+            rebuild_carriers(previous, refresh, &self.subscription_sequences);
 
         let rebound_paths = self
             .carriers
@@ -1111,7 +1159,7 @@ mod tests {
             },
         ];
 
-        let rebuilt = rebuild_carriers(previous, refresh_for(sets));
+        let rebuilt = rebuild_carriers(previous, refresh_for(sets), &BTreeMap::new());
         let entries = rebuilt.get(&shared).expect("shared path remains watched");
         assert_eq!(entries.len(), 2);
         for (bus_id, digest) in [
@@ -1164,7 +1212,7 @@ mod tests {
             }],
         )]);
 
-        let rebuilt = rebuild_carriers(previous, refresh_for(vec![current]));
+        let rebuilt = rebuild_carriers(previous, refresh_for(vec![current]), &BTreeMap::new());
         assert!(!rebuilt.contains_key(&old_path));
         let entry = rebuilt[&goal]
             .iter()
@@ -1180,6 +1228,7 @@ mod tests {
             root: root.path().to_path_buf(),
             this_host: "alias".to_owned(),
             carriers: rebuilt,
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1238,6 +1287,7 @@ mod tests {
                     dirty: true,
                 }],
             )]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1302,6 +1352,7 @@ mod tests {
                     dirty: false,
                 }],
             )]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::from([(parent.clone(), dir_identity(&parent))]),
             watcher: None,
@@ -1350,6 +1401,7 @@ mod tests {
                     dirty: true,
                 }],
             )]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::from([(CarrierClass::Immediate, old_deadline)]),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1419,6 +1471,7 @@ mod tests {
                 malformed_declarations: malformed_declarations.clone(),
                 live_task_ids: BTreeSet::from(["custom-worker-seat".to_owned()]),
             },
+            &BTreeMap::new(),
         );
         let entry = &retained[&declaration][0];
         assert_eq!(entry.digest.as_deref(), Some("before"));
@@ -1437,6 +1490,7 @@ mod tests {
                 malformed_declarations,
                 live_task_ids: BTreeSet::new(),
             },
+            &BTreeMap::new(),
         );
         assert!(
             dropped.is_empty(),
@@ -1488,6 +1542,7 @@ mod tests {
                     dirty: false,
                 }],
             )]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1540,6 +1595,7 @@ mod tests {
                     dirty: false,
                 }],
             )]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1592,6 +1648,7 @@ mod tests {
             root: root.path().to_path_buf(),
             this_host: "hetz".to_owned(),
             carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1658,6 +1715,7 @@ mod tests {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
             carriers: BTreeMap::from([(carrier, entries)]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::from([(CarrierClass::Immediate, now)]),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1670,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_identical_transitions_receive_distinct_occurrence_identities() {
+    fn reinstalled_subscription_keeps_occurrence_identity_without_an_active_watch() {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = root.path().join("agents/host/worker");
         let resources = agent_dir.join("resources");
@@ -1688,33 +1746,61 @@ mod tests {
         std::fs::write(&carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let set = watch_set_for(&discover(root.path()), "host");
+        let seen_subscription_count = set.carriers.len();
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
         };
-        worker.apply_watch_sets(refresh_for(vec![set]));
+        worker.apply_watch_sets(refresh_for(vec![set.clone()]));
 
-        let mut events = Vec::new();
-        for bytes in ["B", "A", "B"] {
-            std::fs::write(&carrier, bytes).unwrap();
-            worker.flush_path(&carrier, None);
-            events.push(resync_inbox_event(&agent_dir));
-        }
+        std::fs::write(&carrier, "B").unwrap();
+        worker.flush_path(&carrier, None);
+        let before_suspend = resync_inbox_event(&agent_dir);
 
-        assert_eq!(event_field(&events[0], "old"), event_field(&events[2], "old"));
-        assert_eq!(event_field(&events[0], "new"), event_field(&events[2], "new"));
-        assert_ne!(
-            event_field(&events[0], "event-id"),
-            event_field(&events[2], "event-id"),
-            "the second A→B occurrence must not deduplicate against the first"
+        // Suspension removes every carrier and watch, while retaining one scalar sequence floor
+        // for each declaration/binding identity seen during this supervisor incarnation.
+        worker
+            .watched
+            .insert(resources.clone(), dir_identity(&resources));
+        worker.apply_watch_sets(refresh_for(Vec::new()));
+        assert!(worker.carriers.is_empty());
+        assert!(worker.watched.is_empty());
+        assert_eq!(
+            worker.subscription_sequences.len(),
+            seen_subscription_count
         );
-        assert!(event_field(&events[0], "occurrence").ends_with(":1"));
-        assert!(event_field(&events[1], "occurrence").ends_with(":2"));
-        assert!(event_field(&events[2], "occurrence").ends_with(":3"));
+
+        std::fs::write(&carrier, "A").unwrap();
+        worker.apply_watch_sets(refresh_for(vec![set]));
+        let resumed = worker.carriers[&carrier]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert_eq!(resumed.occurrence_sequence, 1);
+        std::fs::write(&carrier, "B").unwrap();
+        worker.flush_path(&carrier, None);
+        let after_resume = resync_inbox_event(&agent_dir);
+
+        assert_eq!(
+            event_field(&before_suspend, "old"),
+            event_field(&after_resume, "old")
+        );
+        assert_eq!(
+            event_field(&before_suspend, "new"),
+            event_field(&after_resume, "new")
+        );
+        assert_ne!(
+            event_field(&before_suspend, "event-id"),
+            event_field(&after_resume, "event-id"),
+            "the post-resume A→B occurrence must not deduplicate against the pre-suspend one"
+        );
+        assert!(event_field(&before_suspend, "occurrence").ends_with(":1"));
+        assert!(event_field(&after_resume, "occurrence").ends_with(":2"));
     }
 
     #[test]
@@ -1741,6 +1827,7 @@ mod tests {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
             carriers: BTreeMap::from([(carrier.clone(), entries)]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1804,6 +1891,7 @@ mod tests {
                     dirty: true,
                 }],
             )]),
+            subscription_sequences: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -1937,6 +2025,13 @@ mod tests {
             resolve_local_path(agent_dir, "resources/journal.md"),
             Some(agent_dir.join("resources/journal.md"))
         );
+        assert_eq!(
+            resolve_local_path(
+                agent_dir,
+                "resources/with%20space/%E2%82%AC-journal.md"
+            ),
+            Some(agent_dir.join("resources/with space/€-journal.md"))
+        );
 
         for unsupported in [
             "file://authority/etc/demo.kdl",
@@ -1947,6 +2042,11 @@ mod tests {
             "file:///tmp/encoded%2fseparator",
             "file:///tmp/encoded%5Cseparator",
             "file:///tmp/bad%escape",
+            "file:///tmp/%2E%2E/escape",
+            "resources/encoded%2Fseparator",
+            "resources/encoded%5Cseparator",
+            "resources/%2E%2E/outside.md",
+            "resources/bad%escape",
             "http://x/y",
             "worktree://repo/main",
         ] {
