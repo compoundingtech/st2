@@ -1720,12 +1720,15 @@ fn reconcile_pass(
         // pass's observation. Install them before executing unrelated repairs; targeted upserts
         // preserve every retained baseline and pending transition.
         for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
-            resync.install_live(&spec, this_host);
+            report
+                .warnings
+                .extend(resync.install_live(&spec, this_host));
         }
     }
+    let mut boundary_warnings = Vec::new();
     let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
         if let Some(resync) = resync {
-            resync.install_live(spec, this_host);
+            boundary_warnings.extend(resync.install_live(spec, this_host));
         }
     };
     execute_with_presentation_cursor(
@@ -1736,6 +1739,7 @@ fn reconcile_pass(
         &mut report,
         &mut install_new_live_seat,
     );
+    report.warnings.extend(boundary_warnings);
     if let Some(resync) = resync {
         let profiles = crate::catalog::declared_profiles(root)
             .context("parse resource profiles in catalog.kdl");
@@ -3573,14 +3577,18 @@ mod tests {
             &mut report,
             &mut |spec| {
                 install_count += 1;
-                resync.install_live(spec, "hetz");
+                assert!(resync.install_live(spec, "hetz").is_empty());
             },
         );
-        resync.refresh(
-            &live_resync_specs(specs, "hetz", &[], &report),
-            "hetz",
-            &[],
-            &[],
+        assert!(
+            resync
+                .refresh(
+                    &live_resync_specs(specs, "hetz", &[], &report),
+                    "hetz",
+                    &[],
+                    &[],
+                )
+                .is_empty()
         );
         assert!(install_count > 0 || report.launched.is_empty());
         report
@@ -3742,15 +3750,19 @@ mod tests {
                 &mut report,
                 &mut |spec| {
                     installs.fetch_add(1, AtomicOrdering::SeqCst);
-                    resync.install_live(spec, "hetz");
+                    assert!(resync.install_live(spec, "hetz").is_empty());
                 },
             );
         });
-        resync.refresh(
-            &live_resync_specs(&specs, "hetz", &[], &report),
-            "hetz",
-            &[],
-            &[],
+        assert!(
+            resync
+                .refresh(
+                    &live_resync_specs(&specs, "hetz", &[], &report),
+                    "hetz",
+                    &[],
+                    &[],
+                )
+                .is_empty()
         );
 
         assert_eq!(
