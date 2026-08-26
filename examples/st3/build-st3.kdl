@@ -1,0 +1,78 @@
+subgraph {
+  resource "st3-complex-proof-review" { kind "human.review" }
+  resource "st3-full-corpus-review" { kind "human.review" }
+
+  checkpoints "build-st3" {
+    checkpoint "The implementation and automated tests pass" {
+      subgraph {
+        exec "build-st3/automated-tests" {
+          workspace "."
+          command "cargo test --workspace"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/build-st3/automated-tests" "is" "exited"
+        field "exit_code" "exec/build-st3/automated-tests" "is" 0
+        deadline "30m"
+      }
+    }
+
+    checkpoint "The catalog and eval translations pass parity checks" {
+      subgraph {
+        exec "build-st3/translation-parity" {
+          workspace "."
+          command "./scripts/prepare-st3-migration && ./scripts/check-st3-migration"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/build-st3/translation-parity" "is" "exited"
+        field "exit_code" "exec/build-st3/translation-parity" "is" 0
+        deadline "30m"
+      }
+    }
+
+    checkpoint "A person approves one complex paid proof" {
+      judges {
+        field "decision" "resource/st3-complex-proof-review" "is" "approved"
+      }
+    }
+
+    checkpoint "One complex eval proves the complete path" {
+      subgraph {
+        exec "build-st3/signal-rename-proof" {
+          workspace "."
+          command "st3 eval ./target/st3-migration/evals/signal-rename"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/build-st3/signal-rename-proof" "is" "exited"
+        field "exit_code" "exec/build-st3/signal-rename-proof" "is" 0
+        deadline "45m"
+      }
+    }
+
+    checkpoint "A person approves the full paid eval corpus" {
+      judges {
+        field "decision" "resource/st3-full-corpus-review" "is" "approved"
+      }
+    }
+
+    checkpoint "All translated evals pass" {
+      subgraph {
+        exec "build-st3/full-eval-corpus" {
+          workspace "."
+          command "./scripts/run-all-st3-evals"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/build-st3/full-eval-corpus" "is" "exited"
+        field "exit_code" "exec/build-st3/full-eval-corpus" "is" 0
+        deadline "4h"
+      }
+    }
+  }
+}

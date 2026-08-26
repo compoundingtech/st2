@@ -1225,6 +1225,61 @@ pub fn run_controlled(
     }
 }
 
+/// Run the native Codex driver with explicit private state paths.
+///
+/// A claims-graph caller uses this entry point without creating an st2 catalog. The native driver
+/// still owns the app-server protocol, thread binding, typed delivery receipts, and harness record.
+pub fn run_controlled_paths(
+    driver_root: &Path,
+    state_dir: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !codex_argv.is_empty(),
+        "Codex controlled launch argv is empty"
+    );
+    ensure_supported_version(&codex_argv[0])?;
+    secure_dir(driver_root)?;
+    secure_dir(state_dir)?;
+    secure_dir(agent_dir)?;
+    let inbox = message::inbox_dir(agent_dir);
+    secure_dir(&inbox)?;
+    secure_dir(&message::archive_dir(agent_dir))?;
+    let delivery = CodexDeliveryConfig {
+        catalog_root: driver_root.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        inbox,
+        identity: identity.clone(),
+        this_host: run::detect_host(),
+    };
+    let _owner_lock = acquire_owner_lock(state_dir)?;
+    let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
+    diagnostics.record("ownerAcquired", json!({ "mode": "explicit-paths" }))?;
+    let result = run_controlled_owned(
+        driver_root,
+        state_dir,
+        identity,
+        runtime_id,
+        codex_argv,
+        delivery,
+        &mut diagnostics,
+    );
+    match result {
+        Ok(()) => {
+            diagnostics.record("completed", json!({}))?;
+            Ok(())
+        }
+        Err(error) => {
+            let text = format!("{error:#}");
+            let _ = diagnostics.record("failed", json!({ "error": text }));
+            Err(error)
+        }
+    }
+}
+
 fn run_controlled_owned(
     catalog_root: &Path,
     state_dir: &Path,
@@ -2072,6 +2127,9 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
                 pending = resumable.handshake();
             }
             Err(tungstenite::HandshakeError::Failure(error)) => {
+                if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 anyhow::bail!("Codex WebSocket handshake failed: {error}")
             }
         }
@@ -2576,10 +2634,22 @@ fn completed_tui(status: ExitStatus) -> Result<()> {
 }
 
 fn ensure_supported_version(codex: &str) -> Result<()> {
-    let output = Command::new(codex)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("reading Codex version from {codex}"))?;
+    let mut attempt_index = 0;
+    let output = loop {
+        let attempt = Command::new(codex).arg("--version").output();
+        match attempt {
+            Ok(output) => break output,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt_index + 1 < 5 => {
+                // Some Linux filesystems briefly retain writer exclusion after a binary install.
+                // Retry only this transient error and keep every other launch error immediate.
+                attempt_index += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading Codex version from {codex}"));
+            }
+        }
+    };
     anyhow::ensure!(
         output.status.success(),
         "{codex} --version failed: {}",

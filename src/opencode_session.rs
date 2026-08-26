@@ -1608,11 +1608,8 @@ mod tests {
     /// the ordinary id-matched exit still releases it.
     #[test]
     fn seeding_recovers_a_pending_ask_and_gates_evidence_on_the_level_seed() {
-        let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
-        let state_path = tmp.path().join("state/delivery-state.json");
-        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
 
         // A transiently failing level seed yields no evidence at all.
         server.status_error.store(true, Ordering::SeqCst);

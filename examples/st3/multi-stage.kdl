@@ -1,0 +1,37 @@
+subgraph {
+  resource "release-review" {
+    kind "human.review"
+  }
+
+  checkpoints "release" scope="scope/release-example" {
+    checkpoint "The build command passes" {
+      subgraph {
+        exec "release-example/build" {
+          workspace "."
+          command "cargo test --workspace"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/release-example/build" "is" "exited"
+        field "exit_code" "exec/release-example/build" "is" 0
+        deadline "20m"
+      }
+    }
+
+    checkpoint "A person approves the release" {
+      judges {
+        field "decision" "resource/release-review" "is" "approved"
+      }
+    }
+
+    checkpoint "The temporary release scope is empty" {
+      subgraph {
+        scope "release-example" { stop }
+      }
+      judges {
+        empty "scope/release-example"
+      }
+    }
+  }
+}

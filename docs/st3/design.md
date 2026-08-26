@@ -1,13 +1,6 @@
 # st3 engineering design
 
-Status: proposed for review. This document contains no implementation.
-
-The design uses these catalog sources:
-
-- `~/.local/state/st2/default/catalog/plans/st3.md`
-- `~/.local/state/st2/default/catalog/plans/st3/what-it-is.md`
-
-The existing eval cells are at `~/src/github.com/compoundingtech/evals/cells`.
+Status: implemented on the st3 engineering branch. This document is the version 1 contract.
 
 ## Outcome
 
@@ -72,11 +65,15 @@ Sandboxes remain wanted for all agent types, including workers and judges. Versi
 
 Mechanical judges remain the deterministic first choice when a command can decide the result.
 
-### 3. Exchange claims through a Fabric-carried port
+### 3. Exchange claims through a configured peer port
 
-Fabric carries an authenticated st3 port between hosts. st3 owns the claim replication protocol on that port.
+st3 owns the claim replication protocol on a configured HTTP port.
 
-This choice reuses peer identity, reachability, and peer-drop signals. It avoids a second host network and a second trust configuration.
+The operator supplies the private network. The network can be a VPN, a VPC, Tailscale, or another trusted path.
+
+st3 has no Fabric dependency or Fabric-specific behavior.
+
+Version 1 does not authenticate peers, use TLS, or enforce ACLs. The daemon warns about this limit at startup.
 
 Every authorized host accepts writes. Replication is bidirectional and master-master.
 
@@ -150,7 +147,7 @@ st3 has these components:
 5. The dispatcher starts a reconcile after a state-bearing claim commits.
 6. The reconciler selects the next checkpoint and requests bounded actions.
 7. Runtime drivers operate PTYs, processes, messages, harness readers, and judges.
-8. The peer adapter exchanges claims through Fabric and reports peer-drop claims.
+8. The peer adapter exchanges claims with configured peers and reports peer-drop claims.
 9. The terminal endpoint records input before it proxies that input to an attached PTY.
 10. The clock adapter turns declared schedule occurrences into claims.
 
@@ -206,9 +203,9 @@ A display name, file name, and scope tag are not identities.
 
 Each runtime incarnation has a new `incarnation_id`. A restart does not change the member subject.
 
-Each claim has an authenticated origin and an optional actor. The Unix socket maps a local user to an origin.
+Each claim has a recorded origin and an optional actor. Version 1 does not authenticate that origin.
 
-Fabric maps a peer connection to a replica host. The signed batch preserves the authenticated author origin.
+The Unix socket permissions restrict local access to its owner. A configured peer label records the replica host.
 
 An agent can publish only its allowed subjects and claim kinds.
 
@@ -236,7 +233,7 @@ The revision generation and stable revision key select one deterministic winner.
 
 The local API uses HTTP with JSON over a Unix socket. Terminal attachment upgrades one request to a binary WebSocket.
 
-Peer replication uses the same claim envelope over the Fabric-carried port. Peer endpoints require a host identity.
+Peer replication uses the same claim envelope over a configured plain HTTP port.
 
 Every JSON response has this envelope:
 
@@ -287,8 +284,14 @@ The API uses these common failures:
 | `POST /v1/sessions/{subject}/context/clear` | An expected incarnation and idempotency key | The recorded control action and result cursor |
 | `POST /v1/sessions/{subject}/signal` | An expected incarnation, signal, and idempotency key | The recorded action and result cursor |
 | `POST /v1/sessions/{subject}/attach` | A live subject and terminal dimensions | A short-lived terminal capability and WebSocket path |
-| `POST /v1/peer/claims` | Ordered replica batches from one Fabric peer | Accepted and missing replica sequence ranges |
+| `POST /v1/peer/claims` | Ordered replica batches from one configured peer | Accepted and missing replica sequence ranges |
 | `POST /v1/peer/claims/query` | Per-replica sequence heads | A stream of missing replica batches |
+
+Clients percent-encode a full subject when the subject occupies one path segment.
+
+The context-clear control supports a live terminal Claude driver in version 1. The adapter translates the typed request to Claude's clear control.
+
+The session-signal control accepts `interrupt`, `hangup`, `user-1`, or `user-2`. Lifecycle stop still uses desired state, not this endpoint.
 
 ### Intent request types
 
@@ -567,7 +570,7 @@ PeerClaimResponse {
 }
 ```
 
-`GET /v1/claims` returns a bounded page plus `next_cursor`. `GET /v1/events` emits the response envelope for each committed batch.
+`GET /v1/claims` returns a bounded page plus `next_cursor`. `GET /v1/events` returns bounded long-poll batches in the response envelope.
 
 ### Every change has a claim
 
@@ -626,7 +629,7 @@ Use a scheduled message for that query. Do not add a usage poll.
 
 ### CLI mapping
 
-Every command accepts `--endpoint`. It selects a local socket or an authenticated Fabric endpoint.
+Every command accepts `--endpoint`. It selects a local socket or a configured HTTP endpoint.
 
 `st3 run FILE` reads one KDL file. It never reads a filesystem path from a document reference.
 
@@ -707,7 +710,7 @@ A conflict does not change the exit code. Status shows the selected winner and e
 
 `st3 claim SUBJECT KIND [--actor SUBJECT] [--field KEY=VALUE]...` posts one typed observation.
 
-The authenticated connection supplies the origin. The command cannot select its origin or bypass the claim kind authority registry.
+The daemon supplies the recorded origin. The command cannot select another origin or bypass the claim kind registry.
 
 The server records acceptance time. It validates the optional actor and every claim body field against the selected kind schema.
 
@@ -940,7 +943,7 @@ The first implementation needs these state-bearing claim families:
 - `harness.compacted` and `harness.cleared` record context-generation events.
 - `harness.error` records a typed native harness error.
 - `gate.observed` records a declared gate entering or leaving the visible screen.
-- `transport.peer` records an up or down event on a host subject from Fabric.
+- `transport.peer` records an up or down event on a host subject from the peer adapter.
 - `message.sent` records accepted message content.
 - `message.delivered` records the native driver's observation that the message appeared in the conversation.
 - `message.accepted` records the recipient's lifecycle claim.
@@ -1695,11 +1698,15 @@ run_llm_judge(definition, snapshot):
     return judgement
 ```
 
-The llm judge can read a diff, run tests, use the network, and publish claims allowed for its authenticated origin.
+The llm judge can read a diff, run tests, use the network, and publish claims allowed for its operation capability.
 
 It is not limited to a fixed claim query or a prompt-only call. Its token budget and time limit remain mandatory.
 
-The llm judge posts `pass` or `fail` through `st3 judgement`. The runner does not parse text from its process output.
+The llm judge posts `pass` or `fail` through `st3 judgement`.
+
+The runner reads the provider's structured usage output after exit. It does not parse judgment prose from process output.
+
+Missing structured usage fails the judge. Usage above the declared token budget also fails the judge.
 
 The implementation should later add one sandbox model for all agents. Version 1 does not impose a judge-only sandbox.
 
@@ -1795,7 +1802,7 @@ A full subject string is required in judges, links, stop nodes, resource binding
 
 The message `from` and `to` children also accept a bare agent identity. Normalization adds `agent/` to that identity.
 
-The reserved sender `requester` resolves to the authenticated publisher subject. No other reserved subject word exists.
+The reserved sender `requester` resolves to the recorded publisher subject. No other reserved subject word exists.
 
 ### Desired-state blocks
 
@@ -1964,7 +1971,7 @@ A stream block accepts either `command "SHELL"` or `argv "PROGRAM" "ARG"...`. It
 
 A stream accepts no other child. In particular, `every` is invalid because scheduled work uses a `schedule` subject.
 
-A launched stream derives one exec member under the agent. A command-less stream is an authenticated ingress endpoint.
+A launched stream derives one exec member under the agent. A command-less stream is a configured ingress endpoint.
 
 ### Render block
 
@@ -2005,7 +2012,7 @@ Observed declarations name world-owned subjects. They never grant st3 lifecycle 
 `resource.kind` accepts one non-empty registered kind string. Version 1 includes these kinds:
 
 - `vcs.pull-request`, `ci.run`, and `repository`;
-- `file`, `document`, and `harness.session-file`.
+- `file`, `document`, `harness.session-file`, and `human.review`.
 
 An unknown resource kind produces `unsupported-capability`. A future daemon can add a kind without changing the node shape.
 
@@ -2031,7 +2038,7 @@ Quota is observed state and is invalid in the account declaration. The account a
 
 An agent publishes an `agent.account` claim when it selects an account. The claim changes when the agent rotates accounts.
 
-The host group declares its observed host subject. Fabric attaches `transport.peer` claims to that subject.
+The host group declares its observed host subject. The peer adapter attaches `transport.peer` claims to that subject.
 
 A repository and a harness session file are resource kinds. Neither is a separate subject type.
 
@@ -2282,7 +2289,7 @@ A file subject has the form `file/HOST:ABSOLUTE-PATH`. It is a resource subject 
 
 The first file predicate at one input index requests a read from the encoded host. No process judge is required.
 
-The reader records `resource.file-observed` with the subject, path, mode, content hash, blob reference, time, and authenticated origin.
+The reader records `resource.file-observed` with the subject, path, mode, content hash, blob reference, time, and daemon origin.
 
 A `field` predicate over a structured file parses its recorded content. Version 1 parses JSON files and uses dotted object paths.
 
@@ -2709,6 +2716,10 @@ After parity passes, delete the rewrite script. The committed new-format files b
 
 `st3 import ./catalog` and `st3 eval ./cell` then read those explicit new-format folders.
 
+During a no-downtime cutover, `st3 up --pty-root PATH` observes the existing PTY registry. A matching desired member adopts that exact runtime incarnation.
+
+The daemon passes the selected `PTY_ROOT` to each new member. It keeps the st3 claim store separate from the old catalog and state roots.
+
 ## `st3 claude`
 
 ### Command
@@ -2818,7 +2829,7 @@ replicate(peer):
     stream = POST peer /v1/peer/claims/query { replica_heads: local_heads }
 
     for batch in stream:
-        verify_fabric_replica(peer, batch.replica_id)
+        verify_configured_replica_label(peer, batch.replica_id)
         verify_origin_authority(batch.origin, batch.claims)
         verify_previous_replica_batch(batch)
         verify_subject_predecessors_or_request_missing(batch)
@@ -2829,7 +2840,7 @@ replicate(peer):
 
 The receiver assigns a local ingestion index. It preserves the sender's replica sequence and chain.
 
-Fabric reports a peer drop through the adapter. The adapter appends `transport.peer state="down"` once per connection transition.
+The peer adapter reports a connection failure. It appends `transport.peer state="down"` once per connection transition.
 
 st3 does not infer a peer drop from elapsed time. It does not poll a sleeping peer.
 
@@ -2860,17 +2871,25 @@ The host does not stop healthy local work because a remote host is absent. A req
 | Judge exceeds a limit | `judge.result` fail | Keep the reason and stop the judge operation. |
 | Required eval member is unreachable | Eval verdict `void` | Select the final stop and report `cannot reach intent` until cleanup succeeds. |
 | A scheduled time arrives | `clock.reached` | Create one idempotent message occurrence. |
-| Fabric peer drops | `transport.peer` down | Continue local intent and mark remote actual state unknown. |
+| A configured peer drops | `transport.peer` down | Continue local intent and mark remote actual state unknown. |
 | Missing replica sequence | Replica batch rejected | Request the exact missing replica range. |
 | Reducer cache is lost | No truth is lost | Replay claims through the requested index. |
 
 ## Security properties
 
-The local socket uses filesystem permissions and peer credentials. The peer port accepts only Fabric-authenticated hosts.
+Version 1 is not secure by default.
 
-The API checks claim authority by authenticated origin. A request body cannot choose a stronger origin.
+The local socket uses mode `0600`. The peer port has no TLS, peer authentication, or ACL enforcement.
 
-Worker queries cannot read held-out judge definitions, prompts, executables, or private evidence selectors.
+An operator must bind the peer port only on a trusted private network or leave it disabled.
+
+TLS and ACL support are planned. They remain outside version 1.
+
+st3 does not know which network product carries the traffic. A later access layer can use node identities supplied by that network.
+
+Version 1 cannot hide held-out judge definitions from another process that runs as the same local operating-system user. The local user remains trusted.
+
+A later authenticated query view will withhold judge prompts, executables, and private evidence selectors from worker identities.
 
 The daemon database and judge bundle stay outside worker workspaces. The judge runner receives them through a separate capability.
 
@@ -2908,7 +2927,7 @@ The implementation should follow the vertical checkpoints in the source plan.
 4. Add decision claims, the cheap ladder, the bounded residue model, restart controls, links, and gate actions.
 5. Add checkpoint progression and both bounded judge types.
 6. Write the temporary migration script, rewrite the eval corpus, and prove parity for existing `ask` judges.
-7. Add Fabric replication, offline subject writes, import each rewritten declaration, and prove graph parity before cutover.
+7. Add generic peer replication, offline subject writes, import each rewritten declaration, and prove graph parity before cutover.
 
 Each step must end with the source plan's stated checkpoint. st2 remains the live reconciler until the final parity proof.
 

@@ -1,0 +1,10 @@
+subgraph {
+  agent "catalog.reviewer" {
+    workspace "."
+    restart "always"
+    claude {
+      dev-channels #true
+      prompt "Review work from the graph and report evidence."
+    }
+  }
+}

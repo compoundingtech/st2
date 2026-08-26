@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=${1:-${ST3_TRANSLATED_EVALS:-}}
+if [ -z "$root" ] || [ ! -d "$root" ]; then
+  echo "usage: run-all-st3-evals TRANSLATED_EVALS" >&2
+  echo "This command spends model tokens. Run it only after a human approves the corpus gate." >&2
+  exit 2
+fi
+
+mapfile -t cells < <(find "$root" -mindepth 2 -maxdepth 2 -name eval.kdl -printf '%h\n' | sort)
+if [ "${#cells[@]}" -eq 0 ]; then
+  echo "no translated eval cells exist under $root" >&2
+  exit 2
+fi
+
+for cell in "${cells[@]}"; do
+  echo "running $(basename "$cell")"
+  st3 eval "$cell"
+done

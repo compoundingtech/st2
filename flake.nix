@@ -143,6 +143,45 @@
           };
         };
 
+        st3 = pkgs.rustPlatform.buildRustPackage {
+          pname = "st3";
+          inherit version;
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+          ];
+          cargoTestFlags = [
+            "-p"
+            "st-runtime"
+            "-p"
+            "st3"
+            "-p"
+            "st3-migrate"
+          ];
+          nativeBuildInputs = [ pkgs.installShellFiles ];
+          postInstall = ''
+            $out/bin/st3 completions bash > st3.bash
+            $out/bin/st3 completions zsh > _st3
+            $out/bin/st3 completions fish > st3.fish
+            installShellCompletion --cmd st3 --bash st3.bash --zsh _st3 --fish st3.fish
+          '';
+          meta = {
+            description = "Claims-graph agent reconciler and st2 KDL migration tool";
+            homepage = "https://github.com/compoundingtech/st2";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "st3";
+          };
+        };
+
+        st3Help = pkgs.runCommand "st3-help-check" { } ''
+          ${st3}/bin/st3 --help > $out
+          ${st3}/bin/st3-migrate --help >> $out
+        '';
+
         # Narrow sandbox-safe integration gate for the atomic snapshot boundary. The main package
         # deliberately omits the broad doctor suite because some doctor cases exercise facilities
         # unavailable in the Nix sandbox. A dedicated target containing exactly one test makes the
@@ -218,6 +257,8 @@
       in
       {
         packages.st2 = st2;
+        packages.st3 = st3;
+        packages.st3-migrate = st3;
         packages.default = st2;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
@@ -230,6 +271,8 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
+        checks.st3 = st3;
+        checks.st3-help = st3Help;
         checks.atomic-pty-snapshot = st2AtomicPtySnapshot;
         checks.catalog-bootstrap = st2CatalogBootstrap;
         checks.message-cli = st2MessageCli;

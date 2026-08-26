@@ -357,6 +357,9 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
     }
 
     let apply = |prepared: &Path, expected: &str| {
+        let input_sha256 = st2::catalog_transaction::digest_prepared(&catalog, prepared)
+            .unwrap()
+            .root_sha256;
         Command::new(env!("CARGO_BIN_EXE_st2"))
             .args([
                 "catalog",
@@ -365,6 +368,8 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
                 catalog.to_str().unwrap(),
                 "--prepared",
                 prepared.to_str().unwrap(),
+                "--input-sha256",
+                &input_sha256,
                 "--expect-sha256",
                 expected,
                 "--json",

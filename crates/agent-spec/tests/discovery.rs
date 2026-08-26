@@ -1563,6 +1563,27 @@ fn malformed_kdl_is_collected_as_error() {
 }
 
 #[test]
+fn a_nested_generic_filename_is_static_without_agent_shaped_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/worker/agent.kdl",
+        r#"agent "worker" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/worker/docs/agent.kdl",
+        "note \"documentation metadata\"\n",
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
+    assert_eq!(found.specs.len(), 1);
+    assert_eq!(found.declarations.len(), 1);
+    assert_eq!(found.specs[0].identity, "worker");
+}
+
+#[test]
 fn non_spec_files_are_skipped_silently() {
     let tmp = tempfile::tempdir().unwrap();
     write(

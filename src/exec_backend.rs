@@ -934,18 +934,8 @@ fn generation_id(runtime_id: &str, pid: u32, created_at: &str, start_time_ticks:
 
 #[cfg(target_os = "linux")]
 pub(crate) fn process_start_time_ticks(pid: i32) -> anyhow::Result<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let after_comm = stat
-        .rsplit_once(") ")
-        .ok_or_else(|| anyhow::anyhow!("malformed /proc/{pid}/stat"))?
-        .1;
-    // Fields after comm begin at field 3 (state); starttime is field 22, therefore index 19.
-    after_comm
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| anyhow::anyhow!("missing starttime in /proc/{pid}/stat"))?
-        .parse()
-        .with_context(|| format!("parsing starttime in /proc/{pid}/stat"))
+    let pid = u32::try_from(pid).context("a process ID cannot be negative")?;
+    st_runtime::process_start_token(pid)
 }
 
 #[cfg(target_os = "macos")]

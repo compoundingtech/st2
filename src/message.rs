@@ -1499,11 +1499,8 @@ pub fn send_to_resolved_inbox(
             .as_ref()
             .map(|agent| agent.bus_id.as_str())
             .unwrap_or(from);
-        anyhow::ensure!(
-            sender.is_some() || external_sender,
-            "no agent '{from}' found in catalog {}",
-            catalog_root.display()
-        );
+        // The eval injects this capability into an already admitted seat. Keep its frozen sender
+        // spelling usable if the declaration disappears after boot.
         let (inbox, _) = recipient.boxes()?;
         return send_to_inbox(&inbox, canonical_from, subject, in_reply_to, tags, body);
     }
@@ -2424,5 +2421,37 @@ mod tests {
                 "accepted unsafe external identity {identity:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_external_eval_inbox_accepts_a_frozen_sender_after_declaration_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let peer = root.join("agents/h/peer");
+        fs::create_dir_all(&peer).unwrap();
+        fs::write(
+            peer.join("agent.kdl"),
+            r#"agent "peer" { host "h"; command "true" }"#,
+        )
+        .unwrap();
+        let external = ExternalInbox::provision(root, "requester").unwrap();
+
+        let filename = send_to_resolved_inbox(
+            root,
+            "requester",
+            "h",
+            "h.removed",
+            None,
+            None,
+            &[],
+            "done",
+            None,
+            Some(&external),
+        )
+        .unwrap();
+
+        let message = read_msg(&external.inbox, &filename).unwrap();
+        assert_eq!(message.from.as_deref(), Some("h.removed"));
+        assert_eq!(message.body.trim_end(), "done");
     }
 }

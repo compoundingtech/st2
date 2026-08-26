@@ -1,0 +1,13 @@
+subgraph {
+  agent "reviewer" {
+    identity "team.reviewer"
+    name "Review agent"
+    workspace "."
+    restart "always"
+    shutdown-timeout "5s"
+    claude {
+      dev-channels #true
+      prompt "Review the current work and wait for graph messages."
+    }
+  }
+}

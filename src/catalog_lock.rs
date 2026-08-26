@@ -154,6 +154,11 @@ impl CatalogLock {
         Self::acquire(catalog, Mode::Shared, false, true)
     }
 
+    /// Read the stable control identity for state-plane ownership during an incomplete apply.
+    pub(crate) fn shared_for_state_plane(catalog: &Path) -> Result<Self> {
+        Self::acquire(catalog, Mode::Shared, true, true)
+    }
+
     /// Acquire the existing catalog lock without initializing missing control state.
     pub(crate) fn shared_existing(catalog: &Path) -> Result<Self> {
         Self::acquire(catalog, Mode::Shared, false, false)

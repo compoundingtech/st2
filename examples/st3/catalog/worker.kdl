@@ -1,0 +1,9 @@
+subgraph {
+  agent "catalog.worker" {
+    workspace "."
+    restart "always"
+    codex {
+      prompt "Own the assigned repository and wait for graph messages."
+    }
+  }
+}

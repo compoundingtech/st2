@@ -106,7 +106,7 @@ struct StreamOwnerBinding {
 }
 
 pub(crate) fn publish_owner_binding(root: &Path, host: &str) -> anyhow::Result<()> {
-    let lock = crate::catalog_lock::CatalogLock::shared(root)?;
+    let lock = crate::catalog_lock::CatalogLock::shared_for_state_plane(root)?;
     let metadata = lock.control().metadata()?;
     let binding = StreamOwnerBinding {
         schema: "st2.stream-owner.v1".to_owned(),

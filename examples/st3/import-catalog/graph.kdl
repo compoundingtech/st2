@@ -1,0 +1,7 @@
+subgraph {
+  person "reviewer"
+  message "import-proof" {
+    to "person/reviewer"
+    content "doc/examples/import-proof@b4ff8a4a0e6e1611c3b714356efb8ea91bbdfb8e5b02d6749647c0bed0d2931d"
+  }
+}

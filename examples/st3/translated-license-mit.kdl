@@ -1,0 +1,58 @@
+subgraph {
+  checkpoints "eval/license-mit" scope="scope/eval/license-mit" {
+    checkpoint "The eval team is running" {
+      subgraph {
+        agent "mix.sup" {
+          workspace "${EVAL_ROOT}/sup"
+          command "exec claude --permission-mode bypassPermissions 'Read CLAUDE.md and handle st3 graph messages.'"
+          restart "never"
+          env { ST_AGENT "mix.sup" }
+        }
+        agent "mix.worker" {
+          workspace "${EVAL_ROOT}/worker"
+          command "exec claude --permission-mode auto 'Read CLAUDE.md and handle st3 graph messages.'"
+          restart "never"
+          env { ST_AGENT "mix.worker" }
+        }
+        message "kickoff" {
+          from "requester"
+          to "mix.sup"
+          content "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+        }
+      }
+      judges {
+        field "status" "agent/mix.sup" "is" "running"
+        field "status" "agent/mix.worker" "is" "running"
+        deadline "20m"
+      }
+    }
+
+    checkpoint "All held-out judges pass" {
+      judges {
+        judge "LICENSE is real MIT" {
+          exec "grep -F 'Permission is hereby granted' worker/LICENSE"
+          host "local"
+          workspace "${EVAL_ROOT}"
+          time-limit "120s"
+        }
+        judge "The confirmation contains evidence" type="llm" {
+          model "gpt-5.6-sol"
+          host "local"
+          workspace "${EVAL_ROOT}"
+          tools "shell" "git"
+          token-budget 8192
+          time-limit "120s"
+          prompt "Check that the completion message cites the commit and test evidence."
+        }
+        deadline "20m"
+      }
+    }
+
+    checkpoint "The temporary eval scope is empty" {
+      subgraph {
+        scope "eval/license-mit" { stop }
+      }
+      judges { empty "scope/eval/license-mit" }
+    }
+  }
+}
