@@ -83,7 +83,7 @@ pub fn discover_strict(root: &Path) -> Discovered {
 /// `root` supplies the same path defaults as [`discover`]. The returned warnings describe only
 /// this file.
 pub fn discover_file(root: &Path, path: &Path) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
-    let raws = parse_raw_file(path)?;
+    let raws = parse_raw_file(Some(root), path)?;
     load_specs(root, path, raws)
 }
 
@@ -94,7 +94,8 @@ fn discover_impl(root: &Path, strict: bool) -> Discovered {
     collect_spec_files(root, root, &mut files, strict, &mut out.errors);
     files.sort();
     for path in files {
-        let ParsedRawFile { raws, declaration } = parse_raw_file_with_declaration(&path);
+        let ParsedRawFile { raws, declaration } =
+            parse_raw_file_with_declaration(Some(root), &path);
         let agents = raws
             .as_ref()
             .map(|raws| raws.iter().map(Declared::from).collect())
@@ -167,7 +168,7 @@ pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
     let mut parent = root.to_path_buf();
     for name in components {
         if matches!(name.to_str(), Some("resources" | "archive" | "inbox"))
-            && is_declaration_parent(&parent)
+            && is_declaration_parent(root, &parent)
         {
             return false;
         }
@@ -183,7 +184,7 @@ pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
 /// cannot suddenly expose its inbox as candidate specs. Named declaration files are recognized
 /// only when they parse as an agent spec, which keeps ordinary project JSON/TOML/KDL from claiming
 /// an unrelated `resources` directory.
-fn is_declaration_parent(dir: &Path) -> bool {
+fn is_declaration_parent(catalog_root: &Path, dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
@@ -200,7 +201,8 @@ fn is_declaration_parent(dir: &Path) -> bool {
         if path.file_stem().and_then(|stem| stem.to_str()) == Some("agent") {
             return true;
         }
-        parse_raw_file(&path).is_ok_and(|raws| raws.iter().any(RawSpec::looks_like_spec))
+        parse_raw_file(Some(catalog_root), &path)
+            .is_ok_and(|raws| raws.iter().any(RawSpec::looks_like_spec))
     })
 }
 
@@ -336,14 +338,17 @@ impl From<&RawSpec> for Declared {
 /// One entry per parsed node, *including* nodes [`discover`] skips as non-specs, so this is not
 /// positionally paired with that file's [`Discovered::specs`].
 pub fn parse_declared(path: &Path) -> anyhow::Result<Vec<Declared>> {
-    Ok(parse_raw_file(path)?.iter().map(Declared::from).collect())
+    Ok(parse_raw_file(None, path)?
+        .iter()
+        .map(Declared::from)
+        .collect())
 }
 
 /// Parse a spec file into its raw (pre-resolution) shape — one per `agent` node for KDL, 0-or-1 for
 /// TOML/JSON. Non-spec extensions yield an empty vec. Shared by discovery and [`parse_declared`]
 /// (which exposes the *raw* `type` and `identity` before normalization, without leaking [`RawSpec`]).
-fn parse_raw_file(path: &Path) -> anyhow::Result<Vec<RawSpec>> {
-    parse_raw_file_with_declaration(path).raws
+fn parse_raw_file(catalog_root: Option<&Path>, path: &Path) -> anyhow::Result<Vec<RawSpec>> {
+    parse_raw_file_with_declaration(catalog_root, path).raws
 }
 
 struct ParsedRawFile {
@@ -351,7 +356,7 @@ struct ParsedRawFile {
     declaration: Option<DeclaredParse>,
 }
 
-fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
+fn parse_raw_file_with_declaration(catalog_root: Option<&Path>, path: &Path) -> ParsedRawFile {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -364,7 +369,7 @@ fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
     };
     if ext == "kdl" {
         let mut declaration = parse_declared_document(path, &text);
-        admit_catalog_envelope_nodes(path, &mut declaration);
+        admit_catalog_envelope_nodes(catalog_root, path, &mut declaration);
         let is_adjacent_kdl = declaration
             .document
             .as_ref()
@@ -414,12 +419,19 @@ fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
     }
 }
 
-/// `catalog.kdl` is a shared envelope: st2 owns its `catalog`/`profile` nodes while Agent Spec
-/// discovery owns any colocated `agent` nodes. Suppress only the top-level diagnostics attached to
-/// those two explicitly admitted envelope node kinds; every agent-shape diagnostic and every other
-/// unexpected node remains an error.
-fn admit_catalog_envelope_nodes(path: &Path, declaration: &mut DeclaredParse) {
-    if path.file_name().and_then(|name| name.to_str()) != Some("catalog.kdl") {
+/// The catalog root's `catalog.kdl` is a shared envelope: st2 owns its `catalog`/`profile` nodes
+/// while Agent Spec discovery owns any colocated `agent` nodes. Suppress only the top-level
+/// diagnostics attached to those two explicitly admitted envelope node kinds; a nested file that
+/// merely shares the basename has no catalog-control-plane authority.
+fn admit_catalog_envelope_nodes(
+    catalog_root: Option<&Path>,
+    path: &Path,
+    declaration: &mut DeclaredParse,
+) {
+    let Some(catalog_root) = catalog_root else {
+        return;
+    };
+    if path.strip_prefix(catalog_root).ok() != Some(Path::new("catalog.kdl")) {
         return;
     }
     let Some(document) = declaration.document.as_ref() else {
