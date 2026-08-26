@@ -13,6 +13,8 @@
 //! `cargo build -p demo-resolver-wasm --target wasm32-unknown-unknown --release`
 //! and refresh `crates/agent-spec/tests/fixtures/demo_resolver.wasm`.
 
+// Keep native `cargo test --workspace --lib` viable while this wasm-only fixture remains a member.
+#![cfg(target_arch = "wasm32")]
 #![no_std]
 #![deny(warnings)]
 
