@@ -128,13 +128,59 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
 
 #[test]
 fn st2_without_endpoint_does_not_error() {
+    let Some(otelite) = std::env::var_os("ST2_OTELITE_BIN").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("ST2_ALLOW_OTEL_SKIP").is_some(),
+            "`ST2_OTELITE_BIN` not set — can't prove OTLP silence. Set ST2_ALLOW_OTEL_SKIP=1 to skip."
+        );
+        eprintln!("SKIP st2_without_endpoint_does_not_error: ST2_OTELITE_BIN not set");
+        return;
+    };
+
     // No-op guarantee: an unset OTEL_EXPORTER_OTLP_ENDPOINT must keep every command working
-    // (here: a trivially valid CLI invocation) with no telemetry side effects.
+    // AND emit no telemetry at all. Run a real `st2 up --once` against a scratch EMPTY
+    // catalog with a live otelite receiver attached; if an always-on-export regression ever
+    // lands, the receiver flushes non-empty ndjson files here and the test fails — a bare
+    // `--version` smoke could never catch that.
     let bin = env!("CARGO_BIN_EXE_st2");
+    let bin_dir = Path::new(bin).parent().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cap_dir = tmp.path().join("cap");
+    let empty_catalog = tmp.path().join("catalog");
+    std::fs::create_dir_all(&empty_catalog).unwrap();
+
+    let (mut capture, _endpoint) = spawn_capture(&otelite, &cap_dir);
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let out = Command::new(bin)
-        .arg("--version")
+        .args(["up", "--catalog", empty_catalog.to_str().unwrap(), "--once"])
+        .env("PATH", path)
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .output()
-        .unwrap();
-    assert!(out.status.success());
+        .expect("run st2 up --once without endpoint");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "st2 up --once must succeed without an OTLP endpoint\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // stdin EOF stops the receiver and flushes captured signals to disk. The detached reader
+    // thread keeps otelite's stdout pipe open until process exit (see spawn_capture).
+    let _ = capture.stdin.take();
+    let _ = capture.wait();
+
+    for name in ["traces.ndjson", "metrics.ndjson", "logs.ndjson"] {
+        let path = cap_dir.join(name);
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            bytes, 0,
+            "{name} must be absent or empty when OTEL_EXPORTER_OTLP_ENDPOINT is unset, got {bytes} bytes"
+        );
+    }
 }
