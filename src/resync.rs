@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use notify::Watcher as _;
 use sha2::{Digest as _, Sha256};
-
+use agent_spec::profile::{ProfileClass, ResourceProfileRegistry};
 use agent_spec::spec::{AgentSpec, decode_percent_path};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
@@ -62,9 +62,15 @@ pub struct AgentWatchSet {
 }
 
 /// Resolve one spec's watch set: the declaration file plus every active resource binding whose
-/// URI denotes a local file (`RESYNC-R01`). Bindings with an inactive reason are skipped;
-/// schemes without a local denotation and silent stores are simply absent.
-pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
+/// URI denotes a local file (`RESYNC-R01`) — directly (`file://`, catalog-relative) or through a
+/// declared resource profile for a scheme URI. Bindings with an inactive reason are skipped;
+/// schemes without a local denotation and silent carriers are simply absent. A failing profile
+/// resolver is contained: its binding is skipped, the rest of the set survives.
+pub fn watch_set_for(
+    spec: &AgentSpec,
+    this_host: &str,
+    profiles: &ResourceProfileRegistry,
+) -> AgentWatchSet {
     let declaration_path = lexical_clean(&spec.path);
     let agent_dir = declaration_path.parent().unwrap_or(Path::new("."));
     let mut carriers = vec![WatchableCarrier {
@@ -75,6 +81,26 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
     for resource in &spec.resources {
         if resource.inactive_reason().is_some() {
             continue;
+        }
+        // Declared profile schemes resolve through their wasm module; the DECLARED class
+        // governs notification, replacing the basename-sniffing defaults.
+        match profiles.try_resolve(agent_dir, resource.uri()) {
+            Ok(Some(resolution)) => {
+                let Some(class) = carrier_class(resolution.class) else {
+                    continue;
+                };
+                carriers.push(WatchableCarrier {
+                    label: resource.name().to_owned(),
+                    path: resolution.path,
+                    class,
+                });
+                continue;
+            }
+            // Not this registry's business (no scheme, or scheme without a profile): fall
+            // through to the legacy local-path rules. A registered-but-failed resolution stays
+            // contained — unwatchable, supervisor unharmed.
+            Ok(None) => {}
+            Err(_) => continue,
         }
         let Some(path) = resolve_local_path(agent_dir, resource.uri()) else {
             continue;
@@ -157,9 +183,10 @@ fn lexical_clean(path: &Path) -> PathBuf {
     clean
 }
 
-/// Class defaults (`RESYNC-R04`): goal carriers are immediate; stores the agent itself authors
-/// are silent (None); everything else is coalesced. The declaration carrier is immediate by
-/// construction in [`watch_set_for`].
+/// Class defaults for carriers resolved WITHOUT a declared profile (`RESYNC-R04`): goal carriers
+/// are immediate; stores the agent itself authors are silent (None); everything else is coalesced.
+/// The declaration carrier is immediate by construction in [`watch_set_for`]. Profile-resolved
+/// carriers skip this sniffing entirely — their class is what the catalog declares.
 fn classify(agent_dir: &Path, binding_name: &str, normalized_path: &Path) -> Option<CarrierClass> {
     let agent_relative = normalized_path.strip_prefix(agent_dir).ok();
     let authored_store = agent_relative.is_some_and(|rel| {
@@ -177,6 +204,16 @@ fn classify(agent_dir: &Path, binding_name: &str, normalized_path: &Path) -> Opt
     } else {
         CarrierClass::Coalesced
     })
+}
+
+/// A declared profile class maps onto carrier notification: silent profiles are excluded from
+/// the watch set exactly like sniffed agent-authored stores.
+fn carrier_class(class: ProfileClass) -> Option<CarrierClass> {
+    match class {
+        ProfileClass::Immediate => Some(CarrierClass::Immediate),
+        ProfileClass::Coalesced => Some(CarrierClass::Coalesced),
+        ProfileClass::Silent => None,
+    }
 }
 
 // ---- Supervisor side ---------------------------------------------------------------------------
@@ -201,12 +238,25 @@ enum Msg {
 pub struct ResyncSupervisor {
     tx: Option<Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
+    /// Scheme resolution semantics for resource URIs; injectable, built-in (empty) by default.
+    profiles: ResourceProfileRegistry,
 }
 
 impl ResyncSupervisor {
-    /// Spawn the worker. Watch installation itself is best-effort per refresh; a failure degrades
-    /// to timer-driven digest polling over the watch set rather than losing the capability.
+    /// Spawn the worker over the built-in profile set. Watch installation itself is best-effort
+    /// per refresh; a failure degrades to timer-driven digest polling over the watch set rather
+    /// than losing the capability.
     pub fn spawn(root: PathBuf, this_host: String) -> Self {
+        Self::with_profiles(root, this_host, ResourceProfileRegistry::builtin())
+    }
+
+    /// Spawn with an explicit resource-profile registry — the injection point the `up` loop uses
+    /// to hand over the catalog's declared profiles.
+    pub fn with_profiles(
+        root: PathBuf,
+        this_host: String,
+        profiles: ResourceProfileRegistry,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let forward = tx.clone();
         let handle = std::thread::Builder::new()
@@ -216,6 +266,7 @@ impl ResyncSupervisor {
         Self {
             tx: Some(tx),
             handle,
+            profiles,
         }
     }
     /// Replace the worker's watch set from the pass's already-discovered specs. A malformed
@@ -231,7 +282,7 @@ impl ResyncSupervisor {
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
-            .map(|spec| watch_set_for(spec, this_host))
+            .map(|spec| watch_set_for(spec, this_host, &self.profiles))
             .collect();
         let refresh = WatchRefresh {
             sets,
@@ -982,7 +1033,6 @@ fn render_body(
         old.unwrap_or("unknown"),
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,7 +1087,7 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let set = watch_set_for(&discover(tmp.path()), "hetz");
+        let set = watch_set_for(&discover(tmp.path()), "hetz", &Default::default());
         assert_eq!(set.bus_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
@@ -1060,8 +1110,14 @@ mod tests {
         )
         .unwrap();
         let spec = discover(tmp.path());
-        assert_eq!(watch_set_for(&spec, "alias").bus_id, "alias.worker");
-        assert_eq!(watch_set_for(&spec, "other").bus_id, "other.worker");
+        assert_eq!(
+            watch_set_for(&spec, "alias", &Default::default()).bus_id,
+            "alias.worker"
+        );
+        assert_eq!(
+            watch_set_for(&spec, "other", &Default::default()).bus_id,
+            "other.worker"
+        );
     }
 
     #[test]
@@ -2196,5 +2252,51 @@ mod tests {
             classify(agent_dir, "spec", Path::new("/etc/demo/spec.md")),
             Some(CarrierClass::Coalesced)
         );
+    }
+
+    #[test]
+    fn profile_classes_map_onto_carrier_notification() {
+        assert_eq!(carrier_class(ProfileClass::Immediate), Some(CarrierClass::Immediate));
+        assert_eq!(carrier_class(ProfileClass::Coalesced), Some(CarrierClass::Coalesced));
+        assert_eq!(
+            carrier_class(ProfileClass::Silent),
+            None,
+            "silent profiles are excluded from the watch set like sniffed authored stores"
+        );
+    }
+
+    #[test]
+    fn declared_profile_carriers_use_the_declared_class_not_basename_sniffing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/hetz/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  command "true"
+  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+  resource "issue" uri="worktree://repo/main" reason="Opaque scheme."
+}"#,
+        )
+        .unwrap();
+
+        // A profile that resolves but always fails to compile (garbage module): its binding is
+        // skipped contained while the declaration carrier survives. Without the wasm feature the
+        // same containment applies for a different reason (feature unavailable).
+        let broken = tmp.path().join("broken.wasm");
+        std::fs::write(&broken, b"not a module").unwrap();
+        let profiles = ResourceProfileRegistry::empty().with_profile(
+            agent_spec::ResourceProfile::wasm(
+                "dev.schickling.agent-goal",
+                &broken,
+                ProfileClass::Silent,
+            ),
+        );
+        let set = watch_set_for(&discover(tmp.path()), "hetz", &profiles);
+        assert!(!set.carriers.iter().any(|c| c.label == "goal"));
+        assert!(set.carriers.iter().any(|c| c.label == "declaration"));
+        // Unregistered schemes stay unwatchable exactly as before.
+        assert!(!set.carriers.iter().any(|c| c.label == "issue"));
     }
 }

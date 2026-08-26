@@ -440,6 +440,9 @@
             pkgs.rustfmt
             pkgs.rust-analyzer
             pkgs.git
+            # wasm guest modules (resource-profile resolvers) link with lld; nixpkgs rustc does
+            # not bundle rust-lld the way the rustup toolchain does.
+            pkgs.lld
             pty.packages.${system}.default
           ];
         };
