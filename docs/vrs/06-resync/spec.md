@@ -52,8 +52,9 @@ Resource projection so absence of coverage is observable, never silent.
 
 Windows are constants in one place, named as provisional, and tuned by
 observed notification volume (issue #341 rollout note). A burst inside a
-window collapses to one pass; within that pass each changed carrier still
-gets its own event so per-binding supersession stays meaningful.
+window collapses to one pass; when subscribers of different classes share a
+path, each remains dirty until its own class window. Within one due class each
+changed carrier gets its own event so per-binding supersession stays meaningful.
 
 ## Watcher mechanics
 
@@ -71,11 +72,13 @@ gets its own event so per-binding supersession stays meaningful.
   bus id, label, and class so every subscriber retains its digest and pending
   dirty state even when multiple bindings share one path; only new
   subscriptions seed silently.
-- A previously blind path is digest-diffed before its recovered parent directory is added to the
-  registered-watch set, covering changes made during the blind interval.
+- A previously blind path is digest-diffed both before and after its recovered
+  parent watch is registered, closing the poll-to-registration gap.
 - Installation failure is diagnosed once and degrades to timer-based digest
   polling over the watch set (bounded by the number of bindings), never to
   silence about the mechanism.
+- Digest reads open carriers nonblocking and accept regular files only; FIFOs and other special
+  files cannot stall the worker.
 
 ## Built-in stream
 
