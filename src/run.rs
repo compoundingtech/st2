@@ -1842,9 +1842,16 @@ fn reconcile_pass(
     });
     execute_reconcile(&plan, runner, cap, presentation_cursor, &mut report);
     if let Some(resync) = resync {
+        let malformed_declarations = found
+            .errors
+            .iter()
+            .map(|error| error.path.clone())
+            .collect::<Vec<_>>();
         resync.refresh(
             &live_resync_specs(&found.specs, this_host, &sessions, &report),
             this_host,
+            &sessions,
+            &malformed_declarations,
         );
     }
     report

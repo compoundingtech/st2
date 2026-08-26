@@ -59,7 +59,12 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     // Seed the baseline before any writes: the seeded digest emits nothing.
     let supervisor =
         st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
-    supervisor.refresh(&st2::discover_strict(catalog.path()).specs, "hetz");
+    supervisor.refresh(
+        &st2::discover_strict(catalog.path()).specs,
+        "hetz",
+        &[],
+        &[],
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(resync_events(&agent_dir).len(), 0, "seeding is silent");
 
@@ -121,7 +126,12 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
 
     let supervisor =
         st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
-    supervisor.refresh(&st2::discover_strict(catalog.path()).specs, "hetz");
+    supervisor.refresh(
+        &st2::discover_strict(catalog.path()).specs,
+        "hetz",
+        &[],
+        &[],
+    );
     std::thread::sleep(Duration::from_millis(300));
 
     // Configuration-management style replacement: write-then-rename over the old inode.
