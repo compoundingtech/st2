@@ -102,12 +102,39 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
     }
 }
 
-/// A URI denotes a local file when it is an absolute `file://` URI or a scheme-less
-/// catalog-relative path resolved against the agent directory. Anything else has no local
-/// denotation.
+/// A URI denotes a local file when it is an absolute, authority-free `file://` URI or a
+/// scheme-less catalog-relative path resolved against the agent directory. Unsupported file URI
+/// authorities, query/fragment components, malformed escapes, and encoded path separators have no
+/// local denotation.
 fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        let path = PathBuf::from(rest);
+    if let Some(encoded_path) = uri.strip_prefix("file://") {
+        if !encoded_path.starts_with('/')
+            || encoded_path.starts_with("//")
+            || encoded_path.contains(['?', '#'])
+        {
+            return None;
+        }
+        let bytes = encoded_path.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'%' {
+                decoded.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            let byte = (high << 4) | low;
+            // A decoded separator changes URI path segmentation, and NUL cannot be a filesystem
+            // path byte. Reject both rather than silently resolving a different carrier.
+            if matches!(byte, b'/' | b'\\' | b'\0') {
+                return None;
+            }
+            decoded.push(byte);
+            index += 3;
+        }
+        let path = PathBuf::from(String::from_utf8(decoded).ok()?);
         return path.is_absolute().then(|| lexical_clean(&path));
     }
     let has_uri_scheme = uri.split_once(':').is_some_and(|(scheme, _)| {
@@ -121,6 +148,15 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
         return None;
     }
     Some(lexical_clean(&agent_dir.join(uri)))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Remove `.` and `..` components lexically. This deliberately does not inspect the filesystem:
@@ -255,6 +291,31 @@ impl Drop for ResyncSupervisor {
 
 // ---- Worker side --------------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTransition {
+    binding: String,
+    path: PathBuf,
+    old_digest: Option<String>,
+    new_digest: String,
+    body: String,
+    event_id: String,
+}
+
+impl PendingTransition {
+    fn new(binding: &str, path: &Path, old_digest: Option<&str>, new_digest: &str) -> Self {
+        let body = render_body(binding, path, old_digest, new_digest);
+        let event_id = transition_identity(&body);
+        Self {
+            binding: binding.to_owned(),
+            path: path.to_path_buf(),
+            old_digest: old_digest.map(str::to_owned),
+            new_digest: new_digest.to_owned(),
+            body,
+            event_id,
+        }
+    }
+}
+
 struct Entry {
     declaration_path: PathBuf,
     bus_id: String,
@@ -262,9 +323,9 @@ struct Entry {
     label: String,
     class: CarrierClass,
     digest: Option<String>,
-    /// Exact target digest of a publication that failed. Retry this transition before observing
-    /// any newer carrier contents so a durable pending stream reservation can be completed.
-    pending_digest: Option<String>,
+    /// Immutable publication snapshot retained after a failed emit. Metadata refresh may change
+    /// the current route, path, or class, but a reserved event identity must keep its exact bytes.
+    pending_transition: Option<PendingTransition>,
     dirty: bool,
 }
 
@@ -379,14 +440,13 @@ fn rebuild_carriers(
         for carrier in set.carriers {
             // The declaration path and binding label identify one subscription across refreshed
             // routing metadata. Rebuild every retained entry from the current declaration while
-            // carrying only delivery state: a seat-id or host-alias rename must neither erase a
-            // pending transition nor keep routing it to the stale recipient. Looking across path
-            // buckets also lets a binding's re-resolved path/class metadata become current.
+            // carrying its baseline and immutable delivery snapshot. Looking across path buckets
+            // also lets a binding's re-resolved path/class metadata become current.
             let retained =
                 take_retained_entry(&mut previous, &set.declaration_path, &carrier.label);
-            let (digest, pending_digest, dirty) = retained.map_or_else(
+            let (digest, pending_transition, dirty) = retained.map_or_else(
                 || (read_digest(&carrier.path), None, false),
-                |entry| (entry.digest, entry.pending_digest, entry.dirty),
+                |entry| (entry.digest, entry.pending_transition, entry.dirty),
             );
             let entry = Entry {
                 declaration_path: set.declaration_path.clone(),
@@ -395,7 +455,7 @@ fn rebuild_carriers(
                 label: carrier.label.clone(),
                 class: carrier.class,
                 digest,
-                pending_digest,
+                pending_transition,
                 dirty,
             };
             next.entry(carrier.path).or_default().push(entry);
@@ -426,7 +486,42 @@ fn rebuild_carriers(
 
 impl Worker {
     fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
-        self.carriers = rebuild_carriers(std::mem::take(&mut self.carriers), refresh);
+        let previous = std::mem::take(&mut self.carriers);
+        let previous_paths = previous
+            .iter()
+            .flat_map(|(path, entries)| {
+                entries.iter().map(|entry| {
+                    (
+                        (entry.declaration_path.clone(), entry.label.clone()),
+                        path.clone(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.carriers = rebuild_carriers(previous, refresh);
+
+        let rebound_paths = self
+            .carriers
+            .iter()
+            .flat_map(|(path, entries)| {
+                let previous_paths = &previous_paths;
+                entries.iter().filter_map(move |entry| {
+                    previous_paths
+                        .get(&(entry.declaration_path.clone(), entry.label.clone()))
+                        .filter(|previous_path| *previous_path != path)
+                        .map(|_| path.clone())
+                })
+            })
+            .collect::<BTreeSet<_>>();
+
+        // A retained dirty entry may move notification class during metadata refresh. Remove a
+        // deadline only when no dirty subscriber remains in that class, and schedule every newly
+        // represented class so no dirty transition is stranded under its old class deadline.
+        self.reconcile_dirty_deadlines(Instant::now());
+
+        // Rebindings within an already watched parent produce no filesystem event. Diff their new
+        // paths explicitly before watch refresh so the old baseline transitions immediately.
+        self.poll_paths(rebound_paths.into_iter().collect());
         // Diff paths that were blind before registering newly recovered parents; otherwise the
         // new watch suppresses polling of mutations that happened during the blind interval.
         self.poll_unwatched();
@@ -436,18 +531,35 @@ impl Worker {
         self.poll_registered(&registered);
     }
 
+    fn reconcile_dirty_deadlines(&mut self, now: Instant) {
+        let dirty_classes = self
+            .carriers
+            .values()
+            .flatten()
+            .filter(|entry| entry.dirty)
+            .map(|entry| entry.class)
+            .collect::<BTreeSet<_>>();
+        self.deadlines
+            .retain(|class, _| dirty_classes.contains(class));
+        for class in dirty_classes {
+            self.deadlines
+                .entry(class)
+                .or_insert_with(|| now + class.window());
+        }
+    }
+
     /// Polling observes transitions through the same class deadlines as filesystem events. It
     /// never emits directly: this preserves coalescing and lets `flush_path` replay pending
     /// transitions before considering newer bytes.
     fn poll_paths(&mut self, paths: Vec<PathBuf>) {
         let now = Instant::now();
         for path in paths {
+            let observed = read_digest(&path);
             let Some(entries) = self.carriers.get_mut(&path) else {
                 continue;
             };
             for entry in entries {
-                let observed = read_digest(&path);
-                let changed = entry.pending_digest.is_some()
+                let changed = entry.pending_transition.is_some()
                     || observed
                         .as_deref()
                         .is_some_and(|digest| entry.digest.as_deref() != Some(digest));
@@ -623,42 +735,41 @@ impl Worker {
             }
             entry.dirty = false;
             let observed_digest = read_digest(path);
-            let target_digest = match (&entry.pending_digest, &observed_digest) {
-                (Some(pending), _) => pending.clone(),
-                (None, Some(observed)) => observed.clone(),
-                (None, None) => {
-                    // Unreadable right now (deleted mid-window): stay quiet and keep the previous
-                    // digest, so a later reappearance still counts as a change.
-                    continue;
-                }
-            };
-            if entry.pending_digest.is_none()
-                && entry.digest.as_deref() == Some(target_digest.as_str())
-            {
-                continue;
-            }
-            if emit_resync(
-                &self.root,
-                &self.this_host,
-                &entry.bus_id,
-                &entry.label,
-                path,
-                entry.digest.as_deref(),
-                &target_digest,
-            ) {
-                entry.digest = Some(target_digest.clone());
-                entry.pending_digest = None;
-                // The carrier may have advanced while an older failed transition was pending.
-                // Complete that immutable transition first, then schedule the newly observed one.
-                if observed_digest
-                    .as_deref()
-                    .is_some_and(|observed| observed != target_digest.as_str())
-                {
+
+            if let Some(pending) = entry.pending_transition.as_ref() {
+                if emit_resync(&self.root, &self.this_host, &entry.bus_id, pending) {
+                    let completed = entry
+                        .pending_transition
+                        .take()
+                        .expect("pending transition was just observed");
+                    entry.digest = Some(completed.new_digest);
+                    // The current carrier may have advanced or rebound while the immutable
+                    // transition was pending. Complete it first, then schedule current bytes.
+                    if observed_digest.as_deref() != entry.digest.as_deref() {
+                        entry.dirty = true;
+                        retries.push(entry.class);
+                    }
+                } else {
                     entry.dirty = true;
                     retries.push(entry.class);
                 }
+                continue;
+            }
+
+            let Some(target_digest) = observed_digest else {
+                // Unreadable right now (deleted mid-window): stay quiet and keep the previous
+                // digest, so a later reappearance still counts as a change.
+                continue;
+            };
+            if entry.digest.as_deref() == Some(target_digest.as_str()) {
+                continue;
+            }
+            let transition =
+                PendingTransition::new(&entry.label, path, entry.digest.as_deref(), &target_digest);
+            if emit_resync(&self.root, &self.this_host, &entry.bus_id, &transition) {
+                entry.digest = Some(target_digest);
             } else {
-                entry.pending_digest = Some(target_digest);
+                entry.pending_transition = Some(transition);
                 entry.dirty = true;
                 retries.push(entry.class);
             }
@@ -685,30 +796,25 @@ fn emit_resync(
     root: &Path,
     this_host: &str,
     bus_id: &str,
-    label: &str,
-    path: &Path,
-    old: Option<&str>,
-    new_digest: &str,
+    transition: &PendingTransition,
 ) -> bool {
-    let subject = format!("resource {label} changed");
-    let body = render_body(label, path, old, new_digest);
-    let event_id = transition_identity(&body);
+    let subject = format!("resource {} changed", transition.binding);
     match crate::event::emit(
         root,
         this_host,
         bus_id,
         RESYNC_STREAM,
-        &event_id,
-        Some(label),
+        &transition.event_id,
+        Some(&transition.binding),
         Some(subject.as_str()),
-        &body,
+        &transition.body,
         true,
     ) {
         Ok(_) => true,
         Err(error) => {
             eprintln!(
                 "st2: resync emit for '{}' failed: {error:#}",
-                path.display()
+                transition.path.display()
             );
             false
         }
@@ -899,7 +1005,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("alpha-before".to_owned()),
-                    pending_digest: None,
+                    pending_transition: None,
                     dirty: true,
                 },
                 Entry {
@@ -910,7 +1016,7 @@ mod tests {
                     class: CarrierClass::Coalesced,
                     digest: Some("beta-before".to_owned()),
                     dirty: true,
-                    pending_digest: None,
+                    pending_transition: None,
                 },
             ],
         )]);
@@ -984,7 +1090,7 @@ mod tests {
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
                 digest: Some("old-digest".to_owned()),
-                pending_digest: None,
+                pending_transition: None,
                 dirty: true,
             }],
         )]);
@@ -1016,12 +1122,194 @@ mod tests {
             .find(|entry| entry.label == "goal")
             .unwrap();
         assert!(!entry.dirty, "the current recipient accepted the transition");
-        assert!(entry.pending_digest.is_none());
+        assert!(entry.pending_transition.is_none());
         let events = std::fs::read_dir(agent_dir.join("resources/inbox"))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(events.len(), 1, "the event routes to the current bus id");
+    }
+
+    #[test]
+    fn pending_retry_keeps_its_original_snapshot_across_path_and_route_rebinding() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/alias/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "alias"
+  command "agent"
+  resource "goal" uri="resources/current-goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let old_path = resources.join("old-goal.md");
+        let current_path = resources.join("current-goal.md");
+        std::fs::write(&old_path, "pending bytes").unwrap();
+        std::fs::write(&current_path, "current rebound bytes").unwrap();
+        let current = watch_set_for(&discover(root.path()), "alias");
+        let declaration = current.declaration_path.clone();
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "alias".to_owned(),
+            carriers: BTreeMap::from([(
+                old_path.clone(),
+                vec![Entry {
+                    declaration_path: declaration,
+                    bus_id: "stale.worker".to_owned(),
+                    seat_id: None,
+                    label: "goal".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: Some("old-digest".to_owned()),
+                    pending_transition: None,
+                    dirty: true,
+                }],
+            )]),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+
+        worker.flush_path(&old_path, None);
+        let pending = worker.carriers[&old_path][0]
+            .pending_transition
+            .clone()
+            .expect("failed stale route retains an immutable transition");
+        crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
+
+        worker.apply_watch_sets(refresh_for(vec![current]));
+        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+
+        let event = std::fs::read_dir(resources.join("inbox"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|body| body.contains("stream: resync"))
+            .expect("the retry routes through the refreshed recipient");
+        assert!(event.contains(&format!("event-id: {}", pending.event_id)), "{event}");
+        assert!(event.contains(&pending.body), "{event}");
+        assert!(pending.body.contains(&format!("path: {}", old_path.display())));
+        assert!(
+            !pending
+                .body
+                .contains(&format!("path: {}", current_path.display())),
+            "rebinding must not rewrite bytes reserved under the pending event identity"
+        );
+        let entry = &worker.carriers[&current_path][0];
+        assert_eq!(entry.digest.as_deref(), Some(pending.new_digest.as_str()));
+        assert!(entry.pending_transition.is_none());
+        assert!(
+            entry.dirty,
+            "current rebound bytes are queued only after the pending snapshot completes"
+        );
+    }
+
+    #[test]
+    fn same_directory_path_rebinding_diffs_the_new_path_without_a_filesystem_event() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("resources");
+        std::fs::create_dir_all(&parent).unwrap();
+        let old_path = parent.join("old.md");
+        let new_path = parent.join("new.md");
+        std::fs::write(&old_path, "old bytes").unwrap();
+        std::fs::write(&new_path, "new bytes").unwrap();
+        let declaration = root.path().join("agent.kdl");
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(
+                old_path.clone(),
+                vec![Entry {
+                    declaration_path: declaration.clone(),
+                    bus_id: "host.worker".to_owned(),
+                    seat_id: None,
+                    label: "goal".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: read_digest(&old_path),
+                    pending_transition: None,
+                    dirty: false,
+                }],
+            )]),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::from([(parent.clone(), dir_identity(&parent))]),
+            watcher: None,
+        };
+
+        worker.apply_watch_sets(refresh_for(vec![AgentWatchSet {
+            declaration_path: declaration,
+            bus_id: "host.worker".to_owned(),
+            seat_id: None,
+            carriers: vec![WatchableCarrier {
+                label: "goal".to_owned(),
+                path: new_path.clone(),
+                class: CarrierClass::Immediate,
+            }],
+        }]));
+
+        assert!(!worker.carriers.contains_key(&old_path));
+        assert!(worker.carriers[&new_path][0].dirty);
+        assert!(
+            worker.deadlines.contains_key(&CarrierClass::Immediate),
+            "metadata refresh must enqueue the rebound digest even though its parent stayed watched"
+        );
+    }
+
+    #[test]
+    fn dirty_entry_deadline_migrates_when_refresh_changes_notification_class() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        std::fs::write(&carrier, "same bytes").unwrap();
+        let declaration = root.path().join("agent.kdl");
+        let old_deadline = Instant::now();
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(
+                carrier.clone(),
+                vec![Entry {
+                    declaration_path: declaration.clone(),
+                    bus_id: "host.worker".to_owned(),
+                    seat_id: None,
+                    label: "spec".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: read_digest(&carrier),
+                    pending_transition: None,
+                    dirty: true,
+                }],
+            )]),
+            deadlines: BTreeMap::from([(CarrierClass::Immediate, old_deadline)]),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        let refresh = |class| {
+            refresh_for(vec![AgentWatchSet {
+                declaration_path: declaration.clone(),
+                bus_id: "host.worker".to_owned(),
+                seat_id: None,
+                carriers: vec![WatchableCarrier {
+                    label: "spec".to_owned(),
+                    path: carrier.clone(),
+                    class,
+                }],
+            }])
+        };
+
+        worker.apply_watch_sets(refresh(CarrierClass::Coalesced));
+        assert!(!worker.deadlines.contains_key(&CarrierClass::Immediate));
+        assert!(
+            worker.deadlines[&CarrierClass::Coalesced] >= old_deadline + COALESCED_WINDOW,
+            "immediate-to-coalesced migration receives the new class window"
+        );
+
+        let coalesced_deadline = worker.deadlines[&CarrierClass::Coalesced];
+        worker.apply_watch_sets(refresh(CarrierClass::Immediate));
+        assert!(!worker.deadlines.contains_key(&CarrierClass::Coalesced));
+        assert!(
+            worker.deadlines[&CarrierClass::Immediate] < coalesced_deadline,
+            "coalesced-to-immediate migration is rescheduled under the shorter window"
+        );
+        assert!(worker.carriers[&carrier][0].dirty);
     }
 
     #[test]
@@ -1037,7 +1325,12 @@ mod tests {
                     label: "declaration".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("before".to_owned()),
-                    pending_digest: Some("corrected".to_owned()),
+                    pending_transition: Some(PendingTransition::new(
+                        "declaration",
+                        &declaration,
+                        Some("before"),
+                        "corrected",
+                    )),
                     dirty: true,
                 }],
             )])
@@ -1054,7 +1347,13 @@ mod tests {
         );
         let entry = &retained[&declaration][0];
         assert_eq!(entry.digest.as_deref(), Some("before"));
-        assert_eq!(entry.pending_digest.as_deref(), Some("corrected"));
+        assert_eq!(
+            entry
+                .pending_transition
+                .as_ref()
+                .map(|pending| pending.new_digest.as_str()),
+            Some("corrected")
+        );
 
         let dropped = rebuild_carriers(
             previous(),
@@ -1102,7 +1401,12 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),
-                    pending_digest: Some("pending-target".to_owned()),
+                    pending_transition: Some(PendingTransition::new(
+                        "goal",
+                        &carrier,
+                        Some("old-digest"),
+                        "pending-target",
+                    )),
                     dirty: false,
                 }],
             )]),
@@ -1127,7 +1431,7 @@ mod tests {
         assert!(event.contains("new: pending-target"), "{event}");
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.digest.as_deref(), Some("pending-target"));
-        assert!(entry.pending_digest.is_none());
+        assert!(entry.pending_transition.is_none());
         assert!(
             entry.dirty,
             "newer live bytes are scheduled only after the pending transition completes"
@@ -1152,7 +1456,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
                     digest: baseline.clone(),
-                    pending_digest: None,
+                    pending_transition: None,
                     dirty: false,
                 }],
             )]),
@@ -1176,11 +1480,11 @@ mod tests {
         worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.digest, baseline);
-        assert!(entry.pending_digest.is_none(), "coalesced emit ran too early");
+        assert!(entry.pending_transition.is_none(), "coalesced emit ran too early");
 
         worker.flush_due(now + COALESCED_WINDOW + Duration::from_secs(1));
         assert!(
-            worker.carriers[&carrier][0].pending_digest.is_some(),
+            worker.carriers[&carrier][0].pending_transition.is_some(),
             "the coalesced transition must be attempted after its full window"
         );
     }
@@ -1264,7 +1568,7 @@ mod tests {
                 label: format!("{class:?}"),
                 class,
                 digest: digest.clone(),
-                pending_digest: None,
+                pending_transition: None,
                 dirty: true,
             })
             .collect();
@@ -1301,7 +1605,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),
-                    pending_digest: None,
+                    pending_transition: None,
                     dirty: true,
                 }],
             )]),
@@ -1311,18 +1615,18 @@ mod tests {
         };
 
         worker.flush_path(&carrier, None);
-        let pending_digest = worker.carriers[&carrier][0]
-            .pending_digest
+        let pending_transition = worker.carriers[&carrier][0]
+            .pending_transition
             .clone()
-            .expect("failed transition target is retained");
+            .expect("failed transition snapshot is retained");
         std::fs::write(&carrier, "newer bytes").unwrap();
         worker.flush_path(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.digest.as_deref(), Some("old-digest"));
         assert_eq!(
-            entry.pending_digest.as_deref(),
-            Some(pending_digest.as_str()),
-            "a retry must replay the original target even after the carrier advances"
+            entry.pending_transition.as_ref(),
+            Some(&pending_transition),
+            "a retry must replay the original snapshot even after the carrier advances"
         );
         assert!(entry.dirty);
         assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
@@ -1393,18 +1697,47 @@ mod tests {
     }
 
     #[test]
-    fn local_path_resolution_accepts_only_file_uris_and_schemeless_paths() {
+    fn local_path_resolution_parses_supported_file_uris_without_uri_metadata_bytes() {
         let agent_dir = Path::new("/cat/agents/hetz/w");
         assert_eq!(
             resolve_local_path(agent_dir, "file:///etc/demo.kdl"),
             Some(PathBuf::from("/etc/demo.kdl"))
         );
         assert_eq!(
+            resolve_local_path(agent_dir, "file:///tmp/with%20space/%E2%82%AC.md"),
+            Some(PathBuf::from("/tmp/with space/€.md"))
+        );
+        assert_eq!(
+            resolve_local_path(agent_dir, "file:///tmp/literal%3Fmark"),
+            Some(PathBuf::from("/tmp/literal?mark"))
+        );
+        assert_eq!(
+            resolve_local_path(agent_dir, "file:///"),
+            Some(PathBuf::from("/"))
+        );
+        assert_eq!(
             resolve_local_path(agent_dir, "resources/journal.md"),
             Some(agent_dir.join("resources/journal.md"))
         );
-        assert_eq!(resolve_local_path(agent_dir, "http://x/y"), None);
-        assert_eq!(resolve_local_path(agent_dir, "worktree://repo/main"), None);
+
+        for unsupported in [
+            "file://authority/etc/demo.kdl",
+            "file:////authority/etc/demo.kdl",
+            "file:///etc/demo.kdl?revision=2",
+            "file:///etc/demo.kdl#section",
+            "file:///tmp/encoded%2Fseparator",
+            "file:///tmp/encoded%2fseparator",
+            "file:///tmp/encoded%5Cseparator",
+            "file:///tmp/bad%escape",
+            "http://x/y",
+            "worktree://repo/main",
+        ] {
+            assert_eq!(
+                resolve_local_path(agent_dir, unsupported),
+                None,
+                "{unsupported} must not become filesystem bytes"
+            );
+        }
     }
 
     #[test]
