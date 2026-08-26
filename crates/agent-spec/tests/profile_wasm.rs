@@ -10,7 +10,7 @@
 
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
 use agent_spec::profile_wasm::{
-    DEFAULT_TABLE_ELEMENT_LIMIT, WasmResolveError, WasmResolver,
+    DEFAULT_MODULE_LIMIT_BYTES, DEFAULT_TABLE_ELEMENT_LIMIT, WasmResolveError, WasmResolver,
 };
 use std::path::{Path, PathBuf};
 use wasmtime::Trap;
@@ -95,6 +95,26 @@ fn resolver_cannot_escape_the_agent_directory() {
             assert!(e.to_string().contains("escaped"), "got: {e}");
         }
         other => panic!("expected containment rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolver_rejects_an_empty_path_before_joining_it_to_the_agent_directory() {
+    let empty = WasmResolver::from_wat(&format!(
+        r#"{HOSTILE_PRELUDE}
+      (data (i32.const 8) "{{\22path\22:\22\22,\22class\22:\22goal\22}}")
+      (func (export "resolve") (param i32 i32 i32 i32) (result i64)
+        (i64.or
+          (i64.shl (i64.extend_i32_u (i32.const 8)) (i64.const 32))
+          (i64.extend_i32_u (i32.const 26))))
+)"#
+    ))
+    .expect("empty-path module compiles");
+    match empty.resolve_contained("any://x", Path::new("/agent/dir")) {
+        Err(WasmResolveError::BadReturn(error)) => {
+            assert!(error.contains("empty path"), "got: {error}");
+        }
+        other => panic!("expected empty-path refusal, got {other:?}"),
     }
 }
 
@@ -332,6 +352,21 @@ fn module_without_required_exports_fails_instantiation_cleanly() {
         incomplete.instantiate(),
         Err(WasmResolveError::MissingExport("alloc"))
     ));
+}
+
+#[test]
+fn oversized_module_is_rejected_before_wasmtime_compilation() {
+    let temp = tempfile::NamedTempFile::new().expect("temporary module file");
+    temp.as_file()
+        .set_len(DEFAULT_MODULE_LIMIT_BYTES as u64 + 1)
+        .expect("oversized sparse module");
+    match WasmResolver::load(temp.path()) {
+        Err(WasmResolveError::Instantiation(error)) => {
+            assert!(error.contains("limit"), "got: {error}");
+        }
+        Err(other) => panic!("expected size-limit instantiation error, got {other}"),
+        Ok(_) => panic!("oversized module unexpectedly compiled"),
+    }
 }
 
 #[test]
