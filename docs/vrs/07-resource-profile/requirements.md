@@ -61,10 +61,12 @@ accepted rationale is recorded in
 ### Must contain resolver behavior
 
 - **PROFILE-R04 Closed sandbox:** Resolver modules run with no WASI and no host
-  imports, under a finite module-byte admission bound, per-call fuel budget,
+  imports. Module files are opened nonblocking and accepted only as regular
+  files, under a finite module-byte admission bound, per-call fuel budget,
   linear-memory cap, and table-element cap. Traps, infinite loops, missing
-  exports, invalid memory ranges, malformed output, and oversized module,
-  table, or allocation attempts cannot unwind into or terminate the supervisor.
+  exports, invalid memory ranges, malformed output, and special or oversized
+  module, table, or allocation attempts cannot unwind into or terminate the
+  supervisor.
 - **PROFILE-R05 Host-enforced path boundary:** A module's non-empty returned
   path is decoded and normalized by the host and accepted only when it remains
   inside the agent directory. Every root, ancestor, and final component is

@@ -369,6 +369,25 @@ fn oversized_module_is_rejected_before_wasmtime_compilation() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn special_file_module_is_rejected_without_blocking() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let temp = tempfile::tempdir().expect("module directory");
+    let fifo = temp.path().join("resolver.fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    // SAFETY: the path is NUL-terminated and points into the live temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    match WasmResolver::load(&fifo) {
+        Err(WasmResolveError::Instantiation(error)) => {
+            assert!(error.contains("regular file"), "got: {error}");
+        }
+        Err(other) => panic!("expected special-file refusal, got {other}"),
+        Ok(_) => panic!("FIFO resolver unexpectedly compiled"),
+    }
+}
+
 #[test]
 fn registry_folds_every_guest_failure_into_unwatchable_and_keeps_resolving() {
     // A broken module registered under a scheme: every resolution fails contained, with the

@@ -164,15 +164,16 @@ metadata alone is never treated as a durable proof.
 
 ## Runtime containment (PROFILE-R04..R07)
 
-Each module file is read through a 16 MiB admission cap before validation or
-compilation, then compiled once per module path and shared by registry clones.
+Each module is opened nonblocking and no-follow, accepted only as a regular
+file, and read through a 16 MiB admission cap before validation or compilation.
+It is then compiled once per module path and shared by registry clones.
 Each resolution creates a fresh `Store` and `Instance`. One fuel allowance
 covers the module start function and the first resolution call; a reused
 instance receives one fresh allowance before each later call:
 
 | Boundary | Contract |
 | --- | --- |
-| Module bytes | 16 MiB maximum before Wasmtime compilation |
+| Module file | regular, no-follow, nonblocking open; 16 MiB maximum before Wasmtime compilation |
 | Imports | none; import-requiring modules fail instantiation |
 | Fuel | 5,000,000 fuel units for start + first call; same budget per later call |
 | Linear memory | 64 MiB maximum |
@@ -185,7 +186,7 @@ Failure taxonomy:
 
 | Failure | SDK result | Supervisor effect |
 | --- | --- | --- |
-| oversized module or module load/instantiation | `Instantiation` | binding unwatchable; reconcile warning; supervisor lives |
+| special/oversized module or module load/instantiation | `Instantiation` | binding unwatchable; reconcile warning; supervisor lives |
 | missing `memory`, `alloc`, or `resolve` | `MissingExport` | same |
 | unreachable/stack/memory trap | `Trap` | same |
 | infinite start function or call | `FuelExhausted` | same |
