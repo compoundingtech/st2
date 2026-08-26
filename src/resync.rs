@@ -1587,6 +1587,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("old-digest".to_owned()),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -1661,6 +1662,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: read_digest(&old_path, None),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -1681,6 +1683,7 @@ mod tests {
                 label: "goal".to_owned(),
                 path: new_path.clone(),
                 class: CarrierClass::Immediate,
+                containment_root: None,
             }],
         }]));
 
@@ -1709,6 +1712,7 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: read_digest(&carrier, None),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -1729,6 +1733,7 @@ mod tests {
                     label: "spec".to_owned(),
                     path: carrier.clone(),
                     class,
+                    containment_root: None,
                 }],
             }])
         };

@@ -10,7 +10,9 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::declared::{DeclaredParse, parse_declared_document};
+use crate::declared::{
+    DeclaredDiagnosticCode, DeclaredParse, parse_declared_document,
+};
 use crate::spec::{AgentSpec, RawSpec};
 
 /// The result of walking a catalog folder. Sorted + deterministic.
@@ -361,7 +363,8 @@ fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
         }
     };
     if ext == "kdl" {
-        let declaration = parse_declared_document(path, &text);
+        let mut declaration = parse_declared_document(path, &text);
+        admit_catalog_envelope_nodes(path, &mut declaration);
         let is_adjacent_kdl = declaration
             .document
             .as_ref()
@@ -409,6 +412,29 @@ fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
         raws,
         declaration: None,
     }
+}
+
+/// `catalog.kdl` is a shared envelope: st2 owns its `catalog`/`profile` nodes while Agent Spec
+/// discovery owns any colocated `agent` nodes. Suppress only the top-level diagnostics attached to
+/// those two explicitly admitted envelope node kinds; every agent-shape diagnostic and every other
+/// unexpected node remains an error.
+fn admit_catalog_envelope_nodes(path: &Path, declaration: &mut DeclaredParse) {
+    if path.file_name().and_then(|name| name.to_str()) != Some("catalog.kdl") {
+        return;
+    }
+    let Some(document) = declaration.document.as_ref() else {
+        return;
+    };
+    let admitted_spans = document
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.name.as_str(), "catalog" | "profile"))
+        .map(|node| node.span)
+        .collect::<Vec<_>>();
+    declaration.diagnostics.retain(|diagnostic| {
+        diagnostic.code != DeclaredDiagnosticCode::UnexpectedTopLevelNode
+            || !admitted_spans.contains(&diagnostic.span)
+    });
 }
 
 /// Parse one file into `(specs, warnings)`. TOML/JSON yield 0-or-1 spec; KDL yields one per `agent`
