@@ -82,8 +82,9 @@ changed carrier gets its own event so per-binding supersession stays meaningful.
 - A runtime watcher-backend error may mean mutation events were dropped, so it
   triggers a full digest rescan of the current watch set. Equal digests remain
   silent; observed transitions use the ordinary classified emission path.
-- Digest reads open carriers nonblocking and accept regular files only; FIFOs and other special
-  files cannot stall the worker.
+- Digest reads open carriers nonblocking, accept regular files only, and feed
+  bytes incrementally into SHA-256 with bounded memory; FIFOs, other special
+  files, and large carriers cannot stall or exhaust the worker.
 
 ## Built-in stream
 
@@ -99,8 +100,10 @@ keys cannot collide.
 
 Digest state lives with the supervisor process (seeded at start) and advances
 only after the unchanged ingress returns a successful receipt. Failed
-publication retains the old digest and dirty state and schedules the identical
-transition for retry; the durable dedup horizon remains the stream receipt ring.
+publication retains the old digest, exact target digest, and dirty state; it
+replays that immutable transition before observing a newer carrier digest, so a
+durable pending reservation can always complete. The durable dedup horizon
+remains the stream receipt ring.
 
 ## What this does not do
 
