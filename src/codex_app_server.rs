@@ -439,7 +439,7 @@ impl CodexInboxDelivery {
             ) {
                 Ok(claimed_seq) => writer.with_ownership(runtime.incarnation(), claimed_seq),
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "st2 codex: observed-state claim failed; degrading to token-only: {error:#}"
                     );
                     writer.with_session(runtime.incarnation())

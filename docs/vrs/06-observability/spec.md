@@ -10,14 +10,22 @@ obligations land here; registry/dashboard/census obligations are deferred cross-
 ## Crate stack
 
 ```
-opentelemetry      = "0.30"
-opentelemetry_sdk  = "0.30"
-opentelemetry-otlp = { version = "0.30", default-features = false,
-                       features = ["http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry                   = "0.30"
+opentelemetry_sdk               = { version = "0.30", features = ["logs"] }
+opentelemetry-otlp              = { version = "0.30", default-features = false,
+                                    features = ["http-json", "reqwest-blocking-client",
+                                                "internal-logs", "logs"] }
+# tracing facade (PR3) — spans and logs unify on one subscriber
+tracing                         = "0.1"
+tracing-subscriber              = "0.3"
+tracing-opentelemetry           = "0.31"
+opentelemetry-appender-tracing  = { version = "0.30",
+                                    features = ["experimental_use_tracing_span_context"] }
 ```
 
-The SDK needs no runtime feature: the batch exporter is driven by the blocking reqwest client on
-st2's own threads, so no `rt-tokio` (or any async-runtime) feature is enabled.
+The appender-tracing `experimental_use_tracing_span_context` feature is load-bearing: without
+it, emitted log records do not receive the active tracing span's trace/span ids and every
+record exports uncorrelated.
 
 The otlp feature set is load-bearing, not stylistic:
 
@@ -38,9 +46,9 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 `Telemetry::shutdown()`:
 
 - **Endpoint**: none configured in code. The exporter resolves `OTEL_EXPORTER_OTLP_ENDPOINT` and
-  related `OTEL_*` variables from the environment automatically. Unset → no provider is installed
-  at all (R02): the guard is checked once at init, before any SDK object exists, so the unset case
-  allocates nothing.
+  related `OTEL_*` variables from the environment automatically. Unset → no SDK provider or
+  exporter is built (R02); since PR3 the human-readable stderr `tracing` layer still runs so
+  diagnostics stay visible — see [Log bridge](#log-bridge-pr3-landed).
 - **Protocol**: HTTP JSON (`http-json` + protobuf-free wire), batch exporter, targeting the local
   Alloy forwarder at `127.0.0.1:4318` by convention.
 - **Resource**: `service.name` = `st2-<unit>` selected per entrypoint (below; `src/main.rs`
@@ -61,23 +69,62 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 | One-shot CLI invocations | `st2-cli` |
 | Hook executions (`st2 driver claude-observe`; other hook surfaces not instrumented yet) | `st2-hook` |
 
-## Trace roots
+## Reconciliation trace hierarchy
 
-Instrumented in PR1, one root span per unit of work:
+Instrumented exclusively through the `tracing` facade (`tracing::info_span!` plus
+`tracing-opentelemetry` status extension), one bounded trace represents one reconcile pass:
 
-- **Supervisor loop pass** — each iteration of the `up_loop_until` loop (`src/run.rs`,
-  `up_loop_until`) wraps one reconcile pass in a span named `st2.reconcile_pass` with attribute
-  `st2.host`; after the pass it records `st2.crash_loops` and `st2.unparked` counts.
-- **One-shot up** — `up_once` (`src/run.rs`, `up_once`) wraps its single pass in the same
-  `st2.reconcile_pass` shape with `st2.host`.
+```
+st2.reconcile_pass
+├── st2.catalog.lock
+├── st2.catalog.discover
+├── st2.hooks.verify                 # only when a consumer requires hooks
+├── st2.catalog.materialize
+├── st2.runtime.observe              # omitted for an externally supplied snapshot
+└── st2.reconcile.execute
+```
 
-Not yet instrumented (follow-ups, not PR1 scope):
+`st2.reconcile_pass` remains the compatibility root at the supervisor-loop, one-shot catalog,
+selected-task, and single-file-spec sites. Its `span.label` and `st2.reconcile.path` are the enum
+`catalog | selected | spec`. Root outcome attributes are `st2.host`, `st2.crash_loops`,
+`st2.unparked`, `st2.report.errors`, `st2.report.warnings`, `st2.reconcile.skipped`, and
+`st2.result = pass | fail`; non-empty errors set OTel status `ERROR`. A deterministic INFO event
+(target `st2`, message `reconcile pass complete`, `result = pass | fail`) closes every root so
+log-based assertions need no fault injection.
 
-- Provider session lifecycles (claude / codex / opencode spawn, attach, teardown) beyond the
-  PR2 launch/reap counters, exec sidecars (`src/exec_backend.rs`).
+| Span name | Parent | `span.label` | Operation boundary | Attributes and status | Path applicability |
+| --- | --- | --- | --- | --- | --- |
+| `st2.reconcile_pass` | none | `catalog` \| `selected` \| `spec` | One complete reconcile pass | Root attributes above; `ERROR` when the pass returns/collects an error | Catalog loop/once, selected task, spec loop/once |
+| `st2.catalog.lock` | `st2.reconcile_pass` | `shared` | Shared catalog-authoring lock acquisition | `st2.result`; `ERROR` on acquisition failure | Catalog, selected |
+| `st2.catalog.discover` | `st2.reconcile_pass` | `catalog` | Recursive desired-state snapshot | `st2.catalog.spec_count`, report warning/error counts, `st2.result`; `ERROR` when discovery reports errors even though the pass may continue | Catalog, selected |
+| `st2.hooks.verify` | `st2.reconcile_pass` | `lifecycle hooks` | Required lifecycle-hook receipt/set verification | `st2.hooks.consumer = codex \| pi \| codex+pi`, `st2.result`; `ERROR` on verification failure | Catalog or selected, only when required |
+| `st2.catalog.materialize` | `st2.reconcile_pass` | `catalog` \| `selected owner` | Aggregate catalog/selected-owner materialization call | Materialization failure and report warning/error counts, `st2.result`; `ERROR` when materialization reports errors | Catalog, selected |
+| `st2.runtime.observe` | `st2.reconcile_pass` | `all sessions` | Authoritative `Runner::list_sessions` call | `st2.runtime.session_count`, `st2.result`; `ERROR` on list failure | Catalog, selected, spec; omitted by `_with_sessions` because that snapshot is external |
+| `st2.reconcile.execute` | `st2.reconcile_pass` | `apply plan` | Aggregate mutation call around `execute_with_presentation_cursor` | Plan launch/GC/teardown counts, newly added report warning/error counts, `st2.result`; `ERROR` only when execution adds errors | Catalog, selected, spec |
 
-Span names follow the central `01-conventions` rules (`span.label` discipline included). Names are
-registered st2-side; this list plus PR2's metric set is that registry's seed.
+Every first-party root and child has a non-empty `span.label`. The exporter-enabled
+`AtomicBool` in `src/telemetry.rs` is the hierarchy gate; `tracing::enabled!` is insufficient
+because the stderr formatter remains installed without an endpoint. When the tracer exporter is
+unset, child constructors return before span construction, label handling, collection allocation,
+or count inspection. All children are aggregates and trace volume is bounded by the table.
+
+Attribute policy follows the central `01-conventions` contract:
+
+| Attribute family | Value type | Cardinality | Privacy | Metric-label policy |
+| --- | --- | --- | --- | --- |
+| `span.label` | enum string | bounded | public | forbidden |
+| `st2.reconcile.path`, `st2.result`, `st2.hooks.consumer` | enum string | tiny/bounded | public | spanmetrics-only |
+| All `*_count`, `st2.crash_loops`, `st2.unparked`, `st2.report.errors`, `st2.report.warnings` | integer | bounded numeric | public | forbidden |
+| `st2.reconcile.skipped` | boolean | tiny | public | spanmetrics-only |
+| `st2.host` | string | bounded fleet identity | internal | forbidden |
+
+No span or status description carries an id, filesystem path, selector, or error prose.
+
+Explicitly rejected spans: pure reconcile planning, identity validation,
+`compile_generated_tasks`, debounce, report absorption, wait/sleep, watcher callbacks, and
+wrapper functions. Per-task and per-owner spans are also rejected from this hierarchy: they need
+a separately specified hard detail budget. Provider-session lifecycles and exec sidecars remain
+follow-up surfaces beyond the PR2 launch/reap counters.
 
 ## Metrics (PR2)
 
@@ -120,12 +167,28 @@ with a `PeriodicReader` + OTLP/HTTP-JSON metric exporter behind the same
 a silent no-op (R02 zero-overhead). `Telemetry::shutdown` force-flushes metric points alongside
 spans so short-lived CLI runs deliver them.
 
-## Log bridge (PR3)
+## Log bridge (PR3, landed)
 
-Approach open ([open-questions](open-questions.md)): candidate is bridging the existing
-diagnostic output through an OpenTelemetry logs emitter so log records join the same resource and
-trace context. Ad-hoc `println!`/`eprintln!` on correlated paths migrate onto it; pure UI output
-does not.
+Resolved by interview decision Q6: the `tracing` facade unifies spans and logs on one
+subscriber (`src/telemetry.rs`):
+
+- **stderr fmt layer — always installed.** Human-readable lines keep today's diagnostics
+  visible with or without an endpoint. This is a deliberate deviation from PR1's literal
+  zero-output unset-endpoint behavior: migrated `tracing` sites must not go silent. Level
+  filtering defaults to INFO; `RUST_LOG` overrides.
+- **Span layer** — `tracing-opentelemetry` exports spans through the existing tracer provider.
+- **Log bridge** — `opentelemetry-appender-tracing` exports events through a new SDK logger
+  provider sharing the endpoint, HTTP-JSON protocol, blocking client, and resource. With the
+  `experimental_use_tracing_span_context` feature, records emitted inside a span carry its
+  trace/span ids.
+
+`Telemetry::shutdown` force-flushes and shuts down logger, meter, and tracer providers together.
+
+Emission-site migration rule: non-user-facing diagnostics (`eprintln!` warn/error paths in
+crash-loop handling, park-channel setup, catalog watching, ding transport ambiguity, driver
+session degradation) became `tracing::warn!`/`error!` with unchanged message text. USER-FACING
+CLI OUTPUT STAYS `println!`/`eprintln!`: command results (`installed`, boot reports, `ls`
+tables), lock banners, and validation reports are interfaces, not diagnostics.
 
 ## Systemd unit propagation
 
@@ -143,8 +206,11 @@ into `Environment=` lines alongside the existing `PATH`/`PTY_ROOT` serialization
   `otelite capture` on an ephemeral port (`--http-port 0`), points the binary under test at it
   via `OTEL_EXPORTER_OTLP_ENDPOINT`, drives one command, then stops the receiver by closing its
   stdin — EOF flushes the capture to disk — and asserts on the captured traces (span names,
-  resource attributes). Precedent: dotfiles op-proxy tests use `captureEnvTrace`; dotfiles
-  branchy checks consume `effect-utils.packages.<system>.otelite`.
+  resource attributes), metrics (PR2), and log records (PR3: the deterministic
+  `reconcile pass complete` INFO record must carry the `st2.reconcile_pass` span's trace/span
+  ids, proving tracing→OTel correlation end to end). Precedent: dotfiles op-proxy tests use
+  `captureEnvTrace`; dotfiles branchy checks consume
+  `effect-utils.packages.<system>.otelite`.
   - Caveat baked into harness design: `otelite capture` treats stdin EOF as termination, so the
     harness closes stdin deliberately as the stop signal rather than leaking `/dev/null`.
 - **No-op proof**: a test asserts that with `OTEL_EXPORTER_OTLP_ENDPOINT` unset, the command
@@ -159,7 +225,7 @@ into `Environment=` lines alongside the existing `PATH`/`PTY_ROOT` serialization
    check wiring, plus this VRS tree.
 2. **PR2 — metrics.** Metric set finalized per open questions; shares provider/exporter/resource
    plumbing from PR1; otelite assertions extended to metrics.
-3. **PR3 — log bridge.** Approach finalized per open questions; migrates correlated diagnostics;
-   otelite assertions extended to logs.
+3. **PR3 — log bridge.** Landed per Q6: `tracing` facade adopted, spans and logs on one
+   subscriber; correlated diagnostics migrated; otelite assertions extended to logs.
 
 Each PR lands CI-green independently; PR2/PR3 depend on PR1's plumbing only.

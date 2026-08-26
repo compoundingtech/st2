@@ -165,7 +165,7 @@ fn record_session_end(
         harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()))
             .with_ownership(session, seq);
     if let Err(error) = writer.ended(label) {
-        eprintln!("st2 pi driver: recording session end failed: {error}");
+        tracing::warn!("st2 pi driver: recording session end failed: {error}");
     }
 }
 

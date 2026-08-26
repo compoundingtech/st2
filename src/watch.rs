@@ -184,7 +184,7 @@ impl CatalogDeclarationWatcher {
                     }
                 }
                 Err(error) if self.failed.insert(added.clone()) => {
-                    eprintln!(
+                    tracing::warn!(
                         "st2: cannot watch catalog declaration directory '{}': {error}; immediate changes below it are unavailable, continuing with timer polling.",
                         added.display()
                     );

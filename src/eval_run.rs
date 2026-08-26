@@ -886,7 +886,7 @@ impl<R: Runner> Drop for EvalCleanupGuard<R> {
     fn drop(&mut self) {
         let reap = reap_all_eval_sessions_with_runner(&self.runner, &self.host);
         if let Err(error) = reap {
-            eprintln!(
+            tracing::warn!(
                 "st2 eval cleanup: {error:#}; preserving catalog {}",
                 self.catalog.display()
             );
@@ -988,8 +988,7 @@ fn run_steps(
             }
         }
 
-        let _ =
-            std::fs::write(runs_dir.join(format!("{}.exit", step.id)), exit.to_string());
+        let _ = std::fs::write(runs_dir.join(format!("{}.exit", step.id)), exit.to_string());
         // Also a unified, judge-greppable combined log (stdout then stderr), copied from the two
         // capture files so neither ever has to fit in memory.
         let combined_path = logs_dir.join(format!("{}.log", step.id));

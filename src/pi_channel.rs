@@ -199,7 +199,7 @@ fn channel_loop(
                     // serializes but does not order their writes.
                     && let Err(error) = writer.observe_unless_ended(observation)
                 {
-                    eprintln!("st2 {label} channel: recording observed state failed: {error}");
+                    tracing::warn!("st2 {label} channel: recording observed state failed: {error}");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -210,7 +210,7 @@ fn channel_loop(
         let now = Instant::now();
         if now >= next_heartbeat {
             if let Err(error) = writer.heartbeat() {
-                eprintln!("st2 {label} channel: refreshing observed state failed: {error}");
+                tracing::warn!("st2 {label} channel: refreshing observed state failed: {error}");
             }
             next_heartbeat = now + heartbeat_every;
         }

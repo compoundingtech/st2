@@ -25,7 +25,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use opentelemetry::trace::Status;
 use serde::{Deserialize, Serialize};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
@@ -1245,7 +1247,7 @@ impl ParkChannel {
         let scope = match crate::park::SupervisorScope::current(catalog_root, host) {
             Ok(scope) => scope,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
                 );
                 return Self {
@@ -1257,7 +1259,7 @@ impl ParkChannel {
         let projection = match crate::park::ParkProjection::current(scope.park_dir()) {
             Ok(projection) => Some(projection),
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults for this supervisor."
                 );
                 None
@@ -1330,9 +1332,10 @@ fn driver_label(launch: &crate::reconcile::Launch<'_>, target: &TaskTarget) -> &
     // Legacy routed (`deliver "mcp"` → claude-session, ...) or hand-authored seats: inspect
     // the launch source by its alphanumeric tokens.
     let tokens = |needle: &str| match &target.launch {
-        TaskLaunch::Argv(argv) => argv
-            .iter()
-            .any(|arg| arg.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == needle)),
+        TaskLaunch::Argv(argv) => argv.iter().any(|arg| {
+            arg.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| t == needle)
+        }),
         TaskLaunch::Shell(command) => command
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|t| t == needle),
@@ -1609,19 +1612,38 @@ fn reconcile_pass(
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
-    let _catalog_lock = match crate::CatalogLock::shared(root) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return UpReport {
-                skipped: true,
-                errors: vec![format!(
-                    "acquire shared catalog-authoring lock (pass skipped): {error:#}"
-                )],
-                ..Default::default()
-            };
+    let _catalog_lock = {
+        let span = catalog_lock_span();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let result = crate::CatalogLock::shared(root);
+        finish_child_span(span.as_ref(), result.is_err());
+        drop(entered);
+        match result {
+            Ok(lock) => lock,
+            Err(error) => {
+                return UpReport {
+                    skipped: true,
+                    errors: vec![format!(
+                        "acquire shared catalog-authoring lock (pass skipped): {error:#}"
+                    )],
+                    ..Default::default()
+                };
+            }
         }
     };
-    let found = crate::discover(root);
+    let found = {
+        let span = catalog_discover_span();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let found = crate::discover(root);
+        if let Some(span) = &span {
+            span.record("st2.catalog.spec_count", span_count(found.specs.len()));
+            span.record("st2.report.warning_count", span_count(found.warnings.len()));
+            span.record("st2.report.error_count", span_count(found.errors.len()));
+            finish_child_span(Some(span), !found.errors.is_empty());
+        }
+        drop(entered);
+        found
+    };
     let mut report = UpReport {
         warnings: found.warnings.clone(),
         errors: found
@@ -1644,14 +1666,43 @@ fn reconcile_pass(
     // pi needs the same verified set, but for its launch only: nothing it renders references
     // `$ST_HOOKS`, while `st2 driver pi-session` cannot start without the channel extension. So a
     // pi agent contributes to this verification without having its materialization deferred.
-    let needs_hooks = crate::hooks::required_by_codex(&found.specs, this_host, root)
-        || crate::hooks::required_by_pi(&found.specs, this_host, root)
-        || crate::hooks::required_by_omp(&found.specs, this_host, root);
-    let hook_error = needs_hooks
-        .then(crate::hooks::verify_required_set)
-        .transpose()
-        .err()
-        .map(|error| error.to_string());
+    let tracer_export_enabled = crate::telemetry::tracer_export_enabled();
+    let needs_codex_hooks = crate::hooks::required_by_codex(&found.specs, this_host, root);
+    let needs_pi_hooks = if needs_codex_hooks && !tracer_export_enabled {
+        false
+    } else {
+        crate::hooks::required_by_pi(&found.specs, this_host, root)
+    };
+    let needs_omp_hooks = if (needs_codex_hooks || needs_pi_hooks) && !tracer_export_enabled {
+        false
+    } else {
+        crate::hooks::required_by_omp(&found.specs, this_host, root)
+    };
+    let needs_hooks = needs_codex_hooks || needs_pi_hooks || needs_omp_hooks;
+    let hook_error = {
+        let consumer = match (needs_codex_hooks, needs_pi_hooks, needs_omp_hooks) {
+            (true, true, true) => "codex+pi+omp",
+            (true, true, false) => "codex+pi",
+            (true, false, true) => "codex+omp",
+            (false, true, true) => "pi+omp",
+            (true, false, false) => "codex",
+            (false, true, false) => "pi",
+            (false, false, true) => "omp",
+            (false, false, false) => "none",
+        };
+        let span = needs_hooks
+            .then(|| lifecycle_hooks_span(consumer))
+            .flatten();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let hook_error = needs_hooks
+            .then(crate::hooks::verify_required_set)
+            .transpose()
+            .err()
+            .map(|error| error.to_string());
+        finish_child_span(span.as_ref(), hook_error.is_some());
+        drop(entered);
+        hook_error
+    };
     if let Some(error) = &hook_error {
         report.errors.push(format!(
             "verify this binary's lifecycle hooks before harness materialization: {error}; materialization deferred"
@@ -1670,12 +1721,33 @@ fn reconcile_pass(
     // active fleet even when another gate defers one owner's writes. A gating render failure removes
     // only that agent from this pass; advisory git-exclude failures remain warnings and never block
     // a launch.
-    let materialized = crate::materialize::materialize_catalog_against(
-        root,
-        &materializable_specs,
-        &found.specs,
-        this_host,
-    );
+    let materialized = {
+        let span = catalog_materialize_span("catalog");
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let materialized = crate::materialize::materialize_catalog_against(
+            root,
+            &materializable_specs,
+            &found.specs,
+            this_host,
+        );
+        if let Some(span) = &span {
+            span.record(
+                "st2.materialize.failure_count",
+                span_count(materialized.failed_agents.len()),
+            );
+            span.record(
+                "st2.report.warning_count",
+                span_count(materialized.warnings.len()),
+            );
+            span.record(
+                "st2.report.error_count",
+                span_count(materialized.errors.len()),
+            );
+            finish_child_span(Some(span), !materialized.errors.is_empty());
+        }
+        drop(entered);
+        materialized
+    };
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
     let mut eligible_specs: Vec<_> = found
@@ -1692,14 +1764,24 @@ fn reconcile_pass(
         return report;
     }
 
-    let sessions = match runner.list_sessions() {
-        Ok(s) => s,
-        Err(e) => {
-            report.skipped = true;
-            report
-                .errors
-                .push(format!("list sessions (pass skipped): {e}"));
-            return report;
+    let sessions = {
+        let span = runtime_observe_span();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let sessions = runner.list_sessions();
+        if let (Some(span), Ok(sessions)) = (span.as_ref(), sessions.as_ref()) {
+            span.record("st2.runtime.session_count", span_count(sessions.len()));
+        }
+        finish_child_span(span.as_ref(), sessions.is_err());
+        drop(entered);
+        match sessions {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                report.skipped = true;
+                report
+                    .errors
+                    .push(format!("list sessions (pass skipped): {e}"));
+                return report;
+            }
         }
     };
     let now = Instant::now();
@@ -1712,53 +1794,237 @@ fn reconcile_pass(
         }
     };
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_harness_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
+    gate_harness_launches_on_hooks(&mut plan, root, &mut report, |_| match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
+    execute_reconcile(&plan, runner, cap, presentation_cursor, &mut report);
     report
 }
 
-/// A missing Codex agent must not launch against stale lifecycle hooks. Suppress the affected agent
-/// launches (including their sidecars) and surface the error when hook verification fails.
+/// A missing Codex, pi, or omp agent must not launch against stale lifecycle hooks. Suppress the
+/// affected agent launches (including their sidecars) and surface the error when verification fails.
 ///
 /// Workspace trust belongs to the declared provider command and its selected account-specific
 /// runtime. Reconciliation deliberately does not mutate an ambient Codex config: an account selector
 /// may choose `CODEX_HOME` only after this process launches the command, so such a write would target
 /// the wrong state and could not satisfy the launched seat's trust gate.
+fn lifecycle_hook_consumer(needs_codex: bool, needs_pi: bool, needs_omp: bool) -> &'static str {
+    match (needs_codex, needs_pi, needs_omp) {
+        (true, true, true) => "codex+pi+omp",
+        (true, true, false) => "codex+pi",
+        (true, false, true) => "codex+omp",
+        (false, true, true) => "pi+omp",
+        (true, false, false) => "codex",
+        (false, true, false) => "pi",
+        (false, false, true) => "omp",
+        (false, false, false) => unreachable!("gated launch has a lifecycle-hook consumer"),
+    }
+}
+
 fn gate_harness_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
     catalog_root: &Path,
     report: &mut UpReport,
     verify_hooks: V,
 ) where
-    V: FnOnce() -> anyhow::Result<()>,
+    V: FnOnce(Option<&'static str>) -> anyhow::Result<()>,
 {
     let mut gated_agents = Vec::new();
+    let mut needs_codex = false;
+    let mut needs_pi = false;
+    let mut needs_omp = false;
     for launch in &plan.launch {
-        let Some(_) = launch.tasks.iter().find(|target| {
-            target.name == "agent"
-                && (crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
-                    || crate::hooks::launch_invokes_pi(&target.launch, catalog_root)
-                    || crate::hooks::launch_invokes_omp(&target.launch, catalog_root))
-        }) else {
-            continue;
-        };
-        gated_agents.push(launch.spec.identity.clone());
+        let mut gated = false;
+        for target in &launch.tasks {
+            if target.name != "agent" {
+                continue;
+            }
+            let invokes_codex = crate::hooks::launch_invokes_codex(&target.launch, catalog_root);
+            let invokes_pi = crate::hooks::launch_invokes_pi(&target.launch, catalog_root);
+            let invokes_omp = crate::hooks::launch_invokes_omp(&target.launch, catalog_root);
+            needs_codex |= invokes_codex;
+            needs_pi |= invokes_pi;
+            needs_omp |= invokes_omp;
+            gated |= invokes_codex || invokes_pi || invokes_omp;
+        }
+        if gated {
+            gated_agents.push(launch.spec.identity.clone());
+        }
     }
     if gated_agents.is_empty() {
         return;
     }
 
-    if let Err(error) = verify_hooks() {
+    let consumer = crate::telemetry::tracer_export_enabled()
+        .then(|| lifecycle_hook_consumer(needs_codex, needs_pi, needs_omp));
+    if let Err(error) = verify_hooks(consumer) {
         plan.launch
             .retain(|launch| !gated_agents.contains(&launch.spec.identity));
         report.errors.push(format!(
-            "verify lifecycle hooks for new Codex or pi agent(s) {}: {error}; launch suppressed",
+            "verify lifecycle hooks for new Codex, pi, or omp agent(s) {}: {error}; launch suppressed",
             gated_agents.join(", ")
         ));
     }
+}
+
+/// Root span for one reconcile pass. The compatibility name remains `st2.reconcile_pass`;
+/// `span.label` and `st2.reconcile.path` distinguish the bounded path enum.
+fn reconcile_span(this_host: &str, path: &'static str) -> tracing::Span {
+    tracing::info_span!(
+        "st2.reconcile_pass",
+        "span.label" = path,
+        "st2.host" = this_host,
+        "st2.reconcile.path" = path,
+        "st2.crash_loops" = tracing::field::Empty,
+        "st2.unparked" = tracing::field::Empty,
+        "st2.report.errors" = tracing::field::Empty,
+        "st2.report.warnings" = tracing::field::Empty,
+        "st2.reconcile.skipped" = tracing::field::Empty,
+        "st2.result" = tracing::field::Empty,
+    )
+}
+
+fn catalog_lock_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.catalog.lock",
+            "span.label" = "shared",
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn catalog_discover_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.catalog.discover",
+            "span.label" = "catalog",
+            "st2.catalog.spec_count" = tracing::field::Empty,
+            "st2.report.warning_count" = tracing::field::Empty,
+            "st2.report.error_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn lifecycle_hooks_span(consumer: &'static str) -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.hooks.verify",
+            "span.label" = "lifecycle hooks",
+            "st2.hooks.consumer" = consumer,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn catalog_materialize_span(label: &'static str) -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.catalog.materialize",
+            "span.label" = label,
+            "st2.materialize.failure_count" = tracing::field::Empty,
+            "st2.report.warning_count" = tracing::field::Empty,
+            "st2.report.error_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn runtime_observe_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.runtime.observe",
+            "span.label" = "all sessions",
+            "st2.runtime.session_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn reconcile_execute_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.reconcile.execute",
+            "span.label" = "apply plan",
+            "st2.plan.launch_count" = tracing::field::Empty,
+            "st2.plan.gc_count" = tracing::field::Empty,
+            "st2.plan.teardown_count" = tracing::field::Empty,
+            "st2.report.warning_count" = tracing::field::Empty,
+            "st2.report.error_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn span_count(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn finish_child_span(span: Option<&tracing::Span>, failed: bool) {
+    let Some(span) = span else {
+        return;
+    };
+    span.record("st2.result", if failed { "fail" } else { "pass" });
+    if failed {
+        span.set_status(Status::error(""));
+    }
+}
+
+fn execute_reconcile(
+    plan: &ReconcilePlan,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    presentation_cursor: &mut PresentationPatchCursor,
+    report: &mut UpReport,
+) {
+    let span = reconcile_execute_span();
+    let before = span
+        .as_ref()
+        .map(|_| (report.warnings.len(), report.errors.len()));
+    let _entered = span.as_ref().map(tracing::Span::enter);
+    execute_with_presentation_cursor(plan, runner, cap, presentation_cursor, report);
+    if let (Some(span), Some((warnings_before, errors_before))) = (span.as_ref(), before) {
+        span.record("st2.plan.launch_count", span_count(plan.launch.len()));
+        span.record("st2.plan.gc_count", span_count(plan.gc.len()));
+        span.record("st2.plan.teardown_count", span_count(plan.teardown.len()));
+        span.record(
+            "st2.report.warning_count",
+            span_count(report.warnings.len().saturating_sub(warnings_before)),
+        );
+        let added_errors = report.errors.len().saturating_sub(errors_before);
+        span.record("st2.report.error_count", span_count(added_errors));
+        finish_child_span(Some(span), added_errors > 0);
+    }
+}
+
+/// Stamp bounded pass outcomes onto the root and emit the deterministic per-pass completion log.
+/// Call while the span is entered.
+fn finish_reconcile_pass(span: &tracing::Span, report: &UpReport) {
+    span.record("st2.crash_loops", span_count(report.crash_loops.len()));
+    span.record("st2.unparked", span_count(report.unparked.len()));
+    span.record("st2.report.errors", span_count(report.errors.len()));
+    span.record("st2.report.warnings", span_count(report.warnings.len()));
+    span.record("st2.reconcile.skipped", report.skipped);
+    let failed = !report.errors.is_empty();
+    let result = if failed { "fail" } else { "pass" };
+    span.record("st2.result", result);
+    if failed {
+        span.set_status(Status::error(""));
+    }
+    tracing::info!(target: "st2", result, "reconcile pass complete");
+}
+
+fn finish_failed_reconcile_pass(span: &tracing::Span) {
+    span.record("st2.crash_loops", 0_i64);
+    span.record("st2.unparked", 0_i64);
+    span.record("st2.report.errors", 1_i64);
+    span.record("st2.report.warnings", 0_i64);
+    span.record("st2.reconcile.skipped", true);
+    span.record("st2.result", "fail");
+    span.set_status(Status::error(""));
+    tracing::info!(target: "st2", result = "fail", "reconcile pass complete");
 }
 
 /// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
@@ -1767,18 +2033,22 @@ fn gate_harness_launches_on_hooks<'a, V>(
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    let pass_span = crate::telemetry::PassSpan::start(this_host);
     let started = Instant::now();
-    let report = reconcile_pass(
-        root,
-        this_host,
-        &task_context,
-        runner,
-        &mut FlappingCap::default(),
-        &mut debounce,
-        &mut PresentationPatchCursor::default(),
-    );
-    pass_span.finish(report.crash_loops.len(), report.unparked.len());
+    let span = reconcile_span(this_host, "catalog");
+    let report = {
+        let _entered = span.enter();
+        let report = reconcile_pass(
+            root,
+            this_host,
+            &task_context,
+            runner,
+            &mut FlappingCap::default(),
+            &mut debounce,
+            &mut PresentationPatchCursor::default(),
+        );
+        finish_reconcile_pass(&span, &report);
+        report
+    };
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     Ok(report)
 }
@@ -1816,36 +2086,52 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
+    let started = Instant::now();
+    let span = reconcile_span(this_host, "spec");
     let mut report = UpReport::default();
-    if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
-        report.errors.push(error.to_string());
-        return report;
-    }
-    let sessions = match runner.list_sessions() {
-        Ok(s) => s,
-        Err(e) => {
-            report.skipped = true;
-            report
-                .errors
-                .push(format!("list sessions (pass skipped): {e}"));
-            return report;
+    {
+        let _entered = span.enter();
+        if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
+            report.errors.push(error.to_string());
+        } else {
+            let observe_span = runtime_observe_span();
+            let observe_entered = observe_span.as_ref().map(tracing::Span::enter);
+            let sessions = runner.list_sessions();
+            if let (Some(span), Ok(sessions)) = (observe_span.as_ref(), sessions.as_ref()) {
+                span.record("st2.runtime.session_count", span_count(sessions.len()));
+            }
+            finish_child_span(observe_span.as_ref(), sessions.is_err());
+            drop(observe_entered);
+            match sessions {
+                Ok(sessions) => reconcile_specs_with_sessions_in_span(
+                    specs,
+                    &sessions,
+                    this_host,
+                    runner,
+                    cap,
+                    debounce,
+                    presentation_cursor,
+                    &mut report,
+                ),
+                Err(error) => {
+                    report.skipped = true;
+                    report
+                        .errors
+                        .push(format!("list sessions (pass skipped): {error}"));
+                }
+            }
         }
-    };
-    reconcile_pass_specs_with_sessions(
-        specs,
-        &sessions,
-        this_host,
-        runner,
-        cap,
-        debounce,
-        presentation_cursor,
-    )
+        finish_reconcile_pass(&span, &report);
+    }
+    crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
+    report
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
 /// this so crash classification and reconciliation see the same terminal state: otherwise a clean
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
-/// vanished crash on the next tick.
+/// vanished crash on the next tick. The external snapshot deliberately omits
+/// `st2.runtime.observe`; its provenance is outside this pass.
 pub(crate) fn reconcile_pass_specs_with_sessions(
     specs: &[agent_spec::spec::AgentSpec],
     sessions: &[Session],
@@ -1856,23 +2142,45 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let started = Instant::now();
-    let pass_span = crate::telemetry::PassSpan::start(this_host);
+    let span = reconcile_span(this_host, "spec");
     let mut report = UpReport::default();
-    let now = Instant::now();
-    debounce.observe(sessions, now);
-    let mut plan = match crate::reconcile(specs, sessions, this_host) {
-        Ok(plan) => plan,
-        Err(error) => {
-            report.errors.push(error.to_string());
-            drop(pass_span);
-            crate::metrics::record_reconcile_pass(started.elapsed(), true);
-            return report;
-        }
-    };
-    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
-    pass_span.finish(report.crash_loops.len(), report.unparked.len());
+    {
+        let _entered = span.enter();
+        reconcile_specs_with_sessions_in_span(
+            specs,
+            sessions,
+            this_host,
+            runner,
+            cap,
+            debounce,
+            presentation_cursor,
+            &mut report,
+        );
+        finish_reconcile_pass(&span, &report);
+    }
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     report
+}
+
+fn reconcile_specs_with_sessions_in_span(
+    specs: &[agent_spec::spec::AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
+    report: &mut UpReport,
+) {
+    let now = Instant::now();
+    debounce.observe(sessions, now);
+    match crate::reconcile(specs, sessions, this_host) {
+        Ok(mut plan) => {
+            report.deferred = debounce.defer_flickers(&mut plan, now);
+            execute_reconcile(&plan, runner, cap, presentation_cursor, report);
+        }
+        Err(error) => report.errors.push(error.to_string()),
+    }
 }
 
 /// One reconcile pass over an in-memory spec team (`st2 up <spec> --once`). Throwaway cap+debounce
@@ -1900,9 +2208,31 @@ pub fn up_once_selected_specs(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
-        crate::hooks::verify_installed().map(|_| ())
-    })
+    let span = reconcile_span(this_host, "selected");
+    let result = {
+        let _entered = span.enter();
+        let result = up_once_selected_specs_with_gates(
+            catalog_root,
+            specs,
+            selector,
+            this_host,
+            runner,
+            |consumer| {
+                let hook_span = consumer.and_then(lifecycle_hooks_span);
+                let hook_entered = hook_span.as_ref().map(tracing::Span::enter);
+                let result = crate::hooks::verify_installed().map(|_| ());
+                finish_child_span(hook_span.as_ref(), result.is_err());
+                drop(hook_entered);
+                result
+            },
+        );
+        match &result {
+            Ok(report) => finish_reconcile_pass(&span, report),
+            Err(_) => finish_failed_reconcile_pass(&span),
+        }
+        result
+    };
+    result
 }
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
@@ -1913,55 +2243,111 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    let pass_span = crate::telemetry::PassSpan::start(this_host);
-    let _catalog_lock = crate::CatalogLock::shared(catalog_root)
-        .context("acquire shared catalog-authoring lock for selected reconcile")?;
-    let found = crate::discovery::discover(catalog_root);
-    let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
-    let mut report = UpReport::default();
-    report.warnings.extend(found.warnings);
-    report.errors.extend(
-        found
-            .errors
-            .into_iter()
-            .map(|e| format!("{}: {}", e.path.display(), e.message)),
-    );
-    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
-        report.errors.push(error.to_string());
-        return Ok(report);
-    }
-    let owner = owner.clone();
-    if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
-        && let Err(error) = crate::hooks::verify_installed()
-    {
-        report
-            .errors
-            .push(format!("verify lifecycle hooks: {error}"));
-        return Ok(report);
-    }
-    let materialized = crate::materialize::materialize_catalog_against(
-        catalog_root,
-        std::slice::from_ref(&owner),
-        &found.specs,
-        this_host,
-    );
-    report.warnings.extend(materialized.warnings);
-    let owner_materialization_failed = !materialized.failed_agents.is_empty();
-    report.errors.extend(materialized.errors);
-    if owner_materialization_failed {
-        return Ok(report);
-    }
-    let execution = up_once_selected_specs_with_gates(
-        catalog_root,
-        &found.specs,
-        selector,
-        this_host,
-        runner,
-        || Ok(()),
-    )?;
-    report.absorb(execution);
-    pass_span.finish(report.crash_loops.len(), report.unparked.len());
-    Ok(report)
+    let span = reconcile_span(this_host, "selected");
+    let result = {
+        let _entered = span.enter();
+        let result = (|| {
+            let _catalog_lock = {
+                let lock_span = catalog_lock_span();
+                let lock_entered = lock_span.as_ref().map(tracing::Span::enter);
+                let result = crate::CatalogLock::shared(catalog_root)
+                    .context("acquire shared catalog-authoring lock for selected reconcile");
+                finish_child_span(lock_span.as_ref(), result.is_err());
+                drop(lock_entered);
+                result?
+            };
+            let found = {
+                let discover_span = catalog_discover_span();
+                let discover_entered = discover_span.as_ref().map(tracing::Span::enter);
+                let found = crate::discovery::discover(catalog_root);
+                if let Some(span) = &discover_span {
+                    span.record("st2.catalog.spec_count", span_count(found.specs.len()));
+                    span.record("st2.report.warning_count", span_count(found.warnings.len()));
+                    span.record("st2.report.error_count", span_count(found.errors.len()));
+                    finish_child_span(Some(span), !found.errors.is_empty());
+                }
+                drop(discover_entered);
+                found
+            };
+            let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+            let mut report = UpReport::default();
+            report.warnings.extend(found.warnings);
+            report.errors.extend(
+                found
+                    .errors
+                    .into_iter()
+                    .map(|e| format!("{}: {}", e.path.display(), e.message)),
+            );
+            if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host)
+            {
+                report.errors.push(error.to_string());
+                return Ok(report);
+            }
+            let owner = owner.clone();
+            if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root) {
+                let hook_span = lifecycle_hooks_span("codex");
+                let hook_entered = hook_span.as_ref().map(tracing::Span::enter);
+                let verification = crate::hooks::verify_installed();
+                finish_child_span(hook_span.as_ref(), verification.is_err());
+                drop(hook_entered);
+                if let Err(error) = verification {
+                    report
+                        .errors
+                        .push(format!("verify lifecycle hooks: {error}"));
+                    return Ok(report);
+                }
+            }
+            let materialized = {
+                let materialize_span = catalog_materialize_span("selected owner");
+                let materialize_entered = materialize_span.as_ref().map(tracing::Span::enter);
+                let materialized = crate::materialize::materialize_catalog_against(
+                    catalog_root,
+                    std::slice::from_ref(&owner),
+                    &found.specs,
+                    this_host,
+                );
+                if let Some(span) = &materialize_span {
+                    span.record(
+                        "st2.materialize.failure_count",
+                        span_count(materialized.failed_agents.len()),
+                    );
+                    span.record(
+                        "st2.report.warning_count",
+                        span_count(materialized.warnings.len()),
+                    );
+                    span.record(
+                        "st2.report.error_count",
+                        span_count(materialized.errors.len()),
+                    );
+                    finish_child_span(Some(span), !materialized.errors.is_empty());
+                }
+                drop(materialize_entered);
+                materialized
+            };
+            report.warnings.extend(materialized.warnings);
+            let owner_materialization_failed = !materialized.failed_agents.is_empty();
+            report.errors.extend(materialized.errors);
+            if owner_materialization_failed {
+                return Ok(report);
+            }
+            let execution = up_once_selected_specs_with_gates(
+                catalog_root,
+                &found.specs,
+                selector,
+                this_host,
+                runner,
+                |_| Ok(()),
+            )?;
+            report.absorb(execution);
+            Ok(report)
+        })();
+        match &result {
+            Ok(report) => finish_reconcile_pass(&span, report),
+            Err(_) => finish_failed_reconcile_pass(&span),
+        }
+        result
+    };
+    result
 }
 
 fn up_once_selected_specs_with_gates<V>(
@@ -1973,21 +2359,35 @@ fn up_once_selected_specs_with_gates<V>(
     verify_hooks: V,
 ) -> anyhow::Result<UpReport>
 where
-    V: FnOnce() -> anyhow::Result<()>,
+    V: FnOnce(Option<&'static str>) -> anyhow::Result<()>,
 {
     crate::reconcile::resolve_task(specs, selector, this_host)?;
     crate::reconcile::validate_task_identities(specs, this_host)?;
     let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?;
     let mut compiled_specs = specs.to_vec();
     compile_generated_tasks(&mut compiled_specs, this_host, &task_context)?;
-    let sessions = runner
-        .list_sessions()
-        .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
+    let sessions = {
+        let observe_span = runtime_observe_span();
+        let observe_entered = observe_span.as_ref().map(tracing::Span::enter);
+        let sessions = runner.list_sessions();
+        if let (Some(span), Ok(sessions)) = (observe_span.as_ref(), sessions.as_ref()) {
+            span.record("st2.runtime.session_count", span_count(sessions.len()));
+        }
+        finish_child_span(observe_span.as_ref(), sessions.is_err());
+        drop(observe_entered);
+        sessions.map_err(|e| anyhow::anyhow!("list sessions: {e}"))?
+    };
     let mut plan =
         crate::reconcile::reconcile_selected(&compiled_specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
     gate_harness_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
-    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    execute_reconcile(
+        &plan,
+        runner,
+        &mut FlappingCap::default(),
+        &mut PresentationPatchCursor::default(),
+        &mut report,
+    );
     Ok(report)
 }
 
@@ -2032,7 +2432,7 @@ pub fn up_loop_specs(
                 // Counted once per park (the initial transition), not per pass: a task stays
                 // parked, so per-pass counting would inflate crash_loops_total unboundedly.
                 crate::metrics::record_crash_loop();
-                eprintln!(
+                tracing::error!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
@@ -2197,7 +2597,7 @@ fn best_effort_catalog_watcher(
     match crate::watch::watch_catalog_declarations(root, tx) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2: cannot watch catalog declarations: {error}; immediate catalog changes are unavailable, continuing with timer polling."
             );
             None
@@ -2275,18 +2675,22 @@ fn up_loop_until(
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
         let mut report = {
-            let pass_span = crate::telemetry::PassSpan::start(this_host);
             let started = Instant::now();
-            let pass = reconcile_pass(
-                root,
-                this_host,
-                &task_context,
-                runner,
-                &mut cap,
-                &mut debounce,
-                &mut presentation_cursor,
-            );
-            pass_span.finish(pass.crash_loops.len(), pass.unparked.len());
+            let span = reconcile_span(this_host, "catalog");
+            let pass = {
+                let _entered = span.enter();
+                let pass = reconcile_pass(
+                    root,
+                    this_host,
+                    &task_context,
+                    runner,
+                    &mut cap,
+                    &mut debounce,
+                    &mut presentation_cursor,
+                );
+                finish_reconcile_pass(&span, &pass);
+                pass
+            };
             crate::metrics::record_reconcile_pass(started.elapsed(), !pass.errors.is_empty());
             pass
         };
@@ -2307,7 +2711,7 @@ fn up_loop_until(
                 // Counted once per park (the initial transition), not per pass: a task stays
                 // parked, so per-pass counting would inflate crash_loops_total unboundedly.
                 crate::metrics::record_crash_loop();
-                eprintln!(
+                tracing::error!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
@@ -2340,7 +2744,7 @@ fn up_loop_until(
 pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
     let agent = cl.agent_bus_id(this_host);
     let Some(supervisor) = cl.supervisor.as_deref() else {
-        eprintln!(
+        tracing::warn!(
             "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
             cl.pty_id
         );
@@ -2348,7 +2752,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     };
     let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
     else {
-        eprintln!(
+        tracing::warn!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id
         );
@@ -2372,7 +2776,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         &tags,
         &body,
     ) {
-        eprintln!(
+        tracing::warn!(
             "st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}",
             cl.pty_id
         );
@@ -2537,6 +2941,33 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_hook_consumer_is_a_closed_enum() {
+        let consumers = [
+            lifecycle_hook_consumer(true, false, false),
+            lifecycle_hook_consumer(false, true, false),
+            lifecycle_hook_consumer(false, false, true),
+            lifecycle_hook_consumer(true, true, false),
+            lifecycle_hook_consumer(true, false, true),
+            lifecycle_hook_consumer(false, true, true),
+            lifecycle_hook_consumer(true, true, true),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(
+            consumers,
+            BTreeSet::from([
+                "codex",
+                "pi",
+                "omp",
+                "codex+pi",
+                "codex+omp",
+                "pi+omp",
+                "codex+pi+omp",
+            ])
+        );
+    }
+
+    #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
             identity: "codex".into(),
@@ -2578,7 +3009,10 @@ mod tests {
             "test.codex.agent",
             "test",
             &runner,
-            || anyhow::bail!("stale receipt"),
+            |consumer| {
+                assert_eq!(consumer, None);
+                anyhow::bail!("stale receipt")
+            },
         )
         .unwrap();
         assert_eq!(runner.list_calls.get(), 1);
@@ -2635,7 +3069,7 @@ mod tests {
             "test.codex.agent",
             "test",
             &runner,
-            || {
+            |_| {
                 verify_calls.set(verify_calls.get() + 1);
                 Ok(())
             },
@@ -3219,7 +3653,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || Ok(()));
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, |_| Ok(()));
 
         assert_eq!(
             plan.launch
@@ -3248,7 +3682,7 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, |_| {
             panic!("an already-live Codex agent must not enter the hook gate")
         });
 
@@ -3282,7 +3716,7 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, |_| {
             anyhow::bail!("stale receipt")
         });
 
@@ -3586,11 +4020,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let output = output_with_timeout(
-            &mut Command::new(&executable),
-            Duration::from_secs(5),
-        )
-        .unwrap();
+        let output =
+            output_with_timeout(&mut Command::new(&executable), Duration::from_secs(5)).unwrap();
 
         assert_eq!(output.stdout.len(), CAPTURE_CAP_BYTES);
         assert!(
@@ -3634,7 +4065,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_shared_reaper_reaps_a_killed_child() {
-        let mut child = Command::new("sh").arg("-c").arg("sleep 60").spawn().unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .unwrap();
         let pid = child.id() as i32;
         unsafe {
             libc::kill(pid, libc::SIGKILL);

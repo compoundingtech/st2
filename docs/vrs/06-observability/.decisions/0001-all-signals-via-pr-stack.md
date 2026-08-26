@@ -1,6 +1,6 @@
 # All three signals via a three-PR gh stack
 
-Status: draft
+Status: accepted
 
 Recorded 2026-08-25 from the aligned observability interview (axe decision catalog Q1 + Q3).
 
@@ -17,6 +17,12 @@ is shared by every signal; once it lands, metrics and logs are incremental. Defe
 invites "traces shipped, rest never happens" — and the CI proof obligation (otelite capture +
 assertions) is signal-generic anyway.
 
+## Evidence and Argument
+
+The exporter/provider plumbing and otelite capture harness are shared across all three signals,
+while rates/durations require metrics and correlated diagnostics require logs. Splitting delivery
+at signal boundaries isolates review and CI failures without treating traces as the finished scope.
+
 ## Decision
 
 **Q1 — Scope**: all three signals (traces, metrics, logs) are the target. Not traces-only; not
@@ -31,18 +37,14 @@ traces-first-with-maybe-later.
 Each PR lands green independently; 2 and 3 build on 1's shared plumbing
 (provider/resource/exporter) only.
 
-## Alternatives considered
+## Options
 
-- **Traces-first, defer the rest** — rejected: defers most of the value (rates/durations live in
-  metrics; correlated diagnostics in logs) for no real risk reduction, since the risky part
-  (feature set, sync export, flush-at-exit) is identical across signals.
-- **Single PR** — rejected: couples an unreviewable diff (instrumentation across `run.rs`,
-  `exec_backend.rs`, `hooks.rs`, plus unit changes and test harness) to the plumbing; a regression
-  in any slice blocks all of it.
-- **Spool-files instead of direct OTLP export** — writing telemetry records to local spool files
-  for a separate shipper to forward — rejected: adds a moving part st2 must own (rotation,
-  retention, crash-safety) to solve a problem the fleet pipeline already solves at
-  `127.0.0.1:4318`; the ambient-endpoint no-op contract would need re-inventing.
+| Option | Result | Reason |
+| --- | --- | --- |
+| All three signals in a three-PR stack | Selected | Shares the risky plumbing while isolating signal-specific review and CI failures. |
+| Traces first, defer the rest | Rejected | Defers rates, durations, and correlated diagnostics without reducing exporter risk. |
+| Single PR | Rejected | Couples all instrumentation sites and the capture harness into one blocking review surface. |
+| Spool files instead of direct OTLP | Rejected | Adds rotation, retention, and crash-safety machinery for a pipeline the fleet already provides. |
 
 ## Consequences
 
