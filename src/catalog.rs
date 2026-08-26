@@ -152,6 +152,12 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
     let mut class = ProfileClass::Coalesced;
     let mut seen_class = false;
     for child in children.nodes() {
+        if child.children().is_some() {
+            anyhow::bail!(
+                "profile '{scheme}': '{}' does not accept a child block",
+                child.name().value()
+            );
+        }
         // KDL folds `wasm "a.wasm" class "immediate"` written without separators into ONE node
         // with extra positional entries — reject anything beyond the single expected argument
         // so a run-on line fails loudly instead of parsing as something else.
@@ -389,6 +395,37 @@ mod tests {
         ];
         for text in loud {
             assert!(parse(text).is_err(), "expected error for: {text}");
+        }
+    }
+
+    #[test]
+    fn profile_value_fields_reject_nested_child_blocks() {
+        for (field, text) in [
+            (
+                "wasm",
+                r#"profile "dev.x" {
+                  wasm "x.wasm" {
+                    nested "value"
+                  }
+                }"#,
+            ),
+            (
+                "class",
+                r#"profile "dev.x" {
+                  wasm "x.wasm"
+                  class "immediate" {
+                    nested "value"
+                  }
+                }"#,
+            ),
+        ] {
+            let error = parse(text).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("'{field}' does not accept a child block")),
+                "{field}: {error:#}"
+            );
         }
     }
 
