@@ -24,7 +24,7 @@ Agent Spec resource URI (opaque, byte-preserved)
   profile "<scheme>" { wasm "<module>"; class "<class>"; }
              |
              v ResourceProfileRegistry (injectable; built-ins empty)
-      compiled Module cache keyed by module path
+      bounded outcome cache keyed by module path + file identity/digest
              |
              v fresh Store + Instance per resolution
    closed core-wasm guest (no imports / no WASI)
@@ -166,8 +166,13 @@ metadata alone is never treated as a durable proof.
 
 Each module is opened nonblocking and no-follow, accepted only as a regular
 file, and read through a 16 MiB admission cap before validation or compilation.
-It is then compiled once per module path and shared by registry clones.
-Each resolution creates a fresh `Store` and `Instance`. One fuel allowance
+The bounded 32-entry LRU cache stores both successful modules and compilation
+failures by module path plus byte digest and stable file metadata. Registry
+clones and concurrent subscribers therefore coalesce one compilation attempt
+for an unchanged identity. Byte replacement or metadata identity change
+invalidates that path's entry and retries compilation.
+Each resolution of a successfully compiled module creates a fresh `Store` and
+`Instance`. One fuel allowance
 covers the module start function and the first resolution call; a reused
 instance receives one fresh allowance before each later call:
 
@@ -180,7 +185,7 @@ instance receives one fresh allowance before each later call:
 | Memories | at most 1 |
 | Tables | at most 4, with at most 10,000 elements each |
 | Instance state | fresh per registry resolution |
-| Compiled code | cached per module path |
+| Compiled code/failure | 32-entry LRU by module path + byte digest + file metadata; shared across registry clones |
 
 Failure taxonomy:
 
@@ -230,7 +235,3 @@ targets.
   report registered-profile failures without making hot-path cache hits noisy?
   Resolve by dogfood evidence that distinguishes module defects, hostile input,
   and feature-disabled builds.
-- **DQ-P3 Module replacement:** Should replacing wasm bytes at the same catalog
-  path invalidate the compiled-module cache in a resident supervisor, and what
-  file identity or digest defines that transition? Resolve with an activation-
-  style replacement experiment and an explicit cache lifecycle contract.

@@ -13,8 +13,3 @@ therefore are not open questions.
   production path is no longer silent. Resolve from dogfood evidence whether
   low-volume spans/logs/metrics must further separate feature-disabled builds,
   module defects, traps/fuel, malformed returns, and containment violations.
-- **DQ-P3 Module replacement.** Compiled modules are cached by path for the
-  registry lifetime. Determine whether activation-style replacement of wasm
-  bytes at the same path must invalidate a resident cache and whether path,
-  inode, content digest, or catalog generation owns that lifecycle. Resolve
-  with a replacement experiment before specifying hot reload.
