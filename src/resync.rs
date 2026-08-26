@@ -9,7 +9,7 @@
 //! only a content transition emits.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -51,9 +51,10 @@ pub struct WatchableCarrier {
     pub class: CarrierClass,
 }
 
-/// The watchable carriers of one agent, keyed by its bus id and canonical seat task id.
+/// The watchable carriers of one agent, keyed by its declaration path with current routing IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentWatchSet {
+    pub declaration_path: PathBuf,
     pub bus_id: String,
     pub seat_id: Option<String>,
     pub carriers: Vec<WatchableCarrier>,
@@ -63,10 +64,11 @@ pub struct AgentWatchSet {
 /// URI denotes a local file (`RESYNC-R01`). Bindings with an inactive reason are skipped;
 /// schemes without a local denotation and silent stores are simply absent.
 pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
-    let agent_dir = spec.path.parent().unwrap_or(Path::new("."));
+    let declaration_path = lexical_clean(&spec.path);
+    let agent_dir = declaration_path.parent().unwrap_or(Path::new("."));
     let mut carriers = vec![WatchableCarrier {
         label: "declaration".to_owned(),
-        path: spec.path.clone(),
+        path: declaration_path.clone(),
         class: CarrierClass::Immediate,
     }];
     for resource in &spec.resources {
@@ -89,6 +91,7 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
     // agent supervised under `st2 up --host <alias>` without an explicit declaration host still
     // produces a recipient `resolve_stream` can resolve.
     AgentWatchSet {
+        declaration_path,
         bus_id: spec.bus_id(this_host),
         seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
             task.id
@@ -105,7 +108,7 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
 fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     if let Some(rest) = uri.strip_prefix("file://") {
         let path = PathBuf::from(rest);
-        return path.is_absolute().then_some(path);
+        return path.is_absolute().then(|| lexical_clean(&path));
     }
     let has_uri_scheme = uri.split_once(':').is_some_and(|(scheme, _)| {
         !scheme.is_empty()
@@ -117,14 +120,37 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     if has_uri_scheme {
         return None;
     }
-    Some(agent_dir.join(uri))
+    Some(lexical_clean(&agent_dir.join(uri)))
+}
+
+/// Remove `.` and `..` components lexically. This deliberately does not inspect the filesystem:
+/// classification follows the authored path structure without resolving symlinks.
+fn lexical_clean(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                clean.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = matches!(clean.components().next_back(), Some(Component::Normal(_)));
+                if can_pop {
+                    clean.pop();
+                } else if !clean.has_root() {
+                    clean.push(component.as_os_str());
+                }
+            }
+        }
+    }
+    clean
 }
 
 /// Class defaults (`RESYNC-R04`): goal carriers are immediate; stores the agent itself authors
 /// are silent (None); everything else is coalesced. The declaration carrier is immediate by
 /// construction in [`watch_set_for`].
-fn classify(agent_dir: &Path, binding_name: &str, path: &Path) -> Option<CarrierClass> {
-    let agent_relative = path.strip_prefix(agent_dir).ok();
+fn classify(agent_dir: &Path, binding_name: &str, normalized_path: &Path) -> Option<CarrierClass> {
+    let agent_relative = normalized_path.strip_prefix(agent_dir).ok();
     let authored_store = agent_relative.is_some_and(|rel| {
         rel.starts_with("resources/context")
             || rel.starts_with("resources/decisions")
@@ -133,7 +159,8 @@ fn classify(agent_dir: &Path, binding_name: &str, path: &Path) -> Option<Carrier
     if authored_store {
         return None;
     }
-    let goal = binding_name == "goal" || path.file_name().is_some_and(|n| n == "goal.md");
+    let goal =
+        binding_name == "goal" || normalized_path.file_name().is_some_and(|n| n == "goal.md");
     Some(if goal {
         CarrierClass::Immediate
     } else {
@@ -196,7 +223,10 @@ impl ResyncSupervisor {
             .collect();
         let refresh = WatchRefresh {
             sets,
-            malformed_declarations: malformed_declarations.iter().cloned().collect(),
+            malformed_declarations: malformed_declarations
+                .iter()
+                .map(|path| lexical_clean(path))
+                .collect(),
             live_task_ids: sessions
                 .iter()
                 .filter(|session| session.alive)
@@ -226,6 +256,7 @@ impl Drop for ResyncSupervisor {
 // ---- Worker side --------------------------------------------------------------------------------
 
 struct Entry {
+    declaration_path: PathBuf,
     bus_id: String,
     seat_id: Option<String>,
     label: String,
@@ -324,6 +355,21 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
     }
 }
 
+fn take_retained_entry(
+    previous: &mut BTreeMap<PathBuf, Vec<Entry>>,
+    declaration_path: &Path,
+    label: &str,
+) -> Option<Entry> {
+    for entries in previous.values_mut() {
+        if let Some(index) = entries.iter().position(|entry| {
+            entry.declaration_path == declaration_path && entry.label == label
+        }) {
+            return Some(entries.remove(index));
+        }
+    }
+    None
+}
+
 fn rebuild_carriers(
     mut previous: BTreeMap<PathBuf, Vec<Entry>>,
     refresh: WatchRefresh,
@@ -331,30 +377,27 @@ fn rebuild_carriers(
     let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
     for set in refresh.sets {
         for carrier in set.carriers {
-            // Several agents may bind the same local file: every `(bus_id, label)`
-            // subscription at a path is retained, not replaced (`RESYNC-R01`). Subscribers
-            // already on record keep their digest and pending dirty state: a reconcile pass
-            // can land between a mutation and its flush window, and reseeding here would
-            // silently erase that event (`RESYNC-R03` protects the baseline, not mid-flight
-            // transitions). Only genuinely unknown subscriptions seed silently.
-            let existing = previous.entry(carrier.path.clone()).or_default();
-            let retained = existing
-                .iter()
-                .position(|entry| {
-                    entry.bus_id == set.bus_id
-                        && entry.label == carrier.label
-                        && entry.class == carrier.class
-                })
-                .map(|index| existing.remove(index));
-            let entry = retained.unwrap_or_else(|| Entry {
+            // The declaration path and binding label identify one subscription across refreshed
+            // routing metadata. Rebuild every retained entry from the current declaration while
+            // carrying only delivery state: a seat-id or host-alias rename must neither erase a
+            // pending transition nor keep routing it to the stale recipient. Looking across path
+            // buckets also lets a binding's re-resolved path/class metadata become current.
+            let retained =
+                take_retained_entry(&mut previous, &set.declaration_path, &carrier.label);
+            let (digest, pending_digest, dirty) = retained.map_or_else(
+                || (read_digest(&carrier.path), None, false),
+                |entry| (entry.digest, entry.pending_digest, entry.dirty),
+            );
+            let entry = Entry {
+                declaration_path: set.declaration_path.clone(),
                 bus_id: set.bus_id.clone(),
                 seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
                 class: carrier.class,
-                digest: read_digest(&carrier.path),
-                pending_digest: None,
-                dirty: false,
-            });
+                digest,
+                pending_digest,
+                dirty,
+            };
             next.entry(carrier.path).or_default().push(entry);
         }
     }
@@ -782,12 +825,75 @@ mod tests {
     }
 
     #[test]
+    fn lexical_paths_drive_store_classification_and_containment() {
+        let agent_dir = Path::new("/catalog/agents/host/worker");
+
+        let silent = resolve_local_path(
+            agent_dir,
+            "file:///catalog/agents/host/worker/resources/tmp/../context/./journal.md",
+        )
+        .unwrap();
+        assert_eq!(
+            silent,
+            agent_dir.join("resources/context/journal.md"),
+            "file URI dot segments are removed before classification"
+        );
+        assert_eq!(classify(agent_dir, "journal", &silent), None);
+
+        let goal = resolve_local_path(agent_dir, "resources/context/.././goal.md").unwrap();
+        assert_eq!(goal, agent_dir.join("resources/goal.md"));
+        assert_eq!(
+            classify(agent_dir, "notes", &goal),
+            Some(CarrierClass::Immediate)
+        );
+
+        let escaped =
+            resolve_local_path(agent_dir, "resources/context/../../outside/notes.md").unwrap();
+        assert_eq!(escaped, agent_dir.join("outside/notes.md"));
+        assert_eq!(
+            classify(agent_dir, "notes", &escaped),
+            Some(CarrierClass::Coalesced),
+            "a lexical escape from an authored store is not silent"
+        );
+        assert_eq!(
+            classify(
+                agent_dir,
+                "notes",
+                Path::new("/catalog/agents/host/worker-copy/resources/context/notes.md"),
+            ),
+            Some(CarrierClass::Coalesced),
+            "path-prefix siblings are not contained by the agent directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classification_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(agent_dir.join("resources/context")).unwrap();
+        std::os::unix::fs::symlink(
+            agent_dir.join("resources/context"),
+            agent_dir.join("resources/linked"),
+        )
+        .unwrap();
+
+        let linked = resolve_local_path(&agent_dir, "resources/linked/journal.md").unwrap();
+        assert_eq!(
+            classify(&agent_dir, "journal", &linked),
+            Some(CarrierClass::Coalesced),
+            "classification is lexical and must not canonicalize through the symlink"
+        );
+    }
+
+    #[test]
     fn shared_path_refresh_preserves_every_subscription_state() {
         let shared = PathBuf::from("/shared/resource.md");
         let previous = BTreeMap::from([(
             shared.clone(),
             vec![
                 Entry {
+                    declaration_path: PathBuf::from("/catalog/alpha/agent.kdl"),
                     bus_id: "host.alpha".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
@@ -797,6 +903,7 @@ mod tests {
                     dirty: true,
                 },
                 Entry {
+                    declaration_path: PathBuf::from("/catalog/beta/agent.kdl"),
                     bus_id: "host.beta".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
@@ -809,6 +916,7 @@ mod tests {
         )]);
         let sets = vec![
             AgentWatchSet {
+                declaration_path: PathBuf::from("/catalog/alpha/agent.kdl"),
                 bus_id: "host.alpha".to_owned(),
                 seat_id: None,
                 carriers: vec![WatchableCarrier {
@@ -818,6 +926,7 @@ mod tests {
                 }],
             },
             AgentWatchSet {
+                declaration_path: PathBuf::from("/catalog/beta/agent.kdl"),
                 bus_id: "host.beta".to_owned(),
                 seat_id: None,
                 carriers: vec![WatchableCarrier {
@@ -845,12 +954,84 @@ mod tests {
     }
 
     #[test]
+    fn retained_subscription_uses_current_route_seat_path_and_class() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/alias/worker");
+        std::fs::create_dir_all(agent_dir.join("resources")).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "alias"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let goal = agent_dir.join("resources/goal.md");
+        std::fs::write(&goal, "current bytes").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
+
+        let mut current = watch_set_for(&discover(root.path()), "alias");
+        current.seat_id = Some("current-seat".to_owned());
+        let declaration = current.declaration_path.clone();
+        let old_path = agent_dir.join("resources/old-goal.md");
+        let previous = BTreeMap::from([(
+            old_path.clone(),
+            vec![Entry {
+                declaration_path: declaration,
+                bus_id: "stale-alias.worker".to_owned(),
+                seat_id: Some("stale-seat".to_owned()),
+                label: "goal".to_owned(),
+                class: CarrierClass::Coalesced,
+                digest: Some("old-digest".to_owned()),
+                pending_digest: None,
+                dirty: true,
+            }],
+        )]);
+
+        let rebuilt = rebuild_carriers(previous, refresh_for(vec![current]));
+        assert!(!rebuilt.contains_key(&old_path));
+        let entry = rebuilt[&goal]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .expect("the goal subscription remains pending at its current path");
+        assert_eq!(entry.bus_id, "alias.worker");
+        assert_eq!(entry.seat_id.as_deref(), Some("current-seat"));
+        assert_eq!(entry.class, CarrierClass::Immediate);
+        assert_eq!(entry.digest.as_deref(), Some("old-digest"));
+        assert!(entry.dirty);
+
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "alias".to_owned(),
+            carriers: rebuilt,
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.flush_path(&goal, Some(CarrierClass::Immediate));
+
+        let entry = worker.carriers[&goal]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert!(!entry.dirty, "the current recipient accepted the transition");
+        assert!(entry.pending_digest.is_none());
+        let events = std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(events.len(), 1, "the event routes to the current bus id");
+    }
+
+    #[test]
     fn malformed_declaration_retains_only_an_observed_live_seat_subscription() {
         let declaration = PathBuf::from("/catalog/agents/hetz/worker/agent.kdl");
         let previous = || {
             BTreeMap::from([(
                 declaration.clone(),
                 vec![Entry {
+                    declaration_path: declaration.clone(),
                     bus_id: "hetz.worker".to_owned(),
                     seat_id: Some("custom-worker-seat".to_owned()),
                     label: "declaration".to_owned(),
@@ -915,6 +1096,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
+                    declaration_path: set.declaration_path.clone(),
                     bus_id: "hetz.worker".to_owned(),
                     seat_id: set.seat_id.clone(),
                     label: "goal".to_owned(),
@@ -964,6 +1146,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
+                    declaration_path: PathBuf::from("/catalog/missing/agent.kdl"),
                     bus_id: "host.missing".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
@@ -980,6 +1163,7 @@ mod tests {
         std::fs::write(&carrier, "after").unwrap();
         let now = Instant::now();
         worker.apply_watch_sets(refresh_for(vec![AgentWatchSet {
+            declaration_path: PathBuf::from("/catalog/missing/agent.kdl"),
             bus_id: "host.missing".to_owned(),
             seat_id: None,
             carriers: vec![WatchableCarrier {
@@ -1074,6 +1258,7 @@ mod tests {
         let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
             .into_iter()
             .map(|class| Entry {
+                declaration_path: PathBuf::from("/catalog/worker/agent.kdl"),
                 bus_id: "host.worker".to_owned(),
                 seat_id: None,
                 label: format!("{class:?}"),
@@ -1110,6 +1295,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
+                    declaration_path: PathBuf::from("/catalog/missing/agent.kdl"),
                     bus_id: "host.missing".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
