@@ -1742,12 +1742,12 @@ fn reconcile_pass(
             .iter()
             .map(|error| error.path.clone())
             .collect::<Vec<_>>();
-        resync.refresh(
+        report.warnings.extend(resync.refresh(
             &live_resync_specs(&compiled_specs, this_host, &sessions, &report),
             this_host,
             &sessions,
             &malformed_declarations,
-        );
+        ));
     }
     report
 }

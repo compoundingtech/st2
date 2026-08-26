@@ -73,6 +73,14 @@ pub fn watch_set_for(
     this_host: &str,
     profiles: &ResourceProfileRegistry,
 ) -> AgentWatchSet {
+    resolve_watch_set(spec, this_host, profiles).0
+}
+
+fn resolve_watch_set(
+    spec: &AgentSpec,
+    this_host: &str,
+    profiles: &ResourceProfileRegistry,
+) -> (AgentWatchSet, Vec<String>) {
     let declaration_path = lexical_clean(&spec.path);
     let agent_dir = declaration_path.parent().unwrap_or(Path::new("."));
     let mut carriers = vec![WatchableCarrier {
@@ -81,8 +89,18 @@ pub fn watch_set_for(
         class: CarrierClass::Immediate,
         containment_root: None,
     }];
+    let mut diagnostics = Vec::new();
     for resource in &spec.resources {
         if resource.inactive_reason().is_some() {
+            continue;
+        }
+        // Silent profiles carry no observable transition, so never compile or execute their
+        // untrusted resolver merely to discard its result.
+        let registered_profile = resource
+            .uri()
+            .split_once(':')
+            .and_then(|(scheme, _)| profiles.get(scheme));
+        if registered_profile.is_some_and(|profile| profile.class() == ProfileClass::Silent) {
             continue;
         }
         // Declared profile schemes resolve through their wasm module; the DECLARED class
@@ -102,9 +120,16 @@ pub fn watch_set_for(
             }
             // Not this registry's business (no scheme, or scheme without a profile): fall
             // through to the legacy local-path rules. A registered-but-failed resolution stays
-            // contained — unwatchable, supervisor unharmed.
+            // contained and becomes an explicit reconcile diagnostic.
             Ok(None) => {}
-            Err(_) => continue,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "resync profile for {} resource '{}': {error}; binding is unwatchable",
+                    spec.bus_id(this_host),
+                    resource.name()
+                ));
+                continue;
+            }
         }
         let Some(path) = resolve_local_path(agent_dir, resource.uri()) else {
             continue;
@@ -122,16 +147,19 @@ pub fn watch_set_for(
     // The supervisor's resolved logical host — not the OS hostname — decides the bus id, so an
     // agent supervised under `st2 up --host <alias>` without an explicit declaration host still
     // produces a recipient `resolve_stream` can resolve.
-    AgentWatchSet {
-        declaration_path,
-        bus_id: spec.bus_id(this_host),
-        seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
-            task.id
-                .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
-        }),
-        carriers,
-    }
+    (
+        AgentWatchSet {
+            declaration_path,
+            bus_id: spec.bus_id(this_host),
+            seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
+                task.id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
+            }),
+            carriers,
+        },
+        diagnostics,
+    )
 }
 
 /// A URI denotes a local file when it is an absolute, authority-free `file://` URI or a
@@ -275,19 +303,26 @@ impl ResyncSupervisor {
         }
     }
     /// Replace the worker's watch set from the pass's already-discovered specs. A malformed
-    /// declaration retains its prior subscription only while its canonical seat is observed alive.
+    /// declaration retains its prior subscription only while its canonical seat is observed alive;
+    /// contained profile failures reach the reconcile report.
+    #[must_use = "resolver diagnostics must be surfaced by the reconcile caller"]
     pub fn refresh(
         &self,
         specs: &[AgentSpec],
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
-    ) {
+    ) -> Vec<String> {
+        let mut diagnostics = Vec::new();
         let sets = specs
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
-            .map(|spec| watch_set_for(spec, this_host, &self.profiles))
+            .map(|spec| {
+                let (set, mut failures) = resolve_watch_set(spec, this_host, &self.profiles);
+                diagnostics.append(&mut failures);
+                set
+            })
             .collect();
         let refresh = WatchRefresh {
             sets,
@@ -304,6 +339,7 @@ impl ResyncSupervisor {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Msg::WatchSet(refresh));
         }
+        diagnostics
     }
 
     /// Synchronously install one newly proven-live canonical seat before reconciliation advances
@@ -1042,19 +1078,45 @@ fn read_confined(path: &Path, root: &Path) -> Option<String> {
 
     let relative = path.strip_prefix(root).ok()?;
     let mut components = relative.components().peekable();
-    let root = CString::new(root.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `root` is NUL-terminated and the returned descriptor is checked before ownership.
-    let root_fd = unsafe {
+
+    // Open the confinement root component-by-component from the filesystem root. `O_NOFOLLOW`
+    // on one full pathname protects only its final component; descriptor-relative traversal
+    // protects every ancestor from symlink replacement as well.
+    let mut root_components = root.components();
+    if root_components.next()? != std::path::Component::RootDir {
+        return None;
+    }
+    let slash = CString::new("/").ok()?;
+    // SAFETY: `slash` is NUL-terminated and the returned descriptor is checked before ownership.
+    let filesystem_root = unsafe {
         libc::open(
-            root.as_ptr(),
+            slash.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
-    if root_fd < 0 {
+    if filesystem_root < 0 {
         return None;
     }
-    // SAFETY: `root_fd` is a newly-owned descriptor after the non-negative check above.
-    let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    // SAFETY: `filesystem_root` is newly owned after the non-negative check.
+    let mut directory = unsafe { OwnedFd::from_raw_fd(filesystem_root) };
+    for component in root_components {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = CString::new(name.as_bytes()).ok()?;
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK;
+        // SAFETY: the live directory descriptor and NUL-terminated component are valid.
+        let opened = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if opened < 0 {
+            return None;
+        }
+        // SAFETY: `opened` is newly owned after the non-negative check.
+        directory = unsafe { OwnedFd::from_raw_fd(opened) };
+    }
 
     while let Some(component) = components.next() {
         let std::path::Component::Normal(name) = component else {
@@ -1832,6 +1894,11 @@ mod tests {
         // SAFETY: the path is NUL-terminated and points into the live temp directory.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert_eq!(read_digest(&fifo, None), None);
+        assert_eq!(
+            read_digest(&fifo, Some(tmp.path())),
+            None,
+            "confined carrier reads must reject a FIFO without blocking too"
+        );
     }
 
     #[test]
@@ -1898,6 +1965,25 @@ mod tests {
         std::os::unix::fs::symlink(outside_dir.path(), &resources)
             .expect("replace absent ancestor with an external symlink");
         assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_read_refuses_a_symlinked_confinement_root_ancestor() {
+        let temp = tempfile::tempdir().expect("outer directory");
+        let real_root = temp.path().join("real/agent");
+        std::fs::create_dir_all(&real_root).expect("real agent directory");
+        std::fs::write(real_root.join("goal.md"), "outside admitted ancestry")
+            .expect("carrier bytes");
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(temp.path().join("real"), &alias)
+            .expect("symlinked root ancestor");
+        let admitted_root = alias.join("agent");
+        assert_eq!(
+            read_digest(&admitted_root.join("goal.md"), Some(&admitted_root)),
+            None,
+            "every component of the confinement root must be opened without following symlinks"
+        );
     }
 
     #[test]
@@ -2375,7 +2461,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_profile_carriers_use_the_declared_class_not_basename_sniffing() {
+    fn registered_profile_failures_are_reported_while_other_bindings_survive() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("agents/hetz/worker");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2390,22 +2476,51 @@ mod tests {
         )
         .unwrap();
 
-        // A profile that resolves but always fails to compile (garbage module): its binding is
-        // skipped contained while the declaration carrier survives. Without the wasm feature the
-        // same containment applies for a different reason (feature unavailable).
         let broken = tmp.path().join("broken.wasm");
         std::fs::write(&broken, b"not a module").unwrap();
         let profiles = ResourceProfileRegistry::empty().with_profile(
             agent_spec::ResourceProfile::wasm(
                 "dev.schickling.agent-goal",
                 &broken,
+                ProfileClass::Coalesced,
+            ),
+        );
+        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &profiles);
+        assert!(!set.carriers.iter().any(|c| c.label == "goal"));
+        assert!(set.carriers.iter().any(|c| c.label == "declaration"));
+        assert!(!set.carriers.iter().any(|c| c.label == "issue"));
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("resource 'goal'"));
+        assert!(diagnostics[0].contains("unwatchable"));
+    }
+
+    #[test]
+    fn silent_profile_skips_its_resolver_entirely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/hetz/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  command "true"
+  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let missing = tmp.path().join("must-not-load.wasm");
+        let profiles = ResourceProfileRegistry::empty().with_profile(
+            agent_spec::ResourceProfile::wasm(
+                "dev.schickling.agent-goal",
+                missing,
                 ProfileClass::Silent,
             ),
         );
-        let set = watch_set_for(&discover(tmp.path()), "hetz", &profiles);
-        assert!(!set.carriers.iter().any(|c| c.label == "goal"));
-        assert!(set.carriers.iter().any(|c| c.label == "declaration"));
-        // Unregistered schemes stay unwatchable exactly as before.
-        assert!(!set.carriers.iter().any(|c| c.label == "issue"));
+        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &profiles);
+        assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
+        assert!(
+            diagnostics.is_empty(),
+            "a silent profile must not execute its missing resolver: {diagnostics:?}"
+        );
     }
 }

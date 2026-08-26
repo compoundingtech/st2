@@ -77,11 +77,15 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     // Seed the baseline before any writes: the seeded digest emits nothing.
     let supervisor =
         st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
-    supervisor.refresh(
-        &st2::discover_strict(catalog.path()).specs,
-        "hetz",
-        &[],
-        &[],
+    assert!(
+        supervisor
+            .refresh(
+                &st2::discover_strict(catalog.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
+            .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(resync_events(&agent_dir).len(), 0, "seeding is silent");
@@ -168,11 +172,15 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
 
     let supervisor =
         st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
-    supervisor.refresh(
-        &st2::discover_strict(catalog.path()).specs,
-        "hetz",
-        &[],
-        &[],
+    assert!(
+        supervisor
+            .refresh(
+                &st2::discover_strict(catalog.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
+            .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
 
@@ -265,7 +273,11 @@ fn declared_wasm_profile_resolves_a_scheme_uri_goal_binding_and_fires_on_change(
         "hetz".to_owned(),
         registry,
     );
-    supervisor.refresh(&st2::discover_strict(catalog.path()).specs, "hetz");
+    assert!(
+        supervisor
+            .refresh(&st2::discover_strict(catalog.path()).specs, "hetz")
+            .is_empty()
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(resync_events(&agent_dir).len(), 0, "seeding is silent");
 
@@ -294,7 +306,11 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
         "hetz".to_owned(),
         st2::catalog::declared_profiles(silent.path()).unwrap(),
     );
-    supervisor.refresh(&st2::discover_strict(silent.path()).specs, "hetz");
+    assert!(
+        supervisor
+            .refresh(&st2::discover_strict(silent.path()).specs, "hetz")
+            .is_empty()
+    );
     std::thread::sleep(Duration::from_millis(300));
     let goal = silent_dir.join("resources/goal.md");
     fs::create_dir_all(goal.parent().unwrap()).unwrap();
