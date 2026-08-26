@@ -16,8 +16,8 @@
       },
       "original": {
         "owner": "overengineeringstudio",
-        "ref": "main",
         "repo": "effect-utils",
+        "rev": "911e2ce0f4ac39d2b54f9ebd6df035234982f721",
         "type": "github"
       }
     },

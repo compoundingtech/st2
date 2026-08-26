@@ -11,8 +11,10 @@
     # Shared tooling packages from overengineering: provides the `otelite`
     # OTLP collector binary that the OTel export integration gate
     # (`tests/otel_export.rs`, exposed as `checks.otel-export`) drives to
-    # prove real span export end-to-end.
-    effect-utils.url = "github:overengineeringstudio/effect-utils/main";
+    # prove real span export end-to-end. Pinned to a full rev (like `pty`)
+    # so CI is reproducible; bump deliberately via `nix flake lock`.
+    effect-utils.url =
+      "github:overengineeringstudio/effect-utils/911e2ce0f4ac39d2b54f9ebd6df035234982f721";
   };
 
   outputs =
