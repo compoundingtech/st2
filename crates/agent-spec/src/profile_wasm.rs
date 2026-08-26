@@ -187,6 +187,11 @@ impl WasmResolver {
                 resolution.path
             )));
         }
+        if path == root {
+            return Err(WasmResolveError::BadReturn(
+                "resolver path resolves to the agent directory".to_owned(),
+            ));
+        }
         reject_symlink_components(&root, &path)?;
         Ok(ContainedPath { path, root })
     }

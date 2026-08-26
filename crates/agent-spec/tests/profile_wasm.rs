@@ -118,6 +118,26 @@ fn resolver_rejects_an_empty_path_before_joining_it_to_the_agent_directory() {
     }
 }
 
+#[test]
+fn resolver_rejects_a_path_that_normalizes_to_the_agent_directory() {
+    let root = WasmResolver::from_wat(&format!(
+        r#"{HOSTILE_PRELUDE}
+      (data (i32.const 8) "{{\22path\22:\22sub/..\22,\22class\22:\22goal\22}}")
+      (func (export "resolve") (param i32 i32 i32 i32) (result i64)
+        (i64.or
+          (i64.shl (i64.extend_i32_u (i32.const 8)) (i64.const 32))
+          (i64.extend_i32_u (i32.const 32))))
+)"#
+    ))
+    .expect("root-path module compiles");
+    match root.resolve_contained("any://x", Path::new("/agent/dir")) {
+        Err(WasmResolveError::BadReturn(error)) => {
+            assert!(error.contains("agent directory"), "got: {error}");
+        }
+        other => panic!("expected root-path refusal, got {other:?}"),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn resolver_cannot_cross_a_symlink_inside_the_agent_directory() {
