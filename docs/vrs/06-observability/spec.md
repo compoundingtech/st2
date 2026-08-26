@@ -44,7 +44,7 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 - **Protocol**: HTTP JSON (`http-json` + protobuf-free wire), batch exporter, targeting the local
   Alloy forwarder at `127.0.0.1:4318` by convention.
 - **Resource**: `service.name` = `st2-<unit>` selected per entrypoint (below; `src/main.rs`
-  passes `supervisor` or `cli`), `service.version` from `crate::version::machine_version`, and
+  passes `supervisor`, `hook`, or `cli`), `service.version` from `crate::version::machine_version`, and
   `host.name` from the existing host detection. The remaining R04 fleet attributes
   (`service.namespace`,
   `service.instance.id`, `sk.site`, `sk.role`, `deployment.environment.name`) are not set yet —
@@ -59,7 +59,7 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 | --- | --- |
 | Supervisor loop (`st2 up` daemon / systemd unit) | `st2-supervisor` |
 | One-shot CLI invocations | `st2-cli` |
-| Hook executions (`src/hooks.rs`) — not instrumented yet; planned value | `st2-hook` |
+| Hook executions (`st2 driver claude-observe`; other hook surfaces not instrumented yet) | `st2-hook` |
 
 ## Trace roots
 
@@ -73,20 +73,52 @@ Instrumented in PR1, one root span per unit of work:
 
 Not yet instrumented (follow-ups, not PR1 scope):
 
-- Provider session lifecycles (claude / codex / opencode spawn, attach, teardown), exec sidecars
-  (`src/exec_backend.rs`), and hooks (`src/hooks.rs`).
-- The `st2 up <spec>` path (`reconcile_pass_specs` and friends) emits no spans yet — tracked as
-  an [open question](open-questions.md).
+- Provider session lifecycles (claude / codex / opencode spawn, attach, teardown) beyond the
+  PR2 launch/reap counters, exec sidecars (`src/exec_backend.rs`).
 
 Span names follow the central `01-conventions` rules (`span.label` discipline included). Names are
 registered st2-side; this list plus PR2's metric set is that registry's seed.
 
 ## Metrics (PR2)
 
-Exact metric set is open ([open-questions](open-questions.md)). Shape: counters for reconcile
-passes, spawns, reaps, hook runs, and errors by kind; histograms for reconcile-pass duration and
-provider-session start latency. Same resource attributes, same endpoint, batch exporter shared
-with traces.
+Landed RED-minimal set per interview decision Q5; every label value comes from a bounded enum,
+and identifiers never become metric labels (ids stay in span attributes). `src/metrics.rs` owns
+the instruments; every record call early-outs unless a meter provider is installed.
+
+| Instrument | Type | Labels |
+| --- | --- | --- |
+| `reconcile_passes_total` | counter | `result` = `pass` \| `fail` |
+| `task_launches_total` | counter | `driver` = `codex` \| `claude` \| `opencode` \| `pi` \| `omp` \| `exec` \| `other` |
+| `task_reaps_total` | counter | `driver` (same enum as launches) |
+| `hook_invocations_total` | counter | `hook` = registry name (`claude-observe`), `event` = bounded Claude hook-event set, unknown → `other` |
+| `message_deliveries_total` | counter | `result` = `pass` \| `fail` |
+| `crash_loops_total` | counter | — |
+| `reconcile_pass_duration_seconds` | histogram | — |
+| `session_start_duration_seconds` | histogram | — |
+
+The duration histograms use seconds-scale explicit buckets (`1ms … 10s`, see
+`DURATION_BUCKET_BOUNDARIES` in `src/telemetry.rs`) instead of the SDK's millisecond-tuned
+defaults, so sub-second passes and spawns stay distinguishable.
+
+Scope notes: passes are counted at all three `st2.reconcile_pass` sites (catalog loop pass,
+one-shot up, and the single-file spec path — `reconcile_pass_specs_with_sessions`, which now
+emits the same root span shape); `fail` means the pass collected errors. Reaps count the
+restart path in the launch loop, where driver context exists. Deliveries cover bus deliveries
+onto a recipient inbox (`deliver_record`, send + retry paths); ding/native transport outcomes
+are separate follow-ups. Hook invocations are observed at the single in-process application
+point (`st2 driver claude-observe`); hook scripts the harnesses execute directly are not
+visible to st2. The `driver` label is a closed enum resolved by precedence: `exec` task kind
+first, then a typed driver declaration, then an observational argv/shell token heuristic
+(alphanumeric tokens matched in launch order: `codex`, `claude`, `opencode`, `omp`, `pi`; anything
+else → `other`). Because the heuristic inspects arbitrary user work, a hand-authored seat may
+be labeled by what its command line merely mentions — the label is diagnostic only and never
+influences reconcile decisions.
+
+The meter provider shares PR1's plumbing: `Telemetry::init` installs an `SdkMeterProvider`
+with a `PeriodicReader` + OTLP/HTTP-JSON metric exporter behind the same
+`OTEL_EXPORTER_OTLP_ENDPOINT` guard and resource; unset → no provider and the global meter is
+a silent no-op (R02 zero-overhead). `Telemetry::shutdown` force-flushes metric points alongside
+spans so short-lived CLI runs deliver them.
 
 ## Log bridge (PR3)
 

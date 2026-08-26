@@ -1315,6 +1315,43 @@ fn stop_live_derived_companions(
     }
 }
 
+/// Bounded driver label for lifecycle metrics (`task_launches_total` / `task_reaps_total`).
+/// Typed drivers report their own name; legacy routed and hand-authored seats are classified
+/// by what their launch actually invokes. Anything unrecognizable collapses to `other`, so
+/// the label stays a closed set: `codex|claude|opencode|pi|omp|exec|other`. Observational only —
+/// callers gate on [`crate::metrics::enabled`], and it never influences reconcile decisions.
+fn driver_label(launch: &crate::reconcile::Launch<'_>, target: &TaskTarget) -> &'static str {
+    if target.kind == TaskKind::Exec {
+        return "exec";
+    }
+    if let Some(driver) = &launch.spec.driver {
+        return driver.name();
+    }
+    // Legacy routed (`deliver "mcp"` → claude-session, ...) or hand-authored seats: inspect
+    // the launch source by its alphanumeric tokens.
+    let tokens = |needle: &str| match &target.launch {
+        TaskLaunch::Argv(argv) => argv
+            .iter()
+            .any(|arg| arg.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == needle)),
+        TaskLaunch::Shell(command) => command
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == needle),
+    };
+    if tokens("codex") {
+        "codex"
+    } else if tokens("claude") {
+        "claude"
+    } else if tokens("opencode") {
+        "opencode"
+    } else if tokens("omp") {
+        "omp"
+    } else if tokens("pi") {
+        "pi"
+    } else {
+        "other"
+    }
+}
+
 fn execute_with_presentation_cursor(
     plan: &ReconcilePlan,
     runner: &dyn Runner,
@@ -1394,7 +1431,9 @@ fn execute_with_presentation_cursor(
             let restarting = gc_set.contains(target.pty_id.as_str());
             if restarting {
                 match runner.reap_for_restart(&target.pty_id) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        crate::metrics::record_task_reap(driver_label(launch, target));
+                    }
                     Err(e) => {
                         report
                             .errors
@@ -1407,8 +1446,13 @@ fn execute_with_presentation_cursor(
                     }
                 }
             }
+            let spawn_started = Instant::now();
             match runner.spawn(target, spec_dir) {
                 Ok(()) => {
+                    crate::metrics::record_session_start(
+                        spawn_started.elapsed(),
+                        driver_label(launch, target),
+                    );
                     cap.record(&target.pty_id, now);
                     if restarting {
                         report.restarted.push(target.pty_id.clone());
@@ -1724,6 +1768,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let pass_span = crate::telemetry::PassSpan::start(this_host);
+    let started = Instant::now();
     let report = reconcile_pass(
         root,
         this_host,
@@ -1734,6 +1779,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
         &mut PresentationPatchCursor::default(),
     );
     pass_span.finish(report.crash_loops.len(), report.unparked.len());
+    crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     Ok(report)
 }
 
@@ -1809,6 +1855,8 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
+    let started = Instant::now();
+    let pass_span = crate::telemetry::PassSpan::start(this_host);
     let mut report = UpReport::default();
     let now = Instant::now();
     debounce.observe(sessions, now);
@@ -1816,11 +1864,14 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
         Ok(plan) => plan,
         Err(error) => {
             report.errors.push(error.to_string());
+            drop(pass_span);
+            crate::metrics::record_reconcile_pass(started.elapsed(), true);
             return report;
         }
     };
-    report.deferred = debounce.defer_flickers(&mut plan, now);
     execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
+    pass_span.finish(report.crash_loops.len(), report.unparked.len());
+    crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     report
 }
 
@@ -1978,6 +2029,9 @@ pub fn up_loop_specs(
         }
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
+                // Counted once per park (the initial transition), not per pass: a task stays
+                // parked, so per-pass counting would inflate crash_loops_total unboundedly.
+                crate::metrics::record_crash_loop();
                 eprintln!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
@@ -2222,6 +2276,7 @@ fn up_loop_until(
         park_channel.grant_requests(&mut cap, &mut pre);
         let mut report = {
             let pass_span = crate::telemetry::PassSpan::start(this_host);
+            let started = Instant::now();
             let pass = reconcile_pass(
                 root,
                 this_host,
@@ -2232,6 +2287,7 @@ fn up_loop_until(
                 &mut presentation_cursor,
             );
             pass_span.finish(pass.crash_loops.len(), pass.unparked.len());
+            crate::metrics::record_reconcile_pass(started.elapsed(), !pass.errors.is_empty());
             pass
         };
         pre.absorb(report);
@@ -2248,6 +2304,9 @@ fn up_loop_until(
         park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
+                // Counted once per park (the initial transition), not per pass: a task stays
+                // parked, so per-pass counting would inflate crash_loops_total unboundedly.
+                crate::metrics::record_crash_loop();
                 eprintln!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
@@ -2340,7 +2399,9 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+    use agent_spec::spec::{
+        AgentSpec, Driver, JobType, OmpDriver, Task, TaskKind, TaskLifecycle,
+    };
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
@@ -2966,6 +3027,59 @@ mod tests {
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }
+    }
+
+    #[test]
+    fn driver_labels_include_typed_and_argv_omp_but_remain_bounded() {
+        let legacy_spec = spec_fixture();
+        let legacy_launch = Launch {
+            spec: &legacy_spec,
+            tasks: Vec::new(),
+            live_derived: Vec::new(),
+        };
+        let mut omp_argv = target("hetz.demo.agent", "unused");
+        omp_argv.launch = TaskLaunch::Argv(vec![
+            "st2".into(),
+            "driver".into(),
+            "omp-session".into(),
+        ]);
+        let mut exec = target("hetz.demo.agent", "codex");
+        exec.kind = TaskKind::Exec;
+        let targets = [
+            target("hetz.demo.agent", "codex"),
+            target("hetz.demo.agent", "claude"),
+            target("hetz.demo.agent", "opencode"),
+            target("hetz.demo.agent", "pi"),
+            omp_argv,
+            exec,
+            target("hetz.demo.agent", "unrecognized"),
+        ];
+        let labels = targets
+            .iter()
+            .map(|target| driver_label(&legacy_launch, target))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            labels,
+            BTreeSet::from(["codex", "claude", "opencode", "pi", "omp", "exec", "other"])
+        );
+
+        let mut typed_spec = spec_fixture();
+        typed_spec.driver = Some(Driver::Omp(OmpDriver {
+            model: None,
+            effort: None,
+            prompt: String::new(),
+            args: Vec::new(),
+        }));
+        let typed_launch = Launch {
+            spec: &typed_spec,
+            tasks: Vec::new(),
+            live_derived: Vec::new(),
+        };
+        assert_eq!(
+            driver_label(&typed_launch, &target("hetz.demo.agent", "claude")),
+            "omp",
+            "typed driver identity must take precedence over argv heuristics"
+        );
     }
 
     #[test]

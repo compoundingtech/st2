@@ -1844,15 +1844,32 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
     let (inbox, archive) = recipient.boxes()?;
     let archived = archive.join(&record.filename);
     if archived.is_file() {
-        anyhow::ensure!(
-            fs::read_to_string(&archived)? == record.rendered_message,
-            "archived message differs from pending send {}",
-            record.filename
-        );
+        let same = match fs::read_to_string(&archived) {
+            Ok(content) => content == record.rendered_message,
+            // A read failure is a failed delivery too: report it before propagating so
+            // message_deliveries_total{result="fail"} covers filesystem errors, not just mismatches.
+            Err(error) => {
+                crate::metrics::record_message_delivery(true);
+                return Err(error.into());
+            }
+        };
+        if !same {
+            crate::metrics::record_message_delivery(true);
+            anyhow::bail!("archived message differs from pending send {}", record.filename);
+        }
+        crate::metrics::record_message_delivery(false);
         return Ok(());
     }
-    materialize_message_once(&inbox, &record.filename, &record.rendered_message)?;
-    Ok(())
+    match materialize_message_once(&inbox, &record.filename, &record.rendered_message) {
+        Ok(_) => {
+            crate::metrics::record_message_delivery(false);
+            Ok(())
+        }
+        Err(error) => {
+            crate::metrics::record_message_delivery(true);
+            Err(error)
+        }
+    }
 }
 
 fn key_path(root: &Path, to: &str, key: &str) -> anyhow::Result<PathBuf> {

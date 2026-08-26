@@ -78,6 +78,9 @@ pub fn run_observe(
 ) -> Result<()> {
     let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    // Counted only once the invocation has its application target: a hook for an undeclared
+    // agent errors out before any state is applied and must not inflate `hook_invocations_total`.
+    crate::metrics::record_hook_invocation("claude-observe", event);
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);

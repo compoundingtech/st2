@@ -992,12 +992,21 @@ fn main() -> Result<()> {
         command,
     } = Cli::parse();
 
-    let mut telemetry =
-        st2::telemetry::Telemetry::init(if matches!(command, Command::Up { once: false, .. }) {
+    let mut telemetry = st2::telemetry::Telemetry::init(
+        if matches!(command, Command::Up { once: false, .. }) {
             "supervisor"
+        } else if matches!(
+            command,
+            // Hook executions are their own process unit: `st2 driver claude-observe` runs per
+            // Claude hook event and records hook_invocations_total, which the documented
+            // process-unit contract assigns to `st2-hook`, not `st2-cli`.
+            Command::Driver(DriverCmd::ClaudeObserve { .. })
+        ) {
+            "hook"
         } else {
             "cli"
-        });
+        },
+    );
     let result = dispatch(command, catalog_path.as_deref());
     telemetry.shutdown();
     result
