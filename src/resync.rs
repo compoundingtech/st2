@@ -103,11 +103,23 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
 }
 
 /// A URI denotes a local file when it is an absolute, authority-free `file://` URI or a
-/// scheme-less catalog-relative path resolved against the agent directory. Unsupported file URI
-/// authorities, query/fragment components, malformed escapes, encoded path separators, and
-/// encoded parent components have no local denotation.
+/// scheme-less catalog-relative path resolved against the agent directory. URI scheme syntax is
+/// parsed before the `file` scheme name is matched ASCII-case-insensitively, as required by RFC
+/// 3986. Unsupported file URI authorities, query/fragment components,
+/// malformed escapes, encoded path separators, and encoded parent components have no local
+/// denotation.
 fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
-    if let Some(encoded_path) = uri.strip_prefix("file://") {
+    if let Some((scheme, scheme_specific)) = uri.split_once(':').filter(|(scheme, _)| {
+        !scheme.is_empty()
+            && !scheme.contains('/')
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    }) {
+        if !scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
+        let encoded_path = scheme_specific.strip_prefix("//")?;
         if !encoded_path.starts_with('/')
             || encoded_path.starts_with("//")
             || encoded_path.contains(['?', '#'])
@@ -116,16 +128,6 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
         }
         let path = decode_percent_path(encoded_path)?;
         return path.is_absolute().then(|| lexical_clean(&path));
-    }
-    let has_uri_scheme = uri.split_once(':').is_some_and(|(scheme, _)| {
-        !scheme.is_empty()
-            && !scheme.contains('/')
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    });
-    if has_uri_scheme {
-        return None;
     }
     let path = decode_percent_path(uri)?;
     Some(lexical_clean(&agent_dir.join(path)))
@@ -346,7 +348,6 @@ impl PendingTransition {
 }
 
 struct Entry {
-    declaration_path: PathBuf,
     bus_id: String,
     seat_id: Option<String>,
     label: String,
@@ -360,8 +361,9 @@ struct Entry {
     pending_transition: Option<PendingTransition>,
     dirty: bool,
 }
-type SubscriptionIdentity = (PathBuf, String);
-
+/// Recipient-scoped subscription identity. A declaration or carrier may move without changing
+/// the event deduplication namespace, while a bus-id change intentionally starts a new namespace.
+type SubscriptionIdentity = (String, String);
 
 #[cfg(unix)]
 type DirIdentity = (u64, u64);
@@ -392,7 +394,7 @@ struct Worker {
     root: PathBuf,
     this_host: String,
     carriers: BTreeMap<PathBuf, Vec<Entry>>,
-    /// Last sequence reserved for each declaration/binding identity seen by this supervisor.
+    /// Last sequence reserved for each recipient/binding identity seen by this supervisor.
     /// Inactive subscriptions stay here so a reinstall cannot collide with an earlier occurrence.
     /// Its lifetime is the worker's and its cardinality is bounded by identities observed there.
     subscription_sequences: BTreeMap<SubscriptionIdentity, u64>,
@@ -457,13 +459,14 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
 
 fn take_retained_entry(
     previous: &mut BTreeMap<PathBuf, Vec<Entry>>,
-    declaration_path: &Path,
+    bus_id: &str,
     label: &str,
 ) -> Option<Entry> {
     for entries in previous.values_mut() {
-        if let Some(index) = entries.iter().position(|entry| {
-            entry.declaration_path == declaration_path && entry.label == label
-        }) {
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.bus_id == bus_id && entry.label == label)
+        {
             return Some(entries.remove(index));
         }
     }
@@ -478,13 +481,13 @@ fn rebuild_carriers(
     let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
     for set in refresh.sets {
         for carrier in set.carriers {
-            // The declaration path and binding label identify one subscription across refreshed
-            // routing metadata. Rebuild every retained entry from the current declaration while
-            // carrying its baseline and immutable delivery snapshot. Looking across path buckets
-            // also lets a binding's re-resolved path/class metadata become current.
-            let identity = (set.declaration_path.clone(), carrier.label.clone());
-            let retained =
-                take_retained_entry(&mut previous, &set.declaration_path, &carrier.label);
+            // The canonical recipient and binding label identify one subscription across
+            // declaration and carrier relocation. Rebuild every retained entry from the current
+            // declaration while carrying its baseline and immutable delivery snapshot. Looking
+            // across path buckets also lets a binding's re-resolved path/class metadata become
+            // current. A bus-id change intentionally seeds a new recipient-scoped namespace.
+            let identity = (set.bus_id.clone(), carrier.label.clone());
+            let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
             let (digest, occurrence_sequence, pending_transition, dirty) =
                 retained.map_or_else(
                     || {
@@ -505,7 +508,6 @@ fn rebuild_carriers(
                     },
                 );
             let entry = Entry {
-                declaration_path: set.declaration_path.clone(),
                 bus_id: set.bus_id.clone(),
                 seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
@@ -545,10 +547,10 @@ impl Worker {
     fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
         let previous = std::mem::take(&mut self.carriers);
         // The active entries can disappear entirely while an agent is suspended. Retain only the
-        // scalar sequence floor per declaration/binding identity for this supervisor lifetime;
+        // scalar sequence floor per recipient/binding identity for this supervisor lifetime;
         // watches and carrier baselines remain exclusively in the active carrier map.
         for entry in previous.values().flatten() {
-            let identity = (entry.declaration_path.clone(), entry.label.clone());
+            let identity = (entry.bus_id.clone(), entry.label.clone());
             self.subscription_sequences
                 .entry(identity)
                 .and_modify(|sequence| *sequence = (*sequence).max(entry.occurrence_sequence))
@@ -559,7 +561,7 @@ impl Worker {
             .flat_map(|(path, entries)| {
                 entries.iter().map(|entry| {
                     (
-                        (entry.declaration_path.clone(), entry.label.clone()),
+                        (entry.bus_id.clone(), entry.label.clone()),
                         path.clone(),
                     )
                 })
@@ -575,7 +577,7 @@ impl Worker {
                 let previous_paths = &previous_paths;
                 entries.iter().filter_map(move |entry| {
                     previous_paths
-                        .get(&(entry.declaration_path.clone(), entry.label.clone()))
+                        .get(&(entry.bus_id.clone(), entry.label.clone()))
                         .filter(|previous_path| *previous_path != path)
                         .map(|_| path.clone())
                 })
@@ -1113,7 +1115,6 @@ mod tests {
             shared.clone(),
             vec![
                 Entry {
-                    declaration_path: PathBuf::from("/catalog/alpha/agent.kdl"),
                     bus_id: "host.alpha".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
@@ -1124,7 +1125,6 @@ mod tests {
                     dirty: true,
                 },
                 Entry {
-                    declaration_path: PathBuf::from("/catalog/beta/agent.kdl"),
                     bus_id: "host.beta".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_subscription_uses_current_route_seat_path_and_class() {
+    fn retained_subscription_uses_current_seat_path_and_class() {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = root.path().join("agents/alias/worker");
         std::fs::create_dir_all(agent_dir.join("resources")).unwrap();
@@ -1195,13 +1195,11 @@ mod tests {
 
         let mut current = watch_set_for(&discover(root.path()), "alias");
         current.seat_id = Some("current-seat".to_owned());
-        let declaration = current.declaration_path.clone();
         let old_path = agent_dir.join("resources/old-goal.md");
         let previous = BTreeMap::from([(
             old_path.clone(),
             vec![Entry {
-                declaration_path: declaration,
-                bus_id: "stale-alias.worker".to_owned(),
+                bus_id: "alias.worker".to_owned(),
                 seat_id: Some("stale-seat".to_owned()),
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
@@ -1249,35 +1247,24 @@ mod tests {
     }
 
     #[test]
-    fn pending_retry_keeps_its_original_snapshot_across_path_and_route_rebinding() {
+    fn pending_retry_keeps_its_original_snapshot_across_path_rebinding() {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = root.path().join("agents/alias/worker");
         let resources = agent_dir.join("resources");
         std::fs::create_dir_all(&resources).unwrap();
-        std::fs::write(
-            agent_dir.join("agent.kdl"),
-            r#"agent "worker" {
-  host "alias"
-  command "agent"
-  resource "goal" uri="resources/current-goal.md" reason="Mission."
-}"#,
-        )
-        .unwrap();
         let old_path = resources.join("old-goal.md");
         let current_path = resources.join("current-goal.md");
         std::fs::write(&old_path, "pending bytes").unwrap();
         std::fs::write(&current_path, "current rebound bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
-        let current = watch_set_for(&discover(root.path()), "alias");
-        let declaration = current.declaration_path.clone();
+        let declaration = agent_dir.join("agent.kdl");
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "alias".to_owned(),
             carriers: BTreeMap::from([(
                 old_path.clone(),
                 vec![Entry {
-                    declaration_path: declaration,
-                    bus_id: "stale.worker".to_owned(),
+                    bus_id: "alias.worker".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -1297,7 +1284,17 @@ mod tests {
         let pending = worker.carriers[&old_path][0]
             .pending_transition
             .clone()
-            .expect("failed stale route retains an immutable transition");
+            .expect("failed emit retains an immutable transition");
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" {
+  host "alias"
+  command "agent"
+  resource "goal" uri="resources/current-goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let current = watch_set_for(&discover(root.path()), "alias");
 
         worker.apply_watch_sets(refresh_for(vec![current]));
         worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -1341,7 +1338,6 @@ mod tests {
             carriers: BTreeMap::from([(
                 old_path.clone(),
                 vec![Entry {
-                    declaration_path: declaration.clone(),
                     bus_id: "host.worker".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
@@ -1390,7 +1386,6 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    declaration_path: declaration.clone(),
                     bus_id: "host.worker".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
@@ -1443,7 +1438,6 @@ mod tests {
             BTreeMap::from([(
                 declaration.clone(),
                 vec![Entry {
-                    declaration_path: declaration.clone(),
                     bus_id: "hetz.worker".to_owned(),
                     seat_id: Some("custom-worker-seat".to_owned()),
                     label: "declaration".to_owned(),
@@ -1524,7 +1518,6 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    declaration_path: set.declaration_path.clone(),
                     bus_id: "hetz.worker".to_owned(),
                     seat_id: set.seat_id.clone(),
                     label: "goal".to_owned(),
@@ -1584,7 +1577,6 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    declaration_path: PathBuf::from("/catalog/missing/agent.kdl"),
                     bus_id: "host.missing".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
@@ -1699,7 +1691,6 @@ mod tests {
         let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
             .into_iter()
             .map(|class| Entry {
-                declaration_path: PathBuf::from("/catalog/worker/agent.kdl"),
                 bus_id: "host.worker".to_owned(),
                 seat_id: None,
                 label: format!("{class:?}"),
@@ -1804,6 +1795,96 @@ mod tests {
     }
 
     #[test]
+    fn relocated_subscription_keeps_occurrence_sequence_in_the_recipient_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let original_carrier = resources.join("goal.md");
+        let relocated_carrier = resources.join("relocated-goal.md");
+        std::fs::write(&original_carrier, "A").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let set = watch_set_for(&discover(root.path()), "host");
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.apply_watch_sets(refresh_for(vec![set.clone()]));
+
+        std::fs::write(&original_carrier, "B").unwrap();
+        worker.flush_path(&original_carrier, None);
+        let first_a_to_b = resync_inbox_event(&agent_dir);
+
+        std::fs::write(&relocated_carrier, "A").unwrap();
+        let mut relocated = set;
+        relocated.declaration_path = agent_dir.join("relocated/agent.kdl");
+        for carrier in &mut relocated.carriers {
+            if carrier.label == "declaration" {
+                carrier.path = relocated.declaration_path.clone();
+            } else if carrier.label == "goal" {
+                carrier.path = relocated_carrier.clone();
+            }
+        }
+        worker.apply_watch_sets(refresh_for(vec![relocated.clone()]));
+        let rebound = worker.carriers[&relocated_carrier]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert_eq!(rebound.occurrence_sequence, 1);
+        assert_eq!(rebound.digest.as_deref(), read_digest(&original_carrier).as_deref());
+
+        worker.flush_path(&relocated_carrier, None);
+        let back_to_a = resync_inbox_event(&agent_dir);
+        assert_eq!(event_field(&back_to_a, "old"), event_field(&first_a_to_b, "new"));
+        assert_eq!(event_field(&back_to_a, "new"), event_field(&first_a_to_b, "old"));
+        assert!(event_field(&back_to_a, "occurrence").ends_with(":2"));
+
+        std::fs::write(&relocated_carrier, "B").unwrap();
+        worker.flush_path(&relocated_carrier, None);
+        let second_a_to_b = resync_inbox_event(&agent_dir);
+        assert_eq!(
+            event_field(&first_a_to_b, "old"),
+            event_field(&second_a_to_b, "old")
+        );
+        assert_eq!(
+            event_field(&first_a_to_b, "new"),
+            event_field(&second_a_to_b, "new")
+        );
+        assert_ne!(
+            event_field(&first_a_to_b, "event-id"),
+            event_field(&second_a_to_b, "event-id")
+        );
+        assert!(event_field(&first_a_to_b, "occurrence").ends_with(":1"));
+        assert!(event_field(&second_a_to_b, "occurrence").ends_with(":3"));
+
+        relocated.bus_id = "host.replacement".to_owned();
+        worker.apply_watch_sets(refresh_for(vec![relocated]));
+        assert_eq!(
+            worker.carriers[&relocated_carrier]
+                .iter()
+                .find(|entry| entry.label == "goal")
+                .unwrap()
+                .occurrence_sequence,
+            0,
+            "a different recipient starts a distinct deduplication namespace"
+        );
+    }
+
+    #[test]
     fn subscribers_advance_occurrence_sequences_independently() {
         let root = tempfile::tempdir().unwrap();
         let carrier = root.path().join("shared.md");
@@ -1812,7 +1893,6 @@ mod tests {
         let entries = ["host.alpha", "host.beta"]
             .into_iter()
             .map(|bus_id| Entry {
-                declaration_path: PathBuf::from(format!("/catalog/{bus_id}/agent.kdl")),
                 bus_id: bus_id.to_owned(),
                 seat_id: None,
                 label: "goal".to_owned(),
@@ -1880,7 +1960,6 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    declaration_path: PathBuf::from("/catalog/missing/agent.kdl"),
                     bus_id: "host.missing".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
@@ -2009,6 +2088,12 @@ mod tests {
             resolve_local_path(agent_dir, "file:///etc/demo.kdl"),
             Some(PathBuf::from("/etc/demo.kdl"))
         );
+        for scheme in ["file", "FILE", "FiLe"] {
+            assert_eq!(
+                resolve_local_path(agent_dir, &format!("{scheme}:///etc/demo.kdl")),
+                Some(PathBuf::from("/etc/demo.kdl"))
+            );
+        }
         assert_eq!(
             resolve_local_path(agent_dir, "file:///tmp/with%20space/%E2%82%AC.md"),
             Some(PathBuf::from("/tmp/with space/€.md"))
@@ -2049,6 +2134,8 @@ mod tests {
             "resources/bad%escape",
             "http://x/y",
             "worktree://repo/main",
+            "GitHub-Issue://org/repo/41",
+            "ProFiLe:opaque",
         ] {
             assert_eq!(
                 resolve_local_path(agent_dir, unsupported),
