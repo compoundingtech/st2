@@ -376,6 +376,10 @@ feeding the same chunk to the terminal emulator. A trailing-edge one-second
 debounce persists the newest value as `lastOutputAtMs` through PTY's locked
 metadata mutation. Exit metadata carries the final in-memory stamp.
 
+The Node and Rust PTY implementations expose the identical optional camelCase
+metadata field and persistence semantics. st2 consumes that shared registry
+contract, not an implementation-specific API.
+
 Roster reads on the local host:
 
 1. read and derive the driver record with its existing liveness probe;
