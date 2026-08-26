@@ -561,10 +561,7 @@ fn rebuild_carriers(
                 retained.map_or_else(
                     || {
                         (
-                            read_digest(
-                                &carrier.path,
-                                carrier.containment_root.as_deref(),
-                            ),
+                            read_digest(&carrier.path, carrier.containment_root.as_deref()),
                             subscription_sequences.get(&identity).copied().unwrap_or(0),
                             None,
                             false,
@@ -1513,7 +1510,8 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let current = watch_set_for(&discover(root.path()), "alias");
+        let current =
+            watch_set_for(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
 
         worker.apply_watch_sets(refresh_for(vec![current]));
         worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -2018,7 +2016,7 @@ mod tests {
         let carrier = resources.join("goal.md");
         std::fs::write(&carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host");
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
         let seen_subscription_count = set.carriers.len();
         let mut worker = Worker {
             root: root.path().to_path_buf(),
@@ -2095,7 +2093,8 @@ mod tests {
         let relocated_carrier = resources.join("relocated-goal.md");
         std::fs::write(&original_carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host");
+        let set =
+            watch_set_for(&discover(root.path()), "host", &ResourceProfileRegistry::empty());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -2127,7 +2126,10 @@ mod tests {
             .find(|entry| entry.label == "goal")
             .unwrap();
         assert_eq!(rebound.occurrence_sequence, 1);
-        assert_eq!(rebound.digest.as_deref(), read_digest(&original_carrier).as_deref());
+        assert_eq!(
+            rebound.digest.as_deref(),
+            read_digest(&original_carrier, None).as_deref()
+        );
 
         worker.flush_path(&relocated_carrier, None);
         let back_to_a = resync_inbox_event(&agent_dir);
@@ -2179,6 +2181,7 @@ mod tests {
                 seat_id: None,
                 label: "goal".to_owned(),
                 class: CarrierClass::Immediate,
+                containment_root: None,
                 digest: Some("old-digest".to_owned()),
                 occurrence_sequence: 0,
                 pending_transition: None,

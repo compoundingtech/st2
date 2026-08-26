@@ -150,10 +150,11 @@ an untrusted guest from escalating a `silent` profile to `immediate`.
 
 Before reading or acting, the host checks allocator pointers and the returned
 pointer/length range against linear memory, parses UTF-8 and JSON, rejects an
-empty path, joins the returned path to `agent_dir`, lexically normalizes
-`.`/`..`, and rejects any result outside `agent_dir` or crossing an existing
-symlink below it. Existence is not required at resolution time; the carrier may
-be created later.
+empty path, joins the returned path to `agent_dir`, and lexically normalizes
+`.`/`..`. A result equal to or outside `agent_dir`, or one crossing an existing
+symlink below it, is rejected; a resolver must denote a carrier beneath the
+root rather than the confinement root itself. Existence is not required at
+resolution time; the carrier may be created later.
 
 Successful resolution carries the normalized agent-directory root into resync.
 Every later digest read opens that root and then each relative component with
