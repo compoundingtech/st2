@@ -43,10 +43,11 @@ pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
 /// harmless either way.
 const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
-/// The verified range at introduction (2026-08-25, omp v18.0.3): major 18. A later minor stays
-/// rejected until the admission checks in `docs/vrs/06-omp-driver/spec.md` are repeated against
-/// it.
-const SUPPORTED_MAJOR: u32 = 18;
+/// The versions verified against the admission checks in
+/// `docs/vrs/06-omp-driver/spec.md` (2026-08-25). omp releases near-daily and its
+/// delivery-critical surface is versioned behavior, so admission is per exact version: a later
+/// minor OR patch stays rejected until the checks are repeated against it.
+const SUPPORTED_OMP_VERSIONS: [&str; 1] = ["18.0.3"];
 
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
 /// the channel extension spliced in.
@@ -167,18 +168,11 @@ fn verify_supported_version(binary: &str) -> Result<()> {
             token.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
         });
     let version = version.with_context(|| format!("{{binary}} --version printed no version: '{printed}'"))?;
-    let digits: Vec<&str> = version.split('.').collect();
     anyhow::ensure!(
-        digits.len() >= 2,
-        "omp version '{version}' is not <major>.<minor>[.<patch>]"
-    );
-    let major: u32 = digits[0]
-        .parse()
-        .with_context(|| format!("parsing omp major version from '{version}'"))?;
-    anyhow::ensure!(
-        major == SUPPORTED_MAJOR,
-        "omp {version} is unverified (admitted majors: {SUPPORTED_MAJOR}); repeat the \
-         docs/vrs/06-omp-driver admission checks before extending the gate"
+        SUPPORTED_OMP_VERSIONS.contains(&version),
+        "omp {version} is unverified (admitted: {}); repeat the docs/vrs/06-omp-driver \
+         admission checks before extending the gate",
+        SUPPORTED_OMP_VERSIONS.join(", ")
     );
     Ok(())
 }
@@ -277,6 +271,17 @@ mod tests {
         // executable in place.
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(verify_supported_version(fake.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn version_gate_refuses_an_unverified_minor() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("omp");
+        std::fs::write(&fake, "#!/bin/sh\nprintf '18.1.0\\n'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = verify_supported_version(fake.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("unverified"), "{error}");
     }
 
     #[test]

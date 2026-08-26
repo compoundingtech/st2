@@ -956,6 +956,7 @@ impl RawSpec {
             // still be a candidate, whichever provider the block names.
             || self.driver.pi.is_some()
             || self.driver.opencode.is_some()
+            || self.driver.omp.is_some()
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -1337,7 +1338,7 @@ mod tests {
     /// or path-derived discovery silently skips the seat.
     #[test]
     fn a_lone_driver_block_of_any_provider_is_a_spec_candidate() {
-        for provider in ["claude", "codex", "pi", "opencode"] {
+        for provider in ["claude", "codex", "pi", "opencode", "omp"] {
             let block = format!("[{provider}]\nprompt = \"Start the assigned work.\"");
             let raw: super::RawSpec = toml::from_str(&block).unwrap();
             assert!(raw.looks_like_spec(), "[{provider}] must look like a spec");

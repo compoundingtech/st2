@@ -92,3 +92,25 @@ presence record read `available`; the harness-state record seeded `idle` under
 `st2-session-start` restored-context block; observed state cycled active → idle
 (transitions 3→5) around the delivery. The model's reply itself failed with a provider-side
 429 weekly usage limit — outside st2's surface.
+
+## Fleet e2e run (dotfiles integration)
+
+The dotfiles side activated the driver on dev3 through the standing
+`dev3.omp-scratch` seat (launched by the production supervisor via
+`st2 driver omp-session`, st2 repinned to this branch). Verified live: the
+seat materialized into the catalog, reached presence `available`, published
+the harness-state record (`harness: "omp"`, seeded idle, fenced by the
+wrapper's session token), and a `st2 message send` from `dev3.cos` landed in
+its live TUI through the channel with observed state cycling active → idle
+(transitions around the delivery). The model's reply was blocked by a
+provider-side 429 weekly usage limit on the opencode-go workspace - the same
+external quota exhaustion visible across the fleet that day; the
+model-acts-on-delivery step is covered by the manual runs above.
+
+Integration findings recorded on the way: Nix standing seats launch through
+the `axe agent launch` carrier, which spawns the raw harness binary - so a
+driver-backed seat that wants the wrapper's machinery must declare the
+`st2 driver <h>-session` argv directly rather than ride the axe carrier; and
+axe's managed path requires a profile account binding plus a fixed-account
+credential availability probe, which omp satisfies with its install-identity
+file since its native OAuth exposes no projectable credential.
