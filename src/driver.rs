@@ -3,7 +3,9 @@
 //! Expansion does not read files, inspect a harness, mutate a declaration, or execute a process.
 //! Print, reconcile, and materialization use this same expansion.
 
-use agent_spec::spec::{AgentSpec, ClaudeDriver, CodexDriver, Driver, OpenCodeDriver, PiDriver};
+use agent_spec::spec::{
+    AgentSpec, ClaudeDriver, CodexDriver, Driver, OmpDriver, OpenCodeDriver, PiDriver,
+};
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 
@@ -39,6 +41,7 @@ pub fn expand_driver(spec: &AgentSpec, this_host: &str) -> Result<KdlDocument> {
         Driver::Codex(driver) => expand_codex(driver, &bus_id),
         Driver::Pi(driver) => expand_pi(driver, &bus_id),
         Driver::OpenCode(driver) => expand_opencode(driver, &bus_id),
+        Driver::Omp(driver) => expand_omp(driver, &bus_id),
     };
     output.autoformat();
     Ok(output)
@@ -92,6 +95,36 @@ fn expand_pi(driver: &PiDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "pi-session".to_string(),
+        "--identity".to_string(),
+        bus_id.to_string(),
+        "--runtime-id".to_string(),
+        bus_id.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(provider);
+    document([node("argv", argv)])
+}
+
+/// omp needs no rendered configuration file either: its channel is a pi-style extension the
+/// wrapper injects from this binary's verified hook set. omp has no pi `-a` equivalent it needs
+/// for a workspace launch — the wrapper already runs with the workspace as cwd.
+fn expand_omp(driver: &OmpDriver, bus_id: &str) -> KdlDocument {
+    let mut provider = vec!["omp".to_string()];
+    if let Some(model) = &driver.model {
+        provider.extend(["--model".to_string(), model.clone()]);
+    }
+    if let Some(effort) = &driver.effort {
+        provider.extend(["--thinking".to_string(), effort.clone()]);
+    }
+    provider.extend(driver.args.iter().cloned());
+    provider.push(driver.prompt.clone());
+
+    let mut argv = vec![
+        ST2.to_string(),
+        "--catalog".to_string(),
+        CATALOG.to_string(),
+        "driver".to_string(),
+        "omp-session".to_string(),
         "--identity".to_string(),
         bus_id.to_string(),
         "--runtime-id".to_string(),

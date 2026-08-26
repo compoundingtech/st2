@@ -160,6 +160,7 @@ pub fn compile_driver_agent_tasks(
             Driver::Claude(_) => "claude-session",
             Driver::Pi(_) => "pi-session",
             Driver::OpenCode(_) => "opencode-session",
+            Driver::Omp(_) => "omp-session",
         };
         anyhow::ensure!(
             argv.first().map(String::as_str) == Some("st2")

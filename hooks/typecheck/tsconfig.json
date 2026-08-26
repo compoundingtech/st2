@@ -14,5 +14,5 @@
       "node:*": ["./node_modules/@types/node/*"]
     }
   },
-  "files": ["../pi-channel.ts"]
+  "files": ["../pi-channel.ts", "../omp-channel.ts"]
 }

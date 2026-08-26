@@ -136,7 +136,7 @@ fn pi_deliver_wraps_the_authored_launch_without_rendering_anything() {
 #[test]
 fn cli_prints_each_snapshot_without_changing_its_input() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/driver");
-    for provider in ["claude", "codex", "pi"] {
+    for provider in ["claude", "codex", "pi", "omp"] {
         let input = fixtures.join(format!("{provider}.in.kdl"));
         let before = fs::read(&input).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_st2"))
