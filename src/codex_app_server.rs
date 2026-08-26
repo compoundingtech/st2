@@ -5356,13 +5356,19 @@ mod tests {
             .stderr(Stdio::null());
         let mut launcher = spawn_process_group(&mut command).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !descendant_pidfile.is_file() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        // The shell's `>` redirection creates an empty pidfile before `printf`
+        // writes, so wait for parsable content, not mere file existence.
+        let mut descendant = None;
+        while descendant.is_none() && Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&descendant_pidfile) {
+                descendant = content.trim().parse::<i32>().ok();
+            }
+            if descendant.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        let descendant = std::fs::read_to_string(&descendant_pidfile)
-            .expect("the launcher did not create its native descendant")
-            .parse::<i32>()
-            .unwrap();
+        let descendant =
+            descendant.expect("the launcher did not create its native descendant");
         assert!(
             process_can_retain_cleanup_resources(descendant),
             "the native descendant was not alive before cleanup"
