@@ -1408,7 +1408,6 @@ fn execute_with_presentation_cursor(
                             host: launch.spec.host.clone(),
                             supervisor: launch.spec.supervisor.clone(),
                         });
-                        crate::metrics::record_crash_loop();
                     }
                     if target.name == "agent" && !target.derived {
                         agent_available = false;
@@ -2028,6 +2027,9 @@ pub fn up_loop_specs(
         }
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
+                // Counted once per park (the initial transition), not per pass: a task stays
+                // parked, so per-pass counting would inflate crash_loops_total unboundedly.
+                crate::metrics::record_crash_loop();
                 eprintln!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
@@ -2300,6 +2302,9 @@ fn up_loop_until(
         park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
+                // Counted once per park (the initial transition), not per pass: a task stays
+                // parked, so per-pass counting would inflate crash_loops_total unboundedly.
+                crate::metrics::record_crash_loop();
                 eprintln!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id

@@ -1844,7 +1844,16 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
     let (inbox, archive) = recipient.boxes()?;
     let archived = archive.join(&record.filename);
     if archived.is_file() {
-        if fs::read_to_string(&archived)? != record.rendered_message {
+        let same = match fs::read_to_string(&archived) {
+            Ok(content) => content == record.rendered_message,
+            // A read failure is a failed delivery too: report it before propagating so
+            // message_deliveries_total{result="fail"} covers filesystem errors, not just mismatches.
+            Err(error) => {
+                crate::metrics::record_message_delivery(true);
+                return Err(error.into());
+            }
+        };
+        if !same {
             crate::metrics::record_message_delivery(true);
             anyhow::bail!("archived message differs from pending send {}", record.filename);
         }

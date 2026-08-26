@@ -44,7 +44,7 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 - **Protocol**: HTTP JSON (`http-json` + protobuf-free wire), batch exporter, targeting the local
   Alloy forwarder at `127.0.0.1:4318` by convention.
 - **Resource**: `service.name` = `st2-<unit>` selected per entrypoint (below; `src/main.rs`
-  passes `supervisor` or `cli`), `service.version` from `crate::version::machine_version`, and
+  passes `supervisor`, `hook`, or `cli`), `service.version` from `crate::version::machine_version`, and
   `host.name` from the existing host detection. The remaining R04 fleet attributes
   (`service.namespace`,
   `service.instance.id`, `sk.site`, `sk.role`, `deployment.environment.name`) are not set yet —
@@ -59,7 +59,7 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 | --- | --- |
 | Supervisor loop (`st2 up` daemon / systemd unit) | `st2-supervisor` |
 | One-shot CLI invocations | `st2-cli` |
-| Hook executions (`src/hooks.rs`) — not instrumented yet; planned value | `st2-hook` |
+| Hook executions (`st2 driver claude-observe`; other hook surfaces not instrumented yet) | `st2-hook` |
 
 ## Trace roots
 
