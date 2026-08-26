@@ -96,6 +96,10 @@ the instruments; every record call early-outs unless a meter provider is install
 | `reconcile_pass_duration_seconds` | histogram | — |
 | `session_start_duration_seconds` | histogram | — |
 
+The duration histograms use seconds-scale explicit buckets (`1ms … 10s`, see
+`DURATION_BUCKET_BOUNDARIES` in `src/telemetry.rs`) instead of the SDK's millisecond-tuned
+defaults, so sub-second passes and spawns stay distinguishable.
+
 Scope notes: passes are counted at all three `st2.reconcile_pass` sites (catalog loop pass,
 one-shot up, and the single-file spec path — `reconcile_pass_specs_with_sessions`, which now
 emits the same root span shape); `fail` means the pass collected errors. Reaps count the
@@ -103,7 +107,12 @@ restart path in the launch loop, where driver context exists. Deliveries cover b
 onto a recipient inbox (`deliver_record`, send + retry paths); ding/native transport outcomes
 are separate follow-ups. Hook invocations are observed at the single in-process application
 point (`st2 driver claude-observe`); hook scripts the harnesses execute directly are not
-visible to st2.
+visible to st2. The `driver` label is a closed enum resolved by precedence: `exec` task kind
+first, then a typed driver declaration, then an observational argv/shell token heuristic
+(alphanumeric tokens matched in launch order: `codex`, `claude`, `opencode`, `pi`; anything
+else → `other`). Because the heuristic inspects arbitrary user work, a hand-authored seat may
+be labeled by what its command line merely mentions — the label is diagnostic only and never
+influences reconcile decisions.
 
 The meter provider shares PR1's plumbing: `Telemetry::init` installs an `SdkMeterProvider`
 with a `PeriodicReader` + OTLP/HTTP-JSON metric exporter behind the same
