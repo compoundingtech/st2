@@ -518,8 +518,8 @@ impl Worker {
     }
 }
 
-/// Hash the complete rendered transition so one `(stream, event-id)` can never identify
-/// different bindings, paths, or digest transitions.
+/// Hash the canonical rendered transition body so one `(stream, event-id)` can never identify
+/// different bindings, paths, or old/new digest transitions.
 fn transition_identity(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
@@ -679,31 +679,67 @@ mod tests {
     }
 
     #[test]
-    fn transition_identity_covers_the_rendered_binding_transition() {
-        let a_to_b = render_body("goal", Path::new("/agent/goal.md"), Some("aaaa"), "bbbb");
-        let b_to_a = render_body("goal", Path::new("/agent/goal.md"), Some("bbbb"), "aaaa");
-        assert_ne!(transition_identity(&a_to_b), transition_identity(&b_to_a));
-        assert_eq!(transition_identity(&b_to_a), transition_identity(&b_to_a));
+    fn transition_identity_covers_every_rendered_transition_dimension() {
+        let baseline = render_body(
+            "goal",
+            Path::new("/agent/goal.md"),
+            Some("old-digest"),
+            "new-digest",
+        );
+        assert_eq!(
+            transition_identity(&baseline),
+            transition_identity(&baseline),
+            "replaying one canonical body must reproduce its identity"
+        );
 
-        let first_arrival = render_body("goal", Path::new("/agent/goal.md"), None, "aaaa");
-        assert_ne!(
-            transition_identity(&first_arrival),
-            transition_identity(&b_to_a),
-            "the rollback leg differs from the original arrival"
-        );
-        let other_binding =
-            render_body("spec", Path::new("/agent/goal.md"), Some("aaaa"), "bbbb");
-        assert_ne!(
-            transition_identity(&a_to_b),
-            transition_identity(&other_binding),
-            "different bindings with the same bytes must have different identities"
-        );
-        let other_path = render_body("goal", Path::new("/other/goal.md"), Some("aaaa"), "bbbb");
-        assert_ne!(
-            transition_identity(&a_to_b),
-            transition_identity(&other_path),
-            "different rendered paths must have different identities"
-        );
+        for (dimension, changed) in [
+            (
+                "binding",
+                render_body(
+                    "spec",
+                    Path::new("/agent/goal.md"),
+                    Some("old-digest"),
+                    "new-digest",
+                ),
+            ),
+            (
+                "path",
+                render_body(
+                    "goal",
+                    Path::new("/other/goal.md"),
+                    Some("old-digest"),
+                    "new-digest",
+                ),
+            ),
+            (
+                "old digest",
+                render_body(
+                    "goal",
+                    Path::new("/agent/goal.md"),
+                    Some("other-old"),
+                    "new-digest",
+                ),
+            ),
+            (
+                "seeded old state",
+                render_body("goal", Path::new("/agent/goal.md"), None, "new-digest"),
+            ),
+            (
+                "new digest",
+                render_body(
+                    "goal",
+                    Path::new("/agent/goal.md"),
+                    Some("old-digest"),
+                    "other-new",
+                ),
+            ),
+        ] {
+            assert_ne!(
+                transition_identity(&baseline),
+                transition_identity(&changed),
+                "changing {dimension} must change the event identity"
+            );
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ resync watcher thread
    |
    v  window boundary
 st2::event::emit(bus_id, stream="resync",
-                 event-id=<sha256(rendered binding/path/old/new body)>,
+                 event-id=<sha256(canonical rendered binding/path/old/new body)>,
                  key=<binding label>, --supersede,
                  subject="resource <binding> changed")
    |
