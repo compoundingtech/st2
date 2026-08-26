@@ -67,13 +67,13 @@ changed carrier gets its own event so per-binding supersession stays meaningful.
   same-path replacement, mirroring `CatalogDeclarationWatcher`.
 - The watcher owns no reconcile authority: a resync mutation does not wake a
   full-catalog pass. It shares only the observation primitives.
-- Each reconcile pass first clears the watch set, then reinstalls subscriptions
-  after lifecycle execution only for agents whose canonical seat was adopted
-  alive or successfully launched/restarted in that pass. Desired declarations
-  without a proven live seat never become watched. Existing subscriptions that
-  return are matched independently by path, bus id, label, and class so every
-  subscriber retains its digest and pending dirty state even when multiple
-  bindings share one path; only new subscriptions seed silently.
+- After lifecycle execution, each reconcile pass atomically replaces the watch
+  set with agents whose canonical seat was observed alive or successfully
+  launched/restarted in that pass. Desired declarations, dead keep-retained
+  seats, and companion-only launches never become watched. Existing
+  subscriptions that remain are matched independently by path, bus id, label,
+  and class so every subscriber retains its digest and pending dirty state even
+  when multiple bindings share one path; only new subscriptions seed silently.
 - A previously blind path is digest-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
 - Installation failure is diagnosed once and degrades to timer-based digest
