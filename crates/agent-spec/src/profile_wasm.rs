@@ -25,6 +25,8 @@ use wasmtime::{
 pub const DEFAULT_FUEL_PER_CALL: u64 = 5_000_000;
 /// Default cap on guest linear-memory growth. Breaching it traps instead of OOMing the host.
 pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// Default cap on elements in each guest table. The ABI itself requires no table.
+pub const DEFAULT_TABLE_ELEMENT_LIMIT: usize = 10_000;
 
 /// One resolution result as produced by a wasm resolver module.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -34,6 +36,13 @@ pub struct WasmResolution {
     /// Free-form classification carried alongside the denotation (e.g. `goal`).
     #[serde(default)]
     pub class: String,
+}
+
+/// A resolver-selected path plus the host root that must confine every later read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainedPath {
+    pub path: std::path::PathBuf,
+    pub root: std::path::PathBuf,
 }
 
 /// Why a wasm-backed resolution failed. Every variant is contained: the host survives.
@@ -132,7 +141,7 @@ impl WasmResolver {
         WasmInstance::new(self)
     }
 
-    /// Resolve once: fresh instance, fresh fuel. Cold-path convenience over [`Self::instantiate`].
+    /// Resolve once with one fresh fuel allowance shared by instantiation and the call.
     pub fn resolve_once(
         &self,
         uri: &str,
@@ -143,23 +152,24 @@ impl WasmResolver {
 
     /// Resolve with semantic containment: the returned path must stay inside `agent_dir`.
     /// This is the boundary the wasm sandbox cannot enforce by itself — the guest chooses what
-    /// string to return, so the host decides which strings it will act on.
+    /// string to return, so the host decides which strings it will act on. The returned root must
+    /// also confine every later carrier read because nonexistent path components can change.
     pub fn resolve_contained(
         &self,
         uri: &str,
         agent_dir: &std::path::Path,
-    ) -> Result<std::path::PathBuf, WasmResolveError> {
+    ) -> Result<ContainedPath, WasmResolveError> {
         let resolution = self.resolve_once(uri, &agent_dir.to_string_lossy())?;
-        let agent_dir = normalize(agent_dir);
-        let cleaned = normalize(&agent_dir.join(&resolution.path));
-        if !cleaned.starts_with(&agent_dir) {
+        let root = normalize(agent_dir);
+        let path = normalize(&root.join(&resolution.path));
+        if !path.starts_with(&root) {
             return Err(WasmResolveError::BadReturn(format!(
                 "resolver escaped the agent directory: {:?}",
                 resolution.path
             )));
         }
-        reject_symlink_components(&agent_dir, &cleaned)?;
-        Ok(cleaned)
+        reject_symlink_components(&root, &path)?;
+        Ok(ContainedPath { path, root })
     }
 }
 
@@ -198,6 +208,14 @@ fn engine() -> Engine {
     Engine::new(&config).expect("wasmtime engine configuration is valid")
 }
 
+fn classify_wasmtime_error(err: wasmtime::Error) -> WasmResolveError {
+    match err.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => WasmResolveError::FuelExhausted,
+        Some(trap) => WasmResolveError::Trap(*trap),
+        None => WasmResolveError::Instantiation(err.to_string()),
+    }
+}
+
 /// Lexical normalization only: resolvers name files inside the agent dir; nothing requires them
 /// to exist yet.
 fn normalize(path: &std::path::Path) -> std::path::PathBuf {
@@ -225,6 +243,7 @@ pub struct WasmInstance {
     store: Store<StoreLimits>,
     funcs: GuestFuncs,
     fuel_per_call: u64,
+    first_call_uses_start_fuel: bool,
 }
 
 impl WasmInstance {
@@ -233,17 +252,21 @@ impl WasmInstance {
             &resolver.engine,
             StoreLimitsBuilder::new()
                 .memory_size(resolver.memory_limit)
+                .table_elements(DEFAULT_TABLE_ELEMENT_LIMIT)
                 .memories(1)
                 .tables(4)
                 .build(),
         );
         // Route instance/table/memory growth through the per-instance limits configured above.
         store.limiter(|limits| limits);
+        store
+            .set_fuel(resolver.fuel_per_call)
+            .map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
 
         // No WASI, no imports: the demo protocol is closed. Import-requiring modules fail here,
         // which is itself containment (an untrusted module cannot reach the host environment).
         let instance = Instance::new(&mut store, &resolver.module, &[])
-            .map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
+            .map_err(classify_wasmtime_error)?;
         let alloc = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .map_err(|_| WasmResolveError::MissingExport("alloc"))?;
@@ -257,6 +280,7 @@ impl WasmInstance {
             store,
             funcs: GuestFuncs { alloc, resolve, memory },
             fuel_per_call: resolver.fuel_per_call,
+            first_call_uses_start_fuel: true,
         })
     }
 
@@ -267,20 +291,21 @@ impl WasmInstance {
     }
 
     fn classify_call_error(&self, err: wasmtime::Error) -> WasmResolveError {
-        match err.downcast_ref::<Trap>() {
-            Some(Trap::OutOfFuel) => WasmResolveError::FuelExhausted,
-            Some(trap) => WasmResolveError::Trap(*trap),
-            None => WasmResolveError::Instantiation(err.to_string()),
-        }
+        classify_wasmtime_error(err)
     }
 
-    /// Copy inputs into linear memory and run one metered `resolve` call.
+    /// Copy inputs into linear memory and run one metered `resolve` call. The first call consumes
+    /// the fuel left after the module start function; later calls each receive one fresh budget.
     pub fn resolve(
         &mut self,
         uri: &str,
         agent_dir: &str,
     ) -> Result<WasmResolution, WasmResolveError> {
-        self.charge_fuel()?;
+        if self.first_call_uses_start_fuel {
+            self.first_call_uses_start_fuel = false;
+        } else {
+            self.charge_fuel()?;
+        }
         let uri_ptr = self.write_guest_bytes(uri.as_bytes())?;
         let dir_ptr = self.write_guest_bytes(agent_dir.as_bytes())?;
 

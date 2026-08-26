@@ -9,7 +9,9 @@
 #![cfg(feature = "wasm-resolver")]
 
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
-use agent_spec::profile_wasm::{WasmResolveError, WasmResolver};
+use agent_spec::profile_wasm::{
+    DEFAULT_TABLE_ELEMENT_LIMIT, WasmResolveError, WasmResolver,
+};
 use std::path::{Path, PathBuf};
 use wasmtime::Trap;
 
@@ -153,6 +155,84 @@ fn infinite_loop_hits_the_fuel_budget_deterministically() {
         "fuel interruption took {:?}",
         start.elapsed()
     );
+}
+
+#[test]
+fn finite_start_function_runs_inside_the_initial_fuel_budget() {
+    let finite = WasmResolver::from_wat(&format!(
+        r#"{HOSTILE_PRELUDE}
+      (func $start (nop))
+      (start $start)
+      (func (export "resolve") (param i32 i32 i32 i32) (result i64) (i64.const 0))
+)"#
+    ))
+    .expect("finite-start module compiles")
+    .with_fuel_per_call(10_000);
+
+    finite
+        .instantiate()
+        .expect("finite start function receives bounded fuel");
+}
+
+#[test]
+fn infinite_start_function_hits_the_fuel_budget_during_instantiation() {
+    let looper = WasmResolver::from_wat(&format!(
+        r#"{HOSTILE_PRELUDE}
+      (func $start (loop (br 0)))
+      (start $start)
+      (func (export "resolve") (param i32 i32 i32 i32) (result i64) (i64.const 0))
+)"#
+    ))
+    .expect("infinite-start module compiles")
+    .with_fuel_per_call(10_000);
+
+    assert!(matches!(
+        looper.instantiate(),
+        Err(WasmResolveError::FuelExhausted)
+    ));
+}
+
+#[test]
+fn start_and_first_resolve_share_one_fuel_allowance() {
+    let shared = WasmResolver::from_wat(&format!(
+        r#"{HOSTILE_PRELUDE}
+      (func $burn (param $remaining i32)
+        (block $done
+          (loop $again
+            (br_if $done (i32.eqz (local.get $remaining)))
+            (local.set $remaining (i32.sub (local.get $remaining) (i32.const 1)))
+            (br $again))))
+      (func $start (call $burn (i32.const 100)))
+      (start $start)
+      (func (export "resolve") (param i32 i32 i32 i32) (result i64)
+        (call $burn (i32.const 100))
+        (i64.const 0))
+)"#
+    ))
+    .expect("metered module compiles")
+    .with_fuel_per_call(1_000);
+
+    match shared.resolve_once("any://x", "/a") {
+        Err(WasmResolveError::FuelExhausted) => {}
+        other => panic!("expected the shared start+call allowance to exhaust, got {other:?}"),
+    }
+}
+
+#[test]
+fn oversized_initial_table_is_rejected_before_host_allocation() {
+    let oversized = WasmResolver::from_wat(&format!(
+        r#"{HOSTILE_PRELUDE}
+      (table {} funcref)
+      (func (export "resolve") (param i32 i32 i32 i32) (result i64) (i64.const 0))
+)"#,
+        DEFAULT_TABLE_ELEMENT_LIMIT + 1
+    ))
+    .expect("large-table module compiles");
+
+    assert!(matches!(
+        oversized.instantiate(),
+        Err(WasmResolveError::Instantiation(_))
+    ));
 }
 
 #[test]
