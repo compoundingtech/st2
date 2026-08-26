@@ -35,9 +35,10 @@ accepted rationale is recorded in
 - **PROFILE-T02 Owned guest ABI:** st2 owns a small core-wasm ABI and its future
   compatibility burden. Avoiding WASI and the component model keeps the initial
   capability surface closed, but ABI evolution must be explicit.
-- **PROFILE-T03 Stateless calls:** A compiled module is cached, while each
-  resolution receives a fresh store and instance. The extra instantiation cost
-  is accepted for state, fuel, and memory isolation between calls.
+- **PROFILE-T03 Stateless calls:** Successful compilations and unchanged
+  compilation failures share a bounded cache, while each successful resolution
+  receives a fresh store and instance. The extra instantiation cost is accepted
+  for state, fuel, and memory isolation between calls.
 
 ## Requirements
 
