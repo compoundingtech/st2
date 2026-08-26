@@ -302,8 +302,16 @@ struct PendingTransition {
 }
 
 impl PendingTransition {
-    fn new(binding: &str, path: &Path, old_digest: Option<&str>, new_digest: &str) -> Self {
-        let body = render_body(binding, path, old_digest, new_digest);
+    fn new(
+        binding: &str,
+        path: &Path,
+        old_digest: Option<&str>,
+        new_digest: &str,
+        incarnation: crate::event::StreamOwnerIncarnation,
+        sequence: u64,
+    ) -> Self {
+        let occurrence = incarnation.occurrence_token(sequence);
+        let body = render_body(binding, path, old_digest, new_digest, &occurrence);
         let event_id = transition_identity(&body);
         Self {
             binding: binding.to_owned(),
@@ -323,6 +331,9 @@ struct Entry {
     label: String,
     class: CarrierClass,
     digest: Option<String>,
+    /// Last occurrence sequence reserved by this retained subscription. Sequence zero is the
+    /// silent seeded state; only capturing a new immutable transition advances it.
+    occurrence_sequence: u64,
     /// Immutable publication snapshot retained after a failed emit. Metadata refresh may change
     /// the current route, path, or class, but a reserved event identity must keep its exact bytes.
     pending_transition: Option<PendingTransition>,
@@ -444,10 +455,18 @@ fn rebuild_carriers(
             // also lets a binding's re-resolved path/class metadata become current.
             let retained =
                 take_retained_entry(&mut previous, &set.declaration_path, &carrier.label);
-            let (digest, pending_transition, dirty) = retained.map_or_else(
-                || (read_digest(&carrier.path), None, false),
-                |entry| (entry.digest, entry.pending_transition, entry.dirty),
-            );
+            let (digest, occurrence_sequence, pending_transition, dirty) =
+                retained.map_or_else(
+                    || (read_digest(&carrier.path), 0, None, false),
+                    |entry| {
+                        (
+                            entry.digest,
+                            entry.occurrence_sequence,
+                            entry.pending_transition,
+                            entry.dirty,
+                        )
+                    },
+                );
             let entry = Entry {
                 declaration_path: set.declaration_path.clone(),
                 bus_id: set.bus_id.clone(),
@@ -455,6 +474,7 @@ fn rebuild_carriers(
                 label: carrier.label.clone(),
                 class: carrier.class,
                 digest,
+                occurrence_sequence,
                 pending_transition,
                 dirty,
             };
@@ -725,6 +745,8 @@ impl Worker {
     /// diff digests, emit transitions, and retain failed publications for retry with the same
     /// event identity.
     fn flush_path(&mut self, path: &Path, due_class: Option<CarrierClass>) {
+        let occurrence_incarnation =
+            crate::event::current_stream_owner_incarnation(&self.root, &self.this_host).ok();
         let Some(entries) = self.carriers.get_mut(path) else {
             return;
         };
@@ -764,8 +786,25 @@ impl Worker {
             if entry.digest.as_deref() == Some(target_digest.as_str()) {
                 continue;
             }
-            let transition =
-                PendingTransition::new(&entry.label, path, entry.digest.as_deref(), &target_digest);
+            let (Some(incarnation), Some(sequence)) = (
+                occurrence_incarnation,
+                entry.occurrence_sequence.checked_add(1),
+            ) else {
+                // An event cannot reserve a stable occurrence without a current owner incarnation
+                // or after sequence exhaustion. Keep the transition uncaptured and retry later.
+                entry.dirty = true;
+                retries.push(entry.class);
+                continue;
+            };
+            let transition = PendingTransition::new(
+                &entry.label,
+                path,
+                entry.digest.as_deref(),
+                &target_digest,
+                incarnation,
+                sequence,
+            );
+            entry.occurrence_sequence = sequence;
             if emit_resync(&self.root, &self.this_host, &entry.bus_id, &transition) {
                 entry.digest = Some(target_digest);
             } else {
@@ -786,7 +825,7 @@ impl Worker {
 }
 
 /// Hash the canonical rendered transition body so one `(stream, event-id)` can never identify
-/// different bindings, paths, or old/new digest transitions.
+/// different bindings, paths, digest transitions, or captured occurrences.
 fn transition_identity(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
@@ -862,9 +901,15 @@ fn read_regular(path: &Path) -> Option<String> {
     hash_reader(file)
 }
 
-fn render_body(label: &str, path: &Path, old: Option<&str>, new: &str) -> String {
+fn render_body(
+    label: &str,
+    path: &Path,
+    old: Option<&str>,
+    new: &str,
+    occurrence: &str,
+) -> String {
     format!(
-        "resource `{label}` changed\n\nbinding: {label}\npath: {}\nold: {}\nnew: {new}\n",
+        "resource `{label}` changed\n\nbinding: {label}\npath: {}\nold: {}\nnew: {new}\noccurrence: {occurrence}\n",
         path.display(),
         old.unwrap_or("unknown"),
     )
@@ -882,10 +927,31 @@ mod tests {
         }
     }
 
+    fn owner_incarnation(seed: u64) -> crate::event::StreamOwnerIncarnation {
+        crate::event::StreamOwnerIncarnation::for_test(seed, seed + 1, 42, seed + 2)
+    }
+
     fn discover(catalog: &Path) -> AgentSpec {
         let found = crate::discover_strict(catalog);
         eprintln!("discovery errors: {:?}", found.errors);
         found.specs.into_iter().next().unwrap()
+    }
+
+    fn resync_inbox_event(agent_dir: &Path) -> String {
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|event| event.lines().any(|line| line == "stream: resync"))
+            .expect("current resync inbox event")
+    }
+
+    fn event_field(event: &str, field: &str) -> String {
+        event
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}: ")))
+            .unwrap_or_else(|| panic!("missing {field} in event"))
+            .to_owned()
     }
 
     #[test]
@@ -1005,6 +1071,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("alpha-before".to_owned()),
+                    occurrence_sequence: 4,
                     pending_transition: None,
                     dirty: true,
                 },
@@ -1015,6 +1082,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
                     digest: Some("beta-before".to_owned()),
+                    occurrence_sequence: 9,
                     dirty: true,
                     pending_transition: None,
                 },
@@ -1090,6 +1158,7 @@ mod tests {
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
                 digest: Some("old-digest".to_owned()),
+                occurrence_sequence: 3,
                 pending_transition: None,
                 dirty: true,
             }],
@@ -1149,6 +1218,7 @@ mod tests {
         let current_path = resources.join("current-goal.md");
         std::fs::write(&old_path, "pending bytes").unwrap();
         std::fs::write(&current_path, "current rebound bytes").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
         let current = watch_set_for(&discover(root.path()), "alias");
         let declaration = current.declaration_path.clone();
         let mut worker = Worker {
@@ -1163,6 +1233,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),
+                    occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
                 }],
@@ -1177,7 +1248,6 @@ mod tests {
             .pending_transition
             .clone()
             .expect("failed stale route retains an immutable transition");
-        crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
 
         worker.apply_watch_sets(refresh_for(vec![current]));
         worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -1227,6 +1297,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: read_digest(&old_path),
+                    occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
                 }],
@@ -1274,6 +1345,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: read_digest(&carrier),
+                    occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
                 }],
@@ -1325,11 +1397,14 @@ mod tests {
                     label: "declaration".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("before".to_owned()),
+                    occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
                         "declaration",
                         &declaration,
                         Some("before"),
                         "corrected",
+                        owner_incarnation(1),
+                        1,
                     )),
                     dirty: true,
                 }],
@@ -1401,11 +1476,14 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),
+                    occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
                         "goal",
                         &carrier,
                         Some("old-digest"),
                         "pending-target",
+                        owner_incarnation(1),
+                        1,
                     )),
                     dirty: false,
                 }],
@@ -1441,6 +1519,7 @@ mod tests {
     #[test]
     fn fallback_polling_preserves_the_coalesced_window() {
         let root = tempfile::tempdir().unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "before").unwrap();
         let baseline = read_digest(&carrier);
@@ -1456,6 +1535,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
                     digest: baseline.clone(),
+                    occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
                 }],
@@ -1568,6 +1648,7 @@ mod tests {
                 label: format!("{class:?}"),
                 class,
                 digest: digest.clone(),
+                occurrence_sequence: 0,
                 pending_transition: None,
                 dirty: true,
             })
@@ -1589,8 +1670,121 @@ mod tests {
     }
 
     #[test]
+    fn repeated_identical_transitions_receive_distinct_occurrence_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "A").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let set = watch_set_for(&discover(root.path()), "host");
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.apply_watch_sets(refresh_for(vec![set]));
+
+        let mut events = Vec::new();
+        for bytes in ["B", "A", "B"] {
+            std::fs::write(&carrier, bytes).unwrap();
+            worker.flush_path(&carrier, None);
+            events.push(resync_inbox_event(&agent_dir));
+        }
+
+        assert_eq!(event_field(&events[0], "old"), event_field(&events[2], "old"));
+        assert_eq!(event_field(&events[0], "new"), event_field(&events[2], "new"));
+        assert_ne!(
+            event_field(&events[0], "event-id"),
+            event_field(&events[2], "event-id"),
+            "the second A→B occurrence must not deduplicate against the first"
+        );
+        assert!(event_field(&events[0], "occurrence").ends_with(":1"));
+        assert!(event_field(&events[1], "occurrence").ends_with(":2"));
+        assert!(event_field(&events[2], "occurrence").ends_with(":3"));
+    }
+
+    #[test]
+    fn subscribers_advance_occurrence_sequences_independently() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("shared.md");
+        std::fs::write(&carrier, "new bytes").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let entries = ["host.alpha", "host.beta"]
+            .into_iter()
+            .map(|bus_id| Entry {
+                declaration_path: PathBuf::from(format!("/catalog/{bus_id}/agent.kdl")),
+                bus_id: bus_id.to_owned(),
+                seat_id: None,
+                label: "goal".to_owned(),
+                class: CarrierClass::Immediate,
+                digest: Some("old-digest".to_owned()),
+                occurrence_sequence: 0,
+                pending_transition: None,
+                dirty: true,
+            })
+            .collect();
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(carrier.clone(), entries)]),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+
+        worker.flush_path(&carrier, None);
+
+        let entries = &worker.carriers[&carrier];
+        assert_eq!(entries[0].occurrence_sequence, 1);
+        assert_eq!(entries[1].occurrence_sequence, 1);
+        assert_eq!(
+            event_field(&entries[0].pending_transition.as_ref().unwrap().body, "occurrence"),
+            event_field(&entries[1].pending_transition.as_ref().unwrap().body, "occurrence"),
+            "one subscriber must not consume sequence numbers from another"
+        );
+    }
+
+    #[test]
+    fn supervisor_restart_incarnation_changes_the_occurrence_namespace() {
+        let first = PendingTransition::new(
+            "goal",
+            Path::new("/agent/goal.md"),
+            Some("old"),
+            "new",
+            owner_incarnation(1),
+            1,
+        );
+        let restarted = PendingTransition::new(
+            "goal",
+            Path::new("/agent/goal.md"),
+            Some("old"),
+            "new",
+            owner_incarnation(2),
+            1,
+        );
+
+        assert_ne!(first.body, restarted.body);
+        assert_ne!(first.event_id, restarted.event_id);
+    }
+
+    #[test]
     fn failed_emit_retains_digest_and_schedules_the_same_transition_for_retry() {
         let root = tempfile::tempdir().unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "new bytes").unwrap();
         let mut worker = Worker {
@@ -1605,6 +1799,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),
+                    occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
                 }],
@@ -1619,9 +1814,11 @@ mod tests {
             .pending_transition
             .clone()
             .expect("failed transition snapshot is retained");
+        assert_eq!(worker.carriers[&carrier][0].occurrence_sequence, 1);
         std::fs::write(&carrier, "newer bytes").unwrap();
         worker.flush_path(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
+        assert_eq!(entry.occurrence_sequence, 1);
         assert_eq!(entry.digest.as_deref(), Some("old-digest"));
         assert_eq!(
             entry.pending_transition.as_ref(),
@@ -1639,6 +1836,7 @@ mod tests {
             Path::new("/agent/goal.md"),
             Some("old-digest"),
             "new-digest",
+            "v1:1:2:42:3:1",
         );
         assert_eq!(
             transition_identity(&baseline),
@@ -1654,6 +1852,7 @@ mod tests {
                     Path::new("/agent/goal.md"),
                     Some("old-digest"),
                     "new-digest",
+                    "v1:1:2:42:3:1",
                 ),
             ),
             (
@@ -1663,6 +1862,7 @@ mod tests {
                     Path::new("/other/goal.md"),
                     Some("old-digest"),
                     "new-digest",
+                    "v1:1:2:42:3:1",
                 ),
             ),
             (
@@ -1672,11 +1872,18 @@ mod tests {
                     Path::new("/agent/goal.md"),
                     Some("other-old"),
                     "new-digest",
+                    "v1:1:2:42:3:1",
                 ),
             ),
             (
                 "seeded old state",
-                render_body("goal", Path::new("/agent/goal.md"), None, "new-digest"),
+                render_body(
+                    "goal",
+                    Path::new("/agent/goal.md"),
+                    None,
+                    "new-digest",
+                    "v1:1:2:42:3:1",
+                ),
             ),
             (
                 "new digest",
@@ -1685,6 +1892,17 @@ mod tests {
                     Path::new("/agent/goal.md"),
                     Some("old-digest"),
                     "other-new",
+                    "v1:1:2:42:3:1",
+                ),
+            ),
+            (
+                "occurrence",
+                render_body(
+                    "goal",
+                    Path::new("/agent/goal.md"),
+                    Some("old-digest"),
+                    "new-digest",
+                    "v1:1:2:42:3:2",
                 ),
             ),
         ] {
