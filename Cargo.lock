@@ -1659,6 +1659,7 @@ dependencies = [
  "sha2",
  "st2",
  "st3",
+ "tempfile",
  "walkdir",
 ]
 

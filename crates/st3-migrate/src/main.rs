@@ -185,7 +185,12 @@ fn migrate_evals(args: TreeArgs) -> Result<()> {
         let relative_cell = cell.strip_prefix(&args.input)?;
         let output_cell = args.output.join(relative_cell);
         fs::create_dir_all(&output_cell)?;
-        copy_eval_assets(cell, &output_cell, &input)?;
+        copy_eval_assets(
+            cell,
+            &output_cell,
+            &input,
+            spec.eval.as_ref().and_then(|eval| eval.copy.as_deref()),
+        )?;
         let (transformed, documents) = transform_eval(&spec, cell, &output_cell, &args.host)?;
         report.documents.extend(documents);
         let normalized = st3::parse_intent(&transformed, &args.host)
@@ -680,7 +685,7 @@ fn write_mechanical_judge(
     timeout_ms: u64,
 ) {
     let command =
-        format!("st3 message export \"${{EVAL_ROOT}}/.st3-messages\" >/dev/null; {command}");
+        format!("st3 message export \"${{EVAL_ROOT}}/.st3-messages\" >/dev/null && {command}");
     output.push_str(&format!("        judge {name:?} {{\n"));
     output.push_str(&format!(
         "          exec {command:?}\n          host {host:?}\n          workspace \"${{EVAL_ROOT}}\"\n          env {{ CATALOG \"${{EVAL_ROOT}}\"; ST_ROOT \"${{EVAL_ROOT}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{EVAL_ROOT}}/.st3-messages\" }}\n          time-limit {:?}\n",
@@ -765,31 +770,72 @@ fn stage_document(
     })
 }
 
-fn copy_eval_assets(cell: &Path, output: &Path, input_kdl: &Path) -> Result<()> {
+fn copy_eval_assets(
+    cell: &Path,
+    output: &Path,
+    input_kdl: &Path,
+    fixture: Option<&str>,
+) -> Result<()> {
+    let fixture = fixture
+        .map(|fixture| {
+            let mut relative = PathBuf::new();
+            for component in Path::new(fixture).components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::Normal(component) => relative.push(component),
+                    _ => anyhow::bail!("eval copy path must stay inside its cell"),
+                }
+            }
+            anyhow::ensure!(!relative.as_os_str().is_empty(), "eval copy path is empty");
+            let source = cell.join(relative);
+            anyhow::ensure!(
+                source.is_dir(),
+                "eval copy source {} is not a directory",
+                source.display()
+            );
+            Ok(source)
+        })
+        .transpose()?;
     for entry in WalkDir::new(cell).follow_links(false) {
         let entry = entry?;
-        if entry.path() == cell || entry.path() == input_kdl {
+        if entry.path() == cell
+            || entry.path() == input_kdl
+            || fixture
+                .as_ref()
+                .is_some_and(|fixture| entry.path().starts_with(fixture))
+        {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "eval contains a symlink"
-        );
         let relative = entry.path().strip_prefix(cell)?;
-        let target = output.join(relative);
-        if metadata.is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if metadata.is_file() {
-            let bytes = fs::read(entry.path())?;
-            let bytes = match std::str::from_utf8(&bytes) {
-                Ok(text) => rewrite_eval_asset(text).into_bytes(),
-                Err(_) => bytes,
-            };
-            write_file(&target, &bytes)?;
-        } else {
-            anyhow::bail!("eval contains special file {}", entry.path().display());
+        copy_eval_asset(entry.path(), &output.join(relative))?;
+    }
+    if let Some(fixture) = fixture {
+        for entry in WalkDir::new(&fixture).min_depth(1).follow_links(false) {
+            let entry = entry?;
+            let relative = entry.path().strip_prefix(&fixture)?;
+            copy_eval_asset(entry.path(), &output.join(relative))?;
         }
+    }
+    Ok(())
+}
+
+fn copy_eval_asset(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "eval contains a symlink"
+    );
+    if metadata.is_dir() {
+        fs::create_dir_all(target)?;
+    } else if metadata.is_file() {
+        let bytes = fs::read(source)?;
+        let bytes = match std::str::from_utf8(&bytes) {
+            Ok(text) => rewrite_eval_asset(text).into_bytes(),
+            Err(_) => bytes,
+        };
+        write_file(target, &bytes)?;
+    } else {
+        anyhow::bail!("eval contains special file {}", source.display());
     }
     Ok(())
 }
@@ -932,5 +978,33 @@ mod tests {
         assert_eq!(eval_agent_identity("worker", "node-a"), "node-a.worker");
         assert_eq!(eval_agent_identity("team.worker", "node-a"), "team.worker");
         assert_eq!(eval_agent_identity("requester", "node-a"), "requester");
+    }
+
+    #[test]
+    fn eval_copy_contents_become_the_runtime_root() {
+        let cell = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::create_dir_all(cell.path().join("fixture/sup")).unwrap();
+        fs::create_dir_all(cell.path().join("judges")).unwrap();
+        fs::write(
+            cell.path().join("fixture/sup/CLAUDE.md"),
+            "Use st2 message.\n",
+        )
+        .unwrap();
+        fs::write(cell.path().join("judges/grade.sh"), "st2 status\n").unwrap();
+        let input = cell.path().join("cell.kdl");
+        fs::write(&input, "eval { copy \"./fixture\" }").unwrap();
+
+        copy_eval_assets(cell.path(), output.path(), &input, Some("./fixture")).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(output.path().join("sup/CLAUDE.md")).unwrap(),
+            "Use st3 message.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(output.path().join("judges/grade.sh")).unwrap(),
+            "st3 status\n"
+        );
+        assert!(!output.path().join("fixture").exists());
     }
 }

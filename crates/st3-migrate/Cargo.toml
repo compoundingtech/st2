@@ -18,6 +18,9 @@ st3 = { path = "../st3" }
 st2 = { path = "../.." }
 walkdir = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "st3-migrate"
 path = "src/main.rs"
