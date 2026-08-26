@@ -1800,7 +1800,6 @@ fn finish_reconcile_pass(span: &tracing::Span, report: &UpReport) {
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    let pass_span = crate::telemetry::PassSpan::start(this_host);
     let started = Instant::now();
     let span = reconcile_span(this_host);
     let report = {
@@ -1817,7 +1816,6 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
         finish_reconcile_pass(&span, &report);
         report
     };
-    pass_span.finish(report.crash_loops.len(), report.unparked.len());
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     Ok(report)
 }
@@ -1895,7 +1893,6 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
     let started = Instant::now();
-    let pass_span = crate::telemetry::PassSpan::start(this_host);
     let span = reconcile_span(this_host);
     let mut report = UpReport::default();
     {
@@ -1917,7 +1914,6 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
         }
         finish_reconcile_pass(&span, &report);
     }
-    pass_span.finish(report.crash_loops.len(), report.unparked.len());
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     report
 }
@@ -1960,7 +1956,8 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    let pass_span = crate::telemetry::PassSpan::start(this_host);
+    let span = reconcile_span(this_host);
+    let _entered = span.enter();
     let _catalog_lock = crate::CatalogLock::shared(catalog_root)
         .context("acquire shared catalog-authoring lock for selected reconcile")?;
     let found = crate::discovery::discover(catalog_root);
@@ -2007,7 +2004,7 @@ pub fn up_once_selected(
         || Ok(()),
     )?;
     report.absorb(execution);
-    pass_span.finish(report.crash_loops.len(), report.unparked.len());
+    finish_reconcile_pass(&span, &report);
     Ok(report)
 }
 
@@ -2322,7 +2319,6 @@ fn up_loop_until(
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
         let mut report = {
-            let pass_span = crate::telemetry::PassSpan::start(this_host);
             let started = Instant::now();
             let span = reconcile_span(this_host);
             let pass = {
@@ -2339,7 +2335,6 @@ fn up_loop_until(
                 finish_reconcile_pass(&span, &pass);
                 pass
             };
-            pass_span.finish(pass.crash_loops.len(), pass.unparked.len());
             crate::metrics::record_reconcile_pass(started.elapsed(), !pass.errors.is_empty());
             pass
         };

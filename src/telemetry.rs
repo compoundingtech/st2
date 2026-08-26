@@ -13,11 +13,9 @@
 //! carry its trace/span ids.
 
 use std::io::IsTerminal as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use opentelemetry::trace::{Span as _, Tracer as _};
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -25,15 +23,6 @@ use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stre
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};
-
-static ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Process-wide export gate. Spans and other instrumented work check this before allocating
-/// anything, so the unset-endpoint path stays allocation-free (the provider guard alone cannot
-/// remove no-op span construction on the supervisor hot path).
-pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
-}
 
 /// Seconds-scale explicit bucket boundaries for the duration histograms. The SDK's default
 /// boundaries are millisecond-tuned (`[0, 5, 10, …, 10000]`), so sub-second reconcile passes
@@ -57,9 +46,9 @@ fn duration_view(instrument: &Instrument) -> Option<Stream> {
     }
 }
 
-/// Guard holding the tracer, meter, and logger providers for a process lifetime. Dropping it
-/// flushes and shuts all three exporters down so short-lived CLI invocations still deliver
-/// their spans, metric points, and log records.
+/// Guard holding the tracer, meter, and logger providers for a process lifetime. Explicit
+/// shutdown delivers pending telemetry from short-lived CLI invocations; the process-global
+/// log bridge requires slightly different logger-provider lifetime handling (see [`Self::shutdown`]).
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,
@@ -133,8 +122,8 @@ impl Telemetry {
         // best-effort: if its exporter fails to build (e.g. malformed
         // `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`), metrics are disabled but span and log
         // export must continue. The periodic reader's default interval only governs
-        // background collection — `shutdown` below force-flushes, so short-lived CLI runs
-        // still deliver their points.
+        // background collection — provider shutdown below performs the final collection, so
+        // short-lived CLI runs still deliver their points.
         let meter_provider = match build_metric_exporter() {
             Ok(exporter) => {
                 let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
@@ -145,7 +134,6 @@ impl Telemetry {
                     .build();
                 opentelemetry::global::set_meter_provider(meter_provider.clone());
                 crate::metrics::set_enabled(true);
-                ENABLED.store(true, Ordering::Relaxed);
                 Some(meter_provider)
             }
             Err(err) => {
@@ -153,7 +141,6 @@ impl Telemetry {
                 None
             }
         };
-
 
         // Log records share endpoint, protocol, and resource too; the appender bridge maps
         // `tracing` events onto OTLP logs and stamps the current span context onto them.
@@ -189,72 +176,34 @@ impl Telemetry {
         self.tracer_provider.is_some()
     }
 
-    /// Flush pending spans, metric points, and log records, then stop all exporters. Safe to
-    /// call multiple times.
+    /// Deliver pending spans, metric points, and log records, then stop bounded exporter
+    /// workers. Safe to call multiple times.
     pub fn shutdown(&mut self) {
+        // `PeriodicReader::shutdown` performs a final collect-and-export itself. Calling
+        // `force_flush` first would export the same cumulative counter and histogram snapshot
+        // twice for every short-lived process.
         if let Some(provider) = self.meter_provider.take() {
-            let _ = provider.force_flush();
             let _ = provider.shutdown();
             crate::metrics::set_enabled(false);
         }
+        if let Some(provider) = self.tracer_provider.take() {
+            let _ = provider.shutdown();
+        }
+        // The OpenTelemetry log bridge is installed in the process-global tracing subscriber
+        // and retains a logger from this provider. That subscriber cannot be uninstalled, so
+        // shutting the provider down here exposes a stopped BatchLogProcessor to subsequent
+        // events (including HTTP-client events produced by exporter shutdown). Force-flush last
+        // to deliver the correlated completion log, then leave the provider alive through the
+        // global bridge until process exit.
         if let Some(provider) = self.logger_provider.take() {
             let _ = provider.force_flush();
-            let _ = provider.shutdown();
         }
-        if let Some(provider) = self.tracer_provider.take() {
-            let _ = provider.force_flush();
-            let _ = provider.shutdown();
-        }
-        ENABLED.store(false, Ordering::Relaxed);
     }
 }
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-/// A root `st2.reconcile_pass` span for one bounded pass, or nothing when telemetry is
-/// disabled (construction is skipped entirely — see [`enabled`]). Each pass gets its own
-/// trace; the supervisor loop never holds an endless root open.
-pub struct PassSpan(Option<opentelemetry::global::BoxedSpan>);
-
-impl PassSpan {
-    pub fn start(this_host: &str) -> Self {
-        if !enabled() {
-            return Self(None);
-        }
-        let tracer = opentelemetry::global::tracer("st2");
-        let span = tracer
-            .span_builder("st2.reconcile_pass")
-            .with_attributes(vec![KeyValue::new("st2.host", this_host.to_string())])
-            .start(&tracer);
-        Self(Some(span))
-    }
-
-    /// Record pass outcomes and end the span. Early-drop paths end it without attributes.
-    pub fn finish(mut self, crash_loops: usize, unparked: usize) {
-        if let Some(span) = self.0.as_mut() {
-            let to_i64 = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-            span.set_attribute(KeyValue::new("st2.crash_loops", to_i64(crash_loops)));
-            span.set_attribute(KeyValue::new("st2.unparked", to_i64(unparked)));
-        }
-        self.end();
-    }
-}
-
-impl Drop for PassSpan {
-    fn drop(&mut self) {
-        self.end();
-    }
-}
-
-impl PassSpan {
-    fn end(&mut self) {
-        if let Some(mut span) = self.0.take() {
-            span.end();
-        }
     }
 }
 
