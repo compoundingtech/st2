@@ -1655,6 +1655,7 @@ mod tests {
                     seat_id: Some("custom-worker-seat".to_owned()),
                     label: "declaration".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("before".to_owned()),
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
@@ -1724,7 +1725,7 @@ mod tests {
         std::fs::write(&carrier, "newer live bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
 
-        let set = watch_set_for(&discover(root.path()), "hetz");
+        let set = watch_set_for(&discover(root.path()), "hetz", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "hetz".to_owned(),
@@ -1735,6 +1736,7 @@ mod tests {
                     seat_id: set.seat_id.clone(),
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("old-digest".to_owned()),
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
@@ -1794,6 +1796,7 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
+                    containment_root: None,
                     digest: baseline.clone(),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -1815,6 +1818,7 @@ mod tests {
                 label: "spec".to_owned(),
                 path: carrier.clone(),
                 class: CarrierClass::Coalesced,
+                containment_root: None,
             }],
         }]));
 
