@@ -3435,6 +3435,9 @@ fn print_report(report: &UpReport) {
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);
     report_line("unrunnable", &report.unrunnable);
+    report_line("boot gate cleared", &report.gates_cleared);
+    report_line("plan nudged", &report.plans_nudged);
+    report_line("plan skipped", &report.plans_skipped);
     for w in &report.warnings {
         eprintln!("warning: {w}");
     }

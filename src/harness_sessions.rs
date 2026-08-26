@@ -55,6 +55,24 @@ impl HarnessSessions {
         self.complete
     }
 
+    /// Inspection errors are metadata-only diagnostics. Callers use them to explain why an
+    /// incomplete inventory cannot support a supervision decision.
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+
+    /// The newest safe activity marker. The inventory is sorted newest first, so this does not
+    /// expose provider content or make a second filesystem observation.
+    pub fn newest_activity(&self) -> Option<HarnessActivity<'_>> {
+        self.sessions.first().map(|session| HarnessActivity {
+            modified_at_nanos: session.modified_at_nanos,
+            last_record_type: session
+                .last_record
+                .as_ref()
+                .map(|record| record.record_type.as_str()),
+        })
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("harness session inventory contains serializable paths")
     }
@@ -66,6 +84,15 @@ impl HarnessSessions {
         }
         self.complete = false;
     }
+}
+
+/// The minimum provider-owned session metadata that supervision needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessActivity<'a> {
+    /// Unix time in nanoseconds from the inspected file-prefix snapshot.
+    pub modified_at_nanos: u128,
+    /// The final provider record type, when the JSONL file contains a record.
+    pub last_record_type: Option<&'a str>,
 }
 
 /// Safe metadata from one provider-owned JSONL file.

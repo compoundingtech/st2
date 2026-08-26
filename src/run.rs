@@ -42,6 +42,7 @@ use agent_spec::spec::TaskKind;
 
 // This is an outer containment bound for a wedged runtime, not a fleet-scalability mechanism.
 const PTY_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 const PTY_DAEMON_SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
 const MAX_PRESENTATION_PATCHES_PER_PASS: usize = 8;
 
@@ -237,6 +238,21 @@ pub(crate) fn resolve_task_cwd(
 }
 
 /// The set of task operations st2 needs. Abstracted so execution is testable against a fake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyKey {
+    Down,
+    Return,
+}
+
+impl PtyKey {
+    fn as_name(self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::Return => "return",
+        }
+    }
+}
+
 pub trait Runner {
     /// ACTUAL state: every task session the runner can see (unioned across backends).
     fn list_sessions(&self) -> anyhow::Result<Vec<Session>>;
@@ -247,6 +263,15 @@ pub trait Runner {
     /// existing PTY ID. The default is a no-op for non-PTY test/backends.
     fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
         Ok(())
+    }
+    /// Read the visible PTY viewport without attaching. A non-PTY backend returns `None`.
+    fn peek_plain(&self, _pty_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+    /// Send a fixed key sequence to a PTY. The default refuses because non-PTY runners have no
+    /// interactive input surface.
+    fn send_keys(&self, _pty_id: &str, _keys: &[PtyKey]) -> anyhow::Result<()> {
+        anyhow::bail!("runner does not support PTY input")
     }
     /// SIGTERM a running session.
     fn kill(&self, pty_id: &str) -> anyhow::Result<()>;
@@ -745,6 +770,42 @@ impl Runner for PtyCli {
         PtyCli::patch_presentation(self, presentation)
     }
 
+    fn peek_plain(&self, pty_id: &str) -> anyhow::Result<Option<String>> {
+        let out = output_with_timeout(
+            Command::new(&self.bin)
+                .args(["peek", "--plain", pty_id])
+                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty peek --plain {pty_id}` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty peek --plain {pty_id}` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+    }
+
+    fn send_keys(&self, pty_id: &str, keys: &[PtyKey]) -> anyhow::Result<()> {
+        anyhow::ensure!(!keys.is_empty(), "PTY key sequence is empty");
+        let mut command = Command::new(&self.bin);
+        command.args(["send", pty_id]);
+        for key in keys {
+            command.args(["--seq", &format!("key:{}", key.as_name())]);
+        }
+        command.env("PTY_ROOT", effective_pty_root(&self.catalog_root));
+        let out = output_with_timeout(&mut command, PTY_INPUT_TIMEOUT)
+            .map_err(|error| anyhow::anyhow!("`pty send {pty_id}` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty send {pty_id}` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         let out = Command::new(&self.bin)
             .arg("kill")
@@ -945,6 +1006,22 @@ impl Runner for SystemRunner {
         self.pty.patch_presentation(presentation)
     }
 
+    fn peek_plain(&self, pty_id: &str) -> anyhow::Result<Option<String>> {
+        match self.index.borrow().get(pty_id) {
+            Some(TaskKind::Pty) => self.pty.peek_plain(pty_id),
+            Some(TaskKind::Exec) => Ok(None),
+            None => anyhow::bail!("runtime '{pty_id}' disappeared before PTY inspection"),
+        }
+    }
+
+    fn send_keys(&self, pty_id: &str, keys: &[PtyKey]) -> anyhow::Result<()> {
+        match self.index.borrow().get(pty_id) {
+            Some(TaskKind::Pty) => self.pty.send_keys(pty_id, keys),
+            Some(TaskKind::Exec) => anyhow::bail!("runtime '{pty_id}' is not a PTY"),
+            None => anyhow::bail!("runtime '{pty_id}' disappeared before PTY input"),
+        }
+    }
+
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         match self.index.borrow().get(pty_id) {
             Some(TaskKind::Exec) => self.exec.kill(pty_id),
@@ -1049,6 +1126,12 @@ pub struct UpReport {
     pub other_host: Vec<String>,
     /// identities with no runnable task (unrendered).
     pub unrunnable: Vec<String>,
+    /// Known interactive boot gates cleared through an exact visible-screen match.
+    pub gates_cleared: Vec<String>,
+    /// Open plans whose idle local owner received a durable nudge in this pass.
+    pub plans_nudged: Vec<String>,
+    /// Plans that the scan did not nudge, with one visible reason per plan.
+    pub plans_skipped: Vec<String>,
     /// discovery warnings (mismatches, …).
     pub warnings: Vec<String>,
     /// discovery + execution errors (non-fatal; collected).
@@ -1070,6 +1153,9 @@ impl UpReport {
         self.adopted.append(&mut other.adopted);
         self.other_host.append(&mut other.other_host);
         self.unrunnable.append(&mut other.unrunnable);
+        self.gates_cleared.append(&mut other.gates_cleared);
+        self.plans_nudged.append(&mut other.plans_nudged);
+        self.plans_skipped.append(&mut other.plans_skipped);
         self.warnings.append(&mut other.warnings);
         self.errors.append(&mut other.errors);
     }
@@ -1083,6 +1169,9 @@ impl UpReport {
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
             || !self.unparked.is_empty()
+            || !self.gates_cleared.is_empty()
+            || !self.plans_nudged.is_empty()
+            || !self.plans_skipped.is_empty()
             || !self.warnings.is_empty()
             || !self.errors.is_empty()
     }
@@ -1577,6 +1666,14 @@ fn reconcile_pass(
         None => Ok(()),
     });
     execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
+    // Supervision runs only when a catalog reconcile runs. It uses the authoritative session
+    // snapshot from this pass and never adds its own timer or lifecycle policy.
+    let mut supervision =
+        crate::supervision::reconcile(root, this_host, &eligible_specs, &sessions, runner);
+    report.gates_cleared.append(&mut supervision.gates_cleared);
+    report.plans_nudged.append(&mut supervision.plans_nudged);
+    report.plans_skipped.append(&mut supervision.plans_skipped);
+    report.errors.append(&mut supervision.errors);
     report
 }
 
@@ -2055,6 +2152,7 @@ fn best_effort_catalog_watcher(
 #[derive(Default)]
 struct RecurringWarnings {
     emitted: HashSet<String>,
+    plan_skips: HashSet<String>,
 }
 
 impl RecurringWarnings {
@@ -2064,6 +2162,15 @@ impl RecurringWarnings {
         report
             .warnings
             .retain(|warning| self.emitted.insert(warning.clone()));
+
+        // The initial pass reports every skipped plan. Later passes report only a new or changed
+        // reason, so a stable catalog does not print the same complete scan every interval.
+        let current: HashSet<_> = report.plans_skipped.iter().cloned().collect();
+        self.plan_skips
+            .retain(|plan_skip| current.contains(plan_skip));
+        report
+            .plans_skipped
+            .retain(|plan_skip| self.plan_skips.insert(plan_skip.clone()));
     }
 }
 
@@ -2745,9 +2852,16 @@ mod tests {
 }"#,
         )
         .unwrap();
+        std::fs::create_dir_all(catalog.path().join("plans")).unwrap();
+        std::fs::write(
+            catalog.path().join("plans/blocked.md"),
+            "**Owner:** `test-host.live` **Opened:** today **State:** BLOCKED\n\n### Check\n    never-read\n",
+        )
+        .unwrap();
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
         let mut warnings_seen = 0usize;
+        let mut plan_skips_seen = 0usize;
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -2764,6 +2878,7 @@ mod tests {
                 |report| {
                     passes += 1;
                     warnings_seen += report.warnings.len();
+                    plan_skips_seen += report.plans_skipped.len();
                 },
             )
             .unwrap();
@@ -2776,6 +2891,10 @@ mod tests {
         assert_eq!(
             warnings_seen, 1,
             "an unchanged advisory failure must be diagnosed once across {passes} passes"
+        );
+        assert_eq!(
+            plan_skips_seen, 1,
+            "an unchanged plan refusal must be diagnosed once across {passes} passes"
         );
     }
     /// A pass can execute a plan the task was never in: `up_once` drops an owner whose

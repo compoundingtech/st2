@@ -1534,7 +1534,66 @@ pub fn send_to_resolved_inbox(
         tags,
         body,
         idempotency_key,
+        false,
     )
+    .map(|outcome| outcome.filename)
+}
+
+/// The reconciler is a system sender, not an Agent Spec. Its ledger lives in machine-local state,
+/// while delivery still resolves the recipient through the catalog and uses the ordinary durable
+/// inbox/archive receipt rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SystemSendOutcome {
+    pub filename: String,
+    pub delivered_now: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_system_to_resolved_inbox(
+    catalog_root: &Path,
+    recipient: &str,
+    this_host: &str,
+    sender_state: &Path,
+    from: &str,
+    subject: &str,
+    tags: &[String],
+    body: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<SystemSendOutcome> {
+    validate_idempotency_key(idempotency_key)?;
+    anyhow::ensure!(
+        from == format!("st2.{this_host}"),
+        "system sender must be `st2.{this_host}`"
+    );
+    let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, None)?;
+    anyhow::ensure!(
+        matches!(&recipient, DeliveryEndpoint::Agent(_)),
+        "system supervision requires a catalog agent recipient"
+    );
+    test_capability_checkpoint();
+    send_with_ledger(
+        catalog_root,
+        this_host,
+        None,
+        sender_state,
+        from,
+        recipient,
+        Some(subject),
+        None,
+        tags,
+        body,
+        Some(idempotency_key),
+        true,
+    )
+    .map(|outcome| SystemSendOutcome {
+        filename: outcome.filename,
+        delivered_now: outcome.delivered_now,
+    })
+}
+
+struct LedgerSendOutcome {
+    filename: String,
+    delivered_now: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1550,7 +1609,8 @@ fn send_with_ledger(
     tags: &[String],
     body: &str,
     idempotency_key: Option<&str>,
-) -> anyhow::Result<String> {
+    key_identifies_operation: bool,
+) -> anyhow::Result<LedgerSendOutcome> {
     let root = sent_dir(sender_root);
     let _lock = SentLock::exclusive(&root)?;
     let mut head = ensure_sent_head(&root)?;
@@ -1576,8 +1636,14 @@ fn send_with_ledger(
         body: parsed.body,
         rendered_message,
     };
-    if let Some(existing) = keyed_record(&root, &candidate)? {
-        return Ok(existing.filename);
+    if let Some(existing) = keyed_record(&root, &candidate, key_identifies_operation)? {
+        let delivered_now = recovered
+            .iter()
+            .any(|record| record.filename == existing.filename);
+        return Ok(LedgerSendOutcome {
+            filename: existing.filename,
+            delivered_now,
+        });
     }
     let mut matching = recovered
         .iter()
@@ -1587,7 +1653,10 @@ fn send_with_ledger(
             matching.next().is_none(),
             "multiple recovered sends match one retry"
         );
-        return Ok(existing.filename.clone());
+        return Ok(LedgerSendOutcome {
+            filename: existing.filename.clone(),
+            delivered_now: true,
+        });
     }
 
     let pending = root
@@ -1615,7 +1684,10 @@ fn send_with_ledger(
     test_send_checkpoint("pending-cleanup")?;
     fs::remove_file(root.join(SENT_ACTIVE))?;
     test_send_checkpoint("active-cleanup")?;
-    Ok(candidate.filename)
+    Ok(LedgerSendOutcome {
+        filename: candidate.filename,
+        delivered_now: true,
+    })
 }
 
 fn ensure_sent_head(root: &Path) -> anyhow::Result<SentHead> {
@@ -1880,7 +1952,11 @@ fn publish_key(root: &Path, record: &SentRecord) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<SentRecord>> {
+fn keyed_record(
+    root: &Path,
+    candidate: &SentRecord,
+    key_identifies_operation: bool,
+) -> anyhow::Result<Option<SentRecord>> {
     let Some(key) = candidate.idempotency_key.as_deref() else {
         return Ok(None);
     };
@@ -1919,10 +1995,12 @@ fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<Se
         digest_json(&record)? == receipt.record_digest,
         "sent key record mismatch"
     );
-    anyhow::ensure!(
-        record.same_operation(candidate),
-        "message idempotency key reused with different content"
-    );
+    if !key_identifies_operation {
+        anyhow::ensure!(
+            record.same_operation(candidate),
+            "message idempotency key reused with different content"
+        );
+    }
     Ok(Some(record))
 }
 

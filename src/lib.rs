@@ -41,6 +41,7 @@ pub mod resource;
 pub mod run;
 pub mod service;
 pub mod status;
+mod supervision;
 pub mod task_inventory;
 pub mod validate;
 pub mod version;
