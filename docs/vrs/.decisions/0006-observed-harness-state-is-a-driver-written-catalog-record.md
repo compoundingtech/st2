@@ -108,3 +108,33 @@ scoping delivery-input watching is a prerequisite, not a precaution.
 - Root DQ2 and DQ3 are updated: pi gains an evented signal, the observed half
   of DQ3 is specified here, and the declared half (activity status, plan,
   plan step) plus supervisor-following behavior remain open.
+
+## Amendment 1 — PTY session fidelity composes at read time
+
+Accepted by Johannes on 2026-08-26 after deploying this decision's original
+implementation to a 627-seat downstream catalog. The envelope and readers were
+live while zero seats produced a record: the deployment launched harnesses
+outside st2's native drivers, and nothing enforced or measured the assumption
+that a driver owned every session. The original decision remains correct for
+the **fine driver record** and wrong as the only coverage mechanism.
+
+Observed harness state therefore gains an additive
+`fidelity ∈ driver | session` discriminator and a launcher-agnostic session
+projection:
+
+- `driver` retains this decision's full record, fencing, freshness, and
+  complete tuple semantics;
+- `session` is a read-time projection over the canonical PTY session's
+  persisted `lastOutputAtMs`, covering only `state` and `since`; its
+  blocked/input/ask axes remain `unknown`;
+- a fresh definite driver observation wins; session fidelity replaces a
+  missing or derived-unknown driver observation;
+- the session projection writes no `harness-state` record and creates no
+  second writer class.
+
+The PTY daemon is the observer because it already processes every output byte.
+st2 does not know or branch on the launcher — the canonical agent task's PTY id
+is the bus id regardless of whether the child is axe, a native st2 driver, or a
+future launcher. The decision rejects `pty stats` polling, scrollback deltas,
+and event-stream following based on the fleet measurements in
+[`05-harness-state/.experiments/2026-08-26-launcher-independent-session-activity.md`](../05-harness-state/.experiments/2026-08-26-launcher-independent-session-activity.md).

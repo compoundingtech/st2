@@ -41,6 +41,12 @@ path reads this record.
   session's driver processes — the wrapper that owns the presence lease, and
   the channel or hook subprocesses it shares its incarnation token with;
   nothing verifies that claim.
+- **OHS-A04 PTY output is universal session evidence:** Every maintained
+  launcher runs the agent task in the declared PTY session. The PTY daemon
+  necessarily observes every output byte to maintain terminal state, regardless
+  of which launcher or harness produced it. This is sufficient evidence for a
+  coarse `active | idle` classification, but proves nothing about `blockedOn`,
+  `ask`, or `inputBuffer`.
 
 ## Acceptable Tradeoffs
 
@@ -106,7 +112,7 @@ path reads this record.
   not the agent directory wholesale. This is a prerequisite: the record sits
   in a tree the Codex pump watches unfiltered today.
 
-### Must be produced by drivers under the evidence rule
+### Must derive from positive evidence
 
 - **OHS-R05 Driver-owned projection:** Classification is driver work. The
   Codex producer projects the existing control state with the corrected rows:
@@ -133,11 +139,11 @@ path reads this record.
   narrowing, not a closure: what it cannot prove, the relaunch-time written
   claim supersedes and the staleness horizon bounds. A fresh `ended`
   survives the check: a terminal record is supposed to outlive its writer.
-- **OHS-R08 All-harness coverage:** Codex, Claude, pi, and OpenCode each ship
-  a producer. pi's is evented through the injected extension (the positive
-  idle signal root `DQ2` asks for). OpenCode reaches driver parity first —
-  typed driver, session wrapper owning the presence lease, then its producer
-  and native delivery transport.
+- **OHS-R08 All-harness coverage:** Every local running agent has session
+  fidelity independent of its launcher or harness. Codex, Claude, pi,
+  OpenCode, and OMP additionally ship fine driver producers for sessions the
+  corresponding st2 driver owns. Fine coverage may vary by launch path;
+  session coverage may not.
 
 ### Must be readable beside declared presence
 
@@ -145,11 +151,32 @@ path reads this record.
   declared `status` in one payload — the wedged-agent comparison (declared
   `busy`, observed `idle`) must not require joining two commands. Observed
   state is a third independent axis: it never rewrites presence, desired
-  lifecycle, or `lastActivity`, and the pinned roster wire assertions change
+  lifecycle, or `lastActivity`. `observedState.fidelity ∈ driver | session`
+  tells consumers which axes are proved: driver fidelity covers the full
+  tuple; session fidelity covers `state` only and leaves `blockedOn`, `ask`,
+  and `inputBuffer` `unknown`. The pinned roster wire assertions change
   deliberately, in the same change, with the new proof named.
-- **OHS-R10 Doctor exposure:** Doctor surfaces observed state for agents it
-  owns as advisory output — a stale or session-dead record beside a `running`
-  desired state is worth a warning, never an exit-code failure in v1.
+- **OHS-R10 Doctor exposure:** Doctor surfaces composed observed state for
+  agents it owns as advisory output — fidelity and an indeterminate reason are
+  explicit; absence names a missing driver record *and* missing PTY activity
+  stamp. None is an exit-code failure in v1.
+- **OHS-R11 Launcher-agnostic session projection:** The PTY daemon stamps
+  `lastOutputAtMs` while processing output and persists it to the canonical
+  session metadata, debounced to at most one metadata write per second per busy
+  session. st2 joins that metadata at read time using the canonical agent task
+  mapping `pty_id = bus_id`: alive plus output inside the activity window
+  derives session-fidelity `active`; alive plus older output derives
+  session-fidelity `idle`; missing liveness or output evidence derives nothing.
+  st2 never branches on, imports, or names the launcher.
+- **OHS-R12 Fine-over-session precedence:** A definite fresh driver record
+  wins over session activity. A missing or derived-`unknown` driver record
+  falls back to session activity. The session projection never becomes a
+  `harness-state` writer and therefore introduces no writer identity, fencing,
+  heartbeat, or record-retention contract.
+- **OHS-R13 Bounded fleet cost:** Output stamping is O(1) in the PTY daemon's
+  existing parse path. The persist debounce bounds write amplification.
+  Roster reads consume the small per-session metadata directly; they do not
+  shell out to `pty stats`, follow event streams, or scan terminal buffers.
 
 ## Evidence
 
@@ -162,3 +189,13 @@ the Codex `activeFlags` schema present on all supported codex-cli versions
 machine and its hold reasons, the unfiltered agent-dir watch beside the
 presence refresh that writes into it, and `src/harness_state.rs`, which
 implements the envelope this file ratifies.
+
+The session-fidelity measurements were taken 2026-08-26 on a 627-seat
+downstream catalog: the shipped envelope had zero producer records because the
+launcher bypassed st2 drivers; `pty stats --json` cost 520 ms for 60 sessions
+(~5.5 s projected to 627); `scrollbackUsed` is the bounded terminal-buffer
+length and saturates; the PTY event log is sparse and title-change dominated;
+reading 300 persisted session metadata files cost 19 ms in one process. These
+rule out stats polling, scrollback deltas, and event-following in favor of one
+daemon stamp plus a direct read-time join. See
+[`05-harness-state/.experiments/2026-08-26-launcher-independent-session-activity.md`](./.experiments/2026-08-26-launcher-independent-session-activity.md).

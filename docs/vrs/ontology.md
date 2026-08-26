@@ -119,13 +119,17 @@ Authority: [`reconcile::Session`](../../src/reconcile.rs#L16-L26)
 
 ### observed harness state
 
-The driver-written record of what a harness is seen doing: activity
-(`idle`/`active`/`child`/`ended`, with `unknown` derived and never written),
-who it is blocked on — and, when blocked on a human, what kind of ask holds
-it (`permission`/`question`/`review`) — and what its input buffer holds. The observed
-counterpart of the declared axes: it is not [presence](#presence) (agent-
-authored availability), not [session state](#session-state) (task-record
-liveness), not R08's *declared activity status*, and not R09's *working
+The composed observation of what a harness session is seen doing. Its
+`fidelity` discriminator names the proof:
+
+- **driver fidelity** — a driver-written record carrying activity, who it is
+  blocked on (and the ask kind), and input-buffer state;
+- **session fidelity** — a launcher-agnostic, read-time projection from the
+  PTY's last output, proving coarse `active | idle` activity only.
+
+Both are the observed counterpart of the declared axes. Neither is
+[presence](#presence) (agent-authored availability), [session state](#session-state)
+(task-record liveness), R08's *declared activity status*, or R09's *working
 state* (restored context).
 
 Authority: [`harness_state`](../../src/harness_state.rs);

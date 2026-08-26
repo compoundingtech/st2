@@ -470,7 +470,7 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     let stdout = String::from_utf8_lossy(&absent.stdout);
     assert!(absent.status.success(), "{stdout}");
     assert!(
-        stdout.contains("⚠ h.worker observed harness state absent"),
+        stdout.contains("⚠ h.worker observed state absent"),
         "{stdout}"
     );
 
@@ -492,7 +492,7 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     let stdout = String::from_utf8_lossy(&live.stdout);
     assert!(live.status.success(), "{stdout}");
     assert!(
-        stdout.contains("h.worker observed harness state fresh (is `active`)"),
+        stdout.contains("h.worker observed state fresh (driver fidelity is `active`)"),
         "{stdout}"
     );
 
@@ -505,7 +505,7 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
         stdout.contains("⚠ h.worker observed harness state ended"),
         "{stdout}"
     );
-    assert!(stdout.contains("session ended (signal 9)"), "{stdout}");
+    assert!(stdout.contains("session ended (exit signal 9)"), "{stdout}");
 
     // A record that derives `unknown` names its reason, still advisory.
     fs::write(agent_dir.join("harness-state"), "garbage").unwrap();
@@ -513,7 +513,7 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     let stdout = String::from_utf8_lossy(&indeterminate.stdout);
     assert!(indeterminate.status.success(), "{stdout}");
     assert!(
-        stdout.contains("⚠ h.worker observed harness state indeterminate"),
+        stdout.contains("⚠ h.worker observed state indeterminate"),
         "{stdout}"
     );
     assert!(stdout.contains("(malformed-record)"), "{stdout}");

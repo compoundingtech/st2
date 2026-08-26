@@ -533,11 +533,32 @@ impl Writer {
     }
 }
 
+/// How much of the harness-state vocabulary the observation source can prove.
+///
+/// Driver observations cover every axis in the envelope. Session observations
+/// cover only coarse activity from PTY output; their blocked/input/ask axes stay
+/// `unknown` and consumers must use only `state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fidelity {
+    Driver,
+    Session,
+}
+
+impl Fidelity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Fidelity::Driver => "driver",
+            Fidelity::Session => "session",
+        }
+    }
+}
+
 /// The derived view a consumer reads. `state` already folds in staleness, future skew,
 /// malformation, and (when a probe is supplied) session liveness; `reason` names which derivation
 /// produced an `unknown`, so no absence is silent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observed {
+    pub fidelity: Fidelity,
     pub state: Activity,
     pub blocked_on: BlockedOn,
     pub input_buffer: InputBuffer,
@@ -553,6 +574,7 @@ impl Observed {
         // The single constructor for an indeterminate observation: every absence routes here, so
         // no path can derive `idle` — or anything else — from missing evidence.
         Self {
+            fidelity: Fidelity::Driver,
             state: Activity::Unknown,
             blocked_on: BlockedOn::Unknown,
             input_buffer: InputBuffer::Unknown,
@@ -641,6 +663,7 @@ fn read_raw_at(
         }
     }
     Observed {
+        fidelity: Fidelity::Driver,
         state: record.state,
         blocked_on: record.blocked_on,
         input_buffer: record.input_buffer,

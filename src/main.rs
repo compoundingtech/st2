@@ -1880,21 +1880,21 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     "rotted to `unknown` — is its session owner refreshing presence?",
                 );
             }
-            // Observed harness state is advisory-only in doctor: absence names a driver gap and
-            // a derived `unknown` names its reason, but neither fails the exit code.
-            let observed_path = st2::harness_state::harness_state_path(dir);
+            // Observed state is advisory-only in Doctor. A fresh driver record
+            // wins; otherwise the local PTY activity stamp supplies coarse
+            // session fidelity. Neither absence nor indeterminacy fails Doctor.
             let pty_root = st2::agents::probe_pty_root(&catalog);
-            let probe = |session: &str| st2::ding::session_liveness_in(&pty_root, session);
-            match st2::harness_state::read(&observed_path, Some(&probe)) {
+            match st2::agents::read_observed_state(spec, dir, &pty_root, &this_host) {
                 None => report_advisory(
-                    &format!("{bus_id} observed harness state absent"),
-                    "no driver has published a harness-state record for this agent",
+                    &format!("{bus_id} observed state absent"),
+                    "no fresh driver record or PTY lastOutputAtMs stamp — upgrade/restart pty or inspect the session",
                 ),
                 Some(observed) if observed.state == st2::harness_state::Activity::Unknown => {
                     report_advisory(
-                        &format!("{bus_id} observed harness state indeterminate"),
+                        &format!("{bus_id} observed state indeterminate"),
                         &format!(
-                            "derived `unknown` ({}) — is its driver still observing the harness?",
+                            "{}-fidelity `unknown` ({})",
+                            observed.fidelity.as_str(),
                             observed.reason.as_deref().unwrap_or("unstated")
                         ),
                     )
@@ -1911,9 +1911,6 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                                 .exit
                                 .as_deref()
                                 .map(|exit| format!("exit {exit}"))
-                                // A terminal record can carry only a reason — Codex's
-                                // observed systemError writes reason without an exit — and
-                                // discarding it leaves the operator nothing to act on.
                                 .or_else(|| {
                                     observed.reason.as_deref().map(|reason| format!("{reason}"))
                                 })
@@ -1925,7 +1922,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     &mut problems,
                     true,
                     &format!(
-                        "{bus_id} observed harness state fresh (is `{}`)",
+                        "{bus_id} observed state fresh ({} fidelity is `{}`)",
+                        observed.fidelity.as_str(),
                         observed.state.as_str()
                     ),
                     "",

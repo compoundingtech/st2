@@ -4,13 +4,28 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::message;
 use crate::status::{self, State};
 use crate::{AgentSpec, Discovered, Resource, harness_state};
+
+/// A PTY that emitted output inside this window is running a turn. Maintained
+/// harnesses stream tokens or redraw progress continuously while active and go
+/// silent between turns, so one minute leaves wide margin on both sides.
+///
+/// Deliberately not an alias of presence or driver-record freshness: this is a
+/// read-time session-activity projection with its own evidence and semantics.
+const SESSION_ACTIVE_WINDOW_MS: u64 = 60_000;
+const SESSION_FUTURE_SKEW_MS: u64 = 30_000;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PtySessionMetadata {
+    last_output_at_ms: Option<u64>,
+}
 
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
@@ -57,13 +72,15 @@ pub fn roster_from_discovered(
     this_host: &str,
 ) -> Vec<AgentRow> {
     let pty_root = probe_pty_root(catalog_root);
+    let now_ms = unix_ms_now();
     let mut rows: Vec<AgentRow> = found
         .specs
         .iter()
         .filter_map(|s| {
             let agent_dir = s.path.parent()?;
+            let bus_id = s.bus_id(this_host);
             Some(AgentRow {
-                identity: s.bus_id(this_host),
+                identity: bus_id.clone(),
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: s.name.clone(),
                 description: s.description.clone(),
@@ -73,7 +90,7 @@ pub fn roster_from_discovered(
                 resources: s.resources.clone(),
                 last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
-                observed: observed_state(s, agent_dir, &pty_root, this_host),
+                observed: observed_state_at(s, agent_dir, &pty_root, this_host, &bus_id, now_ms),
             })
         })
         .collect();
@@ -81,22 +98,99 @@ pub fn roster_from_discovered(
     rows
 }
 
-/// Read the observed-harness-state record beside `status`. The session-liveness cross-check is
-/// host-local by construction: it applies only to agents this host runs, and an unreadable
-/// registry downgrades nothing.
-fn observed_state(
+/// Read the same composed observation exposed by the roster, for consumers
+/// such as Doctor that already hold one discovered Agent Spec.
+pub fn read_observed_state(
     spec: &AgentSpec,
     agent_dir: &Path,
     pty_root: &Path,
     this_host: &str,
 ) -> Option<harness_state::Observed> {
+    let bus_id = spec.bus_id(this_host);
+    observed_state_at(spec, agent_dir, pty_root, this_host, &bus_id, unix_ms_now())
+}
+
+/// Compose the rich driver record with launcher-agnostic PTY session activity.
+/// A definite, fresh driver record wins. A missing or indeterminate driver
+/// record falls back to session activity on the local host. Cross-host readers
+/// have neither the remote PTY registry nor its activity stamp, so they retain
+/// the replicated driver record unchanged.
+fn observed_state_at(
+    spec: &AgentSpec,
+    agent_dir: &Path,
+    pty_root: &Path,
+    this_host: &str,
+    bus_id: &str,
+    now_ms: u64,
+) -> Option<harness_state::Observed> {
     let path = harness_state::harness_state_path(agent_dir);
-    if spec.resolved_host(this_host) == this_host {
-        let probe = |session: &str| crate::ding::session_liveness_in(pty_root, session);
-        harness_state::read(&path, Some(&probe))
-    } else {
-        harness_state::read(&path, None)
+    if spec.resolved_host(this_host) != this_host {
+        return harness_state::read(&path, None);
     }
+
+    let probe = |session: &str| crate::ding::session_liveness_in(pty_root, session);
+    let driver = harness_state::read(&path, Some(&probe));
+    let session = session_observation(pty_root, bus_id, now_ms);
+    compose_observations(driver, session)
+}
+
+fn compose_observations(
+    driver: Option<harness_state::Observed>,
+    session: Option<harness_state::Observed>,
+) -> Option<harness_state::Observed> {
+    if driver
+        .as_ref()
+        .is_some_and(|observed| observed.state != harness_state::Activity::Unknown)
+    {
+        driver
+    } else {
+        session.or(driver)
+    }
+}
+
+/// Read coarse activity from the canonical agent task's PTY session. The
+/// runner pins that session id to the agent bus id (`reconcile`'s canonical
+/// agent rule), so the mapping is computed and requires no launcher knowledge.
+fn session_observation(
+    pty_root: &Path,
+    bus_id: &str,
+    now_ms: u64,
+) -> Option<harness_state::Observed> {
+    if crate::ding::session_liveness_in(pty_root, bus_id) != harness_state::SessionLiveness::Alive {
+        return None;
+    }
+    let metadata: PtySessionMetadata =
+        serde_json::from_slice(&fs::read(pty_root.join(format!("{bus_id}.json"))).ok()?).ok()?;
+    let last_output_at_ms = metadata.last_output_at_ms?;
+    let future_skew = last_output_at_ms.saturating_sub(now_ms);
+    let (state, reason) = if future_skew > SESSION_FUTURE_SKEW_MS {
+        (
+            harness_state::Activity::Unknown,
+            Some("pty-future-skew".to_owned()),
+        )
+    } else if now_ms.saturating_sub(last_output_at_ms) <= SESSION_ACTIVE_WINDOW_MS {
+        (harness_state::Activity::Active, None)
+    } else {
+        (harness_state::Activity::Idle, None)
+    };
+    Some(harness_state::Observed {
+        fidelity: harness_state::Fidelity::Session,
+        state,
+        blocked_on: harness_state::BlockedOn::Unknown,
+        input_buffer: harness_state::InputBuffer::Unknown,
+        ask: harness_state::Ask::Unknown,
+        harness: None,
+        since_ms: Some(last_output_at_ms),
+        exit: None,
+        reason,
+    })
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 /// The pty registry root the probe reads: exactly the runner's own resolution, so the reader and
@@ -112,6 +206,7 @@ pub fn probe_pty_root(catalog_root: &Path) -> PathBuf {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObservedJson<'a> {
+    fidelity: &'a str,
     state: &'a str,
     blocked_on: &'a str,
     input_buffer: &'a str,
@@ -125,6 +220,7 @@ struct ObservedJson<'a> {
 impl<'a> ObservedJson<'a> {
     fn from_row(observed: Option<&'a harness_state::Observed>) -> Option<Self> {
         observed.map(|observed| ObservedJson {
+            fidelity: observed.fidelity.as_str(),
             state: observed.state.as_str(),
             blocked_on: observed.blocked_on.as_str(),
             input_buffer: observed.input_buffer.as_str(),
@@ -334,6 +430,7 @@ mod tests {
             0,
         );
         wedged.observed = Some(harness_state::Observed {
+            fidelity: harness_state::Fidelity::Driver,
             state: harness_state::Activity::Idle,
             blocked_on: harness_state::BlockedOn::None,
             input_buffer: harness_state::InputBuffer::Empty,
@@ -346,15 +443,16 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"fidelity":"driver","state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"fidelity":"driver","state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
         derived.observed = Some(harness_state::Observed {
+            fidelity: harness_state::Fidelity::Driver,
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
             input_buffer: harness_state::InputBuffer::Unknown,
@@ -366,7 +464,115 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"fidelity":"driver","state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
+        );
+    }
+
+    fn write_pty_session(root: &Path, bus_id: &str, last_output_at_ms: Option<u64>) {
+        fs::write(
+            root.join(format!("{bus_id}.pid")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let metadata = match last_output_at_ms {
+            Some(timestamp) => serde_json::json!({ "lastOutputAtMs": timestamp }),
+            None => serde_json::json!({}),
+        };
+        fs::write(
+            root.join(format!("{bus_id}.json")),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_activity_projects_active_idle_and_future_skew() {
+        let root = tempfile::tempdir().unwrap();
+        let bus_id = "dev3.worker";
+        let now = 1_800_000_000_000;
+
+        write_pty_session(root.path(), bus_id, Some(now - 500));
+        let active = session_observation(root.path(), bus_id, now).unwrap();
+        assert_eq!(active.fidelity, harness_state::Fidelity::Session);
+        assert_eq!(active.state, harness_state::Activity::Active);
+        assert_eq!(active.blocked_on, harness_state::BlockedOn::Unknown);
+        assert_eq!(active.since_ms, Some(now - 500));
+
+        write_pty_session(
+            root.path(),
+            bus_id,
+            Some(now - SESSION_ACTIVE_WINDOW_MS - 1),
+        );
+        let idle = session_observation(root.path(), bus_id, now).unwrap();
+        assert_eq!(idle.state, harness_state::Activity::Idle);
+        assert_eq!(idle.reason, None);
+
+        write_pty_session(root.path(), bus_id, Some(now + SESSION_FUTURE_SKEW_MS + 1));
+        let skewed = session_observation(root.path(), bus_id, now).unwrap();
+        assert_eq!(skewed.state, harness_state::Activity::Unknown);
+        assert_eq!(skewed.reason.as_deref(), Some("pty-future-skew"));
+    }
+
+    #[test]
+    fn session_activity_requires_both_liveness_and_an_output_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let bus_id = "dev3.worker";
+        write_pty_session(root.path(), bus_id, None);
+        assert_eq!(session_observation(root.path(), bus_id, 10_000), None);
+
+        fs::write(root.path().join(format!("{bus_id}.pid")), "0").unwrap();
+        fs::write(
+            root.path().join(format!("{bus_id}.json")),
+            r#"{"lastOutputAtMs":9999}"#,
+        )
+        .unwrap();
+        assert_eq!(session_observation(root.path(), bus_id, 10_000), None);
+    }
+
+    #[test]
+    fn fresh_driver_state_wins_and_indeterminate_driver_falls_back_to_session() {
+        let driver = harness_state::Observed {
+            fidelity: harness_state::Fidelity::Driver,
+            state: harness_state::Activity::Idle,
+            blocked_on: harness_state::BlockedOn::None,
+            input_buffer: harness_state::InputBuffer::Empty,
+            ask: harness_state::Ask::None,
+            harness: Some("codex".to_owned()),
+            since_ms: Some(10),
+            exit: None,
+            reason: None,
+        };
+        let session = harness_state::Observed {
+            fidelity: harness_state::Fidelity::Session,
+            state: harness_state::Activity::Active,
+            blocked_on: harness_state::BlockedOn::Unknown,
+            input_buffer: harness_state::InputBuffer::Unknown,
+            ask: harness_state::Ask::Unknown,
+            harness: None,
+            since_ms: Some(20),
+            exit: None,
+            reason: None,
+        };
+
+        assert_eq!(
+            compose_observations(Some(driver.clone()), Some(session.clone())),
+            Some(driver)
+        );
+
+        let indeterminate = harness_state::Observed {
+            fidelity: harness_state::Fidelity::Driver,
+            state: harness_state::Activity::Unknown,
+            blocked_on: harness_state::BlockedOn::Unknown,
+            input_buffer: harness_state::InputBuffer::Unknown,
+            ask: harness_state::Ask::Unknown,
+            harness: Some("codex".to_owned()),
+            since_ms: None,
+            exit: None,
+            reason: Some("stale".to_owned()),
+        };
+        assert_eq!(
+            compose_observations(Some(indeterminate), Some(session.clone())),
+            Some(session)
         );
     }
 }

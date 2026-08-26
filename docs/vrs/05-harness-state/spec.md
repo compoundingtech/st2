@@ -17,32 +17,35 @@ are tracked in [open-questions.md](./open-questions.md).
 
 ## Scope
 
-This specification defines the record, its freshness and derivation rules, the
-per-harness producers, and the roster/Doctor exposure. It does not define:
-transition history or a `--watch` surface (deferred, OHS-T03); idle thresholds,
-escalation, or notification policy (#173's, per root `R20`); the withdrawn
-host-local hot tier; the cut PTY screen observer; or any `AGENT-SPEC.md`
-change (separate authority, root `DQ3`).
+This specification defines the fine driver record, its freshness and
+derivation rules, the per-harness producers, the launcher-agnostic PTY session
+projection, their precedence, and the roster/Doctor exposure. It does not
+define: transition history or a `--watch` surface (deferred, OHS-T03);
+escalation or notification policy (#173's, per root `R20`); the withdrawn
+host-local screen-classification observer; or any `AGENT-SPEC.md` change
+(separate authority, root `DQ3`).
 
 ## Overview
 
 ```text
-   codex app-server        claude hooks +          pi extension        opencode
-   control stream          wrapper child poll      (evented)           server surface
-        |                        |                      |                  |
-        v                        v                      v                  v
-   [driver-owned projection: idle/active/child/ended × blockedOn (+ask) × inputBuffer]
-        |
-        v                                          declared axis (unchanged)
-   <agent-dir>/harness-state                       <agent-dir>/status
-   st2.harness-state.v1                            presence, agent-authored
-   transition writes + 5-min heartbeat                     |
-        |                                                  |
-        +--------------------+-----------------------------+
-                             v
-              st2 agents --json  (status ∥ observedState)
-              st2 doctor         (advisory)
-              downstream TUI     (spinner, blocked-on-you)
+ fine fidelity (driver-owned)                 session fidelity (launcher-agnostic)
+
+ codex/claude/pi/opencode/OMP drivers         PTY daemon already parses output bytes
+                   |                                      |
+                   v                                      v
+ <agent-dir>/harness-state                  <pty-root>/<bus-id>.json
+ st2.harness-state.v1                       lastOutputAtMs (persist ≤1/s)
+ full tuple + fencing + heartbeat                         |
+                   |                                      |
+                   +--------------+-----------------------+
+                                  v
+                         roster read-time fold
+              fresh definite driver > PTY session activity
+                                  |
+                                  v
+          st2 agents --json  (status ∥ observedState.fidelity)
+          st2 doctor         (advisory)
+          downstream TUI     (fine semantics or coarse active/idle)
 ```
 
 ## Record (OHS-R01, OHS-R03)
@@ -364,12 +367,47 @@ pending. The status seed trusts exactly the pinned words (`busy`, `retry`,
 pre-signal escalation cover with the exit the grace-window reap actually
 observed.
 
+## PTY session projection (OHS-R08, OHS-R11–R13)
+
+The canonical agent task's PTY id is its host-qualified bus id. This is the
+runner's authored mapping, not a convention recovered from a launcher. The PTY
+daemon stamps the unix-millisecond time of each output chunk in memory while
+feeding the same chunk to the terminal emulator. A trailing-edge one-second
+debounce persists the newest value as `lastOutputAtMs` through PTY's locked
+metadata mutation. Exit metadata carries the final in-memory stamp.
+
+Roster reads on the local host:
+
+1. read and derive the driver record with its existing liveness probe;
+2. return a definite driver observation unchanged;
+3. otherwise prove the canonical PTY session alive from its pidfile and read
+   `<pty-root>/<bus-id>.json`;
+4. derive session-fidelity `active` when `lastOutputAtMs` is no more than 60 s
+   old, `idle` when older, `unknown` for more than 30 s future skew, and no
+   observation when liveness or the activity stamp is absent;
+5. prefer the session observation over a missing or derived-`unknown` driver
+   observation.
+
+The output clock and thresholds belong to the consumer: PTY reports when it
+last observed output and does not interpret harness semantics. st2 neither
+imports nor names a launcher. The session projection does not write
+`harness-state`; it therefore has no writer identity, fencing, heartbeat, or
+transport lifecycle. Its `blockedOn`, `ask`, and `inputBuffer` values remain
+`unknown` because PTY output cannot prove them.
+
+`fidelity` is the discriminator that makes this partial tuple explicit:
+
+- `driver` — every axis follows the envelope semantics in this spec;
+- `session` — only `state` and `since` are proved; consumers use those two
+  fields and must not poison coarse activity with the unknown fine axes.
+
 ## Exposure (OHS-R09, OHS-R10)
 
 `st2 agents --json` (both forms) appends one field per row:
 
 ```json
 "observedState": {
+  "fidelity": "driver",
   "state": "active",
   "blockedOn": "human",
   "inputBuffer": "unknown",
@@ -381,18 +419,30 @@ observed.
 }
 ```
 
-`null` when no record exists. The derivation above is already applied — a
-consumer never re-implements staleness. Roster reads pass the same-host
-liveness probe only for agents whose resolved host is this host, resolving
-the pty root exactly as the runner does (`PTY_ROOT`, else the catalog's own
-pty root; the legacy `PTY_SESSION_DIR` is deliberately not honored — the
-runner never uses it, and probing a directory st2-managed sessions never
-touch turns provable deaths into indeterminate reads). `status`,
-`desiredState`, and `lastActivity` keep their exact meanings; the three
-full-string pinned assertions and the stable-roster invariant wording are
-updated deliberately in the change that adds the field. Doctor prints an
-advisory (not a failure) for an owned agent whose record is stale,
-session-dead, or `ended` while desired state is `running`.
+The session projection uses the same object with an explicit discriminator:
+
+```json
+"observedState": {
+  "fidelity": "session",
+  "state": "idle",
+  "blockedOn": "unknown",
+  "inputBuffer": "unknown",
+  "ask": "unknown",
+  "harness": null,
+  "since": 1787690000000,
+  "reason": null,
+  "exit": null
+}
+```
+
+`null` only when neither a usable driver record nor local PTY session activity
+exists. The derivation and precedence above are already applied — a consumer
+never re-implements freshness or liveness. Roster reads resolve the pty root
+exactly as the runner does (`PTY_ROOT`, else the catalog's own pty root; the
+legacy `PTY_SESSION_DIR` is deliberately not honored). `status`,
+`desiredState`, and `lastActivity` keep their exact meanings; pinned wire
+assertions change deliberately with the discriminator. Doctor names fidelity,
+warns on indeterminacy or missing both sources, and remains advisory.
 
 ## Verification plan
 
@@ -410,6 +460,14 @@ each only once a real test proves it (per `CLAUDE.md`):
   escalation. Proving tests live in `src/harness_state.rs` today (11 tests)
   plus the planned per-producer suites; the SIGKILL-mid-turn test (`ended`,
   not `active`) gates the teardown row.
+- **Session activity composition** — deterministic fixtures prove fresh vs
+  older vs future-skewed output, missing liveness/output evidence, and
+  definite-driver-over-session / session-over-indeterminate-driver precedence.
+  PTY integration tests prove absent-before-output, debounced persist after
+  output, subsequent-stamp advancement, and exit carrying the final stamp.
+- **Fleet cost** — the experiment records the rejected alternatives and direct
+  metadata-read baseline. A large-catalog benchmark gates the consumer PR:
+  composed roster reads must remain linear and avoid subprocesses.
 
 ## Open design questions
 
