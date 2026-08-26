@@ -30,9 +30,9 @@ Agent Spec resource URI (opaque, byte-preserved)
    closed core-wasm guest (no imports / no WASI)
              |
              v UTF-8 JSON path -> host lexical containment
-      Resolution { path, declared ProfileClass }
+      Resolution { path, containment_root, declared ProfileClass }
              |
-             v
+             v descriptor-relative, no-follow digest reads
       resync watch set and existing event pipeline
 ```
 
@@ -50,11 +50,11 @@ fn try_resolve(
 ```
 
 `Ok(None)` means no syntactically valid scheme or no exact registration.
-`Ok(Some(_))` is a contained local denotation plus the catalog-declared class.
-`Err(_)` means the scheme was registered but its wasm implementation was
-unavailable or failed. `resolve` is the containment-oriented convenience API
-that folds the final case into unwatchable; callers needing diagnostics use
-`try_resolve`.
+`Ok(Some(_))` is a contained local denotation, its enforced read root, and the
+catalog-declared class. `Err(_)` means the scheme was registered but its wasm
+implementation was unavailable or failed. `resolve` is the containment-oriented
+convenience API that folds the final case into unwatchable; callers needing
+diagnostics use `try_resolve`.
 
 There is one source variant:
 
@@ -90,19 +90,20 @@ profile "dev.schickling.agent-goal" {
 Grammar:
 
 ```text
-profile <non-empty-scheme> {
+profile <non-empty-scheme> {        # exactly one positional value; no properties
   wasm <non-empty-path>              # exactly once
   class immediate|coalesced|silent  # zero or one; default coalesced
 }
 ```
 
 The profile scheme accepts ASCII alphanumeric characters plus `+`, `-`, and
-`.`, and rejects `/`; lookup remains exact and case-sensitive. Each child takes
-exactly one quoted positional value. Unknown children, duplicate `wasm`,
-duplicate `class`, a missing `wasm`, unsupported class values, and duplicate
-profile schemes fail parsing. Relative module paths anchor at the catalog root
-after the existing `$CATALOG`/environment expansion; absolute paths remain
-absolute.
+`.`, and rejects `/`; lookup remains exact and case-sensitive. The profile
+node takes exactly one quoted positional scheme and no properties. Each child
+takes exactly one quoted positional value. Unknown or extra entries, unknown
+children, duplicate `wasm`, duplicate `class`, a missing `wasm`, unsupported
+class values, and duplicate profile schemes fail parsing. Relative module
+paths anchor at the catalog root after the existing `$CATALOG`/environment
+expansion; absolute paths remain absolute.
 
 `st2 validate` reports malformed declarations. `st2 up` loads declared profiles
 before it spawns tasks, so a malformed profile block fails loudly rather than
@@ -149,22 +150,31 @@ from escalating a `silent` profile to `immediate`.
 Before reading or acting, the host checks allocator pointers and the returned
 pointer/length range against linear memory, parses UTF-8 and JSON, joins the
 returned path to `agent_dir`, lexically normalizes `.`/`..`, and rejects any
-result outside `agent_dir`. Existence is not required at resolution time; the
-carrier may be created later.
+result outside `agent_dir` or crossing an existing symlink below it. Existence
+is not required at resolution time; the carrier may be created later.
+
+Successful resolution carries the normalized agent-directory root into resync.
+Every later digest read opens that root and then each relative component with
+no-follow semantics, using each directory descriptor for the next lookup, and
+reads the already-open final descriptor. A root, ancestor, or final component
+replaced by a symlink before or during traversal fails closed; admission-time
+metadata alone is never treated as a durable proof.
 
 ## Runtime containment (PROFILE-R04..R07)
 
 Each module is compiled once per module path and shared by registry clones. Each
-resolution creates a fresh `Store` and `Instance`, then charges a fresh budget:
+resolution creates a fresh `Store` and `Instance`. One fuel allowance covers
+the module start function and the first resolution call; a reused instance
+receives one fresh allowance before each later call:
 
 | Boundary | Contract |
 | --- | --- |
 | Imports | none; import-requiring modules fail instantiation |
-| Fuel | 5,000,000 fuel units per call |
+| Fuel | 5,000,000 fuel units for start + first call; same budget per later call |
 | Linear memory | 64 MiB maximum |
 | Memories | at most 1 |
-| Tables | at most 4 |
-| Instance state | fresh per resolution |
+| Tables | at most 4, with at most 10,000 elements each |
+| Instance state | fresh per registry resolution |
 | Compiled code | cached per module path |
 
 Failure taxonomy:
@@ -174,8 +184,8 @@ Failure taxonomy:
 | module load/instantiation | `Instantiation` | binding unwatchable; supervisor lives |
 | missing `memory`, `alloc`, or `resolve` | `MissingExport` | same |
 | unreachable/stack/memory trap | `Trap` | same |
-| infinite loop | `FuelExhausted` | same |
-| invalid pointer, UTF-8, JSON, or escaped path | `BadReturn` | same |
+| infinite start function or call | `FuelExhausted` | same |
+| invalid pointer, UTF-8, JSON, escaped path, or symlinked confined read | `BadReturn` or unreadable carrier | same |
 | feature disabled | registered-profile error | same; no alternate resolver |
 
 All wasmtime code and dependencies are gated by `wasm-resolver`, forwarded from

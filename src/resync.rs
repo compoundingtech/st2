@@ -44,12 +44,14 @@ impl CarrierClass {
     }
 }
 
-/// One watchable local carrier: binding label, absolute path, notification class.
+/// One watchable local carrier: binding label, absolute path, notification class, and an optional
+/// host root that must confine every read of a resolver-selected path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchableCarrier {
     pub label: String,
     pub path: PathBuf,
     pub class: CarrierClass,
+    pub containment_root: Option<PathBuf>,
 }
 
 /// The watchable carriers of one agent, keyed by its declaration path with current routing IDs.
@@ -77,6 +79,7 @@ pub fn watch_set_for(
         label: "declaration".to_owned(),
         path: declaration_path.clone(),
         class: CarrierClass::Immediate,
+        containment_root: None,
     }];
     for resource in &spec.resources {
         if resource.inactive_reason().is_some() {
@@ -93,6 +96,7 @@ pub fn watch_set_for(
                     label: resource.name().to_owned(),
                     path: resolution.path,
                     class,
+                    containment_root: Some(resolution.containment_root),
                 });
                 continue;
             }
@@ -112,6 +116,7 @@ pub fn watch_set_for(
             label: resource.name().to_owned(),
             path,
             class,
+            containment_root: None,
         });
     }
     // The supervisor's resolved logical host — not the OS hostname — decides the bus id, so an
@@ -374,6 +379,7 @@ struct Entry {
     seat_id: Option<String>,
     label: String,
     class: CarrierClass,
+    containment_root: Option<PathBuf>,
     digest: Option<String>,
     /// Last occurrence sequence reserved by this retained subscription. Sequence zero is the
     /// silent seeded state; only capturing a new immutable transition advances it.
@@ -510,15 +516,19 @@ fn rebuild_carriers(
             // The canonical recipient and binding label identify one subscription across
             // declaration and carrier relocation. Rebuild every retained entry from the current
             // declaration while carrying its baseline and immutable delivery snapshot. Looking
-            // across path buckets also lets a binding's re-resolved path/class metadata become
-            // current. A bus-id change intentionally seeds a new recipient-scoped namespace.
+            // across path buckets also lets a binding's re-resolved path/class/containment
+            // metadata become current. A bus-id change intentionally seeds a new
+            // recipient-scoped namespace.
             let identity = (set.bus_id.clone(), carrier.label.clone());
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
             let (digest, occurrence_sequence, pending_transition, dirty) =
                 retained.map_or_else(
                     || {
                         (
-                            read_digest(&carrier.path),
+                            read_digest(
+                                &carrier.path,
+                                carrier.containment_root.as_deref(),
+                            ),
                             subscription_sequences.get(&identity).copied().unwrap_or(0),
                             None,
                             false,
@@ -538,6 +548,7 @@ fn rebuild_carriers(
                 seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
                 class: carrier.class,
+                containment_root: carrier.containment_root.clone(),
                 digest,
                 occurrence_sequence,
                 pending_transition,
@@ -694,11 +705,11 @@ impl Worker {
     fn poll_paths(&mut self, paths: Vec<PathBuf>) {
         let now = Instant::now();
         for path in paths {
-            let observed = read_digest(&path);
             let Some(entries) = self.carriers.get_mut(&path) else {
                 continue;
             };
             for entry in entries {
+                let observed = read_digest(&path, entry.containment_root.as_deref());
                 let changed = entry.pending_transition.is_some()
                     || observed
                         .as_deref()
@@ -876,7 +887,7 @@ impl Worker {
                 continue;
             }
             entry.dirty = false;
-            let observed_digest = read_digest(path);
+            let observed_digest = read_digest(path, entry.containment_root.as_deref());
 
             if let Some(pending) = entry.pending_transition.as_ref() {
                 if emit_resync(&self.root, &self.this_host, &entry.bus_id, pending) {
@@ -979,8 +990,11 @@ fn emit_resync(
     }
 }
 
-fn read_digest(path: &Path) -> Option<String> {
-    read_regular(path)
+fn read_digest(path: &Path, containment_root: Option<&Path>) -> Option<String> {
+    match containment_root {
+        Some(root) => read_confined(path, root),
+        None => read_regular(path),
+    }
 }
 
 fn hash_reader(mut file: std::fs::File) -> Option<String> {
@@ -1018,6 +1032,65 @@ fn read_regular(path: &Path) -> Option<String> {
         return None;
     }
     hash_reader(file)
+}
+
+#[cfg(unix)]
+fn read_confined(path: &Path, root: &Path) -> Option<String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let relative = path.strip_prefix(root).ok()?;
+    let mut components = relative.components().peekable();
+    let root = CString::new(root.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `root` is NUL-terminated and the returned descriptor is checked before ownership.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return None;
+    }
+    // SAFETY: `root_fd` is a newly-owned descriptor after the non-negative check above.
+    let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = CString::new(name.as_bytes()).ok()?;
+        let last = components.peek().is_none();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if last { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: both the live directory descriptor and NUL-terminated component are valid;
+        // `O_NOFOLLOW` makes each lookup fail closed if that component is replaced by a symlink.
+        let opened = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if opened < 0 {
+            return None;
+        }
+        // SAFETY: `opened` is a newly-owned descriptor after the non-negative check above.
+        let opened = unsafe { OwnedFd::from_raw_fd(opened) };
+        if last {
+            let file = std::fs::File::from(opened);
+            if !file.metadata().ok()?.file_type().is_file() {
+                return None;
+            }
+            return hash_reader(file);
+        }
+        directory = opened;
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn read_confined(_path: &Path, _root: &Path) -> Option<String> {
+    // No std API can atomically enforce no-follow traversal. Fail closed on unsupported hosts.
+    None
 }
 
 fn render_body(
@@ -1193,6 +1266,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("alpha-before".to_owned()),
                     occurrence_sequence: 4,
                     pending_transition: None,
@@ -1203,6 +1277,7 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
+                    containment_root: None,
                     digest: Some("beta-before".to_owned()),
                     occurrence_sequence: 9,
                     dirty: true,
@@ -1219,6 +1294,7 @@ mod tests {
                     label: "goal".to_owned(),
                     path: shared.clone(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                 }],
             },
             AgentWatchSet {
@@ -1229,6 +1305,7 @@ mod tests {
                     label: "spec".to_owned(),
                     path: shared.clone(),
                     class: CarrierClass::Coalesced,
+                    containment_root: None,
                 }],
             },
         ];
@@ -1416,7 +1493,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
-                    digest: read_digest(&old_path),
+                    digest: read_digest(&old_path, None),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
@@ -1464,7 +1541,7 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Immediate,
-                    digest: read_digest(&carrier),
+                    digest: read_digest(&carrier, None),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -1644,7 +1721,7 @@ mod tests {
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "before").unwrap();
-        let baseline = read_digest(&carrier);
+        let baseline = read_digest(&carrier, None);
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -1753,7 +1830,7 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and points into the live temp directory.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        assert_eq!(read_digest(&fifo), None);
+        assert_eq!(read_digest(&fifo, None), None);
     }
 
     #[test]
@@ -1761,7 +1838,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "same bytes").unwrap();
-        let digest = read_digest(&carrier);
+        let digest = read_digest(&carrier, None);
         let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
             .into_iter()
             .map(|class| Entry {
@@ -1769,6 +1846,7 @@ mod tests {
                 seat_id: None,
                 label: format!("{class:?}"),
                 class,
+                containment_root: None,
                 digest: digest.clone(),
                 occurrence_sequence: 0,
                 pending_transition: None,
@@ -1790,6 +1868,35 @@ mod tests {
         let entries = worker.carriers.values().next().unwrap();
         assert!(!entries[0].dirty);
         assert!(entries[1].dirty, "coalesced subscriber must wait for its own deadline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_read_refuses_a_symlink_created_after_resolution() {
+        let agent_dir = tempfile::tempdir().expect("agent directory");
+        let resources = agent_dir.path().join("resources");
+        std::fs::create_dir(&resources).expect("resources directory");
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "inside").expect("inside carrier");
+        assert!(
+            read_digest(&carrier, Some(agent_dir.path())).is_some(),
+            "ordinary files beneath the admitted root remain readable"
+        );
+
+        std::fs::remove_file(&carrier).expect("remove inside carrier");
+        let outside = tempfile::NamedTempFile::new().expect("outside carrier");
+        std::fs::write(outside.path(), "external").expect("outside bytes");
+        std::os::unix::fs::symlink(outside.path(), &carrier)
+            .expect("replace absent carrier with an external symlink");
+        assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
+
+        std::fs::remove_file(&carrier).expect("remove final symlink");
+        std::fs::remove_dir(&resources).expect("remove resources directory");
+        let outside_dir = tempfile::tempdir().expect("outside directory");
+        std::fs::write(outside_dir.path().join("goal.md"), "external").expect("outside carrier");
+        std::os::unix::fs::symlink(outside_dir.path(), &resources)
+            .expect("replace absent ancestor with an external symlink");
+        assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
     }
 
     #[test]
@@ -2038,6 +2145,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("old-digest".to_owned()),
                     occurrence_sequence: 0,
                     pending_transition: None,
