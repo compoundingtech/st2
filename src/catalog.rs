@@ -116,6 +116,9 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
 }
 
 fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
+    if node.entries().len() != 1 {
+        anyhow::bail!("profile takes exactly one quoted URI scheme and no properties");
+    }
     let scheme = node
         .get(0)
         .and_then(|v| v.as_string())
@@ -341,6 +344,8 @@ mod tests {
             r#"profile { wasm "x.wasm" }"#,
             r#"profile "dev.x" { class "immediate" }"#,
             r#"profile "dev.x""#,
+            r#"profile "dev.x" "extra" { wasm "x.wasm" }"#,
+            r#"profile "dev.x" class="silent" { wasm "x.wasm" }"#,
             // invalid class value and duplicate fields
             r#"profile "dev.x" { wasm "x.wasm" class "goal" }"#,
             r#"profile "dev.x" { wasm "a.wasm" wasm "b.wasm" }"#,

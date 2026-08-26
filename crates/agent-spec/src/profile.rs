@@ -103,10 +103,12 @@ impl ResourceProfile {
     }
 }
 
-/// One successful resolution through a profile: the local denotation and the declared class.
+/// One successful resolution through a profile: the local denotation, the host confinement root
+/// that every later read must honor, and the declared class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
     pub path: PathBuf,
+    pub containment_root: PathBuf,
     pub class: ProfileClass,
 }
 
@@ -219,11 +221,12 @@ impl ResourceProfileRegistry {
         #[cfg(feature = "wasm-resolver")]
         {
             let resolver = self.compiled(module)?;
-            let path = resolver
+            let contained = resolver
                 .resolve_contained(uri, agent_dir)
                 .map_err(|e| e.to_string())?;
             Ok(Some(Resolution {
-                path,
+                path: contained.path,
+                containment_root: contained.root,
                 class: *class,
             }))
         }
@@ -291,6 +294,7 @@ mod tests {
             Some(Resolution {
                 path: PathBuf::from("/cat/agents/dev3/janitor/resources/goal.md"),
                 class: ProfileClass::Immediate,
+                containment_root: PathBuf::from("/cat/agents/dev3/janitor"),
             })
         );
     }
