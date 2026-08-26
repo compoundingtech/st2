@@ -11,6 +11,25 @@ kdl = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+# Wasm resource-profile resolvers (`profile_wasm`). Optional: the default build carries no
+# wasmtime; `wasm-resolver` opts in to sandboxed scheme resolution.
+wasmtime = { version = "48.0.1", optional = true, default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+    "wat",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+wasm-resolver = ["dep:wasmtime"]
+
+[[example]]
+name = "wasm_bench"
+required-features = ["wasm-resolver"]
+
+[[test]]
+name = "profile_wasm"
+required-features = ["wasm-resolver"]

@@ -32,6 +32,9 @@ pub mod declared;
 pub mod discovery;
 mod kdl_format;
 pub mod spec;
+pub mod profile;
+#[cfg(feature = "wasm-resolver")]
+pub mod profile_wasm;
 
 pub use declared::{
     DeclaredAgent, DeclaredDiagnostic, DeclaredDiagnosticCode, DeclaredDocument, DeclaredEntry,
@@ -48,3 +51,4 @@ pub use spec::{
     StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration, stream_name_of_task,
     validate_desired_state_reason,
 };
+pub use profile::{ProfileClass, ProfileSource, ResourceProfile, ResourceProfileRegistry};
