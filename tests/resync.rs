@@ -275,7 +275,12 @@ fn declared_wasm_profile_resolves_a_scheme_uri_goal_binding_and_fires_on_change(
     );
     assert!(
         supervisor
-            .refresh(&st2::discover_strict(catalog.path()).specs, "hetz")
+            .refresh(
+                &st2::discover_strict(catalog.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -308,7 +313,12 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     );
     assert!(
         supervisor
-            .refresh(&st2::discover_strict(silent.path()).specs, "hetz")
+            .refresh(
+                &st2::discover_strict(silent.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
