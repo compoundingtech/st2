@@ -328,7 +328,10 @@ impl Worker {
         // Diff paths that were blind before registering newly recovered parents; otherwise the
         // new watch suppresses polling of mutations that happened during the blind interval.
         self.poll_unwatched();
-        self.refresh_watches();
+        let registered = self.refresh_watches();
+        // Registration closes the event gap first; this second digest pass covers writes between
+        // the pre-registration poll and watch installation.
+        self.poll_registered(&registered);
     }
 
     /// Digest-diff every entry in `next`, emitting observed transitions. Seeding stays silent
@@ -377,7 +380,22 @@ impl Worker {
             .cloned()
             .collect();
         for path in unwatched {
-            self.flush_path(&path);
+            self.flush_path(&path, None);
+        }
+    }
+
+    fn poll_registered(&mut self, directories: &[PathBuf]) {
+        let paths: Vec<PathBuf> = self
+            .carriers
+            .keys()
+            .filter(|path| {
+                path.parent()
+                    .is_some_and(|parent| directories.iter().any(|dir| dir == parent))
+            })
+            .cloned()
+            .collect();
+        for path in paths {
+            self.flush_path(&path, None);
         }
     }
 
@@ -385,7 +403,8 @@ impl Worker {
     /// dropping directories that left the set or were replaced (identity change). A replaced watch
     /// stays blind until the next pass rebuilds it — bounded by the reconcile interval, the same
     /// tradeoff `CatalogDeclarationWatcher` accepts for declarations.
-    fn refresh_watches(&mut self) {
+    fn refresh_watches(&mut self) -> Vec<PathBuf> {
+        let mut registered = Vec::new();
         let mut desired: Vec<PathBuf> = Vec::new();
         for path in self.carriers.keys() {
             if let Some(parent) = path.parent() {
@@ -418,9 +437,11 @@ impl Worker {
                 .watch(&dir, notify::RecursiveMode::NonRecursive)
                 .is_ok()
             {
+                registered.push(dir.clone());
                 self.watched.insert(dir, identity);
             }
         }
+        registered
     }
 
     fn mark_mutated(&mut self, paths: Vec<PathBuf>) {
@@ -459,7 +480,8 @@ impl Worker {
             drop(dirty_here);
         }
         if extend {
-            self.refresh_watches();
+            let registered = self.refresh_watches();
+            self.poll_registered(&registered);
         }
     }
 
@@ -483,19 +505,23 @@ impl Worker {
                 .map(|(path, _)| path.clone())
                 .collect();
             for path in targets {
-                self.flush_path(&path);
+                self.flush_path(&path, Some(class));
             }
         }
     }
 
-    /// Flush every subscriber of one path: diff digests, emit transitions, and retain failed
-    /// publications for retry with the same event identity.
-    fn flush_path(&mut self, path: &Path) {
+    /// Flush subscribers of one path whose class is due, or every subscriber for fallback polls:
+    /// diff digests, emit transitions, and retain failed publications for retry with the same
+    /// event identity.
+    fn flush_path(&mut self, path: &Path, due_class: Option<CarrierClass>) {
         let Some(entries) = self.carriers.get_mut(path) else {
             return;
         };
         let mut retries = Vec::new();
         for entry in entries.iter_mut() {
+            if due_class.is_some_and(|class| entry.class != class) {
+                continue;
+            }
             entry.dirty = false;
             let Some(new_digest) = read_digest(path) else {
                 // Unreadable right now (deleted mid-window): stay quiet and keep the previous
@@ -573,8 +599,34 @@ fn emit_resync(
 }
 
 fn read_digest(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_regular(path)?;
     Some(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+#[cfg(unix)]
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    if !std::fs::metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+    std::fs::read(path).ok()
 }
 
 fn render_body(label: &str, path: &Path, old: Option<&str>, new: &str) -> String {
@@ -694,6 +746,51 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn digesting_a_fifo_fails_without_blocking_the_worker() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("carrier.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and points into the live temp directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_digest(&fifo), None);
+    }
+
+    #[test]
+    fn due_flush_only_clears_subscribers_of_the_due_class() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        std::fs::write(&carrier, "same bytes").unwrap();
+        let digest = read_digest(&carrier);
+        let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
+            .into_iter()
+            .map(|class| Entry {
+                bus_id: "host.worker".to_owned(),
+                label: format!("{class:?}"),
+                class,
+                digest: digest.clone(),
+                dirty: true,
+            })
+            .collect();
+        let now = Instant::now();
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(carrier, entries)]),
+            deadlines: BTreeMap::from([(CarrierClass::Immediate, now)]),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+
+        worker.flush_due(now);
+        let entries = worker.carriers.values().next().unwrap();
+        assert!(!entries[0].dirty);
+        assert!(entries[1].dirty, "coalesced subscriber must wait for its own deadline");
+    }
+
     #[test]
     fn failed_emit_retains_digest_and_schedules_the_same_transition_for_retry() {
         let root = tempfile::tempdir().unwrap();
@@ -717,7 +814,7 @@ mod tests {
             watcher: None,
         };
 
-        worker.flush_path(&carrier);
+        worker.flush_path(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.digest.as_deref(), Some("old-digest"));
         assert!(entry.dirty);
