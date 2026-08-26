@@ -25,8 +25,6 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use opentelemetry::trace::Span as _;
-use opentelemetry::trace::Tracer as _;
 use serde::{Deserialize, Serialize};
 
 use crate::exec_backend::ExecBackend;
@@ -1725,11 +1723,7 @@ fn gate_harness_launches_on_hooks<'a, V>(
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    let tracer = opentelemetry::global::tracer("st2");
-    let mut span = tracer
-        .span_builder("st2.reconcile_pass")
-        .with_attributes(vec![opentelemetry::KeyValue::new("st2.host", this_host.to_string())])
-        .start(&tracer);
+    let pass_span = crate::telemetry::PassSpan::start(this_host);
     let report = reconcile_pass(
         root,
         this_host,
@@ -1739,7 +1733,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
         &mut debounce,
         &mut PresentationPatchCursor::default(),
     );
-    span.end();
+    pass_span.finish(report.crash_loops.len(), report.unparked.len());
     Ok(report)
 }
 
@@ -1868,6 +1862,7 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
+    let pass_span = crate::telemetry::PassSpan::start(this_host);
     let _catalog_lock = crate::CatalogLock::shared(catalog_root)
         .context("acquire shared catalog-authoring lock for selected reconcile")?;
     let found = crate::discovery::discover(catalog_root);
@@ -1914,6 +1909,7 @@ pub fn up_once_selected(
         || Ok(()),
     )?;
     report.absorb(execution);
+    pass_span.finish(report.crash_loops.len(), report.unparked.len());
     Ok(report)
 }
 
@@ -2225,13 +2221,7 @@ fn up_loop_until(
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
         let mut report = {
-            let tracer = opentelemetry::global::tracer("st2");
-            let mut span = tracer
-                .span_builder("st2.reconcile_pass")
-                .with_attributes(vec![
-                    opentelemetry::KeyValue::new("st2.host", this_host.to_string()),
-                ])
-                .start(&tracer);
+            let pass_span = crate::telemetry::PassSpan::start(this_host);
             let pass = reconcile_pass(
                 root,
                 this_host,
@@ -2241,15 +2231,7 @@ fn up_loop_until(
                 &mut debounce,
                 &mut presentation_cursor,
             );
-            span.set_attribute(opentelemetry::KeyValue::new(
-                "st2.crash_loops",
-                i64::try_from(pass.crash_loops.len()).unwrap_or(i64::MAX),
-            ));
-            span.set_attribute(opentelemetry::KeyValue::new(
-                "st2.unparked",
-                i64::try_from(pass.unparked.len()).unwrap_or(i64::MAX),
-            ));
-            span.end();
+            pass_span.finish(pass.crash_loops.len(), pass.unparked.len());
             pass
         };
         pre.absorb(report);

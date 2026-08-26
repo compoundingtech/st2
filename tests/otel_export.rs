@@ -12,12 +12,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Spawn `otelite capture`, wait for its endpoints banner.
-/// Returns (child, its stdout — keep until after `wait()` so otelite's final
-/// writes don't hit a broken pipe, http endpoint).
-fn spawn_capture(
-    otelite: &Path,
-    out_dir: &Path,
-) -> (std::process::Child, std::process::ChildStdout, String) {
+/// Returns (child, http endpoint). The child's stdout pipe stays open until otelite exits:
+/// a detached reader thread owns it until EOF, so otelite's shutdown writes never hit a
+/// broken pipe even though this function returns before the child terminates.
+fn spawn_capture(otelite: &Path, out_dir: &Path) -> (std::process::Child, String) {
     let mut child = Command::new(otelite)
         .args(["capture", "--out"])
         .arg(out_dir)
@@ -29,26 +27,46 @@ fn spawn_capture(
         .expect("failed to spawn otelite capture");
 
     // The endpoints banner is one JSON line: {"grpc":..., "http":..., "out":..., "schema":...}.
-    let mut stdout = child.stdout.take().unwrap();
-    let mut banner = String::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "otelite capture did not print its endpoints banner"
-        );
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        // A plain blocking `stdout.read()` ignores any deadline — if otelite stalls mid-read
+        // the test would hang until the workflow timeout. Ship bytes over a channel instead
+        // so the main thread can enforce the timeout with recv_timeout and fail fast.
+        let mut stdout = stdout;
         let mut chunk = [0u8; 512];
-        let n = stdout.read(&mut chunk).expect("read otelite stdout");
-        if n > 0 {
-            banner.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    const BANNER_TIMEOUT: Duration = Duration::from_secs(10);
+    let started = Instant::now();
+    let mut banner = String::new();
+    loop {
+        let Some(remaining) = BANNER_TIMEOUT.checked_sub(started.elapsed()) else {
+            panic!("otelite capture did not print its endpoints banner within 10s: {banner}");
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(bytes) => banner.push_str(&String::from_utf8_lossy(&bytes)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("otelite capture did not print its endpoints banner within 10s: {banner}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("otelite capture exited before serving: {banner}");
+            }
         }
         if let Some(line) = banner.lines().find(|l| l.contains("otelite.endpoints")) {
             let v: serde_json::Value = serde_json::from_str(line).expect("endpoints banner JSON");
             let http = v["http"].as_str().expect("http endpoint").to_string();
-            return (child, stdout, http);
-        }
-        if n == 0 {
-            panic!("otelite capture exited before serving: {banner}");
+            return (child, http);
         }
     }
 }
@@ -71,7 +89,7 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     let empty_catalog = tmp.path().join("catalog");
     std::fs::create_dir_all(&empty_catalog).unwrap();
 
-    let (mut capture, capture_stdout, endpoint) = spawn_capture(&otelite, &cap_dir);
+    let (mut capture, endpoint) = spawn_capture(&otelite, &cap_dir);
 
     let path = format!(
         "{}:{}",
@@ -90,11 +108,11 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // stdin EOF (or SIGTERM) stops the receiver and flushes captured signals to disk.
+    // stdin EOF stops the receiver and flushes captured signals to disk. The detached reader
+    // thread keeps otelite's stdout pipe open until process exit, so its shutdown writes
+    // never hit a broken pipe.
     let _ = capture.stdin.take();
     let _ = capture.wait();
-    // Only now close otelite's stdout: its shutdown writes must not hit a broken pipe.
-    drop(capture_stdout);
 
     let traces =
         std::fs::read_to_string(cap_dir.join("traces.ndjson")).expect("traces.ndjson written");
