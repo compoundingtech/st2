@@ -33,10 +33,9 @@ root [`R05`](../requirements.md); Resource bindings are defined by
   it runs inside the owner host's existing trust domain (root `A02`). No new
   authentication surface exists.
 - **RESYNC-A03 Equal bytes mean equal state:** For an on-disk carrier,
-  content equality is state equality. This is why the producer-supplied
-  event identity can be derived from content, where the same derivation was
-  rejected for world events (`04-stream` dedup evidence): replay and repeat
-  collapse into the same fact.
+  content equality is state equality, so an equal-byte rewrite is suppressed
+  before event capture. Distinct observed transitions remain distinct
+  occurrences even when they repeat the same old/new byte states.
 
 ## Acceptable Tradeoffs
 
@@ -88,14 +87,19 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 
 ### Must emit honest, deduplicated events
 
-- **RESYNC-R06 Event shape:** One carrier change becomes one stream event on
-  the built-in `resync` stream: subject `resource <binding> changed`, body
-  naming the binding label, resolved path, and old and new content digests.
-  The event identity is the SHA-256 of that canonical rendered transition
-  body, so changing any binding, path, old digest, or new digest changes the
-  identity while replaying the same body is stable. The grouping key is the
-  binding label; every emit declares supersession so a binding collapses to
-  one unread head.
+- **RESYNC-R06 Event shape and occurrence identity:** One carrier change
+  becomes one stream event on the built-in `resync` stream: subject
+  `resource <binding> changed`, body naming the binding label, resolved path,
+  old and new content digests, and an occurrence token. The token combines
+  the current supervisor incarnation — catalog-lock device/inode plus
+  supervisor PID/start-time ticks — with a sequence retained independently by
+  each subscription. A subscription advances its sequence only when it
+  captures a new immutable transition; a failed publication retries the same
+  body, token, and identity. The event identity is the SHA-256 of that
+  canonical rendered body. Thus replay is stable, while A→B, B→A, A→B gives
+  the repeated A→B legs distinct identities. The grouping key is the binding
+  label; every emit declares supersession so a binding collapses to one unread
+  head.
 - **RESYNC-R07 Built-in stream:** The `resync` stream exists on every agent
   without declaration and is reserved: a user-declared stream of that name is
   refused. Publication reuses the implemented ingress unchanged — ring

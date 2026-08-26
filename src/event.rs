@@ -94,6 +94,41 @@ struct ResolvedStream {
     recipient: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamOwnerIncarnation {
+    catalog_lock_device: u64,
+    catalog_lock_inode: u64,
+    supervisor_pid: u32,
+    supervisor_start_time_ticks: u64,
+}
+
+impl StreamOwnerIncarnation {
+    pub(crate) fn occurrence_token(self, sequence: u64) -> String {
+        format!(
+            "v1:{}:{}:{}:{}:{sequence}",
+            self.catalog_lock_device,
+            self.catalog_lock_inode,
+            self.supervisor_pid,
+            self.supervisor_start_time_ticks
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        catalog_lock_device: u64,
+        catalog_lock_inode: u64,
+        supervisor_pid: u32,
+        supervisor_start_time_ticks: u64,
+    ) -> Self {
+        Self {
+            catalog_lock_device,
+            catalog_lock_inode,
+            supervisor_pid,
+            supervisor_start_time_ticks,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamOwnerBinding {
@@ -103,6 +138,17 @@ struct StreamOwnerBinding {
     catalog_lock_inode: u64,
     supervisor_pid: u32,
     supervisor_start_time_ticks: u64,
+}
+
+impl StreamOwnerBinding {
+    fn incarnation(&self) -> StreamOwnerIncarnation {
+        StreamOwnerIncarnation {
+            catalog_lock_device: self.catalog_lock_device,
+            catalog_lock_inode: self.catalog_lock_inode,
+            supervisor_pid: self.supervisor_pid,
+            supervisor_start_time_ticks: self.supervisor_start_time_ticks,
+        }
+    }
 }
 
 pub(crate) fn publish_owner_binding(root: &Path, host: &str) -> anyhow::Result<()> {
@@ -151,11 +197,11 @@ pub fn publish_owner_binding_for_test(root: &Path, host: &str) -> anyhow::Result
     publish_owner_binding(root, host)
 }
 
-fn validate_owner_binding(
+fn read_valid_owner_binding(
     root: &Path,
     host: &str,
     lock: &crate::CatalogLock,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StreamOwnerBinding> {
     let path = crate::park::SupervisorScope::current(root, host)?.stream_owner_binding_path();
     let binding: StreamOwnerBinding = serde_json::from_slice(
         &fs::read(&path)
@@ -175,7 +221,23 @@ fn validate_owner_binding(
                 == Some(binding.supervisor_start_time_ticks),
         "stream owner binding for host '{host}' is stale"
     );
-    Ok(())
+    Ok(binding)
+}
+
+pub(crate) fn current_stream_owner_incarnation(
+    root: &Path,
+    host: &str,
+) -> anyhow::Result<StreamOwnerIncarnation> {
+    let lock = crate::CatalogLock::shared(root)?;
+    Ok(read_valid_owner_binding(root, host, &lock)?.incarnation())
+}
+
+fn validate_owner_binding(
+    root: &Path,
+    host: &str,
+    lock: &crate::CatalogLock,
+) -> anyhow::Result<()> {
+    read_valid_owner_binding(root, host, lock).map(|_| ())
 }
 
 fn resolve_stream(

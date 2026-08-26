@@ -788,10 +788,47 @@ fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
             return validate_absolute_uri(uri);
         }
     }
-    if uri.is_empty() || uri.starts_with('/') || uri.contains("..") {
-        return Err("catalog-relative uri must be a non-empty relative path without `..`");
+    if uri.is_empty() {
+        return Err("catalog-relative uri must be a non-empty relative path");
+    }
+    let decoded = percent_decode_path(uri)?;
+    if decoded.starts_with(b"/") || decoded.split(|byte| *byte == b'/').any(|part| part == b"..") {
+        return Err(
+            "catalog-relative uri must be a relative path without parent (`..`) components",
+        );
     }
     Ok(())
+}
+
+fn percent_decode_path(uri: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes = uri.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] != b'%' {
+            decoded.push(bytes[offset]);
+            offset += 1;
+            continue;
+        }
+        let Some(high) = bytes.get(offset + 1).and_then(|byte| hex_digit(*byte)) else {
+            return Err("catalog-relative uri contains an invalid percent escape");
+        };
+        let Some(low) = bytes.get(offset + 2).and_then(|byte| hex_digit(*byte)) else {
+            return Err("catalog-relative uri contains an invalid percent escape");
+        };
+        decoded.push((high << 4) | low);
+        offset += 3;
+    }
+    Ok(decoded)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
@@ -1388,6 +1425,29 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30)); // bare = seconds
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn catalog_relative_uris_reject_only_parent_components_after_percent_decoding() {
+        for uri in [
+            "report..md",
+            "reports/.../goal.md",
+            "reports/%2Ereport.md",
+            "reports/child..name/goal.md",
+        ] {
+            assert_eq!(validate_resource_uri(uri), Ok(()), "{uri}");
+        }
+
+        for uri in [
+            "..",
+            "../goal.md",
+            "reports/../goal.md",
+            "%2e%2e/goal.md",
+            "reports/%2E%2e/goal.md",
+            "reports%2f..%2fgoal.md",
+        ] {
+            assert!(validate_resource_uri(uri).is_err(), "{uri}");
+        }
     }
 
     #[test]

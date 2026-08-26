@@ -21,7 +21,7 @@ resync watcher thread
    |
    v  window boundary
 st2::event::emit(bus_id, stream="resync",
-                 event-id=<sha256(canonical rendered binding/path/old/new body)>,
+                 event-id=<sha256(canonical binding/path/old/new/occurrence body)>,
                  key=<binding label>, --supersede,
                  subject="resource <binding> changed")
    |
@@ -77,8 +77,9 @@ changed carrier gets its own event so per-binding supersession stays meaningful.
   and pending transition; it drops as soon as that seat is not live. Existing
   valid subscriptions are matched by declaration path and binding label. Each
   refresh takes bus id, canonical seat id, carrier path, label, and class from
-  the current declaration while retaining only digest, pending digest, and
-  dirty state; only new subscriptions seed silently.
+  the current declaration while retaining digest, the per-subscription
+  occurrence sequence, any immutable pending transition, and dirty state; only
+  new subscriptions seed silently with sequence zero.
 - A previously blind path is digest-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
 - Installation failure degrades to timer-based digest polling over the watch
@@ -105,12 +106,18 @@ grammar (1..=200 bytes, no surrounding whitespace or controls), and
 `declaration` is reserved for the synthetic declaration carrier so supersession
 keys cannot collide.
 
-Digest state lives with the supervisor process (seeded at start) and advances
-only after the unchanged ingress returns a successful receipt. Failed
-publication retains the old digest, exact target digest, and dirty state; it
-replays that immutable transition before observing a newer carrier digest, so a
-durable pending reservation can always complete. The durable dedup horizon
-remains the stream receipt ring.
+Digest and occurrence-sequence state live with the supervisor process (seeded
+at start) and have no durable store, consistent with RESYNC-T03. A captured
+transition gets an occurrence token
+`v1:<catalog-lock-dev>:<catalog-lock-inode>:<supervisor-pid>:<supervisor-start-time-ticks>:<subscription-sequence>`
+in its canonical body before that body is hashed for the event ID. Each
+subscription advances its sequence only when capturing a new immutable
+transition. Failed publication retains the old digest, exact target digest,
+canonical body, occurrence token, and event ID; retry replays those bytes
+before observing a newer carrier digest. Repeated A→B legs therefore remain
+distinct occurrences, while a retry remains the same reservation. A supervisor
+restart changes the incarnation namespace and silently seeds new subscription
+sequences. The durable dedup horizon remains the stream receipt ring.
 
 ## What this does not do
 
