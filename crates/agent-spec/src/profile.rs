@@ -18,7 +18,13 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "wasm-resolver")]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+#[cfg(feature = "wasm-resolver")]
+use parking_lot::Mutex;
+
+#[cfg(feature = "wasm-resolver")]
+use sha2::{Digest as _, Sha256};
 
 /// Scheme of the standing-seat goal carrier: `dev.schickling.agent-goal://<host>/<identity>`.
 /// The authority names a logical host and identity; a resolver module decides what the URI
@@ -70,8 +76,8 @@ pub struct ResourceProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileSource {
     /// A wasm module implementing the `resolve` protocol (see [`crate::profile_wasm`] for the
-    /// ABI), plus the notification class every carrier it resolves carries. The compiled module
-    /// is cached per path; instances are still per-resolution.
+    /// ABI), plus the notification class every carrier it resolves carries. Compilation results
+    /// (success or failure) are cached by path and file identity; instances remain per-resolution.
     Wasm { module: PathBuf, class: ProfileClass },
 }
 
@@ -115,14 +121,138 @@ pub struct Resolution {
     pub class: ProfileClass,
 }
 
+#[cfg(feature = "wasm-resolver")]
+const WASM_CACHE_CAPACITY: usize = 32;
+
+#[cfg(feature = "wasm-resolver")]
+#[derive(Clone, PartialEq, Eq)]
+struct ModuleIdentity {
+    digest: [u8; 32],
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    readonly: bool,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+#[cfg(feature = "wasm-resolver")]
+impl ModuleIdentity {
+    fn of(snapshot: &crate::profile_wasm::ModuleSnapshot) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = &snapshot.metadata;
+        Self {
+            digest: Sha256::digest(&snapshot.bytes).into(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+            #[cfg(unix)]
+            uid: metadata.uid(),
+            #[cfg(unix)]
+            gid: metadata.gid(),
+            #[cfg(unix)]
+            ctime: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(feature = "wasm-resolver")]
+#[derive(Clone)]
+struct CachedModule {
+    identity: ModuleIdentity,
+    result: Result<Arc<crate::profile_wasm::WasmResolver>, String>,
+    last_used: u64,
+}
+
+#[cfg(feature = "wasm-resolver")]
+#[derive(Default)]
+struct WasmCache {
+    modules: HashMap<PathBuf, CachedModule>,
+    clock: u64,
+    #[cfg(test)]
+    compile_attempts: u64,
+}
+
+#[cfg(feature = "wasm-resolver")]
+impl WasmCache {
+    fn next_clock(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(
+        &mut self,
+        path: &Path,
+        identity: &ModuleIdentity,
+    ) -> Option<Result<Arc<crate::profile_wasm::WasmResolver>, String>> {
+        let now = self.next_clock();
+        let cached = self.modules.get_mut(path)?;
+        if cached.identity != *identity {
+            return None;
+        }
+        cached.last_used = now;
+        Some(cached.result.clone())
+    }
+
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        identity: ModuleIdentity,
+        result: Result<Arc<crate::profile_wasm::WasmResolver>, String>,
+    ) {
+        if !self.modules.contains_key(&path) && self.modules.len() >= WASM_CACHE_CAPACITY {
+            if let Some(oldest) = self
+                .modules
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(path, _)| path.clone())
+            {
+                self.modules.remove(&oldest);
+            }
+        }
+        let last_used = self.next_clock();
+        self.modules.insert(
+            path,
+            CachedModule {
+                identity,
+                result,
+                last_used,
+            },
+        );
+    }
+}
+
 /// Scheme -> resolver registry. Lookup is exact-scheme; unregistered schemes stay opaque.
 #[derive(Clone)]
 pub struct ResourceProfileRegistry {
     profiles: BTreeMap<String, ResourceProfile>,
-    /// Compiled wasm modules keyed by their path. Shared across clones so repeated resolution
-    /// does not recompile; instances remain per-resolution for state isolation.
+    /// Bounded compiled-module outcomes keyed by path and file identity. Shared across clones so
+    /// repeated and concurrent resolution coalesces successful and failed compilation attempts.
     #[cfg(feature = "wasm-resolver")]
-    wasm_cache: Arc<Mutex<HashMap<PathBuf, Arc<crate::profile_wasm::WasmResolver>>>>,
+    wasm_cache: Arc<Mutex<WasmCache>>,
 }
 
 impl PartialEq for ResourceProfileRegistry {
@@ -133,13 +263,13 @@ impl PartialEq for ResourceProfileRegistry {
 
 impl std::fmt::Debug for ResourceProfileRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Compiled wasm resolvers hold a wasmtime engine; summarize instead of deriving.
+        // Compiled resolvers and cached compile failures are summarized instead of derived.
         #[cfg(feature = "wasm-resolver")]
-        let modules = self.wasm_cache.lock().map(|c| c.len()).unwrap_or(0);
+        let modules = self.wasm_cache.lock().modules.len();
         let mut out = f.debug_struct("ResourceProfileRegistry");
         out.field("profiles", &self.profiles);
         #[cfg(feature = "wasm-resolver")]
-        out.field("wasm_modules", &modules);
+        out.field("wasm_cache_entries", &modules);
         out.finish()
     }
 }
@@ -162,7 +292,7 @@ impl ResourceProfileRegistry {
         Self {
             profiles: BTreeMap::new(),
             #[cfg(feature = "wasm-resolver")]
-            wasm_cache: Arc::new(Mutex::new(HashMap::new())),
+            wasm_cache: Arc::new(Mutex::new(WasmCache::default())),
         }
     }
 
@@ -240,15 +370,27 @@ impl ResourceProfileRegistry {
         &self,
         module_path: &Path,
     ) -> Result<Arc<crate::profile_wasm::WasmResolver>, String> {
-        let mut cache = self.wasm_cache.lock().expect("wasm cache mutex");
-        if let Some(resolver) = cache.get(module_path) {
-            return Ok(Arc::clone(resolver));
+        let snapshot = crate::profile_wasm::read_module_snapshot(
+            module_path,
+            crate::profile_wasm::DEFAULT_MODULE_LIMIT_BYTES,
+        )
+        .map_err(|error| error.to_string())?;
+        let identity = ModuleIdentity::of(&snapshot);
+        let mut cache = self.wasm_cache.lock();
+        if let Some(cached) = cache.get(module_path, &identity) {
+            return cached;
         }
-        let resolver = Arc::new(
-            crate::profile_wasm::WasmResolver::load(module_path).map_err(|e| e.to_string())?,
-        );
-        cache.insert(module_path.to_path_buf(), Arc::clone(&resolver));
-        Ok(resolver)
+        #[cfg(test)]
+        {
+            cache.compile_attempts += 1;
+        }
+        // Compilation stays under the cache mutex: clones and concurrent subscribers coalesce
+        // the same identity into one attempt, including one cached failure.
+        let result = crate::profile_wasm::WasmResolver::from_bytes(&snapshot.bytes)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        cache.insert(module_path.to_path_buf(), identity, result.clone());
+        result
     }
 }
 
@@ -342,7 +484,8 @@ mod tests {
     #[test]
     #[cfg(feature = "wasm-resolver")]
     fn broken_module_fails_contained_with_the_reason_surfaced() {
-        let broken = std::env::temp_dir().join("st2-profile-broken-not-wasm.wasm");
+        let temp = tempfile::tempdir().unwrap();
+        let broken = temp.path().join("broken.wasm");
         std::fs::write(&broken, b"this is not a wasm module").unwrap();
         let registry = ResourceProfileRegistry::empty()
             .with_profile(ResourceProfile::wasm("doomed", &broken, ProfileClass::Immediate));
@@ -351,5 +494,122 @@ mod tests {
         assert!(reason.contains("instantiation failed"), "{reason}");
         // Unregistered schemes are `Ok(None)` even in a registry that also holds failures.
         assert_eq!(registry.try_resolve(Path::new("/a"), "other://x").unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "wasm-resolver")]
+    fn failed_compilation_is_coalesced_and_invalidated_by_file_identity() {
+        const URI: &str = "dev.schickling.agent-goal://host/agent";
+        let temp = tempfile::tempdir().unwrap();
+        let module = temp.path().join("resolver.wasm");
+        std::fs::write(&module, b"this is not a wasm module").unwrap();
+        let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+            AGENT_GOAL_SCHEME,
+            &module,
+            ProfileClass::Immediate,
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.try_resolve(Path::new("/agent"), URI)
+                })
+            })
+            .collect::<Vec<_>>();
+        let attempts = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(attempts.iter().all(Result::is_err));
+        {
+            let cache = registry.wasm_cache.lock();
+            assert_eq!(
+                cache.compile_attempts, 1,
+                "concurrent subscribers compile one unchanged bad identity once"
+            );
+            assert_eq!(cache.modules.len(), 1);
+            assert!(cache.modules[&module].result.is_err());
+        }
+        assert!(
+            registry
+                .try_resolve(Path::new("/agent"), URI)
+                .is_err()
+        );
+        assert_eq!(
+            registry.wasm_cache.lock().compile_attempts,
+            1,
+            "later refreshes reuse the cached failure"
+        );
+
+        let original_permissions = std::fs::metadata(&module).unwrap().permissions();
+        let mut changed_permissions = original_permissions.clone();
+        changed_permissions.set_readonly(!original_permissions.readonly());
+        std::fs::set_permissions(&module, changed_permissions).unwrap();
+        assert!(
+            registry
+                .try_resolve(Path::new("/agent"), URI)
+                .is_err()
+        );
+        assert_eq!(
+            registry.wasm_cache.lock().compile_attempts,
+            2,
+            "metadata identity changes invalidate the cached failure"
+        );
+
+        std::fs::set_permissions(&module, original_permissions).unwrap();
+        std::fs::write(
+            &module,
+            include_bytes!("../tests/fixtures/demo_resolver.wasm"),
+        )
+        .unwrap();
+        assert!(
+            registry
+                .try_resolve(Path::new("/agent"), URI)
+                .unwrap()
+                .is_some(),
+            "new module bytes are compiled after replacement"
+        );
+        assert_eq!(registry.wasm_cache.lock().compile_attempts, 3);
+        assert!(
+            registry
+                .try_resolve(Path::new("/agent"), URI)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            registry.wasm_cache.lock().compile_attempts,
+            3,
+            "the successful replacement is cached too"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "wasm-resolver")]
+    fn compiled_module_cache_is_lru_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = ResourceProfileRegistry::empty();
+        for index in 0..WASM_CACHE_CAPACITY + 4 {
+            let scheme = format!("broken{index}");
+            let module = temp.path().join(format!("{scheme}.wasm"));
+            std::fs::write(&module, format!("not wasm {index}")).unwrap();
+            registry = registry.with_profile(ResourceProfile::wasm(
+                &scheme,
+                &module,
+                ProfileClass::Immediate,
+            ));
+        }
+        for index in 0..WASM_CACHE_CAPACITY + 4 {
+            let uri = format!("broken{index}://host/agent");
+            assert!(registry.try_resolve(Path::new("/agent"), &uri).is_err());
+        }
+        let cache = registry.wasm_cache.lock();
+        assert_eq!(cache.modules.len(), WASM_CACHE_CAPACITY);
+        assert_eq!(
+            cache.compile_attempts as usize,
+            WASM_CACHE_CAPACITY + 4
+        );
     }
 }

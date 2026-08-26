@@ -1507,7 +1507,11 @@ mod tests {
         std::fs::write(&goal, "current bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
 
-        let mut current = watch_set_for(&discover(root.path()), "alias");
+        let mut current = watch_set_for(
+            &discover(root.path()),
+            "alias",
+            &ResourceProfileRegistry::empty(),
+        );
         current.seat_id = Some("current-seat".to_owned());
         let old_path = agent_dir.join("resources/old-goal.md");
         let previous = BTreeMap::from([(
@@ -1517,6 +1521,7 @@ mod tests {
                 seat_id: Some("stale-seat".to_owned()),
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
+                containment_root: None,
                 digest: Some("old-digest".to_owned()),
                 occurrence_sequence: 3,
                 pending_transition: None,

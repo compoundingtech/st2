@@ -101,9 +101,20 @@ impl Clone for WasmResolver {
 impl WasmResolver {
     /// Compile a `.wasm` module from disk with default budgets.
     pub fn load(path: &std::path::Path) -> Result<Self, WasmResolveError> {
+        let snapshot = read_module_snapshot(path, DEFAULT_MODULE_LIMIT_BYTES)?;
+        Self::from_bytes(&snapshot.bytes)
+    }
+
+    /// Compile already-bounded module bytes. The profile registry uses this after fingerprinting
+    /// one immutable read so cache identity and compiled code describe the same byte sequence.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, WasmResolveError> {
+        if bytes.len() > DEFAULT_MODULE_LIMIT_BYTES {
+            return Err(WasmResolveError::Instantiation(format!(
+                "resolver module exceeds the {DEFAULT_MODULE_LIMIT_BYTES}-byte limit"
+            )));
+        }
         let engine = engine();
-        let bytes = read_module_bounded(path, DEFAULT_MODULE_LIMIT_BYTES)?;
-        let module = Module::new(&engine, &bytes)
+        let module = Module::new(&engine, bytes)
             .map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
         Ok(Self {
             engine,
@@ -181,10 +192,15 @@ impl WasmResolver {
     }
 }
 
-fn read_module_bounded(
+pub(crate) struct ModuleSnapshot {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) metadata: std::fs::Metadata,
+}
+
+pub(crate) fn read_module_snapshot(
     path: &std::path::Path,
     limit: usize,
-) -> Result<Vec<u8>, WasmResolveError> {
+) -> Result<ModuleSnapshot, WasmResolveError> {
     use std::io::Read as _;
 
     let file = open_module_file(path)?;
@@ -198,7 +214,8 @@ fn read_module_bounded(
         )));
     }
     let mut bytes = Vec::with_capacity(declared_len as usize);
-    file.take(limit as u64 + 1)
+    (&file)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
     if bytes.len() > limit {
@@ -206,7 +223,10 @@ fn read_module_bounded(
             "resolver module exceeds the {limit}-byte limit"
         )));
     }
-    Ok(bytes)
+    let metadata = file
+        .metadata()
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    Ok(ModuleSnapshot { bytes, metadata })
 }
 
 #[cfg(unix)]
