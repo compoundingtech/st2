@@ -1,11 +1,13 @@
-# Resync composition prototype: watch → classify → digest-keyed emit → inbox
+# Resync composition prototype: watch → classify → occurrence-keyed emit → inbox
 
 ## Question
 
 Does the composed mechanism work end to end against the real filesystem and the
-real stream ingress — a carrier change produces exactly one deduplicated,
-superseded inbox event; equal-byte rewrites stay silent; silent-class stores
-never notify; whole-file replacement by rename stays visible?
+real stream ingress — a carrier change produces exactly one superseded inbox
+event; equal-byte rewrites stay silent; repeated digest transitions remain
+distinct occurrences; failed publication retries one immutable occurrence;
+silent-class stores never notify; whole-file replacement by rename stays
+visible?
 
 ## Method
 
@@ -31,6 +33,21 @@ catalog-relative, non-local schemes), classification (goal immediate,
 agent-authored stores excluded), and the built-in-stream carve-out is covered
 by tests 1–2 passing through real `emit`.
 
+Q13 occurrence identity is covered by four focused unit tests in
+`src/resync.rs`:
+
+4. `repeated_identical_transitions_receive_distinct_occurrence_identities` —
+   drives A→B, B→A, A→B through the real event ingress and proves the repeated
+   A→B legs have distinct IDs and subscription sequences 1 and 3.
+5. `failed_emit_retains_digest_and_schedules_the_same_transition_for_retry` —
+   proves a failed retry retains the exact immutable body, event ID, and
+   sequence.
+6. `subscribers_advance_occurrence_sequences_independently` — proves two
+   subscriptions each capture their first transition at sequence 1.
+7. `supervisor_restart_incarnation_changes_the_occurrence_namespace` — proves
+   an incarnation change produces a different body and ID even when the
+   per-subscription sequence and digest transition repeat.
+
 Three design constraints were discovered by running the code, not by reasoning:
 
 - **Directory-creation blind spot.** Writing a file into a newly created
@@ -51,11 +68,9 @@ Three design constraints were discovered by running the code, not by reasoning:
 
 ## Result
 
-All three integration tests pass (4.3 s wall). Unit tests pass
-(`cargo test --lib resync::`). Pre-existing suite: verified against baseline in
-the same run (results recorded in the PR description); the only formatting
-drift (`src/ding/mod.rs`, `src/eval_run.rs`) predates this branch and was left
-untouched.
+The three integration tests and focused resync unit suite pass, including the
+four Q13 occurrence tests. Pre-existing suite results remain recorded in the
+PR description; unrelated formatting drift was left untouched.
 
 ## Conclusion
 
@@ -66,7 +81,8 @@ now pinned by the tests that exposed them.
 ## VRS Impact
 
 Supports [`06-resync/requirements.md`](../../06-resync/requirements.md)
-RESYNC-R01/R03/R04/R06/R07 and [`spec.md`](../../06-resync/spec.md). No
-protected-document change proposed. The catalog-relative resource URI form is
-an st2 extension pending canonical Agent Spec adoption (noted in
+RESYNC-R01/R03/R04/R06/R07 and [`spec.md`](../../06-resync/spec.md). The Q13
+evidence supports the approved RESYNC-R06 occurrence-identity amendment and
+decision record 0008. The catalog-relative resource URI form remains an st2
+extension pending canonical Agent Spec adoption (noted in
 [`02-agent-spec`](../../02-agent-spec/requirements.md) terms).

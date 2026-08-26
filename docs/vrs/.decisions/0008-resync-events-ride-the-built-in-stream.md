@@ -1,4 +1,4 @@
-# Resync events ride the built-in stream with digest identity
+# Resync events ride the built-in stream with occurrence-scoped digest identity
 
 Status: accepted
 
@@ -60,6 +60,30 @@ Equal-content rewrites remain quiet because digest comparison suppresses them
 before emission; old and new digests keep A→B→A legs distinct. The
 `transition_identity_covers_every_rendered_transition_dimension` matrix test
 proves binding, path, old-digest, new-digest, and stable-replay behavior.
+
+## Amendment — 2026-08-26 (Q13)
+
+Johannes approved decision request Q13 to distinguish repeated occurrences of
+the same rendered digest transition. The canonical transition body now also
+contains an occurrence token: the existing stream-owner supervisor incarnation
+`(catalog-lock device/inode, supervisor PID/start-time ticks)` plus a
+per-subscription sequence. The event ID remains SHA-256 of the complete
+canonical body.
+
+The sequence advances only when the subscription captures a new immutable
+transition. A failed emit retains and retries the exact body, token, and event
+ID; metadata refresh carries that reservation and the sequence with the
+subscription. Separate subscriptions advance independently. A supervisor
+restart changes the incarnation namespace and, under the v1 no-catch-up
+tradeoff, silently seeds fresh sequence state rather than adding a durable
+occurrence store.
+
+`repeated_identical_transitions_receive_distinct_occurrence_identities`,
+`failed_emit_retains_digest_and_schedules_the_same_transition_for_retry`,
+`subscribers_advance_occurrence_sequences_independently`, and
+`supervisor_restart_incarnation_changes_the_occurrence_namespace` prove the
+Q13 contract. The composition experiment records these tests as the direct
+evidence.
 
 ## Options
 
