@@ -61,8 +61,9 @@ pub fn config_path(catalog_root: &Path) -> PathBuf {
 /// exactly the split registry this declaration exists to prevent. Its value set is closed, so the
 /// lint cannot fire on a render-only field st2 ignores by design.
 ///
-/// Top-level nodes other than `catalog` and `profile` are left alone: the same file may
-/// legitimately hold `agent` nodes, which discovery owns.
+/// The top-level vocabulary is closed: `catalog` and `profile` belong to this parser, while a
+/// colocated `agent` belongs to discovery. Rejecting every other node keeps misspelled profile
+/// declarations from silently disappearing.
 pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
     let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("KDL parse error: {e}"))?;
     let mut config = CatalogConfig::default();
@@ -109,7 +110,10 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
                 }
                 config.profiles.push(profile);
             }
-            _ => {}
+            "agent" => {}
+            other => anyhow::bail!(
+                "unknown catalog.kdl top-level node '{other}' (expected catalog, profile, or agent)"
+            ),
         }
     }
     Ok(config)
@@ -310,6 +314,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pty_root(tmp.path()), tmp.path().join("pty"));
+    }
+
+    #[test]
+    fn top_level_profile_typos_fail_without_rejecting_colocated_agents() {
+        let error = parse(r#"profiel "dev.x" { wasm "x.wasm" }"#).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown catalog.kdl top-level node 'profiel'"),
+            "{error:#}"
+        );
+
+        let config = parse(
+            r#"
+            agent "live" { command "true" }
+            catalog { pty-root "registry" }
+            profile "dev.x" { wasm "x.wasm" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.pty_root.as_deref(), Some("registry"));
+        assert_eq!(config.profiles.len(), 1);
     }
 
     #[test]

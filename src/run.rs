@@ -1879,12 +1879,28 @@ fn reconcile_pass(
         &mut install_new_live_seat,
     );
     if let Some(resync) = resync {
+        let profiles = crate::catalog::declared_profiles(root)
+            .context("parse resource profiles in catalog.kdl");
+        let catalog_profile_error = profiles.is_err();
         let malformed_declarations = found
             .errors
             .iter()
             .map(|error| error.path.clone())
+            .filter(|path| {
+                // An invalid profile envelope must drop profile-resolved carriers rather than
+                // preserve their stale semantics through malformed-declaration retention.
+                !catalog_profile_error || *path != crate::catalog::config_path(root)
+            })
             .collect::<Vec<_>>();
-        report.warnings.extend(resync.refresh(
+        let profiles = match profiles {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                report.errors.push(format!("{error:#}"));
+                agent_spec::profile::ResourceProfileRegistry::empty()
+            }
+        };
+        report.warnings.extend(resync.refresh_with_profiles(
+            profiles,
             &live_resync_specs(&compiled_specs, this_host, &sessions, &report),
             this_host,
             &sessions,
@@ -2776,10 +2792,9 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
-    // Declared resource profiles flow into the supervisor the same way the declared pty root
-    // flows into spawning: read once per loop from `<catalog>/catalog.kdl`. Unlike pty-root,
-    // a malformed profile block is a hard error — it gates watchability, and silently dropping
-    // one would hide the misconfiguration behind "nothing fires" (`st2 validate` also reports).
+    // Validate the initial profile envelope before starting the resident supervisor. Every
+    // reconcile pass reloads it again and atomically replaces the registry with the watch set;
+    // malformed later edits surface in that pass and install an empty, fail-closed profile set.
     let profiles = crate::catalog::declared_profiles(root)
         .context("parse resource profiles in catalog.kdl")?;
     let resync = crate::resync::ResyncSupervisor::with_profiles(
@@ -3353,6 +3368,139 @@ mod tests {
             "a declaration mutation must wake the supervisor long before the 60s timer"
         );
         assert!(observed.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn resident_loop_reloads_added_changed_removed_and_malformed_profiles() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" {
+  host "test-host"
+  command "true"
+  resource "alpha" uri="alpha://test-host/live" reason="Alpha."
+  resource "beta" uri="beta://test-host/live" reason="Beta."
+}"#,
+        )
+        .unwrap();
+        let missing = catalog.path().join("missing.wasm");
+        let profile = |scheme: &str| {
+            format!(
+                "profile {scheme:?} {{ wasm {:?} }}\n",
+                missing.display().to_string()
+            )
+        };
+        let config = crate::catalog::config_path(catalog.path());
+        let runner = SpawnCountingRunner::default();
+        runner
+            .sessions
+            .borrow_mut()
+            .push(sess("test-host.live.agent", true));
+        let stop = AtomicBool::new(false);
+        let mut reports = Vec::new();
+
+        up_loop_until(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_millis(5),
+            &stop,
+            |_, _| None,
+            |report| {
+                let pass = reports.len();
+                reports.push((report.warnings.clone(), report.errors.clone()));
+                match pass {
+                    0 => std::fs::write(&config, profile("alpha")).unwrap(),
+                    1 => std::fs::write(&config, profile("beta")).unwrap(),
+                    2 => std::fs::write(&config, "").unwrap(),
+                    3 => stop.store(true, Ordering::SeqCst),
+                    _ => unreachable!("profile removal run stops after four passes"),
+                }
+            },
+        )
+        .unwrap();
+
+        let profile_warnings = |reports: &Vec<(Vec<String>, Vec<String>)>, pass: usize| {
+            reports[pass]
+                .0
+                .iter()
+                .filter(|warning| warning.contains("resync profile"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            profile_warnings(&reports, 0).is_empty(),
+            "no profile is initially declared"
+        );
+        assert!(
+            profile_warnings(&reports, 1)
+                .iter()
+                .any(|warning| warning.contains("resource 'alpha'")),
+            "an added profile takes effect: {:?}",
+            reports[1]
+        );
+        assert!(
+            profile_warnings(&reports, 2)
+                .iter()
+                .any(|warning| warning.contains("resource 'beta'"))
+                && !profile_warnings(&reports, 2)
+                    .iter()
+                    .any(|warning| warning.contains("resource 'alpha'")),
+            "changing definitions replaces the registry: {:?}",
+            reports[2]
+        );
+        assert!(
+            profile_warnings(&reports, 3).is_empty(),
+            "removing every profile removes the old resolution semantics: {:?}",
+            reports[3]
+        );
+
+        // A separate resident lifetime starts valid, then makes the envelope malformed. The
+        // initial hard parse still accepts the valid declaration; the later edit must clear its
+        // active semantics rather than silently carrying them forward.
+        std::fs::write(&config, profile("alpha")).unwrap();
+        stop.store(false, Ordering::SeqCst);
+        let mut malformed_reports = Vec::new();
+        up_loop_until(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_millis(5),
+            &stop,
+            |_, _| None,
+            |report| {
+                let pass = malformed_reports.len();
+                malformed_reports.push((report.warnings.clone(), report.errors.clone()));
+                match pass {
+                    0 => std::fs::write(
+                        &config,
+                        r#"profiel "alpha" { wasm "missing.wasm" }"#,
+                    )
+                    .unwrap(),
+                    1 => stop.store(true, Ordering::SeqCst),
+                    _ => unreachable!("malformed profile run stops after two passes"),
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            profile_warnings(&malformed_reports, 0)
+                .iter()
+                .any(|warning| warning.contains("resource 'alpha'")),
+            "the profile is active before the malformed edit: {:?}",
+            malformed_reports[0]
+        );
+        assert!(
+            malformed_reports[1]
+                .1
+                .iter()
+                .any(|error| error.contains("unknown catalog.kdl top-level node 'profiel'"))
+                && profile_warnings(&malformed_reports, 1).is_empty(),
+            "malformed catalog state is reported and fails closed instead of retaining alpha: {:?}",
+            malformed_reports[1]
+        );
     }
 
     #[cfg(target_os = "linux")]

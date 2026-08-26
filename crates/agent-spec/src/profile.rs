@@ -194,6 +194,67 @@ struct WasmCache {
     clock: u64,
     #[cfg(test)]
     compile_attempts: u64,
+    #[cfg(test)]
+    snapshot_attempts: u64,
+}
+
+/// One resolution pass over a registry. Module snapshots, including read and compile failures, are
+/// shared by every binding in the pass; a later pass snapshots each used path again so replacement
+/// invalidation remains observable.
+pub struct ResourceProfileRefresh<'a> {
+    registry: &'a ResourceProfileRegistry,
+    #[cfg(feature = "wasm-resolver")]
+    modules:
+        Mutex<HashMap<PathBuf, Result<Arc<crate::profile_wasm::WasmResolver>, String>>>,
+}
+
+impl ResourceProfileRefresh<'_> {
+    /// Look up a declared profile without resolving it.
+    pub fn get(&self, scheme: &str) -> Option<&ResourceProfile> {
+        self.registry.get(scheme)
+    }
+
+    /// Resolve one binding against the registry definitions captured by this refresh.
+    pub fn try_resolve(&self, agent_dir: &Path, uri: &str) -> Result<Option<Resolution>, String> {
+        let Some((scheme, _)) = uri.split_once(':') else {
+            return Ok(None);
+        };
+        if !is_uri_scheme(scheme) {
+            return Ok(None);
+        }
+        let Some(profile) = self.registry.profiles.get(scheme) else {
+            return Ok(None);
+        };
+        let ProfileSource::Wasm { module, class } = &profile.source;
+
+        #[cfg(not(feature = "wasm-resolver"))]
+        {
+            let _ = (module, class, agent_dir);
+            Err("profile resolver unavailable: st2 was built without the `wasm-resolver` feature"
+                .to_owned())
+        }
+        #[cfg(feature = "wasm-resolver")]
+        {
+            let resolver = {
+                let mut modules = self.modules.lock();
+                if let Some(result) = modules.get(module) {
+                    result.clone()
+                } else {
+                    let result = self.registry.compiled(module);
+                    modules.insert(module.clone(), result.clone());
+                    result
+                }
+            }?;
+            let contained = resolver
+                .resolve_contained(uri, agent_dir)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(Resolution {
+                path: contained.path,
+                containment_root: contained.root,
+                class: *class,
+            }))
+        }
+    }
 }
 
 #[cfg(feature = "wasm-resolver")]
@@ -313,6 +374,21 @@ impl ResourceProfileRegistry {
         self
     }
 
+    /// Replace definitions from another registry while preserving this registry's compiled cache.
+    pub fn replace_definitions(&mut self, registry: Self) {
+        self.profiles = registry.profiles;
+    }
+
+    /// Start one resolution pass. Every unique module path is read and fingerprinted at most once
+    /// in the pass, even when many bindings or schemes share it.
+    pub fn begin_refresh(&self) -> ResourceProfileRefresh<'_> {
+        ResourceProfileRefresh {
+            registry: self,
+            #[cfg(feature = "wasm-resolver")]
+            modules: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn get(&self, scheme: &str) -> Option<&ResourceProfile> {
         self.profiles.get(scheme)
     }
@@ -334,35 +410,7 @@ impl ResourceProfileRegistry {
     /// - `Err(_)` — the scheme IS registered but resolution failed (wasm trap, malformed output,
     ///   or built without the `wasm-resolver` feature).
     pub fn try_resolve(&self, agent_dir: &Path, uri: &str) -> Result<Option<Resolution>, String> {
-        let Some((scheme, _)) = uri.split_once(':') else {
-            return Ok(None);
-        };
-        if !is_uri_scheme(scheme) {
-            return Ok(None);
-        }
-        let Some(profile) = self.profiles.get(scheme) else {
-            return Ok(None);
-        };
-        let ProfileSource::Wasm { module, class } = &profile.source;
-
-        #[cfg(not(feature = "wasm-resolver"))]
-        {
-            let _ = (module, class, agent_dir);
-            Err("profile resolver unavailable: st2 was built without the `wasm-resolver` feature"
-                .to_owned())
-        }
-        #[cfg(feature = "wasm-resolver")]
-        {
-            let resolver = self.compiled(module)?;
-            let contained = resolver
-                .resolve_contained(uri, agent_dir)
-                .map_err(|e| e.to_string())?;
-            Ok(Some(Resolution {
-                path: contained.path,
-                containment_root: contained.root,
-                class: *class,
-            }))
-        }
+        self.begin_refresh().try_resolve(agent_dir, uri)
     }
 
     #[cfg(feature = "wasm-resolver")]
@@ -370,6 +418,10 @@ impl ResourceProfileRegistry {
         &self,
         module_path: &Path,
     ) -> Result<Arc<crate::profile_wasm::WasmResolver>, String> {
+        #[cfg(test)]
+        {
+            self.wasm_cache.lock().snapshot_attempts += 1;
+        }
         let snapshot = crate::profile_wasm::read_module_snapshot(
             module_path,
             crate::profile_wasm::DEFAULT_MODULE_LIMIT_BYTES,
@@ -543,6 +595,7 @@ mod tests {
             1,
             "later refreshes reuse the cached failure"
         );
+        assert_eq!(registry.wasm_cache.lock().snapshot_attempts, 9);
 
         let original_permissions = std::fs::metadata(&module).unwrap().permissions();
         let mut changed_permissions = original_permissions.clone();
@@ -584,6 +637,75 @@ mod tests {
             3,
             "the successful replacement is cached too"
         );
+
+        assert_eq!(
+            registry.wasm_cache.lock().snapshot_attempts,
+            12,
+            "each direct resolution is its own refresh"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "wasm-resolver")]
+    fn one_refresh_shares_module_snapshot_and_errors_across_many_bindings() {
+        const URI: &str = "shared://host/agent";
+        let temp = tempfile::tempdir().unwrap();
+        let module = temp.path().join("resolver.wasm");
+        std::fs::write(&module, b"not a wasm module").unwrap();
+        let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+            "shared",
+            &module,
+            ProfileClass::Immediate,
+        ));
+
+        let refresh = registry.begin_refresh();
+        let errors = (0..100)
+            .map(|index| {
+                refresh
+                    .try_resolve(&temp.path().join(format!("agent-{index}")), URI)
+                    .unwrap_err()
+            })
+            .collect::<Vec<_>>();
+        assert!(errors.windows(2).all(|pair| pair[0] == pair[1]));
+        let cache = registry.wasm_cache.lock();
+        assert_eq!(cache.snapshot_attempts, 1);
+        assert_eq!(cache.compile_attempts, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "wasm-resolver")]
+    fn a_later_refresh_retries_a_replaced_module_and_reuses_the_new_identity() {
+        const URI: &str = "dev.schickling.agent-goal://host/agent";
+        let temp = tempfile::tempdir().unwrap();
+        let module = temp.path().join("resolver.wasm");
+        std::fs::write(&module, b"not a wasm module").unwrap();
+        let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+            AGENT_GOAL_SCHEME,
+            &module,
+            ProfileClass::Immediate,
+        ));
+
+        let first = registry.begin_refresh();
+        assert!(first.try_resolve(temp.path(), URI).is_err());
+        std::fs::write(
+            &module,
+            include_bytes!("../tests/fixtures/demo_resolver.wasm"),
+        )
+        .unwrap();
+        assert!(
+            first.try_resolve(temp.path(), URI).is_err(),
+            "one pass shares one immutable module outcome"
+        );
+
+        let replacement = registry.begin_refresh();
+        assert!(
+            replacement.try_resolve(temp.path(), URI).unwrap().is_some(),
+            "the next pass snapshots and compiles the replacement"
+        );
+        assert!(replacement.try_resolve(temp.path(), URI).unwrap().is_some());
+        let cache = registry.wasm_cache.lock();
+        assert_eq!(cache.snapshot_attempts, 2);
+        assert_eq!(cache.compile_attempts, 2);
     }
 
     #[test]
