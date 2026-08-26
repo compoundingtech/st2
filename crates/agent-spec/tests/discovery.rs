@@ -1135,6 +1135,30 @@ fn resource_explanation_byte_bounds_are_enforced() {
 }
 
 #[test]
+fn resource_binding_names_and_scheme_candidates_fail_loudly() {
+    for name in [
+        " declaration".to_owned(),
+        "declaration".to_owned(),
+        "line\nbreak".to_owned(),
+        "x".repeat(201),
+    ] {
+        assert!(
+            Resource::new(name.clone(), "issue://one".into(), "Task.".into()).is_err(),
+            "invalid binding name was accepted: {name:?}"
+        );
+    }
+    assert!(
+        Resource::new(
+            "work".into(),
+            "_github://org/repo".into(),
+            "Task.".into(),
+        )
+        .is_err(),
+        "a malformed scheme prefix must not become a catalog-relative path"
+    );
+}
+
+#[test]
 fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types() {
     let tmp = tempfile::tempdir().unwrap();
     for (identity, resource) in [

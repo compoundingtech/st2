@@ -256,8 +256,18 @@ struct ResourceDescriptor {
 impl Resource {
     /// Construct a descriptor after enforcing the same invariants as catalog parsing.
     pub fn new(name: String, uri: String, reason: String) -> Result<Self, String> {
-        if name.is_empty() {
-            return Err("resource binding name cannot be empty".into());
+        if name.is_empty()
+            || name.len() > 200
+            || name.trim() != name
+            || name.chars().any(char::is_control)
+        {
+            return Err(
+                "resource binding name must be 1..=200 bytes without surrounding whitespace or controls"
+                    .into(),
+            );
+        }
+        if name == "declaration" {
+            return Err("resource binding name 'declaration' is reserved by resync".into());
         }
         validate_resource_uri(&uri).map_err(|reason| {
             format!("resource binding '{name}' `uri` must be an exact absolute URI or a catalog-relative path: {reason}")
@@ -772,22 +782,16 @@ fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result
 /// scheme at all, resolved by the consumer against the declaration directory. Relative carriers
 /// are an st2 extension pending canonical Agent Spec adoption (see 06-resync).
 fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
-    match uri.split_once(':') {
-        Some((scheme, _))
-            if !scheme.contains('/')
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
-        {
-            validate_absolute_uri(uri)
-        }
-        _ => {
-            if uri.is_empty() || uri.starts_with('/') || uri.contains("..") {
-                return Err("catalog-relative uri must be a non-empty relative path without `..`");
-            }
-            Ok(())
+    if let Some(colon) = uri.find(':') {
+        let first_separator = uri.find(|character| matches!(character, '/' | '\\'));
+        if first_separator.is_none_or(|separator| colon < separator) {
+            return validate_absolute_uri(uri);
         }
     }
+    if uri.is_empty() || uri.starts_with('/') || uri.contains("..") {
+        return Err("catalog-relative uri must be a non-empty relative path without `..`");
+    }
+    Ok(())
 }
 
 fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
