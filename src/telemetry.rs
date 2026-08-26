@@ -13,9 +13,10 @@
 //! carry its trace/span ids.
 
 use std::io::IsTerminal as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -23,6 +24,15 @@ use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stre
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};
+
+/// Unlike `tracing::enabled!`, this tracks whether the process actually installed an OTLP
+/// tracer layer. The stderr formatter exists without an endpoint, so hierarchy callsites must
+/// use this guard before constructing child spans or computing their attributes.
+static TRACER_EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn tracer_export_enabled() -> bool {
+    TRACER_EXPORT_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Seconds-scale explicit bucket boundaries for the duration histograms. The SDK's default
 /// boundaries are millisecond-tuned (`[0, 5, 10, …, 10000]`), so sub-second reconcile passes
@@ -70,12 +80,7 @@ impl Telemetry {
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
         if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
-            install_subscriber(
-                tracing_subscriber::registry(),
-                None,
-                None,
-                filter,
-            );
+            let _ = install_subscriber(tracing_subscriber::registry(), None, None, filter);
             return Self {
                 tracer_provider: None,
                 meter_provider: None,
@@ -88,12 +93,7 @@ impl Telemetry {
             // Export setup must never take the runner down: telemetry is best-effort.
             Err(err) => {
                 eprintln!("st2: otel exporter unavailable, continuing without telemetry: {err}");
-                install_subscriber(
-                    tracing_subscriber::registry(),
-                    None,
-                    None,
-                    filter,
-                );
+                let _ = install_subscriber(tracing_subscriber::registry(), None, None, filter);
                 return Self {
                     tracer_provider: None,
                     meter_provider: None,
@@ -157,12 +157,13 @@ impl Telemetry {
             }
         };
 
-        install_subscriber(
+        let tracer_layer_installed = install_subscriber(
             tracing_subscriber::registry(),
             Some(otel_span_layer),
             logger_provider.as_ref(),
             filter,
         );
+        TRACER_EXPORT_ENABLED.store(tracer_layer_installed, Ordering::Relaxed);
 
         Self {
             tracer_provider: Some(tracer_provider),
@@ -179,6 +180,7 @@ impl Telemetry {
     /// Deliver pending spans, metric points, and log records, then stop bounded exporter
     /// workers. Safe to call multiple times.
     pub fn shutdown(&mut self) {
+        TRACER_EXPORT_ENABLED.store(false, Ordering::Relaxed);
         // `PeriodicReader::shutdown` performs a final collect-and-export itself. Calling
         // `force_flush` first would export the same cumulative counter and histogram snapshot
         // twice for every short-lived process.
@@ -215,7 +217,8 @@ fn install_subscriber<S>(
     span_layer: Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>,
     logger_provider: Option<&SdkLoggerProvider>,
     filter: tracing_subscriber::EnvFilter,
-) where
+) -> bool
+where
     S: tracing::Subscriber + Send + Sync + 'static,
     for<'a> S: tracing_subscriber::registry::LookupSpan<'a>,
 {
@@ -229,10 +232,11 @@ fn install_subscriber<S>(
     // an event arriving via the log bridge would re-enter the same processor and recurse
     // until the export thread overflows its stack. App signals are exported unfiltered;
     // export-side sampling remains a separate decision.
+    let tracer_layer_present = span_layer.is_some();
     let otel_filter = tracing_subscriber::EnvFilter::new(
         "trace,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_http=off,opentelemetry_otlp=off",
     );
-    let _ = tracing::subscriber::set_global_default(
+    let installed = tracing::subscriber::set_global_default(
         base.with(span_layer.with_filter(otel_filter.clone()))
             .with(
                 logger_provider
@@ -245,7 +249,9 @@ fn install_subscriber<S>(
                     .with_writer(std::io::stderr)
                     .with_filter(filter),
             ),
-    );
+    )
+    .is_ok();
+    tracer_layer_present && installed
 }
 
 /// OTLP/HTTP-JSON span exporter; blocking reqwest client only (module docs).

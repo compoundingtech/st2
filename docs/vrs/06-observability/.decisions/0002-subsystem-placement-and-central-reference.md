@@ -1,6 +1,6 @@
 # Numbered subsystem under st2's VRS root, referencing dotfiles' central tree
 
-Status: draft
+Status: accepted
 
 Recorded 2026-08-25 from the aligned observability interview (axe decision catalog Q2).
 
@@ -18,6 +18,20 @@ Fleet-wide naming/provenance rules and producer obligations genuinely belong to 
 central tree (`01-conventions`, `09-integration/spec.md`). But st2-specific decisions — crate
 feature set, trace roots in `src/run.rs`, unit env propagation — have no home there and would be
 invisible to anyone working in this repo.
+
+## Evidence and Argument
+
+The repository already uses numbered VRS subsystems for product-specific lifecycle contracts,
+while the dotfiles observability tree owns fleet-wide semantics. A local subsystem with explicit
+central references preserves both contributor locality and one authority per shared rule.
+
+## Options
+
+| Option | Result | Reason |
+| --- | --- | --- |
+| Numbered st2 subsystem | Selected | Keeps local mechanisms and evidence beside their code while referencing central rules. |
+| Standalone st2 documentation root | Rejected | Duplicates the established VRS hierarchy. |
+| Central dotfiles tree only | Rejected | Leaves st2-specific crate, process, and CI decisions without repository-local authority. |
 
 ## Decision
 

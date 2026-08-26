@@ -48,7 +48,7 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 - **Endpoint**: none configured in code. The exporter resolves `OTEL_EXPORTER_OTLP_ENDPOINT` and
   related `OTEL_*` variables from the environment automatically. Unset → no SDK provider or
   exporter is built (R02); since PR3 the human-readable stderr `tracing` layer still runs so
-  diagnostics stay visible — see [Log bridge](#log-bridge-pr3).
+  diagnostics stay visible — see [Log bridge](#log-bridge-pr3-landed).
 - **Protocol**: HTTP JSON (`http-json` + protobuf-free wire), batch exporter, targeting the local
   Alloy forwarder at `127.0.0.1:4318` by convention.
 - **Resource**: `service.name` = `st2-<unit>` selected per entrypoint (below; `src/main.rs`
@@ -69,28 +69,62 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 | One-shot CLI invocations | `st2-cli` |
 | Hook executions (`st2 driver claude-observe`; other hook surfaces not instrumented yet) | `st2-hook` |
 
-## Trace roots
+## Reconciliation trace hierarchy
 
-Instrumented via the `tracing` facade since PR3 (`tracing::info_span!`, not manual SDK tracer
-calls), one root span per unit of work:
+Instrumented exclusively through the `tracing` facade (`tracing::info_span!` plus
+`tracing-opentelemetry` status extension), one bounded trace represents one reconcile pass:
 
-- **Supervisor loop pass** — each iteration of the `up_loop_until` loop (`src/run.rs`,
-  `up_loop_until`) wraps one reconcile pass in a span named `st2.reconcile_pass` with field
-  `st2.host`; after the pass it records `st2.crash_loops` and `st2.unparked` counts.
-- **One-shot up** — `up_once` (`src/run.rs`, `up_once`) wraps its single pass in the same
-  `st2.reconcile_pass` shape.
-- **Single-file spec path** — `reconcile_pass_specs_with_sessions` emits the same root span.
+```
+st2.reconcile_pass
+├── st2.catalog.lock
+├── st2.catalog.discover
+├── st2.hooks.verify                 # only when a consumer requires hooks
+├── st2.catalog.materialize
+├── st2.runtime.observe              # omitted for an externally supplied snapshot
+└── st2.reconcile.execute
+```
 
-A deterministic INFO event (target `st2`, message `reconcile pass complete`, `result` =
-`pass`\|`fail`) closes every pass so log-based assertions need no fault injection.
+`st2.reconcile_pass` remains the compatibility root at the supervisor-loop, one-shot catalog,
+selected-task, and single-file-spec sites. Its `span.label` and `st2.reconcile.path` are the enum
+`catalog | selected | spec`. Root outcome attributes are `st2.host`, `st2.crash_loops`,
+`st2.unparked`, `st2.report.errors`, `st2.report.warnings`, `st2.reconcile.skipped`, and
+`st2.result = pass | fail`; non-empty errors set OTel status `ERROR`. A deterministic INFO event
+(target `st2`, message `reconcile pass complete`, `result = pass | fail`) closes every root so
+log-based assertions need no fault injection.
 
-Not yet instrumented (follow-ups, not PR1 scope):
+| Span name | Parent | `span.label` | Operation boundary | Attributes and status | Path applicability |
+| --- | --- | --- | --- | --- | --- |
+| `st2.reconcile_pass` | none | `catalog` \| `selected` \| `spec` | One complete reconcile pass | Root attributes above; `ERROR` when the pass returns/collects an error | Catalog loop/once, selected task, spec loop/once |
+| `st2.catalog.lock` | `st2.reconcile_pass` | `shared` | Shared catalog-authoring lock acquisition | `st2.result`; `ERROR` on acquisition failure | Catalog, selected |
+| `st2.catalog.discover` | `st2.reconcile_pass` | `catalog` | Recursive desired-state snapshot | `st2.catalog.spec_count`, report warning/error counts, `st2.result`; `ERROR` when discovery reports errors even though the pass may continue | Catalog, selected |
+| `st2.hooks.verify` | `st2.reconcile_pass` | `lifecycle hooks` | Required lifecycle-hook receipt/set verification | `st2.hooks.consumer = codex \| pi \| codex+pi`, `st2.result`; `ERROR` on verification failure | Catalog or selected, only when required |
+| `st2.catalog.materialize` | `st2.reconcile_pass` | `catalog` \| `selected owner` | Aggregate catalog/selected-owner materialization call | Materialization failure and report warning/error counts, `st2.result`; `ERROR` when materialization reports errors | Catalog, selected |
+| `st2.runtime.observe` | `st2.reconcile_pass` | `all sessions` | Authoritative `Runner::list_sessions` call | `st2.runtime.session_count`, `st2.result`; `ERROR` on list failure | Catalog, selected, spec; omitted by `_with_sessions` because that snapshot is external |
+| `st2.reconcile.execute` | `st2.reconcile_pass` | `apply plan` | Aggregate mutation call around `execute_with_presentation_cursor` | Plan launch/GC/teardown counts, newly added report warning/error counts, `st2.result`; `ERROR` only when execution adds errors | Catalog, selected, spec |
 
-- Provider session lifecycles (claude / codex / opencode spawn, attach, teardown) beyond the
-  PR2 launch/reap counters, exec sidecars (`src/exec_backend.rs`).
+Every first-party root and child has a non-empty `span.label`. The exporter-enabled
+`AtomicBool` in `src/telemetry.rs` is the hierarchy gate; `tracing::enabled!` is insufficient
+because the stderr formatter remains installed without an endpoint. When the tracer exporter is
+unset, child constructors return before span construction, label handling, collection allocation,
+or count inspection. All children are aggregates and trace volume is bounded by the table.
 
-Span names follow the central `01-conventions` rules (`span.label` discipline included). Names are
-registered st2-side; this list plus PR2's metric set is that registry's seed.
+Attribute policy follows the central `01-conventions` contract:
+
+| Attribute family | Value type | Cardinality | Privacy | Metric-label policy |
+| --- | --- | --- | --- | --- |
+| `span.label` | enum string | bounded | public | forbidden |
+| `st2.reconcile.path`, `st2.result`, `st2.hooks.consumer` | enum string | tiny/bounded | public | spanmetrics-only |
+| All `*_count`, `st2.crash_loops`, `st2.unparked`, `st2.report.errors`, `st2.report.warnings` | integer | bounded numeric | public | forbidden |
+| `st2.reconcile.skipped` | boolean | tiny | public | spanmetrics-only |
+| `st2.host` | string | bounded fleet identity | internal | forbidden |
+
+No span or status description carries an id, filesystem path, selector, or error prose.
+
+Explicitly rejected spans: pure reconcile planning, identity validation,
+`compile_generated_tasks`, debounce, report absorption, wait/sleep, watcher callbacks, and
+wrapper functions. Per-task and per-owner spans are also rejected from this hierarchy: they need
+a separately specified hard detail budget. Provider-session lifecycles and exec sidecars remain
+follow-up surfaces beyond the PR2 launch/reap counters.
 
 ## Metrics (PR2)
 

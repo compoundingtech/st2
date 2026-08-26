@@ -1,6 +1,6 @@
 # Blocking HTTP-JSON exporter, single-client feature set, explicit flush at exit
 
-Status: draft
+Status: accepted
 
 Recorded 2026-08-25 from the aligned observability interview, backed by prototype evidence
 ([../.experiments/2026-08-25-rust-to-otelite-capture.md](../.experiments/2026-08-25-rust-to-otelite-capture.md)).
@@ -23,6 +23,22 @@ Two traps surfaced during prototyping:
    other client feature. The failure appears only when the first span exports.
 2. **The async-batch trap.** The default async batch exporter requires a tokio runtime; under
    st2's sync process model it panicked at export time.
+
+## Evidence and Argument
+
+The linked otelite prototype exported real OTLP/HTTP JSON from a synchronous Rust process only
+with the blocking client and an exclusive reqwest-client feature selection. It reproduced both
+the dual-client `NoHttpClient` failure and the async exporter's missing-reactor panic, and proved
+that explicit shutdown delivers short-lived spans.
+
+## Options
+
+| Option | Result | Reason |
+| --- | --- | --- |
+| Blocking HTTP-JSON with one reqwest client feature | Selected | Proven end to end in the synchronous process model. |
+| Async HTTP client/batch runtime | Rejected | st2 has no tokio reactor and the prototype panicked at export time. |
+| Default or dual reqwest client features | Rejected | Compilation succeeds but exporter construction fails with `NoHttpClient`. |
+| gRPC | Rejected | The fleet ingestion contract is OTLP/HTTP JSON only. |
 
 ## Decision
 

@@ -171,6 +171,69 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     );
     let reconcile_span = reconcile_spans[0];
 
+    // The empty catalog exercises the bounded aggregate hierarchy: no hook consumer exists,
+    // so hook verification is correctly absent rather than represented by a fake no-op span.
+    assert_eq!(
+        all_spans.len(),
+        6,
+        "one empty-catalog pass must export one root plus exactly five semantic children:\n{traces}"
+    );
+    let root_span_id = reconcile_span["spanId"]
+        .as_str()
+        .expect("reconcile root spanId");
+    let root_trace_id = reconcile_span["traceId"]
+        .as_str()
+        .expect("reconcile root traceId");
+    let expected_children = [
+        ("st2.catalog.lock", "shared"),
+        ("st2.catalog.discover", "catalog"),
+        ("st2.catalog.materialize", "catalog"),
+        ("st2.runtime.observe", "all sessions"),
+        ("st2.reconcile.execute", "apply plan"),
+    ];
+    let children: Vec<&serde_json::Value> = all_spans
+        .iter()
+        .filter(|span| span["parentSpanId"].as_str() == Some(root_span_id))
+        .collect();
+    assert_eq!(
+        children.len(),
+        expected_children.len(),
+        "every expected semantic span must be a direct root child:\n{traces}"
+    );
+    for (name, label) in expected_children {
+        let matching: Vec<&&serde_json::Value> = children
+            .iter()
+            .filter(|span| span["name"].as_str() == Some(name))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{name} must occur exactly once as a direct child:\n{traces}"
+        );
+        let child = matching[0];
+        assert_eq!(
+            child["parentSpanId"].as_str(),
+            Some(root_span_id),
+            "{name} must be parented directly to st2.reconcile_pass:\n{child}"
+        );
+        assert_eq!(
+            child["traceId"].as_str(),
+            Some(root_trace_id),
+            "{name} must share the reconcile root trace:\n{child}"
+        );
+        assert_eq!(
+            string_attr(child, "span.label"),
+            Some(label),
+            "{name} must carry its bounded span.label:\n{child}"
+        );
+    }
+    for span in &all_spans {
+        assert!(
+            string_attr(span, "span.label").is_some_and(|label| !label.is_empty()),
+            "every first-party root and child span must carry a non-empty span.label:\n{span}"
+        );
+    }
+
     // PR2: the same run must deliver metric points over the shared OTLP/HTTP endpoint.
     // An empty-catalog `up --once` records exactly one reconcile pass (pass) plus its
     // duration histogram sample.
