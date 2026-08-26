@@ -8,12 +8,11 @@ therefore are not open questions.
   compatibility guarantees, define old-guest/new-host and new-guest/old-host
   behavior and prove it with a compatibility matrix. Tracked in the
   [spec](./spec.md#design-questions).
-- **DQ-P2 Runtime observability.** `try_resolve` distinguishes a registry miss
-  from a registered resolver failure, but the production resync convenience
-  path currently degrades failures to unwatchable without a structured event.
-  Resolve from dogfood evidence with low-volume spans/logs/metrics that separate
-  feature-disabled builds, module defects, traps/fuel, malformed returns, and
-  containment violations.
+- **DQ-P2 Runtime observability.** Reconciliation now reports a warning naming
+  each registered-profile binding that degraded to unwatchable, so the
+  production path is no longer silent. Resolve from dogfood evidence whether
+  low-volume spans/logs/metrics must further separate feature-disabled builds,
+  module defects, traps/fuel, malformed returns, and containment violations.
 - **DQ-P3 Module replacement.** Compiled modules are cached by path for the
   registry lifetime. Determine whether activation-style replacement of wasm
   bytes at the same path must invalidate a resident cache and whether path,

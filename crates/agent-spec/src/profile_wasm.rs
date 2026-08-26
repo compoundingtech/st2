@@ -27,6 +27,8 @@ pub const DEFAULT_FUEL_PER_CALL: u64 = 5_000_000;
 pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// Default cap on elements in each guest table. The ABI itself requires no table.
 pub const DEFAULT_TABLE_ELEMENT_LIMIT: usize = 10_000;
+/// Maximum resolver module bytes admitted before Wasmtime validation and compilation.
+pub const DEFAULT_MODULE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// One resolution result as produced by a wasm resolver module.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -100,8 +102,9 @@ impl WasmResolver {
     /// Compile a `.wasm` module from disk with default budgets.
     pub fn load(path: &std::path::Path) -> Result<Self, WasmResolveError> {
         let engine = engine();
-        let module =
-            Module::from_file(&engine, path).map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
+        let bytes = read_module_bounded(path, DEFAULT_MODULE_LIMIT_BYTES)?;
+        let module = Module::new(&engine, &bytes)
+            .map_err(|e| WasmResolveError::Instantiation(e.to_string()))?;
         Ok(Self {
             engine,
             module,
@@ -160,6 +163,11 @@ impl WasmResolver {
         agent_dir: &std::path::Path,
     ) -> Result<ContainedPath, WasmResolveError> {
         let resolution = self.resolve_once(uri, &agent_dir.to_string_lossy())?;
+        if resolution.path.is_empty() {
+            return Err(WasmResolveError::BadReturn(
+                "resolver returned an empty path".to_owned(),
+            ));
+        }
         let root = normalize(agent_dir);
         let path = normalize(&root.join(&resolution.path));
         if !path.starts_with(&root) {
@@ -171,6 +179,35 @@ impl WasmResolver {
         reject_symlink_components(&root, &path)?;
         Ok(ContainedPath { path, root })
     }
+}
+
+fn read_module_bounded(
+    path: &std::path::Path,
+    limit: usize,
+) -> Result<Vec<u8>, WasmResolveError> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    let declared_len = file
+        .metadata()
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
+        .len();
+    if declared_len > limit as u64 {
+        return Err(WasmResolveError::Instantiation(format!(
+            "resolver module is {declared_len} bytes; limit is {limit} bytes"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(declared_len as usize);
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    if bytes.len() > limit {
+        return Err(WasmResolveError::Instantiation(format!(
+            "resolver module exceeds the {limit}-byte limit"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn reject_symlink_components(

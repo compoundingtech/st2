@@ -13,8 +13,11 @@
 //!
 //! The registry is injectable so a catalog can extend or override the built-in set.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+#[cfg(feature = "wasm-resolver")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "wasm-resolver")]
 use std::sync::{Arc, Mutex};
 
 /// Scheme of the standing-seat goal carrier: `dev.schickling.agent-goal://<host>/<identity>`.
@@ -214,7 +217,7 @@ impl ResourceProfileRegistry {
 
         #[cfg(not(feature = "wasm-resolver"))]
         {
-            let _ = (module, agent_dir);
+            let _ = (module, class, agent_dir);
             Err("profile resolver unavailable: st2 was built without the `wasm-resolver` feature"
                 .to_owned())
         }
@@ -252,7 +255,10 @@ impl ResourceProfileRegistry {
 /// RFC 3986 scheme characters: the same test `st2::resync` uses to decide whether a URI string
 /// carries a scheme at all. Shared so both sides agree on where profiles take over.
 fn is_uri_scheme(scheme: &str) -> bool {
-    !scheme.is_empty()
+    scheme
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
         && !scheme.contains('/')
         && scheme
             .chars()

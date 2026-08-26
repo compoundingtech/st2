@@ -129,7 +129,11 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                  profile \"dev.example.goal\" {{ wasm \"resolvers/goal.wasm\" }}"
             )
         })?;
-    let scheme_ok = !scheme.contains('/')
+    let scheme_ok = scheme
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && !scheme.contains('/')
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
@@ -355,6 +359,7 @@ mod tests {
             r#"profile "dev.a" { wasm "a.wasm" }
                profile "dev.a" { wasm "b.wasm" }"#,
             r#"profile "not a scheme" { wasm "x.wasm" }"#,
+            r#"profile "1bad" { wasm "x.wasm" }"#,
         ];
         for text in loud {
             assert!(parse(text).is_err(), "expected error for: {text}");

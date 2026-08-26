@@ -96,8 +96,9 @@ profile <non-empty-scheme> {        # exactly one positional value; no propertie
 }
 ```
 
-The profile scheme accepts ASCII alphanumeric characters plus `+`, `-`, and
-`.`, and rejects `/`; lookup remains exact and case-sensitive. The profile
+The profile scheme follows RFC 3986: it begins with an ASCII letter, then
+accepts ASCII alphanumeric characters plus `+`, `-`, and `.`, and rejects `/`;
+lookup remains exact and case-sensitive. The profile
 node takes exactly one quoted positional scheme and no properties. Each child
 takes exactly one quoted positional value. Unknown or extra entries, unknown
 children, duplicate `wasm`, duplicate `class`, a missing `wasm`, unsupported
@@ -142,16 +143,17 @@ linear memory through `alloc`. `resolve` returns a packed unsigned
 {"path":"resources/goal.md","class":"goal"}
 ```
 
-`path` is required. `class` is an optional, free-form guest classification and
-is not the resync notification class: notification policy comes only from the
-trusted catalog declaration's `ProfileClass`. This prevents an untrusted guest
-from escalating a `silent` profile to `immediate`.
+`path` is required and non-empty. `class` is an optional, free-form guest
+classification and is not the resync notification class: notification policy
+comes only from the trusted catalog declaration's `ProfileClass`. This prevents
+an untrusted guest from escalating a `silent` profile to `immediate`.
 
 Before reading or acting, the host checks allocator pointers and the returned
-pointer/length range against linear memory, parses UTF-8 and JSON, joins the
-returned path to `agent_dir`, lexically normalizes `.`/`..`, and rejects any
-result outside `agent_dir` or crossing an existing symlink below it. Existence
-is not required at resolution time; the carrier may be created later.
+pointer/length range against linear memory, parses UTF-8 and JSON, rejects an
+empty path, joins the returned path to `agent_dir`, lexically normalizes
+`.`/`..`, and rejects any result outside `agent_dir` or crossing an existing
+symlink below it. Existence is not required at resolution time; the carrier may
+be created later.
 
 Successful resolution carries the normalized agent-directory root into resync.
 Every later digest read opens that root and then each relative component with
@@ -162,13 +164,15 @@ metadata alone is never treated as a durable proof.
 
 ## Runtime containment (PROFILE-R04..R07)
 
-Each module is compiled once per module path and shared by registry clones. Each
-resolution creates a fresh `Store` and `Instance`. One fuel allowance covers
-the module start function and the first resolution call; a reused instance
-receives one fresh allowance before each later call:
+Each module file is read through a 16 MiB admission cap before validation or
+compilation, then compiled once per module path and shared by registry clones.
+Each resolution creates a fresh `Store` and `Instance`. One fuel allowance
+covers the module start function and the first resolution call; a reused
+instance receives one fresh allowance before each later call:
 
 | Boundary | Contract |
 | --- | --- |
+| Module bytes | 16 MiB maximum before Wasmtime compilation |
 | Imports | none; import-requiring modules fail instantiation |
 | Fuel | 5,000,000 fuel units for start + first call; same budget per later call |
 | Linear memory | 64 MiB maximum |
@@ -181,11 +185,11 @@ Failure taxonomy:
 
 | Failure | SDK result | Supervisor effect |
 | --- | --- | --- |
-| module load/instantiation | `Instantiation` | binding unwatchable; supervisor lives |
+| oversized module or module load/instantiation | `Instantiation` | binding unwatchable; reconcile warning; supervisor lives |
 | missing `memory`, `alloc`, or `resolve` | `MissingExport` | same |
 | unreachable/stack/memory trap | `Trap` | same |
 | infinite start function or call | `FuelExhausted` | same |
-| invalid pointer, UTF-8, JSON, escaped path, or symlinked confined read | `BadReturn` or unreadable carrier | same |
+| invalid pointer, UTF-8, JSON, empty/escaped path, symlink, or special-file read | `BadReturn` or unreadable carrier | same |
 | feature disabled | registered-profile error | same; no alternate resolver |
 
 All wasmtime code and dependencies are gated by `wasm-resolver`, forwarded from
@@ -199,9 +203,11 @@ repository dev shell supplies.
 
 For each active Resource binding, resync applies this precedence:
 
-1. A URI with a registered profile resolves through the registry. Success adds
-   the contained path with the profile's declared class. `silent` excludes it
-   from the watch set. Failure leaves only that binding unwatchable.
+1. A URI with a registered `silent` profile is excluded without loading or
+   executing its resolver. Any other registered profile resolves through the
+   registry. Success adds the contained path with the profile's declared
+   class. Failure leaves only that binding unwatchable and adds a reconcile
+   warning naming the agent and binding.
 2. An unregistered `file://` URI uses the existing absolute-file rule.
 3. A schemeless path uses the existing agent-directory-relative rule.
 4. Every other unregistered scheme remains opaque and unwatchable.
