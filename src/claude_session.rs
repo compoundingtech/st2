@@ -76,6 +76,7 @@ pub fn run_observe(
     runtime_id: Option<&str>,
     event: &str,
 ) -> Result<()> {
+    crate::metrics::record_hook_invocation("claude-observe", event);
     let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     let mut raw = String::new();

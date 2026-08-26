@@ -81,6 +81,22 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
         traces.contains("st2-cli"),
         "service.name st2-cli missing from capture:\n{traces}"
     );
+
+    // PR2: the same run must deliver metric points over the shared OTLP/HTTP endpoint.
+    // An empty-catalog `up --once` records exactly one reconcile pass (pass) plus its
+    // duration histogram sample.
+    let metrics =
+        std::fs::read_to_string(cap_dir.join("metrics.ndjson")).expect("metrics.ndjson written");
+    for expected_name in ["reconcile_passes_total", "reconcile_pass_duration_seconds"] {
+        assert!(
+            metrics.contains(&format!("\"name\":\"{expected_name}\"")),
+            "metric `{expected_name}` missing from capture:\n{metrics}"
+        );
+    }
+    assert!(
+        metrics.contains(r#""key":"result","value":{"stringValue":"pass"}"#),
+        "reconcile passes counter must carry result=pass:\n{metrics}"
+    );
 }
 
 #[test]

@@ -2,17 +2,10 @@
 
 Kept minimal; each blocks exactly one delivery slice, not the tree.
 
-- **PR2 metric set.** Resolved by interview (decision record Q5): the RED-minimal
-  set — counters `reconcile_passes_total{result}`, `task_launches_total{driver}`,
-  `task_reaps_total{driver}`, `hook_invocations_total{hook,event}`,
-  `message_deliveries_total{result}`, `crash_loops_total`; histograms
-  `reconcile_pass_duration_seconds`, `session_start_duration_seconds`. Labels only
-  from bounded enums (result/driver/hook); ids stay in span attributes.
-- **`st2 up <spec>` span coverage.** The catalog reconcile paths are instrumented
-  (`st2.reconcile_pass` at the `up_loop_until` loop pass and in `up_once`), but the single-file
-  spec path (`reconcile_pass_specs` / `reconcile_pass_specs_with_sessions`, `src/run.rs`) emits
-  no spans yet. Same span shape applies; folded into PR2, which needs a pass over that call
-  chain for metrics anyway.
+- **PR2 metric set.** Landed: the RED-minimal set from interview decision Q5, with names,
+  types, and label enums as specified in [spec.md](spec.md) (`src/metrics.rs`); the
+  `st2 up <spec>` span coverage folded in as planned — all three reconcile-pass sites now
+  emit `st2.reconcile_pass` plus the pass counter and duration histogram.
 - **Remaining R04 resource attributes.** Resolved by source read (dotfiles dev3
   `monitoring.nix` transform block): the platform edge stamps `service.namespace`,
   `sk.site`, `sk.role`, `deployment.environment.name` where absent, and the central
