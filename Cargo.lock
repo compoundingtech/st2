@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kdl",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
