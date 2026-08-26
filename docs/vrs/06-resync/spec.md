@@ -71,6 +71,8 @@ gets its own event so per-binding supersession stays meaningful.
   bus id, label, and class so every subscriber retains its digest and pending
   dirty state even when multiple bindings share one path; only new
   subscriptions seed silently.
+- A previously blind path is digest-diffed before its recovered parent directory is added to the
+  registered-watch set, covering changes made during the blind interval.
 - Installation failure is diagnosed once and degrades to timer-based digest
   polling over the watch set (bounded by the number of bindings), never to
   silence about the mechanism.
@@ -82,11 +84,15 @@ agent without a declaration check; every other rule (host ownership,
 desired-state running, owner-binding validation, ring transaction) is the
 implemented [`STREAM-R03..R05`](../04-stream/spec.md) path untouched.
 Declaring a stream named `resync` in an Agent Spec is a validation error:
-the reservation must not be shadowable.
+the reservation must not be shadowable. Resource binding names use the event-key
+grammar (1..=200 bytes, no surrounding whitespace or controls), and
+`declaration` is reserved for the synthetic declaration carrier so supersession
+keys cannot collide.
 
-Digest state lives with the supervisor process (seeded at start, updated on
-each observed change); the durable dedup horizon remains the stream receipt
-ring, exactly as for external producers.
+Digest state lives with the supervisor process (seeded at start) and advances
+only after the unchanged ingress returns a successful receipt. Failed
+publication retains the old digest and dirty state and schedules the identical
+transition for retry; the durable dedup horizon remains the stream receipt ring.
 
 ## What this does not do
 

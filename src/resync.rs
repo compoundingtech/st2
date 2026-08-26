@@ -325,10 +325,10 @@ impl Worker {
             self.diff_emit(&mut next);
         }
         self.carriers = next;
-        self.refresh_watches();
-        // Directories that could not be registered stay blind to events; their carriers fall
-        // back to digest polling at refresh cadence (`RESYNC-R01`).
+        // Diff paths that were blind before registering newly recovered parents; otherwise the
+        // new watch suppresses polling of mutations that happened during the blind interval.
         self.poll_unwatched();
+        self.refresh_watches();
     }
 
     /// Digest-diff every entry in `next`, emitting observed transitions. Seeding stays silent
@@ -348,17 +348,18 @@ impl Worker {
                 if entry.digest.as_deref() == Some(new_digest.as_str()) {
                     continue;
                 }
-                let old = entry.digest.take();
-                emit_resync(
+                let old = entry.digest.as_deref();
+                if emit_resync(
                     &root,
                     &this_host,
                     &entry.bus_id,
                     &entry.label,
                     &path,
-                    old.as_deref(),
+                    old,
                     &new_digest,
-                );
-                entry.digest = Some(new_digest);
+                ) {
+                    entry.digest = Some(new_digest);
+                }
             }
         }
     }
@@ -487,33 +488,45 @@ impl Worker {
         }
     }
 
-    /// Flush every subscriber of one path: clear dirty flags, diff digests, emit transitions.
+    /// Flush every subscriber of one path: diff digests, emit transitions, and retain failed
+    /// publications for retry with the same event identity.
     fn flush_path(&mut self, path: &Path) {
         let Some(entries) = self.carriers.get_mut(path) else {
             return;
         };
+        let mut retries = Vec::new();
         for entry in entries.iter_mut() {
             entry.dirty = false;
             let Some(new_digest) = read_digest(path) else {
                 // Unreadable right now (deleted mid-window): stay quiet and keep the previous
-                // digest, so a later reappearance still counts as a change. The next mutation
-                // re-dirties.
+                // digest, so a later reappearance still counts as a change.
                 continue;
             };
             if entry.digest.as_deref() == Some(new_digest.as_str()) {
                 continue;
             }
-            let old = entry.digest.take();
-            emit_resync(
+            if emit_resync(
                 &self.root,
                 &self.this_host,
                 &entry.bus_id,
                 &entry.label,
                 path,
-                old.as_deref(),
+                entry.digest.as_deref(),
                 &new_digest,
-            );
-            entry.digest = Some(new_digest);
+            ) {
+                entry.digest = Some(new_digest);
+            } else {
+                entry.dirty = true;
+                retries.push(entry.class);
+            }
+        }
+        let now = Instant::now();
+        for class in retries {
+            let deadline = now + class.window();
+            self.deadlines
+                .entry(class)
+                .and_modify(|existing| *existing = (*existing).min(deadline))
+                .or_insert(deadline);
         }
     }
 }
@@ -533,11 +546,11 @@ fn emit_resync(
     path: &Path,
     old: Option<&str>,
     new_digest: &str,
-) {
+) -> bool {
     let subject = format!("resource {label} changed");
     let body = render_body(label, path, old, new_digest);
     let event_id = transition_identity(&body);
-    let receipt = crate::event::emit(
+    match crate::event::emit(
         root,
         this_host,
         bus_id,
@@ -547,12 +560,15 @@ fn emit_resync(
         Some(subject.as_str()),
         &body,
         true,
-    );
-    if let Err(error) = receipt {
-        eprintln!(
-            "st2: resync emit for '{}' failed: {error:#}",
-            path.display()
-        );
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!(
+                "st2: resync emit for '{}' failed: {error:#}",
+                path.display()
+            );
+            false
+        }
     }
 }
 
@@ -676,6 +692,36 @@ mod tests {
             assert_eq!(entry.digest.as_deref(), Some(digest));
             assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
         }
+    }
+
+    #[test]
+    fn failed_emit_retains_digest_and_schedules_the_same_transition_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        std::fs::write(&carrier, "new bytes").unwrap();
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(
+                carrier.clone(),
+                vec![Entry {
+                    bus_id: "host.missing".to_owned(),
+                    label: "goal".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: Some("old-digest".to_owned()),
+                    dirty: true,
+                }],
+            )]),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+
+        worker.flush_path(&carrier);
+        let entry = &worker.carriers[&carrier][0];
+        assert_eq!(entry.digest.as_deref(), Some("old-digest"));
+        assert!(entry.dirty);
+        assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
     }
 
     #[test]
