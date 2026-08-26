@@ -211,6 +211,11 @@ fn is_declaration_parent(catalog_root: &Path, dir: &Path) -> bool {
 /// of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble an agent spec; it is
 /// runner state, never catalog input. Unreadable directories are skipped, not fatal in ordinary
 /// discovery. Strict discovery records them as uncertainty.
+///
+/// A declaration directory holds exactly one agent, so its subdirectories are that agent's own
+/// state — evidence artifacts, receipts, scratch — and never more catalog. Descending into them
+/// let an arbitrary JSON file become a spec: a malformed one failed the whole catalog, and a
+/// well-formed one with an `argv` field silently became a launchable phantom agent.
 fn collect_spec_files(
     root: &Path,
     dir: &Path,
@@ -230,6 +235,9 @@ fn collect_spec_files(
             return;
         }
     };
+    // The catalog root is never an agent's own directory, even when a root envelope declares one
+    // inline, so `agents/` and its siblings below the root stay discoverable.
+    let holds_a_declaration = dir != root && is_declaration_parent(root, dir);
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -263,6 +271,9 @@ fn collect_spec_files(
             }
         };
         if ft.is_dir() {
+            if holds_a_declaration {
+                continue;
+            }
             collect_spec_files(root, &path, acc, strict, errors);
         } else if ft.is_file() && has_spec_extension(&path) {
             acc.push(path);

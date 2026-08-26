@@ -228,6 +228,100 @@ fn explicit_json_null_fields_are_rejected_instead_of_granting_default_behavior()
     }
 }
 
+#[test]
+fn an_agents_own_subtree_is_state_and_never_another_declaration() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/evidence.worker/agent.kdl",
+        "agent \"evidence.worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/other.worker/agent.kdl",
+        "agent \"other.worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
+    );
+    // A declaration directory that is not a canonical `agents/<host>/<identity>` bundle. Nothing
+    // positional protects this one, so it is the case that still discriminates: only the rule that
+    // a declaration's subdirectories are its own state keeps the receipt below out of the catalog.
+    write(
+        tmp.path(),
+        "team/agent.kdl",
+        "agent \"team.worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
+    );
+    // Evidence artifacts an agent writes under its own directory. The first is well-formed and
+    // carries an `argv`, which used to lower into a launchable phantom agent with no error at
+    // all; the second is ordinary JSON that used to fail the whole catalog.
+    write(
+        tmp.path(),
+        "team/evidence/agent-launch-receipts/run-1.json",
+        r#"{"identity":"phantom.receipt","host":"h","argv":["true"]}"#,
+    );
+    write(
+        tmp.path(),
+        "team/evidence/agent-launch-receipts/run-2.json",
+        r#"[{"run":1},{"run":2}]"#,
+    );
+    // The same artifacts inside a canonical bundle, which `is_canonical_bundle_descendant` also
+    // covers positionally. Kept so the bundle case stays guarded if that rule ever moves.
+    write(
+        tmp.path(),
+        "agents/h/evidence.worker/axe/agent-launch-receipts/run-1.json",
+        r#"{"schema":"axe.agent-launch-receipt.v3","argv":["axe","agent","launch"]}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/evidence.worker/axe/agent-launch-receipts/run-2.json",
+        r#"[{"run":1},{"run":2}]"#,
+    );
+
+    for found in [discover(tmp.path()), discover_strict(tmp.path())] {
+        let identities: Vec<&str> = found
+            .specs
+            .iter()
+            .map(|spec| spec.identity.as_str())
+            .collect();
+        assert_eq!(
+            identities,
+            ["evidence.worker", "other.worker", "team.worker"],
+            "an evidence artifact became a declaration"
+        );
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+    }
+}
+
+#[test]
+fn a_root_envelope_declaration_does_not_hide_the_agents_subtree() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A root `catalog.kdl` may declare an agent inline beside a profile. The root is still the
+    // catalog envelope, not that agent's own directory, so refusing to descend from it would drop
+    // every canonical bundle in the catalog.
+    write(
+        tmp.path(),
+        "catalog.kdl",
+        "profile \"dev.example.goal\" {\n  wasm \"resolver.wasm\"\n}\nagent \"root-agent\" { command \"true\" }\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/real.worker/agent.kdl",
+        "agent \"real.worker\" {\n  host \"h\"\n  argv \"true\"\n}\n",
+    );
+
+    for found in [discover(tmp.path()), discover_strict(tmp.path())] {
+        let identities: Vec<&str> = found
+            .specs
+            .iter()
+            .map(|spec| spec.identity.as_str())
+            .collect();
+        assert_eq!(
+            identities,
+            ["real.worker", "root-agent"],
+            "a root envelope declaration hid the agents subtree"
+        );
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+    }
+}
+
 fn write(root: &Path, rel: &str, contents: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
