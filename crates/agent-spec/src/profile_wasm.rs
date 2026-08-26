@@ -150,16 +150,46 @@ impl WasmResolver {
         agent_dir: &std::path::Path,
     ) -> Result<std::path::PathBuf, WasmResolveError> {
         let resolution = self.resolve_once(uri, &agent_dir.to_string_lossy())?;
-        let joined = agent_dir.join(&resolution.path);
-        let cleaned = normalize(&joined);
-        if !cleaned.starts_with(agent_dir) {
+        let agent_dir = normalize(agent_dir);
+        let cleaned = normalize(&agent_dir.join(&resolution.path));
+        if !cleaned.starts_with(&agent_dir) {
             return Err(WasmResolveError::BadReturn(format!(
                 "resolver escaped the agent directory: {:?}",
                 resolution.path
             )));
         }
+        reject_symlink_components(&agent_dir, &cleaned)?;
         Ok(cleaned)
     }
+}
+
+fn reject_symlink_components(
+    agent_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), WasmResolveError> {
+    let mut current = agent_dir.to_path_buf();
+    for component in path
+        .strip_prefix(agent_dir)
+        .expect("contained resolver path has the agent directory as its prefix")
+        .components()
+    {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(WasmResolveError::BadReturn(format!(
+                    "resolver path crosses a symlink inside the agent directory: {current:?}"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(WasmResolveError::BadReturn(format!(
+                    "resolver path component cannot be inspected: {current:?}: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn engine() -> Engine {

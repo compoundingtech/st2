@@ -96,6 +96,25 @@ fn resolver_cannot_escape_the_agent_directory() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn resolver_cannot_cross_a_symlink_inside_the_agent_directory() {
+    let agent_dir = tempfile::tempdir().expect("agent directory is created");
+    let outside = tempfile::tempdir().expect("outside directory is created");
+    std::fs::write(outside.path().join("goal.md"), "external").expect("external file is created");
+    std::os::unix::fs::symlink(outside.path(), agent_dir.path().join("resources"))
+        .expect("resources symlink is created");
+
+    let resolver =
+        WasmResolver::load(Path::new(DEMO_WASM_PATH)).expect("demo resolver module loads");
+    match resolver.resolve_contained("dev.schickling.agent-goal://x", agent_dir.path()) {
+        Err(WasmResolveError::BadReturn(error)) => {
+            assert!(error.contains("symlink"), "got: {error}");
+        }
+        other => panic!("expected symlink containment rejection, got {other:?}"),
+    }
+}
+
 #[test]
 fn trap_inside_resolve_is_contained_and_the_engine_resolves_again_afterwards() {
     let trap = WasmResolver::from_wat(&format!(
