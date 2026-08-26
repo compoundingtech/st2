@@ -2,9 +2,18 @@
 
 Status: accepted
 
+Amended by
+[decision 0009](./0009-resource-profiles-use-a-feature-gated-wasm-boundary.md):
+Q2 watch scope and Q3 classification now include declared Resource Profiles.
+
 Design decisions made by Johannes on 2026-08-25 (decision requests Q1–Q6,
 recorded in the ox-alpha.local decision tree), grounding
 [issue #341](https://github.com/compoundingtech/st2/issues/341).
+
+Decision 0009 adds profile-resolved local carriers to Q2 and makes the
+catalog-declared profile class authoritative for those carriers under Q3.
+Native `file://`/relative resolution and path-based class defaults remain as
+recorded here.
 
 ## Context
 
