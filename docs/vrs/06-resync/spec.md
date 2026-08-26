@@ -21,7 +21,7 @@ resync watcher thread
    |
    v  window boundary
 st2::event::emit(bus_id, stream="resync",
-                 event-id=<sha256(new bytes)>,
+                 event-id=<sha256(rendered binding/path/old/new body)>,
                  key=<binding label>, --supersede,
                  subject="resource <binding> changed")
    |
@@ -66,8 +66,11 @@ gets its own event so per-binding supersession stays meaningful.
   same-path replacement, mirroring `CatalogDeclarationWatcher`.
 - The watcher owns no reconcile authority: a resync mutation does not wake a
   full-catalog pass. It shares only the observation primitives.
-- Watch set is recomputed after each reconcile pass (launch, resume, binding
-  edits) — new carriers are watched before their next change can matter.
+- The watch set is recomputed after each reconcile pass (launch, resume,
+  binding edits). Existing subscriptions are matched independently by path,
+  bus id, label, and class so every subscriber retains its digest and pending
+  dirty state even when multiple bindings share one path; only new
+  subscriptions seed silently.
 - Installation failure is diagnosed once and degrades to timer-based digest
   polling over the watch set (bounded by the number of bindings), never to
   silence about the mechanism.
