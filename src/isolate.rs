@@ -54,8 +54,9 @@ fn detect() -> Isolation {
         if systemd_user_available() {
             Isolation::Scope
         } else {
-            eprintln!(
-                "st2: WARN systemd user scopes unavailable (no `systemd-run --user` / no \
+            // The old line embedded a manual "WARN" prefix; the facade carries severity now.
+            tracing::warn!(
+                "st2: systemd user scopes unavailable (no `systemd-run --user` / no \
                  $XDG_RUNTIME_DIR) — spawning tasks WITHOUT cgroup isolation. A transport/supervisor \
                  restart may cascade-kill them. Enable a user systemd manager (loginctl enable-linger) \
                  to restore isolation."

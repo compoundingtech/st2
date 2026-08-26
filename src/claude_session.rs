@@ -149,7 +149,7 @@ fn observe_writer(
                 Ok(Some(seq)) => writer.with_ownership(token, seq),
                 Ok(None) => writer.with_session(token),
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "st2 claude-observe: observed-state claim failed; degrading to token-only: {error:#}"
                     );
                     writer.with_session(token)

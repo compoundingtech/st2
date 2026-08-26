@@ -81,6 +81,28 @@ fn string_attr<'a>(point: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         .and_then(|v| v.as_str())
 }
 
+/// Flatten an OTLP/HTTP-JSON `ExportLogsServiceRequest` into its log records.
+fn log_records(line: &str) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return records;
+    };
+    let Some(resource_logs) = value.get("resourceLogs").and_then(|v| v.as_array()) else {
+        return records;
+    };
+    for resource_log in resource_logs {
+        let Some(scope_logs) = resource_log.get("scopeLogs").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for scope_log in scope_logs {
+            if let Some(batch) = scope_log.get("logRecords").and_then(|v| v.as_array()) {
+                records.extend(batch.iter().cloned());
+            }
+        }
+    }
+    records
+}
+
 #[test]
 fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     let Some(otelite) = std::env::var_os("ST2_OTELITE_BIN").map(PathBuf::from) else {
@@ -151,6 +173,41 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
         bounds[0].as_f64(),
         Some(0.001),
         "lowest duration bucket must be 1ms, not the SDK default:\n{duration}"
+    );
+
+    // PR3: the same run must deliver log records through the tracing facade, and the
+    // deterministic per-pass completion INFO record must carry the reconcile-pass span
+    // context (trace + span ids), proving the tracing→OTel log path end to end.
+    let logs = std::fs::read_to_string(cap_dir.join("logs.ndjson")).expect("logs.ndjson written");
+    let completion = logs
+        .lines()
+        .flat_map(log_records)
+        .find(|record| {
+            record.pointer("/body/stringValue").and_then(|b| b.as_str())
+                == Some("reconcile pass complete")
+        })
+        .expect("reconcile pass completion log missing from capture");
+    assert_eq!(
+        completion["severityText"].as_str(),
+        Some("INFO"),
+        "completion record must be INFO:\n{completion}"
+    );
+    assert_eq!(
+        completion["severityNumber"].as_i64(),
+        Some(9),
+        "INFO maps to severity number 9:\n{completion}"
+    );
+    let trace_id = completion["traceId"].as_str().expect("traceId present");
+    let span_id = completion["spanId"].as_str().expect("spanId present");
+    assert_eq!(
+        trace_id.len(),
+        32,
+        "log must carry a trace id:\n{completion}"
+    );
+    assert_eq!(span_id.len(), 16, "log must carry a span id:\n{completion}");
+    assert!(
+        traces.contains(trace_id),
+        "log's trace id must belong to the captured st2.reconcile_pass span:\n{completion}"
     );
 }
 

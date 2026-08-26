@@ -84,7 +84,7 @@ pub fn run(
         Ok(version) => {
             let ok = SUPPORTED_OPENCODE_VERSIONS.contains(&version.as_str());
             if !ok {
-                eprintln!(
+                tracing::warn!(
                     "st2 opencode-session: version {version} is unverified (supported: {}); native delivery disabled",
                     SUPPORTED_OPENCODE_VERSIONS.join(", ")
                 );
@@ -92,7 +92,7 @@ pub fn run(
             ok
         }
         Err(error) => {
-            eprintln!("st2 opencode-session: cannot read opencode version: {error:#}");
+            tracing::warn!("st2 opencode-session: cannot read opencode version: {error:#}");
             false
         }
     };
@@ -215,7 +215,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 Ok(doc) => match check_openapi_subset(&doc) {
                     Ok(()) => api_ok = true,
                     Err(error) => {
-                        eprintln!("st2 opencode-session: API gate failed: {error:#}");
+                        tracing::warn!("st2 opencode-session: API gate failed: {error:#}");
                         // A failed shape check is terminal for this launch: the surface will not
                         // change until the binary does. Stop probing; run presence-only.
                         next_gate_attempt = Instant::now() + Duration::from_secs(3600);
@@ -972,7 +972,7 @@ impl Delivery {
 
     fn pump(&mut self, client: &Client) {
         if let Err(error) = self.pump_inner(client) {
-            eprintln!("st2 opencode-session: delivery: {error:#}");
+            tracing::warn!("st2 opencode-session: delivery: {error:#}");
         }
     }
 

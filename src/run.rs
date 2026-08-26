@@ -1245,7 +1245,7 @@ impl ParkChannel {
         let scope = match crate::park::SupervisorScope::current(catalog_root, host) {
             Ok(scope) => scope,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
                 );
                 return Self {
@@ -1257,7 +1257,7 @@ impl ParkChannel {
         let projection = match crate::park::ParkProjection::current(scope.park_dir()) {
             Ok(projection) => Some(projection),
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults for this supervisor."
                 );
                 None
@@ -1330,9 +1330,10 @@ fn driver_label(launch: &crate::reconcile::Launch<'_>, target: &TaskTarget) -> &
     // Legacy routed (`deliver "mcp"` → claude-session, ...) or hand-authored seats: inspect
     // the launch source by its alphanumeric tokens.
     let tokens = |needle: &str| match &target.launch {
-        TaskLaunch::Argv(argv) => argv
-            .iter()
-            .any(|arg| arg.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == needle)),
+        TaskLaunch::Argv(argv) => argv.iter().any(|arg| {
+            arg.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| t == needle)
+        }),
         TaskLaunch::Shell(command) => command
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|t| t == needle),
@@ -1761,6 +1762,38 @@ fn gate_harness_launches_on_hooks<'a, V>(
     }
 }
 
+/// Root span for one reconcile pass. Name stays exactly `st2.reconcile_pass`; field names map
+/// 1:1 onto the OTLP attribute keys the dashboards expect (`st2.host`, `st2.crash_loops`,
+/// `st2.unparked`). Counts are recorded after the pass via [`finish_reconcile_pass`].
+fn reconcile_span(this_host: &str) -> tracing::Span {
+    tracing::info_span!(
+        "st2.reconcile_pass",
+        "st2.host" = this_host,
+        "st2.crash_loops" = tracing::field::Empty,
+        "st2.unparked" = tracing::field::Empty,
+    )
+}
+
+/// Stamp pass outcome counts onto the reconcile span and emit the deterministic per-pass
+/// completion log (target `st2`, message `reconcile pass complete`, `result` field) so tests
+/// can assert logs without fault injection. Call while the span is entered.
+fn finish_reconcile_pass(span: &tracing::Span, report: &UpReport) {
+    span.record(
+        "st2.crash_loops",
+        i64::try_from(report.crash_loops.len()).unwrap_or(i64::MAX),
+    );
+    span.record(
+        "st2.unparked",
+        i64::try_from(report.unparked.len()).unwrap_or(i64::MAX),
+    );
+    let result = if report.errors.is_empty() {
+        "pass"
+    } else {
+        "fail"
+    };
+    tracing::info!(target: "st2", result, "reconcile pass complete");
+}
+
 /// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
@@ -1769,15 +1802,21 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let pass_span = crate::telemetry::PassSpan::start(this_host);
     let started = Instant::now();
-    let report = reconcile_pass(
-        root,
-        this_host,
-        &task_context,
-        runner,
-        &mut FlappingCap::default(),
-        &mut debounce,
-        &mut PresentationPatchCursor::default(),
-    );
+    let span = reconcile_span(this_host);
+    let report = {
+        let _entered = span.enter();
+        let report = reconcile_pass(
+            root,
+            this_host,
+            &task_context,
+            runner,
+            &mut FlappingCap::default(),
+            &mut debounce,
+            &mut PresentationPatchCursor::default(),
+        );
+        finish_reconcile_pass(&span, &report);
+        report
+    };
     pass_span.finish(report.crash_loops.len(), report.unparked.len());
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     Ok(report)
@@ -1857,19 +1896,27 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
 ) -> UpReport {
     let started = Instant::now();
     let pass_span = crate::telemetry::PassSpan::start(this_host);
+    let span = reconcile_span(this_host);
     let mut report = UpReport::default();
-    let now = Instant::now();
-    debounce.observe(sessions, now);
-    let mut plan = match crate::reconcile(specs, sessions, this_host) {
-        Ok(plan) => plan,
-        Err(error) => {
-            report.errors.push(error.to_string());
-            drop(pass_span);
-            crate::metrics::record_reconcile_pass(started.elapsed(), true);
-            return report;
+    {
+        let _entered = span.enter();
+        let now = Instant::now();
+        debounce.observe(sessions, now);
+        match crate::reconcile(specs, sessions, this_host) {
+            Ok(mut plan) => {
+                report.deferred = debounce.defer_flickers(&mut plan, now);
+                execute_with_presentation_cursor(
+                    &plan,
+                    runner,
+                    cap,
+                    presentation_cursor,
+                    &mut report,
+                );
+            }
+            Err(error) => report.errors.push(error.to_string()),
         }
-    };
-    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
+        finish_reconcile_pass(&span, &report);
+    }
     pass_span.finish(report.crash_loops.len(), report.unparked.len());
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     report
@@ -2032,7 +2079,7 @@ pub fn up_loop_specs(
                 // Counted once per park (the initial transition), not per pass: a task stays
                 // parked, so per-pass counting would inflate crash_loops_total unboundedly.
                 crate::metrics::record_crash_loop();
-                eprintln!(
+                tracing::error!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
@@ -2197,7 +2244,7 @@ fn best_effort_catalog_watcher(
     match crate::watch::watch_catalog_declarations(root, tx) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2: cannot watch catalog declarations: {error}; immediate catalog changes are unavailable, continuing with timer polling."
             );
             None
@@ -2277,15 +2324,21 @@ fn up_loop_until(
         let mut report = {
             let pass_span = crate::telemetry::PassSpan::start(this_host);
             let started = Instant::now();
-            let pass = reconcile_pass(
-                root,
-                this_host,
-                &task_context,
-                runner,
-                &mut cap,
-                &mut debounce,
-                &mut presentation_cursor,
-            );
+            let span = reconcile_span(this_host);
+            let pass = {
+                let _entered = span.enter();
+                let pass = reconcile_pass(
+                    root,
+                    this_host,
+                    &task_context,
+                    runner,
+                    &mut cap,
+                    &mut debounce,
+                    &mut presentation_cursor,
+                );
+                finish_reconcile_pass(&span, &pass);
+                pass
+            };
             pass_span.finish(pass.crash_loops.len(), pass.unparked.len());
             crate::metrics::record_reconcile_pass(started.elapsed(), !pass.errors.is_empty());
             pass
@@ -2307,7 +2360,7 @@ fn up_loop_until(
                 // Counted once per park (the initial transition), not per pass: a task stays
                 // parked, so per-pass counting would inflate crash_loops_total unboundedly.
                 crate::metrics::record_crash_loop();
-                eprintln!(
+                tracing::error!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
@@ -2340,7 +2393,7 @@ fn up_loop_until(
 pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
     let agent = cl.agent_bus_id(this_host);
     let Some(supervisor) = cl.supervisor.as_deref() else {
-        eprintln!(
+        tracing::warn!(
             "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
             cl.pty_id
         );
@@ -2348,7 +2401,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     };
     let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
     else {
-        eprintln!(
+        tracing::warn!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id
         );
@@ -2372,7 +2425,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         &tags,
         &body,
     ) {
-        eprintln!(
+        tracing::warn!(
             "st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}",
             cl.pty_id
         );
@@ -3586,11 +3639,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let output = output_with_timeout(
-            &mut Command::new(&executable),
-            Duration::from_secs(5),
-        )
-        .unwrap();
+        let output =
+            output_with_timeout(&mut Command::new(&executable), Duration::from_secs(5)).unwrap();
 
         assert_eq!(output.stdout.len(), CAPTURE_CAP_BYTES);
         assert!(
@@ -3634,7 +3684,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_shared_reaper_reaps_a_killed_child() {
-        let mut child = Command::new("sh").arg("-c").arg("sleep 60").spawn().unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .unwrap();
         let pid = child.id() as i32;
         unsafe {
             libc::kill(pid, libc::SIGKILL);

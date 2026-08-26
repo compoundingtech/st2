@@ -798,7 +798,7 @@ fn persist_floor(record_path: &Path, seq: u64) {
     if let Err(error) =
         fs::write(&staged, format!("{seq}\n")).and_then(|()| fs::rename(&staged, &floor_path))
     {
-        eprintln!(
+        tracing::warn!(
             "st2 harness-state: writing the sequence floor {} failed: {error}",
             floor_path.display()
         );

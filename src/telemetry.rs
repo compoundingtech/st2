@@ -5,14 +5,25 @@
 //! model is sync (no tokio), so the blocking reqwest client is mandatory — enabling both
 //! reqwest client features of `opentelemetry-otlp` 0.30 compiles but fails at runtime with
 //! `NoHttpClient` (all client cfg arms exclude each other).
+//!
+//! Spans and logs share one `tracing` subscriber (interview decision Q6): a human-readable
+//! stderr fmt layer runs unconditionally so diagnostics stay visible, and — behind the endpoint
+//! guard — a `tracing-opentelemetry` layer exports spans while `opentelemetry-appender-tracing`
+//! exports log records via an SDK logger provider. Logs emitted inside a span automatically
+//! carry its trace/span ids.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use opentelemetry::trace::{Span as _, Tracer as _};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::layer::SubscriberExt;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -45,22 +56,33 @@ fn duration_view(instrument: &Instrument) -> Option<Stream> {
     }
 }
 
-/// Guard holding the tracer and meter providers for a process lifetime. Dropping it flushes
-/// and shuts both exporters down so short-lived CLI invocations still deliver their spans
-/// and metric points.
+/// Guard holding the tracer, meter, and logger providers for a process lifetime. Dropping it
+/// flushes and shuts all three exporters down so short-lived CLI invocations still deliver
+/// their spans, metric points, and log records.
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 impl Telemetry {
     /// Initialize telemetry for one process unit (`supervisor`, `cli`, ...). The service name
     /// follows the central observability contract's process-unit boundary: `st2-<unit>`.
     pub fn init(unit: &str) -> Self {
+        // The stderr fmt layer is installed unconditionally — with or without an endpoint (see
+        // `install_subscriber`). Migrated `tracing` diagnostics must stay visible exactly when
+        // the old `eprintln!` calls were, so the unset-endpoint case keeps human-visible output
+        // rather than PR1's literal zero-output behavior (documented deviation, spec.md "Log
+        // bridge"). Level filtering defaults to INFO; `RUST_LOG` overrides it.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
         if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
+            install_subscriber(tracing_subscriber::registry().with(filter), None, None);
             return Self {
                 tracer_provider: None,
                 meter_provider: None,
+                logger_provider: None,
             };
         }
 
@@ -69,9 +91,11 @@ impl Telemetry {
             // Export setup must never take the runner down: telemetry is best-effort.
             Err(err) => {
                 eprintln!("st2: otel exporter unavailable, continuing without telemetry: {err}");
+                install_subscriber(tracing_subscriber::registry().with(filter), None, None);
                 return Self {
                     tracer_provider: None,
                     meter_provider: None,
+                    logger_provider: None,
                 };
             }
         };
@@ -90,6 +114,7 @@ impl Telemetry {
             .with_resource(resource.clone())
             .build();
         opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+        let otel_span_layer = OpenTelemetryLayer::new(tracer_provider.tracer("st2"));
 
         // Metrics share endpoint, protocol, and resource with traces. The periodic reader's
         // default interval only governs background collection — `shutdown` below force-flushes,
@@ -98,9 +123,15 @@ impl Telemetry {
             Ok(exporter) => exporter,
             Err(err) => {
                 eprintln!("st2: otel metric exporter unavailable, metrics disabled: {err}");
+                install_subscriber(
+                    tracing_subscriber::registry().with(filter),
+                    Some(otel_span_layer),
+                    None,
+                );
                 return Self {
                     tracer_provider: Some(tracer_provider),
                     meter_provider: None,
+                    logger_provider: None,
                 };
             }
         };
@@ -108,14 +139,37 @@ impl Telemetry {
         let meter_provider = SdkMeterProvider::builder()
             .with_reader(reader)
             .with_view(duration_view)
-            .with_resource(resource)
+            .with_resource(resource.clone())
             .build();
         opentelemetry::global::set_meter_provider(meter_provider.clone());
         crate::metrics::set_enabled(true);
         ENABLED.store(true, Ordering::Relaxed);
+
+        // Log records share endpoint, protocol, and resource too; the appender bridge maps
+        // `tracing` events onto OTLP logs and stamps the current span context onto them.
+        let logger_provider = match build_log_exporter() {
+            Ok(exporter) => Some(
+                SdkLoggerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(resource)
+                    .build(),
+            ),
+            Err(err) => {
+                eprintln!("st2: otel log exporter unavailable, logs disabled: {err}");
+                None
+            }
+        };
+
+        install_subscriber(
+            tracing_subscriber::registry().with(filter),
+            Some(otel_span_layer),
+            logger_provider.as_ref(),
+        );
+
         Self {
             tracer_provider: Some(tracer_provider),
             meter_provider: Some(meter_provider),
+            logger_provider,
         }
     }
 
@@ -124,12 +178,17 @@ impl Telemetry {
         self.tracer_provider.is_some()
     }
 
-    /// Flush pending spans and metric points, then stop both exporters. Safe to call multiple times.
+    /// Flush pending spans, metric points, and log records, then stop all exporters. Safe to
+    /// call multiple times.
     pub fn shutdown(&mut self) {
         if let Some(provider) = self.meter_provider.take() {
             let _ = provider.force_flush();
             let _ = provider.shutdown();
             crate::metrics::set_enabled(false);
+        }
+        if let Some(provider) = self.logger_provider.take() {
+            let _ = provider.force_flush();
+            let _ = provider.shutdown();
         }
         if let Some(provider) = self.tracer_provider.take() {
             let _ = provider.force_flush();
@@ -188,6 +247,24 @@ impl PassSpan {
     }
 }
 
+/// Install the global subscriber once: stderr fmt (always), span exporter layer, and log-record
+/// bridge behind the endpoint guard. A second `Telemetry::init` in the same process cannot
+/// replace it (`set_global_default` errors), which is fine: init runs once per entrypoint.
+fn install_subscriber<S>(
+    base: S,
+    span_layer: Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>,
+    logger_provider: Option<&SdkLoggerProvider>,
+) where
+    S: tracing::Subscriber + Send + Sync + 'static,
+    for<'a> S: tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let _ = tracing::subscriber::set_global_default(
+        base.with(span_layer)
+            .with(logger_provider.map(OpenTelemetryTracingBridge::new))
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr)),
+    );
+}
+
 /// OTLP/HTTP-JSON span exporter; blocking reqwest client only (module docs).
 fn build_span_exporter() -> Result<SpanExporter, opentelemetry_otlp::ExporterBuildError> {
     SpanExporter::builder()
@@ -199,6 +276,14 @@ fn build_span_exporter() -> Result<SpanExporter, opentelemetry_otlp::ExporterBui
 /// OTLP/HTTP-JSON metric exporter; same wire and client constraints as traces.
 fn build_metric_exporter() -> Result<MetricExporter, opentelemetry_otlp::ExporterBuildError> {
     MetricExporter::builder()
+        .with_http()
+        .with_protocol(opentelemetry_otlp::Protocol::HttpJson)
+        .build()
+}
+
+/// OTLP/HTTP-JSON log exporter; same wire and client constraints as traces/metrics.
+fn build_log_exporter() -> Result<LogExporter, opentelemetry_otlp::ExporterBuildError> {
+    LogExporter::builder()
         .with_http()
         .with_protocol(opentelemetry_otlp::Protocol::HttpJson)
         .build()

@@ -26,7 +26,7 @@ mod composer;
 mod harness;
 
 use crate::message::{self, Message};
-use crate::run::{CAPTURE_CAP_BYTES, reap_detached, read_bounded_tail};
+use crate::run::{CAPTURE_CAP_BYTES, read_bounded_tail, reap_detached};
 use crate::status;
 
 use composer::{ComposerState, classify_composer, classify_receipt};
@@ -474,7 +474,9 @@ fn transport_and_observe_with_window(
     // Preserve the accepted transport-first transaction. Once it starts, any command or
     // observation failure is ambiguous: the paste may have landed even if Return did not.
     if let Err(error) = transport() {
-        eprintln!("st2 ding: DING transport became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: DING transport became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
     observe_receipt_with_window(text, peek, poll, observation_window)
@@ -494,7 +496,7 @@ fn observe_receipt_with_window(
         let screen = match peek() {
             Ok(screen) => screen,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2 ding: post-submit receipt observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
@@ -523,7 +525,9 @@ fn retry_staged_with_window(
     let screen = match peek() {
         Ok(screen) => screen,
         Err(error) => {
-            eprintln!("st2 ding: staged retry observation failed; retaining ownership: {error}");
+            tracing::warn!(
+                "st2 ding: staged retry observation failed; retaining ownership: {error}"
+            );
             return Ok(PokeOutcome::Staged);
         }
     };
@@ -553,7 +557,7 @@ fn submit_retained_after_final_observation(
     let screen = match peek() {
         Ok(screen) => screen,
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2 ding: final retained-composer observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
@@ -568,11 +572,13 @@ fn submit_retained_after_final_observation(
         }
     }
     if let Err(error) = before_submit() {
-        eprintln!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
+        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
         return Ok(PokeOutcome::Staged);
     }
     if let Err(error) = submit() {
-        eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
     observe_receipt_with_window(text, peek, poll, observation_window)
@@ -629,7 +635,9 @@ fn observed_poke_with_window(
     // Once this command starts, success is ambiguous on any error or timeout: the paste may already
     // have reached the TUI. Preserve ownership and let retry_staged inspect instead of re-pasting.
     if let Err(error) = stage() {
-        eprintln!("st2 ding: paste command became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: paste command became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
 
@@ -638,7 +646,7 @@ fn observed_poke_with_window(
         let screen = match peek() {
             Ok(screen) => screen,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2 ding: post-paste observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
@@ -679,7 +687,7 @@ fn submit_after_final_observation(
     let screen = match peek() {
         Ok(screen) => screen,
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2 ding: final composer observation failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
@@ -695,11 +703,13 @@ fn submit_after_final_observation(
         }
     }
     if let Err(error) = before_submit() {
-        eprintln!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
+        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
         return Ok(PokeOutcome::Staged);
     }
     if let Err(error) = submit() {
-        eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
     observe_receipt_with_window(text, peek, poll, observation_window)
@@ -1051,7 +1061,9 @@ pub fn run_ding(
                         }
                         Ok(None) => startup_candidates = None,
                         Err(error) => {
-                            eprintln!("st2 ding: startup staged-notice adoption failed: {error}")
+                            tracing::warn!(
+                                "st2 ding: startup staged-notice adoption failed: {error}"
+                            )
                         }
                     }
                 }
@@ -1160,7 +1172,7 @@ fn flush_pending(
             }
             Ok(PokeOutcome::Deferred) => break,
             Err(error) => {
-                eprintln!("st2 ding: {error}");
+                tracing::warn!("st2 ding: {error}");
                 break;
             }
         }
