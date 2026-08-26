@@ -283,37 +283,44 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
     }
 }
 
-impl Worker {
-    fn apply_watch_sets(&mut self, sets: Vec<AgentWatchSet>) {
-        let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
-        for set in sets {
-            for carrier in set.carriers {
-                // Several agents may bind the same local file: every `(bus_id, label)`
-                // subscription at a path is retained, not replaced (`RESYNC-R01`). Subscribers
-                // already on record keep their digest and pending dirty state: a reconcile pass
-                // can land between a mutation and its flush window, and reseeding here would
-                // silently erase that event (`RESYNC-R03` protects the baseline, not mid-flight
-                // transitions). Only genuinely unknown subscriptions seed silently.
-                let mut existing = self.carriers.remove(&carrier.path).unwrap_or_default();
-                let (kept, dropped): (Vec<_>, Vec<_>) = existing.drain(..).partition(|entry| {
+fn rebuild_carriers(
+    mut previous: BTreeMap<PathBuf, Vec<Entry>>,
+    sets: Vec<AgentWatchSet>,
+) -> BTreeMap<PathBuf, Vec<Entry>> {
+    let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
+    for set in sets {
+        for carrier in set.carriers {
+            // Several agents may bind the same local file: every `(bus_id, label)`
+            // subscription at a path is retained, not replaced (`RESYNC-R01`). Subscribers
+            // already on record keep their digest and pending dirty state: a reconcile pass
+            // can land between a mutation and its flush window, and reseeding here would
+            // silently erase that event (`RESYNC-R03` protects the baseline, not mid-flight
+            // transitions). Only genuinely unknown subscriptions seed silently.
+            let existing = previous.entry(carrier.path.clone()).or_default();
+            let retained = existing
+                .iter()
+                .position(|entry| {
                     entry.bus_id == set.bus_id
                         && entry.label == carrier.label
                         && entry.class == carrier.class
-                });
-                drop(dropped);
-                if kept.is_empty() {
-                    next.entry(carrier.path.clone()).or_default().push(Entry {
-                        bus_id: set.bus_id.clone(),
-                        label: carrier.label.clone(),
-                        class: carrier.class,
-                        digest: read_digest(&carrier.path),
-                        dirty: false,
-                    });
-                } else {
-                    next.entry(carrier.path.clone()).or_default().extend(kept);
-                }
-            }
+                })
+                .map(|index| existing.remove(index));
+            let entry = retained.unwrap_or_else(|| Entry {
+                bus_id: set.bus_id.clone(),
+                label: carrier.label.clone(),
+                class: carrier.class,
+                digest: read_digest(&carrier.path),
+                dirty: false,
+            });
+            next.entry(carrier.path).or_default().push(entry);
         }
+    }
+    next
+}
+
+impl Worker {
+    fn apply_watch_sets(&mut self, sets: Vec<AgentWatchSet>) {
+        let mut next = rebuild_carriers(std::mem::take(&mut self.carriers), sets);
         if self.watcher.is_none() {
             self.diff_emit(&mut next);
         }
@@ -511,15 +518,10 @@ impl Worker {
     }
 }
 
-/// The event identity covers the whole rendered transition, not just the new bytes: an
-/// A→B→A oscillation reuses B's content digest as the `new` half but always pairs it with the
-/// previous digest here, so every distinct transition is one immutable `(stream, event-id)`
-/// identity and repeated identities render byte-identical bodies.
-fn transition_identity(old: Option<&str>, new_digest: &str) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!("{}:{new_digest}", old.unwrap_or("seeded")))
-    )
+/// Hash the complete rendered transition so one `(stream, event-id)` can never identify
+/// different bindings, paths, or digest transitions.
+fn transition_identity(body: &str) -> String {
+    format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
 /// One superseded resync event through the unchanged stream ingress (`RESYNC-R06`).
@@ -533,7 +535,8 @@ fn emit_resync(
     new_digest: &str,
 ) {
     let subject = format!("resource {label} changed");
-    let event_id = transition_identity(old, new_digest);
+    let body = render_body(label, path, old, new_digest);
+    let event_id = transition_identity(&body);
     let receipt = crate::event::emit(
         root,
         this_host,
@@ -542,7 +545,7 @@ fn emit_resync(
         &event_id,
         Some(label),
         Some(subject.as_str()),
-        &render_body(label, path, old, new_digest),
+        &body,
         true,
     );
     if let Err(error) = receipt {
@@ -619,22 +622,87 @@ mod tests {
     }
 
     #[test]
-    fn transition_identity_is_unique_per_transition_and_stable_per_replay() {
-        let a = "aaaa";
-        let b = "bbbb";
+    fn shared_path_refresh_preserves_every_subscription_state() {
+        let shared = PathBuf::from("/shared/resource.md");
+        let previous = BTreeMap::from([(
+            shared.clone(),
+            vec![
+                Entry {
+                    bus_id: "host.alpha".to_owned(),
+                    label: "goal".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: Some("alpha-before".to_owned()),
+                    dirty: true,
+                },
+                Entry {
+                    bus_id: "host.beta".to_owned(),
+                    label: "spec".to_owned(),
+                    class: CarrierClass::Coalesced,
+                    digest: Some("beta-before".to_owned()),
+                    dirty: true,
+                },
+            ],
+        )]);
+        let sets = vec![
+            AgentWatchSet {
+                bus_id: "host.alpha".to_owned(),
+                carriers: vec![WatchableCarrier {
+                    label: "goal".to_owned(),
+                    path: shared.clone(),
+                    class: CarrierClass::Immediate,
+                }],
+            },
+            AgentWatchSet {
+                bus_id: "host.beta".to_owned(),
+                carriers: vec![WatchableCarrier {
+                    label: "spec".to_owned(),
+                    path: shared.clone(),
+                    class: CarrierClass::Coalesced,
+                }],
+            },
+        ];
+
+        let rebuilt = rebuild_carriers(previous, sets);
+        let entries = rebuilt.get(&shared).expect("shared path remains watched");
+        assert_eq!(entries.len(), 2);
+        for (bus_id, digest) in [
+            ("host.alpha", "alpha-before"),
+            ("host.beta", "beta-before"),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.bus_id == bus_id)
+                .expect("subscriber remains present");
+            assert_eq!(entry.digest.as_deref(), Some(digest));
+            assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
+        }
+    }
+
+    #[test]
+    fn transition_identity_covers_the_rendered_binding_transition() {
+        let a_to_b = render_body("goal", Path::new("/agent/goal.md"), Some("aaaa"), "bbbb");
+        let b_to_a = render_body("goal", Path::new("/agent/goal.md"), Some("bbbb"), "aaaa");
+        assert_ne!(transition_identity(&a_to_b), transition_identity(&b_to_a));
+        assert_eq!(transition_identity(&b_to_a), transition_identity(&b_to_a));
+
+        let first_arrival = render_body("goal", Path::new("/agent/goal.md"), None, "aaaa");
         assert_ne!(
-            transition_identity(Some(a), b),
-            transition_identity(Some(b), a)
+            transition_identity(&first_arrival),
+            transition_identity(&b_to_a),
+            "the rollback leg differs from the original arrival"
         );
-        assert_eq!(
-            transition_identity(Some(b), a),
-            transition_identity(Some(b), a)
-        );
-        // The rollback leg of an oscillation differs from the original arrival even though the
-        // new-bytes digest is the same — the body's `old` field matches the pairing here.
+        let other_binding =
+            render_body("spec", Path::new("/agent/goal.md"), Some("aaaa"), "bbbb");
         assert_ne!(
-            transition_identity(None, a),
-            transition_identity(Some(b), a)
+            transition_identity(&a_to_b),
+            transition_identity(&other_binding),
+            "different bindings with the same bytes must have different identities"
+        );
+        let other_path = render_body("goal", Path::new("/other/goal.md"), Some("aaaa"), "bbbb");
+        assert_ne!(
+            transition_identity(&a_to_b),
+            transition_identity(&other_path),
+            "different rendered paths must have different identities"
         );
     }
 
