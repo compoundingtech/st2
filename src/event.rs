@@ -94,6 +94,11 @@ struct ResolvedStream {
     recipient: String,
 }
 
+enum StreamAdmission {
+    Declared,
+    BuiltinResync,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamOwnerIncarnation {
     catalog_lock_device: u64,
@@ -245,6 +250,7 @@ fn resolve_stream(
     this_host: &str,
     recipient: &str,
     stream: &str,
+    admission: StreamAdmission,
 ) -> anyhow::Result<ResolvedStream> {
     let discovered = crate::discover_strict(root);
     anyhow::ensure!(
@@ -289,12 +295,17 @@ fn resolve_stream(
         spec.bus_id(this_host),
         spec.resolved_host(this_host)
     );
-    anyhow::ensure!(
-        stream == crate::resync::RESYNC_STREAM
-            || spec.streams.iter().any(|declared| declared.name == stream),
-        "agent '{}' does not declare stream '{stream}'",
-        spec.bus_id(this_host),
-    );
+    match admission {
+        StreamAdmission::Declared => anyhow::ensure!(
+            spec.streams.iter().any(|declared| declared.name == stream),
+            "agent '{}' does not declare stream '{stream}'",
+            spec.bus_id(this_host),
+        ),
+        StreamAdmission::BuiltinResync => anyhow::ensure!(
+            stream == crate::resync::RESYNC_STREAM,
+            "built-in resync admission requires the reserved resync stream"
+        ),
+    }
     anyhow::ensure!(
         spec.desired_state.is_running(),
         "agent '{}' is {}; refusing event while its eyes are closed",
@@ -344,6 +355,58 @@ pub fn emit(
     body: &str,
     supersede: bool,
 ) -> anyhow::Result<EventReceipt> {
+    emit_admitted(
+        root,
+        this_host,
+        recipient,
+        stream,
+        event_id,
+        key,
+        subject,
+        body,
+        supersede,
+        StreamAdmission::Declared,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_builtin_resync(
+    root: &Path,
+    this_host: &str,
+    recipient: &str,
+    event_id: &str,
+    key: Option<&str>,
+    subject: Option<&str>,
+    body: &str,
+    supersede: bool,
+) -> anyhow::Result<EventReceipt> {
+    emit_admitted(
+        root,
+        this_host,
+        recipient,
+        crate::resync::RESYNC_STREAM,
+        event_id,
+        key,
+        subject,
+        body,
+        supersede,
+        StreamAdmission::BuiltinResync,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_admitted(
+    root: &Path,
+    this_host: &str,
+    recipient: &str,
+    stream: &str,
+    event_id: &str,
+    key: Option<&str>,
+    subject: Option<&str>,
+    body: &str,
+    supersede: bool,
+    admission: StreamAdmission,
+) -> anyhow::Result<EventReceipt> {
     validate_component("stream", stream)?;
     validate_component("event id", event_id)?;
     if let Some(key) = key {
@@ -356,7 +419,7 @@ pub fn emit(
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
     let catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
     validate_owner_binding(root, this_host, &catalog_lock)?;
-    let resolved = resolve_stream(root, this_host, recipient, stream)?;
+    let resolved = resolve_stream(root, this_host, recipient, stream, admission)?;
     let canonical_recipient = resolved.recipient;
     let from = format!("{canonical_recipient}/{stream}");
     let rendered = render_event(&from, subject, stream, event_id, key, body);

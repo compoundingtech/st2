@@ -102,9 +102,11 @@ root [`R05`](../requirements.md); Resource bindings are defined by
   head.
 - **RESYNC-R07 Built-in stream:** The `resync` stream exists on every agent
   without declaration and is reserved: a user-declared stream of that name is
-  refused. Publication reuses the implemented ingress unchanged — ring
-  deduplication, receipt validation, supersession semantics, ordinary inbox
-  transport, and the DING `»` marker all inherited from [`STREAM-R03..R07`](../04-stream/requirements.md).
+  refused. Only the supervisor's crate-internal publisher admits the built-in
+  stream; public event ingress remains declaration-gated. After that admission,
+  publication reuses the ordinary ring deduplication, receipt validation,
+  supersession semantics, inbox transport, and DING `»` marker inherited from
+  [`STREAM-R03..R07`](../04-stream/requirements.md).
 - **RESYNC-R08 Lifecycle honesty:** No events accumulate for suspended or
   retired agents. Digest seeding happens when a seat launches or resumes, so
   resume re-observes current state silently and only later transitions notify.

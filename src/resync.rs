@@ -1,8 +1,9 @@
 //! Resync events: supervisor-emitted notifications when a live agent's declared resource carriers
 //! change on disk ([`06-resync`](../docs/vrs/06-resync/spec.md)).
 //!
-//! Delivery rides the declared-stream ingress (`st2::event::emit`) through the built-in reserved
-//! `resync` stream that exists on every running agent without declaration. Watching is
+//! Delivery rides the event-stream machinery through a crate-internal admission for the built-in
+//! reserved `resync` stream that exists on every running agent without declaration. Public event
+//! ingress remains declaration-gated. Watching is
 //! deny-by-default: one non-recursive watch per distinct parent directory of the resolved
 //! watchable carriers, so whole-file replacement by rename stays visible through the surviving
 //! directory inode. Digest state is seeded silently when a reconcile pass installs a watch set;
@@ -19,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 
 use agent_spec::spec::AgentSpec;
 
-/// The built-in stream every running agent accepts without declaring it.
+/// The reserved stream used only by the supervisor's crate-internal resync publisher.
 pub const RESYNC_STREAM: &str = "resync";
 
 /// Provisional coalescing windows (`RESYNC-T02`): tuned by observed notification volume.
@@ -880,7 +881,7 @@ fn transition_identity(body: &str) -> String {
     format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
-/// One superseded resync event through the unchanged stream ingress (`RESYNC-R06`).
+/// One superseded resync event through the supervisor-only built-in admission (`RESYNC-R06`).
 fn emit_resync(
     root: &Path,
     this_host: &str,
@@ -888,11 +889,10 @@ fn emit_resync(
     transition: &PendingTransition,
 ) -> bool {
     let subject = format!("resource {} changed", transition.binding);
-    match crate::event::emit(
+    match crate::event::emit_builtin_resync(
         root,
         this_host,
         bus_id,
-        RESYNC_STREAM,
         &transition.event_id,
         Some(&transition.binding),
         Some(subject.as_str()),
