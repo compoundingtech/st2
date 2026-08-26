@@ -1552,33 +1552,34 @@ impl LivenessDebounce {
     }
 }
 
-/// Specs whose canonical agent seat this pass proved live. Desired state alone is not evidence:
-/// adopted seats were already observed alive, while launched/restarted ids record successful spawns.
+/// Specs whose canonical agent seat this pass proved live. Desired state and whole-spec adoption
+/// are not evidence: the canonical task itself must have been observed alive or spawned successfully.
 fn live_resync_specs(
     specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
+    sessions: &[Session],
     report: &UpReport,
 ) -> Vec<agent_spec::spec::AgentSpec> {
-    let live_task_ids = report
-        .launched
+    let live_task_ids = sessions
         .iter()
-        .chain(&report.restarted)
-        .map(String::as_str)
+        .filter(|session| session.alive)
+        .map(|session| session.pty_id.as_str())
+        .chain(report.launched.iter().map(String::as_str))
+        .chain(report.restarted.iter().map(String::as_str))
         .collect::<HashSet<_>>();
     specs
         .iter()
         .filter(|spec| {
-            report.adopted.contains(&spec.identity)
-                || spec.tasks.iter().any(|task| {
-                    if task.name != "agent" {
-                        return false;
-                    }
-                    let task_id = task
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
-                    live_task_ids.contains(task_id.as_str())
-                })
+            spec.tasks.iter().any(|task| {
+                if task.name != "agent" {
+                    return false;
+                }
+                let task_id = task
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                live_task_ids.contains(task_id.as_str())
+            })
         })
         .cloned()
         .collect()
@@ -1611,10 +1612,6 @@ fn reconcile_pass(
         }
     };
     let found = crate::discover(root);
-    if let Some(resync) = resync {
-        // Fail closed until this pass proves which desired agents actually have live seats.
-        resync.refresh(&[], this_host);
-    }
     let mut report = UpReport {
         warnings: found.warnings.clone(),
         errors: found
@@ -1711,7 +1708,7 @@ fn reconcile_pass(
     execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
     if let Some(resync) = resync {
         resync.refresh(
-            &live_resync_specs(&found.specs, this_host, &report),
+            &live_resync_specs(&found.specs, this_host, &sessions, &report),
             this_host,
         );
     }
@@ -3024,12 +3021,19 @@ mod tests {
         };
         let specs = vec![
             spec("desired", None),
-            spec("adopted", None),
+            spec("dead-adopted", None),
+            spec("observed-live", None),
             spec("launched", None),
             spec("restarted", Some("custom-seat")),
         ];
+        let sessions = vec![
+            sess("hetz.dead-adopted.agent", false),
+            // A live canonical seat remains eligible even when a missing companion means the
+            // whole spec was not adopted and the companion later fails to launch.
+            sess("hetz.observed-live.agent", true),
+        ];
         let report = UpReport {
-            adopted: vec!["adopted".into()],
+            adopted: vec!["dead-adopted".into()],
             launched: vec![
                 "hetz.launched.agent".into(),
                 // A successfully launched companion is not evidence of a live agent seat.
@@ -3039,11 +3043,11 @@ mod tests {
             ..UpReport::default()
         };
 
-        let eligible = live_resync_specs(&specs, "hetz", &report)
+        let eligible = live_resync_specs(&specs, "hetz", &sessions, &report)
             .into_iter()
             .map(|spec| spec.identity)
             .collect::<Vec<_>>();
-        assert_eq!(eligible, vec!["adopted", "launched", "restarted"]);
+        assert_eq!(eligible, vec!["observed-live", "launched", "restarted"]);
     }
 
     #[test]
