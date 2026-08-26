@@ -47,6 +47,40 @@ fn run_with_capture(
         .expect("run st2 up --once under otelite")
 }
 
+/// Flatten an OTLP/HTTP-JSON `ExportMetricsServiceRequest` into its metric records.
+fn metric_records(line: &str) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return records;
+    };
+    let Some(resource_metrics) = value.get("resourceMetrics").and_then(|v| v.as_array()) else {
+        return records;
+    };
+    for resource_metric in resource_metrics {
+        let Some(scope_metrics) =
+            resource_metric.get("scopeMetrics").and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        for scope_metric in scope_metrics {
+            if let Some(batch) = scope_metric.get("metrics").and_then(|v| v.as_array()) {
+                records.extend(batch.iter().cloned());
+            }
+        }
+    }
+    records
+}
+
+/// A data point's string-valued attribute by key, if present.
+fn string_attr<'a>(point: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    point["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attr| attr["key"].as_str() == Some(key))?["value"]
+        .get("stringValue")
+        .and_then(|v| v.as_str())
+}
+
 #[test]
 fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     let Some(otelite) = std::env::var_os("ST2_OTELITE_BIN").map(PathBuf::from) else {
@@ -87,15 +121,36 @@ fn st2_exports_spans_to_otelite_when_endpoint_is_set() {
     // duration histogram sample.
     let metrics =
         std::fs::read_to_string(cap_dir.join("metrics.ndjson")).expect("metrics.ndjson written");
-    for expected_name in ["reconcile_passes_total", "reconcile_pass_duration_seconds"] {
-        assert!(
-            metrics.contains(&format!("\"name\":\"{expected_name}\"")),
-            "metric `{expected_name}` missing from capture:\n{metrics}"
-        );
-    }
-    assert!(
-        metrics.contains(r#""key":"result","value":{"stringValue":"pass"}"#),
-        "reconcile passes counter must carry result=pass:\n{metrics}"
+    let all_metrics: Vec<serde_json::Value> =
+        metrics.lines().flat_map(metric_records).collect();
+
+    let passes = all_metrics
+        .iter()
+        .find(|m| m["name"].as_str() == Some("reconcile_passes_total"))
+        .expect("reconcile passes counter missing from capture");
+    let pass_point = &passes["sum"]["dataPoints"][0];
+    assert_eq!(
+        string_attr(pass_point, "result"),
+        Some("pass"),
+        "reconcile passes counter must carry result=pass:\n{passes}"
+    );
+
+    // The view must replace the SDK's millisecond-tuned default boundaries with seconds-scale
+    // buckets, or every sub-second pass sample collapses into the lowest bucket (P2).
+    let duration = all_metrics
+        .iter()
+        .find(|m| m["name"].as_str() == Some("reconcile_pass_duration_seconds"))
+        .expect("reconcile pass duration histogram missing from capture");
+    let bounds = &duration["histogram"]["dataPoints"][0]["explicitBounds"];
+    assert_eq!(
+        bounds.as_array().map(Vec::len),
+        Some(12),
+        "duration histogram must carry the 12 seconds-scale boundaries:\n{duration}"
+    );
+    assert_eq!(
+        bounds[0].as_f64(),
+        Some(0.001),
+        "lowest duration bucket must be 1ms, not the SDK default:\n{duration}"
     );
 }
 
