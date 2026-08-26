@@ -1318,7 +1318,7 @@ fn stop_live_derived_companions(
 /// Bounded driver label for lifecycle metrics (`task_launches_total` / `task_reaps_total`).
 /// Typed drivers report their own name; legacy routed and hand-authored seats are classified
 /// by what their launch actually invokes. Anything unrecognizable collapses to `other`, so
-/// the label stays a closed set: `codex|claude|opencode|pi|exec|other`. Observational only —
+/// the label stays a closed set: `codex|claude|opencode|pi|omp|exec|other`. Observational only —
 /// callers gate on [`crate::metrics::enabled`], and it never influences reconcile decisions.
 fn driver_label(launch: &crate::reconcile::Launch<'_>, target: &TaskTarget) -> &'static str {
     if target.kind == TaskKind::Exec {
@@ -1343,6 +1343,8 @@ fn driver_label(launch: &crate::reconcile::Launch<'_>, target: &TaskTarget) -> &
         "claude"
     } else if tokens("opencode") {
         "opencode"
+    } else if tokens("omp") {
+        "omp"
     } else if tokens("pi") {
         "pi"
     } else {
@@ -2397,7 +2399,9 @@ pub fn detect_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+    use agent_spec::spec::{
+        AgentSpec, Driver, JobType, OmpDriver, Task, TaskKind, TaskLifecycle,
+    };
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
@@ -3023,6 +3027,59 @@ mod tests {
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }
+    }
+
+    #[test]
+    fn driver_labels_include_typed_and_argv_omp_but_remain_bounded() {
+        let legacy_spec = spec_fixture();
+        let legacy_launch = Launch {
+            spec: &legacy_spec,
+            tasks: Vec::new(),
+            live_derived: Vec::new(),
+        };
+        let mut omp_argv = target("hetz.demo.agent", "unused");
+        omp_argv.launch = TaskLaunch::Argv(vec![
+            "st2".into(),
+            "driver".into(),
+            "omp-session".into(),
+        ]);
+        let mut exec = target("hetz.demo.agent", "codex");
+        exec.kind = TaskKind::Exec;
+        let targets = [
+            target("hetz.demo.agent", "codex"),
+            target("hetz.demo.agent", "claude"),
+            target("hetz.demo.agent", "opencode"),
+            target("hetz.demo.agent", "pi"),
+            omp_argv,
+            exec,
+            target("hetz.demo.agent", "unrecognized"),
+        ];
+        let labels = targets
+            .iter()
+            .map(|target| driver_label(&legacy_launch, target))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            labels,
+            BTreeSet::from(["codex", "claude", "opencode", "pi", "omp", "exec", "other"])
+        );
+
+        let mut typed_spec = spec_fixture();
+        typed_spec.driver = Some(Driver::Omp(OmpDriver {
+            model: None,
+            effort: None,
+            prompt: String::new(),
+            args: Vec::new(),
+        }));
+        let typed_launch = Launch {
+            spec: &typed_spec,
+            tasks: Vec::new(),
+            live_derived: Vec::new(),
+        };
+        assert_eq!(
+            driver_label(&typed_launch, &target("hetz.demo.agent", "claude")),
+            "omp",
+            "typed driver identity must take precedence over argv heuristics"
+        );
     }
 
     #[test]

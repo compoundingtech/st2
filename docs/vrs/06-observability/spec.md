@@ -88,7 +88,7 @@ the instruments; every record call early-outs unless a meter provider is install
 | Instrument | Type | Labels |
 | --- | --- | --- |
 | `reconcile_passes_total` | counter | `result` = `pass` \| `fail` |
-| `task_launches_total` | counter | `driver` = `codex` \| `claude` \| `opencode` \| `pi` \| `exec` \| `other` |
+| `task_launches_total` | counter | `driver` = `codex` \| `claude` \| `opencode` \| `pi` \| `omp` \| `exec` \| `other` |
 | `task_reaps_total` | counter | `driver` (same enum as launches) |
 | `hook_invocations_total` | counter | `hook` = registry name (`claude-observe`), `event` = bounded Claude hook-event set, unknown → `other` |
 | `message_deliveries_total` | counter | `result` = `pass` \| `fail` |
@@ -109,7 +109,7 @@ are separate follow-ups. Hook invocations are observed at the single in-process 
 point (`st2 driver claude-observe`); hook scripts the harnesses execute directly are not
 visible to st2. The `driver` label is a closed enum resolved by precedence: `exec` task kind
 first, then a typed driver declaration, then an observational argv/shell token heuristic
-(alphanumeric tokens matched in launch order: `codex`, `claude`, `opencode`, `pi`; anything
+(alphanumeric tokens matched in launch order: `codex`, `claude`, `opencode`, `omp`, `pi`; anything
 else → `other`). Because the heuristic inspects arbitrary user work, a hand-authored seat may
 be labeled by what its command line merely mentions — the label is diagnostic only and never
 influences reconcile decisions.
