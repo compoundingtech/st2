@@ -33,7 +33,7 @@ The CLI reads a folder only when a person gives it to `st3 import` or `st3 eval`
 
 ### One graph accepts subgraph publishes
 
-st3 has one graph. A document publishes the complete desired state of each named subject.
+st3 has one graph. An intent publishes the complete desired state of each named subject.
 
 The daemon derives a patch by comparing each published state with its selected current revision.
 
@@ -131,7 +131,9 @@ The reconciler does not poll the clock or wake itself to search for work.
 
 `st3 import ./catalog` reads the named catalog. `st3 eval ./cell` reads the named eval cell.
 
-The CLI makes a deterministic upload bundle from that explicit path and its exact `doc/` references. It does not discover other files.
+The CLI makes a deterministic input from that explicit path. It does not read paths named by `doc/` references or discover other files.
+
+`st3 doc put FILE --as doc/NAME` is the separate, explicit operation that reads and posts document bytes.
 
 The daemon has no synced catalog folder. It never watches, discovers, or interprets filesystem changes as intent.
 
@@ -154,7 +156,7 @@ st3 has these components:
 
 The CLI contains no reducer, planner, reconciler, or judge logic.
 
-The daemon does not read source repositories or catalog folders. A client sends KDL bytes or an explicit bundle.
+The daemon does not read source repositories or catalog folders. A client sends KDL bytes or an explicit eval bundle.
 
 The import and eval CLI commands read only the path that the person supplied.
 
@@ -269,8 +271,9 @@ The API uses these common failures:
 
 | Method and path | Accepts | Returns |
 |---|---|---|
-| `POST /v1/intent/plan` | Subgraph KDL, referenced text documents, and an optional snapshot index | Normalized desired states, the derived patch, subject tokens, predicted actions, and blockers |
-| `POST /v1/intent/apply` | KDL, referenced text documents, subject tokens, and an idempotency key | New subject tokens, the batch, claim IDs, and reconcile subjects |
+| `POST /v1/documents` | A document name, UTF-8 bytes, an expected document token, and an idempotency key | The blob hash, canonical reference, document token, and binding claim ID |
+| `POST /v1/intent/plan` | Subgraph KDL with stored document references and an optional snapshot index | The hash-pinned intent, desired states, derived patch, subject tokens, predicted actions, and blockers |
+| `POST /v1/intent/apply` | Hash-pinned KDL, subject tokens, and an idempotency key | New subject tokens, the batch, claim IDs, and reconcile subjects |
 | `GET /v1/status` | Optional subject, scope, and local snapshot selectors | Selected desired state, losing revisions, actual state, gaps, reachability, and checkpoints |
 | `GET /v1/claims` | A subject or scope, an index range, and a page cursor | Immutable claim envelopes in local index order |
 | `POST /v1/claims` | A typed observation, optional actor, evidence claim IDs, and idempotency key | The durable claim ID and store index |
@@ -295,6 +298,11 @@ SubjectToken {
     intent_heads: SortedSet<Hash>
 }
 
+DocumentToken {
+    subject: Subject
+    binding_heads: SortedSet<Hash>
+}
+
 SubjectDesiredState {
     subject: Subject
     kind: DesiredKind
@@ -305,14 +313,22 @@ IntentInput {
     media_type: "application/vnd.st3.intent+kdl"
     source_name: String
     bytes: Bytes
-    documents: [DocumentInput]
 }
 
-DocumentInput {
+DocumentPutRequest {
     name: String
     media_type: "text/plain; charset=utf-8"
     bytes: Bytes
-    sha256: Hash
+    expected_document: DocumentToken
+    idempotency_key: String
+}
+
+DocumentPutResponse {
+    blob_hash: Hash
+    canonical_reference: String
+    document_token: DocumentToken
+    binding_claim_id: Hash
+    store_index: u64
 }
 
 PlanIntentRequest {
@@ -328,6 +344,7 @@ ApplyIntentRequest {
 
 PlanIntentResponse {
     snapshot_index: u64
+    resolved_intent: IntentInput
     subject_tokens: [SubjectToken]
     normalized_subgraph_digest: Hash
     normalized_desired_states: [SubjectDesiredState]
@@ -350,6 +367,12 @@ ApplyIntentResponse {
 `POST /v1/intent/plan` never appends a claim and never starts a driver.
 
 `POST /v1/intent/apply` parses and validates again inside the write transaction.
+
+`POST /v1/documents` stores the blob and publishes its name binding atomically. It publishes no intent subject.
+
+Posting the same bytes under the same name is a no-op. Posting different bytes requires the current document token.
+
+The document response returns the exact hash token that KDL references use after `@`.
 
 Any host can plan and accept an authorized publish from the claims that it currently knows.
 
@@ -383,6 +406,7 @@ StatusView {
 SubjectStatus {
     subject: String
     intent_token: SubjectToken
+    document_token: Option<DocumentToken>
     intent_state: "clean" | "conflicted"
     winning_revision: Option<Hash>
     losing_revisions: [Hash]
@@ -404,6 +428,8 @@ The response always separates desired state, actual state, and the gap reason fo
 `SubjectToken` uses claim hashes. It is stable across hosts and gives wall-clock time no ordering meaning.
 
 This token is the per-subject compare-and-swap index for a write on one node.
+
+`DocumentToken` uses the selected document binding heads. It provides the same compare-and-swap rule for `st3 doc put`.
 
 Two writes to different subjects never conflict. Audit claims do not change an intent head.
 
@@ -602,7 +628,7 @@ Use a scheduled message for that query. Do not add a usage poll.
 
 Every command accepts `--endpoint`. It selects a local socket or an authenticated Fabric endpoint.
 
-`st3 run FILE` reads one file and its exact document references. Standard input is valid only when it contains no document reference.
+`st3 run FILE` reads one KDL file. It never reads a filesystem path from a document reference.
 
 The command does not retry a stale subject token. It prints the changed subject and asks the caller to review a new plan.
 
@@ -611,31 +637,29 @@ To stop a member, the document publishes desired stopped state. No command or AP
 ```text
 run(file, expected_subjects?, json):
     bytes = read_exact_file_or_stdin(file)
-    references = parse_exact_document_references(bytes)
-    documents = read_referenced_text_files(file.parent, references)
-    intent = { bytes, documents }
+    preview = POST /v1/intent/plan { intent: { bytes } }
+    if preview.blockers is not empty:
+        print(preview.blockers)
+        exit 3
     if expected_subjects is absent:
-        preview = POST /v1/intent/plan { intent }
-        if preview.blockers is not empty:
-            print(preview.blockers)
-            exit 3
         expected_subjects = preview.subject_tokens
     result = POST /v1/intent/apply {
-        intent,
+        intent: preview.resolved_intent,
         expected_subjects,
-        idempotency_key: hash(intent, expected_subjects, caller_origin)
+        idempotency_key: hash(preview.resolved_intent, expected_subjects, caller_origin)
     }
     print(result)
 ```
 
-`st3 plan FILE` calls only the plan endpoint. It returns zero when the document is valid, even when changes exist.
+`st3 plan FILE` calls only the plan endpoint. It shows each bare document name as its resolved name-and-hash reference.
+
+It returns zero when the document is valid, even when changes exist.
 
 ```text
 plan(file, at_index?, json):
     bytes = read_exact_file_or_stdin(file)
-    documents = read_referenced_text_files(file.parent, parse_exact_document_references(bytes))
-    result = POST /v1/intent/plan { intent: { bytes, documents }, at_index }
-    print(result.normalized_diff, result.predicted_actions, result.blockers)
+    result = POST /v1/intent/plan { intent: { bytes }, at_index }
+    print(result.resolved_intent, result.normalized_diff, result.predicted_actions, result.blockers)
 ```
 
 `st3 import CATALOG` reads only the named folder. It combines its new-format KDL files into one deterministic publish.
@@ -643,12 +667,32 @@ plan(file, at_index?, json):
 ```text
 import(catalog, json):
     files = read_declared_kdl_tree(catalog)
-    documents = read_referenced_text_files(catalog, parse_all_document_references(files))
-    bundle = normalize_import(files, documents)
-    return run(bundle, json)
+    intent = normalize_import(files)
+    return run(intent, json)
 ```
 
 The daemon receives the resulting bytes. It does not retain, sync, or watch the source folder.
+
+`st3 doc put FILE --as doc/NAME` reads only `FILE`. It posts the document before any intent references it.
+
+```text
+doc_put(file, name, json):
+    bytes = read_exact_utf8_file(file)
+    expected_document = GET /v1/status { subject: name }.subject_token_or_empty
+    result = POST /v1/documents {
+        name,
+        bytes,
+        expected_document,
+        idempotency_key: hash(name, bytes, expected_document, caller_origin)
+    }
+    print(result.blob_hash)
+```
+
+The command refuses an absolute name, `..`, a symbolic-link source, invalid UTF-8, and an oversized document.
+
+The command hashes the local bytes before posting. It warns when that hash differs from the selected binding for the name.
+
+The warning shows both hashes. The post still succeeds and returns the new hash for the authored KDL reference.
 
 `st3 status [SUBJECT]` calls the status endpoint. `--at INDEX` gives a reproducible historical view.
 
@@ -802,7 +846,7 @@ CREATE TABLE reducer_cache (
 
 Database permissions deny other users. SQLite triggers reject `UPDATE` and `DELETE` on every truth table.
 
-Large eval assets live in `blobs`. A claim names each required blob by hash.
+Posted documents and large eval assets live in `blobs`. A claim names each required blob by hash.
 
 The server derives `reconcile_input` from the claim kind registry. It does not trust a value from a client or peer.
 
@@ -883,7 +927,7 @@ The first implementation needs these state-bearing claim families:
 - `intent.schedule` publishes one declared message schedule.
 - `intent.checkpoints`, `intent.link`, and `intent.supervisor` publish their typed policy subjects.
 - `intent.resource`, `intent.host`, `intent.person`, and `intent.account` publish observed-subject declarations.
-- `resource.binding` binds a role-named resource subject to a concrete external resource ID.
+- `resource.binding` binds a role-named resource subject to a concrete external resource ID or document blob hash.
 - `resource.file-observed` records an on-demand file read for a judge.
 - `resource.session-bound` relates a harness session-file resource to one member incarnation.
 - `actor.action-observed` records an external action and names its person or account actor.
@@ -2061,19 +2105,38 @@ An inline message is UTF-8 text of at most 4 KiB. A longer instruction must use 
 
 ### Document references
 
-A `content` value that starts with `doc/` names one text file at that exact relative bundle path.
+A document is posted before an intent references it:
 
-The CLI reads only referenced document paths. It does not discover sibling files or follow a directory recursively.
+```text
+st3 doc put ./stage-1.md --as doc/release-work/stage-1
+-> 4e81b7a0
 
-A document path cannot be absolute, contain `..`, or resolve through a symbolic link. A document must be valid UTF-8.
+content "doc/release-work/stage-1@4e81b7a0"
+```
 
-Version 1 accepts at most 1 MiB for one document and 16 MiB for the complete intent bundle.
+A `content` value can use `doc/NAME@HASH`. `HASH` is the exact token returned by `st3 doc put`.
 
-The publish uploads the bytes and records their blob hash. The normalized message revision cites that immutable hash.
+The part before `@` must be a valid `doc/` subject. The reference cannot contain a filesystem path.
+
+A hash-pinned reference names its immutable blob directly. A later binding for the same name does not change that reference.
+
+Planning and apply always honor a valid hash-pinned reference when its blob is available.
+
+Apply does not compare the hash with the selected name binding. It never uploads or rebinds a document.
+
+A bare `doc/NAME` is valid authoring shorthand for the selected binding at the planning snapshot.
+
+The plan response replaces every bare reference with `doc/NAME@HASH`. The published form always contains that hash.
+
+`st3 run` applies the plan response. A binding change after planning does not change or invalidate the resolved reference.
+
+The normalized message revision stores the document name and full blob hash. It never stores an unpinned name.
+
+`st3 doc put` accepts valid UTF-8 text of at most 1 MiB. An intent KDL input can contain at most 16 MiB.
 
 The `doc/` name is a resource role with kind `document`. Its binding claim records the selected blob hash.
 
-Publishing different bytes under the same document name creates a new binding claim. Prior bindings and message revisions remain visible.
+Posting different bytes under the same document name creates a new binding claim. Prior bindings and message revisions remain visible.
 
 Document text is opaque. It cannot declare subjects, create graph edges, or expand another document reference.
 
@@ -2311,7 +2374,7 @@ The parser refuses every shape not accepted above. These cross-node refusals are
 13. A pattern uses an unknown operator, a wrong scalar type, an invalid field path, or an unsupported subject type.
 14. A direct stop targets an observed or structure subject. Scope and schedule stops must use their typed block forms.
 15. Any singular field repeats, or any unknown node, property, child, type annotation, or extra argument occurs.
-16. A document reference is missing, non-text, oversized, outside the bundle, or resolves through a symbolic link.
+16. A document reference has an invalid name or hash, or its immutable blob is unavailable to the authorized reader.
 
 Planning also reports unresolved referenced subjects and offline hosts. These are blockers or reachability states, not inferred declarations.
 
@@ -2319,7 +2382,9 @@ st3 never infers a member. An authoring skill or user interface must produce the
 
 ### Plain agent example
 
-The following three examples match the settled reference files.
+The following three examples use the settled reference KDL.
+
+The multi-stage comments include Nathan's later correction that a hash-pinned reference always names its immutable blob.
 
 ```kdl
 // One agent. Nothing here is a default.
@@ -2388,7 +2453,7 @@ subgraph {
       subgraph {
         message "release-work/kickoff" {
           to "agent/worker-1.release-owner"
-          content "doc/release-work/brief"
+          content "doc/release-work/brief@9f2a3c1d"
         }
       }
       judges {
@@ -2400,7 +2465,7 @@ subgraph {
       subgraph {
         message "release-work/stage-1" {
           to "agent/worker-1.release-owner"
-          content "doc/release-work/stage-1"
+          content "doc/release-work/stage-1@4e81b7a0"
         }
       }
       judges {
@@ -2443,9 +2508,14 @@ subgraph {
   }
 }
 
-// doc/release-work/stage-1 names a blob. A publish uploads the bytes and the
-// reference becomes their hash, so an agent on any machine reads the same
-// bytes the plan meant.
+// A document is posted before it is referenced:
+//
+//     st3 doc put ./stage-1.md --as doc/release-work/stage-1   ->  4e81b7a0
+//
+// A pinned reference always names that exact blob, whatever doc/release-work/
+// stage-1 points at now. A new version is a new hash: post, take the hash,
+// update the reference. st3 doc put warns when the local file no longer
+// matches the hash the plan cites.
 //
 // Concurrent stages are separate documents and separate checkpoints.
 //
@@ -2457,7 +2527,7 @@ The resource name is a role. A resource observation later ties it to the concret
 
 The first two checkpoints ask the owner through messages. The observation-only checkpoints contain no subgraph.
 
-Each `doc/` reference becomes an immutable uploaded blob. The LLM judge posts its verdict through the typed API.
+Each `doc/` reference selects a previously posted immutable blob. The LLM judge posts its verdict through the typed API.
 
 ### Team eval example
 
@@ -2540,7 +2610,7 @@ subgraph {
         message "message/team-42/kickoff" {
           from "requester"
           to "team.sup-42"
-          content "doc/team-review-42/task"
+          content "doc/team-review-42/task@b30f5ce2"
         }
       }
       judges {
@@ -2621,7 +2691,9 @@ It converts file checks to `has` and `lacks` over full file subjects. It convert
 
 It moves the old eval deadline to `deadline` inside the applicable judges block.
 
-It moves long message text to deterministic `doc/` paths. The parity report compares each source text with its uploaded blob.
+It posts long message text under deterministic `doc/` names and writes each returned hash into the converted KDL.
+
+The parity report compares each source text with its posted blob.
 
 It preserves every mechanical `exec` shell command. It adds the explicit host and workspace that ran the old judge.
 
