@@ -7,7 +7,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # `nix flake check` builds the package plus every checks.* on contended
+    # shared builders; 30m was cancelled mid-build with the otel-export check added.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
