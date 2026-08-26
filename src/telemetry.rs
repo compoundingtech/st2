@@ -23,7 +23,7 @@ use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer as _, SubscriberExt};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -73,12 +73,19 @@ impl Telemetry {
         // `install_subscriber`). Migrated `tracing` diagnostics must stay visible exactly when
         // the old `eprintln!` calls were, so the unset-endpoint case keeps human-visible output
         // rather than PR1's literal zero-output behavior (documented deviation, spec.md "Log
-        // bridge"). Level filtering defaults to INFO; `RUST_LOG` overrides it.
+        // bridge"). Level filtering defaults to INFO; `RUST_LOG` overrides it — on the stderr
+        // fmt layer ONLY (see `install_subscriber`), so stderr verbosity can never silence
+        // OTel span/log export (export-side sampling is a separate decision).
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
         if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
-            install_subscriber(tracing_subscriber::registry().with(filter), None, None);
+            install_subscriber(
+                tracing_subscriber::registry(),
+                None,
+                None,
+                filter,
+            );
             return Self {
                 tracer_provider: None,
                 meter_provider: None,
@@ -91,7 +98,12 @@ impl Telemetry {
             // Export setup must never take the runner down: telemetry is best-effort.
             Err(err) => {
                 eprintln!("st2: otel exporter unavailable, continuing without telemetry: {err}");
-                install_subscriber(tracing_subscriber::registry().with(filter), None, None);
+                install_subscriber(
+                    tracing_subscriber::registry(),
+                    None,
+                    None,
+                    filter,
+                );
                 return Self {
                     tracer_provider: None,
                     meter_provider: None,
@@ -116,34 +128,31 @@ impl Telemetry {
         opentelemetry::global::set_tracer_provider(tracer_provider.clone());
         let otel_span_layer = OpenTelemetryLayer::new(tracer_provider.tracer("st2"));
 
-        // Metrics share endpoint, protocol, and resource with traces. The periodic reader's
-        // default interval only governs background collection — `shutdown` below force-flushes,
-        // so short-lived CLI runs still deliver their points.
-        let meter_exporter = match build_metric_exporter() {
-            Ok(exporter) => exporter,
+        // Metrics share endpoint, protocol, and resource with traces. Metric setup is
+        // best-effort: if its exporter fails to build (e.g. malformed
+        // `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`), metrics are disabled but span and log
+        // export must continue. The periodic reader's default interval only governs
+        // background collection — `shutdown` below force-flushes, so short-lived CLI runs
+        // still deliver their points.
+        let meter_provider = match build_metric_exporter() {
+            Ok(exporter) => {
+                let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
+                let meter_provider = SdkMeterProvider::builder()
+                    .with_reader(reader)
+                    .with_view(duration_view)
+                    .with_resource(resource.clone())
+                    .build();
+                opentelemetry::global::set_meter_provider(meter_provider.clone());
+                crate::metrics::set_enabled(true);
+                ENABLED.store(true, Ordering::Relaxed);
+                Some(meter_provider)
+            }
             Err(err) => {
                 eprintln!("st2: otel metric exporter unavailable, metrics disabled: {err}");
-                install_subscriber(
-                    tracing_subscriber::registry().with(filter),
-                    Some(otel_span_layer),
-                    None,
-                );
-                return Self {
-                    tracer_provider: Some(tracer_provider),
-                    meter_provider: None,
-                    logger_provider: None,
-                };
+                None
             }
         };
-        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(meter_exporter).build();
-        let meter_provider = SdkMeterProvider::builder()
-            .with_reader(reader)
-            .with_view(duration_view)
-            .with_resource(resource.clone())
-            .build();
-        opentelemetry::global::set_meter_provider(meter_provider.clone());
-        crate::metrics::set_enabled(true);
-        ENABLED.store(true, Ordering::Relaxed);
+
 
         // Log records share endpoint, protocol, and resource too; the appender bridge maps
         // `tracing` events onto OTLP logs and stamps the current span context onto them.
@@ -161,14 +170,15 @@ impl Telemetry {
         };
 
         install_subscriber(
-            tracing_subscriber::registry().with(filter),
+            tracing_subscriber::registry(),
             Some(otel_span_layer),
             logger_provider.as_ref(),
+            filter,
         );
 
         Self {
             tracer_provider: Some(tracer_provider),
-            meter_provider: Some(meter_provider),
+            meter_provider,
             logger_provider,
         }
     }
@@ -254,14 +264,36 @@ fn install_subscriber<S>(
     base: S,
     span_layer: Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>,
     logger_provider: Option<&SdkLoggerProvider>,
+    filter: tracing_subscriber::EnvFilter,
 ) where
     S: tracing::Subscriber + Send + Sync + 'static,
     for<'a> S: tracing_subscriber::registry::LookupSpan<'a>,
 {
+    // The stderr layer's `EnvFilter` is scoped to that layer only: `RUST_LOG` is a
+    // stderr-noise knob and can never silently disable OTLP export.
+    //
+    // The OpenTelemetry layers carry their own static filter, likewise independent of
+    // `RUST_LOG`, that silences ONLY the exporters' own instrumentation targets. Those
+    // cannot pass through the layers they feed: `opentelemetry_sdk`'s BatchLogProcessor
+    // emits tracing events from inside its own `emit` (channel-full/shutdown notices), so
+    // an event arriving via the log bridge would re-enter the same processor and recurse
+    // until the export thread overflows its stack. App signals are exported unfiltered;
+    // export-side sampling remains a separate decision.
+    let otel_filter = tracing_subscriber::EnvFilter::new(
+        "trace,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_http=off,opentelemetry_otlp=off",
+    );
     let _ = tracing::subscriber::set_global_default(
-        base.with(span_layer)
-            .with(logger_provider.map(OpenTelemetryTracingBridge::new))
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr)),
+        base.with(span_layer.with_filter(otel_filter.clone()))
+            .with(
+                logger_provider
+                    .map(OpenTelemetryTracingBridge::new)
+                    .with_filter(otel_filter),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(filter),
+            ),
     );
 }
 
