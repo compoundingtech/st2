@@ -140,6 +140,7 @@ fn classify(agent_dir: &Path, binding_name: &str, path: &Path) -> Option<Carrier
 enum Msg {
     WatchSet(Vec<AgentWatchSet>),
     Mutations(Vec<PathBuf>),
+    Rescan,
     /// Explicit stop: the worker's own watcher holds the last `Sender`, so `Disconnected`
     /// would stay unreachable while `join` waits.
     Shutdown,
@@ -241,15 +242,23 @@ struct Worker {
     watcher: Option<notify::RecommendedWatcher>,
 }
 
+fn forward_watch_result(forward: &Sender<Msg>, result: notify::Result<notify::Event>) {
+    match result {
+        Ok(event) if is_mutation(&event) => {
+            let _ = forward.send(Msg::Mutations(event.paths));
+        }
+        Ok(_) => {}
+        Err(_) => {
+            // A backend error can mean events were dropped. Re-read every subscribed carrier:
+            // digest equality suppresses false positives while changed bytes still notify.
+            let _ = forward.send(Msg::Rescan);
+        }
+    }
+}
+
 fn make_watcher(forward: Sender<Msg>) -> Option<notify::RecommendedWatcher> {
     notify::RecommendedWatcher::new(
-        move |result: notify::Result<notify::Event>| {
-            if let Ok(event) = result {
-                if is_mutation(&event) {
-                    let _ = forward.send(Msg::Mutations(event.paths.clone()));
-                }
-            }
-        },
+        move |result| forward_watch_result(&forward, result),
         notify::Config::default().with_follow_symlinks(false),
     )
     .ok()
@@ -275,6 +284,7 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
         match rx.recv_timeout(timeout) {
             Ok(Msg::WatchSet(sets)) => worker.apply_watch_sets(sets),
             Ok(Msg::Mutations(paths)) => worker.mark_mutated(paths),
+            Ok(Msg::Rescan) => worker.rescan_all(),
             Ok(Msg::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -394,6 +404,13 @@ impl Worker {
             })
             .cloned()
             .collect();
+        for path in paths {
+            self.flush_path(&path, None);
+        }
+    }
+
+    fn rescan_all(&mut self) {
+        let paths: Vec<PathBuf> = self.carriers.keys().cloned().collect();
         for path in paths {
             self.flush_path(&path, None);
         }
@@ -744,6 +761,53 @@ mod tests {
             assert_eq!(entry.digest.as_deref(), Some(digest));
             assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
         }
+    }
+
+    #[test]
+    fn notify_backend_error_rescans_every_carrier_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/hetz/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let goal = resources.join("goal.md");
+        std::fs::write(&goal, "before\n").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
+
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "hetz".to_owned(),
+            carriers: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.apply_watch_sets(vec![watch_set_for(&discover(root.path()), "hetz")]);
+        std::fs::write(&goal, "after\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        forward_watch_result(&tx, Err(notify::Error::generic("backend dropped events")));
+        match rx.recv().unwrap() {
+            Msg::Rescan => worker.rescan_all(),
+            _ => panic!("a notify backend error must request a full digest rescan"),
+        }
+
+        let inbox = resources.join("inbox");
+        let events = std::fs::read_dir(inbox)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("stream: resync"));
+        assert!(events[0].contains("binding: goal"));
     }
 
     #[cfg(unix)]

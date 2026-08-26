@@ -1552,6 +1552,38 @@ impl LivenessDebounce {
     }
 }
 
+/// Specs whose canonical agent seat this pass proved live. Desired state alone is not evidence:
+/// adopted seats were already observed alive, while launched/restarted ids record successful spawns.
+fn live_resync_specs(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    report: &UpReport,
+) -> Vec<agent_spec::spec::AgentSpec> {
+    let live_task_ids = report
+        .launched
+        .iter()
+        .chain(&report.restarted)
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    specs
+        .iter()
+        .filter(|spec| {
+            report.adopted.contains(&spec.identity)
+                || spec.tasks.iter().any(|task| {
+                    if task.name != "agent" {
+                        return false;
+                    }
+                    let task_id = task
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                    live_task_ids.contains(task_id.as_str())
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 /// One full reconcile pass: discover → list actual → reconcile → execute. On a `pty list` failure the
 /// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
@@ -1580,7 +1612,8 @@ fn reconcile_pass(
     };
     let found = crate::discover(root);
     if let Some(resync) = resync {
-        resync.refresh(&found.specs, this_host);
+        // Fail closed until this pass proves which desired agents actually have live seats.
+        resync.refresh(&[], this_host);
     }
     let mut report = UpReport {
         warnings: found.warnings.clone(),
@@ -1676,6 +1709,12 @@ fn reconcile_pass(
         None => Ok(()),
     });
     execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
+    if let Some(resync) = resync {
+        resync.refresh(
+            &live_resync_specs(&found.specs, this_host, &report),
+            this_host,
+        );
+    }
     report
 }
 
@@ -2961,6 +3000,50 @@ mod tests {
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }
+    }
+
+    #[test]
+    fn resync_watch_eligibility_requires_a_proven_live_agent_seat() {
+        let spec = |identity: &str, explicit_id: Option<&str>| {
+            let mut spec = spec_fixture();
+            spec.identity = identity.to_owned();
+            spec.tasks = vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: explicit_id.map(str::to_owned),
+                command: Some("agent".into()),
+                argv: None,
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            }];
+            spec
+        };
+        let specs = vec![
+            spec("desired", None),
+            spec("adopted", None),
+            spec("launched", None),
+            spec("restarted", Some("custom-seat")),
+        ];
+        let report = UpReport {
+            adopted: vec!["adopted".into()],
+            launched: vec![
+                "hetz.launched.agent".into(),
+                // A successfully launched companion is not evidence of a live agent seat.
+                "hetz.desired.ding".into(),
+            ],
+            restarted: vec!["custom-seat".into()],
+            ..UpReport::default()
+        };
+
+        let eligible = live_resync_specs(&specs, "hetz", &report)
+            .into_iter()
+            .map(|spec| spec.identity)
+            .collect::<Vec<_>>();
+        assert_eq!(eligible, vec!["adopted", "launched", "restarted"]);
     }
 
     #[test]
