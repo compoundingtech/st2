@@ -203,6 +203,9 @@ struct Entry {
     label: String,
     class: CarrierClass,
     digest: Option<String>,
+    /// Exact target digest of a publication that failed. Retry this transition before observing
+    /// any newer carrier contents so a durable pending stream reservation can be completed.
+    pending_digest: Option<String>,
     dirty: bool,
 }
 
@@ -320,6 +323,7 @@ fn rebuild_carriers(
                 label: carrier.label.clone(),
                 class: carrier.class,
                 digest: read_digest(&carrier.path),
+                pending_digest: None,
                 dirty: false,
             });
             next.entry(carrier.path).or_default().push(entry);
@@ -540,12 +544,19 @@ impl Worker {
                 continue;
             }
             entry.dirty = false;
-            let Some(new_digest) = read_digest(path) else {
-                // Unreadable right now (deleted mid-window): stay quiet and keep the previous
-                // digest, so a later reappearance still counts as a change.
-                continue;
+            let observed_digest = read_digest(path);
+            let target_digest = match (&entry.pending_digest, &observed_digest) {
+                (Some(pending), _) => pending.clone(),
+                (None, Some(observed)) => observed.clone(),
+                (None, None) => {
+                    // Unreadable right now (deleted mid-window): stay quiet and keep the previous
+                    // digest, so a later reappearance still counts as a change.
+                    continue;
+                }
             };
-            if entry.digest.as_deref() == Some(new_digest.as_str()) {
+            if entry.pending_digest.is_none()
+                && entry.digest.as_deref() == Some(target_digest.as_str())
+            {
                 continue;
             }
             if emit_resync(
@@ -555,10 +566,21 @@ impl Worker {
                 &entry.label,
                 path,
                 entry.digest.as_deref(),
-                &new_digest,
+                &target_digest,
             ) {
-                entry.digest = Some(new_digest);
+                entry.digest = Some(target_digest.clone());
+                entry.pending_digest = None;
+                // The carrier may have advanced while an older failed transition was pending.
+                // Complete that immutable transition first, then schedule the newly observed one.
+                if observed_digest
+                    .as_deref()
+                    .is_some_and(|observed| observed != target_digest.as_str())
+                {
+                    entry.dirty = true;
+                    retries.push(entry.class);
+                }
             } else {
+                entry.pending_digest = Some(target_digest);
                 entry.dirty = true;
                 retries.push(entry.class);
             }
@@ -616,16 +638,27 @@ fn emit_resync(
 }
 
 fn read_digest(path: &Path) -> Option<String> {
-    let bytes = read_regular(path)?;
-    Some(format!("{:x}", Sha256::digest(&bytes)))
+    read_regular(path)
+}
+
+fn hash_reader(mut file: std::fs::File) -> Option<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(unix)]
-fn read_regular(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read as _;
+fn read_regular(path: &Path) -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
@@ -633,17 +666,16 @@ fn read_regular(path: &Path) -> Option<Vec<u8>> {
     if !file.metadata().ok()?.file_type().is_file() {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+    hash_reader(file)
 }
 
 #[cfg(not(unix))]
-fn read_regular(path: &Path) -> Option<Vec<u8>> {
-    if !std::fs::metadata(path).ok()?.file_type().is_file() {
+fn read_regular(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
         return None;
     }
-    std::fs::read(path).ok()
+    hash_reader(file)
 }
 
 fn render_body(label: &str, path: &Path, old: Option<&str>, new: &str) -> String {
@@ -717,6 +749,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("alpha-before".to_owned()),
+                    pending_digest: None,
                     dirty: true,
                 },
                 Entry {
@@ -725,6 +758,7 @@ mod tests {
                     class: CarrierClass::Coalesced,
                     digest: Some("beta-before".to_owned()),
                     dirty: true,
+                    pending_digest: None,
                 },
             ],
         )]);
@@ -836,6 +870,7 @@ mod tests {
                 label: format!("{class:?}"),
                 class,
                 digest: digest.clone(),
+                pending_digest: None,
                 dirty: true,
             })
             .collect();
@@ -870,6 +905,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),
+                    pending_digest: None,
                     dirty: true,
                 }],
             )]),
@@ -879,8 +915,19 @@ mod tests {
         };
 
         worker.flush_path(&carrier, None);
+        let pending_digest = worker.carriers[&carrier][0]
+            .pending_digest
+            .clone()
+            .expect("failed transition target is retained");
+        std::fs::write(&carrier, "newer bytes").unwrap();
+        worker.flush_path(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.digest.as_deref(), Some("old-digest"));
+        assert_eq!(
+            entry.pending_digest.as_deref(),
+            Some(pending_digest.as_str()),
+            "a retry must replay the original target even after the carrier advances"
+        );
         assert!(entry.dirty);
         assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
     }
