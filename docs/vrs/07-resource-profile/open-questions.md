@@ -1,0 +1,21 @@
+# Resource Profile open questions
+
+The registry/SDK boundary (Q8) and wasm-only foundation (Q10) are accepted and
+therefore are not open questions.
+
+- **DQ-P1 ABI compatibility.** The core-wasm ABI has three exports but no
+  version negotiation. Before independently released third-party modules need
+  compatibility guarantees, define old-guest/new-host and new-guest/old-host
+  behavior and prove it with a compatibility matrix. Tracked in the
+  [spec](./spec.md#design-questions).
+- **DQ-P2 Runtime observability.** `try_resolve` distinguishes a registry miss
+  from a registered resolver failure, but the production resync convenience
+  path currently degrades failures to unwatchable without a structured event.
+  Resolve from dogfood evidence with low-volume spans/logs/metrics that separate
+  feature-disabled builds, module defects, traps/fuel, malformed returns, and
+  containment violations.
+- **DQ-P3 Module replacement.** Compiled modules are cached by path for the
+  registry lifetime. Determine whether activation-style replacement of wasm
+  bytes at the same path must invalidate a resident cache and whether path,
+  inode, content digest, or catalog generation owns that lifecycle. Resolve
+  with a replacement experiment before specifying hot reload.

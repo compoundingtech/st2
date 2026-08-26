@@ -194,27 +194,32 @@ An agent may directly declare zero or more generic Resource bindings:
 resource "work" uri="github-issue://example/project/123" reason="release work item"
 ```
 
-The positional name is an agent-local semantic role. `reason` explains why the reference belongs
-to this agent (required; optional `inactive-reason` retains inactive bindings). `uri` is the exact RFC 3986 absolute resource
-identity, preserved byte-for-byte without normalization, and its scheme selects the open,
-downstream-owned Resource profile.
-Declaration order has no meaning and binding names are unique within one
-agent. A Resource URI may be referenced by any number of agent declarations.
-The public `agent-spec` read model preserves the bindings in name order across
-canonical KDL and the supported TOML/JSON forms. `st2 agents --json` projects
-the same descriptors for language-neutral inspection.
+The positional name is an agent-local semantic role. `reason` explains why the
+reference belongs to this agent (required; optional `inactive-reason` retains
+inactive bindings). `uri` is the exact RFC 3986 absolute Resource identity,
+preserved byte-for-byte without normalization. Declaration order has no meaning
+and binding names are unique within one agent. A Resource URI may be referenced
+by any number of agent declarations. The public `agent-spec` read model
+preserves the bindings in name order across canonical KDL and the supported
+TOML/JSON forms. `st2 agents --json` projects the same descriptors for
+language-neutral inspection.
 
-st2 validates only this portable envelope. It does not register schemes, define downstream profile
-schemas, resolve targets, infer authority from URI possession, or attach
-required/optional, access, readiness, or lifecycle semantics. Those concerns
-remain outside the generic binding contract. A Resource binding is declaration
-metadata and is absent from task launch targets; changing only Resource
+The generic binding envelope does not register schemes, resolve targets, infer
+authority from URI possession, or attach required/optional, access, readiness,
+or lifecycle semantics. Its scheme is, however, the exact lookup key for an
+optional catalog-declared Resource Profile. The built-in registry is empty;
+unregistered schemes stay opaque. Registered schemes resolve through the
+feature-gated wasm-only SDK boundary specified by
+[`07-resource-profile`](07-resource-profile/spec.md) and may supply a contained
+local path plus resync notification class. Scheme semantics and profile modules
+remain downstream-owned.
+
+A Resource binding and its optional resolution are declaration/observation
+metadata and are absent from task launch targets. Changing only Resource
 bindings adopts an already-live task without stop, replacement, or relaunch.
-
-The unresolved-resource runtime discussion remains tracked in
-[st2#60](https://github.com/compoundingtech/st2/issues/60), read-oriented
-renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/61),
-and the portable Agent Spec envelope in
+Read-oriented renderer integration remains tracked in
+[st2#61](https://github.com/compoundingtech/st2/issues/61), and the portable
+Agent Spec envelope in
 [evals#41](https://github.com/compoundingtech/evals/issues/41).
 
 ## Transactional catalog authoring
