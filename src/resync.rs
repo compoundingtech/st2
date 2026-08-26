@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -238,6 +238,7 @@ struct WatchRefresh {
 
 enum Msg {
     WatchSet(WatchRefresh),
+    Install(AgentWatchSet, Sender<()>),
     Mutations(Vec<PathBuf>),
     Rescan,
     /// Explicit stop: the worker's own watcher holds the last `Sender`, so `Disconnected`
@@ -295,6 +296,24 @@ impl ResyncSupervisor {
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(Msg::WatchSet(refresh));
+        }
+    }
+
+    /// Synchronously install one newly proven-live canonical seat before reconciliation advances
+    /// to another launch target. The acknowledgement closes the gap between a successful spawn and
+    /// the worker's silent baseline seed; later full refreshes still own removals and malformed
+    /// declaration retention.
+    pub fn install_live(&self, spec: &AgentSpec, this_host: &str) {
+        if spec.resolved_host(this_host) != this_host || !spec.desired_state.is_running() {
+            return;
+        }
+        let (ack_tx, ack_rx) = channel();
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(Msg::Install(watch_set_for(spec, this_host), ack_tx)).is_ok())
+        {
+            let _ = ack_rx.recv();
         }
     }
 }
@@ -448,6 +467,10 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
             .unwrap_or(Duration::from_secs(3600));
         match rx.recv_timeout(timeout) {
             Ok(Msg::WatchSet(refresh)) => worker.apply_watch_sets(refresh),
+            Ok(Msg::Install(set, ack)) => {
+                worker.install_watch_set(set);
+                let _ = ack.send(());
+            }
             Ok(Msg::Mutations(paths)) => worker.mark_mutated(paths),
             Ok(Msg::Rescan) => worker.rescan_all(),
             Ok(Msg::Shutdown) => break,
@@ -545,8 +568,10 @@ fn rebuild_carriers(
 }
 
 impl Worker {
-    fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
-        let previous = std::mem::take(&mut self.carriers);
+    fn prepare_carrier_update(
+        &mut self,
+        previous: &BTreeMap<PathBuf, Vec<Entry>>,
+    ) -> BTreeMap<SubscriptionIdentity, PathBuf> {
         // The active entries can disappear entirely while an agent is suspended. Retain only the
         // scalar sequence floor per recipient/binding identity for this supervisor lifetime;
         // watches and carrier baselines remain exclusively in the active carrier map.
@@ -557,7 +582,7 @@ impl Worker {
                 .and_modify(|sequence| *sequence = (*sequence).max(entry.occurrence_sequence))
                 .or_insert(entry.occurrence_sequence);
         }
-        let previous_paths = previous
+        previous
             .iter()
             .flat_map(|(path, entries)| {
                 entries.iter().map(|entry| {
@@ -567,15 +592,17 @@ impl Worker {
                     )
                 })
             })
-            .collect::<BTreeMap<_, _>>();
-        self.carriers =
-            rebuild_carriers(previous, refresh, &self.subscription_sequences);
+            .collect()
+    }
 
+    fn finish_carrier_update(
+        &mut self,
+        previous_paths: &BTreeMap<SubscriptionIdentity, PathBuf>,
+    ) {
         let rebound_paths = self
             .carriers
             .iter()
             .flat_map(|(path, entries)| {
-                let previous_paths = &previous_paths;
                 entries.iter().filter_map(move |entry| {
                     previous_paths
                         .get(&(entry.bus_id.clone(), entry.label.clone()))
@@ -600,6 +627,46 @@ impl Worker {
         // Registration closes the event gap first; this second digest pass covers writes between
         // the pre-registration poll and watch installation.
         self.poll_registered(&registered);
+    }
+
+    fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
+        let previous = std::mem::take(&mut self.carriers);
+        let previous_paths = self.prepare_carrier_update(&previous);
+        self.carriers = rebuild_carriers(previous, refresh, &self.subscription_sequences);
+        self.finish_carrier_update(&previous_paths);
+    }
+
+    fn install_watch_set(&mut self, set: AgentWatchSet) {
+        let replaced_bus_id = set.bus_id.clone();
+        let previous = std::mem::take(&mut self.carriers);
+        let previous_paths = self.prepare_carrier_update(&previous);
+        let mut retained = BTreeMap::<PathBuf, Vec<Entry>>::new();
+        let mut unaffected = BTreeMap::<PathBuf, Vec<Entry>>::new();
+        for (path, entries) in previous {
+            let (matching, other): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|entry| entry.bus_id == replaced_bus_id);
+            if !matching.is_empty() {
+                retained.insert(path.clone(), matching);
+            }
+            if !other.is_empty() {
+                unaffected.insert(path, other);
+            }
+        }
+        let replacement = rebuild_carriers(
+            retained,
+            WatchRefresh {
+                sets: vec![set],
+                malformed_declarations: BTreeSet::new(),
+                live_task_ids: BTreeSet::new(),
+            },
+            &self.subscription_sequences,
+        );
+        for (path, entries) in replacement {
+            unaffected.entry(path).or_default().extend(entries);
+        }
+        self.carriers = unaffected;
+        self.finish_carrier_update(&previous_paths);
     }
 
     fn reconcile_dirty_deadlines(&mut self, now: Instant) {

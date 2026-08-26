@@ -1307,6 +1307,7 @@ pub fn execute(
         cap,
         &mut PresentationPatchCursor::default(),
         report,
+        &mut |_| {},
     );
 }
 
@@ -1369,6 +1370,7 @@ fn execute_with_presentation_cursor(
     cap: &mut FlappingCap,
     presentation_cursor: &mut PresentationPatchCursor,
     report: &mut UpReport,
+    on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
@@ -1472,6 +1474,9 @@ fn execute_with_presentation_cursor(
                     }
                     if target.name == "agent" && !target.derived {
                         agent_available = true;
+                        // Baseline the canonical seat synchronously at the exact transition that
+                        // made it live. A later target may block while its carriers keep changing.
+                        on_canonical_live(launch.spec);
                     }
                 }
                 Err(e) => {
@@ -1840,7 +1845,27 @@ fn reconcile_pass(
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute_reconcile(&plan, runner, cap, presentation_cursor, &mut report);
+    if let Some(resync) = resync {
+        // Existing canonical seats are established by this pass's observation. Install them before
+        // executing unrelated repairs; targeted upserts preserve every retained baseline and
+        // pending transition.
+        for spec in live_resync_specs(&found.specs, this_host, &sessions, &report) {
+            resync.install_live(&spec, this_host);
+        }
+    }
+    let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
+        if let Some(resync) = resync {
+            resync.install_live(spec, this_host);
+        }
+    };
+    execute_reconcile(
+        &plan,
+        runner,
+        cap,
+        presentation_cursor,
+        &mut report,
+        &mut install_new_live_seat,
+    );
     if let Some(resync) = resync {
         let malformed_declarations = found
             .errors
@@ -2033,13 +2058,21 @@ fn execute_reconcile(
     cap: &mut FlappingCap,
     presentation_cursor: &mut PresentationPatchCursor,
     report: &mut UpReport,
+    on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
     let span = reconcile_execute_span();
     let before = span
         .as_ref()
         .map(|_| (report.warnings.len(), report.errors.len()));
     let _entered = span.as_ref().map(tracing::Span::enter);
-    execute_with_presentation_cursor(plan, runner, cap, presentation_cursor, report);
+    execute_with_presentation_cursor(
+        plan,
+        runner,
+        cap,
+        presentation_cursor,
+        report,
+        on_canonical_live,
+    );
     if let (Some(span), Some((warnings_before, errors_before))) = (span.as_ref(), before) {
         span.record("st2.plan.launch_count", span_count(plan.launch.len()));
         span.record("st2.plan.gc_count", span_count(plan.gc.len()));
@@ -2233,7 +2266,14 @@ fn reconcile_specs_with_sessions_in_span(
     match crate::reconcile(specs, sessions, this_host) {
         Ok(mut plan) => {
             report.deferred = debounce.defer_flickers(&mut plan, now);
-            execute_reconcile(&plan, runner, cap, presentation_cursor, report);
+            execute_reconcile(
+                &plan,
+                runner,
+                cap,
+                presentation_cursor,
+                report,
+                &mut |_| {},
+            );
         }
         Err(error) => report.errors.push(error.to_string()),
     }
@@ -2443,6 +2483,7 @@ where
         &mut FlappingCap::default(),
         &mut PresentationPatchCursor::default(),
         &mut report,
+        &mut |_| {},
     );
     Ok(report)
 }
@@ -2858,7 +2899,6 @@ pub fn detect_host() -> String {
     "localhost".to_string()
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
     use agent_spec::spec::{
@@ -2867,7 +2907,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
 
     #[cfg(target_os = "linux")]
     fn linux_process_state(pid: i32) -> Option<char> {
@@ -3007,6 +3048,7 @@ mod tests {
                 &mut cap,
                 &mut cursor,
                 &mut UpReport::default(),
+                &mut |_| {},
             );
         }
 
@@ -3648,6 +3690,285 @@ mod tests {
             .map(|spec| spec.identity)
             .collect::<Vec<_>>();
         assert_eq!(eligible, vec!["observed-live", "launched", "restarted"]);
+    }
+
+    struct BlockingLaunchRunner {
+        fail_id: Option<String>,
+        block_id: String,
+        entered: mpsc::SyncSender<()>,
+        release: RefCell<mpsc::Receiver<()>>,
+    }
+
+    impl Runner for BlockingLaunchRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(Vec::new())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            if self.fail_id.as_deref() == Some(&target.pty_id) {
+                anyhow::bail!("simulated launch failure");
+            }
+            if target.pty_id == self.block_id {
+                self.entered.send(()).unwrap();
+                self.release.borrow_mut().recv().unwrap();
+            }
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_resync_agent(catalog: &Path, identity: &str) -> (PathBuf, PathBuf) {
+        let agent_dir = catalog.join("agents/hetz").join(identity);
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(
+                r#"agent "{identity}" {{
+  host "hetz"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}}"#
+            ),
+        )
+        .unwrap();
+        let goal = resources.join("goal.md");
+        std::fs::write(&goal, "before\n").unwrap();
+        (agent_dir, goal)
+    }
+
+    fn current_resync_event(agent_dir: &Path) -> Option<String> {
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|body| body.lines().any(|line| line == "stream: resync"))
+    }
+
+    fn wait_for_resync_event(agent_dir: &Path) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event(agent_dir) {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn execute_resync_plan(
+        plan: &ReconcilePlan<'_>,
+        runner: &dyn Runner,
+        specs: &[AgentSpec],
+        resync: &crate::resync::ResyncSupervisor,
+    ) -> UpReport {
+        let mut report = UpReport::default();
+        let mut install_count = 0;
+        execute_with_presentation_cursor(
+            plan,
+            runner,
+            &mut FlappingCap::default(),
+            &mut PresentationPatchCursor::default(),
+            &mut report,
+            &mut |spec| {
+                install_count += 1;
+                resync.install_live(spec, "hetz");
+            },
+        );
+        resync.refresh(
+            &live_resync_specs(specs, "hetz", &[], &report),
+            "hetz",
+            &[],
+            &[],
+        );
+        assert!(install_count > 0 || report.launched.is_empty());
+        report
+    }
+
+    #[test]
+    fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
+        write_resync_agent(catalog.path(), "second");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
+        let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
+        let plan = ReconcilePlan {
+            launch: vec![
+                Launch {
+                    spec: first,
+                    tasks: vec![target("hetz.first.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+                Launch {
+                    spec: second,
+                    tasks: vec![target("hetz.second.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+            ],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            fail_id: None,
+            block_id: "hetz.second.agent".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&first_goal, "changed while second launches\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(
+                report.launched,
+                ["hetz.first.agent", "hetz.second.agent"]
+            );
+        });
+
+        let event = wait_for_resync_event(&first_dir)
+            .expect("the first seat must observe a carrier transition during the later launch");
+        assert!(event.contains("binding: goal"), "{event}");
+    }
+
+    #[test]
+    fn resync_launch_boundary_excludes_failed_canonical_seat() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
+        write_resync_agent(catalog.path(), "second");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
+        let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
+        let plan = ReconcilePlan {
+            launch: vec![
+                Launch {
+                    spec: first,
+                    tasks: vec![target("hetz.first.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+                Launch {
+                    spec: second,
+                    tasks: vec![target("hetz.second.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+            ],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            fail_id: Some("hetz.first.agent".to_owned()),
+            block_id: "hetz.second.agent".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&first_goal, "changed after failed launch\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(report.launched, ["hetz.second.agent"]);
+            assert!(report.errors.iter().any(|error| {
+                error.contains("hetz.first.agent") && error.contains("simulated launch failure")
+            }));
+        });
+
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&first_dir).is_none(),
+            "desired-but-failed canonical seats must remain unwatched"
+        );
+    }
+
+    #[test]
+    fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let spec = &specs[0];
+        let mut derived = target("hetz.worker.ding", "ding");
+        derived.name = "ding".into();
+        derived.derived = true;
+        let plan = ReconcilePlan {
+            launch: vec![Launch {
+                spec,
+                tasks: vec![target("hetz.worker.agent", "agent"), derived],
+                live_derived: Vec::new(),
+            }],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            fail_id: None,
+            block_id: "hetz.worker.ding".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let installs = AtomicUsize::new(0);
+        let mut report = UpReport::default();
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&goal, "changed while companion launches\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            execute_with_presentation_cursor(
+                &plan,
+                &runner,
+                &mut FlappingCap::default(),
+                &mut PresentationPatchCursor::default(),
+                &mut report,
+                &mut |spec| {
+                    installs.fetch_add(1, AtomicOrdering::SeqCst);
+                    resync.install_live(spec, "hetz");
+                },
+            );
+        });
+        resync.refresh(
+            &live_resync_specs(&specs, "hetz", &[], &report),
+            "hetz",
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            installs.load(AtomicOrdering::SeqCst),
+            1,
+            "only the canonical task transition may install its watch set"
+        );
+        let event = wait_for_resync_event(&agent_dir)
+            .expect("the companion launch and final refresh must preserve the canonical baseline");
+        assert!(event.contains("binding: goal"), "{event}");
     }
 
     #[test]
