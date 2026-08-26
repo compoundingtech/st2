@@ -12,6 +12,7 @@
 //! exports log records via an SDK logger provider. Logs emitted inside a span automatically
 //! carry its trace/span ids.
 
+use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use opentelemetry::trace::{Span as _, Tracer as _};
@@ -291,6 +292,7 @@ fn install_subscriber<S>(
             )
             .with(
                 tracing_subscriber::fmt::layer()
+                    .with_ansi(std::io::stderr().is_terminal())
                     .with_writer(std::io::stderr)
                     .with_filter(filter),
             ),
