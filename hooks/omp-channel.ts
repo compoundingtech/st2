@@ -252,8 +252,16 @@ export default function (pi: ExtensionAPI) {
   const IDLE_POLL_BUDGET_MS = 5000;
 
   const watchSettle = (ctx: ExtensionContext) => {
+    // Bind this poll to the channel that was live when it started. A session
+    // replacement inside the polling window would otherwise let a retired
+    // context publish `idle` into the SUCCESSOR's channel while it is active.
+    const originatingChild = state.child;
     const startedAt = Date.now();
     const poller = setInterval(() => {
+      if (state.child !== originatingChild) {
+        clearInterval(poller);
+        return;
+      }
       const idle = idleProof(ctx);
       if (!idle && Date.now() - startedAt < IDLE_POLL_BUDGET_MS) return;
       clearInterval(poller);
