@@ -1799,6 +1799,7 @@ mod tests {
         worker.apply_watch_sets(refresh_for(vec![watch_set_for(
             &discover(root.path()),
             "hetz",
+            &Default::default(),
         )]));
         std::fs::write(&goal, "after\n").unwrap();
 
