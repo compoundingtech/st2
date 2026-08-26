@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use opentelemetry::trace::{Span as _, Tracer as _};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -21,6 +21,28 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// remove no-op span construction on the supervisor hot path).
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Seconds-scale explicit bucket boundaries for the duration histograms. The SDK's default
+/// boundaries are millisecond-tuned (`[0, 5, 10, …, 10000]`), so sub-second reconcile passes
+/// and session spawns would collapse into the lowest buckets and be indistinguishable.
+const DURATION_BUCKET_BOUNDARIES: [f64; 12] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// View mapping each duration instrument onto seconds-scale explicit buckets (see
+/// [`DURATION_BUCKET_BOUNDARIES`]); every other instrument keeps its default aggregation.
+fn duration_view(instrument: &Instrument) -> Option<Stream> {
+    match instrument.name() {
+        "reconcile_pass_duration_seconds" | "session_start_duration_seconds" => Stream::builder()
+            .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                boundaries: DURATION_BUCKET_BOUNDARIES.into(),
+                record_min_max: true,
+            })
+            .build()
+            .ok(),
+        _ => None,
+    }
 }
 
 /// Guard holding the tracer and meter providers for a process lifetime. Dropping it flushes
@@ -85,6 +107,7 @@ impl Telemetry {
         let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(meter_exporter).build();
         let meter_provider = SdkMeterProvider::builder()
             .with_reader(reader)
+            .with_view(duration_view)
             .with_resource(resource)
             .build();
         opentelemetry::global::set_meter_provider(meter_provider.clone());
