@@ -1262,6 +1262,53 @@ fn retirement_cannot_commit_between_reconcile_discovery_and_launch() {
     );
 }
 
+#[test]
+fn an_in_place_candidate_is_a_publishable_spec_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path();
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    // The name `axe agent check` requires for an in-place candidate.
+    let candidate = agent.join("agent.kdl.candidate");
+    fs::write(&candidate, valid_spec(false)).unwrap();
+
+    assert_eq!(
+        source_digest("--spec", &candidate),
+        sha256(valid_spec(false).as_bytes())
+    );
+
+    let published = publish(catalog, &candidate, &["--expect-absent"]);
+    assert!(
+        published.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(target(catalog)).unwrap(),
+        valid_spec(false)
+    );
+}
+
+#[test]
+fn a_rejected_spec_source_names_the_filename_it_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("worker.toml");
+    fs::write(&spec, valid_spec(false)).unwrap();
+
+    let output = publish(temp.path(), &spec, &["--expect-absent"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("spec source must be named `*.kdl` or `agent.kdl.candidate`")
+            && stderr.contains("worker.toml"),
+        "stderr: {stderr}"
+    );
+}
+
 fn wait_for_path(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !path.exists() {
