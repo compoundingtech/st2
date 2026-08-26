@@ -34,9 +34,10 @@ resources/inbox/<unix-ms>-<rand6>.md   → DING » marker, normal wake
 
 A binding URI resolves to a watchable local path when:
 
-1. It is an absolute `file://` URI — the path component is used verbatim.
+1. It is an absolute `file://` URI — the path component is lexically cleaned
+   (`.`/`..`) without following symlinks.
 2. It is a catalog-relative path (no scheme) — resolved against the agent's
-   declaration directory.
+   declaration directory and lexically cleaned the same way.
 
 Everything else (any other scheme) is not watchable. Watchability of every
 active binding is projected into `st2 agents --json` as part of the declared
@@ -74,9 +75,10 @@ changed carrier gets its own event so per-binding supersession stays meaningful.
   temporarily rejects a declaration whose exact canonical seat remains
   observed alive, its prior declaration subscription survives with its digest
   and pending transition; it drops as soon as that seat is not live. Existing
-  valid subscriptions are matched independently by path, bus id, label, and
-  class so every subscriber retains its state even when multiple bindings
-  share one path; only new subscriptions seed silently.
+  valid subscriptions are matched by declaration path and binding label. Each
+  refresh takes bus id, canonical seat id, carrier path, label, and class from
+  the current declaration while retaining only digest, pending digest, and
+  dirty state; only new subscriptions seed silently.
 - A previously blind path is digest-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
 - Installation failure degrades to timer-based digest polling over the watch
