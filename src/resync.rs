@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use notify::Watcher as _;
 use sha2::{Digest as _, Sha256};
-use agent_spec::profile::{ProfileClass, ResourceProfileRegistry};
+use agent_spec::profile::{
+    ProfileClass, ResourceProfileRefresh, ResourceProfileRegistry,
+};
 use agent_spec::spec::{AgentSpec, decode_percent_path};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
@@ -73,13 +75,14 @@ pub fn watch_set_for(
     this_host: &str,
     profiles: &ResourceProfileRegistry,
 ) -> AgentWatchSet {
-    resolve_watch_set(spec, this_host, profiles).0
+    let refresh = profiles.begin_refresh();
+    resolve_watch_set(spec, this_host, &refresh).0
 }
 
 fn resolve_watch_set(
     spec: &AgentSpec,
     this_host: &str,
-    profiles: &ResourceProfileRegistry,
+    profiles: &ResourceProfileRefresh<'_>,
 ) -> (AgentWatchSet, Vec<String>) {
     let declaration_path = lexical_clean(&spec.path);
     let agent_dir = declaration_path.parent().unwrap_or(Path::new("."));
@@ -271,8 +274,9 @@ enum Msg {
 pub struct ResyncSupervisor {
     tx: Option<Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
-    /// Scheme resolution semantics for resource URIs; injectable, built-in (empty) by default.
-    profiles: ResourceProfileRegistry,
+    /// Scheme resolution semantics for resource URIs. Definitions update under the same lock as
+    /// watch-set construction, while the registry retains its bounded compiled-module cache.
+    profiles: std::sync::Mutex<ResourceProfileRegistry>,
 }
 
 impl ResyncSupervisor {
@@ -299,7 +303,7 @@ impl ResyncSupervisor {
         Self {
             tx: Some(tx),
             handle,
-            profiles,
+            profiles: std::sync::Mutex::new(profiles),
         }
     }
     /// Replace the worker's watch set from the pass's already-discovered specs. A malformed
@@ -313,13 +317,63 @@ impl ResyncSupervisor {
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
     ) -> Vec<String> {
+        let profiles = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_with_registry(
+            &profiles,
+            specs,
+            this_host,
+            sessions,
+            malformed_declarations,
+        )
+    }
+
+    /// Atomically replace the profile definitions and the watch set for one reconcile pass.
+    ///
+    /// Replacement keeps the supervisor's bounded compiled-module cache but gives this pass a
+    /// fresh module-snapshot scope shared by all bindings.
+    #[must_use = "resolver diagnostics must be surfaced by the reconcile caller"]
+    pub fn refresh_with_profiles(
+        &self,
+        profiles: ResourceProfileRegistry,
+        specs: &[AgentSpec],
+        this_host: &str,
+        sessions: &[crate::reconcile::Session],
+        malformed_declarations: &[PathBuf],
+    ) -> Vec<String> {
+        let mut current = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.replace_definitions(profiles);
+        self.refresh_with_registry(
+            &current,
+            specs,
+            this_host,
+            sessions,
+            malformed_declarations,
+        )
+    }
+
+    fn refresh_with_registry(
+        &self,
+        profiles: &ResourceProfileRegistry,
+        specs: &[AgentSpec],
+        this_host: &str,
+        sessions: &[crate::reconcile::Session],
+        malformed_declarations: &[PathBuf],
+    ) -> Vec<String> {
         let mut diagnostics = Vec::new();
+        let refresh_profiles = profiles.begin_refresh();
         let sets = specs
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
             .map(|spec| {
-                let (set, mut failures) = resolve_watch_set(spec, this_host, &self.profiles);
+                let (set, mut failures) =
+                    resolve_watch_set(spec, this_host, &refresh_profiles);
                 diagnostics.append(&mut failures);
                 set
             })
@@ -2502,7 +2556,8 @@ mod tests {
                 ProfileClass::Coalesced,
             ),
         );
-        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &profiles);
+        let refresh = profiles.begin_refresh();
+        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &refresh);
         assert!(!set.carriers.iter().any(|c| c.label == "goal"));
         assert!(set.carriers.iter().any(|c| c.label == "declaration"));
         assert!(!set.carriers.iter().any(|c| c.label == "issue"));
@@ -2533,7 +2588,8 @@ mod tests {
                 ProfileClass::Silent,
             ),
         );
-        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &profiles);
+        let refresh = profiles.begin_refresh();
+        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &refresh);
         assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
         assert!(
             diagnostics.is_empty(),
