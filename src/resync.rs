@@ -8,7 +8,7 @@
 //! directory inode. Digest state is seeded silently when a reconcile pass installs a watch set;
 //! only a content transition emits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -51,10 +51,11 @@ pub struct WatchableCarrier {
     pub class: CarrierClass,
 }
 
-/// The watchable carriers of one agent, keyed by its bus id.
+/// The watchable carriers of one agent, keyed by its bus id and canonical seat task id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentWatchSet {
     pub bus_id: String,
+    pub seat_id: Option<String>,
     pub carriers: Vec<WatchableCarrier>,
 }
 
@@ -89,6 +90,11 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
     // produces a recipient `resolve_stream` can resolve.
     AgentWatchSet {
         bus_id: spec.bus_id(this_host),
+        seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
+            task.id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
+        }),
         carriers,
     }
 }
@@ -137,8 +143,14 @@ fn classify(agent_dir: &Path, binding_name: &str, path: &Path) -> Option<Carrier
 
 // ---- Supervisor side ---------------------------------------------------------------------------
 
+struct WatchRefresh {
+    sets: Vec<AgentWatchSet>,
+    malformed_declarations: BTreeSet<PathBuf>,
+    live_task_ids: BTreeSet<String>,
+}
+
 enum Msg {
-    WatchSet(Vec<AgentWatchSet>),
+    WatchSet(WatchRefresh),
     Mutations(Vec<PathBuf>),
     Rescan,
     /// Explicit stop: the worker's own watcher holds the last `Sender`, so `Disconnected`
@@ -167,17 +179,32 @@ impl ResyncSupervisor {
             handle,
         }
     }
-    /// Replace the worker's watch set from the pass's already-discovered specs. Called once per
-    /// reconcile pass; new carriers are seeded silently, removed ones are dropped.
-    pub fn refresh(&self, specs: &[AgentSpec], this_host: &str) {
+    /// Replace the worker's watch set from the pass's already-discovered specs. A malformed
+    /// declaration retains its prior subscription only while its canonical seat is observed alive.
+    pub fn refresh(
+        &self,
+        specs: &[AgentSpec],
+        this_host: &str,
+        sessions: &[crate::reconcile::Session],
+        malformed_declarations: &[PathBuf],
+    ) {
         let sets = specs
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
             .map(|spec| watch_set_for(spec, this_host))
             .collect();
+        let refresh = WatchRefresh {
+            sets,
+            malformed_declarations: malformed_declarations.iter().cloned().collect(),
+            live_task_ids: sessions
+                .iter()
+                .filter(|session| session.alive)
+                .map(|session| session.pty_id.clone())
+                .collect(),
+        };
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Msg::WatchSet(sets));
+            let _ = tx.send(Msg::WatchSet(refresh));
         }
     }
 }
@@ -200,6 +227,7 @@ impl Drop for ResyncSupervisor {
 
 struct Entry {
     bus_id: String,
+    seat_id: Option<String>,
     label: String,
     class: CarrierClass,
     digest: Option<String>,
@@ -285,7 +313,7 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
             .min()
             .unwrap_or(Duration::from_secs(3600));
         match rx.recv_timeout(timeout) {
-            Ok(Msg::WatchSet(sets)) => worker.apply_watch_sets(sets),
+            Ok(Msg::WatchSet(refresh)) => worker.apply_watch_sets(refresh),
             Ok(Msg::Mutations(paths)) => worker.mark_mutated(paths),
             Ok(Msg::Rescan) => worker.rescan_all(),
             Ok(Msg::Shutdown) => break,
@@ -298,10 +326,10 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
 
 fn rebuild_carriers(
     mut previous: BTreeMap<PathBuf, Vec<Entry>>,
-    sets: Vec<AgentWatchSet>,
+    refresh: WatchRefresh,
 ) -> BTreeMap<PathBuf, Vec<Entry>> {
     let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
-    for set in sets {
+    for set in refresh.sets {
         for carrier in set.carriers {
             // Several agents may bind the same local file: every `(bus_id, label)`
             // subscription at a path is retained, not replaced (`RESYNC-R01`). Subscribers
@@ -320,6 +348,7 @@ fn rebuild_carriers(
                 .map(|index| existing.remove(index));
             let entry = retained.unwrap_or_else(|| Entry {
                 bus_id: set.bus_id.clone(),
+                seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
                 class: carrier.class,
                 digest: read_digest(&carrier.path),
@@ -329,16 +358,32 @@ fn rebuild_carriers(
             next.entry(carrier.path).or_default().push(entry);
         }
     }
+    // Strict discovery omits a malformed declaration entirely. Preserve only its declaration
+    // subscription, and only when the exact canonical seat task is still observed alive.
+    for (path, entries) in previous {
+        if !refresh.malformed_declarations.contains(&path) {
+            continue;
+        }
+        let retained = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.label == "declaration"
+                    && entry
+                        .seat_id
+                        .as_ref()
+                        .is_some_and(|seat_id| refresh.live_task_ids.contains(seat_id))
+            })
+            .collect::<Vec<_>>();
+        if !retained.is_empty() {
+            next.entry(path).or_default().extend(retained);
+        }
+    }
     next
 }
 
 impl Worker {
-    fn apply_watch_sets(&mut self, sets: Vec<AgentWatchSet>) {
-        let mut next = rebuild_carriers(std::mem::take(&mut self.carriers), sets);
-        if self.watcher.is_none() {
-            self.diff_emit(&mut next);
-        }
-        self.carriers = next;
+    fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
+        self.carriers = rebuild_carriers(std::mem::take(&mut self.carriers), refresh);
         // Diff paths that were blind before registering newly recovered parents; otherwise the
         // new watch suppresses polling of mutations that happened during the blind interval.
         self.poll_unwatched();
@@ -348,42 +393,39 @@ impl Worker {
         self.poll_registered(&registered);
     }
 
-    /// Digest-diff every entry in `next`, emitting observed transitions. Seeding stays silent
-    /// because each baseline was captured when its subscription was created.
-    fn diff_emit(&mut self, next: &mut BTreeMap<PathBuf, Vec<Entry>>) {
-        let paths: Vec<PathBuf> = next.keys().cloned().collect();
+    /// Polling observes transitions through the same class deadlines as filesystem events. It
+    /// never emits directly: this preserves coalescing and lets `flush_path` replay pending
+    /// transitions before considering newer bytes.
+    fn poll_paths(&mut self, paths: Vec<PathBuf>) {
+        let now = Instant::now();
         for path in paths {
-            let Some(entries) = next.get_mut(&path) else {
+            let Some(entries) = self.carriers.get_mut(&path) else {
                 continue;
             };
-            let root = self.root.clone();
-            let this_host = self.this_host.clone();
-            for entry in entries.iter_mut() {
-                let Some(new_digest) = read_digest(&path) else {
-                    continue;
-                };
-                if entry.digest.as_deref() == Some(new_digest.as_str()) {
+            for entry in entries {
+                let observed = read_digest(&path);
+                let changed = entry.pending_digest.is_some()
+                    || observed
+                        .as_deref()
+                        .is_some_and(|digest| entry.digest.as_deref() != Some(digest));
+                if !changed {
                     continue;
                 }
-                let old = entry.digest.as_deref();
-                if emit_resync(
-                    &root,
-                    &this_host,
-                    &entry.bus_id,
-                    &entry.label,
-                    &path,
-                    old,
-                    &new_digest,
-                ) {
-                    entry.digest = Some(new_digest);
+                if !entry.dirty {
+                    let deadline = now + entry.class.window();
+                    self.deadlines
+                        .entry(entry.class)
+                        .and_modify(|existing| *existing = (*existing).min(deadline))
+                        .or_insert(deadline);
                 }
+                entry.dirty = true;
             }
         }
     }
 
     /// Poll carriers whose parent directory carries no registered watch right now.
     fn poll_unwatched(&mut self) {
-        let unwatched: Vec<PathBuf> = self
+        let unwatched = self
             .carriers
             .keys()
             .filter(|path| {
@@ -393,13 +435,11 @@ impl Worker {
             })
             .cloned()
             .collect();
-        for path in unwatched {
-            self.flush_path(&path, None);
-        }
+        self.poll_paths(unwatched);
     }
 
     fn poll_registered(&mut self, directories: &[PathBuf]) {
-        let paths: Vec<PathBuf> = self
+        let paths = self
             .carriers
             .keys()
             .filter(|path| {
@@ -408,16 +448,11 @@ impl Worker {
             })
             .cloned()
             .collect();
-        for path in paths {
-            self.flush_path(&path, None);
-        }
+        self.poll_paths(paths);
     }
 
     fn rescan_all(&mut self) {
-        let paths: Vec<PathBuf> = self.carriers.keys().cloned().collect();
-        for path in paths {
-            self.flush_path(&path, None);
-        }
+        self.poll_paths(self.carriers.keys().cloned().collect());
     }
 
     /// Re-register watches so every distinct parent directory of the current watch set is covered,
@@ -690,6 +725,14 @@ fn render_body(label: &str, path: &Path, old: Option<&str>, new: &str) -> String
 mod tests {
     use super::*;
 
+    fn refresh_for(sets: Vec<AgentWatchSet>) -> WatchRefresh {
+        WatchRefresh {
+            sets,
+            malformed_declarations: BTreeSet::new(),
+            live_task_ids: BTreeSet::new(),
+        }
+    }
+
     fn discover(catalog: &Path) -> AgentSpec {
         let found = crate::discover_strict(catalog);
         eprintln!("discovery errors: {:?}", found.errors);
@@ -746,6 +789,7 @@ mod tests {
             vec![
                 Entry {
                     bus_id: "host.alpha".to_owned(),
+                    seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("alpha-before".to_owned()),
@@ -754,6 +798,7 @@ mod tests {
                 },
                 Entry {
                     bus_id: "host.beta".to_owned(),
+                    seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
                     digest: Some("beta-before".to_owned()),
@@ -765,6 +810,7 @@ mod tests {
         let sets = vec![
             AgentWatchSet {
                 bus_id: "host.alpha".to_owned(),
+                seat_id: None,
                 carriers: vec![WatchableCarrier {
                     label: "goal".to_owned(),
                     path: shared.clone(),
@@ -773,6 +819,7 @@ mod tests {
             },
             AgentWatchSet {
                 bus_id: "host.beta".to_owned(),
+                seat_id: None,
                 carriers: vec![WatchableCarrier {
                     label: "spec".to_owned(),
                     path: shared.clone(),
@@ -781,7 +828,7 @@ mod tests {
             },
         ];
 
-        let rebuilt = rebuild_carriers(previous, sets);
+        let rebuilt = rebuild_carriers(previous, refresh_for(sets));
         let entries = rebuilt.get(&shared).expect("shared path remains watched");
         assert_eq!(entries.len(), 2);
         for (bus_id, digest) in [
@@ -795,6 +842,163 @@ mod tests {
             assert_eq!(entry.digest.as_deref(), Some(digest));
             assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
         }
+    }
+
+    #[test]
+    fn malformed_declaration_retains_only_an_observed_live_seat_subscription() {
+        let declaration = PathBuf::from("/catalog/agents/hetz/worker/agent.kdl");
+        let previous = || {
+            BTreeMap::from([(
+                declaration.clone(),
+                vec![Entry {
+                    bus_id: "hetz.worker".to_owned(),
+                    seat_id: Some("custom-worker-seat".to_owned()),
+                    label: "declaration".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: Some("before".to_owned()),
+                    pending_digest: Some("corrected".to_owned()),
+                    dirty: true,
+                }],
+            )])
+        };
+        let malformed_declarations = BTreeSet::from([declaration.clone()]);
+
+        let retained = rebuild_carriers(
+            previous(),
+            WatchRefresh {
+                sets: Vec::new(),
+                malformed_declarations: malformed_declarations.clone(),
+                live_task_ids: BTreeSet::from(["custom-worker-seat".to_owned()]),
+            },
+        );
+        let entry = &retained[&declaration][0];
+        assert_eq!(entry.digest.as_deref(), Some("before"));
+        assert_eq!(entry.pending_digest.as_deref(), Some("corrected"));
+
+        let dropped = rebuild_carriers(
+            previous(),
+            WatchRefresh {
+                sets: Vec::new(),
+                malformed_declarations,
+                live_task_ids: BTreeSet::new(),
+            },
+        );
+        assert!(
+            dropped.is_empty(),
+            "a malformed declaration must not retain a watch after its exact seat is no longer live"
+        );
+    }
+
+    #[test]
+    fn degraded_poll_replays_a_pending_transition_before_newer_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/hetz/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "newer live bytes").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
+
+        let set = watch_set_for(&discover(root.path()), "hetz");
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "hetz".to_owned(),
+            carriers: BTreeMap::from([(
+                carrier.clone(),
+                vec![Entry {
+                    bus_id: "hetz.worker".to_owned(),
+                    seat_id: set.seat_id.clone(),
+                    label: "goal".to_owned(),
+                    class: CarrierClass::Immediate,
+                    digest: Some("old-digest".to_owned()),
+                    pending_digest: Some("pending-target".to_owned()),
+                    dirty: false,
+                }],
+            )]),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        let now = Instant::now();
+        worker.apply_watch_sets(refresh_for(vec![set]));
+        assert!(
+            !resources.join("inbox").exists(),
+            "degraded polling must schedule rather than emit during refresh"
+        );
+        worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
+
+        let event = std::fs::read_dir(resources.join("inbox"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|body| body.contains("stream: resync"))
+            .expect("pending transition is replayed");
+        assert!(event.contains("old: old-digest"), "{event}");
+        assert!(event.contains("new: pending-target"), "{event}");
+        let entry = &worker.carriers[&carrier][0];
+        assert_eq!(entry.digest.as_deref(), Some("pending-target"));
+        assert!(entry.pending_digest.is_none());
+        assert!(
+            entry.dirty,
+            "newer live bytes are scheduled only after the pending transition completes"
+        );
+    }
+
+    #[test]
+    fn fallback_polling_preserves_the_coalesced_window() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        std::fs::write(&carrier, "before").unwrap();
+        let baseline = read_digest(&carrier);
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(
+                carrier.clone(),
+                vec![Entry {
+                    bus_id: "host.missing".to_owned(),
+                    seat_id: None,
+                    label: "spec".to_owned(),
+                    class: CarrierClass::Coalesced,
+                    digest: baseline.clone(),
+                    pending_digest: None,
+                    dirty: false,
+                }],
+            )]),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        std::fs::write(&carrier, "after").unwrap();
+        let now = Instant::now();
+        worker.apply_watch_sets(refresh_for(vec![AgentWatchSet {
+            bus_id: "host.missing".to_owned(),
+            seat_id: None,
+            carriers: vec![WatchableCarrier {
+                label: "spec".to_owned(),
+                path: carrier.clone(),
+                class: CarrierClass::Coalesced,
+            }],
+        }]));
+
+        worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        let entry = &worker.carriers[&carrier][0];
+        assert_eq!(entry.digest, baseline);
+        assert!(entry.pending_digest.is_none(), "coalesced emit ran too early");
+
+        worker.flush_due(now + COALESCED_WINDOW + Duration::from_secs(1));
+        assert!(
+            worker.carriers[&carrier][0].pending_digest.is_some(),
+            "the coalesced transition must be attempted after its full window"
+        );
     }
 
     #[test]
@@ -824,7 +1028,10 @@ mod tests {
             watched: BTreeMap::new(),
             watcher: None,
         };
-        worker.apply_watch_sets(vec![watch_set_for(&discover(root.path()), "hetz")]);
+        worker.apply_watch_sets(refresh_for(vec![watch_set_for(
+            &discover(root.path()),
+            "hetz",
+        )]));
         std::fs::write(&goal, "after\n").unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -833,6 +1040,7 @@ mod tests {
             Msg::Rescan => worker.rescan_all(),
             _ => panic!("a notify backend error must request a full digest rescan"),
         }
+        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW);
 
         let inbox = resources.join("inbox");
         let events = std::fs::read_dir(inbox)
@@ -867,6 +1075,7 @@ mod tests {
             .into_iter()
             .map(|class| Entry {
                 bus_id: "host.worker".to_owned(),
+                seat_id: None,
                 label: format!("{class:?}"),
                 class,
                 digest: digest.clone(),
@@ -902,6 +1111,7 @@ mod tests {
                 carrier.clone(),
                 vec![Entry {
                     bus_id: "host.missing".to_owned(),
+                    seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     digest: Some("old-digest".to_owned()),

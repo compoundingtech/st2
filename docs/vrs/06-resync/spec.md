@@ -70,18 +70,23 @@ changed carrier gets its own event so per-binding supersession stays meaningful.
 - After lifecycle execution, each reconcile pass atomically replaces the watch
   set with agents whose canonical seat was observed alive or successfully
   launched/restarted in that pass. Desired declarations, dead keep-retained
-  seats, and companion-only launches never become watched. Existing
-  subscriptions that remain are matched independently by path, bus id, label,
-  and class so every subscriber retains its digest and pending dirty state even
-  when multiple bindings share one path; only new subscriptions seed silently.
+  seats, and companion-only launches never become watched. If strict discovery
+  temporarily rejects a declaration whose exact canonical seat remains
+  observed alive, its prior declaration subscription survives with its digest
+  and pending transition; it drops as soon as that seat is not live. Existing
+  valid subscriptions are matched independently by path, bus id, label, and
+  class so every subscriber retains its state even when multiple bindings
+  share one path; only new subscriptions seed silently.
 - A previously blind path is digest-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
-- Installation failure is diagnosed once and degrades to timer-based digest
-  polling over the watch set (bounded by the number of bindings), never to
-  silence about the mechanism.
+- Installation failure degrades to timer-based digest polling over the watch
+  set (bounded by the number of bindings), never to silence about the
+  mechanism. Polling only marks observed changes dirty and schedules the
+  carrier's ordinary class deadline; it neither bypasses coalescing nor emits
+  ahead of an immutable pending transition.
 - A runtime watcher-backend error may mean mutation events were dropped, so it
-  triggers a full digest rescan of the current watch set. Equal digests remain
-  silent; observed transitions use the ordinary classified emission path.
+  schedules every changed carrier through the same pending-aware classified
+  path. Equal digests remain silent.
 - Digest reads open carriers nonblocking, accept regular files only, and feed
   bytes incrementally into SHA-256 with bounded memory; FIFOs, other special
   files, and large carriers cannot stall or exhaust the worker.
