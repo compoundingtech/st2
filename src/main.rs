@@ -991,8 +991,20 @@ fn main() -> Result<()> {
         catalog_path,
         command,
     } = Cli::parse();
-    initialize_catalog_env(catalog_path.as_deref())?;
 
+    let mut telemetry =
+        st2::telemetry::Telemetry::init(if matches!(command, Command::Up { once: false, .. }) {
+            "supervisor"
+        } else {
+            "cli"
+        });
+    let result = dispatch(command, catalog_path.as_deref());
+    telemetry.shutdown();
+    result
+}
+
+fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<()> {
+    initialize_catalog_env(catalog_path.map(|path| path.to_path_buf()).as_deref())?;
     match command {
         Command::Ls { root } => {
             let root = catalog_arg(root)?;
