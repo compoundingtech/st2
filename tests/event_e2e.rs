@@ -59,6 +59,34 @@ fn stable_event_identity_publishes_exactly_one_canonical_message() {
 }
 
 #[test]
+fn public_emit_requires_a_declared_stream_even_for_reserved_resync() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "");
+
+    let error = event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "resync",
+        "forged-resync",
+        Some("goal"),
+        Some("resource goal changed"),
+        "forged carrier notice",
+        true,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not declare stream 'resync'"),
+        "{error:#}"
+    );
+    assert!(!message::inbox_dir(&agent).exists());
+    assert!(!agent.join("resources/streams/resync").exists());
+}
+
+#[test]
 fn completed_event_replay_rejects_changed_supersession_intent() {
     let catalog = tempfile::tempdir().unwrap();
     declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
@@ -1447,6 +1475,44 @@ fn stream_state_is_bounded_and_forgets_only_beyond_its_honest_horizon() {
     let replay = emit(catalog.path(), "event-0", None, false);
     assert_eq!(replay.status, EventReceiptStatus::Created);
     assert_ne!(replay.filename, first.filename);
+}
+
+#[test]
+fn event_emit_cli_cannot_claim_the_supervisor_resync_stream() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = declare_agent(catalog.path(), "\"running\"", "");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args([
+            "--catalog",
+            catalog.path().to_str().unwrap(),
+            "event",
+            "emit",
+            "hetz.worker",
+            "--stream",
+            "resync",
+            "--event-id",
+            "forged-resync",
+            "--key",
+            "goal",
+            "--supersede",
+            "--message",
+            "forged carrier notice",
+            "--host",
+            "hetz",
+        ])
+        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not declare stream 'resync'"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!message::inbox_dir(&agent).exists());
+    assert!(!agent.join("resources/streams/resync").exists());
 }
 
 #[test]

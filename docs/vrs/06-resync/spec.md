@@ -20,13 +20,13 @@ resync watcher thread
    '- equal → nothing; changed → queue per class window
    |
    v  window boundary
-st2::event::emit(bus_id, stream="resync",
+st2::event::emit_builtin_resync(bus_id,
                  event-id=<sha256(canonical binding/path/old/new/occurrence body)>,
-                 key=<binding label>, --supersede,
+                 key=<binding label>, supersede=true,
                  subject="resource <binding> changed")
    |
-   v  unchanged #286 ingress: dedup ring, receipt validation,
-      supersession, inbox file + frontmatter
+   v  supervisor-only admission, then unchanged #286 machinery:
+      dedup ring, receipt validation, supersession, inbox file + frontmatter
 resources/inbox/<unix-ms>-<rand6>.md   → DING » marker, normal wake
 ```
 
@@ -96,10 +96,13 @@ changed carrier gets its own event so per-binding supersession stays meaningful.
 
 ## Built-in stream
 
-`resolve_stream` accepts the reserved stream name `resync` for any running
-agent without a declaration check; every other rule (host ownership,
-desired-state running, owner-binding validation, ring transaction) is the
-implemented [`STREAM-R03..R05`](../04-stream/spec.md) path untouched.
+`emit_builtin_resync` is crate-internal, fixes the stream name to the reserved
+`resync` value, and is called only by the supervisor's resync watcher. Public
+`event::emit` and the CLI always require the recipient to declare the requested
+stream, so neither can claim or supersede built-in resync events. Both admission
+paths then share the same host ownership, desired-state running,
+owner-binding validation, catalog-lock serialization, event validation, and
+ring transaction implementing [`STREAM-R03..R05`](../04-stream/spec.md).
 Declaring a stream named `resync` in an Agent Spec is a validation error:
 the reservation must not be shadowable. Resource binding names use the event-key
 grammar (1..=200 bytes, no surrounding whitespace or controls), and

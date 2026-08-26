@@ -79,6 +79,34 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     let body = &resync_events(&agent_dir)[0];
     assert!(body.contains("resource goal changed"), "{body}");
     assert!(body.contains("binding: goal"), "{body}");
+    let legitimate_event_id = body
+        .lines()
+        .find(|line| line.starts_with("event-id:"))
+        .unwrap()
+        .to_owned();
+
+    // Public ingress cannot forge or supersede the supervisor's unread built-in event.
+    let error = st2::event::emit(
+        catalog.path(),
+        "hetz",
+        "hetz.worker",
+        "resync",
+        "forged-resync",
+        Some("goal"),
+        Some("resource goal changed"),
+        "forged carrier notice",
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not declare stream 'resync'"),
+        "{error:#}"
+    );
+    let unread = resync_events(&agent_dir);
+    assert_eq!(unread.len(), 1);
+    assert!(unread[0].contains(&legitimate_event_id), "{}", unread[0]);
 
     // An equal-content rewrite deduplicates to nothing new (digest identity).
     fs::write(&goal, "ship resync v1\n").unwrap();
@@ -101,11 +129,7 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     );
     // A real content change emits again under the same key: supersession keeps one unread head
     // per binding (the archive receipt retires the predecessor).
-    let first_event_id = resync_events(&agent_dir)[0]
-        .lines()
-        .find(|l| l.starts_with("event-id:"))
-        .unwrap()
-        .to_owned();
+    let first_event_id = legitimate_event_id;
     fs::write(&goal, "ship resync v2\n").unwrap();
     assert!(wait_for(
         || {
