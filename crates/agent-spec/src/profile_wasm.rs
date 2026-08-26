@@ -187,8 +187,7 @@ fn read_module_bounded(
 ) -> Result<Vec<u8>, WasmResolveError> {
     use std::io::Read as _;
 
-    let file = std::fs::File::open(path)
-        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    let file = open_module_file(path)?;
     let declared_len = file
         .metadata()
         .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
@@ -208,6 +207,45 @@ fn read_module_bounded(
         )));
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_module_file(path: &std::path::Path) -> Result<std::fs::File, WasmResolveError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    if !file
+        .metadata()
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
+        .file_type()
+        .is_file()
+    {
+        return Err(WasmResolveError::Instantiation(
+            "resolver module is not a regular file".to_owned(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_module_file(path: &std::path::Path) -> Result<std::fs::File, WasmResolveError> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    if !file
+        .metadata()
+        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
+        .file_type()
+        .is_file()
+    {
+        return Err(WasmResolveError::Instantiation(
+            "resolver module is not a regular file".to_owned(),
+        ));
+    }
+    Ok(file)
 }
 
 fn reject_symlink_components(
