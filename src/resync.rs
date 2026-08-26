@@ -451,19 +451,28 @@ impl ResyncSupervisor {
     /// Synchronously install one newly proven-live canonical seat before reconciliation advances
     /// to another launch target. The acknowledgement closes the gap between a successful spawn and
     /// the worker's silent baseline seed; later full refreshes still own removals and malformed
-    /// declaration retention.
-    pub fn install_live(&self, spec: &AgentSpec, this_host: &str) {
+    /// declaration retention. Profile resolution uses the supervisor's current registry and
+    /// returns contained resolver failures for the reconcile report.
+    pub fn install_live(&self, spec: &AgentSpec, this_host: &str) -> Vec<String> {
         if spec.resolved_host(this_host) != this_host || !spec.desired_state.is_running() {
-            return;
+            return Vec::new();
         }
+        let (set, diagnostics) = {
+            let profiles = self
+                .profiles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            resolve_watch_set(spec, this_host, &profiles.begin_refresh())
+        };
         let (ack_tx, ack_rx) = channel();
         if self
             .tx
             .as_ref()
-            .is_some_and(|tx| tx.send(Msg::Install(watch_set_for(spec, this_host), ack_tx)).is_ok())
+            .is_some_and(|tx| tx.send(Msg::Install(set, ack_tx)).is_ok())
         {
             let _ = ack_rx.recv();
         }
+        diagnostics
     }
 
     /// Synchronously remove a canonical seat's active subscriptions before relaunch work begins.
