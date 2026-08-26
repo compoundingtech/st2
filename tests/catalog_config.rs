@@ -117,6 +117,39 @@ fn declaring_a_root_does_not_turn_the_catalog_into_a_single_file_spec() {
     );
 }
 
+#[test]
+fn catalog_profile_and_agent_nodes_share_catalog_kdl_without_hiding_the_agent() {
+    let catalog = tempfile::tempdir().unwrap();
+    fs::write(
+        catalog.path().join("catalog.kdl"),
+        r#"catalog { pty-root "pty" }
+profile "dev.example.goal" { wasm "resolver.wasm"; class "immediate" }
+agent "worker" { host "hetz"; command "true" }
+"#,
+    )
+    .unwrap();
+
+    let discovered = st2::discover_strict(catalog.path());
+    assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+    assert!(discovered.warnings.is_empty(), "{:?}", discovered.warnings);
+    assert_eq!(discovered.specs.len(), 1);
+    assert_eq!(discovered.specs[0].identity, "worker");
+    assert_eq!(discovered.specs[0].host.as_deref(), Some("hetz"));
+    assert!(
+        discovered.declarations[0]
+            .parse
+            .as_ref()
+            .is_some_and(agent_spec::DeclaredParse::is_valid),
+        "the shared catalog envelope must retain a valid agent declaration parse"
+    );
+
+    let config = st2::catalog::load(catalog.path()).expect("catalog and profile nodes parse");
+    assert_eq!(config.pty_root.as_deref(), Some("pty"));
+    assert_eq!(config.profiles.len(), 1);
+    assert_eq!(config.profiles[0].scheme, "dev.example.goal");
+    assert_eq!(config.profiles[0].wasm, "resolver.wasm");
+}
+
 /// A mistyped field resolves back to `<catalog>/pty`, which is the split registry this declaration
 /// exists to prevent — so it fails the gate instead of degrading quietly.
 #[test]
