@@ -45,6 +45,22 @@ they are allowed to be, and what their identity is.
 5. **Build approach (Q6):** direct test-first implementation; the PR's
    integration tests are the prototype evidence.
 
+## Amendment — 2026-08-26
+
+Johannes approved decision request Q12 to supersede the event-identity part of
+item 4. The event ID is SHA-256 of the canonical rendered transition body,
+which contains the binding label, resolved path, old digest, and new digest.
+The grouping key remains the binding label and every emit still supersedes.
+
+The original new-bytes identity could collide when two bindings or paths made
+the same byte transition: one `(stream, event-id)` then named different
+rendered content, so the unchanged ingress correctly rejected the second
+event. Hashing the body makes identity reuse imply byte-identical content.
+Equal-content rewrites remain quiet because digest comparison suppresses them
+before emission; old and new digests keep A→B→A legs distinct. The
+`transition_identity_covers_every_rendered_transition_dimension` matrix test
+proves binding, path, old-digest, new-digest, and stable-replay behavior.
+
 ## Options
 
 | Option | Result | Reason |

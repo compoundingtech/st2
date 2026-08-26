@@ -91,9 +91,11 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 - **RESYNC-R06 Event shape:** One carrier change becomes one stream event on
   the built-in `resync` stream: subject `resource <binding> changed`, body
   naming the binding label, resolved path, and old and new content digests.
-  The event identity is the SHA-256 of the new carrier bytes; the grouping
-  key is the binding label; every emit declares supersession so a binding
-  collapses to one unread head.
+  The event identity is the SHA-256 of that canonical rendered transition
+  body, so changing any binding, path, old digest, or new digest changes the
+  identity while replaying the same body is stable. The grouping key is the
+  binding label; every emit declares supersession so a binding collapses to
+  one unread head.
 - **RESYNC-R07 Built-in stream:** The `resync` stream exists on every agent
   without declaration and is reserved: a user-declared stream of that name is
   refused. Publication reuses the implemented ingress unchanged — ring
