@@ -479,6 +479,9 @@
             pkgs.rustfmt
             pkgs.rust-analyzer
             pkgs.git
+            # wasm guest modules (resource-profile resolvers) link with lld; nixpkgs rustc does
+            # not bundle rust-lld the way the rustup toolchain does.
+            pkgs.lld
             pty.packages.${system}.default
             # Local runs of the OTLP export integration gate
             # (`cargo test --test otel_export`) need the same collector the

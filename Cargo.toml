@@ -2,7 +2,7 @@
 # `package.version` out of this file as the single source of truth for the
 # build, and a virtual root has no `[package]` to read.
 [workspace]
-members = ["crates/agent-spec", "crates/st2-wire"]
+members = ["crates/agent-spec", "crates/st2-wire", "crates/demo-resolver-wasm"]
 default-members = [".", "crates/agent-spec", "crates/st2-wire"]
 
 [package]
@@ -50,3 +50,8 @@ tungstenite = "0.30"
 [dev-dependencies]
 libc = "0.2"
 toml = "0.9"
+
+[features]
+# Sandbox wasm resource-profile resolvers (`agent-spec/profile_wasm`). Off by default: the
+# runner binary carries no wasmtime unless a build opts in.
+wasm-resolver = ["agent-spec/wasm-resolver"]

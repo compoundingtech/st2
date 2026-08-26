@@ -2776,7 +2776,17 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
-    let resync = crate::resync::ResyncSupervisor::spawn(root.to_path_buf(), this_host.to_owned());
+    // Declared resource profiles flow into the supervisor the same way the declared pty root
+    // flows into spawning: read once per loop from `<catalog>/catalog.kdl`. Unlike pty-root,
+    // a malformed profile block is a hard error — it gates watchability, and silently dropping
+    // one would hide the misconfiguration behind "nothing fires" (`st2 validate` also reports).
+    let profiles = crate::catalog::declared_profiles(root)
+        .context("parse resource profiles in catalog.kdl")?;
+    let resync = crate::resync::ResyncSupervisor::with_profiles(
+        root.to_path_buf(),
+        this_host.to_owned(),
+        profiles,
+    );
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
