@@ -22,13 +22,14 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 ## Assumptions
 
 - **RESYNC-A01 Local carriers only:** A carrier is watchable iff its binding
-  URI denotes a local regular file: an absolute `file://` URI, or a
-  catalog-relative path resolved against the agent's directory (for example
-  `resources/goal.md`). Bindings whose scheme has no local denotation
-  (`http://`, `github-issue://`, `pty://`) are never watched, never error,
-  and their watchability is visible through catalog observation. The agent's
-  own declaration file is covered by the existing declaration watcher and is
-  also a resync source.
+  URI denotes a local regular file: an absolute `file://` URI, a
+  catalog-relative path resolved against the agent's directory, or a scheme URI
+  successfully resolved to a contained local path by a declared
+  [`07-resource-profile`](../07-resource-profile/requirements.md). Bindings
+  whose scheme has no registered profile, or whose registered profile fails,
+  are never watched and never stop the supervisor; their watchability remains
+  observable through catalog inspection. The agent's own declaration file is
+  covered by the existing declaration watcher and is also a resync source.
 - **RESYNC-A02 Trusted fleet:** The supervisor is the only resync producer;
   it runs inside the owner host's existing trust domain (root `A02`). No new
   authentication surface exists.
@@ -39,11 +40,13 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 
 ## Acceptable Tradeoffs
 
-- **RESYNC-T01 Static classes, no write attribution:** v1 classifies carriers
-  by path role, not by who wrote the change. An external edit into a store
-  the agent authors (context, decisions) is silent by classification; a
-  st2-mediated write to an immediate-class carrier would notify. True
-  authorship attribution is deferred until evidence shows the gap matters.
+- **RESYNC-T01 Static classes, no write attribution:** Classification comes
+  from a Resource Profile declaration for profile-resolved carriers and from
+  fixed path roles for native local carriers; it does not infer who wrote the
+  change. An external edit into a store the agent authors (context, decisions)
+  is silent by classification; a st2-mediated write to an immediate-class
+  carrier would notify. True authorship attribution is deferred until evidence
+  shows the gap matters.
 - **RESYNC-T02 Provisional windows:** Coalescing window lengths ship as
   provisional constants tuned by observation, per the rollout note in
   [issue #341](https://github.com/compoundingtech/st2/issues/341).
@@ -74,12 +77,14 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 ### Must classify before notifying
 
 - **RESYNC-R04 Class defaults:** Each carrier belongs to exactly one class:
-  *immediate* (the agent's declaration file and goal carriers), *silent*
-  (stores under the agent directory that the agent itself authors: context,
-  decisions, friction logs), *coalesced* (every other local carrier).
-  Immediate changes notify within a short coalescing window; coalesced
-  changes notify within a longer window; silent classes never emit. A burst
-  of mutations collapses to one notification pass per window.
+  *immediate*, *silent*, or *coalesced*. A profile-resolved carrier takes the
+  trusted class declared beside its resolver; `silent` excludes it from the
+  watch set. Native local carriers use fixed path defaults: immediate for the
+  agent's declaration file and goal carriers, silent for stores under the
+  agent directory that it authors (context, decisions, friction logs), and
+  coalesced for every other local carrier. Immediate changes notify within a
+  short coalescing window; coalesced changes notify within a longer window; a
+  burst of mutations collapses to one notification pass per window.
 - **RESYNC-R05 Bounded coalescing:** Window behavior is bounded and tested
   per [`R15`](../requirements.md): emissions happen at window boundaries, not
   per writer event, and a fast-rewriting carrier cannot produce unbounded

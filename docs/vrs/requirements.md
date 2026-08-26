@@ -161,11 +161,14 @@ accepted.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
   order-independent Resource bindings. Each binding has a non-empty, agent-local
   unique name and preserves an RFC 3986 absolute URI byte-for-byte without
-  normalization. The URI scheme selects an open, downstream-owned Resource profile;
-  st2 does not register schemes. The generic envelope does not imply resolution,
-  access, readiness, or lifecycle semantics;
-  declarations that add such unsupported policy are rejected rather than
-  silently ignored.
+  normalization. Its URI scheme is the exact lookup key for an optional,
+  catalog-declared Resource Profile; scheme meaning remains downstream-owned,
+  and st2 ships no built-in profiles. A registered profile may give the URI a
+  contained local denotation under
+  [`07-resource-profile`](07-resource-profile/requirements.md); an unregistered
+  scheme stays opaque. The generic envelope itself does not imply resolution,
+  access, readiness, or lifecycle semantics, and declarations that add such
+  unsupported policy are rejected rather than silently ignored.
 - **R21 Nondisruptive Resource observation:** Machine-readable catalog
   inspection exposes every Resource binding without interpreting its profile or URI.
   Resource-only declaration changes do not alter a task's effective launch
