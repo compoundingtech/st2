@@ -124,9 +124,6 @@ fn resolve_watch_set(
     }];
     let mut diagnostics = Vec::new();
     for resource in &spec.resources {
-<<<<<<< HEAD
-        let Some(class) = resource_coverage(agent_dir, resource).carrier_class() else {
-=======
         if resource.inactive_reason().is_some() {
             continue;
         }
@@ -139,8 +136,8 @@ fn resolve_watch_set(
         if registered_profile.is_some_and(|profile| profile.class() == ProfileClass::Silent) {
             continue;
         }
-        // Declared profile schemes resolve through their wasm module; the DECLARED class
-        // governs notification, replacing the basename-sniffing defaults.
+        // Declared profile schemes resolve through their wasm module; the declared class governs
+        // notification instead of the local-path defaults.
         match profiles.try_resolve(agent_dir, resource.uri()) {
             Ok(Some(resolution)) => {
                 let Some(class) = carrier_class(resolution.class) else {
@@ -154,9 +151,6 @@ fn resolve_watch_set(
                 });
                 continue;
             }
-            // Not this registry's business (no scheme, or scheme without a profile): fall
-            // through to the legacy local-path rules. A registered-but-failed resolution stays
-            // contained and becomes an explicit reconcile diagnostic.
             Ok(None) => {}
             Err(error) => {
                 diagnostics.push(format!(
@@ -167,11 +161,7 @@ fn resolve_watch_set(
                 continue;
             }
         }
-        let Some(path) = resolve_local_path(agent_dir, resource.uri()) else {
-            continue;
-        };
-        let Some(class) = classify(agent_dir, resource.name(), &path) else {
->>>>>>> 7edbb9f (feat(resync): wasm-only resource profiles behind a wasm-resolver feature)
+        let Some(class) = resource_coverage(agent_dir, resource).carrier_class() else {
             continue;
         };
         let path = resolve_local_path(agent_dir, resource.uri())
@@ -300,6 +290,37 @@ fn carrier_class(class: ProfileClass) -> Option<CarrierClass> {
         ProfileClass::Immediate => Some(CarrierClass::Immediate),
         ProfileClass::Coalesced => Some(CarrierClass::Coalesced),
         ProfileClass::Silent => None,
+    }
+}
+
+/// Resolve coverage with the catalog's declared profile registry. Silent profiles report their
+/// declared class without executing a guest; other registered schemes are watchable only when
+/// their resolver succeeds.
+pub fn resource_coverage_with_profiles(
+    agent_dir: &Path,
+    resource: &agent_spec::spec::Resource,
+    profiles: &ResourceProfileRefresh<'_>,
+) -> ResyncCoverage {
+    if resource.inactive_reason().is_some() {
+        return ResyncCoverage::Inactive;
+    }
+    let registered = resource
+        .uri()
+        .split_once(':')
+        .and_then(|(scheme, _)| profiles.get(scheme));
+    let Some(profile) = registered else {
+        return resource_coverage(agent_dir, resource);
+    };
+    if profile.class() == ProfileClass::Silent {
+        return ResyncCoverage::Silent;
+    }
+    match profiles.try_resolve(agent_dir, resource.uri()) {
+        Ok(Some(resolution)) => match resolution.class {
+            ProfileClass::Immediate => ResyncCoverage::Immediate,
+            ProfileClass::Coalesced => ResyncCoverage::Coalesced,
+            ProfileClass::Silent => ResyncCoverage::Silent,
+        },
+        Ok(None) | Err(_) => ResyncCoverage::Unsupported,
     }
 }
 
@@ -1369,12 +1390,8 @@ mod tests {
 }"#,
         )
         .unwrap();
-<<<<<<< HEAD
         let spec = discover(tmp.path());
-        let set = watch_set_for(&spec, "hetz");
-=======
-        let set = watch_set_for(&discover(tmp.path()), "hetz", &Default::default());
->>>>>>> 7edbb9f (feat(resync): wasm-only resource profiles behind a wasm-resolver feature)
+        let set = watch_set_for(&spec, "hetz", &Default::default());
         assert_eq!(set.bus_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
@@ -2667,13 +2684,18 @@ mod tests {
             ),
         );
         let refresh = profiles.begin_refresh();
-        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &refresh);
+        let spec = discover(tmp.path());
+        let (set, diagnostics) = resolve_watch_set(&spec, "hetz", &refresh);
         assert!(!set.carriers.iter().any(|c| c.label == "goal"));
         assert!(set.carriers.iter().any(|c| c.label == "declaration"));
         assert!(!set.carriers.iter().any(|c| c.label == "issue"));
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("resource 'goal'"));
         assert!(diagnostics[0].contains("unwatchable"));
+        assert_eq!(
+            resource_coverage_with_profiles(&dir, &spec.resources[0], &refresh),
+            ResyncCoverage::Unsupported
+        );
     }
 
     #[test]
@@ -2699,11 +2721,16 @@ mod tests {
             ),
         );
         let refresh = profiles.begin_refresh();
-        let (set, diagnostics) = resolve_watch_set(&discover(tmp.path()), "hetz", &refresh);
+        let spec = discover(tmp.path());
+        let (set, diagnostics) = resolve_watch_set(&spec, "hetz", &refresh);
         assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
         assert!(
             diagnostics.is_empty(),
             "a silent profile must not execute its missing resolver: {diagnostics:?}"
+        );
+        assert_eq!(
+            resource_coverage_with_profiles(&dir, &spec.resources[0], &refresh),
+            ResyncCoverage::Silent
         );
     }
 }

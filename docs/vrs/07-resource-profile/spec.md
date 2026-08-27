@@ -66,8 +66,12 @@ There is one source variant:
 ProfileSource::Wasm {
     module: PathBuf,
     class: ProfileClass,
+    containment_root: Option<PathBuf>,
 }
 ```
+
+`containment_root` is the trusted descriptor-traversal root for catalog-relative
+modules and is absent for explicitly external absolute modules.
 
 There is no template or exec variant. `ResourceProfileRegistry::builtin()` is
 empty. `with_profile` and `with_profiles` inject catalog-owned registrations;
@@ -219,6 +223,8 @@ metadata alone is never treated as a durable proof.
 
 Each module is opened nonblocking and no-follow, accepted only as a regular
 file, and read through a 16 MiB admission cap before validation or compilation.
+Catalog-relative modules are traversed descriptor-relative from the catalog
+root with `O_NOFOLLOW` on every ancestor and the final component.
 The bounded 32-entry LRU cache stores both successful modules and compilation
 failures by module path plus byte digest and stable file metadata. Registry
 clones and concurrent subscribers therefore coalesce one compilation attempt
@@ -231,10 +237,11 @@ instance receives one fresh allowance before each later call:
 
 | Boundary | Contract |
 | --- | --- |
-| Module file | regular, no-follow, nonblocking open; 16 MiB maximum before Wasmtime compilation |
+| Module file | regular, nonblocking; catalog-relative paths use descriptor-relative no-follow traversal for every component; 16 MiB maximum before Wasmtime compilation |
 | Imports | none; import-requiring modules fail instantiation |
 | Fuel | 5,000,000 fuel units for start + first call; same budget per later call |
 | Linear memory | 64 MiB maximum |
+| Resolver return | memory range must be valid and at most 64 KiB before UTF-8/JSON decoding |
 | Memories | at most 1 |
 | Tables | at most 4, with at most 10,000 elements each |
 | Instance state | fresh per registry resolution |
@@ -248,7 +255,7 @@ Failure taxonomy:
 | missing `memory`, `alloc`, or `resolve` | `MissingExport` | same |
 | unreachable/stack/memory trap | `Trap` | same |
 | infinite start function or call | `FuelExhausted` | same |
-| invalid pointer, UTF-8, JSON, empty/escaped path, symlink, or special-file read | `BadReturn` or unreadable carrier | same |
+| invalid pointer, oversized return, UTF-8, JSON, empty/escaped path, symlink, or special-file read | `BadReturn` or unreadable carrier | same |
 | feature disabled | registered-profile error | same; no alternate resolver |
 
 All wasmtime code and dependencies are gated by `wasm-resolver`, forwarded from

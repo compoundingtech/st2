@@ -293,6 +293,7 @@ struct ApplyMarker {
     stage_name: String,
     expected_root_sha256: String,
     prepared_root_sha256: String,
+    #[serde(default)]
     original_profile_modules: Vec<String>,
     original_paths: Vec<String>,
 }

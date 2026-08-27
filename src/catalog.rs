@@ -367,18 +367,28 @@ pub fn pty_root(catalog_root: &Path) -> PathBuf {
 /// behind "nothing fires". `st2 up` surfaces this before spawning; `st2 validate` reports it.
 pub fn declared_profiles(catalog_root: &Path) -> anyhow::Result<ResourceProfileRegistry> {
     let config = load(catalog_root)?;
+    let absolute_root = if catalog_root.is_absolute() {
+        lexical_absolute(catalog_root)?
+    } else {
+        lexical_absolute(&std::env::current_dir()?.join(catalog_root))?
+    };
     config.profiles.into_iter().try_fold(
         ResourceProfileRegistry::empty(),
         |registry, declared| -> anyhow::Result<ResourceProfileRegistry> {
-            let module = match resolve_profile_module(catalog_root, &declared.wasm)? {
-                ResolvedProfileModule::CatalogRelative(relative) => catalog_root.join(relative),
-                ResolvedProfileModule::External(module) => module,
+            let profile = match resolve_profile_module(&absolute_root, &declared.wasm)? {
+                ResolvedProfileModule::CatalogRelative(relative) => {
+                    ResourceProfile::wasm_contained(
+                        declared.scheme,
+                        &absolute_root,
+                        relative,
+                        declared.class,
+                    )
+                }
+                ResolvedProfileModule::External(module) => {
+                    ResourceProfile::wasm(declared.scheme, module, declared.class)
+                }
             };
-            Ok(registry.with_profile(ResourceProfile::wasm(
-                declared.scheme,
-                module,
-                declared.class,
-            )))
+            Ok(registry.with_profile(profile))
         },
     )
 }
