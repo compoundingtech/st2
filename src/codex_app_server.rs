@@ -43,10 +43,16 @@ use crate::{ding, harness_state, message, run, status};
 /// `turn/start` response body, `turn/started`, `turn/completed`, the typed `item/completed`
 /// receipt, `turn/steer`, and the `thread/resume` subscription path are therefore unproven on this
 /// version. See #267.
+///
+/// `codex-cli 0.150.0` is admitted after a generated JSON Schema comparison against 0.147.0. The
+/// delivery request schemas are unchanged. Delivery response changes are additive. The changed
+/// `thread/resume` history item shape does not affect the wrapper's thread-id-only request. A live
+/// st3 eval proves thread start, typed delivery, completed turns, and the native message path.
 pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &[
     "codex-cli 0.145.0",
     "codex-cli 0.146.0",
     "codex-cli 0.147.0",
+    "codex-cli 0.150.0",
 ];
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";

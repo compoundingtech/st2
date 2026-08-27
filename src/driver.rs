@@ -9,7 +9,6 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 
 const ST2: &str = "st2";
 const CATALOG: &str = "$CATALOG";
-const CLAUDE_SERVER: &str = "st2";
 
 /// Reject two launch sources before expansion, task compilation, or workspace writes.
 pub(crate) fn ensure_single_source(spec: &AgentSpec) -> Result<()> {
@@ -131,42 +130,22 @@ fn expand_opencode(driver: &OpenCodeDriver, bus_id: &str) -> KdlDocument {
 }
 
 fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
-    let mcp = serde_json::json!({
-        "mcpServers": {
-            CLAUDE_SERVER: {
-                "type": "stdio",
-                "command": ST2,
-                "args": [
-                    "--catalog",
-                    CATALOG,
-                    "driver",
-                    "claude-mcp",
-                    "--identity",
-                    bus_id
-                ]
-            }
-        }
-    });
-    let mcp = serde_json::to_string_pretty(&mcp)?;
     // The same registration a hand-authored seat carries: without it a driver-declared
     // seat has no observed-state producer and no lifecycle hooks at all.
     let settings = serde_json::to_string_pretty(&crate::hooks::claude_settings_registration())?;
     let mut render = KdlNode::new("render");
-    render.set_children(document([
-        node("json-upsert", vec![".mcp.json".to_string(), mcp]),
-        {
-            // Hook arrays join whatever the workspace already declares: replacement would clobber
-            // user-registered hooks on every materialization, and union is idempotent.
-            let mut upsert = node(
-                "json-upsert",
-                vec![".claude/settings.local.json".to_string(), settings],
-            );
-            upsert
-                .entries_mut()
-                .push(KdlEntry::new_prop("arrays", "union"));
-            upsert
-        },
-    ]));
+    render.set_children(document([{
+        // Hook arrays join whatever the workspace already declares: replacement would clobber
+        // user-registered hooks on every materialization, and union is idempotent.
+        let mut upsert = node(
+            "json-upsert",
+            vec![".claude/settings.local.json".to_string(), settings],
+        );
+        upsert
+            .entries_mut()
+            .push(KdlEntry::new_prop("arrays", "union"));
+        upsert
+    }]));
 
     let mut provider = vec!["claude".to_string()];
     if let Some(model) = &driver.model {
@@ -176,7 +155,10 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
         provider.extend(["--effort".to_string(), effort.clone()]);
     }
     if driver.dev_channels {
-        provider.push("--dangerously-load-development-channels=server:st2".to_string());
+        provider.extend([
+            "--channels".to_string(),
+            crate::claude_channel::CHANNEL.to_string(),
+        ]);
     }
     provider.extend(driver.args.iter().cloned());
     provider.push(driver.prompt.clone());
@@ -350,30 +332,15 @@ mod tests {
             .iter()
             .filter(|node| node.name().value() == "json-upsert")
             .collect();
-        assert_eq!(upserts.len(), 2);
-        let upsert = strings(upserts[0]);
-        assert_eq!(upsert[0], ".mcp.json");
-        let mcp: serde_json::Value = serde_json::from_str(upsert[1]).unwrap();
-        assert_eq!(mcp["mcpServers"]["st2"]["type"], "stdio");
-        assert_eq!(mcp["mcpServers"]["st2"]["command"], "st2");
-        assert_eq!(
-            mcp["mcpServers"]["st2"]["args"],
-            serde_json::json!([
-                "--catalog",
-                "$CATALOG",
-                "driver",
-                "claude-mcp",
-                "--identity",
-                "host.worker"
-            ])
-        );
-        let settings = strings(upserts[1]);
+        assert_eq!(upserts.len(), 1);
+        let settings = strings(upserts[0]);
         assert_eq!(settings[0], ".claude/settings.local.json");
         let settings: serde_json::Value = serde_json::from_str(settings[1]).unwrap();
         assert_eq!(settings, crate::hooks::claude_settings_registration());
+        let argv = strings(output.get("argv").unwrap());
         assert_eq!(
-            strings(output.get("argv").unwrap()),
-            [
+            &argv[..17],
+            &[
                 "st2",
                 "--catalog",
                 "$CATALOG",
@@ -389,11 +356,10 @@ mod tests {
                 "opus",
                 "--effort",
                 "xhigh",
-                "--dangerously-load-development-channels=server:st2",
-                "--model",
-                "override",
-                "Start work."
+                "--channels",
+                "plugin:st2-channel@st2",
             ]
         );
+        assert_eq!(&argv[17..], &["--model", "override", "Start work."]);
     }
 }

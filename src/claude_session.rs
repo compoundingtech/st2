@@ -35,6 +35,10 @@ pub fn run(
         !claude_argv.is_empty(),
         "Claude driver '{runtime_id}' has no provider argv"
     );
+    let claude_argv = prepare_channel_argv(catalog_root, &identity, claude_argv)?;
+    let workspace = std::env::current_dir().context("reading the Claude driver workspace")?;
+    crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
+        .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
     install_signal_handler();
     let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id)?;
     // The runtime ID reaches hook subprocesses through the provider environment, so their
@@ -57,6 +61,84 @@ pub fn run(
         Some(&observer),
     )
     .with_context(|| format!("running Claude driver '{runtime_id}'"))
+}
+
+fn requires_st2_channel(argv: &[String]) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::CHANNEL)
+}
+
+/// Prefer the approved plugin, but preserve an interactive development path when it is absent.
+///
+/// The fallback keeps its MCP declaration in provider arguments. It does not write project state.
+fn prepare_channel_argv(
+    catalog_root: &Path,
+    identity: &str,
+    argv: Vec<String>,
+) -> Result<Vec<String>> {
+    if !requires_st2_channel(&argv) {
+        return Ok(argv);
+    }
+    match crate::claude_channel::verify_installed() {
+        Ok(()) => Ok(argv),
+        Err(error) => {
+            eprintln!(
+                "warning: the approved st2 Claude channel plugin is unavailable: {error:#}\n\
+                 warning: using Claude's interactive development channel; Claude can ask for confirmation\n\
+                 warning: run `st2 claude-channel install` for unattended startup"
+            );
+            let executable = std::env::current_exe()
+                .context("resolving the st2 executable for the Claude development channel")?;
+            development_channel_argv(argv, &executable, catalog_root, identity)
+        }
+    }
+}
+
+fn development_channel_argv(
+    argv: Vec<String>,
+    executable: &Path,
+    catalog_root: &Path,
+    identity: &str,
+) -> Result<Vec<String>> {
+    let mcp = serde_json::json!({
+        "mcpServers": {
+            "st2": {
+                "type": "stdio",
+                "command": executable,
+                "args": [
+                    "--catalog",
+                    catalog_root,
+                    "driver",
+                    "claude-mcp",
+                    "--identity",
+                    identity
+                ]
+            }
+        }
+    });
+    let mut output = Vec::with_capacity(argv.len() + 1);
+    let mut index = 0;
+    let mut replaced = false;
+    while index < argv.len() {
+        if !replaced
+            && argv[index] == "--channels"
+            && argv.get(index + 1).map(String::as_str) == Some(crate::claude_channel::CHANNEL)
+        {
+            output.extend([
+                "--mcp-config".to_string(),
+                serde_json::to_string(&mcp)
+                    .context("serializing the Claude development channel")?,
+                "--dangerously-load-development-channels=server:st2".to_string(),
+            ]);
+            replaced = true;
+            index += 2;
+            continue;
+        }
+        output.push(argv[index].clone());
+        index += 1;
+    }
+    anyhow::ensure!(replaced, "the Claude plugin channel selector is missing");
+    Ok(output)
 }
 
 /// Apply one Claude hook event (payload on stdin) to the agent's observed-harness-state record.
@@ -225,6 +307,65 @@ mod tests {
 
     use super::*;
     use crate::harness_state::harness_state_path;
+
+    #[test]
+    fn only_the_packaged_channel_requests_the_installation_preflight() {
+        assert!(requires_st2_channel(&[
+            "claude".into(),
+            "--channels".into(),
+            "plugin:st2-channel@st2".into(),
+        ]));
+        assert!(!requires_st2_channel(&[
+            "claude".into(),
+            "--channels".into(),
+            "plugin:other@marketplace".into(),
+        ]));
+    }
+
+    #[test]
+    fn development_channel_fallback_is_inline_and_keeps_the_provider_arguments() {
+        let argv = vec![
+            "claude".into(),
+            "--model".into(),
+            "sonnet".into(),
+            "--channels".into(),
+            "plugin:st2-channel@st2".into(),
+            "prompt".into(),
+        ];
+        let output = development_channel_argv(
+            argv,
+            Path::new("/opt/st2/bin/st2"),
+            Path::new("/var/lib/st2/catalog"),
+            "host.worker",
+        )
+        .unwrap();
+        assert_eq!(&output[..3], &["claude", "--model", "sonnet"]);
+        assert_eq!(
+            output.last().map(String::as_str),
+            Some("prompt"),
+            "the user prompt remains last"
+        );
+        let config_index = output.iter().position(|arg| arg == "--mcp-config").unwrap();
+        let mcp: serde_json::Value = serde_json::from_str(&output[config_index + 1]).unwrap();
+        assert_eq!(mcp["mcpServers"]["st2"]["command"], "/opt/st2/bin/st2");
+        assert_eq!(
+            mcp["mcpServers"]["st2"]["args"],
+            serde_json::json!([
+                "--catalog",
+                "/var/lib/st2/catalog",
+                "driver",
+                "claude-mcp",
+                "--identity",
+                "host.worker"
+            ])
+        );
+        assert!(
+            output
+                .iter()
+                .any(|arg| arg == "--dangerously-load-development-channels=server:st2")
+        );
+        assert!(!output.iter().any(|arg| arg == "--channels"));
+    }
 
     #[test]
     fn idle_provider_refreshes_presence_without_mcp_input() {

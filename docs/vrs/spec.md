@@ -580,6 +580,19 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   after st2 starts it. `st2 pretrust` remains an explicit operator utility for
   commands that intentionally use the ambient Claude and Codex configs.
 
+  A typed Claude driver with channel delivery uses the stable
+  `plugin:st2-channel@st2` identity. `st2 claude-channel install` publishes the
+  marketplace and plugin embedded in the binary, installs the user plugin, and
+  writes a separate machine policy fragment through an elevated child command.
+  Reconciliation does not install or approve the plugin. The Claude session
+  wrapper checks the installation before each launch. The wrapper uses the
+  approved plugin when all parts are ready. Otherwise, it passes an inline MCP
+  declaration and selects Claude's development channel. That fallback can show
+  Claude's confirmation prompt. Neither path writes a project `.mcp.json` file.
+  The plugin starts `st2 driver claude-mcp` from the managed task environment.
+  The typed Claude session admits only its exact workspace in Claude's selected
+  config. An opaque command never receives this provider-specific action.
+
   st2 owns `ST_AGENT` for every PTY and exec task, deriving the value as
   `<resolved-host>.<identity>` on every reconciliation. An omitted value is
   injected, an authored exact match is accepted, and a conflicting authored

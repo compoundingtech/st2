@@ -189,6 +189,7 @@ pub struct Reconciler<R = NativeRuntime> {
     driver_state_dir: PathBuf,
     runtime_environment: BTreeMap<String, String>,
     notify: Arc<Notify>,
+    event_notify: Arc<Notify>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
@@ -202,6 +203,7 @@ impl Reconciler<NativeRuntime> {
         host: String,
         endpoint: String,
         notify: Arc<Notify>,
+        event_notify: Arc<Notify>,
     ) -> Self {
         let selected_pty_root = pty_root
             .map(Path::to_path_buf)
@@ -217,6 +219,7 @@ impl Reconciler<NativeRuntime> {
                 selected_pty_root.to_string_lossy().into_owned(),
             )]),
             notify,
+            event_notify,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
@@ -234,6 +237,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
             runtime_environment: BTreeMap::new(),
             notify,
+            event_notify: Arc::new(Notify::new()),
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
@@ -255,6 +259,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 );
             }
         }
+    }
+
+    fn signal_changed(&self) {
+        signal_changed(&self.notify, &self.event_notify);
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
@@ -726,8 +734,17 @@ impl<R: RuntimeControl> Reconciler<R> {
             "ST3_DRIVER_STATE_DIR".into(),
             self.driver_state_dir.to_string_lossy().into_owned(),
         );
+        launch_member
+            .environment
+            .insert("ST_AGENT".into(), subject.subject.clone());
+        let executable = std::env::current_exe()?;
+        prepend_executable_dir(&mut launch_member.environment, &executable)?;
+        if let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
+            && argv.first().map(String::as_str) == Some("st3")
+        {
+            argv[0] = executable.to_string_lossy().into_owned();
+        }
         if !launch_member.terminal {
-            let executable = std::env::current_exe()?.to_string_lossy().into_owned();
             let original = match &launch_member.launch {
                 crate::model::LaunchSpec::Shell(source) => {
                     vec!["sh".into(), "-c".into(), source.clone()]
@@ -735,7 +752,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 crate::model::LaunchSpec::Argv(argv) => argv.clone(),
             };
             let mut wrapper = vec![
-                executable,
+                executable.to_string_lossy().into_owned(),
                 "driver".into(),
                 "exec".into(),
                 "--subject".into(),
@@ -784,7 +801,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ),
             ]),
         )?;
-        self.notify.notify_one();
+        self.signal_changed();
         Ok(())
     }
 
@@ -1117,6 +1134,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 self.fail_checkpoint(&stage, &scopes, &reason)?;
                 continue;
             }
+            if !self.checkpoint_subgraph_holds(&stage, desired)? {
+                continue;
+            }
             for judge in stage
                 .judges
                 .iter()
@@ -1171,10 +1191,54 @@ impl<R: RuntimeControl> Reconciler<R> {
                         ]),
                     )?;
                 }
-                self.notify.notify_one();
+                self.signal_changed();
             }
         }
         Ok(())
+    }
+
+    fn checkpoint_subgraph_holds(
+        &self,
+        stage: &CheckpointSpec,
+        desired: &[DesiredSubject],
+    ) -> Result<bool> {
+        for subject in desired.iter().filter(|subject| {
+            subject.activation.as_ref().is_some_and(|activation| {
+                activation.sequence == stage.sequence && activation.ordinal == stage.ordinal
+            })
+        }) {
+            let status = self
+                .store
+                .latest_actual_value(&subject.subject)?
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let holds = match subject.kind.as_str() {
+                "scope-stop" | "stop" => {
+                    matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
+                }
+                "message" => matches!(status.as_deref(), Some("delivered" | "accepted" | "closed")),
+                _ => match subject.member.as_ref() {
+                    Some(member) if member.lifecycle == MemberLifecycle::AdoptOnly => matches!(
+                        status.as_deref(),
+                        Some("absent" | "running" | "ready" | "working" | "idle" | "exited")
+                    ),
+                    Some(member) if member.driver.is_some() => {
+                        matches!(status.as_deref(), Some("ready" | "working" | "idle"))
+                    }
+                    Some(_) => matches!(
+                        status.as_deref(),
+                        Some("running" | "ready" | "working" | "idle" | "exited")
+                    ),
+                    None => true,
+                },
+            };
+            if !holds {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn current_checkpoint_reached(
@@ -1260,7 +1324,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ]),
             )?;
         }
-        self.notify.notify_waiters();
+        self.signal_changed();
         Ok(())
     }
 
@@ -1279,18 +1343,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .find(|item| item.subject == recipient)
                 .and_then(|item| item.member.as_ref())
                 .and_then(|member| member.driver.as_deref());
-            let native_codex = driver == Some("codex")
-                && self
-                    .store
-                    .latest_claim(&recipient, Some("harness.ready"))?
-                    .is_some_and(|claim| {
-                        claim
-                            .body
-                            .pointer("/fields/transport")
-                            .and_then(Value::as_str)
-                            == Some("app-server")
-                    });
-            if driver == Some("claude") || native_codex {
+            if matches!(driver, Some("claude" | "codex")) {
                 continue;
             }
             let Some(actual) = self.store.latest_actual_value(&recipient)? else {
@@ -1481,7 +1534,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     subject.subject, supervisor.subject, prior
                 )),
             })?;
-            self.notify.notify_waiters();
+            self.signal_changed();
             return Ok(());
         }
         Ok(())
@@ -1599,9 +1652,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("clock-wake:{operation}")),
             })?;
+            self.event_notify.notify_waiters();
             let template = spec.message.clone();
             let store = self.store.clone();
             let notify = self.notify.clone();
+            let event_notify = self.event_notify.clone();
             let armed = self.armed_schedules.clone();
             let schedule_subject = schedule.subject.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1635,7 +1690,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .lock()
                             .expect("schedule mutex poisoned")
                             .remove(&operation);
-                        notify.notify_waiters();
+                        signal_changed(&notify, &event_notify);
                         return;
                     }
                     let reached = store.append_claim(&ClaimInput {
@@ -1676,7 +1731,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .expect("schedule mutex poisoned")
                         .remove(&operation);
-                    notify.notify_waiters();
+                    signal_changed(&notify, &event_notify);
                 });
             } else {
                 self.armed_schedules
@@ -1798,13 +1853,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             JudgeSpec::Mechanical {
                 name,
                 command,
+                host,
                 workspace,
                 environment,
                 time_limit_ms,
                 ..
-            } => {
-                self.run_mechanical(stage, name, command, workspace, environment, *time_limit_ms)?
-            }
+            } => self.run_mechanical(
+                stage,
+                name,
+                command,
+                host,
+                workspace,
+                environment,
+                *time_limit_ms,
+            )?,
             JudgeSpec::Llm {
                 name,
                 model,
@@ -1830,11 +1892,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_mechanical(
         &self,
         stage: &CheckpointSpec,
         name: &str,
         command: &str,
+        host: &str,
         workspace: &str,
         environment: &BTreeMap<String, String>,
         time_limit_ms: u64,
@@ -1845,60 +1909,134 @@ impl<R: RuntimeControl> Reconciler<R> {
             &serde_json::json!({
                 "type": "mechanical",
                 "command": command,
+                "host": host,
                 "workspace": workspace,
                 "environment": environment,
                 "time_limit_ms": time_limit_ms,
             }),
         )?;
-        if let Some(result) = self.store.latest_actual_value(&result_subject)? {
-            if actual_field(&result, "verdict").and_then(Value::as_str) == Some("pass") {
-                return Ok(JudgeOutcome::Pass);
+        let runtime_id = result_subject.replace('/', ".");
+        if let Some(result) = self
+            .store
+            .latest_claim(&result_subject, Some("judgement.result"))?
+        {
+            let verdict = result
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str)
+                .unwrap_or("fail");
+            let reason = result
+                .body
+                .pointer("/fields/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the mechanical judge failed");
+            return Ok(if verdict == "pass" {
+                JudgeOutcome::Pass
+            } else {
+                JudgeOutcome::Fail(reason.into())
+            });
+        }
+        if host != self.host {
+            return Ok(JudgeOutcome::Pending);
+        }
+        if let Some(requested) = self
+            .store
+            .latest_claim(&result_subject, Some("judgement.requested"))?
+        {
+            let elapsed = now_ms().saturating_sub(requested.accepted_at_unix_ms);
+            if elapsed >= time_limit_ms as u128 {
+                self.stop_judge_runner(&result_subject, true)?;
+                let reason = format!("mechanical judge `{name}` exceeded {time_limit_ms}ms");
+                self.record_once(
+                    &result_subject,
+                    "judgement.result",
+                    BTreeMap::from([
+                        ("verdict".into(), Value::String("fail".into())),
+                        ("reason".into(), Value::String(reason.clone())),
+                    ]),
+                )?;
+                return Ok(JudgeOutcome::Fail(reason));
             }
-            if let Some(claim) = self
-                .store
-                .latest_claim(&result_subject, Some("judgement.result"))?
-                && self.store.index()? <= claim.store_index
-            {
-                return Ok(JudgeOutcome::Pending);
+            match self.runtime.observe_exec(&runtime_id)? {
+                Some(observation) if observation.status == "running" => {
+                    self.arm_judge_poll();
+                    return Ok(JudgeOutcome::Pending);
+                }
+                Some(observation) if observation.status == "exited" => {
+                    let verdict = if observation.exit_code == Some(0) {
+                        "pass"
+                    } else {
+                        "fail"
+                    };
+                    let reason = format!("mechanical judge `{name}` {verdict}");
+                    self.record_once(
+                        &result_subject,
+                        "judgement.result",
+                        BTreeMap::from([
+                            ("verdict".into(), Value::String(verdict.into())),
+                            ("reason".into(), Value::String(reason.clone())),
+                        ]),
+                    )?;
+                    return Ok(if verdict == "pass" {
+                        JudgeOutcome::Pass
+                    } else {
+                        JudgeOutcome::Fail(reason)
+                    });
+                }
+                _ => {
+                    self.arm_judge_poll();
+                    return Ok(JudgeOutcome::Pending);
+                }
             }
         }
-        let mut process = std::process::Command::new("sh");
-        process
-            .args(["-c", command])
-            .current_dir(workspace)
-            .envs(environment)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let start = std::time::Instant::now();
-        let mut child = process.spawn()?;
-        let verdict = loop {
-            if let Some(status) = child.try_wait()? {
-                break if status.success() { "pass" } else { "fail" };
-            }
-            if start.elapsed() >= Duration::from_millis(time_limit_ms) {
-                let _ = child.kill();
-                let _ = child.wait();
-                break "fail";
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+
         self.record_once(
             &result_subject,
-            "judgement.result",
+            "judgement.requested",
             BTreeMap::from([
-                ("verdict".into(), Value::String(verdict.into())),
-                (
-                    "reason".into(),
-                    Value::String(format!("mechanical judge `{name}` {verdict}")),
-                ),
+                ("status".into(), Value::String("requested".into())),
+                ("runner".into(), Value::String("exec".into())),
             ]),
         )?;
-        Ok(if verdict == "pass" {
-            JudgeOutcome::Pass
-        } else {
-            JudgeOutcome::Fail(format!("mechanical judge `{name}` failed"))
-        })
+        let member = MemberSpec {
+            kind: MemberKind::Exec,
+            host: host.into(),
+            runtime_id,
+            workspace: workspace.into(),
+            cwd: workspace.into(),
+            terminal: false,
+            launch: LaunchSpec::Shell(command.into()),
+            environment: environment.clone(),
+            tags: BTreeMap::new(),
+            display_name: None,
+            lifecycle: MemberLifecycle::Service,
+            restart: RestartType::Never,
+            restart_intensity: RestartIntensity::default(),
+            shutdown_timeout_ms: 5_000,
+            driver: Some("mechanical-judge".into()),
+            supervisor: "supervisor/root".into(),
+        };
+        let desired = DesiredSubject {
+            subject: result_subject,
+            kind: "judge".into(),
+            desired: Value::Null,
+            member: Some(member.clone()),
+            activation: None,
+            scopes: Default::default(),
+        };
+        self.perform_start(&desired, &member, "the mechanical judge was requested")?;
+        self.arm_judge_poll();
+        Ok(JudgeOutcome::Pending)
+    }
+
+    fn arm_judge_poll(&self) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let notify = self.notify.clone();
+            handle.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                notify.notify_one();
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2301,6 +2439,11 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 }
 
+fn signal_changed(reconcile_notify: &Notify, event_notify: &Notify) {
+    reconcile_notify.notify_one();
+    event_notify.notify_waiters();
+}
+
 fn structured_token_usage(log: &str) -> Option<u64> {
     let mut usages = Vec::new();
     let trimmed = log.trim();
@@ -2457,6 +2600,27 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn prepend_executable_dir(
+    environment: &mut BTreeMap<String, String>,
+    executable: &Path,
+) -> Result<()> {
+    let Some(directory) = executable.parent() else {
+        return Ok(());
+    };
+    let current = environment
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let paths = std::iter::once(directory.to_path_buf())
+        .chain(std::env::split_paths(&current).filter(|path| path != directory));
+    environment.insert(
+        "PATH".into(),
+        std::env::join_paths(paths)?.to_string_lossy().into_owned(),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -2472,10 +2636,12 @@ mod tests {
         execs: Mutex<HashMap<String, RuntimeObservation>>,
         logs: Mutex<HashMap<String, String>>,
         starts: Mutex<Vec<String>>,
+        started_members: Mutex<Vec<MemberSpec>>,
         stops: Mutex<Vec<String>>,
         kills: Mutex<Vec<String>>,
         screen: Mutex<String>,
         keys: Mutex<Vec<String>>,
+        sent_lines: Mutex<Vec<(String, String)>>,
     }
 
     impl RuntimeControl for FakeRuntime {
@@ -2487,6 +2653,7 @@ mod tests {
         }
         fn start(&self, member: &MemberSpec) -> Result<()> {
             self.starts.lock().unwrap().push(member.runtime_id.clone());
+            self.started_members.lock().unwrap().push(member.clone());
             Ok(())
         }
         fn stop(
@@ -2510,7 +2677,11 @@ mod tests {
         fn attach(&self, _runtime_id: &str) -> Result<()> {
             Ok(())
         }
-        fn send(&self, _runtime_id: &str, _text: &str) -> Result<()> {
+        fn send(&self, runtime_id: &str, text: &str) -> Result<()> {
+            self.sent_lines
+                .lock()
+                .unwrap()
+                .push((runtime_id.into(), text.into()));
             Ok(())
         }
         fn screen(&self, _runtime_id: &str) -> Result<String> {
@@ -2559,6 +2730,450 @@ mod tests {
     #[test]
     fn rejects_an_unstructured_usage_log() {
         assert_eq!(structured_token_usage("the judge finished"), None);
+    }
+
+    #[test]
+    fn a_started_member_gets_its_graph_identity() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            subgraph {
+              agent "worker" {
+                command "true"
+                env { ST_AGENT "ambient.identity" }
+              }
+            }
+        "#;
+        apply_source(&store, source, "member-identity");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let members = runtime.started_members.lock().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].environment.get("ST_AGENT").map(String::as_str),
+            Some("agent/node.worker")
+        );
+        let executable = std::env::current_exe().unwrap();
+        let path = members[0].environment.get("PATH").unwrap();
+        assert_eq!(
+            std::env::split_paths(std::ffi::OsStr::new(path)).next(),
+            executable.parent().map(Path::to_path_buf)
+        );
+    }
+
+    #[test]
+    fn a_native_driver_uses_the_running_st3_executable() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            subgraph {
+              agent "worker" {
+                codex { prompt "Wait for work." }
+              }
+            }
+        "#;
+        apply_source(&store, source, "native-driver-executable");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        let members = runtime.started_members.lock().unwrap();
+        let LaunchSpec::Argv(argv) = &members[0].launch else {
+            panic!("the native driver launch is not argv");
+        };
+        assert_eq!(
+            argv.first().map(Path::new),
+            Some(std::env::current_exe().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_waits_for_native_driver_readiness_before_starting_a_judge() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            subgraph {
+              checkpoints "proof" {
+                checkpoint "The native agent is ready" {
+                  subgraph {
+                    agent "worker" {
+                      codex { prompt "Do the work." }
+                    }
+                    message "kick" {
+                      from "requester"
+                      to "node.worker"
+                      content "Start."
+                    }
+                  }
+                  judges {
+                    judge "verify" {
+                      exec "true"
+                      host "node"
+                      workspace "."
+                      time-limit "1m"
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        apply_source(&store, source, "checkpoint-native-ready");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
+
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.ready".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("ready".into())),
+                    ("transport".into(), Value::String("app-server".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("worker-ready".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/kick".into(),
+                kind: "message.delivered".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: BTreeMap::from([("status".into(), Value::String("delivered".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("kick-delivered".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+
+        let starts = runtime.starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert!(starts[1].contains(".judge."));
+    }
+
+    #[test]
+    fn a_simulated_codex_graph_reaches_verdict_and_cleans_its_scope() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            subgraph {
+              checkpoints "eval/simulated-codex" scope="scope/eval/simulated-codex" {
+                checkpoint "The Codex team is ready" {
+                  subgraph {
+                    agent "sup" {
+                      codex { prompt "Coordinate the work." }
+                      restart "never"
+                    }
+                    agent "worker" {
+                      codex { prompt "Do the work." }
+                      restart "never"
+                    }
+                    message "kickoff" {
+                      from "requester"
+                      to "node.sup"
+                      content "Start."
+                    }
+                  }
+                  judges {
+                    exists "agent/node.sup"
+                    exists "agent/node.worker"
+                    deadline "60s"
+                  }
+                }
+                checkpoint "The worker report is delivered" {
+                  subgraph {
+                    message "worker-report" {
+                      from "node.worker"
+                      to "node.sup"
+                      content "The work is complete."
+                    }
+                  }
+                  judges { deadline "60s" }
+                }
+                checkpoint "The supervisor confirmation is delivered" {
+                  subgraph {
+                    message "confirmation" {
+                      from "node.sup"
+                      to "requester"
+                      content "The result is verified."
+                    }
+                  }
+                  judges { deadline "60s" }
+                }
+                checkpoint "The mechanical judge passes" {
+                  judges {
+                    judge "mechanical" {
+                      exec "true"
+                      host "node"
+                      workspace "."
+                      time-limit "60s"
+                    }
+                  }
+                }
+                checkpoint "The Codex judge passes" {
+                  judges {
+                    judge "semantic" type="llm" {
+                      model "gpt-5.6-sol"
+                      host "node"
+                      workspace "."
+                      tools "shell"
+                      token-budget 1000
+                      time-limit "60s"
+                      prompt "Check the result."
+                    }
+                  }
+                }
+                checkpoint "The temporary eval scope is empty" {
+                  subgraph { scope "eval/simulated-codex" { stop } }
+                  judges { empty "scope/eval/simulated-codex" }
+                }
+              }
+            }
+        "#;
+        apply_source(&store, source, "simulated-codex-graph");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let deliver = |subject: &str, recipient: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "message.delivered".into(),
+                    actor: Some(recipient.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String("delivered".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("deliver:{subject}")),
+                })
+                .unwrap();
+        };
+
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.started_members.lock().unwrap().len(), 2);
+        runtime.ptys.lock().unwrap().extend([
+            RuntimeObservation {
+                runtime_id: "node.sup".into(),
+                terminal: true,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("sup-one".into()),
+            },
+            RuntimeObservation {
+                runtime_id: "node.worker".into(),
+                terminal: true,
+                status: "running".into(),
+                exit_code: None,
+                incarnation_id: Some("worker-one".into()),
+            },
+        ]);
+        reconciler.reconcile_once().unwrap();
+        for subject in ["agent/node.sup", "agent/node.worker"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.ready".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("ready".into())),
+                        ("transport".into(), Value::String("app-server".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("ready:{subject}")),
+                })
+                .unwrap();
+        }
+        deliver("message/kickoff", "agent/node.sup");
+        reconciler.reconcile_once().unwrap();
+        deliver("message/worker-report", "agent/node.sup");
+        reconciler.reconcile_once().unwrap();
+        deliver("message/confirmation", "requester");
+        reconciler.reconcile_once().unwrap();
+
+        let mechanical = runtime
+            .started_members
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|member| member.driver.as_deref() == Some("mechanical-judge"))
+            .unwrap()
+            .runtime_id
+            .clone();
+        runtime.execs.lock().unwrap().insert(
+            mechanical.clone(),
+            RuntimeObservation {
+                runtime_id: mechanical,
+                terminal: false,
+                status: "exited".into(),
+                exit_code: Some(0),
+                incarnation_id: Some("mechanical-one".into()),
+            },
+        );
+        reconciler.reconcile_once().unwrap();
+
+        let (llm, judge_subject) = {
+            let members = runtime.started_members.lock().unwrap();
+            let member = members
+                .iter()
+                .find(|member| member.driver.as_deref() == Some("llm-judge"))
+                .unwrap();
+            (
+                member.runtime_id.clone(),
+                member.environment["ST3_JUDGE_SUBJECT"].clone(),
+            )
+        };
+        store
+            .append_claim(&ClaimInput {
+                subject: judge_subject,
+                kind: "judgement.result".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("verdict".into(), Value::String("pass".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the result is correct".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("simulated-llm-result".into()),
+            })
+            .unwrap();
+        runtime.execs.lock().unwrap().insert(
+            llm.clone(),
+            RuntimeObservation {
+                runtime_id: llm.clone(),
+                terminal: false,
+                status: "exited".into(),
+                exit_code: Some(0),
+                incarnation_id: Some("llm-one".into()),
+            },
+        );
+        runtime.logs.lock().unwrap().insert(
+            llm,
+            r#"{"type":"turn.completed","usage":{"total_tokens":120}}"#.into(),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.stops.lock().unwrap().len(), 2);
+
+        runtime.ptys.lock().unwrap().clear();
+        reconciler.reconcile_once().unwrap();
+
+        let verdict = store
+            .latest_claim("scope/eval/simulated-codex", Some("eval.verdict"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verdict
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            store
+                .latest_actual_value("scope/eval/simulated-codex")
+                .unwrap()
+                .and_then(|actual| actual.get("status").cloned()),
+            Some(Value::String("stopped".into()))
+        );
+    }
+
+    #[test]
+    fn a_mechanical_judge_uses_the_async_exec_runtime() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            subgraph {
+              checkpoints "proof" {
+                checkpoint "The command passes" {
+                  judges {
+                    judge "verify" {
+                      exec "sleep 60"
+                      host "node"
+                      workspace "."
+                      time-limit "1m"
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        apply_source(&store, source, "checkpoint-async-judge");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        let runtime_id = runtime.starts.lock().unwrap()[0].clone();
+        assert!(
+            store
+                .latest_claim("checkpoint/proof", Some("checkpoint.reached"))
+                .unwrap()
+                .is_none()
+        );
+        runtime.execs.lock().unwrap().insert(
+            runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id,
+                terminal: false,
+                status: "exited".into(),
+                exit_code: Some(0),
+                incarnation_id: Some("judge-one".into()),
+            },
+        );
+
+        reconciler.reconcile_once().unwrap();
+
+        assert!(
+            store
+                .latest_claim("checkpoint/proof", Some("checkpoint.reached"))
+                .unwrap()
+                .is_some()
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2721,6 +3336,90 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(actual_field(&actual, "adopted"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn restart_types_follow_success_and_failure() {
+        for (name, restart, exit_code, expected_starts) in [
+            ("always-success", "always", 0, 2),
+            ("failure-success", "on-failure", 0, 1),
+            ("failure-error", "on-failure", 1, 2),
+            ("never-error", "never", 1, 1),
+        ] {
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            let source = format!(
+                r#"
+                    subgraph {{
+                      agent "worker" {{
+                        command "true"
+                        restart "{restart}"
+                      }}
+                    }}
+                "#
+            );
+            apply_source(&store, &source, name);
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store,
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+
+            reconciler.reconcile_once().unwrap();
+            runtime.ptys.lock().unwrap().push(RuntimeObservation {
+                runtime_id: "node.worker".into(),
+                terminal: true,
+                status: "exited".into(),
+                exit_code: Some(exit_code),
+                incarnation_id: Some(format!("{name}-one")),
+            });
+            reconciler.reconcile_once().unwrap();
+
+            assert_eq!(
+                runtime.starts.lock().unwrap().len(),
+                expected_starts,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reconcile_does_not_redeliver_an_accepted_message() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            subgraph {
+              agent "worker" {
+                command "sleep 60"
+                ding
+              }
+              message "one" {
+                from "requester"
+                to "node.worker"
+                content "Do the work."
+              }
+            }
+        "#;
+        apply_source(&store, source, "one-message");
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("worker-one".into()),
+        });
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+
+        assert_eq!(runtime.sent_lines.lock().unwrap().len(), 1);
     }
 
     #[test]

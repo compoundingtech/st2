@@ -1,0 +1,88 @@
+subgraph {
+  resource "st3-stabilization-review" {
+    kind "human.review"
+  }
+
+  checkpoints "stabilize-st3" {
+    checkpoint "The deterministic st3 verification passes" {
+      subgraph {
+        exec "stabilize-st3/free-verification" {
+          workspace "."
+          command "cargo test -q -p st3 && cargo test -q -p st3-migrate && cargo clippy -p st3 -p st3-migrate --no-deps -- -D warnings && cargo fmt --all -- --check"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/stabilize-st3/free-verification" "is" "exited"
+        field "exit_code" "exec/stabilize-st3/free-verification" "is" 0
+        deadline "30m"
+      }
+    }
+
+    checkpoint "The migration audit records every opaque provider command" {
+      subgraph {
+        exec "stabilize-st3/migration-audit" {
+          workspace "."
+          command "test -f docs/st3/stabilization-report.md && rg 'Opaque Codex cells: 16|Opaque Claude cells: 26' docs/st3/stabilization-report.md"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/stabilize-st3/migration-audit" "is" "exited"
+        field "exit_code" "exec/stabilize-st3/migration-audit" "is" 0
+        deadline "5m"
+      }
+    }
+
+    checkpoint "The license MIT Codex eval passes" {
+      subgraph {
+        exec "stabilize-st3/license-mit-codex" {
+          workspace "."
+          command "st3 eval ./evals/license-mit-codex"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/stabilize-st3/license-mit-codex" "is" "exited"
+        field "exit_code" "exec/stabilize-st3/license-mit-codex" "is" 0
+        deadline "25m"
+      }
+    }
+
+    checkpoint "The ghost bug Codex eval passes" {
+      subgraph {
+        exec "stabilize-st3/ghost-bug-codex" {
+          workspace "."
+          command "st3 eval ./evals/ghost-bug-codex"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/stabilize-st3/ghost-bug-codex" "is" "exited"
+        field "exit_code" "exec/stabilize-st3/ghost-bug-codex" "is" 0
+        deadline "25m"
+      }
+    }
+
+    checkpoint "The signal rename Codex eval passes" {
+      subgraph {
+        exec "stabilize-st3/signal-rename-codex" {
+          workspace "."
+          command "st3 eval ./evals/signal-rename-codex"
+          restart "never"
+        }
+      }
+      judges {
+        field "status" "exec/stabilize-st3/signal-rename-codex" "is" "exited"
+        field "exit_code" "exec/stabilize-st3/signal-rename-codex" "is" 0
+        deadline "35m"
+      }
+    }
+
+    checkpoint "A person reviews the stabilization receipts" {
+      judges {
+        field "decision" "resource/st3-stabilization-review" "is" "approved"
+      }
+    }
+  }
+}

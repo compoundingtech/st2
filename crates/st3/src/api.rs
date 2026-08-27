@@ -40,10 +40,16 @@ use crate::store::Store;
 pub struct AppState {
     pub store: Arc<Store>,
     pub notify: Arc<Notify>,
+    pub event_notify: Arc<Notify>,
     pub node: String,
     pub state_dir: std::path::PathBuf,
     pub pty_root: std::path::PathBuf,
     pub trusted_peers: std::collections::BTreeSet<String>,
+}
+
+fn signal_changed(state: &AppState) {
+    state.notify.notify_one();
+    state.event_notify.notify_waiters();
 }
 
 #[derive(Debug)]
@@ -292,7 +298,7 @@ async fn apply(
             &request.idempotency_key,
         )
         .map_err(ApiError::bad)?;
-    state.notify.notify_one();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -309,7 +315,7 @@ async fn put_document(
             &request.idempotency_key,
         )
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -368,7 +374,7 @@ async fn post_claim(
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
     let response = state.store.append_claim(&request).map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -450,7 +456,7 @@ async fn post_review(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -531,7 +537,7 @@ async fn send_message(
             idempotency_key: Some(request.idempotency_key),
         })
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(MessageView {
         subject,
         from,
@@ -623,7 +629,7 @@ async fn post_message_claim(
             idempotency_key: Some(request.idempotency_key),
         })
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(record))
 }
 
@@ -652,7 +658,7 @@ async fn close_message(
             idempotency_key: Some(idempotency_key),
         })
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -698,6 +704,9 @@ async fn events(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<EventRecord>>, ApiError> {
+    let notified = state.event_notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
     let current = state
         .store
         .events_after_filtered(
@@ -709,7 +718,7 @@ async fn events(
     if !current.is_empty() {
         return Ok(Json(current));
     }
-    let _ = tokio::time::timeout(Duration::from_secs(30), state.notify.notified()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), notified).await;
     state
         .store
         .events_after_filtered(
@@ -768,7 +777,7 @@ async fn quick_agent(
         .store
         .apply(&intent, &expected_subjects, &request.idempotency_key)
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(state);
     let runtime_id = intent
         .subjects
         .get(&request.subject)
@@ -839,7 +848,7 @@ async fn start_eval(
             &format!("eval:{}:{}", request.name, request.bundle_hash),
         )
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     let scope = intent
         .subjects
         .values()
@@ -1217,7 +1226,7 @@ fn finish_session_control(
             idempotency_key: Some(result_key.into()),
         })
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(state);
     if let Some(reason) = reason {
         let code = if reason.contains("changed incarnation") {
             "stale-incarnation"
@@ -1344,7 +1353,7 @@ async fn post_judgement(
             idempotency_key: Some(request.idempotency_key),
         })
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -1525,7 +1534,7 @@ async fn import_peer(
         .store
         .import_replication(relay, &batch)
         .map_err(ApiError::bad)?;
-    state.notify.notify_waiters();
+    signal_changed(&state);
     Ok(Json(response))
 }
 
@@ -1599,11 +1608,30 @@ mod tests {
         AppState {
             store: Arc::new(Store::open_memory("node").unwrap()),
             notify: Arc::new(Notify::new()),
+            event_notify: Arc::new(Notify::new()),
             node: "node".into(),
             state_dir: root.to_path_buf(),
             pty_root: root.join("pty"),
             trusted_peers: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn an_event_waiter_cannot_consume_the_reconciler_signal() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let event = state.event_notify.notified();
+        tokio::pin!(event);
+        event.as_mut().enable();
+
+        signal_changed(&state);
+
+        tokio::time::timeout(Duration::from_millis(50), event)
+            .await
+            .expect("the event waiter did not wake");
+        tokio::time::timeout(Duration::from_millis(50), state.notify.notified())
+            .await
+            .expect("the reconciler signal was lost");
     }
 
     async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {

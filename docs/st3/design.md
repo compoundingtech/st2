@@ -572,6 +572,10 @@ PeerClaimResponse {
 
 `GET /v1/claims` returns a bounded page plus `next_cursor`. `GET /v1/events` returns bounded long-poll batches in the response envelope.
 
+The event long poll and the reconcile queue use separate wake channels.
+
+An event subscriber cannot consume a reconcile permit.
+
 ### Every change has a claim
 
 The write path records a durable request before it changes a process, PTY, harness, message, or graph.
@@ -945,7 +949,7 @@ The first implementation needs these state-bearing claim families:
 - `gate.observed` records a declared gate entering or leaving the visible screen.
 - `transport.peer` records an up or down event on a host subject from the peer adapter.
 - `message.sent` records accepted message content.
-- `message.delivered` records the native driver's observation that the message appeared in the conversation.
+- `message.delivered` records that the native driver accepted the message into its durable delivery bridge.
 - `message.accepted` records the recipient's lifecycle claim.
 - `message.closed` records an agent close claim or a held-out judge close verdict.
 - `action.result` records a driver result that changes actual state.
@@ -1143,6 +1147,12 @@ It exists for one pass. It is not a graph identifier or a stored namespace.
 Two active checkpoint sequences can name the same subject. Different desired revisions use the normal deterministic winner rule.
 
 A subject outside a checkpoint sequence gets one implicit direct target. Its `control_subject` is the subject itself.
+
+The runtime owns `ST_AGENT`. It sets this value to the canonical graph subject for every launched member.
+
+The runtime also adds the active st3 executable directory to the child `PATH`.
+
+A native driver wrapper uses the exact executable that started the daemon. The stored desired state keeps the portable `st3` name.
 
 ### One reconcile pass
 
@@ -1644,6 +1654,10 @@ A running judge time limit produces `fail` with a bounded reason. The runner sto
 
 A mechanical judge keeps the current `exec` shell command form. Exit zero passes, and any other exit fails.
 
+The reconciler starts the command through the durable exec runtime and returns to other reconciliation work.
+
+Later passes observe completion or enforce the time limit. The command does not block the reconcile loop.
+
 ```text
 run_mechanical_judge(definition, snapshot):
     assert definition.authority == judge_request.requester_authority
@@ -1838,7 +1852,7 @@ The aggregate agent subject controls all its task members. Stopping the agent st
 | `description "TEXT"` | One string of at most 1,000 characters | No description. |
 | `role "TEXT"` | One string | No role metadata. The runtime does not use this value. |
 | `type "service"` | Only `service` | `service`; the removed `batch` value is invalid. |
-| `host "NAME"` | One host name | The enclosing host, then the API host. |
+| `host "NAME"` | One host name | The enclosing host, then the API host. `local` resolves to the receiving API host. |
 | `workspace "PATH"` | One path | The uploaded bundle root on the resolved host. |
 | `supervisor "NAME"` | A full or bare supervisor name | `supervisor/root`. |
 | `keep BOOL` | One Boolean | `#false`; true exempts the agent tasks from normal garbage collection. |
@@ -1886,6 +1900,8 @@ Omitted restart children use their listed defaults. An empty restart block equal
 
 An `env` block accepts unique child names with one string value. An empty block is valid.
 
+The runtime replaces an authored `ST_AGENT` value with the canonical member subject at launch.
+
 A `meta` block accepts unique child names with one KDL scalar value. The reducer preserves this map but does not interpret it.
 
 ### Typed driver blocks
@@ -1902,6 +1918,8 @@ Claude supplies MCP delivery. Codex supplies app-server delivery, Pi supplies ch
 | `opencode` | Optional `model`, required `prompt`, optional `args` | `args` is empty; `effort` and `dev-channels` are invalid. |
 
 `model`, `effort`, and `prompt` each accept one string. `args` accepts zero or more string arguments.
+
+`dev-channels #true` selects Claude's prompt-based development channel. A declared supervisor gate can approve that prompt for a managed agent.
 
 The provider validates supported model and effort strings. An unavailable value produces `unsupported-capability` during planning.
 
@@ -1940,6 +1958,8 @@ A root or scope can declare `exec "NAME" { ... }` or `pty "NAME" { ... }` withou
 The block accepts every task child above. It also accepts `host`, `workspace`, `supervisor`, both restart forms, `shutdown-timeout`, and `render`.
 
 The added children use the agent defaults. Host resolves from the enclosing host or API host, and workspace defaults to the bundle root.
+
+The portable host name `local` resolves to the receiving API host for agents, tasks, judges, and schedules.
 
 Supervisor defaults to `supervisor/root`. Restart type defaults to `always`, and shutdown timeout defaults to `5s`.
 
@@ -2195,6 +2215,14 @@ A wait-only checkpoint omits `subgraph`. Its judges can observe work that st3 ca
 
 A checkpoint `subgraph` publishes when that checkpoint becomes active. It contains complete desired state for each named subject.
 
+The reconciler waits until the active subgraph holds before it evaluates non-deadline judges.
+
+A native driver agent holds after it reports `ready`, `working`, or `idle`.
+
+A message holds after delivery. A stop holds after the selected member or scope is not live.
+
+The checkpoint deadline still starts at activation. It can expire while the active subgraph converges.
+
 Work that needs an agent or person must include a message to that subject.
 
 The planner reports an unaddressed-work blocker when it can prove this gap.
@@ -2411,7 +2439,6 @@ subgraph {
     }
 
     env {
-      ST_AGENT "worker-1.release-owner"
       PATH "/opt/team-tools:$PATH"
     }
 
@@ -2546,12 +2573,17 @@ Each `doc/` reference selects a previously posted immutable blob. The LLM judge 
 
 subgraph {
   supervisor "team-eval" {
+    gate "claude-workspace-trust" driver="claude" {
+      contains "Quick safety check: Is this a project you created or one you trust?"
+      key "enter"
+      max-inputs 1
+    }
+
     gate "claude-development-channel" driver="claude" {
       contains "WARNING: Loading development channels"
-      selected "I am using this for local development"
+      contains "Channels: server:st3"
       key "enter"
-      key "enter"
-      max-inputs 3
+      max-inputs 1
     }
   }
 
@@ -2578,7 +2610,6 @@ subgraph {
             host "control-1"
             workspace "./fixture/sup"
             supervisor "team-eval"
-            env { ST_AGENT "team.sup-42" }
             claude {
               model "claude-sonnet-5"
               effort "medium"
@@ -2591,7 +2622,6 @@ subgraph {
             host "worker-1"
             workspace "./fixture/work"
             supervisor "team-eval"
-            env { ST_AGENT "team.dev-42" }
             claude {
               model "claude-sonnet-5"
               effort "medium"
@@ -2604,7 +2634,6 @@ subgraph {
             host "worker-2"
             workspace "./fixture/work"
             supervisor "team-eval"
-            env { ST_AGENT "team.review-42" }
             claude {
               model "claude-sonnet-5"
               effort "medium"
@@ -2690,9 +2719,15 @@ For evals, it converts teams to scopes, kickoff messages to message subjects, an
 
 It converts each old run step to a standalone exec member. It preserves workspace, environment changes, retry behavior, and exit expectations.
 
+It keeps native driver blocks as native driver blocks. It does not infer a driver from an opaque shell command.
+
+The source owner must replace each opaque provider command with a typed driver block before the final migration.
+
 It splits each old stage into a desired `subgraph` and an assertion-only `judges` block.
 
 It removes a subgraph when the checkpoint only waits. It writes the scope stop as the last checkpoint subgraph.
+
+It adds an explicit completion checkpoint after the team starts. Every named worker must report before the supervisor confirms completion.
 
 It converts file checks to `has` and `lacks` over full file subjects. It converts JSON checks to `field` predicates.
 

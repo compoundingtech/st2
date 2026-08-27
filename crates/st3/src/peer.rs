@@ -8,18 +8,26 @@ use crate::config::PeerConfig;
 use crate::model::{ApiResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse};
 use crate::store::Store;
 
-pub fn start(store: Arc<Store>, node: String, peers: Vec<PeerConfig>, notify: Arc<Notify>) {
+pub fn start(
+    store: Arc<Store>,
+    node: String,
+    peers: Vec<PeerConfig>,
+    notify: Arc<Notify>,
+    event_notify: Arc<Notify>,
+) {
     for peer in peers {
         let store = store.clone();
         let node = node.clone();
         let notify = notify.clone();
+        let event_notify = event_notify.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
                 match exchange(&store, &node, &peer).await {
                     Ok(changed) => {
                         if changed {
-                            notify.notify_waiters();
+                            notify.notify_one();
+                            event_notify.notify_waiters();
                         }
                         backoff = Duration::from_secs(1);
                         tokio::time::sleep(Duration::from_secs(2)).await;

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use agent_spec::spec::Driver;
 use anyhow::{Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
@@ -9,6 +10,8 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use st2::eval_spec::{Check, JsonScalar, JudgeKind, Spec as EvalSpec};
 use walkdir::WalkDir;
+
+const WAIT_TEAM_DONE: &[u8] = include_bytes!("../assets/wait-team-done.sh");
 
 #[derive(Parser)]
 #[command(
@@ -113,6 +116,7 @@ fn migrate_file(args: FileArgs) -> Result<()> {
 
 fn migrate_catalog(args: TreeArgs) -> Result<()> {
     validate_tree_args(&args)?;
+    clear_generated_assets(&args.output)?;
     let discovery = agent_spec::discovery::discover_strict(&args.input);
     anyhow::ensure!(
         discovery.errors.is_empty(),
@@ -185,6 +189,7 @@ fn migrate_evals(args: TreeArgs) -> Result<()> {
         let relative_cell = cell.strip_prefix(&args.input)?;
         let output_cell = args.output.join(relative_cell);
         fs::create_dir_all(&output_cell)?;
+        clear_generated_assets(&output_cell)?;
         copy_eval_assets(
             cell,
             &output_cell,
@@ -429,9 +434,34 @@ fn transform_eval(
     let mut output = String::new();
     output.push_str("subgraph {\n");
     output.push_str(&format!("  checkpoints {sequence:?} scope={scope:?} {{\n"));
-    output.push_str("    checkpoint \"The eval team is running\" {\n      subgraph {\n");
+    let mut team_checkpoint = String::new();
+    team_checkpoint.push_str("    checkpoint \"The eval team is running\" {\n      subgraph {\n");
+    let all_agents = spec
+        .agents
+        .iter()
+        .chain(eval.agents.iter())
+        .collect::<Vec<_>>();
+    let has_claude = all_agents
+        .iter()
+        .any(|agent| matches!(agent.driver.as_ref(), Some(Driver::Claude(_))));
+    let has_development_channel = all_agents.iter().any(|agent| {
+        matches!(
+            agent.driver.as_ref(),
+            Some(Driver::Claude(driver)) if driver.dev_channels
+        )
+    });
+    let eval_supervisor = has_claude.then(|| format!("eval-{name}"));
+    if let Some(supervisor) = &eval_supervisor {
+        write_eval_supervisor(&mut team_checkpoint, supervisor, has_development_channel);
+    }
     for agent in spec.agents.iter().chain(eval.agents.iter()) {
-        write_eval_agent(&mut output, agent, restart, host);
+        write_eval_agent(
+            &mut team_checkpoint,
+            agent,
+            restart,
+            host,
+            eval_supervisor.as_deref(),
+        );
     }
     if let Some(kick) = &eval.message {
         let content = if cell.join(&kick.content).is_file() {
@@ -450,34 +480,40 @@ fn transform_eval(
         } else {
             kick.content.clone()
         };
-        output.push_str(&format!(
+        team_checkpoint.push_str(&format!(
             "        message \"kickoff\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
             eval_agent_identity(&kick.from, host),
             eval_agent_identity(&kick.to, host),
             content
         ));
     }
-    output.push_str("      }\n      judges {\n");
+    team_checkpoint.push_str("      }\n      judges {\n");
     let agents = spec
         .agents
         .iter()
         .chain(eval.agents.iter())
         .collect::<Vec<_>>();
     if agents.is_empty() {
-        output.push_str(&format!("        exists {scope:?}\n"));
+        team_checkpoint.push_str(&format!("        exists {scope:?}\n"));
     } else {
         for agent in agents {
-            output.push_str(&format!(
-                "        field \"status\" {:?} \"is\" \"running\"\n",
-                format!("agent/{}", eval_agent_identity(&agent.id, host))
-            ));
+            let subject = format!("agent/{}", eval_agent_identity(&agent.id, host));
+            if agent.driver.is_some() {
+                // The checkpoint reconciler requires a native driver to reach ready, working, or
+                // idle before it evaluates this explicit existence predicate.
+                team_checkpoint.push_str(&format!("        exists {subject:?}\n"));
+            } else {
+                team_checkpoint.push_str(&format!(
+                    "        field \"status\" {subject:?} \"is\" \"running\"\n"
+                ));
+            }
         }
     }
-    output.push_str(&format!(
+    team_checkpoint.push_str(&format!(
         "        deadline {:?}\n",
         format!("{}ms", eval.max_timeout.as_millis())
     ));
-    output.push_str("      }\n    }\n");
+    team_checkpoint.push_str("      }\n    }\n");
 
     for (ordinal, step) in eval.run_steps.iter().enumerate() {
         let subject = format!("eval/{name}/run/{ordinal}-{}", step.id);
@@ -527,6 +563,27 @@ fn transform_eval(
             format!("{}ms", eval.max_timeout.as_millis())
         ));
         output.push_str("      }\n    }\n");
+    }
+
+    output.push_str(&team_checkpoint);
+    if let Some(kick) = &eval.message {
+        let generated = output_cell.join(".st3-migration/wait-team-done.sh");
+        write_file(&generated, WAIT_TEAM_DONE)?;
+        let supervisor = eval_agent_identity(&kick.to, host);
+        let workers = spec
+            .agents
+            .iter()
+            .map(|agent| eval_agent_identity(&agent.id, host))
+            .filter(|identity| identity != &supervisor)
+            .collect::<Vec<_>>();
+        write_team_completion_checkpoint(
+            &mut output,
+            &eval_agent_identity(&kick.from, host),
+            &supervisor,
+            &workers,
+            host,
+            eval.max_timeout.as_millis() as u64,
+        );
     }
 
     output.push_str("    checkpoint \"All held-out judges pass\" {\n");
@@ -583,7 +640,7 @@ fn transform_eval(
                     .agents
                     .iter()
                     .find(|candidate| &candidate.id == agent)
-                    .and_then(|candidate| infer_model(&candidate.command))
+                    .and_then(infer_agent_model)
                     .unwrap_or_else(|| "gpt-5.6-sol".into());
                 output.push_str(&format!("        judge {:?} type=\"llm\" {{\n", judge.name));
                 output.push_str(&format!(
@@ -618,7 +675,9 @@ fn transform_eval(
         "      }}\n      judges {{ empty {scope:?} }}\n    }}\n"
     ));
     output.push_str("  }\n}\n");
-    Ok((output, documents))
+    let mut formatted: KdlDocument = output.parse()?;
+    formatted.autoformat();
+    Ok((formatted.to_string(), documents))
 }
 
 fn write_eval_agent(
@@ -626,6 +685,7 @@ fn write_eval_agent(
     agent: &st2::eval_spec::SpecAgent,
     restart: &str,
     host: &str,
+    supervisor: Option<&str>,
 ) {
     output.push_str(&format!("    agent {:?} {{\n", agent.id));
     if !agent.id.contains('.') {
@@ -642,10 +702,19 @@ fn write_eval_agent(
     } else {
         output.push_str("      workspace \"${EVAL_ROOT}\"\n");
     }
-    output.push_str(&format!(
-        "      command {:?}\n      restart {restart:?}\n",
-        rewrite_bus_command(&agent.command)
-    ));
+    if let Some(supervisor) = supervisor {
+        output.push_str(&format!("      supervisor {supervisor:?}\n"));
+    }
+    if let Some(command) = &agent.command {
+        output.push_str(&format!(
+            "      command {:?}\n",
+            rewrite_bus_command(command)
+        ));
+    }
+    if let Some(driver) = &agent.driver {
+        write_eval_driver(output, driver);
+    }
+    output.push_str(&format!("      restart {restart:?}\n"));
     output.push_str("      env {\n");
     for (key, value) in &agent.env {
         if key != "ST_ROOT" && key != "CATALOG" && key != "ST3_MESSAGE_ROOT" {
@@ -669,12 +738,114 @@ fn write_eval_agent(
     output.push_str("    }\n");
 }
 
+fn write_eval_supervisor(output: &mut String, supervisor: &str, development_channel: bool) {
+    output.push_str(&format!("        supervisor {supervisor:?} {{\n"));
+    output.push_str(
+        "          gate \"claude-workspace-trust\" driver=\"claude\" {\n\
+                   contains \"Quick safety check: Is this a project you created or one you trust?\"\n\
+                   key \"enter\"\n\
+                   max-inputs 1\n\
+                   }\n",
+    );
+    if development_channel {
+        output.push_str(
+            "          gate \"claude-development-channel\" driver=\"claude\" {\n\
+                       contains \"WARNING: Loading development channels\"\n\
+                       contains \"Channels: server:st3\"\n\
+                       key \"enter\"\n\
+                       max-inputs 1\n\
+                       }\n",
+        );
+    }
+    output.push_str("        }\n");
+}
+
+fn write_eval_driver(output: &mut String, driver: &Driver) {
+    let (name, model, effort, prompt, args, dev_channels) = match driver {
+        Driver::Claude(driver) => (
+            "claude",
+            driver.model.as_deref(),
+            driver.effort.as_deref(),
+            driver.prompt.as_str(),
+            driver.args.as_slice(),
+            Some(driver.dev_channels),
+        ),
+        Driver::Codex(driver) => (
+            "codex",
+            driver.model.as_deref(),
+            driver.effort.as_deref(),
+            driver.prompt.as_str(),
+            driver.args.as_slice(),
+            None,
+        ),
+        Driver::Pi(_) | Driver::OpenCode(_) => {
+            unreachable!("the compact eval grammar accepts only Claude and Codex drivers")
+        }
+    };
+    output.push_str(&format!("      {name} {{\n"));
+    if let Some(model) = model {
+        output.push_str(&format!("        model {model:?}\n"));
+    }
+    if let Some(effort) = effort {
+        output.push_str(&format!("        effort {effort:?}\n"));
+    }
+    if dev_channels == Some(true) {
+        output.push_str("        dev-channels #true\n");
+    }
+    output.push_str(&format!(
+        "        prompt {:?}\n",
+        rewrite_bus_command(prompt)
+    ));
+    if !args.is_empty() {
+        output.push_str("        args");
+        for arg in args {
+            output.push_str(&format!(" {arg:?}"));
+        }
+        output.push('\n');
+    }
+    output.push_str("      }\n");
+}
+
 fn eval_agent_identity(identity: &str, host: &str) -> String {
     if identity.contains('.') || identity.contains('/') || identity == "requester" {
         identity.into()
     } else {
         format!("{host}.{identity}")
     }
+}
+
+fn write_team_completion_checkpoint(
+    output: &mut String,
+    requester: &str,
+    supervisor: &str,
+    workers: &[String],
+    host: &str,
+    timeout_ms: u64,
+) {
+    let mut command = format!(
+        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff",
+        timeout_ms.div_ceil(1_000),
+        shell(requester),
+        shell(supervisor)
+    );
+    for worker in workers {
+        command.push(' ');
+        command.push_str(&shell(worker));
+    }
+    output.push_str("    checkpoint \"The team reported completion\" {\n      judges {\n");
+    let judge_name = if workers.is_empty() {
+        "The supervisor confirmed after kickoff"
+    } else {
+        "Every worker reported before the supervisor confirmed"
+    };
+    write_raw_mechanical_judge(
+        output,
+        judge_name,
+        &command,
+        host,
+        timeout_ms.saturating_add(5_000),
+    );
+    output.push_str("      }\n    }\n");
 }
 
 fn write_mechanical_judge(
@@ -686,6 +857,16 @@ fn write_mechanical_judge(
 ) {
     let command =
         format!("st3 message export \"${{EVAL_ROOT}}/.st3-messages\" >/dev/null && {command}");
+    write_raw_mechanical_judge(output, name, &command, host, timeout_ms);
+}
+
+fn write_raw_mechanical_judge(
+    output: &mut String,
+    name: &str,
+    command: &str,
+    host: &str,
+    timeout_ms: u64,
+) {
     output.push_str(&format!("        judge {name:?} {{\n"));
     output.push_str(&format!(
         "          exec {command:?}\n          host {host:?}\n          workspace \"${{EVAL_ROOT}}\"\n          env {{ CATALOG \"${{EVAL_ROOT}}\"; ST_ROOT \"${{EVAL_ROOT}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{EVAL_ROOT}}/.st3-messages\" }}\n          time-limit {:?}\n",
@@ -744,11 +925,36 @@ fn infer_model(command: &str) -> Option<String> {
         .map(|pair| pair[1].trim_matches(['\'', '"']).to_owned())
 }
 
+fn infer_agent_model(agent: &st2::eval_spec::SpecAgent) -> Option<String> {
+    match agent.driver.as_ref() {
+        Some(Driver::Claude(driver)) => driver.model.clone(),
+        Some(Driver::Codex(driver)) => driver.model.clone(),
+        Some(Driver::Pi(_)) | Some(Driver::OpenCode(_)) => None,
+        None => agent.command.as_deref().and_then(infer_model),
+    }
+}
+
 fn rewrite_bus_command(value: &str) -> String {
     value
         .replace("st2 message", "st3 message")
+        .replace("st2 channel message", "st3 graph message notification")
         .replace("st2 bus", "st3 graph message API")
         .replace("hermetic st2 eval", "hermetic st3 eval")
+}
+
+fn clear_generated_assets(output_root: &Path) -> Result<()> {
+    for name in [".st3-documents", ".st3-migration"] {
+        let generated = output_root.join(name);
+        match fs::remove_dir_all(&generated) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove stale output {}", generated.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stage_document(
@@ -766,7 +972,11 @@ fn stage_document(
         hash: hash.into(),
         source: source.display().to_string(),
         staged: staged.display().to_string(),
-        put_command: format!("st3 doc put {} --as {}", staged.display(), name),
+        put_command: format!(
+            "st3 doc put {} --as {}",
+            shell(&staged.display().to_string()),
+            shell(name)
+        ),
     })
 }
 
@@ -931,6 +1141,47 @@ fn shell(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn run_completion_wait(
+        supervisor_messages: &str,
+        requester_messages: &str,
+        workers: &[&str],
+    ) -> std::process::ExitStatus {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("wait-team-done.sh");
+        fs::write(&script, WAIT_TEAM_DONE).unwrap();
+        let bin = temporary.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let st3 = bin.join("st3");
+        fs::write(
+            &st3,
+            r#"#!/bin/sh
+case "$3" in
+  supervisor) printf '%s\n' "$SUPERVISOR_MESSAGES" ;;
+  requester) printf '%s\n' "$REQUESTER_MESSAGES" ;;
+  *) printf '%s\n' '[]' ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&st3, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        std::process::Command::new("bash")
+            .arg(script)
+            .args(["requester", "supervisor", "kickoff"])
+            .args(workers)
+            .env("TIMEOUT_SECONDS", "0")
+            .env("SUPERVISOR_MESSAGES", supervisor_messages)
+            .env("REQUESTER_MESSAGES", requester_messages)
+            .env("PATH", path)
+            .status()
+            .unwrap()
+    }
+
     #[test]
     fn catalog_translation_wraps_old_agents_and_adds_restart_policy() {
         let translated = transform_declaration(
@@ -981,6 +1232,151 @@ mod tests {
     }
 
     #[test]
+    fn team_completion_requires_every_worker_report() {
+        let status = run_completion_wait(
+            r#"[{"from":"agent/worker.one","created_index":10}]"#,
+            r#"[{"from":"agent/supervisor","created_index":20}]"#,
+            &["worker.one", "worker.two"],
+        );
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn team_completion_requires_confirmation_after_the_latest_report() {
+        let reports = r#"[
+            {"from":"agent/worker.one","created_index":10},
+            {"from":"agent/worker.two","created_index":15}
+        ]"#;
+        let early = run_completion_wait(
+            reports,
+            r#"[{"from":"agent/supervisor","created_index":14}]"#,
+            &["worker.one", "worker.two"],
+        );
+        assert!(!early.success());
+
+        let final_confirmation = run_completion_wait(
+            reports,
+            r#"[{"from":"agent/supervisor","created_index":16}]"#,
+            &["worker.one", "worker.two"],
+        );
+        assert!(final_confirmation.success());
+    }
+
+    #[test]
+    fn eval_translation_preserves_native_driver_declarations() {
+        let source = r#"
+            team "mix" {
+              agent "sup" {
+                workspace "./sup"
+                claude {
+                  model "claude-sonnet-5"
+                  effort "medium"
+                  prompt "Coordinate the task."
+                  args "--permission-mode" "bypassPermissions"
+                }
+              }
+            }
+            eval {
+              message { from "requester"; to "mix.sup"; content "Do the work." }
+              max-timeout "60s"
+              agent "judge" {
+                codex {
+                  model "gpt-5.6-sol"
+                  effort "medium"
+                  prompt "Judge the result."
+                }
+              }
+              judges {
+                judge "review" { ask "judge" "Check the result." }
+              }
+            }
+        "#;
+        let spec = st2::eval_spec::parse_spec(source).unwrap();
+        let cell = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let (translated, documents) =
+            transform_eval(&spec, cell.path(), output.path(), "local").unwrap();
+        let intent = st3::parse_intent(&translated, "local").unwrap();
+
+        assert!(documents.is_empty());
+        assert!(translated.contains("claude {"));
+        assert!(translated.contains("codex {"));
+        assert!(!translated.contains("command \"exec claude"));
+        assert_eq!(
+            intent.subjects["agent/mix.sup"]
+                .member
+                .as_ref()
+                .unwrap()
+                .driver
+                .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            intent.subjects["agent/local.judge"]
+                .member
+                .as_ref()
+                .unwrap()
+                .driver
+                .as_deref(),
+            Some("codex")
+        );
+        assert!(translated.contains("model gpt-5.6-sol"));
+        assert!(intent.checkpoints[0].judges.iter().any(|judge| {
+            matches!(
+                judge,
+                st3::model::JudgeSpec::Exists { subject } if subject == "agent/mix.sup"
+            )
+        }));
+        assert!(translated.contains("checkpoint \"The team reported completion\""));
+        assert!(translated.contains(".st3-migration/wait-team-done.sh"));
+        assert!(translated.contains("supervisor eval-"));
+        assert!(translated.contains("gate claude-workspace-trust"));
+        assert!(
+            !translated.contains("wait-team-done.sh 'requester' 'mix.sup' kickoff 'local.judge'")
+        );
+        assert!(
+            output
+                .path()
+                .join(".st3-migration/wait-team-done.sh")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn eval_run_steps_finish_before_the_team_starts_and_judges_wait_for_completion() {
+        let source = r#"
+            agent "sup" { command "sleep 60" }
+            eval {
+              run "setup" { command "true" }
+              message { from "requester"; to "sup"; content "Do the work." }
+              max-timeout "60s"
+              judges { judge "result" { exec "true" } }
+            }
+        "#;
+        let spec = st2::eval_spec::parse_spec(source).unwrap();
+        let cell = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let (translated, _) = transform_eval(&spec, cell.path(), output.path(), "local").unwrap();
+        st3::parse_intent(&translated, "local").unwrap();
+
+        let run = translated
+            .find("checkpoint \"Run step setup finishes\"")
+            .unwrap();
+        let team = translated
+            .find("checkpoint \"The eval team is running\"")
+            .unwrap();
+        let completion = translated
+            .find("checkpoint \"The team reported completion\"")
+            .unwrap();
+        let judges = translated
+            .find("checkpoint \"All held-out judges pass\"")
+            .unwrap();
+        assert!(run < team && team < completion && completion < judges);
+    }
+
+    #[test]
     fn eval_copy_contents_become_the_runtime_root() {
         let cell = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
@@ -1006,5 +1402,29 @@ mod tests {
             "st3 status\n"
         );
         assert!(!output.path().join("fixture").exists());
+    }
+
+    #[test]
+    fn eval_prompt_rewrite_removes_st2_channel_language() {
+        let translated = rewrite_bus_command(
+            "In a hermetic st2 eval, use st2 message and wait for an st2 channel message.",
+        );
+        assert_eq!(
+            translated,
+            "In a hermetic st3 eval, use st3 message and wait for an st3 graph message notification."
+        );
+    }
+
+    #[test]
+    fn migration_refresh_removes_stale_staged_documents() {
+        let output = tempfile::tempdir().unwrap();
+        let stage = output.path().join(".st3-documents");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("old-hash"), "old").unwrap();
+
+        clear_generated_assets(output.path()).unwrap();
+        clear_generated_assets(output.path()).unwrap();
+
+        assert!(!stage.exists());
     }
 }

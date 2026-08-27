@@ -514,6 +514,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         )),
     })?;
     let notify = Arc::new(Notify::new());
+    let event_notify = Arc::new(Notify::new());
     let pty_root = config
         .pty_root
         .clone()
@@ -526,6 +527,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
+        event_notify: event_notify.clone(),
         node: config.node.clone(),
         state_dir: config.state_dir.clone(),
         pty_root: pty_root.clone(),
@@ -538,9 +540,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.node.clone(),
         config.socket.display().to_string(),
         notify.clone(),
+        event_notify.clone(),
     ));
     tokio::spawn(reconciler.run());
-    st3::peer::start(store, config.node.clone(), config.peers.clone(), notify);
+    st3::peer::start(
+        store,
+        config.node.clone(),
+        config.peers.clone(),
+        notify,
+        event_notify,
+    );
     if let Some(address) = config.peer_listen.clone() {
         let app = router(state.clone());
         tokio::spawn(async move {
@@ -2145,14 +2154,7 @@ async fn forward_projected_messages(
     transport: &str,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
-    let unread = st2::message::list_dir(inbox)?;
-    let handled = st2::message::list_dir(archive)?;
-    let present = unread
-        .iter()
-        .chain(&handled)
-        .flat_map(|message| &message.tags)
-        .filter_map(|tag| tag.strip_prefix(TAG_PREFIX))
-        .collect::<BTreeSet<_>>();
+    let present = projected_message_subjects(inbox, archive)?;
     let messages: Vec<MessageView> = client
         .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
         .await?;
@@ -2160,50 +2162,40 @@ async fn forward_projected_messages(
         .into_iter()
         .filter(|message| message.status == "sent")
     {
-        if present.contains(message.subject.as_str()) {
-            continue;
-        }
-        let content = if message.content.starts_with("doc/") {
-            let value: Value = client
-                .get(&format!(
-                    "/v1/documents/content?reference={}",
-                    urlencoding::encode(&message.content)
-                ))
-                .await?;
-            let bytes = serde_json::from_value::<Vec<u8>>(
-                value
-                    .get("bytes")
-                    .cloned()
-                    .context("document response lacks bytes")?,
+        if !present.contains(&message.subject) {
+            let content = if message.content.starts_with("doc/") {
+                let value: Value = client
+                    .get(&format!(
+                        "/v1/documents/content?reference={}",
+                        urlencoding::encode(&message.content)
+                    ))
+                    .await?;
+                let bytes = serde_json::from_value::<Vec<u8>>(
+                    value
+                        .get("bytes")
+                        .cloned()
+                        .context("document response lacks bytes")?,
+                )?;
+                String::from_utf8(bytes).context("message document is not UTF-8")?
+            } else {
+                message.content.clone()
+            };
+            let mut tags = message.tags.clone();
+            tags.push(format!("{TAG_PREFIX}{}", message.subject));
+            st2::message::send_to_inbox(
+                inbox,
+                &message.from,
+                message.title.as_deref(),
+                message.in_reply_to.as_deref(),
+                &tags,
+                &content,
             )?;
-            String::from_utf8(bytes).context("message document is not UTF-8")?
-        } else {
-            message.content.clone()
-        };
-        let mut tags = message.tags.clone();
-        tags.push(format!("{TAG_PREFIX}{}", message.subject));
-        st2::message::send_to_inbox(
-            inbox,
-            &message.from,
-            message.title.as_deref(),
-            message.in_reply_to.as_deref(),
-            &tags,
-            &content,
-        )?;
-    }
-    for message in handled {
-        let Some(st3_subject) = message
-            .tags
-            .iter()
-            .find_map(|tag| tag.strip_prefix(TAG_PREFIX))
-        else {
-            continue;
-        };
+        }
         let _: ClaimRecord = client
             .post(
                 "/v1/claims",
                 &ClaimInput {
-                    subject: st3_subject.into(),
+                    subject: message.subject.clone(),
                     kind: "message.delivered".into(),
                     actor: Some(subject.into()),
                     fields: BTreeMap::from([
@@ -2213,12 +2205,25 @@ async fn forward_projected_messages(
                     ]),
                     evidence: Vec::new(),
                     expected_subject: None,
-                    idempotency_key: Some(format!("codex-delivered:{subject}:{st3_subject}")),
+                    idempotency_key: Some(format!(
+                        "native-delivered:{transport}:{subject}:{}",
+                        message.subject
+                    )),
                 },
             )
             .await?;
     }
     Ok(())
+}
+
+fn projected_message_subjects(inbox: &Path, archive: &Path) -> Result<BTreeSet<String>> {
+    const TAG_PREFIX: &str = "st3-message:";
+    Ok(st2::message::list_dir(inbox)?
+        .into_iter()
+        .chain(st2::message::list_dir(archive)?)
+        .flat_map(|message| message.tags)
+        .filter_map(|tag| tag.strip_prefix(TAG_PREFIX).map(str::to_owned))
+        .collect())
 }
 
 async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
@@ -2481,5 +2486,26 @@ mod tests {
         );
         assert_eq!(identity, "node.worker");
         assert_eq!(runtime_id, "node.worker");
+    }
+
+    #[test]
+    fn an_unread_native_message_is_ready_for_a_delivery_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        st2::message::send_to_inbox(
+            &inbox,
+            "requester",
+            Some("Start"),
+            None,
+            &["st3-message:message/kickoff".into()],
+            "Do the work.",
+        )
+        .unwrap();
+
+        assert_eq!(
+            projected_message_subjects(&inbox, &archive).unwrap(),
+            BTreeSet::from(["message/kickoff".into()])
+        );
     }
 }

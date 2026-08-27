@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
@@ -375,6 +375,17 @@ impl PtyCli {
         env
     }
 
+    /// Expand direct arguments against the environment that the managed task receives. The task
+    /// overlay wins over the launcher environment, as it does after the process starts.
+    fn expand_managed(&self, value: &str, managed_env: &BTreeMap<OsString, OsString>) -> String {
+        crate::expand::expand_vars(value, |key| {
+            managed_env
+                .get(OsStr::new(key))
+                .map(|value| value.to_string_lossy().into_owned())
+                .or_else(|| std::env::var(key).ok())
+        })
+    }
+
     /// Build (but do not run) the `pty run` invocation for `target`. Split out so the exact argv +
     /// env can be unit-tested without spawning anything.
     ///
@@ -465,7 +476,10 @@ impl PtyCli {
             // Direct mode preserves argument boundaries and introduces no shell process.
             TaskLaunch::Argv(argv) => {
                 debug_assert!(!argv.is_empty());
-                cmd.args(argv.iter().map(|arg| self.expand(arg)));
+                cmd.args(
+                    argv.iter()
+                        .map(|arg| self.expand_managed(arg, &managed_env)),
+                );
             }
         }
         cmd
@@ -3461,6 +3475,33 @@ mod tests {
             ]
         );
         assert!(!args[sep + 1..].iter().any(|arg| arg == "sh"));
+    }
+
+    #[test]
+    fn build_run_command_expands_direct_argv_with_the_managed_agent_environment() {
+        let cli = PtyCli::new(PathBuf::from("/eval/catalog"));
+        let mut t = target("local.worker", "unused");
+        t.env.insert("ST_AGENT".into(), "local.worker".into());
+        t.env.insert("ST_ROOT".into(), "/eval/catalog".into());
+        t.launch = TaskLaunch::Argv(vec![
+            "claude".into(),
+            "$ST_AGENT reads $ST_ROOT and $CATALOG".into(),
+        ]);
+
+        let cmd = cli.build_run_command(&t, Path::new("/eval/catalog/local/worker"));
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+
+        assert_eq!(
+            &args[separator + 1..],
+            [
+                "claude",
+                "local.worker reads /eval/catalog and /eval/catalog"
+            ]
+        );
     }
 
     #[test]

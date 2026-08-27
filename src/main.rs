@@ -88,6 +88,9 @@ enum Command {
     /// Subcommands: install / status / uninstall.
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// Install and approve the embedded Claude Code channel plugin.
+    #[command(subcommand)]
+    ClaudeChannel(ClaudeChannelCmd),
     /// Explicit lifecycle-hook management. `up` and materialization only verify; they never install
     /// or refresh hooks.
     #[command(subcommand)]
@@ -333,7 +336,7 @@ enum DriverCmd {
     /// Run the Claude session-owned MCP server over stdio.
     ClaudeMcp {
         #[arg(long)]
-        identity: String,
+        identity: Option<String>,
     },
     /// Deprecated name for the Claude MCP server.
     // Keep this hidden command until no rendered configuration uses the old name.
@@ -623,6 +626,30 @@ enum ServiceCmd {
     Status,
     /// Stop, disable, and remove the `st2.service` unit. Idempotent.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ClaudeChannelCmd {
+    /// Install or update the user plugin and its machine approval policy.
+    Install {
+        /// Install only the user plugin. An administrator will manage the machine policy.
+        #[arg(long)]
+        no_policy: bool,
+    },
+    /// Verify the embedded files, Claude registration, plugin, and machine policy.
+    Status,
+    /// Remove the user plugin, marketplace, embedded files, and machine policy.
+    Uninstall {
+        /// Keep the machine approval policy in place.
+        #[arg(long)]
+        keep_policy: bool,
+    },
+    /// Write only the machine policy. The main installer runs this through sudo.
+    #[command(hide = true)]
+    InstallPolicy,
+    /// Remove only the st2-owned machine policy fragment.
+    #[command(hide = true)]
+    UninstallPolicy,
 }
 
 #[derive(Subcommand)]
@@ -1009,6 +1036,7 @@ fn main() -> Result<()> {
         Command::Context(cmd) => context_cmd(cmd),
         Command::Resource(cmd) => resource_cmd(cmd),
         Command::Service(cmd) => service_cmd(cmd),
+        Command::ClaudeChannel(cmd) => claude_channel_cmd(cmd),
         Command::Hooks(cmd) => hooks_cmd(cmd),
         Command::Ding {
             session,
@@ -1043,6 +1071,9 @@ fn main() -> Result<()> {
         Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
+            let identity = identity
+                .or_else(|| std::env::var("ST_AGENT").ok())
+                .context("--identity is required when ST_AGENT is not set")?;
             st2::claude_mcp::run(&catalog, &identity)
         }
         Command::Driver(DriverCmd::PiChannel { identity }) => {
@@ -3062,6 +3093,18 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
     }
 }
 
+fn claude_channel_cmd(cmd: ClaudeChannelCmd) -> Result<()> {
+    match cmd {
+        ClaudeChannelCmd::Install { no_policy } => {
+            st2::claude_channel::install(no_policy).map(|_| ())
+        }
+        ClaudeChannelCmd::Status => st2::claude_channel::status(),
+        ClaudeChannelCmd::Uninstall { keep_policy } => st2::claude_channel::uninstall(keep_policy),
+        ClaudeChannelCmd::InstallPolicy => st2::claude_channel::install_policy().map(|_| ()),
+        ClaudeChannelCmd::UninstallPolicy => st2::claude_channel::uninstall_policy(),
+    }
+}
+
 fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
         ResourceCmd::Add {
@@ -3434,7 +3477,12 @@ fn ls(root: &Path) -> Result<()> {
                 a.id,
                 a.workspace.as_deref().unwrap_or("<none>")
             );
-            println!("      command: {}", a.command);
+            if let Some(command) = &a.command {
+                println!("      command: {command}");
+            }
+            if let Some(driver) = &a.driver {
+                println!("      driver: {}", driver.name());
+            }
             for ex in &a.execs {
                 println!("      + exec {}: {}", ex.id, ex.command);
             }

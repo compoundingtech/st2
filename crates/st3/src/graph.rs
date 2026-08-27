@@ -272,6 +272,7 @@ fn parse_agent(
     let host = child_string(children, "host")?
         .or_else(|| enclosing_host.map(str::to_owned))
         .unwrap_or_else(|| context.default_host.clone());
+    let host = placement_host(host, &context.default_host);
     let bus_id = if identity.contains('.') {
         identity.clone()
     } else {
@@ -434,6 +435,7 @@ fn parse_standalone_member(
     let host = child_string(children, "host")?
         .or_else(|| enclosing_host.map(str::to_owned))
         .unwrap_or_else(|| context.default_host.clone());
+    let host = placement_host(host, &context.default_host);
     let workspace = child_string(children, "workspace")?.unwrap_or_else(|| ".".into());
     let environment = parse_map_child(children, "env")?;
     let lifecycle = parse_lifecycle(child_string(children, "lifecycle")?)?;
@@ -616,7 +618,7 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
                 ),
             ));
         }
-        let judges = parse_judges(judges_nodes[0])?;
+        let judges = parse_judges(judges_nodes[0], &context.default_host)?;
         if judges.is_empty() {
             return Err(St3Error::new(
                 "empty-judges",
@@ -677,7 +679,7 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
     Ok(())
 }
 
-fn parse_judges(node: &KdlNode) -> Result<Vec<JudgeSpec>, St3Error> {
+fn parse_judges(node: &KdlNode, default_host: &str) -> Result<Vec<JudgeSpec>, St3Error> {
     ensure_bare(node)?;
     let children = node.children().ok_or_else(|| {
         St3Error::new(
@@ -798,7 +800,7 @@ fn parse_judges(node: &KdlNode) -> Result<Vec<JudgeSpec>, St3Error> {
                         format!("running judge `{name}` repeats"),
                     ));
                 }
-                output.push(parse_running_judge(child, name)?);
+                output.push(parse_running_judge(child, name, default_host)?);
             }
             other => {
                 return Err(St3Error::new(
@@ -811,7 +813,11 @@ fn parse_judges(node: &KdlNode) -> Result<Vec<JudgeSpec>, St3Error> {
     Ok(output)
 }
 
-fn parse_running_judge(node: &KdlNode, name: String) -> Result<JudgeSpec, St3Error> {
+fn parse_running_judge(
+    node: &KdlNode,
+    name: String,
+    default_host: &str,
+) -> Result<JudgeSpec, St3Error> {
     ensure_only_properties(node, &["type"])?;
     let body = node.children().ok_or_else(|| {
         St3Error::new("missing-judge-body", format!("judge `{name}` has no body"))
@@ -840,7 +846,7 @@ fn parse_running_judge(node: &KdlNode, name: String) -> Result<JudgeSpec, St3Err
     for child in allowed {
         unique_child(body, child)?;
     }
-    let host = required_child_string(body, "host", &name)?;
+    let host = placement_host(required_child_string(body, "host", &name)?, default_host);
     let workspace = required_child_string(body, "workspace", &name)?;
     let environment = parse_map_child(body, "env")?;
     if let Some(env) = unique_child(body, "env")? {
@@ -1034,7 +1040,10 @@ fn task_member(
         )
     })?;
     validate_task_body(body, subject, standalone)?;
-    let host = child_string(body, "host")?.unwrap_or_else(|| default_host.into());
+    let host = placement_host(
+        child_string(body, "host")?.unwrap_or_else(|| default_host.into()),
+        default_host,
+    );
     let workspace = child_string(body, "workspace")?.unwrap_or_else(|| default_workspace.into());
     let cwd = child_string(body, "cwd")?.unwrap_or_else(|| workspace.clone());
     let runtime_id = child_string(body, "id")?.unwrap_or_else(|| runtime_id(subject));
@@ -1130,6 +1139,14 @@ fn parse_restart_type(value: Option<String>) -> Result<RestartType, St3Error> {
             "invalid-restart",
             format!("invalid restart type `{value}`"),
         )),
+    }
+}
+
+fn placement_host(host: String, default_host: &str) -> String {
+    if host == "local" {
+        default_host.into()
+    } else {
+        host
     }
 }
 
@@ -2076,6 +2093,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         .and_then(Value::as_str)
         .unwrap_or(default_host)
         .to_owned();
+    let host = placement_host(host, default_host);
     let at_unix_ms = canonical_child_value(value, "at")
         .and_then(Value::as_str)
         .and_then(|value| parse_utc_time(value).ok());
@@ -2809,6 +2827,7 @@ subgraph {
       subgraph { exec "one" { command "true"; restart "never" } }
       judges { field "status" "exec/one" is "exited" }
     }
+
     checkpoint "The work is reviewed" {
       judges { field "decision" "resource/review" is "approved" }
     }
@@ -2827,6 +2846,40 @@ subgraph {
                 .ordinal,
             0
         );
+    }
+
+    #[test]
+    fn local_placement_resolves_to_the_receiving_node() {
+        let source = r#"
+            subgraph {
+              exec "setup" {
+                host "local"
+                command "true"
+              }
+              checkpoints "proof" {
+                checkpoint "The local judge passes" {
+                  judges {
+                    judge "verify" {
+                      exec "true"
+                      host "local"
+                      workspace "."
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+
+        let intent = parse_intent(source, "node-a").unwrap();
+
+        assert_eq!(
+            intent.subjects["exec/setup"].member.as_ref().unwrap().host,
+            "node-a"
+        );
+        let JudgeSpec::Mechanical { host, .. } = &intent.checkpoints[0].judges[0] else {
+            panic!("the test judge is not mechanical");
+        };
+        assert_eq!(host, "node-a");
     }
 
     #[test]

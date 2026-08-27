@@ -961,6 +961,7 @@ impl Store {
                         .and_then(|value| canonical_child_string(value, "from"))
                 })
                 .unwrap_or_else(|| "requester".into());
+            let from = normalize_message_party(&from);
             let to = actual
                 .get("to")
                 .and_then(Value::as_str)
@@ -971,6 +972,7 @@ impl Store {
                         .and_then(|value| canonical_child_string(value, "to"))
                 })
                 .unwrap_or_default();
+            let to = normalize_message_party(&to);
             let content = actual
                 .get("content")
                 .and_then(Value::as_str)
@@ -1548,6 +1550,14 @@ fn current_desired_row(connection: &Connection, subject: &str) -> Result<Option<
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn normalize_message_party(value: &str) -> String {
+    if value.is_empty() || value == "requester" || value.contains('/') {
+        value.into()
+    } else {
+        format!("agent/{value}")
+    }
 }
 
 fn subject_in_scope(connection: &Connection, subject: &str, scope: &str) -> bool {
@@ -3002,5 +3012,45 @@ mod tests {
         .unwrap();
         append("message.closed", "closed", Some("agent/worker"), "closed").unwrap();
         assert_eq!(store.messages(None, true).unwrap()[0].status, "closed");
+    }
+
+    #[test]
+    fn desired_messages_use_canonical_agent_parties_in_views() {
+        let store = Store::open_memory("node").unwrap();
+        let intent = crate::graph::parse_intent(
+            r#"
+subgraph {
+  agent "mix.sup" {
+    workspace "/work"
+    command "sleep 60"
+    restart "never"
+  }
+  message "kickoff" {
+    from "requester"
+    to "mix.sup"
+    content "work"
+  }
+}
+"#,
+            "local",
+        )
+        .unwrap();
+        let plan = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: "message".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &plan.subject_tokens, "message")
+            .unwrap();
+
+        let messages = store.messages(Some("agent/mix.sup"), true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from, "requester");
+        assert_eq!(messages[0].to, "agent/mix.sup");
     }
 }

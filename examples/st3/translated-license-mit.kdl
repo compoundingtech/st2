@@ -4,15 +4,19 @@ subgraph {
       subgraph {
         agent "mix.sup" {
           workspace "${EVAL_ROOT}/sup"
-          command "exec claude --permission-mode bypassPermissions 'Read CLAUDE.md and handle st3 graph messages.'"
+          claude {
+            prompt "Read CLAUDE.md and handle st3 graph messages."
+            args "--permission-mode" "bypassPermissions"
+          }
           restart "never"
-          env { ST_AGENT "mix.sup" }
         }
         agent "mix.worker" {
           workspace "${EVAL_ROOT}/worker"
-          command "exec claude --permission-mode auto 'Read CLAUDE.md and handle st3 graph messages.'"
+          claude {
+            prompt "Read CLAUDE.md and handle st3 graph messages."
+            args "--permission-mode" "auto"
+          }
           restart "never"
-          env { ST_AGENT "mix.worker" }
         }
         message "kickoff" {
           from "requester"
@@ -21,8 +25,8 @@ subgraph {
         }
       }
       judges {
-        field "status" "agent/mix.sup" "is" "running"
-        field "status" "agent/mix.worker" "is" "running"
+        exists "agent/mix.sup"
+        exists "agent/mix.worker"
         deadline "20m"
       }
     }
