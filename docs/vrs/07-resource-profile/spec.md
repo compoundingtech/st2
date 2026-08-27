@@ -28,7 +28,7 @@ Agent Spec resource URI (opaque, byte-preserved)
              |                              + catalog root hash / transaction
              |
              v ResourceProfileRegistry (injectable; built-ins empty)
-      bounded outcome cache keyed by module path + file identity/digest
+      bounded outcome cache keyed by normalized module path + admission policy + file identity
              |
              v fresh Store + Instance per resolution
    closed core-wasm guest (no imports / no WASI)
@@ -226,10 +226,14 @@ file, and read through a 16 MiB admission cap before validation or compilation.
 Catalog-relative modules are traversed descriptor-relative from the catalog
 root with `O_NOFOLLOW` on every ancestor and the final component.
 The bounded 32-entry LRU cache stores both successful modules and compilation
-failures by module path plus byte digest and stable file metadata. Registry
-clones and concurrent subscribers therefore coalesce one compilation attempt
-for an unchanged identity. Byte replacement or metadata identity change
-invalidates that path's entry and retries compilation.
+failures by normalized module path, admission policy, byte digest, and stable
+file metadata. Admission policy distinguishes an external open from
+descriptor-relative traversal under a specific confinement root. Refresh-local
+snapshot outcomes use the same path-and-policy key, so resolving one spelling
+externally can never authorize a contained declaration. Registry clones and
+concurrent subscribers coalesce one compilation attempt only for an unchanged
+identity under the same policy. Byte replacement or metadata identity change
+invalidates that entry and retries compilation.
 Each resolution of a successfully compiled module creates a fresh `Store` and
 `Instance`. One fuel allowance
 covers the module start function and the first resolution call; a reused
@@ -245,7 +249,7 @@ instance receives one fresh allowance before each later call:
 | Memories | at most 1 |
 | Tables | at most 4, with at most 10,000 elements each |
 | Instance state | fresh per registry resolution |
-| Compiled code/failure | 32-entry LRU by module path + byte digest + file metadata; shared across registry clones |
+| Compiled code/failure | 32-entry LRU by normalized module path + admission policy (external or exact confinement root) + byte digest + file metadata; shared across registry clones only for the same policy |
 
 Failure taxonomy:
 
