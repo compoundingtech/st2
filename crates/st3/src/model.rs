@@ -527,6 +527,58 @@ pub struct SessionSignalRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionInputMode {
+    Line,
+    Raw,
+    Key,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionInputRequest {
+    pub expected_incarnation: String,
+    pub mode: SessionInputMode,
+    pub value: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionLogChunk {
+    pub subject: String,
+    pub runtime_id: String,
+    pub generation_id: String,
+    pub previous: bool,
+    pub start_offset: u64,
+    pub next_offset: u64,
+    pub data_base64: String,
+    pub eof: bool,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionScreen {
+    pub subject: String,
+    pub runtime_id: String,
+    pub incarnation_id: String,
+    pub screen: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DoctorReport {
+    pub status: String,
+    pub checks: Vec<DoctorCheck>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionControlResponse {
     pub subject: String,
     pub request_claim_id: String,

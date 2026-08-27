@@ -38,6 +38,7 @@ pub struct PtyRuntime {
 
 impl PtyRuntime {
     pub fn new(root: PathBuf) -> Self {
+        crate::warn_if_degraded("st3");
         Self {
             binary: "pty".into(),
             root,
@@ -65,29 +66,55 @@ impl PtyRuntime {
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let mut command = self.command();
-        command
-            .arg("run")
-            .arg("-d")
-            .arg("--force")
-            .args(["--id", id, "--cwd"]);
-        command.arg(cwd);
+        let unit = crate::scope_unit("st3", id);
+        let mut arguments = vec![
+            OsString::from("run"),
+            OsString::from("-d"),
+            OsString::from("--force"),
+            OsString::from("--id"),
+            OsString::from(id),
+            OsString::from("--cwd"),
+            cwd.as_os_str().to_os_string(),
+        ];
         if let Some(display_name) = display_name {
-            command.args(["--name", display_name]);
+            arguments.extend([OsString::from("--name"), OsString::from(display_name)]);
         } else {
-            command.arg("--no-display-name");
+            arguments.push(OsString::from("--no-display-name"));
         }
         for (key, value) in env {
-            command.args(["--env", &format!("{key}={value}")]);
+            arguments.extend([
+                OsString::from("--env"),
+                OsString::from(format!("{key}={value}")),
+            ]);
         }
-        for (key, value) in tags {
-            command.args(["--tag", &format!("{key}={value}")]);
+        let mut effective_tags = tags.clone();
+        effective_tags.insert(
+            "st3.isolation".into(),
+            isolation_name(crate::isolation_mode()).into(),
+        );
+        if crate::isolation_mode() == crate::Isolation::Scope {
+            effective_tags.insert("st3.scope-unit".into(), unit.clone());
         }
-        command.arg("--");
+        for (key, value) in effective_tags {
+            arguments.extend([
+                OsString::from("--tag"),
+                OsString::from(format!("{key}={value}")),
+            ]);
+        }
+        arguments.push(OsString::from("--"));
         match launch {
-            Launch::Shell(source) => command.args(["sh", "-c", source]),
-            Launch::Argv(argv) => command.args(argv),
-        };
+            Launch::Shell(source) => {
+                arguments.extend([OsString::from("sh"), OsString::from("-c"), source.into()]);
+            }
+            Launch::Argv(argv) => arguments.extend(argv.iter().map(OsString::from)),
+        }
+        let argument_refs = arguments
+            .iter()
+            .map(OsString::as_os_str)
+            .collect::<Vec<_>>();
+        let mut command =
+            crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
+        command.env("PTY_ROOT", &self.root);
         let output = command.output()?;
         require_success("spawn PTY", output)?;
         Ok(())
@@ -187,6 +214,16 @@ impl PtyRuntime {
     }
 
     pub fn send_raw(&self, id: &str, bytes: &[u8]) -> Result<()> {
+        self.send_raw_if(id, bytes, None)
+    }
+
+    pub fn send_raw_if(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        expected_incarnation: Option<&str>,
+    ) -> Result<()> {
+        self.require_incarnation(id, expected_incarnation)?;
         anyhow::ensure!(
             !bytes.contains(&0),
             "terminal input cannot contain a NUL byte"
@@ -202,6 +239,16 @@ impl PtyRuntime {
     }
 
     pub fn send_key(&self, id: &str, key: &str) -> Result<()> {
+        self.send_key_if(id, key, None)
+    }
+
+    pub fn send_key_if(
+        &self,
+        id: &str,
+        key: &str,
+        expected_incarnation: Option<&str>,
+    ) -> Result<()> {
+        self.require_incarnation(id, expected_incarnation)?;
         let output = self
             .command()
             .args(["send", id, "--seq", &format!("key:{key}")])
@@ -231,6 +278,14 @@ impl PtyRuntime {
     }
 }
 
+fn isolation_name(mode: crate::Isolation) -> &'static str {
+    match mode {
+        crate::Isolation::Scope => "scope",
+        crate::Isolation::Detached => "detached",
+        crate::Isolation::DegradedDetached => "degraded-detached",
+    }
+}
+
 fn ensure_incarnation(
     id: &str,
     observation: &PtyObservation,
@@ -253,4 +308,71 @@ fn require_success(action: &str, output: Output) -> Result<Vec<u8>> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn terminal_input_checks_the_expected_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("fake-pty");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = list ]; then
+  printf '[{"name":"work","status":"running","pid":42,"createdAt":"now"}]'
+  exit 0
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+
+        runtime
+            .send_line_if("work", "hello", Some("42:now"))
+            .unwrap();
+        runtime
+            .send_raw_if("work", b"bytes", Some("42:now"))
+            .unwrap();
+        runtime
+            .send_key_if("work", "escape", Some("42:now"))
+            .unwrap();
+        let error = runtime
+            .send_key_if("work", "escape", Some("41:old"))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed incarnation"));
+    }
+
+    #[test]
+    fn spawn_records_the_shared_isolation_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("fake-pty-spawn");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["sh".into(), "-c".into(), "true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(arguments.contains("st3.isolation="));
+        assert!(arguments.contains("--force"));
+        if crate::isolation_mode() == crate::Isolation::Scope {
+            assert!(arguments.contains("st3.scope-unit=st3-work-"));
+        }
+    }
 }

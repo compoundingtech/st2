@@ -272,9 +272,10 @@ The API uses these common failures:
 | `POST /v1/intent/plan` | Subgraph KDL with stored document references and an optional snapshot index | The hash-pinned intent, desired states, derived patch, subject tokens, predicted actions, and blockers |
 | `POST /v1/intent/apply` | Hash-pinned KDL, subject tokens, and an idempotency key | New subject tokens, the batch, claim IDs, and reconcile subjects |
 | `GET /v1/status` | Optional subject, scope, and local snapshot selectors | Selected desired state, losing revisions, actual state, gaps, reachability, and checkpoints |
-| `GET /v1/claims` | A subject or scope, an index range, and a page cursor | Immutable claim envelopes in local index order |
+| `GET /v1/claims` | A subject or scope, `after_index`, `before_index`, `asc` or `desc` order, and a bounded page size | Immutable claim envelopes and the next cursor |
 | `POST /v1/claims` | A typed observation, optional actor, evidence claim IDs, and idempotency key | The durable claim ID and store index |
 | `GET /v1/events` | An `after_index` cursor and optional subject or scope filter | A server event stream of committed claim batches |
+| `GET /v1/doctor` | No body | Typed store, state, PTY, isolation, ownership, runtime drift, and driver checks |
 | `POST /v1/messages` | Sender, recipient, content, close judges, subject tokens, and an idempotency key | The message claim, token, and delivery action ID |
 | `POST /v1/messages/{message_id}/claims` | An agent lifecycle claim or a judge close verdict | The lifecycle claim and current message token |
 | `POST /v1/judgements` | A running judge verdict, its operation capability, reason, and evidence claim IDs | The durable judge result claim and store index |
@@ -284,6 +285,9 @@ The API uses these common failures:
 | `POST /v1/sessions/{subject}/context/clear` | An expected incarnation and idempotency key | The recorded control action and result cursor |
 | `POST /v1/sessions/{subject}/signal` | An expected incarnation, signal, and idempotency key | The recorded action and result cursor |
 | `POST /v1/sessions/{subject}/attach` | A live subject and terminal dimensions | A short-lived terminal capability and WebSocket path |
+| `GET /v1/sessions/logs/{subject}` | Byte offset, limit up to 64 KiB, current or previous generation, and optional long wait | A generation-bound base64 log chunk, offsets, EOF state, and exit status |
+| `GET /v1/sessions/screen/{subject}` | A terminal subject | Its current plain screen and incarnation |
+| `POST /v1/sessions/input/{subject}` | An expected incarnation, line, raw, or key input, and an idempotency key | The recorded input action and result cursor |
 | `POST /v1/peer/claims` | Ordered replica batches from one configured peer | Accepted and missing replica sequence ranges |
 | `POST /v1/peer/claims/query` | Per-replica sequence heads | A stream of missing replica batches |
 
@@ -292,6 +296,12 @@ Clients percent-encode a full subject when the subject occupies one path segment
 The context-clear control supports a live terminal Claude driver in version 1. The adapter translates the typed request to Claude's clear control.
 
 The session-signal control accepts `interrupt`, `hangup`, `user-1`, or `user-2`. Lifecycle stop still uses desired state, not this endpoint.
+
+The health response includes the st3 version and active process isolation mode.
+
+An exec log keeps the current generation and one previous generation. A client cannot join bytes from two generations.
+
+The input endpoint stores the input bytes as a blob. It records request and result claims before it returns.
 
 ### Intent request types
 
@@ -750,6 +760,30 @@ The command cannot post for another judge definition. Repeating an identical req
 
 Its complete path appears in the `st3 claude` section.
 
+`st3 exec -- COMMAND` creates a normal standalone `exec` declaration. It uses `restart "never"` and the normal plan and apply endpoints.
+
+The command waits for the member, follows its log, and returns the remote exit status. `--detach` returns after publication.
+
+An interrupt stops only the local log follow by default. `--cancel-on-interrupt` publishes explicit stop intent before it returns.
+
+`st3 logs SUBJECT` shows the last 64 KiB. `--all`, `--follow`, and `--previous` select the full log, live output, or prior generation.
+
+`st3 pty ls|attach|peek|send|signal` uses graph subjects. Each mutation uses the incarnation that the API returned.
+
+`st3 pty ui` starts the installed PTY interface with the configured registry. It refuses an HTTP endpoint.
+
+`st3 inspect SUBJECT` shows the subject status and its 20 newest claims. `st3 trace` shows bounded claim history and can follow events.
+
+`st3 wait SUBJECT --for CONDITION` checks status before it waits on events. Conditions include `running`, `ready`, `exited`, and `stopped`.
+
+The command also accepts `checkpoint=NAME` and `verdict=pass|fail|void`. The default timeout is ten minutes, and zero disables it.
+
+`st3 doctor` prints typed checks. Warnings fail only with `--strict`, while failed checks always return an error.
+
+`st3 service install|status|uninstall` manages a Linux systemd user service. Install writes the resolved configuration, executable, and `PATH` into the unit.
+
+The service has a 1 GiB memory limit. Install refuses a Linux host that cannot create transient user scopes.
+
 ### CLI exit codes
 
 | Code | Meaning |
@@ -757,8 +791,10 @@ Its complete path appears in the `st3 claude` section.
 | `0` | The command completed successfully. |
 | `2` | Input or KDL validation failed. |
 | `3` | A local compare-and-swap write was stale. |
-| `4` | A selected subject, scope, or eval reached `unreachable`, `fail`, or `void`. |
+| `4` | A selected subject or eval reached a terminal failure, or `st3 wait` reached its timeout. |
 | `5` | The API was unavailable. |
+
+`st3 exec` returns the remote exit status. A signal result uses `128 + signal`.
 
 ## Claims store
 

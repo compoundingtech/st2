@@ -10,6 +10,7 @@ pub mod peer;
 pub mod projection;
 pub mod reconcile;
 pub mod render;
+pub mod service;
 pub mod store;
 
 pub use graph::parse_intent;

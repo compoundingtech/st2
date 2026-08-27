@@ -3,8 +3,13 @@
 //! This crate owns process identity and the small `pty` CLI boundary. It has no
 //! catalog, graph, claim, or provider policy.
 
+mod isolate;
 mod process;
 mod pty;
 
+pub use isolate::{
+    Isolation, mode as isolation_mode, scope_unit, systemd_user_available, warn_if_degraded,
+    wrap as wrap_isolated,
+};
 pub use process::{ExecGeneration, ExecObservation, ExecRuntime, process_start_token};
 pub use pty::{Launch, PtyObservation, PtyRuntime};

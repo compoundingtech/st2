@@ -1064,14 +1064,19 @@ impl Store {
         subject: Option<&str>,
         scope: Option<&str>,
         after_index: u64,
+        before_index: Option<u64>,
+        descending: bool,
         limit: usize,
     ) -> Result<ClaimsPage> {
         let connection = self.connection.lock().expect("store mutex poisoned");
-        let mut statement = connection.prepare(
+        let order = if descending { "DESC" } else { "ASC" };
+        let query = format!(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims WHERE store_index>?1 AND (?2 IS NULL OR subject=?2) ORDER BY store_index",
-        )?;
-        let rows = statement.query_map(params![after_index, subject], claim_from_row)?;
+             FROM claims WHERE store_index>?1 AND (?2 IS NULL OR store_index<?2) AND (?3 IS NULL OR subject=?3) ORDER BY store_index {order}"
+        );
+        let mut statement = connection.prepare(&query)?;
+        let rows =
+            statement.query_map(params![after_index, before_index, subject], claim_from_row)?;
         let mut claims = Vec::new();
         for row in rows {
             let claim = row?;

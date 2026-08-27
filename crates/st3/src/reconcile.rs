@@ -258,6 +258,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ]),
                 );
             }
+            self.event_notify.notify_waiters();
         }
     }
 
@@ -576,7 +577,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 return Err(error);
             }
-            self.arm_restart(&format!("stop:{subject}"), deadline);
+            self.arm_restart(&format!("stop:{subject}"), now_ms().saturating_add(100));
             return Ok(false);
         };
         let deadline = request

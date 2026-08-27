@@ -13,6 +13,7 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -28,11 +29,12 @@ use crate::archive::hydrate_cell;
 use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
-    ContextClearRequest, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
-    EvalStatus, EventRecord, JudgementRequest, MessageLifecycleRequest, MessageSendRequest,
-    MessageView, PlanRequest, PlanResponse, QuickAgentRequest, QuickAgentResponse,
-    ReplicationBatch, ReplicationQuery, ReplicationResponse, ReviewRequest, SessionControlResponse,
-    SessionSignalRequest, St3Error, StatusResponse,
+    ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
+    EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, JudgementRequest,
+    MessageLifecycleRequest, MessageSendRequest, MessageView, PlanRequest, PlanResponse,
+    QuickAgentRequest, QuickAgentResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse,
+    ReviewRequest, SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk,
+    SessionScreen, SessionSignalRequest, St3Error, StatusResponse,
 };
 use crate::store::Store;
 
@@ -122,6 +124,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/status", get(status))
         .route("/v1/events", get(events))
+        .route("/v1/doctor", get(doctor))
         .route("/v1/claude", post(quick_claude))
         .route("/v1/codex", post(quick_codex))
         .route("/v1/evals", post(start_eval))
@@ -129,6 +132,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/judgements", post(post_judgement))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
         .route("/v1/sessions/{subject}/signal", post(signal_session))
+        .route("/v1/sessions/input/{*subject}", post(input_session))
+        .route("/v1/sessions/logs/{*subject}", get(logs_session))
+        .route("/v1/sessions/screen/{*subject}", get(screen_session))
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session))
@@ -257,9 +263,221 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     Ok(Json(json!({
         "status": "ready",
         "node": state.node,
+        "version": env!("CARGO_PKG_VERSION"),
+        "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
     })))
+}
+
+fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
+    match mode {
+        st_runtime::Isolation::Scope => "scope",
+        st_runtime::Isolation::Detached => "detached",
+        st_runtime::Isolation::DegradedDetached => "degraded-detached",
+    }
+}
+
+async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
+    let mut checks = Vec::new();
+    match state.store.index() {
+        Ok(index) => checks.push(DoctorCheck {
+            name: "claim-store".into(),
+            status: "pass".into(),
+            message: format!("the claim store is readable at index {index}"),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "claim-store".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
+    match tempfile::Builder::new()
+        .prefix(".st3-doctor-")
+        .tempfile_in(&state.state_dir)
+    {
+        Ok(_) => checks.push(DoctorCheck {
+            name: "state-directory".into(),
+            status: "pass".into(),
+            message: format!("{} is a writable directory", state.state_dir.display()),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "state-directory".into(),
+            status: "fail".into(),
+            message: format!("cannot write {}: {error}", state.state_dir.display()),
+        }),
+    }
+    let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
+    let terminal_required = desired.iter().any(|subject| {
+        subject
+            .member
+            .as_ref()
+            .is_some_and(|member| member.terminal)
+    });
+    let pty_snapshot = st_runtime::PtyRuntime::new(state.pty_root.clone()).snapshot();
+    match &pty_snapshot {
+        Ok(items) => checks.push(DoctorCheck {
+            name: "pty-runtime".into(),
+            status: "pass".into(),
+            message: format!("the PTY runtime returned {} sessions", items.len()),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "pty-runtime".into(),
+            status: if terminal_required { "fail" } else { "warn" }.into(),
+            message: error.to_string(),
+        }),
+    }
+    let isolation = st_runtime::isolation_mode();
+    checks.push(DoctorCheck {
+        name: "process-isolation".into(),
+        status: if isolation == st_runtime::Isolation::DegradedDetached {
+            "warn"
+        } else {
+            "pass"
+        }
+        .into(),
+        message: match isolation {
+            st_runtime::Isolation::Scope => "Linux tasks use transient systemd user scopes".into(),
+            st_runtime::Isolation::Detached => {
+                "tasks use detached process groups on this platform".into()
+            }
+            st_runtime::Isolation::DegradedDetached => {
+                "systemd user scopes are unavailable; a daemon restart can stop tasks".into()
+            }
+        },
+    });
+    let mut owners = BTreeMap::<String, Vec<String>>::new();
+    for subject in &desired {
+        if let Some(member) = &subject.member {
+            owners
+                .entry(member.runtime_id.clone())
+                .or_default()
+                .push(subject.subject.clone());
+        }
+    }
+    let duplicates = owners
+        .into_iter()
+        .filter(|(_, subjects)| subjects.len() > 1)
+        .map(|(runtime, subjects)| format!("{runtime}: {}", subjects.join(", ")))
+        .collect::<Vec<_>>();
+    checks.push(DoctorCheck {
+        name: "runtime-ownership".into(),
+        status: if duplicates.is_empty() {
+            "pass"
+        } else {
+            "fail"
+        }
+        .into(),
+        message: if duplicates.is_empty() {
+            "each desired member has a unique runtime ID".into()
+        } else {
+            format!("duplicate runtime owners: {}", duplicates.join("; "))
+        },
+    });
+    let status = state.store.status(None).map_err(ApiError::internal)?;
+    let mut desired_runtime_ids = desired
+        .iter()
+        .filter_map(|subject| {
+            subject
+                .member
+                .as_ref()
+                .map(|member| member.runtime_id.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for subject in &status.subjects {
+        if subject.desired.is_none() {
+            continue;
+        }
+        if let Some(runtime_id) = subject
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual))
+            .and_then(|fields| fields.get("runtime_id"))
+            .and_then(Value::as_str)
+        {
+            desired_runtime_ids.insert(runtime_id.into());
+        }
+    }
+    let mut unowned = pty_snapshot
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| !desired_runtime_ids.contains(&item.name))
+                .map(|item| format!("PTY {}", item.name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let exec_directory = state.state_dir.join("exec");
+    if let Ok(entries) = fs::read_dir(&exec_directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(runtime_id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if !desired_runtime_ids.contains(runtime_id) {
+                unowned.push(format!("exec {runtime_id}"));
+            }
+        }
+    }
+    checks.push(DoctorCheck {
+        name: "runtime-drift".into(),
+        status: if unowned.is_empty() { "pass" } else { "warn" }.into(),
+        message: if unowned.is_empty() {
+            "the runtime has no unowned sessions or current records".into()
+        } else {
+            format!("unowned runtime state: {}", unowned.join(", "))
+        },
+    });
+    let driver_gaps = status
+        .subjects
+        .iter()
+        .filter(|subject| {
+            desired.iter().any(|desired| {
+                desired.subject == subject.subject
+                    && desired
+                        .member
+                        .as_ref()
+                        .and_then(|member| member.driver.as_ref())
+                        .is_some()
+            }) && subject.gap.is_some()
+        })
+        .map(|subject| {
+            format!(
+                "{}: {}",
+                subject.subject,
+                subject.gap.as_deref().unwrap_or("not ready")
+            )
+        })
+        .collect::<Vec<_>>();
+    checks.push(DoctorCheck {
+        name: "driver-readiness".into(),
+        status: if driver_gaps.is_empty() {
+            "pass"
+        } else {
+            "warn"
+        }
+        .into(),
+        message: if driver_gaps.is_empty() {
+            "all desired native drivers have no current graph gap".into()
+        } else {
+            driver_gaps.join("; ")
+        },
+    });
+    let report_status = if checks.iter().any(|check| check.status == "fail") {
+        "fail"
+    } else if checks.iter().any(|check| check.status == "warn") {
+        "warn"
+    } else {
+        "pass"
+    };
+    Ok(Json(DoctorReport {
+        status: report_status.into(),
+        checks,
+    }))
 }
 
 async fn plan(
@@ -384,8 +602,20 @@ struct ClaimsQuery {
     scope: Option<String>,
     #[serde(default, alias = "after")]
     after_index: u64,
+    #[serde(alias = "before")]
+    before_index: Option<u64>,
+    #[serde(default)]
+    order: ClaimsOrder,
     #[serde(default = "default_claim_limit")]
     limit: usize,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ClaimsOrder {
+    #[default]
+    Asc,
+    Desc,
 }
 
 fn default_claim_limit() -> usize {
@@ -408,6 +638,8 @@ async fn list_claims(
             query.subject.as_deref(),
             query.scope.as_deref(),
             query.after_index,
+            query.before_index,
+            matches!(query.order, ClaimsOrder::Desc),
             query.limit,
         )
         .map(Json)
@@ -1003,7 +1235,7 @@ struct LiveSession {
 fn live_session(
     state: &AppState,
     subject: &str,
-    expected_incarnation: &str,
+    expected_incarnation: Option<&str>,
 ) -> Result<LiveSession, ApiError> {
     let status = state
         .store
@@ -1023,7 +1255,7 @@ fn live_session(
         .get("incarnation_id")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no incarnation")))?;
-    if incarnation_id != expected_incarnation {
+    if expected_incarnation.is_some_and(|expected| incarnation_id != expected) {
         return Err(ApiError::bad(St3Error::new(
             "stale-incarnation",
             format!("subject `{subject}` changed incarnation"),
@@ -1035,14 +1267,248 @@ fn live_session(
         .map_err(ApiError::internal)?
         .into_iter()
         .find(|desired| desired.subject == subject)
-        .and_then(|desired| desired.member)
-        .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no member intent")))?;
+        .and_then(|desired| desired.member);
+    let terminal = member
+        .as_ref()
+        .map(|member| member.terminal)
+        .or_else(|| fields.get("terminal").and_then(Value::as_bool))
+        .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no runtime kind")))?;
     Ok(LiveSession {
         runtime_id: runtime_id.into(),
         incarnation_id: incarnation_id.into(),
-        terminal: member.terminal,
-        driver: member.driver,
+        terminal,
+        driver: member.and_then(|member| member.driver),
     })
+}
+
+#[derive(Deserialize)]
+struct SessionLogQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_log_limit")]
+    limit: usize,
+    #[serde(default)]
+    previous: bool,
+    #[serde(default)]
+    wait: bool,
+}
+
+fn default_log_limit() -> usize {
+    64 * 1024
+}
+
+async fn logs_session(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Query(query): Query<SessionLogQuery>,
+) -> Result<Json<SessionLogChunk>, ApiError> {
+    if query.limit == 0 || query.limit > 64 * 1024 {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-log-limit",
+            "a log chunk limit must be between 1 and 65536 bytes",
+        )));
+    }
+    let session = live_session(&state, &subject, None)?;
+    if session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "terminal sessions expose a screen instead of an exec log",
+        )));
+    }
+    let runtime =
+        st_runtime::ExecRuntime::new(state.state_dir.join("exec"), state.state_dir.join("logs"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut generation = if query.previous {
+            runtime
+                .previous_generation(&session.runtime_id)
+                .map_err(ApiError::internal)?
+        } else {
+            match runtime
+                .observe(&session.runtime_id)
+                .map_err(ApiError::internal)?
+            {
+                Some(st_runtime::ExecObservation::Running(generation))
+                | Some(st_runtime::ExecObservation::Exited(generation)) => Some(generation),
+                Some(st_runtime::ExecObservation::Indeterminate(reason)) => {
+                    return Err(ApiError::internal(reason));
+                }
+                None => None,
+            }
+        }
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "subject `{subject}` has no {}exec log generation",
+                if query.previous { "previous " } else { "" }
+            ))
+        })?;
+        if !query.previous && generation.generation_id != session.incarnation_id {
+            return Err(ApiError::bad(St3Error::new(
+                "stale-incarnation",
+                format!("subject `{subject}` changed exec generation"),
+            )));
+        }
+        let log = runtime
+            .read_log_bytes(&session.runtime_id, query.previous)
+            .map_err(ApiError::internal)?
+            .unwrap_or_default();
+        let start = usize::try_from(query.after)
+            .unwrap_or(usize::MAX)
+            .min(log.len());
+        let end = start.saturating_add(query.limit).min(log.len());
+        let running = if query.previous {
+            false
+        } else {
+            match runtime
+                .observe(&session.runtime_id)
+                .map_err(ApiError::internal)?
+            {
+                Some(st_runtime::ExecObservation::Running(latest)) => {
+                    generation = latest;
+                    true
+                }
+                Some(st_runtime::ExecObservation::Exited(latest)) => {
+                    generation = latest;
+                    false
+                }
+                Some(st_runtime::ExecObservation::Indeterminate(reason)) => {
+                    return Err(ApiError::internal(reason));
+                }
+                None => false,
+            }
+        };
+        if end > start || !query.wait || !running || tokio::time::Instant::now() >= deadline {
+            return Ok(Json(SessionLogChunk {
+                subject,
+                runtime_id: session.runtime_id,
+                generation_id: generation.generation_id,
+                previous: query.previous,
+                start_offset: start as u64,
+                next_offset: end as u64,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&log[start..end]),
+                eof: end == log.len() && !running,
+                status: if running { "running" } else { "exited" }.into(),
+                exit_code: generation.exit_code,
+                exit_signal: generation.exit_signal,
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn screen_session(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<SessionScreen>, ApiError> {
+    let session = live_session(&state, &subject, None)?;
+    if !session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "an exec session has a log instead of a terminal screen",
+        )));
+    }
+    let screen = st_runtime::PtyRuntime::new(state.pty_root.clone())
+        .screen(&session.runtime_id)
+        .map_err(ApiError::internal)?;
+    Ok(Json(SessionScreen {
+        subject,
+        runtime_id: session.runtime_id,
+        incarnation_id: session.incarnation_id,
+        screen,
+    }))
+}
+
+async fn input_session(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<SessionInputRequest>,
+) -> Result<Json<SessionControlResponse>, ApiError> {
+    let result_key = format!(
+        "session-control-result:input:{subject}:{}",
+        request.idempotency_key
+    );
+    if let Some(result) = state
+        .store
+        .idempotent_claim(&result_key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(session_control_response(&subject, &result)));
+    }
+    let session = live_session(&state, &subject, Some(&request.expected_incarnation))?;
+    if !session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "session input requires a terminal session",
+        )));
+    }
+    let bytes = match request.mode {
+        SessionInputMode::Raw => base64::engine::general_purpose::STANDARD
+            .decode(&request.value)
+            .map_err(|error| {
+                ApiError::bad(St3Error::new(
+                    "invalid-session-input",
+                    format!("raw terminal input is not valid base64: {error}"),
+                ))
+            })?,
+        SessionInputMode::Line | SessionInputMode::Key => request.value.as_bytes().to_vec(),
+    };
+    let blob_hash = state.store.put_blob(&bytes).map_err(ApiError::internal)?;
+    let mode = match request.mode {
+        SessionInputMode::Line => "line",
+        SessionInputMode::Raw => "raw",
+        SessionInputMode::Key => "key",
+    };
+    let request_claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "terminal.input.requested".into(),
+            actor: Some("requester".into()),
+            fields: BTreeMap::from([
+                ("mode".into(), Value::String(mode.into())),
+                ("blob_hash".into(), Value::String(blob_hash)),
+                (
+                    "runtime_id".into(),
+                    Value::String(session.runtime_id.clone()),
+                ),
+                (
+                    "incarnation_id".into(),
+                    Value::String(session.incarnation_id.clone()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "session-control-request:input:{subject}:{}",
+                request.idempotency_key
+            )),
+        })
+        .map_err(ApiError::bad)?;
+    let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone());
+    let effect = match request.mode {
+        SessionInputMode::Line => runtime.send_line_if(
+            &session.runtime_id,
+            &request.value,
+            Some(&session.incarnation_id),
+        ),
+        SessionInputMode::Raw => {
+            runtime.send_raw_if(&session.runtime_id, &bytes, Some(&session.incarnation_id))
+        }
+        SessionInputMode::Key => runtime.send_key_if(
+            &session.runtime_id,
+            &request.value,
+            Some(&session.incarnation_id),
+        ),
+    };
+    finish_session_control(
+        &state,
+        &subject,
+        "terminal.input.result",
+        &result_key,
+        &request_claim,
+        &session,
+        effect,
+    )
 }
 
 async fn clear_context(
@@ -1061,7 +1527,7 @@ async fn clear_context(
     {
         return Ok(Json(session_control_response(&subject, &result)));
     }
-    let session = live_session(&state, &subject, &request.expected_incarnation)?;
+    let session = live_session(&state, &subject, Some(&request.expected_incarnation))?;
     if !session.terminal || session.driver.as_deref() != Some("claude") {
         return Err(ApiError::bad(St3Error::new(
             "unsupported-capability",
@@ -1137,7 +1603,7 @@ async fn signal_session(
     {
         return Ok(Json(session_control_response(&subject, &result)));
     }
-    let session = live_session(&state, &subject, &request.expected_incarnation)?;
+    let session = live_session(&state, &subject, Some(&request.expected_incarnation))?;
     let request_claim = state
         .store
         .append_claim(&ClaimInput {
@@ -1262,27 +1728,16 @@ async fn attach_session(
     AxumPath(subject): AxumPath<String>,
     Json(_request): Json<AttachRequest>,
 ) -> Result<Json<Attachment>, ApiError> {
-    let status = state
-        .store
-        .status(Some(&subject))
-        .map_err(ApiError::internal)?;
-    let actual = status
-        .subjects
-        .first()
-        .and_then(|subject| subject.actual.as_ref())
-        .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
-    let fields = actual.get("fields").unwrap_or(actual);
-    let runtime_id = fields
-        .get("runtime_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no runtime")))?;
-    let incarnation_id = fields
-        .get("incarnation_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let session = live_session(&state, &subject, None)?;
+    if !session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "terminal attachment requires a terminal session",
+        )));
+    }
     let (capability, expires_at_unix_ms) = state
         .store
-        .issue_capability("terminal", &subject, incarnation_id.as_deref(), 30_000)
+        .issue_capability("terminal", &subject, Some(&session.incarnation_id), 30_000)
         .map_err(ApiError::internal)?;
     Ok(Json(Attachment {
         websocket_path: format!(
@@ -1291,8 +1746,8 @@ async fn attach_session(
             capability
         ),
         subject,
-        runtime_id: runtime_id.into(),
-        incarnation_id,
+        runtime_id: session.runtime_id,
+        incarnation_id: Some(session.incarnation_id),
         capability,
         expires_at_unix_ms,
     }))
@@ -1393,17 +1848,28 @@ async fn terminal_session(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no runtime")))?
         .to_owned();
-    let current_incarnation = fields.get("incarnation_id").and_then(Value::as_str);
-    if capability.incarnation_id.as_deref() != current_incarnation {
+    let current_incarnation = fields
+        .get("incarnation_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if capability.incarnation_id != current_incarnation {
         return Err(ApiError::bad(St3Error::new(
             "stale-incarnation",
             "the terminal incarnation changed before attachment",
         )));
     }
-    Ok(websocket.on_upgrade(move |socket| terminal_proxy(socket, state, subject, runtime_id)))
+    Ok(websocket.on_upgrade(move |socket| {
+        terminal_proxy(socket, state, subject, runtime_id, current_incarnation)
+    }))
 }
 
-async fn terminal_proxy(socket: WebSocket, state: AppState, subject: String, runtime_id: String) {
+async fn terminal_proxy(
+    socket: WebSocket,
+    state: AppState,
+    subject: String,
+    runtime_id: String,
+    incarnation_id: Option<String>,
+) {
     let mut output = match tokio::process::Command::new("pty")
         .env("PTY_ROOT", &state.pty_root)
         .args(["peek", "-f", &runtime_id])
@@ -1457,7 +1923,10 @@ async fn terminal_proxy(socket: WebSocket, state: AppState, subject: String, run
             let Ok(request) = request else {
                 break;
             };
-            if runtime.send_raw(&input_runtime, &bytes).is_err() {
+            if runtime
+                .send_raw_if(&input_runtime, &bytes, incarnation_id.as_deref())
+                .is_err()
+            {
                 break;
             }
             let _ = store.append_claim(&ClaimInput {
@@ -1634,6 +2103,27 @@ mod tests {
             .expect("the reconciler signal was lost");
     }
 
+    #[tokio::test]
+    async fn health_and_doctor_report_runtime_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, health) = get_request(app.clone(), "/v1/health").await;
+        assert_eq!(status, StatusCode::OK, "{health}");
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        assert!(health["isolation"].is_string());
+
+        let (status, doctor) = get_request(app, "/v1/doctor").await;
+        assert_eq!(status, StatusCode::OK, "{doctor}");
+        assert!(doctor["status"].is_string());
+        assert!(
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["name"] == "runtime-ownership")
+        );
+    }
+
     async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {
         let response = app
             .oneshot(
@@ -1804,11 +2294,22 @@ subgraph {{
         assert_eq!(status, StatusCode::OK, "{first}");
         assert_eq!(first["claims"].as_array().unwrap().len(), 1);
         let cursor = first["next_cursor"].as_u64().unwrap();
-        let (status, second) =
-            get_request(app, &format!("/v1/claims?limit=1&after_index={cursor}")).await;
+        let (status, second) = get_request(
+            app.clone(),
+            &format!("/v1/claims?limit=1&after_index={cursor}"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_eq!(second["claims"].as_array().unwrap().len(), 1);
         assert!(second["next_cursor"].is_null());
+
+        let (status, descending) =
+            get_request(app, "/v1/claims?limit=1&order=desc&before_index=3").await;
+        assert_eq!(status, StatusCode::OK, "{descending}");
+        assert_eq!(
+            descending["claims"][0]["subject"].as_str(),
+            Some("host/two")
+        );
     }
 
     #[tokio::test]

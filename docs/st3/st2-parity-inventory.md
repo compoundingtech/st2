@@ -58,17 +58,17 @@ creating a live runtime conflict.
 | DING safety | Delivery uses FIFO order, DND deferral, restart recovery, retry ownership, and composer checks. | Partial. Generic st3 delivery sends once and records delivery. | Weak. Native delivery hides most generic DING behavior. | Use a controlled PTY with ambiguous sends and restarts. No paid model is necessary. |
 | Render operations | Render supports `copy`, `file`, `json-upsert`, `ensure-line`, and `git-exclude`. | Partial. st3 implements all operations. | Strong for `copy`, `json-upsert`, and `git-exclude`. Absent for active `file` and `ensure-line`. | Use temporary workspaces for each operation and mode. |
 | Render safety | Render checks ownership conflicts, tracked files, all writes before mutation, variables, and hook replacement. | Partial. st3 has atomic writes and workspace path checks. | Weak. The active setup covers successful writes, not most refusal paths. | Use two owners, a tracked destination, a late failure, variables, and managed hooks. |
-| Host service | The CLI installs, checks, and removes a persistent supervisor service. | Missing. `st3 up` starts the server and reconciler. | Strong for service status. Weak for install and removal. | Use a disposable user service and an isolated state directory. |
+| Host service | The CLI installs, checks, and removes a persistent supervisor service. | Linux parity. `st3 service` manages a systemd user unit with a resolved configuration, `PATH`, restart policy, and 1 GiB memory limit. | Strong for service status. Weak for install and removal. | Use a disposable user service and an isolated state directory. Prove install and removal without replacing the active service. |
 | Driver setup | The CLI installs hooks and the Claude channel plugin. | Missing from the st3 CLI. The native driver can use existing host state. | Host-specific. The active catalog uses Claude, but the installation belongs to another host. | Use isolated home directories for plugin install, update, detection, fallback, and removal. |
-| PTY operations | `pty`, `shell`, and environment helpers target the selected catalog. | Partial. Quick Claude and Codex commands attach automatically. | Weak. Catalog declarations cannot show operator helper use. | Use pseudo-terminal CLI tests with an isolated registry. |
-| Diagnostics | `doctor` and `tasks` compare desired state with runtime state. | Missing. `st3 status` provides part of the view. | Strong. The active setup uses both healthy and incomplete inventory cases. | Reproduce live, absent, duplicate, unknown, and unreachable members. |
+| PTY operations | `pty`, `shell`, and environment helpers target the selected catalog. | Partial. `st3 pty` lists, attaches, peeks, sends, signals, and opens the local PTY interface. It does not duplicate all lower-level PTY commands. | Weak. Catalog declarations cannot show operator helper use. | Use pseudo-terminal CLI tests with an isolated registry. |
+| Diagnostics | `doctor` and `tasks` compare desired state with runtime state. | Partial. `st3 doctor`, `inspect`, `trace`, `wait`, generation logs, and health metadata cover normal graph debugging. A full task inventory comparison remains missing. | Strong. The active setup uses both healthy and incomplete inventory cases. | Reproduce live, absent, duplicate, unknown, unreachable, stale generation, and log rotation cases. |
 | Recovery | `unpark` restarts one repaired task without restarting its peers. | Missing. | Absent. No current task is parked. | Cause a controlled crash loop and unpark only that task. |
 | Lifecycle commands | `down`, suspend, resume, retirement, and targeted desired-state changes control members. | Partial. Graph and scope stops replace part of this behavior. | Strong for retirement and eval teardown. Absent for suspension and resume. | Use a graph with running, suspended, retired, stopped, and sibling members. |
 | Presentation | `rename`, `describe`, and `away` update human-facing state. | Missing. | Absent. Active declarations have no presentation fields or away state. | Seed each field and verify updates without identity changes. |
 | Enriched roster | The roster includes presentation, resources, activity, inbox count, and desired state. | Partial. st3 enrichment currently adds reachability. | Strong for roster use. Weak for optional fields because most values are empty. | Seed every optional field and compare stable JSON output. |
 | Request transport | Typed service requests and replies are durable and idempotent. | Missing. The st2 design already marks this feature for possible retirement. | Absent. No request state exists in the observed catalog. | Decide whether migration retains or retires it. If retained, use a local service principal fixture. |
 | Message trees | `message thread --tree` renders reply relationships. | Partial. st3 accepts `--tree` but prints a flat list. | Strong. The archive has many replies. | Import a branched thread and compare text and JSON output. |
-| Process containment | Linux PTY tasks use systemd user scopes when available. | Missing. st3 launches PTYs directly and uses process groups for exec tasks. | Host-specific. Linux scope use is active, while other hosts use fallback behavior. | Prove Linux scope cleanup and a non-systemd fallback separately. |
+| Process containment | Linux PTY tasks use systemd user scopes when available. | Implemented for Linux and other Unix hosts. st2 and st3 share the same scope or detached-process selection. st3 records its isolation mode and adopts surviving exec members after a daemon restart. | Host-specific. Linux scope use is active, while other hosts use fallback behavior. | Keep the daemon-restart survival test. Add a macOS detached-process test and a Linux degraded-mode fixture. |
 | Catalog utilities | Snapshot, diff, bootstrap, digest, and targeted publishing manage the filesystem catalog. | Partial. Graph history plus `plan`, `run`, and `import` replace the main workflow. | Strong for a large catalog. Weak for safe tests of destructive utilities. | Use a copied catalog with retired duplicate runtime IDs and shared documents. |
 
 ## Features that need purpose-built coverage
@@ -80,15 +80,15 @@ The active setup does not adequately cover these features:
 - Generic command-agent delivery and complete DING safety.
 - Active `file` and `ensure-line` rendering.
 - Render conflict and refusal paths.
-- Service installation and removal.
+- Service installation and removal against a disposable user unit.
 - Claude channel installation on each supported host type.
-- General PTY operator helpers.
+- PTY operator helpers against an isolated registry.
 - Park and targeted unpark behavior.
 - Suspension and resume.
 - Presentation fields and the `away` state.
 - Typed service requests, if st3 retains them.
 - Pi and OpenCode native drivers.
-- Cross-platform process containment.
+- macOS and degraded Linux process containment.
 
 Most of these proofs can use local commands and synthetic PTYs. They do not need paid model runs.
 

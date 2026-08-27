@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
-use kdl::{KdlDocument, KdlNode};
+use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use st3::api::{AppState, router, serve_tcp, serve_unix};
@@ -16,11 +17,12 @@ use st3::archive::archive_cell;
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
 use st3::model::{
-    ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord,
-    DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse, EventRecord,
-    IntentInput, JudgementRequest, MessageLifecycleRequest, MessageSendRequest, MessageView,
-    PlanRequest, PlanResponse, QuickAgentRequest, QuickAgentResponse, ReviewRequest,
-    StatusResponse,
+    ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
+    DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
+    EvalStatus, EventRecord, IntentInput, JudgementRequest, MessageLifecycleRequest,
+    MessageSendRequest, MessageView, PlanRequest, PlanResponse, QuickAgentRequest,
+    QuickAgentResponse, ReviewRequest, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -54,6 +56,28 @@ enum Command {
     Run(FileArgs),
     /// Apply all new-format KDL files in one directory tree.
     Import(ImportArgs),
+    /// Publish one exec member and follow its log.
+    Exec(ExecArgs),
+    /// Read or follow one exec member log.
+    Logs(LogsArgs),
+    /// Inspect and control terminal members.
+    Pty {
+        #[command(subcommand)]
+        command: PtyCommand,
+    },
+    /// Show one subject with its recent claims.
+    Inspect(InspectArgs),
+    /// Show claim history and optionally follow new events.
+    Trace(TraceArgs),
+    /// Wait until a graph condition is true.
+    Wait(WaitArgs),
+    /// Check the daemon and runtime dependencies.
+    Doctor(DoctorArgs),
+    /// Manage the Linux st3 user service.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Store or read immutable documents.
     Doc {
         #[command(subcommand)]
@@ -136,6 +160,110 @@ struct FileArgs {
 #[derive(Args)]
 struct ImportArgs {
     directory: PathBuf,
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, default_value = "local")]
+    host: String,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long = "env", value_parser = parse_env)]
+    environment: Vec<(String, String)>,
+    #[arg(long)]
+    detach: bool,
+    #[arg(long)]
+    cancel_on_interrupt: bool,
+    #[arg(last = true, required = true)]
+    argv: Vec<String>,
+}
+
+#[derive(Args)]
+struct LogsArgs {
+    subject: String,
+    #[arg(short = 'f', long)]
+    follow: bool,
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    previous: bool,
+}
+
+#[derive(Subcommand)]
+enum PtyCommand {
+    Ls,
+    Attach(PtySubjectArgs),
+    Peek(PtySubjectArgs),
+    Send(PtySendArgs),
+    Signal(PtySignalArgs),
+    Ui,
+}
+
+#[derive(Args)]
+struct PtySubjectArgs {
+    subject: String,
+}
+
+#[derive(Args)]
+struct PtySendArgs {
+    subject: String,
+    value: String,
+    #[arg(long, conflicts_with = "key")]
+    raw: bool,
+    #[arg(long, conflicts_with = "raw")]
+    key: bool,
+}
+
+#[derive(Args)]
+struct PtySignalArgs {
+    subject: String,
+    #[arg(value_parser = ["interrupt", "hangup", "user-1", "user-2"])]
+    signal: String,
+}
+
+#[derive(Args)]
+struct InspectArgs {
+    subject: String,
+}
+
+#[derive(Args)]
+struct TraceArgs {
+    subject: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    #[arg(long)]
+    after_index: Option<u64>,
+    #[arg(short = 'f', long)]
+    follow: bool,
+}
+
+#[derive(Args)]
+struct WaitArgs {
+    subject: String,
+    #[arg(long = "for", default_value = "ready")]
+    condition: String,
+    #[arg(long, default_value = "10m")]
+    timeout: String,
+}
+
+#[derive(Args)]
+struct DoctorArgs {
+    #[arg(long)]
+    strict: bool,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    Install {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    Status,
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -396,12 +524,26 @@ enum CompletionShell {
     Fish,
 }
 
+#[derive(Debug)]
+struct CommandExit(u8);
+
+impl std::fmt::Display for CommandExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "the command selected exit status {}", self.0)
+    }
+}
+
+impl std::error::Error for CommandExit {}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(exit) = error.downcast_ref::<CommandExit>() {
+                return ExitCode::from(exit.0);
+            }
             eprintln!("st3: {error:#}");
             let message = error.to_string();
             if message.contains("run `st3 up` first") || message.contains("connect to the st3 API")
@@ -409,7 +551,9 @@ async fn main() -> ExitCode {
                 ExitCode::from(5)
             } else if message.contains("stale-subject") {
                 ExitCode::from(3)
-            } else if message.contains("terminal status selected") {
+            } else if message.contains("terminal status selected")
+                || message.contains("wait timed out")
+            {
                 ExitCode::from(4)
             } else {
                 ExitCode::from(2)
@@ -441,6 +585,14 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Plan(args) => run_plan(&client, args, cli.json).await,
         Command::Run(args) => run_file(&client, args, cli.json).await,
         Command::Import(args) => run_import(&client, args, cli.json).await,
+        Command::Exec(args) => run_exec(&client, args, cli.json).await,
+        Command::Logs(args) => run_logs(&client, args, cli.json).await,
+        Command::Pty { command } => run_pty(&client, endpoint, &config, command, cli.json).await,
+        Command::Inspect(args) => run_inspect(&client, args, cli.json).await,
+        Command::Trace(args) => run_trace(&client, args, cli.json).await,
+        Command::Wait(args) => run_wait(&client, args, cli.json).await,
+        Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
+        Command::Service { command } => run_service(command),
         Command::Doc { command } => run_doc(&client, command, cli.json).await,
         Command::Eval(args) => run_eval(&client, args, cli.json).await,
         Command::Status(args) => run_status(&client, args, cli.json).await,
@@ -614,6 +766,596 @@ async fn run_import(client: &Client, args: ImportArgs, json_output: bool) -> Res
         json_output,
     )
     .await
+}
+
+async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<()> {
+    let explicit_name = args.name.is_some();
+    let name = args.name.unwrap_or_else(|| {
+        format!(
+            "cli-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        )
+    });
+    let subject = format!("exec/{name}");
+    if explicit_name {
+        let status = status_for(client, &subject).await?;
+        anyhow::ensure!(
+            status
+                .subjects
+                .first()
+                .is_none_or(|item| item.desired.is_none() && item.actual.is_none()),
+            "subject `{subject}` already exists"
+        );
+    }
+    let cwd = args.cwd.unwrap_or(std::env::current_dir()?);
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("resolve working directory {}", cwd.display()))?;
+    let kdl = exec_intent(&name, &args.host, &cwd, &args.environment, &args.argv);
+    let applied = apply_generated(client, kdl, format!("st3 exec {name}")).await?;
+    if args.detach {
+        if json_output {
+            return print_value(
+                &json!({
+                "subject": subject,
+                "store_index": applied.store_index,
+                "detached": true,
+                }),
+                true,
+            );
+        }
+        println!("{subject}");
+        return Ok(());
+    }
+    wait_for_actual(client, &subject, applied.store_index).await?;
+    if !json_output {
+        eprintln!("{}", subject);
+    }
+    let follow = follow_logs(client, &subject, false, true, true, !json_output);
+    let final_chunk = tokio::select! {
+        result = follow => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            if args.cancel_on_interrupt {
+                apply_generated(client, stop_intent(&subject), format!("st3 exec stop {name}")).await?;
+            }
+            return Err(CommandExit(130).into());
+        }
+    };
+    if json_output {
+        print_value(&final_chunk, true)?;
+    }
+    if let Some(signal) = final_chunk.exit_signal {
+        return Err(CommandExit((128_i32.saturating_add(signal)).clamp(1, 255) as u8).into());
+    }
+    if let Some(code) = final_chunk.exit_code
+        && code != 0
+    {
+        return Err(CommandExit(code.clamp(1, 255) as u8).into());
+    }
+    Ok(())
+}
+
+fn exec_intent(
+    name: &str,
+    host: &str,
+    cwd: &Path,
+    environment: &[(String, String)],
+    argv: &[String],
+) -> String {
+    let mut task = KdlNode::new("exec");
+    task.entries_mut().push(KdlEntry::new(name));
+    let mut body = KdlDocument::new();
+    body.nodes_mut().push(kdl_node("host", [host]));
+    let cwd = cwd.to_string_lossy().into_owned();
+    body.nodes_mut().push(kdl_node("workspace", [cwd.as_str()]));
+    body.nodes_mut().push(kdl_node("cwd", [cwd.as_str()]));
+    body.nodes_mut()
+        .push(kdl_node("argv", argv.iter().map(String::as_str)));
+    if !environment.is_empty() {
+        let mut environment_node = KdlNode::new("env");
+        let mut environment_body = KdlDocument::new();
+        for (name, value) in environment {
+            environment_body
+                .nodes_mut()
+                .push(kdl_node(name, [value.as_str()]));
+        }
+        environment_node.set_children(environment_body);
+        body.nodes_mut().push(environment_node);
+    }
+    body.nodes_mut().push(kdl_node("restart", ["never"]));
+    task.set_children(body);
+    subgraph_document(task)
+}
+
+fn stop_intent(subject: &str) -> String {
+    let mut stop = KdlNode::new("stop");
+    stop.entries_mut().push(KdlEntry::new(subject));
+    subgraph_document(stop)
+}
+
+fn kdl_node<'a>(name: &str, values: impl IntoIterator<Item = &'a str>) -> KdlNode {
+    let mut node = KdlNode::new(name);
+    node.entries_mut()
+        .extend(values.into_iter().map(KdlEntry::new));
+    node
+}
+
+fn subgraph_document(node: KdlNode) -> String {
+    let mut children = KdlDocument::new();
+    children.nodes_mut().push(node);
+    let mut root = KdlNode::new("subgraph");
+    root.set_children(children);
+    let mut document = KdlDocument::new();
+    document.nodes_mut().push(root);
+    document.autoformat();
+    document.to_string()
+}
+
+async fn apply_generated(
+    client: &Client,
+    kdl: String,
+    source_name: String,
+) -> Result<ApplyResponse> {
+    let intent = IntentInput {
+        kdl,
+        source_name: Some(source_name),
+    };
+    let plan: PlanResponse = client
+        .post(
+            "/v1/intent/plan",
+            &PlanRequest {
+                intent: intent.clone(),
+                at_index: None,
+            },
+        )
+        .await?;
+    anyhow::ensure!(plan.blockers.is_empty(), "{}", plan.blockers.join("; "));
+    let resolved = plan.resolved_intent;
+    client
+        .post(
+            "/v1/intent/apply",
+            &ApplyRequest {
+                idempotency_key: idempotency(&resolved.kdl, &plan.subject_tokens),
+                intent: resolved,
+                expected_subjects: plan.subject_tokens,
+            },
+        )
+        .await
+}
+
+async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Result<()> {
+    loop {
+        let status = status_for(client, subject).await?;
+        if status
+            .subjects
+            .first()
+            .and_then(|item| item.actual.as_ref())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let events: Vec<EventRecord> = client
+            .get(&format!(
+                "/v1/events?after={cursor}&subject={}",
+                urlencoding::encode(subject)
+            ))
+            .await?;
+        for event in events {
+            cursor = cursor.max(event.store_index);
+            if event.kind == "action.failed" {
+                anyhow::bail!("{} failed: {}", subject, event.body);
+            }
+        }
+    }
+}
+
+async fn run_logs(client: &Client, args: LogsArgs, json_output: bool) -> Result<()> {
+    let chunk = follow_logs(
+        client,
+        &args.subject,
+        args.previous,
+        args.all,
+        args.follow,
+        !json_output,
+    )
+    .await?;
+    if json_output {
+        print_value(&chunk, true)?;
+    }
+    Ok(())
+}
+
+async fn follow_logs(
+    client: &Client,
+    subject: &str,
+    previous: bool,
+    all: bool,
+    follow: bool,
+    emit: bool,
+) -> Result<SessionLogChunk> {
+    let subject = normalize_member_subject(subject, "exec");
+    let probe: SessionLogChunk = client
+        .get(&format!(
+            "/v1/sessions/logs/{}?after={}&limit=1&previous={previous}",
+            urlencoding::encode(&subject),
+            u64::MAX
+        ))
+        .await?;
+    let mut offset = if all {
+        0
+    } else {
+        probe.next_offset.saturating_sub(64 * 1024)
+    };
+    let generation = probe.generation_id.clone();
+    loop {
+        let chunk: SessionLogChunk = client
+            .get(&format!(
+                "/v1/sessions/logs/{}?after={offset}&limit={}&previous={previous}&wait=false",
+                urlencoding::encode(&subject),
+                64 * 1024
+            ))
+            .await?;
+        anyhow::ensure!(
+            chunk.generation_id == generation,
+            "the exec generation changed while the log was open"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&chunk.data_base64)
+            .context("the API returned invalid base64 log data")?;
+        if emit && !bytes.is_empty() {
+            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().flush()?;
+        }
+        offset = chunk.next_offset;
+        if chunk.eof {
+            return Ok(chunk);
+        }
+        if !follow && offset >= probe.next_offset {
+            return Ok(chunk);
+        }
+        if bytes.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+async fn run_pty(
+    client: &Client,
+    endpoint: Endpoint,
+    config: &Config,
+    command: PtyCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        PtyCommand::Ls => {
+            let status: StatusResponse = client.get("/v1/status").await?;
+            let sessions = status
+                .subjects
+                .into_iter()
+                .filter(|subject| {
+                    subject.actual.as_ref().is_some_and(|actual| {
+                        actual
+                            .get("fields")
+                            .unwrap_or(actual)
+                            .get("terminal")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    })
+                })
+                .collect::<Vec<_>>();
+            print_value(&sessions, json_output)
+        }
+        PtyCommand::Attach(args) => {
+            let subject = normalize_member_subject(&args.subject, "pty");
+            let attachment: Attachment = client
+                .post(
+                    &format!("/v1/sessions/attach/{}", urlencoding::encode(&subject)),
+                    &AttachRequest::default(),
+                )
+                .await?;
+            client.proxy_terminal(&attachment.websocket_path).await
+        }
+        PtyCommand::Peek(args) => {
+            let subject = normalize_member_subject(&args.subject, "pty");
+            let screen: SessionScreen = client
+                .get(&format!(
+                    "/v1/sessions/screen/{}",
+                    urlencoding::encode(&subject)
+                ))
+                .await?;
+            if json_output {
+                print_value(&screen, true)
+            } else {
+                print!("{}", screen.screen);
+                Ok(())
+            }
+        }
+        PtyCommand::Send(args) => {
+            let subject = normalize_member_subject(&args.subject, "pty");
+            let incarnation = session_incarnation(client, &subject).await?;
+            let mode = if args.raw {
+                SessionInputMode::Raw
+            } else if args.key {
+                SessionInputMode::Key
+            } else {
+                SessionInputMode::Line
+            };
+            let value = if args.raw {
+                base64::engine::general_purpose::STANDARD.encode(args.value.as_bytes())
+            } else {
+                args.value
+            };
+            let response: SessionControlResponse = client
+                .post(
+                    &format!("/v1/sessions/input/{}", urlencoding::encode(&subject)),
+                    &SessionInputRequest {
+                        expected_incarnation: incarnation,
+                        mode,
+                        value,
+                        idempotency_key: format!("pty-input:{}:{}", subject, now_ms()),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        PtyCommand::Signal(args) => {
+            let subject = normalize_member_subject(&args.subject, "pty");
+            let response: SessionControlResponse = client
+                .post(
+                    &format!("/v1/sessions/{}/signal", urlencoding::encode(&subject)),
+                    &SessionSignalRequest {
+                        expected_incarnation: session_incarnation(client, &subject).await?,
+                        signal: args.signal,
+                        idempotency_key: format!("pty-signal:{}:{}", subject, now_ms()),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        PtyCommand::Ui => {
+            anyhow::ensure!(
+                matches!(endpoint, Endpoint::Unix(_)),
+                "st3 pty ui is available only with the local Unix endpoint"
+            );
+            let _: Value = client.get("/v1/health").await?;
+            let pty_root = config
+                .pty_root
+                .clone()
+                .unwrap_or_else(|| config.state_dir.join("pty"));
+            let status = std::process::Command::new("pty")
+                .env("PTY_ROOT", pty_root)
+                .status()
+                .context("start the PTY operator interface")?;
+            anyhow::ensure!(
+                status.success(),
+                "the PTY operator interface exited with {status}"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> Result<()> {
+    let status = status_for(client, &args.subject).await?;
+    let claims: ClaimsPage = client
+        .get(&format!(
+            "/v1/claims?subject={}&order=desc&limit=20",
+            urlencoding::encode(&args.subject)
+        ))
+        .await?;
+    print_value(
+        &json!({ "status": status, "recent_claims": claims.claims }),
+        json_output,
+    )
+}
+
+async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(
+        args.limit > 0 && args.limit <= 500,
+        "the trace limit must be 1 through 500"
+    );
+    let mut query = vec![format!("limit={}", args.limit), "order=desc".into()];
+    if let Some(subject) = &args.subject {
+        query.push(format!("subject={}", urlencoding::encode(subject)));
+    }
+    if let Some(scope) = &args.scope {
+        query.push(format!("scope={}", urlencoding::encode(scope)));
+    }
+    if let Some(after) = args.after_index {
+        query.push(format!("after_index={after}"));
+    }
+    let page: ClaimsPage = client
+        .get(&format!("/v1/claims?{}", query.join("&")))
+        .await?;
+    let mut claims = page.claims;
+    claims.reverse();
+    let mut cursor = args.after_index.unwrap_or_default();
+    for claim in claims {
+        cursor = cursor.max(claim.store_index);
+        if json_output {
+            println!("{}", serde_json::to_string(&claim)?);
+        } else {
+            println!("{}\t{}\t{}", claim.store_index, claim.kind, claim.subject);
+        }
+    }
+    if !args.follow {
+        return Ok(());
+    }
+    loop {
+        let mut event_query = vec![format!("after={cursor}")];
+        if let Some(subject) = &args.subject {
+            event_query.push(format!("subject={}", urlencoding::encode(subject)));
+        }
+        if let Some(scope) = &args.scope {
+            event_query.push(format!("scope={}", urlencoding::encode(scope)));
+        }
+        let events: Vec<EventRecord> = client
+            .get(&format!("/v1/events?{}", event_query.join("&")))
+            .await?;
+        for event in events {
+            cursor = cursor.max(event.store_index);
+            if json_output {
+                println!("{}", serde_json::to_string(&event)?);
+            } else {
+                println!("{}\t{}\t{}", event.store_index, event.kind, event.subject);
+            }
+        }
+    }
+}
+
+async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<()> {
+    validate_wait_condition(&args.condition)?;
+    let timeout = parse_timeout(&args.timeout)?;
+    let wait = wait_for_condition(client, &args.subject, &args.condition);
+    let value = if timeout.is_zero() {
+        wait.await?
+    } else {
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| anyhow::anyhow!("wait timed out after {}", args.timeout))??
+    };
+    print_value(&value, json_output)
+}
+
+async fn wait_for_condition(client: &Client, subject: &str, condition: &str) -> Result<Value> {
+    let mut cursor = 0;
+    loop {
+        if let Some(value) = condition_value(client, subject, condition).await? {
+            return Ok(value);
+        }
+        let events: Vec<EventRecord> = client
+            .get(&format!(
+                "/v1/events?after={cursor}&subject={}",
+                urlencoding::encode(subject)
+            ))
+            .await?;
+        for event in events {
+            cursor = cursor.max(event.store_index);
+        }
+    }
+}
+
+async fn condition_value(client: &Client, subject: &str, condition: &str) -> Result<Option<Value>> {
+    if let Some(expected) = condition.strip_prefix("checkpoint=") {
+        let eval: EvalStatus = client
+            .get(&format!("/v1/evals/{}", urlencoding::encode(subject)))
+            .await?;
+        return Ok((eval.active_checkpoint.as_deref() == Some(expected)).then(|| json!(eval)));
+    }
+    if let Some(expected) = condition.strip_prefix("verdict=") {
+        let eval: EvalStatus = client
+            .get(&format!("/v1/evals/{}", urlencoding::encode(subject)))
+            .await?;
+        return Ok((eval.verdict.as_deref() == Some(expected)).then(|| json!(eval)));
+    }
+    let status = status_for(client, subject).await?;
+    let item = status.subjects.first();
+    let fields = item
+        .and_then(|item| item.actual.as_ref())
+        .map(|actual| actual.get("fields").unwrap_or(actual));
+    let actual_status = fields
+        .and_then(|fields| fields.get("status"))
+        .and_then(Value::as_str);
+    let matches = match condition {
+        "running" => matches!(actual_status, Some("running" | "ready")),
+        "ready" => actual_status == Some("ready"),
+        "exited" => actual_status == Some("exited"),
+        "stopped" => {
+            item.is_none_or(|item| item.actual.is_none())
+                || matches!(actual_status, Some("stopped" | "removed"))
+        }
+        _ => false,
+    };
+    Ok(matches.then(|| json!(status)))
+}
+
+fn validate_wait_condition(condition: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(condition, "running" | "ready" | "exited" | "stopped")
+            || condition.starts_with("checkpoint=")
+            || matches!(
+                condition.strip_prefix("verdict="),
+                Some("pass" | "fail" | "void")
+            ),
+        "unknown wait condition `{condition}`"
+    );
+    Ok(())
+}
+
+fn parse_timeout(value: &str) -> Result<Duration> {
+    if value == "0" {
+        return Ok(Duration::ZERO);
+    }
+    for (suffix, factor) in [("ms", 1_u64), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            let amount = number.parse::<u64>()?;
+            anyhow::ensure!(amount > 0, "a timeout must be positive or zero");
+            return Ok(Duration::from_millis(amount.saturating_mul(factor)));
+        }
+    }
+    anyhow::bail!("a timeout must use ms, s, m, h, or zero")
+}
+
+async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    let report: DoctorReport = client.get("/v1/doctor").await?;
+    if json_output {
+        print_value(&report, true)?;
+    } else {
+        for check in &report.checks {
+            println!("{}\t{}\t{}", check.status, check.name, check.message);
+        }
+    }
+    anyhow::ensure!(report.status != "fail", "st3 doctor found a failed check");
+    anyhow::ensure!(
+        !args.strict || report.status == "pass",
+        "st3 doctor found a warning in strict mode"
+    );
+    Ok(())
+}
+
+fn run_service(command: ServiceCommand) -> Result<()> {
+    match command {
+        ServiceCommand::Install { config } => {
+            st3::service::install(Config::load(config.as_deref())?)
+        }
+        ServiceCommand::Status => st3::service::status(),
+        ServiceCommand::Uninstall => st3::service::uninstall(),
+    }
+}
+
+async fn status_for(client: &Client, subject: &str) -> Result<StatusResponse> {
+    client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(subject)
+        ))
+        .await
+}
+
+async fn session_incarnation(client: &Client, subject: &str) -> Result<String> {
+    let status = status_for(client, subject).await?;
+    status
+        .subjects
+        .first()
+        .and_then(|item| item.actual.as_ref())
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .and_then(|fields| fields.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("subject `{subject}` has no live incarnation"))
+}
+
+fn normalize_member_subject(subject: &str, namespace: &str) -> String {
+    if subject.contains('/') {
+        subject.into()
+    } else {
+        format!("{namespace}/{subject}")
+    }
 }
 
 async fn post_staged_documents(client: &Client, root: &Path, kdl: &str) -> Result<()> {
@@ -1693,6 +2435,11 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         tokio::select! {
             status = child.wait() => {
                 let status = status?;
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    status.signal()
+                };
                 let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                     subject: subject.into(),
                     kind: "member.observed".into(),
@@ -1700,11 +2447,22 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
                     fields: BTreeMap::from([
                         ("status".into(), Value::String("exited".into())),
                         ("exit_code".into(), status.code().map(Value::from).unwrap_or(Value::Null)),
+                        ("exit_signal".into(), signal.map(Value::from).unwrap_or(Value::Null)),
                     ]),
                     evidence: Vec::new(),
                     expected_subject: None,
                     idempotency_key: None,
                 }).await?;
+                if args.driver == "exec" {
+                    let code = status
+                        .code()
+                        .unwrap_or_else(|| 128_i32.saturating_add(signal.unwrap_or(1)))
+                        .clamp(0, 255) as u8;
+                    if code != 0 {
+                        return Err(CommandExit(code).into());
+                    }
+                    return Ok(());
+                }
                 anyhow::ensure!(status.success(), "{} exited with {status}", args.driver);
                 return Ok(());
             }
@@ -2467,9 +3225,66 @@ fn parse_peer(value: &str) -> Result<PeerConfig, String> {
     })
 }
 
+fn parse_env(value: &str) -> Result<(String, String), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| "an environment value must use NAME=VALUE".to_owned())?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err("an environment name is invalid".into());
+    }
+    Ok((name.into(), value.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_cli_builds_a_normal_st3_member() {
+        let source = exec_intent(
+            "cli-test",
+            "local",
+            Path::new("/work/tree"),
+            &[("MODE".into(), "test".into())],
+            &["printf".into(), "%s".into(), "hello".into()],
+        );
+        let intent = st3::parse_intent(&source, "node").unwrap();
+        let member = intent.subjects["exec/cli-test"].member.as_ref().unwrap();
+        assert_eq!(member.host, "node");
+        assert_eq!(member.cwd, "/work/tree");
+        assert_eq!(member.environment["MODE"], "test");
+        assert_eq!(member.restart, st3::model::RestartType::Never);
+        assert_eq!(
+            member.launch,
+            st3::model::LaunchSpec::Argv(vec!["printf".into(), "%s".into(), "hello".into()])
+        );
+    }
+
+    #[test]
+    fn wait_timeout_accepts_bounded_units_and_zero() {
+        assert_eq!(parse_timeout("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_timeout("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_timeout("0").unwrap(), Duration::ZERO);
+        assert!(parse_timeout("forever").is_err());
+    }
+
+    #[tokio::test]
+    async fn pty_ui_refuses_a_remote_endpoint_before_launch() {
+        let endpoint = Endpoint::Http("http://example.invalid".into());
+        let client = Client::new(endpoint.clone());
+        let error = run_pty(&client, endpoint, &Config::default(), PtyCommand::Ui, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("local Unix endpoint"));
+    }
 
     #[test]
     fn a_native_driver_gets_one_private_st2_projection() {

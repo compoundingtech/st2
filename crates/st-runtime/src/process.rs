@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,12 @@ pub struct ExecGeneration {
     pub generation_id: String,
     #[serde(default)]
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub exit_signal: Option<i32>,
+    #[serde(default)]
+    pub isolation_mode: String,
+    #[serde(default)]
+    pub scope_unit: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +49,7 @@ pub struct ExecRuntime {
 
 impl ExecRuntime {
     pub fn new(state_dir: PathBuf, log_dir: PathBuf) -> Self {
+        crate::warn_if_degraded("st3");
         Self {
             state_dir,
             log_dir,
@@ -58,7 +66,8 @@ impl ExecRuntime {
     ) -> Result<ExecGeneration> {
         fs::create_dir_all(&self.state_dir)?;
         fs::create_dir_all(&self.log_dir)?;
-        let log_path = self.log_dir.join(format!("{id}.log"));
+        self.rotate_generation(id)?;
+        let log_path = self.log_path(id, false);
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -66,21 +75,27 @@ impl ExecRuntime {
             .open(&log_path)
             .with_context(|| format!("open exec log {}", log_path.display()))?;
 
-        let mut command = match launch {
-            crate::Launch::Shell(source) => {
-                let mut command = Command::new("sh");
-                command.args(["-c", source]);
-                command
-            }
+        let (program, arguments): (OsString, Vec<OsString>) = match launch {
+            crate::Launch::Shell(source) => (
+                OsString::from("sh"),
+                vec![OsString::from("-c"), OsString::from(source)],
+            ),
             crate::Launch::Argv(argv) => {
                 let (program, arguments) = argv
                     .split_first()
                     .context("an argv launch must contain a program")?;
-                let mut command = Command::new(program);
-                command.args(arguments);
-                command
+                (
+                    OsString::from(program),
+                    arguments.iter().map(OsString::from).collect(),
+                )
             }
         };
+        let unit = crate::scope_unit("st3", id);
+        let argument_refs = arguments
+            .iter()
+            .map(OsString::as_os_str)
+            .collect::<Vec<_>>();
+        let mut command = crate::wrap_isolated(&unit, program.as_os_str(), &argument_refs);
         command
             .current_dir(cwd)
             .envs(env)
@@ -111,6 +126,9 @@ impl ExecRuntime {
             start_token,
             generation_id,
             exit_code: None,
+            exit_signal: None,
+            isolation_mode: isolation_name(crate::isolation_mode()).into(),
+            scope_unit: (crate::isolation_mode() == crate::Isolation::Scope).then_some(unit),
         };
         self.write_generation(id, &generation)?;
         self.owned_children
@@ -154,6 +172,7 @@ impl ExecRuntime {
         };
         if let Some(status) = owned_exit {
             generation.exit_code = status.code();
+            generation.exit_signal = exit_signal(&status);
             self.write_generation(id, &generation)?;
             return Ok(Some(ExecObservation::Exited(generation)));
         }
@@ -216,7 +235,7 @@ impl ExecRuntime {
     }
 
     pub fn read_log(&self, id: &str) -> Result<Option<String>> {
-        let path = self.log_dir.join(format!("{id}.log"));
+        let path = self.log_path(id, false);
         match fs::read_to_string(&path) {
             Ok(log) => Ok(Some(log)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -224,16 +243,62 @@ impl ExecRuntime {
         }
     }
 
-    pub fn remove(&self, id: &str) -> Result<()> {
-        match fs::remove_file(self.record_path(id)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+    pub fn read_log_bytes(&self, id: &str, previous: bool) -> Result<Option<Vec<u8>>> {
+        let path = self.log_path(id, previous);
+        match fs::read(&path) {
+            Ok(log) => Ok(Some(log)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read exec log {}", path.display())),
         }
+    }
+
+    pub fn previous_generation(&self, id: &str) -> Result<Option<ExecGeneration>> {
+        self.read_generation_path(&self.previous_record_path(id))
+    }
+
+    pub fn remove(&self, id: &str) -> Result<()> {
+        for path in [
+            self.record_path(id),
+            self.previous_record_path(id),
+            self.log_path(id, false),
+            self.log_path(id, true),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     fn record_path(&self, id: &str) -> PathBuf {
         self.state_dir.join(format!("{id}.json"))
+    }
+
+    fn previous_record_path(&self, id: &str) -> PathBuf {
+        self.state_dir.join(format!("{id}.json.1"))
+    }
+
+    fn log_path(&self, id: &str, previous: bool) -> PathBuf {
+        self.log_dir.join(if previous {
+            format!("{id}.log.1")
+        } else {
+            format!("{id}.log")
+        })
+    }
+
+    fn rotate_generation(&self, id: &str) -> Result<()> {
+        rotate_file(&self.record_path(id), &self.previous_record_path(id))?;
+        rotate_file(&self.log_path(id, false), &self.log_path(id, true))
+    }
+
+    fn read_generation_path(&self, path: &Path) -> Result<Option<ExecGeneration>> {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(Into::into),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn write_generation(&self, id: &str, generation: &ExecGeneration) -> Result<()> {
@@ -250,6 +315,36 @@ impl ExecRuntime {
         fs::rename(&temporary, &path)?;
         Ok(())
     }
+}
+
+fn rotate_file(current: &Path, previous: &Path) -> Result<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+    match fs::remove_file(previous) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::rename(current, previous) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn isolation_name(mode: crate::Isolation) -> &'static str {
+    match mode {
+        crate::Isolation::Scope => "scope",
+        crate::Isolation::Detached => "detached",
+        crate::Isolation::DegradedDetached => "degraded-detached",
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
 }
 
 #[cfg(target_os = "linux")]
@@ -296,4 +391,69 @@ fn generation_id(id: &str, pid: u32, start_token: u64, created_at_unix_ms: u128)
     hash.update(start_token.to_be_bytes());
     hash.update(created_at_unix_ms.to_be_bytes());
     format!("{:x}", hash.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    fn wait_for_exit(runtime: &ExecRuntime, id: &str) -> ExecGeneration {
+        for _ in 0..200 {
+            match runtime.observe(id).unwrap() {
+                Some(ExecObservation::Exited(generation)) => return generation,
+                Some(ExecObservation::Running(_)) => thread::sleep(Duration::from_millis(10)),
+                other => panic!("unexpected exec observation: {other:?}"),
+            }
+        }
+        panic!("the exec did not exit");
+    }
+
+    #[test]
+    fn retains_the_current_and_previous_log_generations() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        let environment = BTreeMap::new();
+        let cwd = root.path();
+        let first = runtime
+            .spawn(
+                "work",
+                &crate::Launch::Argv(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf first; exit 3".into(),
+                ]),
+                cwd,
+                &environment,
+            )
+            .unwrap();
+        let first_exit = wait_for_exit(&runtime, "work");
+        assert_eq!(first_exit.exit_code, Some(3));
+
+        let second = runtime
+            .spawn(
+                "work",
+                &crate::Launch::Argv(vec!["sh".into(), "-c".into(), "printf second".into()]),
+                cwd,
+                &environment,
+            )
+            .unwrap();
+        let second_exit = wait_for_exit(&runtime, "work");
+
+        assert_ne!(first.generation_id, second.generation_id);
+        assert_eq!(second_exit.exit_code, Some(0));
+        assert_eq!(
+            runtime.previous_generation("work").unwrap().unwrap(),
+            first_exit
+        );
+        assert_eq!(
+            runtime.read_log_bytes("work", true).unwrap().unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            runtime.read_log_bytes("work", false).unwrap().unwrap(),
+            b"second"
+        );
+    }
 }
