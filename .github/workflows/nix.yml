@@ -10,8 +10,10 @@ concurrency:
   group: nix-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Both jobs are named for the flake system they prove, not for the runner that hosts them.
+# They are deliberately not the same size — see the comment on the Darwin job.
 jobs:
-  check:
+  check-x86_64-linux:
     runs-on: ubuntu-latest
     # A healthy full `nix flake check` baseline is ~35m; 90m provides
     # headroom while still failing boundedly.
@@ -24,17 +26,17 @@ jobs:
       # the `--help` smoke test all gate the PR from one entrypoint.
       - run: nix flake check --print-build-logs
 
-  # Darwin gate. st2 drives real processes — process groups, signals, pipes, reaping —
-  # and those paths are OS behaviour, not portable Rust: issue #356 was two aarch64-darwin
-  # test failures that no Linux run could have caught. The hosted macOS runner is arm64
-  # with 3 cores, so it is also a *stricter* scheduler than any Mac in the fleet, which is
-  # what makes it a useful detector for load-sensitive lifecycle tests.
+  # st2 drives real processes — process groups, signals, pipes, reaping — and those paths
+  # are OS behaviour, not portable Rust: #356 and #255 were aarch64-darwin failures no Linux
+  # run could have caught. The hosted macOS runner is arm64 with 3 cores, so it is also a
+  # stricter scheduler than any Mac in the fleet, which makes it a good detector for
+  # load-sensitive lifecycle tests.
   #
-  # Scope is deliberately `nix build .#st2`, not `nix flake check`: that builds the package
-  # and runs its hermetic suite via `doCheck` — exactly the surface #356 lives on — without
-  # also demanding cold aarch64-darwin builds of the `pty` and `otelite` dependencies that
+  # Narrower than its Linux sibling on purpose: `nix build .#st2` builds the package and runs
+  # its hermetic suite via `doCheck` — the surface those issues live on — without also
+  # demanding cold aarch64-darwin builds of the `pty` and `otelite` inputs that
   # `checks.parked-recovery` and `checks.otel-export` pull in. Widen once this is stable.
-  build-darwin:
+  check-aarch64-darwin:
     runs-on: macos-15
     timeout-minutes: 90
     steps:
