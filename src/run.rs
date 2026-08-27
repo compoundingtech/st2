@@ -1672,13 +1672,8 @@ fn reconcile_pass(
     );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
-    let mut eligible_specs = Vec::new();
-    for mut spec in found
-        .specs
-        .iter()
-        .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
-        .cloned()
-    {
+    let mut compiled_specs = Vec::new();
+    for mut spec in found.specs.iter().cloned() {
         if let Err(error) =
             compile_generated_tasks(std::slice::from_mut(&mut spec), this_host, task_context)
         {
@@ -1688,8 +1683,13 @@ fn reconcile_pass(
             ));
             continue;
         }
-        eligible_specs.push(spec);
+        compiled_specs.push(spec);
     }
+    let eligible_specs = compiled_specs
+        .iter()
+        .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
+        .cloned()
+        .collect::<Vec<_>>();
 
     let sessions = match runner.list_sessions() {
         Ok(s) => s,
@@ -1719,7 +1719,7 @@ fn reconcile_pass(
         // Existing canonical seats from successfully compiled declarations are established by this
         // pass's observation. Install them before executing unrelated repairs; targeted upserts
         // preserve every retained baseline and pending transition.
-        for spec in live_resync_specs(&eligible_specs, this_host, &sessions, &report) {
+        for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
             resync.install_live(&spec, this_host);
         }
     }
@@ -1743,7 +1743,7 @@ fn reconcile_pass(
             .map(|error| error.path.clone())
             .collect::<Vec<_>>();
         resync.refresh(
-            &live_resync_specs(&eligible_specs, this_host, &sessions, &report),
+            &live_resync_specs(&compiled_specs, this_host, &sessions, &report),
             this_host,
             &sessions,
             &malformed_declarations,
@@ -3293,6 +3293,110 @@ mod tests {
         let corrected_event = wait_for_resync_event_change(&live_dir, &first_event)
             .expect("correcting another declaration must not reseed and hide the live transition");
         assert!(corrected_event.contains("binding: goal"), "{corrected_event}");
+    }
+
+    #[test]
+    fn materialization_failure_retains_only_the_observed_live_resync_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let write_broken_agent = |identity: &str| {
+            let (agent_dir, goal) = write_resync_agent(catalog.path(), identity);
+            let workspace = catalog.path().join(format!("{identity}-workspace"));
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(
+                agent_dir.join("agent.kdl"),
+                format!(
+                    r#"agent "{identity}" {{
+  host "hetz"
+  workspace "{}"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+  render {{
+    copy "_templates/{identity}.md" "AGENTS.md"
+  }}
+}}"#,
+                    workspace.display()
+                ),
+            )
+            .unwrap();
+            (agent_dir, goal)
+        };
+        let (live_dir, live_goal) = write_broken_agent("live");
+        let (dormant_dir, dormant_goal) = write_broken_agent("dormant");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![sess("hetz.live", true)]),
+            ..SpawnCountingRunner::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let failed = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            failed
+                .errors
+                .iter()
+                .filter(|error| error.contains("copy source"))
+                .count()
+                >= 2,
+            "{failed:#?}"
+        );
+        assert!(
+            runner.spawned.borrow().is_empty(),
+            "materialization-failed seats must not launch"
+        );
+
+        std::fs::write(&live_goal, "changed while materialization failed\n").unwrap();
+        std::fs::write(&dormant_goal, "unwatched while materialization failed\n").unwrap();
+        let first_event = wait_for_resync_event(&live_dir)
+            .expect("the observed live seat must remain watched through materialization failure");
+        assert!(first_event.contains("binding: goal"), "{first_event}");
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&dormant_dir).is_none(),
+            "a materialization-failed seat without an observed live session must stay unwatched"
+        );
+
+        std::fs::write(&live_goal, "changed immediately before recovery\n").unwrap();
+        std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
+        std::fs::write(catalog.path().join("_templates/live.md"), "rendered\n").unwrap();
+        let recovered = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            recovered
+                .errors
+                .iter()
+                .all(|error| !error.contains("_templates/live.md")),
+            "{recovered:#?}"
+        );
+        assert!(recovered.launched.is_empty(), "{recovered:#?}");
+        let recovered_event = wait_for_resync_event_change(&live_dir, &first_event)
+            .expect("recovery must preserve the pending transition instead of silently reseeding");
+        assert!(
+            recovered_event.contains("binding: goal"),
+            "{recovered_event}"
+        );
     }
 
     fn execute_resync_plan(

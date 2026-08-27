@@ -1257,6 +1257,108 @@ fn catalog_relative_resource_uris_are_an_st2_extension_resolved_against_the_decl
 }
 
 #[test]
+fn resource_percent_paths_are_validated_consistently_across_public_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/valid-kdl/agent.kdl",
+        r#"agent "valid-kdl" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/with%20space.md" reason="Task."
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-kdl/agent.kdl",
+        r#"agent "invalid-kdl" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/a%00b" reason="Task."
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/valid-json/agent.json",
+        r#"{
+  "identity": "valid-json",
+  "host": "h",
+  "command": "true",
+  "resource": {"work": {"uri": "resources/with%20space.md", "reason": "Task."}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-json/agent.json",
+        r#"{
+  "identity": "invalid-json",
+  "host": "h",
+  "command": "true",
+  "resource": {"work": {"uri": "resources/encoded%2Fseparator", "reason": "Task."}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/valid-toml/agent.toml",
+        r#"identity = "valid-toml"
+host = "h"
+command = "true"
+[resource.work]
+uri = "resources/with%20space.md"
+reason = "Task."
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-toml/agent.toml",
+        r#"identity = "invalid-toml"
+host = "h"
+command = "true"
+[resource.work]
+uri = "resources/%FF.md"
+reason = "Task."
+"#,
+    );
+
+    let found = discover(tmp.path());
+    let identities = found
+        .specs
+        .iter()
+        .map(|spec| spec.identity.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        vec!["valid-json", "valid-kdl", "valid-toml"],
+        "{:?}",
+        found.errors
+    );
+    assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
+
+    let valid: Resource = serde_json::from_str(
+        r#"{"name":"work","uri":"resources/with%20space/%E2%82%AC.md","reason":"Task."}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        valid.uri(),
+        "resources/with%20space/%E2%82%AC.md",
+        "validation must preserve the URI identity instead of normalizing it"
+    );
+    for uri in [
+        "resources/a%00b",
+        "resources/encoded%2Fseparator",
+        "resources/encoded%5cseparator",
+        "resources/%FF.md",
+        "resources/%2e%2e/goal.md",
+    ] {
+        let descriptor = format!(r#"{{"name":"work","uri":"{uri}","reason":"Task."}}"#);
+        assert!(
+            serde_json::from_str::<Resource>(&descriptor).is_err(),
+            "{uri}"
+        );
+    }
+}
+
+#[test]
 fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
     let tmp = tempfile::tempdir().unwrap();
     write(
