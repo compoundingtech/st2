@@ -256,11 +256,21 @@ struct ResourceDescriptor {
 impl Resource {
     /// Construct a descriptor after enforcing the same invariants as catalog parsing.
     pub fn new(name: String, uri: String, reason: String) -> Result<Self, String> {
-        if name.is_empty() {
-            return Err("resource binding name cannot be empty".into());
+        if name.is_empty()
+            || name.len() > 200
+            || name.trim() != name
+            || name.chars().any(char::is_control)
+        {
+            return Err(
+                "resource binding name must be 1..=200 bytes without surrounding whitespace or controls"
+                    .into(),
+            );
         }
-        validate_absolute_uri(&uri).map_err(|reason| {
-            format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
+        if name == "declaration" {
+            return Err("resource binding name 'declaration' is reserved by resync".into());
+        }
+        validate_resource_uri(&uri).map_err(|reason| {
+            format!("resource binding '{name}' `uri` must be an exact absolute URI or a catalog-relative path: {reason}")
         })?;
         validate_resource_explanation(&name, "reason", &reason)?;
         Ok(Self {
@@ -585,6 +595,10 @@ fn validate_stream_name(identity: &str, name: &str) -> anyhow::Result<()> {
             && !name.ends_with('-'),
         "agent '{identity}' stream name '{name}' must match [a-z0-9]([a-z0-9-]*[a-z0-9])?"
     );
+    anyhow::ensure!(
+        name != "resync",
+        "agent '{identity}' stream name '{name}' is reserved for built-in resync events"
+    );
     Ok(())
 }
 
@@ -762,6 +776,87 @@ fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result
         ));
     }
     Ok(())
+}
+
+/// A resource URI is either an exact absolute URI (any scheme) or a catalog-relative path with no
+/// scheme at all, resolved by the consumer against the declaration directory. Relative carriers
+/// are an st2 extension pending canonical Agent Spec adoption (see 06-resync).
+fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
+    if let Some(colon) = uri.find(':') {
+        let first_separator = uri.find(|character| matches!(character, '/' | '\\'));
+        if first_separator.is_none_or(|separator| colon < separator) {
+            return validate_absolute_uri(uri);
+        }
+    }
+    if uri.is_empty() {
+        return Err("catalog-relative uri must be a non-empty relative path");
+    }
+    let decoded = decode_percent_path(uri)?;
+    if decoded.starts_with('/') || decoded.split('/').any(|part| part == "..") {
+        return Err(
+            "catalog-relative uri must be a relative path without parent (`..`) components",
+        );
+    }
+    Ok(())
+}
+
+/// Decode filesystem-path percent escapes without allowing an escape to change path segmentation.
+///
+/// Consumers may apply additional policy to the decoded path (for example, catalog-relative
+/// resources reject every parent component). This shared boundary rejects bytes that cannot name
+/// the same UTF-8 filesystem path the resource URI visibly denotes.
+pub fn decode_percent_path(encoded_path: &str) -> Result<String, &'static str> {
+    let bytes = encoded_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut component_start = 0;
+    let mut component_had_escape = false;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'/' {
+            if component_had_escape && decoded[component_start..] == *b".." {
+                return Err("path contains an encoded parent (`..`) component");
+            }
+            decoded.push(b'/');
+            component_start = decoded.len();
+            component_had_escape = false;
+            offset += 1;
+            continue;
+        }
+        if bytes[offset] != b'%' {
+            decoded.push(bytes[offset]);
+            offset += 1;
+            continue;
+        }
+        let Some(high) = bytes.get(offset + 1).and_then(|byte| hex_digit(*byte)) else {
+            return Err("path contains an invalid percent escape");
+        };
+        let Some(low) = bytes.get(offset + 2).and_then(|byte| hex_digit(*byte)) else {
+            return Err("path contains an invalid percent escape");
+        };
+        let byte = (high << 4) | low;
+        if matches!(byte, b'/' | b'\\') {
+            return Err("path contains an encoded separator");
+        }
+        if byte == b'\0' {
+            return Err("path decodes to NUL");
+        }
+        decoded.push(byte);
+        component_had_escape = true;
+        offset += 3;
+    }
+    if component_had_escape && decoded[component_start..] == *b".." {
+        return Err("path contains an encoded parent (`..`) component");
+    }
+    String::from_utf8(decoded).map_err(|_| "percent-decoded path is not valid UTF-8")
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
@@ -1358,6 +1453,35 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30)); // bare = seconds
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn catalog_relative_uris_share_filesystem_safe_percent_decoding() {
+        for uri in [
+            "report..md",
+            "reports/.../goal.md",
+            "reports/%2Ereport.md",
+            "reports/child..name/goal.md",
+            "reports/with%20space/%E2%82%AC.md",
+        ] {
+            assert_eq!(validate_resource_uri(uri), Ok(()), "{uri}");
+        }
+
+        for uri in [
+            "..",
+            "../goal.md",
+            "reports/../goal.md",
+            "%2e%2e/goal.md",
+            "reports/%2E%2e/goal.md",
+            "reports%2f..%2fgoal.md",
+            "reports/encoded%2Fseparator",
+            "reports/encoded%5cseparator",
+            "reports/a%00b",
+            "reports/%FF.md",
+            "reports/bad%escape",
+        ] {
+            assert!(validate_resource_uri(uri).is_err(), "{uri}");
+        }
     }
 
     #[test]

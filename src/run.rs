@@ -1307,6 +1307,7 @@ pub fn execute(
         cap,
         &mut PresentationPatchCursor::default(),
         report,
+        &mut |_| {},
     );
 }
 
@@ -1369,6 +1370,7 @@ fn execute_with_presentation_cursor(
     cap: &mut FlappingCap,
     presentation_cursor: &mut PresentationPatchCursor,
     report: &mut UpReport,
+    on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
@@ -1472,6 +1474,9 @@ fn execute_with_presentation_cursor(
                     }
                     if target.name == "agent" && !target.derived {
                         agent_available = true;
+                        // Baseline the canonical seat synchronously at the exact transition that
+                        // made it live. A later target may block while its carriers keep changing.
+                        on_canonical_live(launch.spec);
                     }
                 }
                 Err(e) => {
@@ -1607,6 +1612,39 @@ impl LivenessDebounce {
     }
 }
 
+/// Specs whose canonical agent seat this pass proved live. Desired state and whole-spec adoption
+/// are not evidence: the canonical task itself must have been observed alive or spawned successfully.
+fn live_resync_specs(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    sessions: &[Session],
+    report: &UpReport,
+) -> Vec<agent_spec::spec::AgentSpec> {
+    let live_task_ids = sessions
+        .iter()
+        .filter(|session| session.alive)
+        .map(|session| session.pty_id.as_str())
+        .chain(report.launched.iter().map(String::as_str))
+        .chain(report.restarted.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    specs
+        .iter()
+        .filter(|spec| {
+            spec.tasks.iter().any(|task| {
+                if task.name != "agent" {
+                    return false;
+                }
+                let task_id = task
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                live_task_ids.contains(task_id.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// One full reconcile pass: discover → list actual → reconcile → execute. On a `pty list` failure the
 /// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
@@ -1619,6 +1657,7 @@ fn reconcile_pass(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
+    resync: Option<&crate::resync::ResyncSupervisor>,
 ) -> UpReport {
     let _catalog_lock = {
         let span = catalog_lock_span();
@@ -1758,19 +1797,24 @@ fn reconcile_pass(
     };
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
-    let mut eligible_specs: Vec<_> = found
-        .specs
+    let mut compiled_specs = Vec::new();
+    for mut spec in found.specs.iter().cloned() {
+        if let Err(error) =
+            compile_generated_tasks(std::slice::from_mut(&mut spec), this_host, task_context)
+        {
+            report.errors.push(format!(
+                "compile generated tasks for {}: {error:#}",
+                spec.path.display()
+            ));
+            continue;
+        }
+        compiled_specs.push(spec);
+    }
+    let eligible_specs = compiled_specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
-        .collect();
-    if let Err(error) = compile_generated_tasks(&mut eligible_specs, this_host, task_context) {
-        report.skipped = true;
-        report
-            .errors
-            .push(format!("compile generated tasks (pass skipped): {error:#}"));
-        return report;
-    }
+        .collect::<Vec<_>>();
 
     let sessions = {
         let span = runtime_observe_span();
@@ -1802,11 +1846,51 @@ fn reconcile_pass(
         }
     };
     report.deferred = debounce.defer_flickers(&mut plan, now);
+    if let Some(resync) = resync {
+        for launch in &plan.launch {
+            if launch.tasks.iter().any(|task| task.name == "agent") {
+                resync.deactivate(launch.spec, this_host);
+            }
+        }
+    }
     gate_harness_launches_on_hooks(&mut plan, root, &mut report, |_| match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute_reconcile(&plan, runner, cap, presentation_cursor, &mut report);
+    if let Some(resync) = resync {
+        // Existing canonical seats from successfully compiled declarations are established by this
+        // pass's observation. Install them before executing unrelated repairs; targeted upserts
+        // preserve every retained baseline and pending transition.
+        for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
+            resync.install_live(&spec, this_host);
+        }
+    }
+    let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
+        if let Some(resync) = resync {
+            resync.install_live(spec, this_host);
+        }
+    };
+    execute_reconcile(
+        &plan,
+        runner,
+        cap,
+        presentation_cursor,
+        &mut report,
+        &mut install_new_live_seat,
+    );
+    if let Some(resync) = resync {
+        let malformed_declarations = found
+            .errors
+            .iter()
+            .map(|error| error.path.clone())
+            .collect::<Vec<_>>();
+        resync.refresh(
+            &live_resync_specs(&compiled_specs, this_host, &sessions, &report),
+            this_host,
+            &sessions,
+            &malformed_declarations,
+        );
+    }
     report
 }
 
@@ -1986,13 +2070,21 @@ fn execute_reconcile(
     cap: &mut FlappingCap,
     presentation_cursor: &mut PresentationPatchCursor,
     report: &mut UpReport,
+    on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
     let span = reconcile_execute_span();
     let before = span
         .as_ref()
         .map(|_| (report.warnings.len(), report.errors.len()));
     let _entered = span.as_ref().map(tracing::Span::enter);
-    execute_with_presentation_cursor(plan, runner, cap, presentation_cursor, report);
+    execute_with_presentation_cursor(
+        plan,
+        runner,
+        cap,
+        presentation_cursor,
+        report,
+        on_canonical_live,
+    );
     if let (Some(span), Some((warnings_before, errors_before))) = (span.as_ref(), before) {
         span.record("st2.plan.launch_count", span_count(plan.launch.len()));
         span.record("st2.plan.gc_count", span_count(plan.gc.len()));
@@ -2053,6 +2145,7 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
             &mut FlappingCap::default(),
             &mut debounce,
             &mut PresentationPatchCursor::default(),
+            None,
         );
         finish_reconcile_pass(&span, &report);
         report
@@ -2185,7 +2278,14 @@ fn reconcile_specs_with_sessions_in_span(
     match crate::reconcile(specs, sessions, this_host) {
         Ok(mut plan) => {
             report.deferred = debounce.defer_flickers(&mut plan, now);
-            execute_reconcile(&plan, runner, cap, presentation_cursor, report);
+            execute_reconcile(
+                &plan,
+                runner,
+                cap,
+                presentation_cursor,
+                report,
+                &mut |_| {},
+            );
         }
         Err(error) => report.errors.push(error.to_string()),
     }
@@ -2395,6 +2495,7 @@ where
         &mut FlappingCap::default(),
         &mut PresentationPatchCursor::default(),
         &mut report,
+        &mut |_| {},
     );
     Ok(report)
 }
@@ -2675,6 +2776,7 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
+    let resync = crate::resync::ResyncSupervisor::spawn(root.to_path_buf(), this_host.to_owned());
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
@@ -2695,6 +2797,7 @@ fn up_loop_until(
                     &mut cap,
                     &mut debounce,
                     &mut presentation_cursor,
+                    Some(&resync),
                 );
                 finish_reconcile_pass(&span, &pass);
                 pass
@@ -2808,7 +2911,6 @@ pub fn detect_host() -> String {
     "localhost".to_string()
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
     use agent_spec::spec::{
@@ -2817,7 +2919,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
 
     #[cfg(target_os = "linux")]
     fn linux_process_state(pid: i32) -> Option<char> {
@@ -2957,6 +3060,7 @@ mod tests {
                 &mut cap,
                 &mut cursor,
                 &mut UpReport::default(),
+                &mut |_| {},
             );
         }
 
@@ -3547,6 +3651,637 @@ mod tests {
             "omp",
             "typed driver identity must take precedence over argv heuristics"
         );
+    }
+
+    #[test]
+    fn resync_watch_eligibility_requires_a_proven_live_agent_seat() {
+        let spec = |identity: &str, explicit_id: Option<&str>| {
+            let mut spec = spec_fixture();
+            spec.identity = identity.to_owned();
+            spec.tasks = vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: explicit_id.map(str::to_owned),
+                command: Some("agent".into()),
+                argv: None,
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            }];
+            spec
+        };
+        let specs = vec![
+            spec("desired", None),
+            spec("dead-adopted", None),
+            spec("observed-live", None),
+            spec("launched", None),
+            spec("restarted", Some("custom-seat")),
+        ];
+        let sessions = vec![
+            sess("hetz.dead-adopted.agent", false),
+            // A live canonical seat remains eligible even when a missing companion means the
+            // whole spec was not adopted and the companion later fails to launch.
+            sess("hetz.observed-live.agent", true),
+        ];
+        let report = UpReport {
+            adopted: vec!["dead-adopted".into()],
+            launched: vec![
+                "hetz.launched.agent".into(),
+                // A successfully launched companion is not evidence of a live agent seat.
+                "hetz.desired.ding".into(),
+            ],
+            restarted: vec!["custom-seat".into()],
+            ..UpReport::default()
+        };
+
+        let eligible = live_resync_specs(&specs, "hetz", &sessions, &report)
+            .into_iter()
+            .map(|spec| spec.identity)
+            .collect::<Vec<_>>();
+        assert_eq!(eligible, vec!["observed-live", "launched", "restarted"]);
+    }
+
+    struct BlockingLaunchRunner {
+        sessions: RefCell<Vec<Session>>,
+        fail_id: Option<String>,
+        block_id: String,
+        entered: mpsc::SyncSender<()>,
+        release: RefCell<mpsc::Receiver<()>>,
+    }
+
+    impl Runner for BlockingLaunchRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.borrow().clone())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            if self.fail_id.as_deref() == Some(&target.pty_id) {
+                anyhow::bail!("simulated launch failure");
+            }
+            if target.pty_id == self.block_id {
+                self.entered.send(()).unwrap();
+                self.release.borrow_mut().recv().unwrap();
+            }
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_resync_agent(catalog: &Path, identity: &str) -> (PathBuf, PathBuf) {
+        let agent_dir = catalog.join("agents/hetz").join(identity);
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(
+                r#"agent "{identity}" {{
+  host "hetz"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}}"#
+            ),
+        )
+        .unwrap();
+        let goal = resources.join("goal.md");
+        std::fs::write(&goal, "before\n").unwrap();
+        (agent_dir, goal)
+    }
+
+    fn current_resync_event(agent_dir: &Path) -> Option<String> {
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|body| body.lines().any(|line| line == "stream: resync"))
+    }
+
+    fn wait_for_resync_event(agent_dir: &Path) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event(agent_dir) {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_resync_event_change(agent_dir: &Path, prior: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event(agent_dir)
+                && body != prior
+            {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (live_dir, live_goal) = write_resync_agent(catalog.path(), "live");
+        let broken_dir = catalog.path().join("agents/hetz/broken");
+        let broken_resources = broken_dir.join("resources");
+        std::fs::create_dir_all(&broken_resources).unwrap();
+        std::fs::create_dir_all(catalog.path().join("broken-workspace")).unwrap();
+        let broken_declaration = broken_dir.join("agent.kdl");
+        std::fs::write(
+            &broken_declaration,
+            r#"agent "broken" {
+  host "hetz"
+  deliver "mcp"
+  workspace "$CATALOG/broken-workspace"
+  exec "agent" { command "true" }
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let broken_goal = broken_resources.join("goal.md");
+        std::fs::write(&broken_goal, "before\n").unwrap();
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![
+                sess("hetz.live", true),
+                sess("hetz.broken.agent", true),
+            ]),
+            ..SpawnCountingRunner::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let first = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            first.errors.iter().any(|error| {
+                error.contains("compile generated tasks")
+                    && error.contains("non-PTY canonical task")
+            }),
+            "{first:#?}"
+        );
+        assert!(!first.skipped, "the valid subset completed its pass");
+        assert!(
+            runner.spawned.borrow().is_empty(),
+            "the compile-invalid seat must not launch"
+        );
+
+        std::fs::write(&live_goal, "changed while compile failed\n").unwrap();
+        let first_event = wait_for_resync_event(&live_dir)
+            .expect("the already-live valid seat must stay watched across the compile error");
+        assert!(first_event.contains("binding: goal"), "{first_event}");
+
+        std::fs::write(&broken_goal, "invalid seat changed\n").unwrap();
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&broken_dir).is_none(),
+            "a compile-invalid seat must not be watched even when its canonical task is live"
+        );
+
+        std::fs::write(&live_goal, "changed while declaration is corrected\n").unwrap();
+        std::fs::write(
+            &broken_declaration,
+            r#"agent "broken" {
+  host "hetz"
+  deliver "mcp"
+  workspace "$CATALOG/broken-workspace"
+  pty "agent" { command "true" }
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let corrected = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            corrected
+                .errors
+                .iter()
+                .all(|error| !error.contains("compile generated tasks")),
+            "{corrected:#?}"
+        );
+        assert!(corrected.launched.is_empty(), "{corrected:#?}");
+        assert!(
+            corrected.adopted.iter().any(|identity| identity == "broken"),
+            "the corrected already-live seat should be adopted: {corrected:#?}"
+        );
+        let corrected_event = wait_for_resync_event_change(&live_dir, &first_event)
+            .expect("correcting another declaration must not reseed and hide the live transition");
+        assert!(corrected_event.contains("binding: goal"), "{corrected_event}");
+    }
+
+    #[test]
+    fn materialization_failure_retains_only_the_observed_live_resync_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let write_broken_agent = |identity: &str| {
+            let (agent_dir, goal) = write_resync_agent(catalog.path(), identity);
+            let workspace = catalog.path().join(format!("{identity}-workspace"));
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(
+                agent_dir.join("agent.kdl"),
+                format!(
+                    r#"agent "{identity}" {{
+  host "hetz"
+  workspace "{}"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+  render {{
+    copy "_templates/{identity}.md" "AGENTS.md"
+  }}
+}}"#,
+                    workspace.display()
+                ),
+            )
+            .unwrap();
+            (agent_dir, goal)
+        };
+        let (live_dir, live_goal) = write_broken_agent("live");
+        let (dormant_dir, dormant_goal) = write_broken_agent("dormant");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![sess("hetz.live", true)]),
+            ..SpawnCountingRunner::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let failed = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            failed
+                .errors
+                .iter()
+                .filter(|error| error.contains("copy source"))
+                .count()
+                >= 2,
+            "{failed:#?}"
+        );
+        assert!(
+            runner.spawned.borrow().is_empty(),
+            "materialization-failed seats must not launch"
+        );
+
+        std::fs::write(&live_goal, "changed while materialization failed\n").unwrap();
+        std::fs::write(&dormant_goal, "unwatched while materialization failed\n").unwrap();
+        let first_event = wait_for_resync_event(&live_dir)
+            .expect("the observed live seat must remain watched through materialization failure");
+        assert!(first_event.contains("binding: goal"), "{first_event}");
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&dormant_dir).is_none(),
+            "a materialization-failed seat without an observed live session must stay unwatched"
+        );
+
+        std::fs::write(&live_goal, "changed immediately before recovery\n").unwrap();
+        std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
+        std::fs::write(catalog.path().join("_templates/live.md"), "rendered\n").unwrap();
+        let recovered = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            recovered
+                .errors
+                .iter()
+                .all(|error| !error.contains("_templates/live.md")),
+            "{recovered:#?}"
+        );
+        assert!(recovered.launched.is_empty(), "{recovered:#?}");
+        let recovered_event = wait_for_resync_event_change(&live_dir, &first_event)
+            .expect("recovery must preserve the pending transition instead of silently reseeding");
+        assert!(
+            recovered_event.contains("binding: goal"),
+            "{recovered_event}"
+        );
+    }
+
+    fn execute_resync_plan(
+        plan: &ReconcilePlan<'_>,
+        runner: &dyn Runner,
+        specs: &[AgentSpec],
+        resync: &crate::resync::ResyncSupervisor,
+    ) -> UpReport {
+        let mut report = UpReport::default();
+        let mut install_count = 0;
+        execute_with_presentation_cursor(
+            plan,
+            runner,
+            &mut FlappingCap::default(),
+            &mut PresentationPatchCursor::default(),
+            &mut report,
+            &mut |spec| {
+                install_count += 1;
+                resync.install_live(spec, "hetz");
+            },
+        );
+        resync.refresh(
+            &live_resync_specs(specs, "hetz", &[], &report),
+            "hetz",
+            &[],
+            &[],
+        );
+        assert!(install_count > 0 || report.launched.is_empty());
+        report
+    }
+
+    #[test]
+    fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
+        write_resync_agent(catalog.path(), "second");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
+        let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
+        let plan = ReconcilePlan {
+            launch: vec![
+                Launch {
+                    spec: first,
+                    tasks: vec![target("hetz.first.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+                Launch {
+                    spec: second,
+                    tasks: vec![target("hetz.second.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+            ],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: None,
+            block_id: "hetz.second.agent".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&first_goal, "changed while second launches\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(
+                report.launched,
+                ["hetz.first.agent", "hetz.second.agent"]
+            );
+        });
+
+        let event = wait_for_resync_event(&first_dir)
+            .expect("the first seat must observe a carrier transition during the later launch");
+        assert!(event.contains("binding: goal"), "{event}");
+    }
+
+    #[test]
+    fn resync_launch_boundary_excludes_failed_canonical_seat() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
+        write_resync_agent(catalog.path(), "second");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
+        let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
+        let plan = ReconcilePlan {
+            launch: vec![
+                Launch {
+                    spec: first,
+                    tasks: vec![target("hetz.first.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+                Launch {
+                    spec: second,
+                    tasks: vec![target("hetz.second.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+            ],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: Some("hetz.first.agent".to_owned()),
+            block_id: "hetz.second.agent".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&first_goal, "changed after failed launch\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(report.launched, ["hetz.second.agent"]);
+            assert!(report.errors.iter().any(|error| {
+                error.contains("hetz.first.agent") && error.contains("simulated launch failure")
+            }));
+        });
+
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&first_dir).is_none(),
+            "desired-but-failed canonical seats must remain unwatched"
+        );
+    }
+
+    #[test]
+    fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(vec![sess("hetz.worker", true)]),
+            fail_id: None,
+            block_id: "hetz.worker".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(Duration::ZERO);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let seeded = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(seeded.adopted.iter().any(|identity| identity == "worker"));
+        *runner.sessions.borrow_mut() = vec![sess("hetz.worker", false)];
+        let blocked_goal = goal.clone();
+
+        let relaunched = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&blocked_goal, "changed while replacement launch blocks\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            reconcile_pass(
+                catalog.path(),
+                "hetz",
+                &task_context,
+                &runner,
+                &mut cap,
+                &mut debounce,
+                &mut presentation_cursor,
+                Some(&resync),
+            )
+        });
+        assert_eq!(relaunched.restarted, ["hetz.worker"]);
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&agent_dir).is_none(),
+            "a carrier mutation while no canonical seat is live must not emit"
+        );
+
+        std::fs::write(&goal, "changed after replacement launch\n").unwrap();
+        let event = wait_for_resync_event(&agent_dir)
+            .expect("the successful replacement must receive a fresh silent baseline");
+        assert!(event.contains("binding: goal"), "{event}");
+    }
+
+    #[test]
+    fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let spec = &specs[0];
+        let mut derived = target("hetz.worker.ding", "ding");
+        derived.name = "ding".into();
+        derived.derived = true;
+        let plan = ReconcilePlan {
+            launch: vec![Launch {
+                spec,
+                tasks: vec![target("hetz.worker.agent", "agent"), derived],
+                live_derived: Vec::new(),
+            }],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: None,
+            block_id: "hetz.worker.ding".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let installs = AtomicUsize::new(0);
+        let mut report = UpReport::default();
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&goal, "changed while companion launches\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            execute_with_presentation_cursor(
+                &plan,
+                &runner,
+                &mut FlappingCap::default(),
+                &mut PresentationPatchCursor::default(),
+                &mut report,
+                &mut |spec| {
+                    installs.fetch_add(1, AtomicOrdering::SeqCst);
+                    resync.install_live(spec, "hetz");
+                },
+            );
+        });
+        resync.refresh(
+            &live_resync_specs(&specs, "hetz", &[], &report),
+            "hetz",
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            installs.load(AtomicOrdering::SeqCst),
+            1,
+            "only the canonical task transition may install its watch set"
+        );
+        let event = wait_for_resync_event(&agent_dir)
+            .expect("the companion launch and final refresh must preserve the canonical baseline");
+        assert!(event.contains("binding: goal"), "{event}");
     }
 
     #[test]

@@ -1135,6 +1135,30 @@ fn resource_explanation_byte_bounds_are_enforced() {
 }
 
 #[test]
+fn resource_binding_names_and_scheme_candidates_fail_loudly() {
+    for name in [
+        " declaration".to_owned(),
+        "declaration".to_owned(),
+        "line\nbreak".to_owned(),
+        "x".repeat(201),
+    ] {
+        assert!(
+            Resource::new(name.clone(), "issue://one".into(), "Task.".into()).is_err(),
+            "invalid binding name was accepted: {name:?}"
+        );
+    }
+    assert!(
+        Resource::new(
+            "work".into(),
+            "_github://org/repo".into(),
+            "Task.".into(),
+        )
+        .is_err(),
+        "a malformed scheme prefix must not become a catalog-relative path"
+    );
+}
+
+#[test]
 fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types() {
     let tmp = tempfile::tempdir().unwrap();
     for (identity, resource) in [
@@ -1148,10 +1172,6 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
             r#"resource "work" _tag="issue" uri="issue://example/1" reason="Task.""#,
         ),
         ("missing-uri", r#"resource "work" reason="Task.""#),
-        (
-            "relative-uri",
-            r#"resource "work" uri="./issue/1" reason="Task.""#,
-        ),
         (
             "policy",
             r#"resource "work" uri="issue://example/1" reason="Task." required=#true"#,
@@ -1170,7 +1190,7 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
 
     let found = discover(tmp.path());
     assert!(found.specs.is_empty(), "{:?}", found.specs);
-    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    assert_eq!(found.errors.len(), 5, "{:?}", found.errors);
     let errors = found
         .errors
         .iter()
@@ -1189,12 +1209,6 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("needs string `uri`"))
-    );
-    assert!(errors.iter().any(|error| error.contains("absolute URI")));
-    assert!(
-        errors
-            .iter()
             .any(|error| error.contains("unsupported property `required`"))
     );
     assert!(
@@ -1202,6 +1216,146 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
             .iter()
             .any(|error| error.contains("cannot have children"))
     );
+}
+
+#[test]
+fn catalog_relative_resource_uris_are_an_st2_extension_resolved_against_the_declaration_dir() {
+    // Catalog-relative carrier paths are an st2 extension pending canonical Agent Spec adoption
+    // (see docs/vrs/06-resync): accepted here, resolved by the consumer against the declaration
+    // directory.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/relative/agent.kdl",
+        r#"agent "relative" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/goal.md" reason="Task."
+}"#,
+    );
+    let found = discover(tmp.path());
+    assert!(
+        found.specs.iter().any(|spec| spec.identity == "relative"
+            && spec
+                .resources
+                .iter()
+                .any(|r| r.uri() == "resources/goal.md")),
+        "{:?}",
+        found.errors
+    );
+    let descriptor: Resource =
+        serde_json::from_str(r#"{"name":"work","uri":"resources/goal.md","reason":"Task."}"#)
+            .expect("catalog-relative uri is valid");
+    assert_eq!(descriptor.uri(), "resources/goal.md");
+
+    let absolute = Resource::new(
+        "work".into(),
+        "/etc/absolute".into(),
+        "Still refused.".into(),
+    );
+    assert!(absolute.is_err(), "absolute paths must keep a scheme");
+}
+
+#[test]
+fn resource_percent_paths_are_validated_consistently_across_public_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/valid-kdl/agent.kdl",
+        r#"agent "valid-kdl" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/with%20space.md" reason="Task."
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-kdl/agent.kdl",
+        r#"agent "invalid-kdl" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/a%00b" reason="Task."
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/valid-json/agent.json",
+        r#"{
+  "identity": "valid-json",
+  "host": "h",
+  "command": "true",
+  "resource": {"work": {"uri": "resources/with%20space.md", "reason": "Task."}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-json/agent.json",
+        r#"{
+  "identity": "invalid-json",
+  "host": "h",
+  "command": "true",
+  "resource": {"work": {"uri": "resources/encoded%2Fseparator", "reason": "Task."}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/valid-toml/agent.toml",
+        r#"identity = "valid-toml"
+host = "h"
+command = "true"
+[resource.work]
+uri = "resources/with%20space.md"
+reason = "Task."
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-toml/agent.toml",
+        r#"identity = "invalid-toml"
+host = "h"
+command = "true"
+[resource.work]
+uri = "resources/%FF.md"
+reason = "Task."
+"#,
+    );
+
+    let found = discover(tmp.path());
+    let identities = found
+        .specs
+        .iter()
+        .map(|spec| spec.identity.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        vec!["valid-json", "valid-kdl", "valid-toml"],
+        "{:?}",
+        found.errors
+    );
+    assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
+
+    let valid: Resource = serde_json::from_str(
+        r#"{"name":"work","uri":"resources/with%20space/%E2%82%AC.md","reason":"Task."}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        valid.uri(),
+        "resources/with%20space/%E2%82%AC.md",
+        "validation must preserve the URI identity instead of normalizing it"
+    );
+    for uri in [
+        "resources/a%00b",
+        "resources/encoded%2Fseparator",
+        "resources/encoded%5cseparator",
+        "resources/%FF.md",
+        "resources/%2e%2e/goal.md",
+    ] {
+        let descriptor = format!(r#"{{"name":"work","uri":"{uri}","reason":"Task."}}"#);
+        assert!(
+            serde_json::from_str::<Resource>(&descriptor).is_err(),
+            "{uri}"
+        );
+    }
 }
 
 #[test]
@@ -1233,7 +1387,7 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
 fn public_resource_json_deserialization_enforces_the_catalog_invariants() {
     for descriptor in [
         r#"{"name":"","uri":"issue://one","reason":"Task."}"#,
-        r#"{"name":"work","uri":"./relative","reason":"Task."}"#,
+        r#"{"name":"work","uri":"/etc/absolute","reason":"Task."}"#,
         r#"{"name":"work","uri":"issue://one","reason":"Task.","_tag":"issue"}"#,
         r#"{"name":"work","uri":"issue://one","reason":"Task.","required":true}"#,
     ] {
