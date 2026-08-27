@@ -1301,6 +1301,22 @@ mod tests {
         );
     }
 
+    /// Block until `ready` holds, reporting whether it did. The ceiling bounds a DING loop that
+    /// made no progress at all; it is not the behaviour under test, so it is far larger than any
+    /// plausible scheduling delay and a loaded host cannot turn it into a failure. Callers report
+    /// the result after their scope ends rather than panicking inside it, because an unwind from a
+    /// scoped thread leaves `run_ding` without the `stop` flag that ends it.
+    fn await_ding_progress(ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
     #[derive(Default)]
     struct RecordingPoker {
         alive: AtomicBool,
@@ -3690,16 +3706,18 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             status_refresh: Duration::from_secs(60),
         };
 
+        // Two separate barriers, each with its own generous budget. Sharing one 3s deadline
+        // across both meant the first wait could spend it: the loop then stopped after a single
+        // poke and the count assertion failed while naming neither barrier. The ceiling bounds a
+        // loop that never ran at all, so a loaded host cannot turn it into a failure — and `stop`
+        // is set on every path, because panicking here would leave `run_ding` looping forever.
+        let mut polled = false;
+        let mut poked_twice = false;
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while poker.probes.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
+                polled = await_ding_progress(|| poker.probes.load(Ordering::SeqCst) > 0);
                 send_to_inbox(&inbox, "new", Some("post-start"), None, &[], "new").unwrap();
-                while poker.calls.lock().unwrap().len() < 2 && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
+                poked_twice = await_ding_progress(|| poker.calls.lock().unwrap().len() >= 2);
                 stop.store(true, Ordering::SeqCst);
             });
 
@@ -3718,6 +3736,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .unwrap();
         });
 
+        assert!(polled, "the ding loop never reached its first poll");
+        assert!(poked_twice, "the ding loop never delivered both notices");
         let calls = poker.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], RECOVERY_POKE);
