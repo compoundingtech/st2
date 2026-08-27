@@ -253,9 +253,71 @@ pub(crate) fn resolve_profile_module(
         !relative.as_os_str().is_empty(),
         "catalog-relative profile module names the catalog root: {declared}"
     );
+    validate_catalog_relative_profile_module_path(relative)
+        .with_context(|| format!("profile module path is reserved: {declared}"))?;
     Ok(ResolvedProfileModule::CatalogRelative(
         relative.to_path_buf(),
     ))
+}
+
+pub(crate) fn validate_catalog_relative_profile_module_path(relative: &Path) -> anyhow::Result<()> {
+    let components = relative
+        .components()
+        .map(|component| {
+            let Component::Normal(name) = component else {
+                anyhow::bail!("profile module path contains an unsafe component")
+            };
+            name.to_str()
+                .context("catalog-relative profile module path is not UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let first = components
+        .first()
+        .copied()
+        .context("catalog-relative profile module path is empty")?;
+    let reserved_control = components
+        .iter()
+        .any(|name| matches!(*name, ".git" | ".st2"));
+    let reserved_root = matches!(
+        first,
+        "pty"
+            | "workspace"
+            | "workspaces"
+            | ".workspace"
+            | "resources"
+            | "archive"
+            | "inbox"
+            | "status"
+    );
+    let reserved_agent_state = first == "agents"
+        && components.get(3).is_some_and(|name| {
+            matches!(
+                *name,
+                ".workspace" | "resources" | "archive" | "inbox" | "status"
+            ) || name.starts_with(".status.tmp-")
+        });
+    let reserved_template_subtree = first == "_templates"
+        && components.iter().skip(1).any(|name| {
+            matches!(
+                *name,
+                ".git"
+                    | ".st2"
+                    | "pty"
+                    | "workspace"
+                    | "workspaces"
+                    | ".workspace"
+                    | "resources"
+                    | "archive"
+                    | "inbox"
+                    | "status"
+            ) || name.starts_with(".status.tmp-")
+        });
+    anyhow::ensure!(
+        !(reserved_control || reserved_root || reserved_agent_state || reserved_template_subtree),
+        "catalog-relative profile module targets a reserved control/state path: {}",
+        relative.display()
+    );
+    Ok(())
 }
 
 fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
