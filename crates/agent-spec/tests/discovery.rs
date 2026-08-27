@@ -1793,7 +1793,7 @@ fn non_spec_files_are_skipped_silently() {
 }
 
 #[test]
-fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
+fn adjacent_and_nested_bundle_kdl_are_outside_strict_agent_admission() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -1804,6 +1804,11 @@ fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
         tmp.path(),
         "agents/hetz/x/agent.kdl",
         r#"agent "x" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/x/docs/agent.kdl",
+        r#"note "static payload despite the generic filename""#,
     );
 
     let found = discover(tmp.path());

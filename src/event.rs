@@ -158,6 +158,16 @@ impl StreamOwnerBinding {
 
 pub(crate) fn publish_owner_binding(root: &Path, host: &str) -> anyhow::Result<()> {
     let lock = crate::catalog_lock::CatalogLock::shared(root)?;
+    publish_owner_binding_under_lock(root, host, &lock)
+}
+
+/// Publish against a caller-held catalog read fence so related declaration reads and this
+/// incarnation binding observe one catalog generation.
+pub(crate) fn publish_owner_binding_under_lock(
+    root: &Path,
+    host: &str,
+    lock: &crate::catalog_lock::CatalogLock,
+) -> anyhow::Result<()> {
     let metadata = lock.control().metadata()?;
     let binding = StreamOwnerBinding {
         schema: "st2.stream-owner.v1".to_owned(),

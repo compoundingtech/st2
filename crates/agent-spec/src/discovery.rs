@@ -206,10 +206,11 @@ fn is_declaration_parent(catalog_root: &Path, dir: &Path) -> bool {
     })
 }
 
-/// Recursively gather candidate spec files, skipping only explicit control/runtime namespaces and
-/// anything that isn't one of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble
-/// an agent spec; it is runner state, never catalog input. Unreadable directories are skipped, not
-/// fatal in ordinary discovery. Strict discovery records them as uncertainty.
+/// Recursively gather candidate spec files, skipping explicit control/runtime namespaces, static
+/// descendants beneath a canonical `agents/<host>/<identity>` bundle, and anything that isn't one
+/// of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble an agent spec; it is
+/// runner state, never catalog input. Unreadable directories are skipped, not fatal in ordinary
+/// discovery. Strict discovery records them as uncertainty.
 fn collect_spec_files(
     root: &Path,
     dir: &Path,
@@ -246,6 +247,9 @@ fn collect_spec_files(
         if !is_catalog_path(root, &path) {
             continue;
         }
+        if is_canonical_bundle_descendant(root, &path) {
+            continue;
+        }
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(error) => {
@@ -269,6 +273,20 @@ fn collect_spec_files(
             });
         }
     }
+}
+
+/// Files below the canonical agent bundle root are resource/static payload, even when a nested
+/// payload happens to use a generic declaration filename such as `docs/agent.kdl`.
+fn is_canonical_bundle_descendant(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = relative.components().filter_map(|component| match component {
+        Component::Normal(name) => Some(name),
+        _ => None,
+    });
+    components.next().and_then(|name| name.to_str()) == Some("agents")
+        && components.count() >= 4
 }
 
 fn has_spec_extension(path: &Path) -> bool {
