@@ -219,7 +219,8 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         serde_json::json!([{
             "name": "work",
             "uri": "issue://example/live",
-            "reason": "example work item"
+            "reason": "example work item",
+            "resync": "unsupported"
         }])
     );
     assert_eq!(rows[1]["identity"], "h.retired");
