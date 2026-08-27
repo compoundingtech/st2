@@ -112,8 +112,8 @@ The scoped clippy check passes with warnings denied.
 
 The formatting check, diff check, and receipt JSON checks pass.
 
-The full workspace check passes except for three PTY survival tests.
+The full workspace check passes with PTY `0.12.0+500eab2`.
 
-The host has PTY `0.12.0+face607`. It lacks the metadata patch behavior required by those tests.
+This PTY version includes the metadata patch behavior required by the survival tests.
 
 Nix is unavailable on this host, so `nix flake check` did not run.
