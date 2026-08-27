@@ -209,6 +209,11 @@ fn output_with_input_timeout(
 /// that pid is also its process group id — the group this function signals on every failure path.
 /// Tests need it to assert the child was reaped, and the child cannot supply it: a test whose
 /// deadline expires before the child is first scheduled would never see anything the child wrote.
+///
+/// It runs BEFORE the child deadline starts, and tests rely on that: a lifecycle test blocks in
+/// `on_spawn` until the fixture reached the state it wants to measure, so fork+exec scheduling is
+/// paid outside the deadline instead of out of it. See
+/// `tests::the_spawn_observer_runs_before_the_child_deadline_starts`.
 fn output_with_input_timeout_observed(
     command: &mut Command,
     timeout: Duration,
@@ -261,6 +266,9 @@ fn run_captured(
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
     on_spawn(pid);
+    // Load-bearing order: the deadline starts after `on_spawn` returns, so a test that blocks there
+    // as a readiness barrier spends none of `timeout` on fork+exec. Moving this line above
+    // `on_spawn` is silent in production and makes every barrier test load-sensitive again.
     let deadline = Instant::now() + timeout;
     if let Some(input) = input {
         let Some(stdin) = child.stdin.take() else {
@@ -2821,6 +2829,31 @@ mod tests {
             .next()
     }
 
+    /// Block until the fixture publishes `marker`, which its script creates by an atomic rename so
+    /// the barrier never observes a half-written file. Called from `on_spawn`, which runs before
+    /// [`run_captured`] starts the child deadline: fork+exec scheduling is therefore paid here and
+    /// not out of the deadline the test then measures. The ceiling is deliberately far larger than
+    /// any plausible fork+exec — it bounds a fixture that never ran at all, and is not itself the
+    /// behaviour under test, so a loaded host cannot turn it into a failure.
+    fn await_fixture_ready(pid: i32, marker: &Path, what: &str) {
+        const CEILING: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + CEILING;
+        while !marker.exists() {
+            if Instant::now() >= deadline {
+                // Do not leak the fixture's long sleeper into the test host on the way out.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                panic!(
+                    "{what} within {CEILING:?}: {} never appeared",
+                    marker.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn process_can_retain_cleanup_resources(pid: i32) -> bool {
         #[cfg(target_os = "linux")]
         if linux_process_state(pid) == Some('Z') {
@@ -3855,19 +3888,29 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("close-stdin");
-        std::fs::write(&executable, "#!/bin/sh\nexec 0<&-\nsleep 60\n").unwrap();
+        let stdin_closed = temporary.path().join("stdin-closed");
+        // The script signals only AFTER closing its stdin, so the barrier below returns exactly when
+        // the read end is gone and the parent's very next write must fail with EPIPE.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nexec 0<&-\n: > \"$READY.tmp\"\nmv \"$READY.tmp\" \"$READY\"\nsleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
-        // The pid comes from the parent at spawn. Reading it from a file the child writes made the
-        // case depend on the child being scheduled inside the deadline: miss that and the read
-        // panics with `NotFound` before either assertion runs, naming neither the pipe nor the
-        // deadline. The `on_spawn` seam removes the dependency rather than widening the window.
+        // The pid comes from the parent at spawn, and the barrier makes the deadline measure only
+        // the behaviour under test. Without it the 1s budget also had to cover fork+exec of the
+        // shell, so a loaded host reported `timed out after 1.0s` instead of `Broken pipe` — the
+        // fixture's scheduling consumed the deadline the assertion is about.
         let mut spawned = None;
         let error = output_with_input_timeout_observed(
-            &mut Command::new(&executable),
+            Command::new(&executable).env("READY", &stdin_closed),
             Duration::from_secs(1),
             Some(input),
-            |pid| spawned = Some(pid),
+            |pid| {
+                spawned = Some(pid);
+                await_fixture_ready(pid, &stdin_closed, "the child never closed its stdin");
+            },
         )
         .unwrap_err();
         let pid = spawned.expect("the child was spawned before the input write failed");
@@ -3896,16 +3939,29 @@ mod tests {
         let descendant_pidfile = temporary.path().join("descendant.pid");
         // The descendant inherits stdout/stderr and outlives the direct child, which is exactly the
         // shape the docstring describes. `child.kill()` cannot reach it; only the group signal can.
+        // It publishes its pid by atomic rename, so the barrier never reads a truncated file.
         std::fs::write(
             &executable,
-            "#!/bin/sh\nsh -c 'printf \"%s\" \"$$\" > \"$DESCENDANT_PIDFILE\"; sleep 60' &\nsleep 60\n",
+            "#!/bin/sh\nsh -c 'printf \"%s\" \"$$\" > \"$DESCENDANT_PIDFILE.tmp\"; mv \"$DESCENDANT_PIDFILE.tmp\" \"$DESCENDANT_PIDFILE\"; sleep 60' &\nsleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = output_with_timeout(
+        // This test *requires* the child to have run — a descendant it never forked is nothing to
+        // reap. Waiting for the pidfile inside `on_spawn` makes that a barrier instead of a race:
+        // the deadline then only has to outlast a `sleep`, never a fork+exec, so a loaded host can
+        // no longer end the run before the fixture has built the thing under test.
+        let error = output_with_input_timeout_observed(
             Command::new(&executable).env("DESCENDANT_PIDFILE", &descendant_pidfile),
-            Duration::from_secs(2),
+            Duration::from_millis(500),
+            None,
+            |pid| {
+                await_fixture_ready(
+                    pid,
+                    &descendant_pidfile,
+                    "the child never forked a descendant, so this case would test nothing",
+                )
+            },
         )
         .unwrap_err();
         assert!(
@@ -3913,16 +3969,15 @@ mod tests {
             "unexpected error: {error:#}"
         );
 
-        // Unlike the deadline case, this test *requires* the child to have run — a descendant it
-        // never forked is nothing to reap — so reading the pid it recorded is sound here. Two
-        // seconds against a fork+exec is a wide margin, and the failure is named rather than a bare
-        // `NotFound`.
         let descendant = std::fs::read_to_string(&descendant_pidfile)
-            .expect("the child never forked a descendant, so this case tested nothing")
+            .expect("the readiness barrier returned without a pidfile")
             .parse::<i32>()
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // Generous on purpose: the descendant is orphaned by the same group kill, so its exit is
+        // observable only once the reparenting init reaps it. That latency is not the behaviour
+        // under test, and waiting longer costs nothing when the kill did reach it.
+        let deadline = Instant::now() + Duration::from_secs(5);
         while process_can_retain_cleanup_resources(descendant) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3975,21 +4030,23 @@ mod tests {
         std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
-        let started = Instant::now();
-        // The pid comes from the parent at spawn, not from the child. This case is precisely the one
-        // where the child may never be scheduled: the write blocks as soon as the pipe buffer fills,
-        // which needs no execution by the child at all, and the deadline then terminates the whole
-        // group. Anything the child was supposed to record would never be written, so a test that
-        // waits for it fails on exactly the condition it exists to cover.
+        // The pid comes from the parent at spawn, not from the child, and this case cannot use a
+        // readiness barrier: it is precisely the one where the child may never be scheduled. The
+        // write blocks as soon as the pipe buffer fills, which needs no execution by the child at
+        // all, and the deadline then terminates the whole group. Anything the child was supposed to
+        // record would never be written, so a test that waits for it fails on exactly the condition
+        // it exists to cover. The observed spawn instant is therefore also the clock: timing from
+        // before the call would charge fork+exec to the 1s budget this assertion polices.
         let mut spawned = None;
         let error = output_with_input_timeout_observed(
             &mut Command::new(&executable),
             Duration::from_millis(100),
             Some(input),
-            |pid| spawned = Some(pid),
+            |pid| spawned = Some((pid, Instant::now())),
         )
         .unwrap_err();
-        let pid = spawned.expect("the child was spawned before the input deadline expired");
+        let (pid, started) =
+            spawned.expect("the child was spawned before the input deadline expired");
 
         assert!(
             format!("{error:#}").contains("timed out"),
@@ -4004,6 +4061,46 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!crate::host_lock::process_alive(pid));
+    }
+
+    /// The two lifecycle tests above block in `on_spawn` until their fixture reached the state under
+    /// test, which only keeps them load-insensitive because [`run_captured`] starts the child
+    /// deadline AFTER `on_spawn` returns. Nothing else proves that order: reversing it leaves every
+    /// other test green on an idle host and silently puts both back on a race with the scheduler.
+    #[test]
+    fn the_spawn_observer_runs_before_the_child_deadline_starts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("close-stdin");
+        let stdin_closed = temporary.path().join("stdin-closed");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nexec 0<&-\n: > \"$READY.tmp\"\nmv \"$READY.tmp\" \"$READY\"\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let timeout = Duration::from_millis(200);
+
+        // The barrier deliberately outlasts `timeout`, so the outcome depends on the order alone and
+        // on nothing the host's scheduler does. Deadline after `on_spawn`: the write meets a closed
+        // read end and fails with EPIPE at once. Deadline before `on_spawn`: it has already expired
+        // when the barrier returns, so the write never runs and the call reports a timeout instead.
+        let error = output_with_input_timeout_observed(
+            Command::new(&executable).env("READY", &stdin_closed),
+            timeout,
+            Some(vec![b'x'; 1024]),
+            |pid| {
+                await_fixture_ready(pid, &stdin_closed, "the child never closed its stdin");
+                std::thread::sleep(timeout * 2);
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Broken pipe"),
+            "the child deadline started before `on_spawn` returned: {error:#}"
+        );
     }
 
     #[test]
