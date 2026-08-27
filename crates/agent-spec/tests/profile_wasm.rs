@@ -10,7 +10,8 @@
 
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
 use agent_spec::profile_wasm::{
-    DEFAULT_MODULE_LIMIT_BYTES, DEFAULT_TABLE_ELEMENT_LIMIT, WasmResolveError, WasmResolver,
+    DEFAULT_MODULE_LIMIT_BYTES, DEFAULT_OUTPUT_LIMIT_BYTES, DEFAULT_TABLE_ELEMENT_LIMIT,
+    WasmResolveError, WasmResolver,
 };
 use std::path::{Path, PathBuf};
 use wasmtime::Trap;
@@ -294,6 +295,26 @@ fn garbage_return_payload_is_reported_not_crashed_on() {
 }
 
 #[test]
+fn oversized_valid_return_range_is_rejected_before_decoding() {
+    let oversized = WasmResolver::from_wat(
+        r#"(module
+  (memory (export "memory") 2)
+  (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "resolve") (param i32 i32 i32 i32) (result i64)
+    (i64.extend_i32_u (i32.const 65537)))
+)"#,
+    )
+    .expect("oversized-return module compiles");
+    match oversized.resolve_once("dev.schickling.agent-goal://x", "/a") {
+        Err(WasmResolveError::BadReturn(error)) => {
+            assert!(error.contains("limit"), "got: {error}");
+            assert!(error.contains(&(DEFAULT_OUTPUT_LIMIT_BYTES + 1).to_string()));
+        }
+        other => panic!("expected output-limit rejection, got {other:?}"),
+    }
+}
+
+#[test]
 fn wild_return_pointer_is_caught_before_memory_access() {
     let wild = WasmResolver::from_wat(&format!(
         r#"{HOSTILE_PRELUDE}
@@ -388,6 +409,34 @@ fn oversized_module_is_rejected_before_wasmtime_compilation() {
         Ok(_) => panic!("oversized module unexpectedly compiled"),
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn catalog_relative_module_rejects_symlinked_path_ancestors() {
+    let catalog = tempfile::tempdir().expect("catalog directory");
+    let outside = tempfile::tempdir().expect("outside directory");
+    std::fs::copy(DEMO_WASM_PATH, outside.path().join("demo.wasm"))
+        .expect("outside module is copied");
+    std::os::unix::fs::symlink(outside.path(), catalog.path().join("resolvers"))
+        .expect("resolver ancestor symlink is created");
+    let registry = ResourceProfileRegistry::empty().with_profile(
+        ResourceProfile::wasm_contained(
+            "dev.schickling.agent-goal",
+            catalog.path(),
+            "resolvers/demo.wasm",
+            ProfileClass::Immediate,
+        ),
+    );
+
+    let error = registry
+        .try_resolve(
+            catalog.path(),
+            "dev.schickling.agent-goal://host/worker",
+        )
+        .expect_err("a symlinked module ancestor must be rejected");
+    assert!(!error.is_empty());
+}
+
 
 #[cfg(unix)]
 #[test]

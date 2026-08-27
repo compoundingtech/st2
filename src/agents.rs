@@ -59,6 +59,8 @@ pub fn roster_from_discovered(
     this_host: &str,
 ) -> Vec<AgentRow> {
     let pty_root = probe_pty_root(catalog_root);
+    let profiles = crate::catalog::declared_profiles(catalog_root).unwrap_or_default();
+    let profile_refresh = profiles.begin_refresh();
     let mut rows: Vec<AgentRow> = found
         .specs
         .iter()
@@ -76,7 +78,13 @@ pub fn roster_from_discovered(
                 resource_resync: s
                     .resources
                     .iter()
-                    .map(|resource| crate::resync::resource_coverage(agent_dir, resource))
+                    .map(|resource| {
+                        crate::resync::resource_coverage_with_profiles(
+                            agent_dir,
+                            resource,
+                            &profile_refresh,
+                        )
+                    })
                     .collect(),
                 last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),

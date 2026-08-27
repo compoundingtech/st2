@@ -29,6 +29,8 @@ pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_TABLE_ELEMENT_LIMIT: usize = 10_000;
 /// Maximum resolver module bytes admitted before Wasmtime validation and compilation.
 pub use crate::profile::DEFAULT_MODULE_LIMIT_BYTES;
+/// Maximum JSON payload accepted from one resolver call before UTF-8 or Serde decoding.
+pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 /// One resolution result as produced by a wasm resolver module.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -101,7 +103,7 @@ impl Clone for WasmResolver {
 impl WasmResolver {
     /// Compile a `.wasm` module from disk with default budgets.
     pub fn load(path: &std::path::Path) -> Result<Self, WasmResolveError> {
-        let snapshot = read_module_snapshot(path, DEFAULT_MODULE_LIMIT_BYTES)?;
+        let snapshot = read_module_snapshot(path, None, DEFAULT_MODULE_LIMIT_BYTES)?;
         Self::from_bytes(&snapshot.bytes)
     }
 
@@ -204,11 +206,12 @@ pub(crate) struct ModuleSnapshot {
 
 pub(crate) fn read_module_snapshot(
     path: &std::path::Path,
+    containment_root: Option<&std::path::Path>,
     limit: usize,
 ) -> Result<ModuleSnapshot, WasmResolveError> {
     use std::io::Read as _;
 
-    let file = open_module_file(path)?;
+    let file = open_module_file(path, containment_root)?;
     let declared_len = file
         .metadata()
         .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
@@ -235,14 +238,82 @@ pub(crate) fn read_module_snapshot(
 }
 
 #[cfg(unix)]
-fn open_module_file(path: &std::path::Path) -> Result<std::fs::File, WasmResolveError> {
+fn open_module_file(
+    path: &std::path::Path,
+    containment_root: Option<&std::path::Path>,
+) -> Result<std::fs::File, WasmResolveError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::path::Component;
 
-    let file = std::fs::OpenOptions::new()
+    let Some(root) = containment_root else {
+        return validate_module_file(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?,
+        );
+    };
+    let relative = path.strip_prefix(root).map_err(|_| {
+        WasmResolveError::Instantiation(format!(
+            "resolver module {} escapes containment root {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(WasmResolveError::Instantiation(
+            "resolver module path is empty".to_owned(),
+        ));
+    }
+    let mut directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(root)
         .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(WasmResolveError::Instantiation(
+                "resolver module path contains an unsafe component".to_owned(),
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            WasmResolveError::Instantiation(
+                "resolver module path contains an interior NUL".to_owned(),
+            )
+        })?;
+        let is_last = components.peek().is_none();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if is_last {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: `directory` is a live descriptor and `name` is a NUL-terminated single path
+        // component. The returned descriptor is immediately owned by `File`.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(WasmResolveError::Instantiation(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        // SAFETY: `openat` returned a fresh owned descriptor.
+        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        if is_last {
+            return validate_module_file(opened);
+        }
+        directory = opened;
+    }
+    unreachable!("a non-empty component iterator returns its final file")
+}
+
+fn validate_module_file(file: std::fs::File) -> Result<std::fs::File, WasmResolveError> {
     if !file
         .metadata()
         .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
@@ -257,20 +328,14 @@ fn open_module_file(path: &std::path::Path) -> Result<std::fs::File, WasmResolve
 }
 
 #[cfg(not(unix))]
-fn open_module_file(path: &std::path::Path) -> Result<std::fs::File, WasmResolveError> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?;
-    if !file
-        .metadata()
-        .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?
-        .file_type()
-        .is_file()
-    {
-        return Err(WasmResolveError::Instantiation(
-            "resolver module is not a regular file".to_owned(),
-        ));
-    }
-    Ok(file)
+fn open_module_file(
+    path: &std::path::Path,
+    _containment_root: Option<&std::path::Path>,
+) -> Result<std::fs::File, WasmResolveError> {
+    validate_module_file(
+        std::fs::File::open(path)
+            .map_err(|error| WasmResolveError::Instantiation(error.to_string()))?,
+    )
 }
 
 fn reject_symlink_components(
@@ -420,6 +485,11 @@ impl WasmInstance {
 
         let ret_ptr = (packed >> 32) as u32 as usize;
         let ret_len = (packed as u32) as usize;
+        if ret_len > DEFAULT_OUTPUT_LIMIT_BYTES {
+            return Err(WasmResolveError::BadReturn(format!(
+                "return payload is {ret_len} bytes; limit is {DEFAULT_OUTPUT_LIMIT_BYTES} bytes"
+            )));
+        }
         let bytes = self.read_guest_bytes(ret_ptr, ret_len)?;
         let text = std::str::from_utf8(bytes)
             .map_err(|e| WasmResolveError::BadReturn(format!("return payload is not UTF-8: {e}")))?;

@@ -81,7 +81,11 @@ pub enum ProfileSource {
     /// A wasm module implementing the `resolve` protocol (see [`crate::profile_wasm`] for the
     /// ABI), plus the notification class every carrier it resolves carries. Compilation results
     /// (success or failure) are cached by path and file identity; instances remain per-resolution.
-    Wasm { module: PathBuf, class: ProfileClass },
+    Wasm {
+        module: PathBuf,
+        class: ProfileClass,
+        containment_root: Option<PathBuf>,
+    },
 }
 
 impl ResourceProfile {
@@ -96,6 +100,26 @@ impl ResourceProfile {
             source: ProfileSource::Wasm {
                 module: module.into(),
                 class,
+                containment_root: None,
+            },
+        }
+    }
+
+    /// Wasm-module profile whose module must be opened beneath one trusted directory without
+    /// following symlinks in any relative path component.
+    pub fn wasm_contained(
+        scheme: impl Into<String>,
+        containment_root: impl Into<PathBuf>,
+        relative_module: impl AsRef<Path>,
+        class: ProfileClass,
+    ) -> Self {
+        let containment_root = containment_root.into();
+        Self {
+            scheme: scheme.into(),
+            source: ProfileSource::Wasm {
+                module: containment_root.join(relative_module),
+                class,
+                containment_root: Some(containment_root),
             },
         }
     }
@@ -228,11 +252,15 @@ impl ResourceProfileRefresh<'_> {
         let Some(profile) = self.registry.profiles.get(scheme) else {
             return Ok(None);
         };
-        let ProfileSource::Wasm { module, class } = &profile.source;
+        let ProfileSource::Wasm {
+            module,
+            class,
+            containment_root,
+        } = &profile.source;
 
         #[cfg(not(feature = "wasm-resolver"))]
         {
-            let _ = (module, class, agent_dir);
+            let _ = (module, class, containment_root, agent_dir);
             Err("profile resolver unavailable: st2 was built without the `wasm-resolver` feature"
                 .to_owned())
         }
@@ -243,7 +271,7 @@ impl ResourceProfileRefresh<'_> {
                 if let Some(result) = modules.get(module) {
                     result.clone()
                 } else {
-                    let result = self.registry.compiled(module);
+                    let result = self.registry.compiled(module, containment_root.as_deref());
                     modules.insert(module.clone(), result.clone());
                     result
                 }
@@ -420,6 +448,7 @@ impl ResourceProfileRegistry {
     fn compiled(
         &self,
         module_path: &Path,
+        containment_root: Option<&Path>,
     ) -> Result<Arc<crate::profile_wasm::WasmResolver>, String> {
         #[cfg(test)]
         {
@@ -427,6 +456,7 @@ impl ResourceProfileRegistry {
         }
         let snapshot = crate::profile_wasm::read_module_snapshot(
             module_path,
+            containment_root,
             DEFAULT_MODULE_LIMIT_BYTES,
         )
         .map_err(|error| error.to_string())?;

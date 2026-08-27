@@ -428,10 +428,18 @@ fn apply_input_fence_survives_source_free_crash_resume() {
         .output()
         .unwrap();
     assert!(!interrupted.status.success());
-    let marker: Value =
-        serde_json::from_slice(&fs::read(catalog.join(".st2/catalog-apply-incomplete")).unwrap())
-            .unwrap();
+    let marker_path = catalog.join(".st2/catalog-apply-incomplete");
+    let mut marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
     assert_eq!(marker["preparedRootSha256"], input_sha256);
+    assert!(
+        marker
+            .as_object_mut()
+            .unwrap()
+            .remove("originalProfileModules")
+            .is_some(),
+        "the current writer must include the field before emulating an older v1 marker"
+    );
+    fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
     fs::remove_dir_all(&prepared).unwrap();
 
     let recovered = resume(&catalog);
