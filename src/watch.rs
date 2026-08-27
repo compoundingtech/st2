@@ -95,18 +95,21 @@ pub(crate) struct CatalogDeclarationWatcher {
     failed: BTreeSet<PathBuf>,
 }
 
-/// Identity of a watched directory. An inotify watch attaches to an INODE, not a name, so a
-/// directory deleted and recreated at the same pathname is a DIFFERENT directory: matching on
-/// identity alone lets `refresh` force re-registration for replacements.
+/// Identity of a watched directory. A backend watch attaches to an inode, not a name, so a
+/// directory deleted and recreated at the same pathname is a different subscription target.
+/// Include ctime as the inode generation discriminator: filesystems may immediately reuse an inode
+/// number, but recreating that directory still changes its metadata-change generation.
 #[cfg(unix)]
-type DirIdentity = (u64, u64);
+type DirIdentity = (u64, u64, i64, i64);
 #[cfg(not(unix))]
 type DirIdentity = ();
 
 #[cfg(unix)]
 fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+    fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()))
 }
 
 #[cfg(not(unix))]
@@ -160,36 +163,68 @@ impl CatalogDeclarationWatcher {
                 false
             }
         });
+
+        // Stage additions without publishing them yet. A stale watch's queued removal callback
+        // must finish before the same pathname is reserved for its replacement, or that old event
+        // can consume the new reservation and make refresh discard a successfully registered watch.
+        let additions = desired
+            .into_iter()
+            .filter(|(path, _)| !watched.contains_key(path))
+            .collect::<Vec<_>>();
+        drop(watched);
+
+        // notify may synchronously wait for its event loop while registering or unregistering.
+        // Never call it while holding the map mutex: the event-loop callback also needs that mutex
+        // to invalidate a removed directory, so doing both at once can deadlock watcher teardown.
         for path in &stale {
             // Backends normally discard a watch when its directory disappears. An explicit
             // best-effort unwatch also handles moves that leave the watched inode alive elsewhere.
+            // The synchronous backend call is also the ordering boundary after which callbacks for
+            // the stale registration have run, so only then may this pathname represent a new watch.
             let _ = self.watcher.unwatch(path);
         }
-        for added in desired.into_keys() {
+        for (added, expected_identity) in additions {
+            let mut watched = self.watched.lock().unwrap_or_else(|p| p.into_inner());
             if watched.contains_key(&added) {
                 continue;
             }
+            watched.insert(added.clone(), None);
+            drop(watched);
             match self.watcher.watch(&added, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     self.failed.remove(&added);
-                    match dir_identity(&added) {
-                        Some(identity) => {
-                            watched.insert(added, Some(identity));
-                        }
-                        // Vanished between registration and stat: leave it unrecorded so the
-                        // next refresh retries from scratch.
-                        None => {
-                            let _ = self.watcher.unwatch(&added);
-                        }
+                    let fresh_identity = dir_identity(&added);
+                    let mut watched = self.watched.lock().unwrap_or_else(|p| p.into_inner());
+                    let pending = watched.get(&added).is_some_and(Option::is_none);
+                    let registered =
+                        pending && fresh_identity.is_some() && fresh_identity == expected_identity;
+                    if registered {
+                        watched.insert(added.clone(), fresh_identity);
+                    } else if pending {
+                        watched.remove(&added);
+                    }
+                    drop(watched);
+
+                    // The directory vanished or was replaced during registration, or its queued
+                    // removal callback already consumed the reservation. Discard this backend
+                    // watch and let the next refresh retry from a fresh identity.
+                    if !registered {
+                        let _ = self.watcher.unwatch(&added);
                     }
                 }
-                Err(error) if self.failed.insert(added.clone()) => {
-                    tracing::warn!(
-                        "st2: cannot watch catalog declaration directory '{}': {error}; immediate changes below it are unavailable, continuing with timer polling.",
-                        added.display()
-                    );
+                Err(error) => {
+                    let mut watched = self.watched.lock().unwrap_or_else(|p| p.into_inner());
+                    if watched.get(&added).is_some_and(Option::is_none) {
+                        watched.remove(&added);
+                    }
+                    drop(watched);
+                    if self.failed.insert(added.clone()) {
+                        tracing::warn!(
+                            "st2: cannot watch catalog declaration directory '{}': {error}; immediate changes below it are unavailable, continuing with timer polling.",
+                            added.display()
+                        );
+                    }
                 }
-                Err(_) => {}
             }
         }
     }
@@ -205,10 +240,10 @@ impl CatalogDeclarationWatcher {
     }
 }
 
-/// Eagerly drop tracked directories the moment the backend reports them removed or renamed
-/// away — an inotify watch dies with its inode, and a same-pathname replacement can reuse the
-/// old identity, so only event-time invalidation makes the next [`refresh`] re-register
-/// deterministically instead of trusting a stat race.
+/// Invalidate a removed subscription without letting its delayed callback erase a replacement
+/// already registered at the same pathname. A live identity equal to the recorded identity proves
+/// the event belongs to an older registration; a `None` value is refresh's in-flight reservation,
+/// whose before/after identity check owns rollback if the directory changes during registration.
 fn invalidate_removed_dirs(watched: &Mutex<BTreeMap<PathBuf, Option<DirIdentity>>>, event: &Event) {
     let torn_down = matches!(
         &event.kind,
@@ -222,9 +257,17 @@ fn invalidate_removed_dirs(watched: &Mutex<BTreeMap<PathBuf, Option<DirIdentity>
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for path in &event.paths {
-        watched.remove(path);
-        // Removing or moving away a parent retires every watch beneath it too.
-        watched.retain(|tracked, _| !tracked.starts_with(path));
+        // Removing or moving away a parent retires every watch beneath it too, except for a
+        // replacement that refresh has already registered with a new, still-live identity.
+        watched.retain(|tracked, identity| {
+            if !tracked.starts_with(path) {
+                return true;
+            }
+            match identity {
+                None => true,
+                Some(recorded) => dir_identity(tracked).is_some_and(|current| current == *recorded),
+            }
+        });
     }
 }
 
