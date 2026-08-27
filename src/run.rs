@@ -1672,18 +1672,23 @@ fn reconcile_pass(
     );
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
-    let mut eligible_specs: Vec<_> = found
+    let mut eligible_specs = Vec::new();
+    for mut spec in found
         .specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
-        .collect();
-    if let Err(error) = compile_generated_tasks(&mut eligible_specs, this_host, task_context) {
-        report.skipped = true;
-        report
-            .errors
-            .push(format!("compile generated tasks (pass skipped): {error:#}"));
-        return report;
+    {
+        if let Err(error) =
+            compile_generated_tasks(std::slice::from_mut(&mut spec), this_host, task_context)
+        {
+            report.errors.push(format!(
+                "compile generated tasks for {}: {error:#}",
+                spec.path.display()
+            ));
+            continue;
+        }
+        eligible_specs.push(spec);
     }
 
     let sessions = match runner.list_sessions() {
@@ -1711,10 +1716,10 @@ fn reconcile_pass(
         None => Ok(()),
     });
     if let Some(resync) = resync {
-        // Existing canonical seats are established by this pass's observation. Install them before
-        // executing unrelated repairs; targeted upserts preserve every retained baseline and
-        // pending transition.
-        for spec in live_resync_specs(&found.specs, this_host, &sessions, &report) {
+        // Existing canonical seats from successfully compiled declarations are established by this
+        // pass's observation. Install them before executing unrelated repairs; targeted upserts
+        // preserve every retained baseline and pending transition.
+        for spec in live_resync_specs(&eligible_specs, this_host, &sessions, &report) {
             resync.install_live(&spec, this_host);
         }
     }
@@ -1738,7 +1743,7 @@ fn reconcile_pass(
             .map(|error| error.path.clone())
             .collect::<Vec<_>>();
         resync.refresh(
-            &live_resync_specs(&found.specs, this_host, &sessions, &report),
+            &live_resync_specs(&eligible_specs, this_host, &sessions, &report),
             this_host,
             &sessions,
             &malformed_declarations,
@@ -3161,6 +3166,133 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn wait_for_resync_event_change(agent_dir: &Path, prior: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event(agent_dir)
+                && body != prior
+            {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (live_dir, live_goal) = write_resync_agent(catalog.path(), "live");
+        let broken_dir = catalog.path().join("agents/hetz/broken");
+        let broken_resources = broken_dir.join("resources");
+        std::fs::create_dir_all(&broken_resources).unwrap();
+        std::fs::create_dir_all(catalog.path().join("broken-workspace")).unwrap();
+        let broken_declaration = broken_dir.join("agent.kdl");
+        std::fs::write(
+            &broken_declaration,
+            r#"agent "broken" {
+  host "hetz"
+  deliver "mcp"
+  workspace "$CATALOG/broken-workspace"
+  exec "agent" { command "true" }
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let broken_goal = broken_resources.join("goal.md");
+        std::fs::write(&broken_goal, "before\n").unwrap();
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![
+                sess("hetz.live", true),
+                sess("hetz.broken.agent", true),
+            ]),
+            ..SpawnCountingRunner::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let first = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            first.errors.iter().any(|error| {
+                error.contains("compile generated tasks")
+                    && error.contains("non-PTY canonical task")
+            }),
+            "{first:#?}"
+        );
+        assert!(!first.skipped, "the valid subset completed its pass");
+        assert!(
+            runner.spawned.borrow().is_empty(),
+            "the compile-invalid seat must not launch"
+        );
+
+        std::fs::write(&live_goal, "changed while compile failed\n").unwrap();
+        let first_event = wait_for_resync_event(&live_dir)
+            .expect("the already-live valid seat must stay watched across the compile error");
+        assert!(first_event.contains("binding: goal"), "{first_event}");
+
+        std::fs::write(&broken_goal, "invalid seat changed\n").unwrap();
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&broken_dir).is_none(),
+            "a compile-invalid seat must not be watched even when its canonical task is live"
+        );
+
+        std::fs::write(&live_goal, "changed while declaration is corrected\n").unwrap();
+        std::fs::write(
+            &broken_declaration,
+            r#"agent "broken" {
+  host "hetz"
+  deliver "mcp"
+  workspace "$CATALOG/broken-workspace"
+  pty "agent" { command "true" }
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let corrected = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(
+            corrected
+                .errors
+                .iter()
+                .all(|error| !error.contains("compile generated tasks")),
+            "{corrected:#?}"
+        );
+        assert!(corrected.launched.is_empty(), "{corrected:#?}");
+        assert!(
+            corrected.adopted.iter().any(|identity| identity == "broken"),
+            "the corrected already-live seat should be adopted: {corrected:#?}"
+        );
+        let corrected_event = wait_for_resync_event_change(&live_dir, &first_event)
+            .expect("correcting another declaration must not reseed and hide the live transition");
+        assert!(corrected_event.contains("binding: goal"), "{corrected_event}");
     }
 
     fn execute_resync_plan(
