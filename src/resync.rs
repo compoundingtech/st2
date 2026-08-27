@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use notify::Watcher as _;
 use sha2::{Digest as _, Sha256};
 
-use agent_spec::spec::AgentSpec;
+use agent_spec::spec::{AgentSpec, decode_percent_path};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
 pub const RESYNC_STREAM: &str = "resync";
@@ -127,60 +127,11 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
         {
             return None;
         }
-        let path = decode_percent_path(encoded_path)?;
+        let path = PathBuf::from(decode_percent_path(encoded_path).ok()?);
         return path.is_absolute().then(|| lexical_clean(&path));
     }
-    let path = decode_percent_path(uri)?;
+    let path = PathBuf::from(decode_percent_path(uri).ok()?);
     Some(lexical_clean(&agent_dir.join(path)))
-}
-
-fn decode_percent_path(encoded_path: &str) -> Option<PathBuf> {
-    let bytes = encoded_path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut component_start = 0;
-    let mut component_had_escape = false;
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'/' {
-            if component_had_escape && decoded[component_start..] == *b".." {
-                return None;
-            }
-            decoded.push(b'/');
-            component_start = decoded.len();
-            component_had_escape = false;
-            index += 1;
-            continue;
-        }
-        if bytes[index] != b'%' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        let high = hex_value(*bytes.get(index + 1)?)?;
-        let low = hex_value(*bytes.get(index + 2)?)?;
-        let byte = (high << 4) | low;
-        // A decoded separator changes URI path segmentation, and NUL cannot be a filesystem path
-        // byte. Reject both rather than silently resolving a different carrier.
-        if matches!(byte, b'/' | b'\\' | b'\0') {
-            return None;
-        }
-        decoded.push(byte);
-        component_had_escape = true;
-        index += 3;
-    }
-    if component_had_escape && decoded[component_start..] == *b".." {
-        return None;
-    }
-    Some(PathBuf::from(String::from_utf8(decoded).ok()?))
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Remove `.` and `..` components lexically. This deliberately does not inspect the filesystem:
@@ -2195,10 +2146,14 @@ mod tests {
             "file:///tmp/encoded%5Cseparator",
             "file:///tmp/bad%escape",
             "file:///tmp/%2E%2E/escape",
+            "file:///tmp/a%00b",
+            "file:///tmp/%FF.md",
             "resources/encoded%2Fseparator",
             "resources/encoded%5Cseparator",
             "resources/%2E%2E/outside.md",
             "resources/bad%escape",
+            "resources/a%00b",
+            "resources/%FF.md",
             "http://x/y",
             "worktree://repo/main",
             "GitHub-Issue://org/repo/41",
