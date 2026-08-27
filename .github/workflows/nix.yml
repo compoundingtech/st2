@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
 
+# One in-flight run per ref: a push that supersedes an earlier one should not keep
+# two ~35m Linux checks and two macOS builds competing for the same runner pool.
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -17,3 +23,21 @@ jobs:
       # evaluates every `checks.*`, so fmt, clippy, the hermetic test suite, and
       # the `--help` smoke test all gate the PR from one entrypoint.
       - run: nix flake check --print-build-logs
+
+  # Darwin gate. st2 drives real processes — process groups, signals, pipes, reaping —
+  # and those paths are OS behaviour, not portable Rust: issue #356 was two aarch64-darwin
+  # test failures that no Linux run could have caught. The hosted macOS runner is arm64
+  # with 3 cores, so it is also a *stricter* scheduler than any Mac in the fleet, which is
+  # what makes it a useful detector for load-sensitive lifecycle tests.
+  #
+  # Scope is deliberately `nix build .#st2`, not `nix flake check`: that builds the package
+  # and runs its hermetic suite via `doCheck` — exactly the surface #356 lives on — without
+  # also demanding cold aarch64-darwin builds of the `pty` and `otelite` dependencies that
+  # `checks.parked-recovery` and `checks.otel-export` pull in. Widen once this is stable.
+  build-darwin:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - run: nix build .#st2 --no-link --print-build-logs

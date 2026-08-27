@@ -3741,9 +3741,24 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             status_refresh: Duration::from_secs(60),
         };
 
+        // Synchronize on the loop's own progress rather than a wall-clock window. `session_alive`
+        // runs exactly once per iteration, so `probes` counts polls directly: stop only once the
+        // first poke landed AND the loop polled several more times, which is precisely when a
+        // missing backoff would poke again. A fixed window instead ends wherever the host's
+        // scheduler leaves it — on a loaded machine before the first poll, so the test observed zero
+        // pokes and failed while asserting nothing about backoff.
+        const POLLS_AFTER_FIRST_POKE: usize = 5;
+        let barrier = Duration::from_secs(30);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(250));
+                let deadline = Instant::now() + barrier;
+                while poker.calls.lock().unwrap().is_empty() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let polled = poker.probes.load(Ordering::SeqCst) + POLLS_AFTER_FIRST_POKE;
+                while poker.probes.load(Ordering::SeqCst) < polled && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 stop.store(true, Ordering::SeqCst);
             });
             run_ding(
@@ -3761,6 +3776,11 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .unwrap();
         });
 
+        // Without this the counter-test is vacuous: one poke across one poll proves no backoff.
+        assert!(
+            poker.probes.load(Ordering::SeqCst) > POLLS_AFTER_FIRST_POKE,
+            "the loop did not poll again, so no backoff was exercised"
+        );
         assert_eq!(
             poker.calls.lock().unwrap().len(),
             1,
