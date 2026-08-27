@@ -31,6 +31,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::driver_diagnostic::{
+    Driver as DiagnosticDriver, Publisher as DiagnosticPublisher, Reason as DiagnosticReason,
+    Source as DiagnosticSource, Stage as DiagnosticStage, Support as DiagnosticSupport,
+};
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
 use crate::{ding, message, status};
@@ -80,20 +84,35 @@ pub fn run(
         !opencode_argv.is_empty(),
         "opencode driver '{runtime_id}' has no provider argv"
     );
-    let version_ok = match supported_version(&opencode_argv[0]) {
+    let version_probe = supported_version(&opencode_argv[0]);
+    let (version_ok, producer_version, support, version_failure) = match version_probe {
         Ok(version) => {
-            let ok = SUPPORTED_OPENCODE_VERSIONS.contains(&version.as_str());
-            if !ok {
+            let supported = SUPPORTED_OPENCODE_VERSIONS.contains(&version.as_str());
+            if !supported {
                 tracing::warn!(
                     "st2 opencode-session: version {version} is unverified (supported: {}); native delivery disabled",
                     SUPPORTED_OPENCODE_VERSIONS.join(", ")
                 );
             }
-            ok
+            (
+                supported,
+                Some(version),
+                if supported {
+                    DiagnosticSupport::Supported
+                } else {
+                    DiagnosticSupport::Unsupported
+                },
+                (!supported).then_some(DiagnosticReason::UnsupportedVersion),
+            )
         }
         Err(error) => {
             tracing::warn!("st2 opencode-session: cannot read opencode version: {error:#}");
-            false
+            (
+                false,
+                None,
+                DiagnosticSupport::Unknown,
+                Some(DiagnosticReason::VersionProbeFailed),
+            )
         }
     };
 
@@ -115,6 +134,17 @@ pub fn run(
     let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
+        let mut diagnostics =
+            DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
+        if let Some(reason) = version_failure {
+            diagnostics.publish(
+                DiagnosticStage::VersionGate,
+                reason,
+                DiagnosticSource::VersionProbe,
+            );
+        } else {
+            diagnostics.clear(DiagnosticStage::VersionGate);
+        }
         Session {
             client,
             version_ok,
@@ -129,6 +159,7 @@ pub fn run(
             )
             .with_ownership(session, seq),
             delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+            diagnostics,
         }
     };
     let mut child = match spawn_provider(&argv, &password) {
@@ -158,6 +189,7 @@ struct Session {
     status_path: PathBuf,
     writer: Writer,
     delivery: Delivery,
+    diagnostics: DiagnosticPublisher,
 }
 
 fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Result<()> {
@@ -213,15 +245,30 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         if !api_ok && Instant::now() >= next_gate_attempt {
             match session.client.get_json("/doc") {
                 Ok(doc) => match check_openapi_subset(&doc) {
-                    Ok(()) => api_ok = true,
+                    Ok(()) => {
+                        api_ok = true;
+                        session.diagnostics.clear(DiagnosticStage::ApiGate);
+                    }
                     Err(error) => {
+                        session.diagnostics.publish(
+                            DiagnosticStage::ApiGate,
+                            DiagnosticReason::IncompatibleApi,
+                            DiagnosticSource::OpenApiDocument,
+                        );
                         tracing::warn!("st2 opencode-session: API gate failed: {error:#}");
                         // A failed shape check is terminal for this launch: the surface will not
                         // change until the binary does. Stop probing; run presence-only.
                         next_gate_attempt = Instant::now() + Duration::from_secs(3600);
                     }
                 },
-                Err(_) => next_gate_attempt = Instant::now() + Duration::from_millis(250),
+                Err(_) => {
+                    session.diagnostics.publish(
+                        DiagnosticStage::ApiGate,
+                        DiagnosticReason::ApiUnavailable,
+                        DiagnosticSource::OpenApiDocument,
+                    );
+                    next_gate_attempt = Instant::now() + Duration::from_millis(250);
+                }
             }
         }
         if api_ok && !sse_started {
@@ -234,14 +281,24 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 SseMessage::Connected => {
                     machine = EventMachine::default();
                     sse_connected = true;
+                    session.diagnostics.clear(DiagnosticStage::Sse);
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
                     // on a transiently failed seed would re-stamp whatever the disk last said.
-                    evidence = seed_from_server(&session.client, &mut machine);
+                    evidence = seed_with_diagnostics(
+                        &session.client,
+                        &mut machine,
+                        &mut session.diagnostics,
+                    );
                     next_seed_attempt = Instant::now() + SEED_RETRY;
                 }
-                SseMessage::Disconnected => {
+                SseMessage::Disconnected(reason) => {
                     sse_connected = false;
                     evidence = false;
+                    session.diagnostics.publish(
+                        DiagnosticStage::Sse,
+                        reason,
+                        DiagnosticSource::EventStream,
+                    );
                     // Everything from here until a successful reseed happened unobserved: the
                     // next observation must open a fresh transition even if it restates the
                     // pre-outage tuple.
@@ -261,10 +318,18 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             evidence = false;
             session.writer.interrupt();
             next_seed_attempt = Instant::now();
+            session.diagnostics.publish(
+                DiagnosticStage::Sse,
+                DiagnosticReason::UnknownEvent,
+                DiagnosticSource::EventStream,
+            );
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_from_server(&session.client, &mut machine);
-            next_seed_attempt = Instant::now() + SEED_RETRY;
+            evidence = seed_with_diagnostics(
+                &session.client,
+                &mut machine,
+                &mut session.diagnostics,
+            );
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -285,7 +350,9 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         }
         if inbox_due {
             if session.version_ok && api_ok {
-                session.delivery.pump(&session.client);
+                session
+                    .delivery
+                    .pump_diagnosed(&session.client, &mut session.diagnostics);
             }
             next_inbox = Instant::now() + INBOX_REFRESH_FALLBACK;
         }
@@ -542,7 +609,7 @@ fn base64(bytes: &[u8]) -> String {
 enum SseMessage {
     Connected,
     Event(Value),
-    Disconnected,
+    Disconnected(DiagnosticReason),
 }
 
 fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc<AtomicBool>) {
@@ -573,12 +640,18 @@ fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc
                             data.clear();
                         }
                     }
-                    if tx.send(SseMessage::Disconnected).is_err() {
+                    if tx
+                        .send(SseMessage::Disconnected(DiagnosticReason::SseDisconnected))
+                        .is_err()
+                    {
                         return;
                     }
                 }
                 Err(_) => {
-                    if tx.send(SseMessage::Disconnected).is_err() {
+                    if tx
+                        .send(SseMessage::Disconnected(DiagnosticReason::SseConnectFailed))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -591,7 +664,12 @@ fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc
 /// Re-seed observed state from the level surface after (re)connecting: events missed while
 /// disconnected are unrecoverable, and `/session/status` omits idle sessions, so an empty map over
 /// a live server is itself the idle proof.
-fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
+type SeedFailure = (DiagnosticReason, DiagnosticSource);
+
+fn seed_from_server(
+    client: &Client,
+    machine: &mut EventMachine,
+) -> std::result::Result<(), SeedFailure> {
     // The seed is built in a FRESH machine and swapped in only once every read validates:
     // mutating the live one would leave half-seeded asks behind a mid-seed failure, and a
     // successful re-seed must also CLEAR stale busy/blocked entries whose exits passed while
@@ -599,61 +677,86 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
     // that raced the seed re-arrives or is re-listed on the next reconnect. Delivery targeting
     // deliberately learns nothing here: status-map iteration order is not recency (W8-5); the
     // pending-work recovery path resolves targets from the session listing instead.
-    let Ok(statuses) = client.get_json("/session/status") else {
-        return false;
-    };
+    let statuses = client.get_json("/session/status").map_err(|_| {
+        (
+            DiagnosticReason::StatusUnavailable,
+            DiagnosticSource::StatusSnapshot,
+        )
+    })?;
     // A response that is not the documented object shape proves nothing: seeding definite idle
     // from a null or an array would fabricate level evidence out of a shape this version cannot
     // read. Fail the seed and retry.
-    let Some(map) = statuses.as_object() else {
-        return false;
-    };
+    let map = statuses.as_object().ok_or((
+        DiagnosticReason::MalformedStatus,
+        DiagnosticSource::StatusSnapshot,
+    ))?;
     let mut seeded = EventMachine::default();
     seeded.seed_idle();
-    {
-        for (session_id, status) in map {
-            // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is
-            // surface drift the /doc gate vocabulary did not cover, and evidence restored over
-            // words we cannot read would be fabricated. Fail the seed and retry instead.
-            match status.get("type").and_then(Value::as_str) {
-                Some("idle") => {}
-                Some("busy") => seeded.seed_busy(session_id.clone(), false),
-                Some("retry") => seeded.seed_busy(session_id.clone(), true),
-                _ => return false,
+    for (session_id, status) in map {
+        // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is surface
+        // drift the /doc gate vocabulary did not cover.
+        match status.get("type").and_then(Value::as_str) {
+            Some("idle") => {}
+            Some("busy") => seeded.seed_busy(session_id.clone(), false),
+            Some("retry") => seeded.seed_busy(session_id.clone(), true),
+            _ => {
+                return Err((
+                    DiagnosticReason::UnknownStatus,
+                    DiagnosticSource::StatusSnapshot,
+                ));
             }
         }
     }
-    // An ask opened before this connection would otherwise be invisible until its exit event:
-    // re-seed pending asks so blockedOn survives an SSE reconnect, with each id kept so the
-    // ordinary id-matched exit still releases it. Both listing endpoints are measured on 1.18.19
-    // (the committed capture drove them: `GET /permission` and `GET /question` return pending
-    // ids), so a question open across a reconnect is recovered exactly like a permission.
-    // Both listings must succeed for the seed to count: a transient failure here would restore
-    // evidence on an unblocked picture and silently wedge an ask opened during the outage —
-    // return false instead, keep heartbeats off, and let the seed retry.
-    for (endpoint, kind) in [("/permission", "permission"), ("/question", "question")] {
-        let Ok(pending) = client.get_json(endpoint) else {
-            return false;
-        };
-        let Some(items) = pending.as_array() else {
-            return false;
-        };
+    // Both pending-ask listings must succeed for the seed to count: a transient failure must not
+    // restore evidence on an unblocked picture and silently wedge an ask opened during the outage.
+    for (endpoint, kind, unavailable, malformed, source) in [
+        (
+            "/permission",
+            "permission",
+            DiagnosticReason::PermissionUnavailable,
+            DiagnosticReason::MalformedPermissions,
+            DiagnosticSource::PermissionSnapshot,
+        ),
+        (
+            "/question",
+            "question",
+            DiagnosticReason::QuestionUnavailable,
+            DiagnosticReason::MalformedQuestions,
+            DiagnosticSource::QuestionSnapshot,
+        ),
+    ] {
+        let pending = client.get_json(endpoint).map_err(|_| (unavailable, source))?;
+        let items = pending.as_array().ok_or((malformed, source))?;
         for item in items {
-            // An entry whose id this version cannot read is a pending ask that could never be
-            // released by its id-matched exit: seeding around it would restore evidence on a
-            // picture that silently drops a human block. Fail the seed and retry.
-            let Some(id) = item
+            // An unreadable id could never be released by its id-matched exit.
+            let id = item
                 .get("id")
                 .or_else(|| item.get("requestID"))
                 .and_then(Value::as_str)
-            else {
-                return false;
-            };
+                .ok_or((DiagnosticReason::MissingAskId, source))?;
             seeded.seed_ask(id.to_string(), kind);
         }
     }
     *machine = seeded;
-    true
+    Ok(())
+}
+
+fn seed_with_diagnostics(
+    client: &Client,
+    machine: &mut EventMachine,
+    diagnostics: &mut DiagnosticPublisher,
+) -> bool {
+    match seed_from_server(client, machine) {
+        Ok(()) => {
+            diagnostics.clear(DiagnosticStage::Seed);
+            diagnostics.clear(DiagnosticStage::Sse);
+            true
+        }
+        Err((reason, source)) => {
+            diagnostics.publish(DiagnosticStage::Seed, reason, source);
+            false
+        }
+    }
 }
 
 // ---- event projection ------------------------------------------------------------------------
@@ -873,6 +976,7 @@ fn event_session_id(event: &Value) -> Option<&str> {
 
 // ---- native delivery -------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 enum ReadBack {
     Durable,
     Absent,
@@ -970,13 +1074,30 @@ impl Delivery {
         self.target_session = Some(session_id.to_string());
     }
 
+    #[cfg(test)]
     fn pump(&mut self, client: &Client) {
-        if let Err(error) = self.pump_inner(client) {
+        self.pump_with_diagnostics(client, None);
+    }
+
+    fn pump_diagnosed(&mut self, client: &Client, diagnostics: &mut DiagnosticPublisher) {
+        self.pump_with_diagnostics(client, Some(diagnostics));
+    }
+
+    fn pump_with_diagnostics(
+        &mut self,
+        client: &Client,
+        diagnostics: Option<&mut DiagnosticPublisher>,
+    ) {
+        if let Err(error) = self.pump_inner(client, diagnostics) {
             tracing::warn!("st2 opencode-session: delivery: {error:#}");
         }
     }
 
-    fn pump_inner(&mut self, client: &Client) -> Result<()> {
+    fn pump_inner(
+        &mut self,
+        client: &Client,
+        mut diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
         let unread = message::list_inbox(&self.inbox)?;
         if let Some(state) = self.state.as_ref()
             && unread
@@ -989,6 +1110,10 @@ impl Delivery {
             return Ok(());
         }
         let Some(head) = unread.into_iter().next() else {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.clear(DiagnosticStage::Delivery);
+                diagnostics.clear(DiagnosticStage::ReadBack);
+            }
             return Ok(());
         };
         let target = match self.target_session.clone() {
@@ -1017,8 +1142,16 @@ impl Delivery {
                 return Ok(()); // The bound message is behind the head; archive precedence resolves it.
             }
             match state.phase {
-                DeliveryPhase::Accepted => return Ok(()),
-                DeliveryPhase::Attempted => return self.reconcile_or_retry(client, state),
+                DeliveryPhase::Accepted => {
+                    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                        diagnostics.clear(DiagnosticStage::Delivery);
+                        diagnostics.clear(DiagnosticStage::ReadBack);
+                    }
+                    return Ok(());
+                }
+                DeliveryPhase::Attempted => {
+                    return self.reconcile_or_retry(client, state, diagnostics);
+                }
             }
         }
 
@@ -1034,11 +1167,18 @@ impl Delivery {
         };
         self.write_state(state.clone())?;
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text)
+        self.send(client, &state, &text, diagnostics)
     }
 
-    fn reconcile_or_retry(&mut self, client: &Client, state: DeliveryState) -> Result<()> {
-        match self.read_back(client, &state) {
+    fn reconcile_or_retry(
+        &mut self,
+        client: &Client,
+        state: DeliveryState,
+        mut diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
+        let read_back = self.read_back(client, &state);
+        report_read_back(read_back, &mut diagnostics);
+        match read_back {
             ReadBack::Durable => {
                 let mut accepted = state;
                 accepted.phase = DeliveryPhase::Accepted;
@@ -1061,22 +1201,51 @@ impl Delivery {
             return Ok(());
         };
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text)
+        self.send(client, &state, &text, diagnostics)
     }
 
-    fn send(&mut self, client: &Client, state: &DeliveryState, text: &str) -> Result<()> {
+    fn send(
+        &mut self,
+        client: &Client,
+        state: &DeliveryState,
+        text: &str,
+        mut diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
         let payload = json!({
             "messageID": state.message_id,
             "parts": [{ "type": "text", "text": text }],
         });
         let path = format!("/session/{}/prompt_async", state.session_id);
-        let status = client.post_json(&path, &payload)?;
-        anyhow::ensure!(
-            (200..300).contains(&status),
-            "POST {path} returned {status}"
-        );
-        if matches!(self.read_back(client, state), ReadBack::Durable) {
+        let status = match client.post_json(&path, &payload) {
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.publish(
+                        DiagnosticStage::Delivery,
+                        DiagnosticReason::DeliveryUnavailable,
+                        DiagnosticSource::PromptTransport,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if !(200..300).contains(&status) {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.publish(
+                    DiagnosticStage::Delivery,
+                    DiagnosticReason::DeliveryRejected,
+                    DiagnosticSource::PromptTransport,
+                );
+            }
+            anyhow::bail!("POST {path} returned {status}");
+        }
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.clear(DiagnosticStage::Delivery);
+        }
+        let read_back = self.read_back(client, state);
+        report_read_back(read_back, &mut diagnostics);
+        if matches!(read_back, ReadBack::Durable) {
             let mut accepted = state.clone();
             accepted.phase = DeliveryPhase::Accepted;
             self.write_state(accepted)?;
@@ -1109,6 +1278,31 @@ impl Delivery {
         }
         self.state = None;
         Ok(())
+    }
+}
+
+fn report_read_back(
+    read_back: ReadBack,
+    diagnostics: &mut Option<&mut DiagnosticPublisher>,
+) {
+    let Some(diagnostics) = diagnostics.as_deref_mut() else {
+        return;
+    };
+    match read_back {
+        ReadBack::Durable => {
+            diagnostics.clear(DiagnosticStage::ReadBack);
+            diagnostics.clear(DiagnosticStage::Delivery);
+        }
+        ReadBack::Absent => diagnostics.publish(
+            DiagnosticStage::ReadBack,
+            DiagnosticReason::NotDurable,
+            DiagnosticSource::MessageReadBack,
+        ),
+        ReadBack::Indeterminate => diagnostics.publish(
+            DiagnosticStage::ReadBack,
+            DiagnosticReason::ReadBackUnavailable,
+            DiagnosticSource::MessageReadBack,
+        ),
     }
 }
 
@@ -1604,27 +1798,90 @@ mod tests {
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
-    /// An ask opened before the SSE connection must survive the reconnect seed with its id, so
-    /// the ordinary id-matched exit still releases it.
     #[test]
-    fn seeding_recovers_a_pending_ask_and_gates_evidence_on_the_level_seed() {
+    fn delivery_and_read_back_boundaries_publish_and_clear_diagnostics_without_changing_retry() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
         let state_path = tmp.path().join("state/delivery-state.json");
         let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            Some("1.18.19".to_string()),
+            DiagnosticSupport::Supported,
+        );
+
+        server.accept_posts.store(false, Ordering::SeqCst);
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        let crate::driver_diagnostic::Observed::Failure(failure) =
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir))
+        else {
+            panic!("rejected prompt must be diagnosed")
+        };
+        assert_eq!(failure.stage, DiagnosticStage::Delivery);
+        assert_eq!(failure.reason, DiagnosticReason::DeliveryRejected);
+
+        server.accept_posts.store(true, Ordering::SeqCst);
+        delivery.next_attempt = Instant::now();
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        assert_eq!(
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir)),
+            crate::driver_diagnostic::Observed::Absent,
+            "successful retry and durable read-back clear both boundaries"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            Some("1.18.19".to_string()),
+            DiagnosticSupport::Supported,
+        );
+        server.read_back_error.store(true, Ordering::SeqCst);
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        let crate::driver_diagnostic::Observed::Failure(failure) =
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir))
+        else {
+            panic!("indeterminate read-back must be diagnosed")
+        };
+        assert_eq!(failure.stage, DiagnosticStage::ReadBack);
+        assert_eq!(failure.reason, DiagnosticReason::ReadBackUnavailable);
+
+        server.read_back_error.store(false, Ordering::SeqCst);
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        assert_eq!(
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir)),
+            crate::driver_diagnostic::Observed::Absent,
+            "read-back recovery clears without a second POST"
+        );
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
+    /// An ask opened before the SSE connection must survive the reconnect seed with its id, so
+    /// the ordinary id-matched exit still releases it.
+    #[test]
+    fn seeding_recovers_a_pending_ask_and_gates_evidence_on_the_level_seed() {
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
 
         // A transiently failing level seed yields no evidence at all.
         server.status_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
-        assert!(!seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_err());
         server.status_error.store(false, Ordering::SeqCst);
 
         // So does a failing pending-ask listing: an ask opened during the outage must not be
         // reported unblocked with heartbeats restored — the seed retries instead.
         server.ask_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
-        assert!(!seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_err());
         server.ask_error.store(false, Ordering::SeqCst);
 
         // A successful seed recovers the pending ask under its own id.
@@ -1635,7 +1892,7 @@ mod tests {
             .unwrap()
             .push("per_pending".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         let blocked = observed(&machine);
         assert_eq!(blocked.state, Activity::Active);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
@@ -1657,7 +1914,7 @@ mod tests {
             .unwrap()
             .push("que_pending".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         let blocked = observed(&machine);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
         assert_eq!(blocked.ask, Ask::Question);
@@ -1864,7 +2121,7 @@ mod tests {
         server.ask_error.store(true, Ordering::SeqCst);
         // ask_error fails BOTH listings; simulate the split by failing only after /permission:
         // the atomicity claim is the same — nothing of the attempt lands.
-        assert!(!seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_err());
         let snapshot = observed(&machine);
         assert_eq!(
             snapshot.blocked_on,
@@ -1875,7 +2132,7 @@ mod tests {
 
         // A successful re-seed states the whole level truth: the settled session and the
         // resolved ask disappear, the listed pending ask remains.
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         let snapshot = observed(&machine);
         assert_eq!(snapshot.blocked_on, BlockedOn::Human);
         machine.apply(&event(
@@ -1948,7 +2205,7 @@ mod tests {
         *server.ask_body.lock().unwrap() = Some(r#"[{"id":"per_ok"},{"token":42}]"#.to_string());
         let mut machine = EventMachine::default();
         assert!(
-            !seed_from_server(&client, &mut machine),
+            seed_from_server(&client, &mut machine).is_err(),
             "an entry without a readable id must fail the seed, not be skipped"
         );
 
@@ -1959,7 +2216,7 @@ mod tests {
             .unwrap()
             .push("per_ok".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
     }
 
@@ -1975,7 +2232,7 @@ mod tests {
             *server.status_body.lock().unwrap() = Some(shape.to_string());
             let mut machine = EventMachine::default();
             assert!(
-                !seed_from_server(&client, &mut machine),
+                seed_from_server(&client, &mut machine).is_err(),
                 "shape {shape} must fail the seed"
             );
             assert_eq!(
@@ -1986,7 +2243,7 @@ mod tests {
         }
         *server.status_body.lock().unwrap() = None;
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
     }
 
     /// n8: a server that accepts the stream and then goes silent must surface as a disconnect
@@ -2013,7 +2270,7 @@ mod tests {
         let mut saw_disconnect = false;
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(SseMessage::Disconnected) => {
+                Ok(SseMessage::Disconnected(_)) => {
                     saw_disconnect = true;
                     break;
                 }

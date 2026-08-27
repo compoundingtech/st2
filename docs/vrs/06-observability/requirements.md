@@ -55,6 +55,13 @@ pipeline as one more producer; it does not invent its own.
   remaining central obligations — the `telemetry.contract.ts` registry entry, the Grafana
   dashboard, and coverage-census subject registration — live in dotfiles' central observability
   tree and are explicitly deferred as cross-repo follow-up work, not part of st2's delivery.
+- **O11Y-R09 Native-driver diagnostics:** Native-driver diagnostic
+  failure/recovery transitions emit a bounded span/event and counter. The only
+  metric-label axes are closed stage, reason, source, support, and outcome
+  vocabularies. `span.label` is the bounded stage. Raw producer versions and
+  agent/runtime/session/message identity are forbidden from metrics and
+  `span.label`; raw prompt, message, and path content is forbidden from every
+  diagnostic signal.
 
 The [specification](spec.md) owns the crate stack, exporter configuration, trace roots, and PR
 stack. Open items are tracked in [open-questions](open-questions.md).

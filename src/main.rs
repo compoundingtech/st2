@@ -1952,6 +1952,31 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     "",
                 ),
             }
+            if st2::driver_diagnostic::expected_for(spec) {
+                let diagnostic =
+                    st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
+                match &diagnostic {
+                    st2::driver_diagnostic::Observed::Failure(failure) => report_advisory(
+                        &format!(
+                            "{bus_id} native driver diagnostic: {}/{}",
+                            failure.stage.as_str(),
+                            failure.reason.as_str()
+                        ),
+                        st2::driver_diagnostic::repair_text(&diagnostic),
+                    ),
+                    st2::driver_diagnostic::Observed::Indeterminate(reason) => report_advisory(
+                        &format!(
+                            "{bus_id} native driver diagnostic indeterminate ({})",
+                            reason.as_str()
+                        ),
+                        st2::driver_diagnostic::repair_text(&diagnostic),
+                    ),
+                    st2::driver_diagnostic::Observed::Absent => report_advisory(
+                        &format!("{bus_id} native driver diagnostic absent"),
+                        st2::driver_diagnostic::repair_text(&diagnostic),
+                    ),
+                }
+            }
         }
     }
 

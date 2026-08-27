@@ -126,6 +126,23 @@ wrapper functions. Per-task and per-owner spans are also rejected from this hier
 a separately specified hard detail budget. Provider-session lifecycles and exec sidecars remain
 follow-up surfaces beyond the PR2 launch/reap counters.
 
+### Native-driver diagnostic transitions (O11Y-R09)
+
+`src/driver_diagnostic.rs` emits one `st2.driver.diagnostic` span plus its
+correlated `st2 native driver diagnostic transition` INFO event only when a
+typed failure tuple changes or recovers. `span.label` is the closed stage.
+Span/event attributes are `st2.driver.stage`, `st2.driver.reason`,
+`st2.driver.source`, `st2.driver.support`, and `st2.outcome`; the raw
+`st2.driver.producer_version` is span/log-only. No agent, runtime, session, or
+message id is needed on this transition, and no prompt/message/path value is
+recorded.
+
+The span's stage/reason/source/support/outcome attributes are the same closed
+values used by the counter below. Versions and identities are specifically not
+counter labels or `span.label`. With no trace exporter the span is not
+constructed; with no meter provider the counter returns before touching its
+instrument.
+
 ## Metrics (PR2)
 
 Landed RED-minimal set per interview decision Q5; every label value comes from a bounded enum,
@@ -140,6 +157,7 @@ the instruments; every record call early-outs unless a meter provider is install
 | `hook_invocations_total` | counter | `hook` = registry name (`claude-observe`), `event` = bounded Claude hook-event set, unknown → `other` |
 | `message_deliveries_total` | counter | `result` = `pass` \| `fail` |
 | `crash_loops_total` | counter | — |
+| `driver_diagnostic_transitions_total` | counter | `stage`, `reason`, `source`, `support`, `outcome = failure | recovery` (all closed enums) |
 | `reconcile_pass_duration_seconds` | histogram | — |
 | `session_start_duration_seconds` | histogram | — |
 

@@ -17,6 +17,7 @@ use std::time::Duration;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 
+use crate::driver_diagnostic::{Reason, Source, Stage, Support};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a real meter provider is installed. False → recording is a free no-op.
@@ -87,6 +88,13 @@ static CRASH_LOOPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_unit("1")
         .build()
 });
+static DRIVER_DIAGNOSTICS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("driver_diagnostic_transitions_total")
+        .with_description("Native driver diagnostic failures and recoveries by bounded boundary")
+        .with_unit("1")
+        .build()
+});
 
 /// One reconcile pass finished. `failed` = the pass collected errors.
 pub fn record_reconcile_pass(duration: Duration, failed: bool) {
@@ -150,6 +158,39 @@ pub fn record_crash_loop() {
     }
     CRASH_LOOPS.add(1, &[]);
 }
+/// One native-driver boundary entered failure or recovered. Every label is a closed enum; raw
+/// versions and agent/session/message identity stay on spans and logs.
+pub fn record_driver_diagnostic(
+    stage: Stage,
+    reason: Reason,
+    source: Source,
+    support: Support,
+    recovered: bool,
+) {
+    if !enabled() {
+        return;
+    }
+    DRIVER_DIAGNOSTICS.add(
+        1,
+        &driver_diagnostic_attributes(stage, reason, source, support, recovered),
+    );
+}
+
+fn driver_diagnostic_attributes(
+    stage: Stage,
+    reason: Reason,
+    source: Source,
+    support: Support,
+    recovered: bool,
+) -> [opentelemetry::KeyValue; 5] {
+    [
+        opentelemetry::KeyValue::new("stage", stage.as_str()),
+        opentelemetry::KeyValue::new("reason", reason.as_str()),
+        opentelemetry::KeyValue::new("source", source.as_str()),
+        opentelemetry::KeyValue::new("support", support.as_str()),
+        opentelemetry::KeyValue::new("outcome", if recovered { "recovery" } else { "failure" }),
+    ]
+}
 
 /// The bounded Claude hook-event vocabulary st2 applies; anything else is `other`.
 fn normalize_hook_event(event: &str) -> &'static str {
@@ -184,11 +225,36 @@ mod tests {
         record_message_delivery(true);
         record_crash_loop();
         assert!(!enabled());
+
+        record_driver_diagnostic(
+            Stage::Seed,
+            Reason::UnknownStatus,
+            Source::StatusSnapshot,
+            Support::Supported,
+            false,
+        );
     }
 
     #[test]
     fn unknown_hook_events_collapse_to_other() {
         assert_eq!(normalize_hook_event("SessionStart"), "SessionStart");
         assert_eq!(normalize_hook_event("TotallyNewEvent"), "other");
+    }
+
+    #[test]
+    fn driver_diagnostic_metric_attributes_are_exactly_the_bounded_axes() {
+        let attributes = driver_diagnostic_attributes(
+            Stage::ReadBack,
+            Reason::NotDurable,
+            Source::MessageReadBack,
+            Support::Supported,
+            true,
+        );
+        let keys: Vec<&str> = attributes.iter().map(|attribute| attribute.key.as_str()).collect();
+        assert_eq!(keys, ["stage", "reason", "source", "support", "outcome"]);
+        let rendered = format!("{attributes:?}");
+        for forbidden in ["1.18.19", "h.worker", "ses_", "msg_"] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
     }
 }

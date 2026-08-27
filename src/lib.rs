@@ -16,6 +16,7 @@ pub mod codex_app_server;
 pub mod context;
 pub mod ding;
 pub mod driver;
+pub mod driver_diagnostic;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod event;
