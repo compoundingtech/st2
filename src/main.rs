@@ -1931,7 +1931,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                             observed
                                 .exit
                                 .as_deref()
-                                .map(|exit| format!("exit {exit}"))
+                                .map(str::to_owned)
                                 // A terminal record can carry only a reason — Codex's
                                 // observed systemError writes reason without an exit — and
                                 // discarding it leaves the operator nothing to act on.
