@@ -151,6 +151,30 @@
           };
         };
 
+        # Production variant for catalogs that declare wasm resource-profile resolvers. Keep the
+        # default package lightweight; consumers opt into the wasmtime closure explicitly.
+        st2WasmResolver = st2.overrideAttrs (old: {
+          pname = "st2-wasm-resolver";
+          cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasm-resolver" ];
+          cargoCheckFeatures = (old.cargoCheckFeatures or [ ]) ++ [ "wasm-resolver" ];
+          # Wasmtime's Cranelift build and the feature-gated resolver tests need the Rust toolchain
+          # inherited from buildRustPackage plus an LLVM linker on every supported platform.
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
+        });
+
+        # Non-vacuous feature gate: both the runner's live resync integration and agent-spec's wasm
+        # ABI/containment suite compile and execute with the same features as the production variant.
+        st2WasmResolverCheck = st2WasmResolver.overrideAttrs (_: {
+          pname = "st2-wasm-resolver-check";
+          cargoTestFlags = [
+            "--workspace"
+            "--test"
+            "resync"
+            "--test"
+            "profile_wasm"
+          ];
+        });
+
         # Narrow sandbox-safe integration gate for the atomic snapshot boundary. The main package
         # deliberately omits the broad doctor suite because some doctor cases exercise facilities
         # unavailable in the Nix sandbox. A dedicated target containing exactly one test makes the
@@ -249,6 +273,7 @@
       in
       {
         packages.st2 = st2;
+        packages.st2-wasm-resolver = st2WasmResolver;
         packages.default = st2;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
@@ -266,6 +291,34 @@
         checks.message-cli = st2MessageCli;
         checks.parked-recovery = st2ParkedRecovery;
         checks.otel-export = st2OtelExport;
+        checks.wasm-resolver-feature = st2WasmResolverCheck;
+        # Exercise the shipped binary, not a cargo-side surrogate: its version entrypoint runs and
+        # the same artifact strictly admits a catalog carrying a real wasm profile module.
+        checks.wasm-resolver-artifact = pkgs.runCommand "st2-wasm-resolver-artifact-${version}" { } ''
+          ${st2WasmResolver}/bin/st2 --version |
+            ${pkgs.gnugrep}/bin/grep -E '^st2 [^[:space:]]+' >/dev/null
+
+          catalog="$TMPDIR/catalog"
+          mkdir -p "$catalog/resolvers" "$catalog/h/worker"
+          cp ${self}/crates/agent-spec/tests/fixtures/demo_resolver.wasm \
+            "$catalog/resolvers/goal.wasm"
+          cat > "$catalog/catalog.kdl" <<'EOF'
+          profile "dev.schickling.agent-goal" {
+            wasm "resolvers/goal.wasm"
+            class "immediate"
+          }
+          EOF
+          cat > "$catalog/h/worker/agent.kdl" <<'EOF'
+          agent "worker" {
+            host "h"
+            command "true"
+            resource "goal" uri="dev.schickling.agent-goal://h/worker" reason="Mission."
+          }
+          EOF
+
+          ${st2WasmResolver}/bin/st2 validate "$catalog" --host h --strict
+          touch "$out"
+        '';
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
