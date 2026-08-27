@@ -406,3 +406,51 @@ fn the_retired_link_record_plane_is_gone() {
         "no link-record store may be created"
     );
 }
+
+/// A hand-authored binding may carry a trailing `//` comment explaining it. Removing the binding
+/// removes that explanation with it, and updating one keeps the separator before it.
+/// Regression: `remove` previously refused with `unsafe-source-shape`, and `add` glued the
+/// rendered node onto the comment.
+#[test]
+fn a_binding_with_a_trailing_line_comment_is_removable_and_updatable() {
+    let commented = "// unrelated comment\nagent \"worker\" {\n  host \"h\"\n  meta { managed-by \"catalog\" }\n  resource \"work\" uri=\"github-pr://github.com/o/r/pull/42\" reason=\"PR under preparation.\" // why it is here\n  resource \"notes\" uri=\"agent-notes://h/worker\" reason=\"Durable notes.\"\n  command \"sleep 300\"\n}\n";
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(root, "h/worker/agent.kdl", commented);
+
+    ok(
+        root,
+        &[
+            "resource", "add", "work",
+            "--agent", "worker",
+            "--uri", "https://example.test/x",
+            "--reason", "Changed.",
+        ],
+    );
+    let updated = spec(root);
+    assert!(
+        updated.contains(r#"reason="Changed." // why it is here"#),
+        "the blank before a trailing comment must survive an update:\n{updated}"
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(root, "h/worker/agent.kdl", commented);
+
+    ok(root, &["resource", "remove", "work", "--agent", "worker"]);
+    let after = spec(root);
+    assert!(!after.contains("resource \"work\""), "got:\n{after}");
+    assert!(
+        !after.contains("why it is here"),
+        "the binding's own trailing comment goes with it:\n{after}"
+    );
+    assert!(
+        after.contains("resource \"notes\""),
+        "the sibling binding must survive:\n{after}"
+    );
+    assert!(
+        after.contains("// unrelated comment") && after.contains("command \"sleep 300\""),
+        "unrelated bytes must survive:\n{after}"
+    );
+}

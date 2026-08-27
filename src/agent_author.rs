@@ -1306,8 +1306,11 @@ fn replace_node(text: &str, node: &KdlNode, authored: &str) -> Result<String, Au
             "resource binding span falls outside the declaration",
         )
     })?;
+    // The span can run to the start of trailing trivia, so replacing it verbatim would glue the
+    // rendered node onto a following `// comment`. Leave that separator in the source.
+    let kept = text[range.clone()].trim_end_matches([' ', '\t']).len();
     let mut replacement = text.to_owned();
-    replacement.replace_range(range, authored);
+    replacement.replace_range(range.start..range.start + kept, authored);
     Ok(replacement)
 }
 
@@ -1872,6 +1875,15 @@ fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, A
     Ok(replacement)
 }
 
+/// Whether the remainder of a node's own line is removable trivia: blanks, optionally followed by
+/// a `//` line comment. A hand-authored `resource "work" uri="…" reason="…" // why` owns that
+/// comment, so deleting the binding deletes its explanation with it. `/*` is deliberately not
+/// accepted — a block comment can span lines, and this only ever sees one.
+fn is_line_tail_trivia(tail: &str) -> bool {
+    let rest = tail.trim_start_matches([' ', '\t', '\r']);
+    rest.is_empty() || rest.starts_with("//")
+}
+
 fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
     let span = node.span();
     let start = span.offset();
@@ -1889,9 +1901,7 @@ fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
     if text[line_start..start]
         .chars()
         .all(|value| matches!(value, ' ' | '\t'))
-        && text[end..line_end]
-            .chars()
-            .all(|value| matches!(value, ' ' | '\t' | '\r'))
+        && is_line_tail_trivia(&text[end..line_end])
     {
         let mut replacement = text.to_owned();
         let remove_end = usize::min(line_end + usize::from(line_end < text.len()), text.len());
