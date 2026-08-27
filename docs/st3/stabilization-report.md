@@ -117,3 +117,7 @@ The full workspace check passes with PTY `0.12.0+500eab2`.
 This PTY version includes the metadata patch behavior required by the survival tests.
 
 Nix is unavailable on this host, so `nix flake check` did not run.
+
+## Future overlap work
+
+The [st2 to st3 parity inventory](./st2-parity-inventory.md) records the remaining gaps and test coverage.
