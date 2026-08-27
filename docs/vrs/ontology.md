@@ -132,6 +132,33 @@ Authority: [`harness_state`](../../src/harness_state.rs);
 [05-harness-state requirements](05-harness-state/requirements.md);
 [decision 0006](.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md)
 
+### native driver diagnostic
+
+The current typed explanation that a native harness driver's boundary cannot
+produce trustworthy evidence or complete transport work. It is advisory
+evidence, not the provider's free-form error, not observed harness state, and
+not authority to launch, retry, deliver, reconcile, or archive.
+
+Authority: [05-harness-state requirements OHS-R11–OHS-R15](05-harness-state/requirements.md);
+[`driver_diagnostic`](../../src/driver_diagnostic.rs)
+
+### diagnostic stage
+
+One closed native-driver boundary at which a diagnostic is observed:
+version gate, API gate, event stream, state seed, delivery, or read-back. A
+stage owns its bounded reasons and sources; a reason paired with another stage
+is unknown evidence rather than a best-effort match.
+
+Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+
+### diagnostic evidence age
+
+Reader-derived elapsed time since the current native driver diagnostic was
+observed. The origin timestamp is durable; age is a projection and never file
+mtime.
+
+Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+
 ### restart policy
 
 The declared rules that bound when and how an agent task may be relaunched
@@ -337,6 +364,15 @@ operator action --creates--> unpark request --targets--> owning supervisor run
 leitwort for policy and budget; `park` links the terminal decision to its
 explicit `unpark` recovery request.
 
+```text
+native driver boundary --publishes/clears--> native driver diagnostic
+       |                                      |
+       `-- diagnostic stage                   `-- derives diagnostic evidence age
+```
+
+`diagnostic` is the leitwort for typed driver degradation; `observed` remains
+the leitwort for harness activity evidence.
+
 ## Collision rules
 
 - Qualify **root** as [root agent](requirements.md#L51-L54) or
@@ -358,6 +394,13 @@ explicit `unpark` recovery request.
 - *Working state* remains R09's restored durable context and is never a
   liveness or activity term; the observed signal is **observed harness
   state**, not *working state*.
+- Use **native driver diagnostic** for typed boundary degradation and
+  **observed harness state** for the harness activity projection. Neither is
+  presence or session state, and a driver diagnostic never rewrites the
+  observed tuple.
+- Use **diagnostic stage**, **reason**, and **source** for the closed fields.
+  Provider error prose may be logged, but must not become consumer branching
+  vocabulary.
 - Use **parked task** or **park decision** for the owning supervisor's policy
   decision. Do not use *parked* as a session state or replace the runtime
   observation with it.

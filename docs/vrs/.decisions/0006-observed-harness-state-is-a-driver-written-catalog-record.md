@@ -108,3 +108,32 @@ scoping delivery-input watching is a prerequisite, not a precaution.
 - Root DQ2 and DQ3 are updated: pi gains an evented signal, the observed half
   of DQ3 is specified here, and the declared half (activity status, plan,
   plan step) plus supervisor-following behavior remain open.
+
+## Amendment: native-driver degradation is a sibling typed record
+
+Accepted by Johannes on 2026-08-27 for the OpenCode diagnostics scope.
+
+The observed-state record remains only the harness activity projection and
+delivery still reads none of it. Native-driver degradation is a sibling
+driver-core-owned current record,
+`<agent-dir>/driver-diagnostic` (`st2.driver-diagnostic.v1`), rather than
+free-form OpenCode strings added to `observedState` or interpreted separately
+by roster and Doctor. Its closed axes are stage, reason, source, support, and
+recovery outcome; producer version and observation time are evidence fields.
+The driver publishes at version/API/SSE/seed/delivery/read-back boundaries and
+clears on boundary recovery, without changing transport behavior.
+
+One persisted current snapshot was selected over a failure history or one
+record per stage. The in-process publisher may retain one failure per stage,
+but projects the earliest boundary so downstream symptoms cannot hide an
+admission failure; clearing that boundary reveals the next. History is still
+unjustified, and multiple files would make roster/Doctor choose precedence
+independently.
+
+Absence and unreadable/unknown records are visibly `absent` or
+`indeterminate`, never healthy. `agents --json` always projects that state;
+Doctor applies the same typed reader and stable repair policy where the
+declared native driver is expected to publish it. Telemetry repeats only the
+closed axes on
+metrics and `span.label`; raw versions and identities remain trace/log-only,
+and prompt/message/path content never enters the record or labels.

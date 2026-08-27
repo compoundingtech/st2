@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::message;
 use crate::status::{self, State};
-use crate::{AgentSpec, Discovered, Resource, harness_state};
+use crate::{AgentSpec, Discovered, Resource, driver_diagnostic, harness_state};
 
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
@@ -40,6 +40,9 @@ pub struct AgentRow {
     /// axis independent from declared presence and from desired lifecycle. `None` means no driver
     /// has ever published a record for this agent, which is different from a derived `unknown`.
     pub observed: Option<harness_state::Observed>,
+    /// Current native-driver diagnostic. Absence and unreadable records remain explicit states;
+    /// neither is projected as healthy.
+    pub driver_diagnostic: driver_diagnostic::Observed,
 }
 
 /// Every agent in the catalog, sorted by bus id, with presence + enrich data computed. Read-only:
@@ -74,6 +77,7 @@ pub fn roster_from_discovered(
                 last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
                 observed: observed_state(s, agent_dir, &pty_root, this_host),
+                driver_diagnostic: driver_diagnostic::read(&driver_diagnostic::path(agent_dir)),
             })
         })
         .collect();
@@ -137,6 +141,67 @@ impl<'a> ObservedJson<'a> {
     }
 }
 
+/// The closed `driverDiagnostic` object. Every state uses the same field set so a malformed,
+/// unsupported, or absent record remains machine-visible rather than disappearing as a healthy
+/// null/default.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DriverDiagnosticJson<'a> {
+    status: &'static str,
+    driver: Option<&'a str>,
+    stage: Option<&'static str>,
+    reason: Option<&'static str>,
+    source: Option<&'static str>,
+    producer_version: Option<&'a str>,
+    support: &'static str,
+    observed_at: Option<u64>,
+    evidence_age_ms: Option<u64>,
+    recovery: &'static str,
+}
+
+impl<'a> DriverDiagnosticJson<'a> {
+    fn from_row(observed: &'a driver_diagnostic::Observed) -> Self {
+        match observed {
+            driver_diagnostic::Observed::Absent => Self {
+                status: observed.status(),
+                driver: None,
+                stage: None,
+                reason: None,
+                source: None,
+                producer_version: None,
+                support: "unknown",
+                observed_at: None,
+                evidence_age_ms: None,
+                recovery: "publishFailureOrClearOnStageRecovery",
+            },
+            driver_diagnostic::Observed::Indeterminate(reason) => Self {
+                status: observed.status(),
+                driver: None,
+                stage: None,
+                reason: Some(reason.as_str()),
+                source: None,
+                producer_version: None,
+                support: "unknown",
+                observed_at: None,
+                evidence_age_ms: None,
+                recovery: "replaceWithValidRecordOrClearOnStageRecovery",
+            },
+            driver_diagnostic::Observed::Failure(failure) => Self {
+                status: observed.status(),
+                driver: Some(failure.driver.as_str()),
+                stage: Some(failure.stage.as_str()),
+                reason: Some(failure.reason.as_str()),
+                source: Some(failure.source.as_str()),
+                producer_version: failure.producer_version.as_deref(),
+                support: failure.support.as_str(),
+                observed_at: Some(failure.observed_at),
+                evidence_age_ms: Some(failure.evidence_age_ms),
+                recovery: "clearsOnStageRecovery",
+            },
+        }
+    }
+}
+
 /// `st2 agents --json` row. Field order and names are the stable wire contract.
 #[derive(Serialize)]
 struct SummaryJson<'a> {
@@ -152,6 +217,8 @@ struct SummaryJson<'a> {
     desired_state_reason: Option<&'a str>,
     #[serde(rename = "observedState")]
     observed_state: Option<ObservedJson<'a>>,
+    #[serde(rename = "driverDiagnostic")]
+    driver_diagnostic: DriverDiagnosticJson<'a>,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -172,6 +239,8 @@ struct EnrichedJson<'a> {
     desired_state_reason: Option<&'a str>,
     #[serde(rename = "observedState")]
     observed_state: Option<ObservedJson<'a>>,
+    #[serde(rename = "driverDiagnostic")]
+    driver_diagnostic: DriverDiagnosticJson<'a>,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -191,6 +260,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 last_activity: r.last_activity_ms,
                 inbox: r.inbox,
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
+                driver_diagnostic: DriverDiagnosticJson::from_row(&r.driver_diagnostic),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -207,6 +277,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 desired_state: &r.desired_state,
                 desired_state_reason: r.desired_state_reason.as_deref(),
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
+                driver_diagnostic: DriverDiagnosticJson::from_row(&r.driver_diagnostic),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -272,6 +343,7 @@ mod tests {
             last_activity_ms: last,
             inbox,
             observed: None,
+            driver_diagnostic: driver_diagnostic::Observed::Absent,
         }
     }
 
@@ -292,11 +364,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -316,7 +388,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}}]"#
         );
     }
 
@@ -346,11 +418,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -366,7 +438,43 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null}}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"}}]"#
         );
+    }
+
+    #[test]
+    fn driver_diagnostic_wire_exposes_failure_and_evidence_age_without_identity_payloads() {
+        let mut diagnosed = row("hetz.worker", State::Available, None, false, None, 0);
+        diagnosed.driver_diagnostic =
+            driver_diagnostic::Observed::Failure(driver_diagnostic::Failure {
+                driver: driver_diagnostic::Driver::OpenCode,
+                stage: driver_diagnostic::Stage::ReadBack,
+                reason: driver_diagnostic::Reason::NotDurable,
+                source: driver_diagnostic::Source::MessageReadBack,
+                producer_version: Some("1.18.19".to_string()),
+                support: driver_diagnostic::Support::Supported,
+                observed_at: 100,
+                evidence_age_ms: 25,
+            });
+        let wire: serde_json::Value = serde_json::from_str(&to_json(&[diagnosed], false)).unwrap();
+        assert_eq!(
+            wire[0]["driverDiagnostic"],
+            serde_json::json!({
+                "status": "failure",
+                "driver": "opencode",
+                "stage": "readBack",
+                "reason": "notDurable",
+                "source": "messageReadBack",
+                "producerVersion": "1.18.19",
+                "support": "supported",
+                "observedAt": 100,
+                "evidenceAgeMs": 25,
+                "recovery": "clearsOnStageRecovery"
+            })
+        );
+        let rendered = wire[0]["driverDiagnostic"].to_string();
+        for forbidden in ["prompt", "body", "filename", "sessionId", "messageId"] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
     }
 }

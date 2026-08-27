@@ -8,8 +8,9 @@ spec's R08 section; terminal delivery remains in
 ## Status
 
 Draft. The envelope (`src/harness_state.rs`), all four producers, the scoped
-delivery-input watcher, and the roster/Doctor exposure are implemented; the
-former DELTA-005 fence is resolved and deleted, and the DQ-H1 and DQ-H6
+delivery-input watcher, the native-driver diagnostic snapshot, and the
+roster/Doctor exposure are implemented; the former DELTA-005 fence is
+resolved and deleted, and the DQ-H1 and DQ-H6
 captures are taken and folded in. Draft status remains for the genuinely
 unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
 Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
@@ -17,8 +18,9 @@ are tracked in [open-questions.md](./open-questions.md).
 
 ## Scope
 
-This specification defines the record, its freshness and derivation rules, the
-per-harness producers, and the roster/Doctor exposure. It does not define:
+This specification defines the observed-state record, its freshness and
+derivation rules, the per-harness producers, the adjacent native-driver
+diagnostic record, and their roster/Doctor exposure. It does not define:
 transition history or a `--watch` surface (deferred, OHS-T03); idle thresholds,
 escalation, or notification policy (#173's, per root `R20`); the withdrawn
 host-local hot tier; the cut PTY screen observer; or any `AGENT-SPEC.md`
@@ -364,7 +366,109 @@ pending. The status seed trusts exactly the pinned words (`busy`, `retry`,
 pre-signal escalation cover with the exit the grace-window reap actually
 observed.
 
-## Exposure (OHS-R09, OHS-R10)
+## Native driver diagnostic snapshot (OHS-R11–OHS-R15)
+
+```text
+version gate -> API gate -> SSE -> seed -> delivery -> read-back
+      \_____________ typed failure/recovery transitions ____________/
+                                |
+                                v
+              <agent-dir>/driver-diagnostic
+                  st2.driver-diagnostic.v1
+                                |
+                 +--------------+---------------+
+                 v                              v
+       agents --json.driverDiagnostic     Doctor advisory
+```
+
+The native driver core, not OpenCode prose and not either consumer, owns the
+closed model. The persisted newline-terminated JSON object is atomically
+stage-and-renamed:
+
+```json
+{
+  "schema": "st2.driver-diagnostic.v1",
+  "driver": "opencode",
+  "stage": "readBack",
+  "reason": "notDurable",
+  "source": "messageReadBack",
+  "producerVersion": "1.18.19",
+  "support": "supported",
+  "observedAt": 1787690300000,
+  "recovery": "clearsOnStageRecovery"
+}
+```
+
+`producerVersion` is omitted when the version probe cannot produce one.
+`support` is `supported | unsupported | unknown`; an unrecognized future word
+is distinct from the literal supported vocabulary and makes the record
+indeterminate. Unknown additive object fields are ignored. Unknown enum words,
+a foreign schema/recovery contract, an empty driver, or a known reason paired
+with the wrong stage/source are never accepted as failure evidence.
+
+The closed stage/reason/source matrix is:
+
+| Stage | Reasons | Sources |
+| --- | --- | --- |
+| `versionGate` | `versionProbeFailed`, `unsupportedVersion` | `versionProbe` |
+| `apiGate` | `apiUnavailable`, `incompatibleApi` | `openApiDocument` |
+| `sse` | `sseConnectFailed`, `sseDisconnected`, `unknownEvent` | `eventStream` |
+| `seed` | `statusUnavailable`, `malformedStatus`, `unknownStatus` | `statusSnapshot` |
+| `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
+| `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
+| `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
+| `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
+
+One in-process publisher retains at most one current failure per stage and
+persists the earliest stage in the table's execution order. Re-publishing the
+same tuple is a no-op; it does not refresh `observedAt` or increment telemetry.
+A stage success clears only that stage and atomically reveals the next
+outstanding failure. Clearing the final failure removes the record. At a new
+session, a measured stage success may clear a matching persisted failure from
+the predecessor, so recovery never requires an st2 restart beyond the restart
+that was itself needed to cross a static version/API gate.
+
+OpenCode publishes and clears at the actual boundary, not at a catch-all error
+renderer:
+
+1. `opencode --version` resolves version support before launch.
+2. `/doc` reachability and exact subset compatibility resolve the API gate.
+3. `/event` connect/disconnect/silence and unknown event status resolve SSE.
+4. `/session/status`, `/permission`, and `/question` resolve the atomic seed.
+5. `prompt_async` transport reachability/status resolves delivery.
+6. Exact message GET `200`/`404`/indeterminate resolves read-back.
+
+Diagnostic persistence errors log and do not escape into those operations.
+The existing attempted-before-transport receipt, same-message retry,
+indeterminate-read-back no-resend rule, durable acceptance, and archive
+behavior are unchanged.
+
+The roster projection always has one fixed shape. `failure` fills every
+evidence field; `absent` and `indeterminate` preserve the same keys with null
+evidence and stable reader recovery text:
+
+```json
+"driverDiagnostic": {
+  "status": "failure | absent | indeterminate",
+  "driver": "opencode | null",
+  "stage": "readBack | null",
+  "reason": "notDurable | malformedRecord | unsupportedSchema | unknownVocabulary | futureSkew | null",
+  "source": "messageReadBack | null",
+  "producerVersion": "1.18.19 | null",
+  "support": "supported | unsupported | unknown",
+  "observedAt": 1787690300000,
+  "evidenceAgeMs": 250,
+  "recovery": "clearsOnStageRecovery | publishFailureOrClearOnStageRecovery | replaceWithValidRecordOrClearOnStageRecovery"
+}
+```
+
+Doctor consumes the same `Observed` value and `repair_text` function for
+declarations whose native driver is expected to publish this record (OpenCode
+in this version). It emits an advisory for `failure`, `absent`, and
+`indeterminate`; none changes Doctor's exit status. Roster retains the
+explicit object for every declaration.
+
+## Exposure (OHS-R09, OHS-R10, OHS-R14)
 
 `st2 agents --json` (both forms) appends one field per row:
 
@@ -410,6 +514,12 @@ each only once a real test proves it (per `CLAUDE.md`):
   escalation. Proving tests live in `src/harness_state.rs` today (11 tests)
   plus the planned per-producer suites; the SIGKILL-mid-turn test (`ended`,
   not `active`) gates the teardown row.
+- **Native-driver diagnostic discipline** — exhaustive closed vocabulary,
+  wrong-pair/unknown/malformed/additive decoding, stage-priority recovery,
+  OpenCode delivery/read-back recovery, exact roster wire, Doctor agreement,
+  and bounded telemetry labels are proved by focused unit/integration tests in
+  `src/driver_diagnostic.rs`, `src/opencode_session.rs`, `src/agents.rs`,
+  `src/metrics.rs`, and `tests/doctor.rs`.
 
 ## Open design questions
 

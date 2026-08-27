@@ -518,3 +518,76 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     );
     assert!(stdout.contains("(malformed-record)"), "{stdout}");
 }
+
+#[test]
+fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
+    use st2::driver_diagnostic::{Driver, Publisher, Reason, Source, Stage, Support};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; opencode { prompt "go" } }"#,
+    )
+    .unwrap();
+    let agent_dir = declaration.parent().unwrap();
+    fs::write(agent_dir.join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    let mut publisher = Publisher::new(
+        agent_dir,
+        Driver::OpenCode,
+        Some("1.18.19".to_string()),
+        Support::Supported,
+    );
+    publisher.publish(Stage::Seed, Reason::UnknownStatus, Source::StatusSnapshot);
+
+    let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(&catalog)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+    assert!(roster.status.success());
+    let wire: serde_json::Value = serde_json::from_slice(&roster.stdout).unwrap();
+    assert_eq!(wire[0]["driverDiagnostic"]["status"], "failure");
+    assert_eq!(wire[0]["driverDiagnostic"]["stage"], "seed");
+    assert_eq!(wire[0]["driverDiagnostic"]["reason"], "unknownStatus");
+
+    let diagnosed = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&diagnosed.stdout);
+    assert!(diagnosed.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic: seed/unknownStatus"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(st2::driver_diagnostic::repair_text(
+            &st2::driver_diagnostic::read(&st2::driver_diagnostic::path(agent_dir))
+        )),
+        "{stdout}"
+    );
+
+    publisher.clear(Stage::Seed);
+    let recovered = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&recovered.stdout);
+    assert!(recovered.status.success(), "{stdout}");
+    assert!(stdout.contains("native driver diagnostic absent"), "{stdout}");
+    assert!(!stdout.contains("seed/unknownStatus"), "{stdout}");
+
+    fs::write(st2::driver_diagnostic::path(agent_dir), b"{bad").unwrap();
+    let malformed = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&malformed.stdout);
+    assert!(malformed.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic indeterminate (malformedRecord)"),
+        "{stdout}"
+    );
+}
