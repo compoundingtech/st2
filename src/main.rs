@@ -81,7 +81,8 @@ enum Command {
     /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
-    /// An agent's linked resources (high-value output a peer can find): add/ls/read/remove.
+    /// An agent's declared Resource bindings (a named, exact URI a peer can resolve):
+    /// ls/read/add/remove/rename.
     #[command(subcommand)]
     Resource(ResourceCmd),
     /// Install `st2 up` as a systemd-user service on headless Linux. macOS stays manual (TCC).
@@ -658,41 +659,73 @@ enum HooksCmd {
 
 #[derive(Subcommand)]
 enum ResourceCmd {
-    /// Link a resource (a URL you produced or reference) into your resource list.
-    Add {
-        /// The resource URL (any `scheme:` — http/https/file/pty/…).
-        url: String,
-        #[arg(long)]
-        title: Option<String>,
-        /// Comma-separated tags.
-        #[arg(long = "tag", value_delimiter = ',')]
-        tags: Vec<String>,
-        /// A relation label (e.g. `output`, `reference`).
-        #[arg(long)]
-        relation: Option<String>,
-        /// Read a body/notes from stdin.
-        #[arg(long = "body-stdin")]
-        body_stdin: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// List an agent's resources. Defaults to your own.
+    /// List an agent's declared Resource bindings. Defaults to your own.
     Ls {
+        /// Whose declaration to read — bus id or bare identity. Defaults to you (`$ST_AGENT`).
         identity: Option<String>,
+        /// Emit the bindings as a JSON array.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// Read one resource. With a leading identity, from that agent; otherwise your own.
+    /// Read one declared binding. With a leading identity, from that agent; otherwise your own.
     Read {
         first: String,
         second: Option<String>,
+        /// Emit the binding as a JSON object.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// Remove one resource.
+    /// Declare a Resource binding, or prove the identical binding already exists.
+    Add {
+        /// The agent-local binding name.
+        name: String,
+        /// The exact absolute URI this binding names (any `scheme:` — the identity is verbatim).
+        #[arg(long)]
+        uri: String,
+        /// Why this reference belongs in the declaration.
+        #[arg(long)]
+        reason: String,
+        /// Preserve the binding as no longer active for this agent, and say why.
+        #[arg(long = "inactive-reason", value_name = "TEXT")]
+        inactive_reason: Option<String>,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Remove one declared binding, or prove it is already absent.
     Remove {
-        first: String,
-        second: Option<String>,
+        /// The agent-local binding name.
+        name: String,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Rename one declared binding's agent-local label, keeping its uri and reasons.
+    Rename {
+        /// The current binding name.
+        old: String,
+        /// The new binding name.
+        new: String,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -3136,98 +3169,208 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
     }
 }
 
+/// Read one agent's declared Resource bindings. Selector resolution mirrors the mediated author
+/// (`bus_id` first, then bare identity, unique or refuse) so `ls` and `add` always name the same
+/// declaration, and a malformed catalog refuses rather than silently hiding an agent.
+fn resource_bindings(
+    root: &Path,
+    selector: &str,
+    host: &str,
+) -> Result<(String, Vec<st2::Resource>)> {
+    let _catalog_lock = st2::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for Resource bindings")?;
+    let found = st2::discover_strict(root);
+    if let Some(error) = found.errors.first() {
+        anyhow::bail!(
+            "cannot prove an exact Resource binding target while {} is malformed: {}",
+            error.path.display(),
+            error.message
+        );
+    }
+    let exact = found
+        .specs
+        .iter()
+        .filter(|spec| spec.bus_id(host) == selector)
+        .collect::<Vec<_>>();
+    let matches = if exact.is_empty() {
+        found
+            .specs
+            .iter()
+            .filter(|spec| spec.identity == selector)
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    match matches.as_slice() {
+        [] => anyhow::bail!("no agent '{selector}' found in catalog {}", root.display()),
+        [spec] => Ok((spec.bus_id(host), spec.resources.clone())),
+        many => {
+            let mut candidates = many
+                .iter()
+                .map(|spec| format!("{} ({})", spec.bus_id(host), spec.path.display()))
+                .collect::<Vec<_>>();
+            candidates.sort();
+            anyhow::bail!(
+                "agent selector '{selector}' is ambiguous: {}",
+                candidates.join(", ")
+            )
+        }
+    }
+}
+
 fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
-        ResourceCmd::Add {
-            url,
-            title,
-            tags,
-            relation,
-            body_stdin,
+        ResourceCmd::Ls {
+            identity,
+            json,
             ctx,
         } => {
-            let (root, host) = resolve_ctx(&ctx)?;
-            let id = acting_id(&ctx)?;
-            let body = if body_stdin {
-                std::io::read_to_string(std::io::stdin())?
-            } else {
-                String::new()
-            };
-            let f = message::with_resolved_state_dir(
-                &root,
-                &id,
-                &host,
-                &["resources", "links"],
-                true,
-                |dir| {
-                    st2::resource::add(
-                        dir,
-                        &url,
-                        title.as_deref(),
-                        &tags,
-                        relation.as_deref(),
-                        &body,
-                    )
-                },
-            )?;
-            println!("{f}");
-            Ok(())
-        }
-        ResourceCmd::Ls { identity, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let id = match identity {
                 Some(i) => i,
                 None => acting_id(&ctx)?,
             };
-            let dir = st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?);
-            let items = st2::resource::list(&dir);
-            println!("# {} resource{} for {id}", items.len(), plural(items.len()));
-            for r in &items {
-                let title = r.title.as_deref().unwrap_or("");
-                println!("{}  {}  {title}", r.filename, r.url);
+            let (identity, bindings) = resource_bindings(&root, &id, &host)?;
+            if json {
+                println!("{}", serde_json::to_string(&bindings)?);
+                return Ok(());
             }
-            Ok(())
-        }
-        ResourceCmd::Read { first, second, ctx } => {
-            let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
-            let dir = st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?);
-            let r = st2::resource::read(&dir, &filename)?;
-            println!("url:      {}", r.url);
-            if let Some(t) = &r.title {
-                println!("title:    {t}");
-            }
-            if !r.tags.is_empty() {
-                println!("tags:     {}", r.tags.join(", "));
-            }
-            if let Some(rel) = &r.relation {
-                println!("relation: {rel}");
-            }
-            if !r.body.is_empty() {
-                println!();
-                print!("{}", r.body);
-            }
-            Ok(())
-        }
-        ResourceCmd::Remove { first, second, ctx } => {
-            let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
-            anyhow::ensure!(
-                message::is_message_filename(&filename),
-                "invalid resource filename {filename:?}"
+            println!(
+                "# {} resource{} for {identity}",
+                bindings.len(),
+                plural(bindings.len())
             );
-            message::with_resolved_state_dir(
+            // Align the uri column to the widest name so a long binding name still leaves a
+            // separator. `{:<width$}` pads by chars, so measure chars, not bytes.
+            let width = bindings
+                .iter()
+                .map(|binding| binding.name().chars().count())
+                .max()
+                .unwrap_or(0)
+                + 2;
+            for binding in &bindings {
+                println!("  {:<width$}{}", binding.name(), binding.uri());
+            }
+            Ok(())
+        }
+        ResourceCmd::Read {
+            first,
+            second,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (id, name) = box_target(first, second, &ctx)?;
+            let (identity, bindings) = resource_bindings(&root, &id, &host)?;
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.name() == name)
+                .with_context(|| format!("no resource binding '{name}' declared by {identity}"))?;
+            if json {
+                println!("{}", serde_json::to_string(binding)?);
+                return Ok(());
+            }
+            println!("{:<17}{}", "name:", binding.name());
+            println!("{:<17}{}", "uri:", binding.uri());
+            println!("{:<17}{}", "reason:", binding.reason());
+            if let Some(inactive_reason) = binding.inactive_reason() {
+                println!("{:<17}{}", "inactive-reason:", inactive_reason);
+            }
+            Ok(())
+        }
+        ResourceCmd::Add {
+            name,
+            uri,
+            reason,
+            inactive_reason,
+            agent,
+            json,
+            ctx,
+        } => {
+            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let receipt = st2::agent_author::add_resource(
                 &root,
-                &id,
+                &target,
                 &host,
-                &["resources", "links"],
-                false,
-                |dir| st2::resource::remove(dir, &filename),
+                actor.as_deref(),
+                &name,
+                &uri,
+                &reason,
+                inactive_reason.as_deref(),
             )?;
-            println!("removed");
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{:?} resource {} on {}",
+                    receipt.result, receipt.name, receipt.identity
+                );
+            }
+            Ok(())
+        }
+        ResourceCmd::Remove {
+            name,
+            agent,
+            json,
+            ctx,
+        } => {
+            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let receipt =
+                st2::agent_author::remove_resource(&root, &target, &host, actor.as_deref(), &name)?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{:?} resource {} on {}",
+                    receipt.result, receipt.name, receipt.identity
+                );
+            }
+            Ok(())
+        }
+        ResourceCmd::Rename {
+            old,
+            new,
+            agent,
+            json,
+            ctx,
+        } => {
+            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let receipt = st2::agent_author::rename_resource(
+                &root,
+                &target,
+                &host,
+                actor.as_deref(),
+                &old,
+                &new,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{:?} resource {} -> {} on {}",
+                    receipt.result, receipt.old, receipt.new, receipt.identity
+                );
+            }
             Ok(())
         }
     }
+}
+
+/// The catalog root, host, acting actor, and authored target for one mediated binding edit.
+fn resource_author_target(
+    agent: Option<String>,
+    ctx: &MsgCtx,
+) -> Result<(PathBuf, String, Option<String>, String)> {
+    let (root, host) = resolve_ctx(ctx)?;
+    let actor = ctx
+        .as_id
+        .clone()
+        .or_else(|| std::env::var("ST_AGENT").ok())
+        .filter(|value| !value.is_empty());
+    let target = agent
+        .or_else(|| actor.clone())
+        .context("no resource binding target: pass --agent, --as, or set $ST_AGENT")?;
+    Ok((root, host, actor, target))
 }
 
 /// Resolve an agent's context dir (`<agent_dir>/resources/context`). Identity defaults to `$ST_AGENT`.

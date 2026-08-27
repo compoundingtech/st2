@@ -39,7 +39,6 @@ pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
 pub mod request;
-pub mod resource;
 pub mod resync;
 pub mod run;
 pub mod service;

@@ -3248,11 +3248,13 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
         "{}",
         String::from_utf8_lossy(&context.stderr)
     );
-    let resource = st2()
+    let message = st2()
         .args([
-            "resource",
-            "add",
-            "https://example.test/result",
+            "message",
+            "send",
+            "host.old",
+            "-m",
+            "state plane during apply",
             "--catalog",
             catalog_text,
             "--as",
@@ -3263,9 +3265,9 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
         .output()
         .unwrap();
     assert!(
-        resource.status.success(),
+        message.status.success(),
         "{}",
-        String::from_utf8_lossy(&resource.stderr)
+        String::from_utf8_lossy(&message.stderr)
     );
     let status = st2()
         .args([
@@ -3290,7 +3292,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
         "working during apply"
     );
     assert!(
-        old.join("resources/links")
+        old.join("resources/inbox")
             .read_dir()
             .unwrap()
             .next()
@@ -3579,7 +3581,7 @@ fn marker_time_status_write_remains_bound_to_its_retained_agent_capability() {
 }
 
 #[test]
-fn marker_time_context_and_resource_writes_reject_a_swapped_state_ancestor() {
+fn marker_time_state_plane_writes_reject_a_swapped_state_ancestor() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     write_agent(&catalog, "old", false);
@@ -3618,15 +3620,17 @@ fn marker_time_context_and_resource_writes_reject_a_swapped_state_ancestor() {
             "must-not-land",
         ),
         (
-            "resource",
+            "decisions",
             vec![
-                "resource",
-                "add",
-                "https://example.test/must-not-land",
+                "context",
+                "append",
+                "host.old",
+                "--decision",
+                "must-not-land",
+                "--why",
+                "must-not-land",
                 "--catalog",
                 catalog.to_str().unwrap(),
-                "--as",
-                "host.old",
                 "--host",
                 "host",
             ],
