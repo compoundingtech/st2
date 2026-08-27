@@ -13,8 +13,64 @@ use agent_spec::spec::{
     TaskLifecycle,
 };
 use agent_spec::{
-    AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
+    AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_file,
+    discover_strict,
 };
+
+#[test]
+fn root_catalog_envelope_allows_a_profile_beside_an_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "catalog.kdl",
+        r#"profile "dev.example.goal" {
+  wasm "resolver.wasm"
+}
+agent "root-agent" { command "true" }
+"#,
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(find(&found.specs, "root-agent").identity, "root-agent");
+    let (specs, warnings) =
+        discover_file(tmp.path(), &tmp.path().join("catalog.kdl")).unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("identity mismatch")),
+        "{warnings:?}"
+    );
+    assert_eq!(find(&specs, "root-agent").identity, "root-agent");
+}
+
+#[test]
+fn nested_catalog_basename_does_not_admit_profile_envelope_nodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "nested/catalog.kdl",
+        r#"profile "dev.example.goal" {
+  wasm "resolver.wasm"
+}
+agent "nested-agent" { command "true" }
+"#,
+    );
+
+    let nested = tmp.path().join("nested/catalog.kdl");
+    let found = discover_strict(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert_eq!(found.errors[0].path, nested);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("[unexpected-top-level-node]"),
+        "{:?}",
+        found.errors
+    );
+    assert!(discover_file(tmp.path(), &nested).is_err());
+}
 
 #[test]
 fn desired_state_is_typed_and_legacy_retirement_remains_readable() {
@@ -1737,7 +1793,7 @@ fn non_spec_files_are_skipped_silently() {
 }
 
 #[test]
-fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
+fn adjacent_and_nested_bundle_kdl_are_outside_strict_agent_admission() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -1748,6 +1804,11 @@ fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
         tmp.path(),
         "agents/hetz/x/agent.kdl",
         r#"agent "x" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/x/docs/agent.kdl",
+        r#"note "static payload despite the generic filename""#,
     );
 
     let found = discover(tmp.path());

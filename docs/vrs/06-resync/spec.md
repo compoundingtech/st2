@@ -32,30 +32,41 @@ resources/inbox/<unix-ms>-<rand6>.md   → DING » marker, normal wake
 
 ## Carrier resolution
 
-A binding URI resolves to a watchable local path when:
+A binding URI resolves to a watchable local path in this precedence order:
 
-1. It is an absolute `file://` URI — the path component is lexically cleaned
-   (`.`/`..`) without following symlinks.
-2. It is a catalog-relative path (no scheme) — resolved against the agent's
-   declaration directory and lexically cleaned the same way.
+1. A URI whose exact scheme has a declared
+   [`07-resource-profile`](../07-resource-profile/spec.md) resolves through that
+   profile to a host-contained path and declared notification class.
+2. An unregistered absolute `file://` URI uses its lexically cleaned path
+   component (`.`/`..`) without following symlinks.
+3. A catalog-relative path with no scheme resolves against the agent's
+   declaration directory and is lexically cleaned the same way.
 
-Everything else (any other scheme) is not watchable. Watchability of every
-active binding is projected into `st2 agents --json` as part of the declared
-Resource projection so absence of coverage is observable, never silent.
+Any other unregistered scheme is not watchable. A registered profile that
+cannot load or resolve also leaves only that binding unwatchable; it never
+falls back to a guessed local rule or stops the supervisor. Watchability of
+every active binding is projected into `st2 agents --json` as part of the
+declared Resource projection so absence of coverage is observable.
 
 ## Classification
 
-| Class | Members (by resolved path relative to the agent dir, or the declaration itself) | Window |
-| --- | --- | --- |
-| immediate | the agent's own `agent.kdl`; carriers whose binding name is `goal` or whose basename is `goal.md` | short (500 ms provisional) |
-| silent | paths under `resources/context`, `resources/decisions`, `resources/friction` | never emits |
-| coalesced | every other watchable local carrier | long (5 s provisional) |
+Classification is decided before a path enters the watch set:
 
-Windows are constants in one place, named as provisional, and tuned by
-observed notification volume (issue #341 rollout note). A burst inside a
-window collapses to one pass; when subscribers of different classes share a
-path, each remains dirty until its own class window. Within one due class each
-changed carrier gets its own event so per-binding supersession stays meaningful.
+| Source | Class | Window |
+| --- | --- | --- |
+| profile-resolved carrier | the trusted `class` beside the catalog's resolver module | `immediate`: short; `coalesced`: long; `silent`: excluded |
+| native declaration | immediate | short (500 ms provisional) |
+| native local carrier named `goal` or with basename `goal.md` | immediate | short (500 ms provisional) |
+| native local path under `resources/context`, `resources/decisions`, or `resources/friction` | silent | excluded |
+| every other native local carrier | coalesced | long (5 s provisional) |
+
+Profile class takes precedence over basename/path heuristics; the guest module
+cannot choose it. Windows are constants in one place, named as provisional,
+and tuned by observed notification volume (issue #341 rollout note). A burst
+inside a window collapses to one pass; when subscribers of different classes
+share a path, each remains dirty until its own class window. Within one due
+class each changed carrier gets its own event so per-binding supersession stays
+meaningful.
 
 ## Watcher mechanics
 

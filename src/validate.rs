@@ -153,13 +153,25 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
     // 2. The catalog's own declaration. Its field set is closed (like `type`), so a typo is checkable
     //    here without touching render-agnosticism — and it must be, because a mistyped `pty-root`
     //    silently resolves back to `<catalog>/pty` and reads as an agent whose task is dead.
-    if let Err(e) = crate::catalog::load(root) {
-        issues.push(Issue::error(
-            "catalog-config",
-            crate::catalog::CONFIG_FILE.to_string(),
-            None,
-            e.to_string(),
-        ));
+    match crate::catalog::load(root) {
+        Ok(_) => {
+            if let Err(error) = crate::catalog_transaction::validate_catalog_profile_modules(root) {
+                issues.push(Issue::error(
+                    "profile-module",
+                    crate::catalog::CONFIG_FILE.to_string(),
+                    None,
+                    format!("{error:#}"),
+                ));
+            }
+        }
+        Err(error) => {
+            issues.push(Issue::error(
+                "catalog-config",
+                crate::catalog::CONFIG_FILE.to_string(),
+                None,
+                error.to_string(),
+            ));
+        }
     }
 
     // 3. Raw pass (once per file): a typo'd `type` is normalized to `service` by the parser, so it can

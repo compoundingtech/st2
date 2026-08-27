@@ -1862,12 +1862,15 @@ fn reconcile_pass(
         // pass's observation. Install them before executing unrelated repairs; targeted upserts
         // preserve every retained baseline and pending transition.
         for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
-            resync.install_live(&spec, this_host);
+            report
+                .warnings
+                .extend(resync.install_live(&spec, this_host));
         }
     }
+    let mut boundary_warnings = Vec::new();
     let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
         if let Some(resync) = resync {
-            resync.install_live(spec, this_host);
+            boundary_warnings.extend(resync.install_live(spec, this_host));
         }
     };
     execute_reconcile(
@@ -1878,18 +1881,35 @@ fn reconcile_pass(
         &mut report,
         &mut install_new_live_seat,
     );
+    report.warnings.extend(boundary_warnings);
     if let Some(resync) = resync {
+        let profiles = crate::catalog::declared_profiles(root)
+            .context("parse resource profiles in catalog.kdl");
+        let catalog_profile_error = profiles.is_err();
         let malformed_declarations = found
             .errors
             .iter()
             .map(|error| error.path.clone())
+            .filter(|path| {
+                // An invalid profile envelope must drop profile-resolved carriers rather than
+                // preserve their stale semantics through malformed-declaration retention.
+                !catalog_profile_error || *path != crate::catalog::config_path(root)
+            })
             .collect::<Vec<_>>();
-        resync.refresh(
+        let profiles = match profiles {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                report.errors.push(format!("{error:#}"));
+                agent_spec::profile::ResourceProfileRegistry::empty()
+            }
+        };
+        report.warnings.extend(resync.refresh_with_profiles(
+            profiles,
             &live_resync_specs(&compiled_specs, this_host, &sessions, &report),
             this_host,
             &sessions,
             &malformed_declarations,
-        );
+        ));
     }
     report
 }
@@ -2762,8 +2782,6 @@ fn up_loop_until(
     install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogDeclarationWatcher>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
-    crate::event::publish_owner_binding(root, this_host)
-        .context("publish machine-local stream owner binding")?;
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
     let mut watcher = install_watcher(root, tx);
@@ -2776,7 +2794,12 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
-    let resync = crate::resync::ResyncSupervisor::spawn(root.to_path_buf(), this_host.to_owned());
+    // Profile parsing and stream-owner publication both belong behind the catalog read fence.
+    // Defer them together until the first readable pass: an incomplete catalog apply keeps a
+    // resident supervisor alive and retrying without exposing declarations or starting runtime I/O.
+    // Once initialized, every reconcile pass reloads profiles and atomically replaces the registry
+    // with the watch set; malformed later edits install an empty, fail-closed profile set.
+    let mut resync = None;
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
@@ -2784,6 +2807,33 @@ fn up_loop_until(
     loop {
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
+        if resync.is_none() {
+            let catalog_lock = match crate::CatalogLock::shared(root) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    pre.skipped = true;
+                    pre.errors.push(format!(
+                        "acquire shared catalog-authoring lock for resident initialization (pass skipped): {error:#}"
+                    ));
+                    on_report(&pre);
+                    if stop.load(Ordering::SeqCst)
+                        || wait_for_reconcile(&rx, interval, stop) == ReconcileWake::Stop
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let profiles = crate::catalog::declared_profiles(root)
+                .context("parse resource profiles in catalog.kdl")?;
+            crate::event::publish_owner_binding_under_lock(root, this_host, &catalog_lock)
+                .context("publish machine-local stream owner binding")?;
+            resync = Some(crate::resync::ResyncSupervisor::with_profiles(
+                root.to_path_buf(),
+                this_host.to_owned(),
+                profiles,
+            ));
+        }
         let mut report = {
             let started = Instant::now();
             let span = reconcile_span(this_host, "catalog");
@@ -2797,7 +2847,7 @@ fn up_loop_until(
                     &mut cap,
                     &mut debounce,
                     &mut presentation_cursor,
-                    Some(&resync),
+                    resync.as_ref(),
                 );
                 finish_reconcile_pass(&span, &pass);
                 pass
@@ -3263,9 +3313,12 @@ mod tests {
         .unwrap();
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let stop = &stop;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(350));
                 stop.store(true, Ordering::SeqCst);
             });
@@ -3276,7 +3329,10 @@ mod tests {
                 Duration::from_millis(100),
                 &stop,
                 |_, _| None, // watcher installation fails, as it did on dev3's oversized catalog
-                |_| passes += 1,
+                |_| {
+                    passes += 1;
+                    let _ = started_tx.try_send(());
+                },
             )
             .unwrap();
         });
@@ -3299,10 +3355,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let passes = std::sync::Arc::new(AtomicUsize::new(0));
         let observed = passes.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let started = Instant::now();
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(200));
                 std::fs::write(
                     &spec,
@@ -3333,6 +3391,7 @@ mod tests {
                 best_effort_catalog_watcher,
                 |_| {
                     passes.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.try_send(());
                 },
             )
             .unwrap();
@@ -3343,6 +3402,139 @@ mod tests {
             "a declaration mutation must wake the supervisor long before the 60s timer"
         );
         assert!(observed.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn resident_loop_reloads_added_changed_removed_and_malformed_profiles() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" {
+  host "test-host"
+  command "true"
+  resource "alpha" uri="alpha://test-host/live" reason="Alpha."
+  resource "beta" uri="beta://test-host/live" reason="Beta."
+}"#,
+        )
+        .unwrap();
+        let missing = catalog.path().join("missing.wasm");
+        let profile = |scheme: &str| {
+            format!(
+                "profile {scheme:?} {{ wasm {:?} }}\n",
+                missing.display().to_string()
+            )
+        };
+        let config = crate::catalog::config_path(catalog.path());
+        let runner = SpawnCountingRunner::default();
+        runner
+            .sessions
+            .borrow_mut()
+            .push(sess("test-host.live.agent", true));
+        let stop = AtomicBool::new(false);
+        let mut reports = Vec::new();
+
+        up_loop_until(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_millis(5),
+            &stop,
+            |_, _| None,
+            |report| {
+                let pass = reports.len();
+                reports.push((report.warnings.clone(), report.errors.clone()));
+                match pass {
+                    0 => std::fs::write(&config, profile("alpha")).unwrap(),
+                    1 => std::fs::write(&config, profile("beta")).unwrap(),
+                    2 => std::fs::write(&config, "").unwrap(),
+                    3 => stop.store(true, Ordering::SeqCst),
+                    _ => unreachable!("profile removal run stops after four passes"),
+                }
+            },
+        )
+        .unwrap();
+
+        let profile_warnings = |reports: &Vec<(Vec<String>, Vec<String>)>, pass: usize| {
+            reports[pass]
+                .0
+                .iter()
+                .filter(|warning| warning.contains("resync profile"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            profile_warnings(&reports, 0).is_empty(),
+            "no profile is initially declared"
+        );
+        assert!(
+            profile_warnings(&reports, 1)
+                .iter()
+                .any(|warning| warning.contains("resource 'alpha'")),
+            "an added profile takes effect: {:?}",
+            reports[1]
+        );
+        assert!(
+            profile_warnings(&reports, 2)
+                .iter()
+                .any(|warning| warning.contains("resource 'beta'"))
+                && !profile_warnings(&reports, 2)
+                    .iter()
+                    .any(|warning| warning.contains("resource 'alpha'")),
+            "changing definitions replaces the registry: {:?}",
+            reports[2]
+        );
+        assert!(
+            profile_warnings(&reports, 3).is_empty(),
+            "removing every profile removes the old resolution semantics: {:?}",
+            reports[3]
+        );
+
+        // A separate resident lifetime starts valid, then makes the envelope malformed. The
+        // initial hard parse still accepts the valid declaration; the later edit must clear its
+        // active semantics rather than silently carrying them forward.
+        std::fs::write(&config, profile("alpha")).unwrap();
+        stop.store(false, Ordering::SeqCst);
+        let mut malformed_reports = Vec::new();
+        up_loop_until(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_millis(5),
+            &stop,
+            |_, _| None,
+            |report| {
+                let pass = malformed_reports.len();
+                malformed_reports.push((report.warnings.clone(), report.errors.clone()));
+                match pass {
+                    0 => std::fs::write(
+                        &config,
+                        r#"profiel "alpha" { wasm "missing.wasm" }"#,
+                    )
+                    .unwrap(),
+                    1 => stop.store(true, Ordering::SeqCst),
+                    _ => unreachable!("malformed profile run stops after two passes"),
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            profile_warnings(&malformed_reports, 0)
+                .iter()
+                .any(|warning| warning.contains("resource 'alpha'")),
+            "the profile is active before the malformed edit: {:?}",
+            malformed_reports[0]
+        );
+        assert!(
+            malformed_reports[1]
+                .1
+                .iter()
+                .any(|error| error.contains("unknown catalog.kdl top-level node 'profiel'"))
+                && profile_warnings(&malformed_reports, 1).is_empty(),
+            "malformed catalog state is reported and fails closed instead of retaining alpha: {:?}",
+            malformed_reports[1]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -3487,9 +3679,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
         let mut warnings_seen = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let stop = &stop;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(300));
                 stop.store(true, Ordering::SeqCst);
             });
@@ -3503,6 +3698,7 @@ mod tests {
                 |report| {
                     passes += 1;
                     warnings_seen += report.warnings.len();
+                    let _ = started_tx.try_send(());
                 },
             )
             .unwrap();
@@ -4025,14 +4221,18 @@ mod tests {
             &mut report,
             &mut |spec| {
                 install_count += 1;
-                resync.install_live(spec, "hetz");
+                assert!(resync.install_live(spec, "hetz").is_empty());
             },
         );
-        resync.refresh(
-            &live_resync_specs(specs, "hetz", &[], &report),
-            "hetz",
-            &[],
-            &[],
+        assert!(
+            resync
+                .refresh(
+                    &live_resync_specs(specs, "hetz", &[], &report),
+                    "hetz",
+                    &[],
+                    &[],
+                )
+                .is_empty()
         );
         assert!(install_count > 0 || report.launched.is_empty());
         report
@@ -4263,15 +4463,19 @@ mod tests {
                 &mut report,
                 &mut |spec| {
                     installs.fetch_add(1, AtomicOrdering::SeqCst);
-                    resync.install_live(spec, "hetz");
+                    assert!(resync.install_live(spec, "hetz").is_empty());
                 },
             );
         });
-        resync.refresh(
-            &live_resync_specs(&specs, "hetz", &[], &report),
-            "hetz",
-            &[],
-            &[],
+        assert!(
+            resync
+                .refresh(
+                    &live_resync_specs(&specs, "hetz", &[], &report),
+                    "hetz",
+                    &[],
+                    &[],
+                )
+                .is_empty()
         );
 
         assert_eq!(

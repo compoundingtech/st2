@@ -23,6 +23,24 @@ fn write_agent(root: &Path) -> PathBuf {
     dir
 }
 
+/// Same catalog fixture, but the goal binding is a profile-scheme URI instead of a
+/// catalog-relative path.
+fn write_agent_with_goal_scheme(root: &Path) -> PathBuf {
+    let dir = root.join("agents/hetz/worker");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("agent.kdl"),
+        r#"agent "worker" {
+  host "hetz"
+  command "agent"
+  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+}"#,
+    )
+    .unwrap();
+    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    dir
+}
+
 fn resync_events(agent_dir: &Path) -> Vec<String> {
     let inbox = agent_dir.join("resources/inbox");
     let mut subjects = Vec::new();
@@ -59,11 +77,15 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     // Seed the baseline before any writes: the seeded digest emits nothing.
     let supervisor =
         st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
-    supervisor.refresh(
-        &st2::discover_strict(catalog.path()).specs,
-        "hetz",
-        &[],
-        &[],
+    assert!(
+        supervisor
+            .refresh(
+                &st2::discover_strict(catalog.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
+            .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(resync_events(&agent_dir).len(), 0, "seeding is silent");
@@ -150,11 +172,15 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
 
     let supervisor =
         st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
-    supervisor.refresh(
-        &st2::discover_strict(catalog.path()).specs,
-        "hetz",
-        &[],
-        &[],
+    assert!(
+        supervisor
+            .refresh(
+                &st2::discover_strict(catalog.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
+            .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
 
@@ -204,4 +230,124 @@ fn declaring_the_reserved_resync_stream_is_refused() {
         "refusal must name the reservation: {:?}",
         found.errors
     );
+}
+
+/// The demo resolver guest, built from `crates/demo-resolver-wasm` (see its module docs for the
+/// rebuild recipe). It maps `dev.schickling.agent-goal://<host>/<id>` to
+/// `<agent_dir>/resources/goal.md`.
+const DEMO_WASM_SRC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/agent-spec/tests/fixtures/demo_resolver.wasm"
+);
+
+/// Declare a catalog-level wasm profile for the goal scheme and materialize the fixture module
+/// where the declaration points: `<catalog>/resolvers/goal.wasm` (catalog-root anchored).
+fn catalog_with_profile(catalog: &Path, class: &str) {
+    fs::create_dir_all(catalog.join("resolvers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, catalog.join("resolvers/goal.wasm")).unwrap();
+    fs::write(
+        st2::catalog::config_path(catalog),
+        format!(
+            r#"profile "dev.schickling.agent-goal" {{
+  wasm "resolvers/goal.wasm"
+  class "{class}"
+}}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "wasm-resolver")]
+fn declared_wasm_profile_resolves_a_scheme_uri_goal_binding_and_fires_on_change() {
+    // Immediate-class declaration: the scheme-URI binding resolves through the wasm module to
+    // resources/goal.md and one content change becomes one event.
+    let catalog = tempfile::tempdir().unwrap();
+    let agent_dir = write_agent_with_goal_scheme(catalog.path());
+    catalog_with_profile(catalog.path(), "immediate");
+    let registry = st2::catalog::declared_profiles(catalog.path()).unwrap();
+
+    let supervisor = st2::resync::ResyncSupervisor::with_profiles(
+        catalog.path().to_path_buf(),
+        "hetz".to_owned(),
+        registry,
+    );
+    assert!(
+        supervisor
+            .refresh(
+                &st2::discover_strict(catalog.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
+            .is_empty()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(resync_events(&agent_dir).len(), 0, "seeding is silent");
+
+    let goal = agent_dir.join("resources/goal.md");
+    fs::create_dir_all(goal.parent().unwrap()).unwrap();
+    fs::write(&goal, "ship profiles v1\n").unwrap();
+    assert!(
+        wait_for(|| resync_events(&agent_dir).len(), 1),
+        "a wasm-resolved carrier must fire on change: {:?}",
+        resync_events(&agent_dir)
+    );
+    let body = &resync_events(&agent_dir)[0];
+    assert!(body.contains("resource goal changed"), "{body}");
+}
+
+#[test]
+#[cfg(feature = "wasm-resolver")]
+fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
+    // The same goal.md basename would sniff as immediate; the DECLARED silent class must win:
+    // changes never emit.
+    let silent = tempfile::tempdir().unwrap();
+    let silent_dir = write_agent_with_goal_scheme(silent.path());
+    catalog_with_profile(silent.path(), "silent");
+    let supervisor = st2::resync::ResyncSupervisor::with_profiles(
+        silent.path().to_path_buf(),
+        "hetz".to_owned(),
+        st2::catalog::declared_profiles(silent.path()).unwrap(),
+    );
+    assert!(
+        supervisor
+            .refresh(
+                &st2::discover_strict(silent.path()).specs,
+                "hetz",
+                &[],
+                &[],
+            )
+            .is_empty()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let goal = silent_dir.join("resources/goal.md");
+    fs::create_dir_all(goal.parent().unwrap()).unwrap();
+    fs::write(&goal, "silent store write\n").unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        resync_events(&silent_dir).len(),
+        0,
+        "declared silent beats basename-immediate sniffing"
+    );
+
+    // A declared resolver that fails to compile is contained: no carrier, no crash, and the
+    // failure is visible through try_resolve rather than swallowed.
+    let broken = tempfile::tempdir().unwrap();
+    let broken_dir = write_agent_with_goal_scheme(broken.path());
+    fs::write(st2::catalog::config_path(broken.path()),
+        "profile \"dev.schickling.agent-goal\" { wasm \"broken.wasm\" }\n").unwrap();
+    fs::write(broken.path().join("broken.wasm"), b"not a module").unwrap();
+    let registry = st2::catalog::declared_profiles(broken.path()).unwrap();
+    let spec = &st2::discover_strict(broken.path()).specs[0];
+    let set = st2::resync::watch_set_for(spec, "hetz", &registry);
+    assert!(
+        !set.carriers.iter().any(|c| c.label == "goal"),
+        "a failing resolver must not produce a carrier"
+    );
+    assert!(set.carriers.iter().any(|c| c.label == "declaration"));
+    assert!(registry
+        .try_resolve(broken_dir.parent().unwrap(), "dev.schickling.agent-goal://hetz/w")
+        .is_err());
 }

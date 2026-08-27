@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use notify::Watcher as _;
 use sha2::{Digest as _, Sha256};
-
+use agent_spec::profile::{
+    ProfileClass, ResourceProfileRefresh, ResourceProfileRegistry,
+};
 use agent_spec::spec::{AgentSpec, decode_percent_path};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
@@ -74,12 +76,14 @@ impl ResyncCoverage {
 }
 
 
-/// One watchable local carrier: binding label, absolute path, notification class.
+/// One watchable local carrier: binding label, absolute path, notification class, and an optional
+/// host root that must confine every read of a resolver-selected path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchableCarrier {
     pub label: String,
     pub path: PathBuf,
     pub class: CarrierClass,
+    pub containment_root: Option<PathBuf>,
 }
 
 /// The watchable carriers of one agent, keyed by its declaration path with current routing IDs.
@@ -92,17 +96,71 @@ pub struct AgentWatchSet {
 }
 
 /// Resolve one spec's watch set: the declaration file plus every active resource binding whose
-/// URI denotes a local file (`RESYNC-R01`). Bindings with an inactive reason are skipped;
-/// schemes without a local denotation and silent stores are simply absent.
-pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
+/// URI denotes a local file (`RESYNC-R01`) — directly (`file://`, catalog-relative) or through a
+/// declared resource profile for a scheme URI. Bindings with an inactive reason are skipped;
+/// schemes without a local denotation and silent carriers are simply absent. A failing profile
+/// resolver is contained: its binding is skipped, the rest of the set survives.
+pub fn watch_set_for(
+    spec: &AgentSpec,
+    this_host: &str,
+    profiles: &ResourceProfileRegistry,
+) -> AgentWatchSet {
+    let refresh = profiles.begin_refresh();
+    resolve_watch_set(spec, this_host, &refresh).0
+}
+
+fn resolve_watch_set(
+    spec: &AgentSpec,
+    this_host: &str,
+    profiles: &ResourceProfileRefresh<'_>,
+) -> (AgentWatchSet, Vec<String>) {
     let declaration_path = lexical_clean(&spec.path);
     let agent_dir = declaration_path.parent().unwrap_or(Path::new("."));
     let mut carriers = vec![WatchableCarrier {
         label: "declaration".to_owned(),
         path: declaration_path.clone(),
         class: CarrierClass::Immediate,
+        containment_root: None,
     }];
+    let mut diagnostics = Vec::new();
     for resource in &spec.resources {
+        if resource.inactive_reason().is_some() {
+            continue;
+        }
+        // Silent profiles carry no observable transition, so never compile or execute their
+        // untrusted resolver merely to discard its result.
+        let registered_profile = resource
+            .uri()
+            .split_once(':')
+            .and_then(|(scheme, _)| profiles.get(scheme));
+        if registered_profile.is_some_and(|profile| profile.class() == ProfileClass::Silent) {
+            continue;
+        }
+        // Declared profile schemes resolve through their wasm module; the declared class governs
+        // notification instead of the local-path defaults.
+        match profiles.try_resolve(agent_dir, resource.uri()) {
+            Ok(Some(resolution)) => {
+                let Some(class) = carrier_class(resolution.class) else {
+                    continue;
+                };
+                carriers.push(WatchableCarrier {
+                    label: resource.name().to_owned(),
+                    path: resolution.path,
+                    class,
+                    containment_root: Some(resolution.containment_root),
+                });
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                diagnostics.push(format!(
+                    "resync profile for {} resource '{}': {error}; binding is unwatchable",
+                    spec.bus_id(this_host),
+                    resource.name()
+                ));
+                continue;
+            }
+        }
         let Some(class) = resource_coverage(agent_dir, resource).carrier_class() else {
             continue;
         };
@@ -112,21 +170,25 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
             label: resource.name().to_owned(),
             path,
             class,
+            containment_root: None,
         });
     }
     // The supervisor's resolved logical host — not the OS hostname — decides the bus id, so an
     // agent supervised under `st2 up --host <alias>` without an explicit declaration host still
     // produces a recipient `resolve_stream` can resolve.
-    AgentWatchSet {
-        declaration_path,
-        bus_id: spec.bus_id(this_host),
-        seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
-            task.id
-                .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
-        }),
-        carriers,
-    }
+    (
+        AgentWatchSet {
+            declaration_path,
+            bus_id: spec.bus_id(this_host),
+            seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
+                task.id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
+            }),
+            carriers,
+        },
+        diagnostics,
+    )
 }
 
 /// A URI denotes a local file when it is an absolute, authority-free `file://` URI or a
@@ -198,9 +260,10 @@ fn lexical_clean(path: &Path) -> PathBuf {
     clean
 }
 
-/// Class defaults (`RESYNC-R04`): goal carriers are immediate; stores the agent itself authors
-/// are silent (None); everything else is coalesced. The declaration carrier is immediate by
-/// construction in [`watch_set_for`].
+/// Class defaults for carriers resolved WITHOUT a declared profile (`RESYNC-R04`): goal carriers
+/// are immediate; stores the agent itself authors are silent (None); everything else is coalesced.
+/// The declaration carrier is immediate by construction in [`watch_set_for`]. Profile-resolved
+/// carriers skip this sniffing entirely — their class is what the catalog declares.
 fn classify(agent_dir: &Path, binding_name: &str, normalized_path: &Path) -> Option<CarrierClass> {
     let agent_relative = normalized_path.strip_prefix(agent_dir).ok();
     let authored_store = agent_relative.is_some_and(|rel| {
@@ -218,6 +281,47 @@ fn classify(agent_dir: &Path, binding_name: &str, normalized_path: &Path) -> Opt
     } else {
         CarrierClass::Coalesced
     })
+}
+
+/// A declared profile class maps onto carrier notification: silent profiles are excluded from
+/// the watch set exactly like sniffed agent-authored stores.
+fn carrier_class(class: ProfileClass) -> Option<CarrierClass> {
+    match class {
+        ProfileClass::Immediate => Some(CarrierClass::Immediate),
+        ProfileClass::Coalesced => Some(CarrierClass::Coalesced),
+        ProfileClass::Silent => None,
+    }
+}
+
+/// Resolve coverage with the catalog's declared profile registry. Silent profiles report their
+/// declared class without executing a guest; other registered schemes are watchable only when
+/// their resolver succeeds.
+pub fn resource_coverage_with_profiles(
+    agent_dir: &Path,
+    resource: &agent_spec::spec::Resource,
+    profiles: &ResourceProfileRefresh<'_>,
+) -> ResyncCoverage {
+    if resource.inactive_reason().is_some() {
+        return ResyncCoverage::Inactive;
+    }
+    let registered = resource
+        .uri()
+        .split_once(':')
+        .and_then(|(scheme, _)| profiles.get(scheme));
+    let Some(profile) = registered else {
+        return resource_coverage(agent_dir, resource);
+    };
+    if profile.class() == ProfileClass::Silent {
+        return ResyncCoverage::Silent;
+    }
+    match profiles.try_resolve(agent_dir, resource.uri()) {
+        Ok(Some(resolution)) => match resolution.class {
+            ProfileClass::Immediate => ResyncCoverage::Immediate,
+            ProfileClass::Coalesced => ResyncCoverage::Coalesced,
+            ProfileClass::Silent => ResyncCoverage::Silent,
+        },
+        Ok(None) | Err(_) => ResyncCoverage::Unsupported,
+    }
 }
 
 // ---- Supervisor side ---------------------------------------------------------------------------
@@ -243,12 +347,26 @@ enum Msg {
 pub struct ResyncSupervisor {
     tx: Option<Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
+    /// Scheme resolution semantics for resource URIs. Definitions update under the same lock as
+    /// watch-set construction, while the registry retains its bounded compiled-module cache.
+    profiles: std::sync::Mutex<ResourceProfileRegistry>,
 }
 
 impl ResyncSupervisor {
-    /// Spawn the worker. Watch installation itself is best-effort per refresh; a failure degrades
-    /// to timer-driven digest polling over the watch set rather than losing the capability.
+    /// Spawn the worker over the built-in profile set. Watch installation itself is best-effort
+    /// per refresh; a failure degrades to timer-driven digest polling over the watch set rather
+    /// than losing the capability.
     pub fn spawn(root: PathBuf, this_host: String) -> Self {
+        Self::with_profiles(root, this_host, ResourceProfileRegistry::builtin())
+    }
+
+    /// Spawn with an explicit resource-profile registry — the injection point the `up` loop uses
+    /// to hand over the catalog's declared profiles.
+    pub fn with_profiles(
+        root: PathBuf,
+        this_host: String,
+        profiles: ResourceProfileRegistry,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let forward = tx.clone();
         let handle = std::thread::Builder::new()
@@ -258,22 +376,80 @@ impl ResyncSupervisor {
         Self {
             tx: Some(tx),
             handle,
+            profiles: std::sync::Mutex::new(profiles),
         }
     }
     /// Replace the worker's watch set from the pass's already-discovered specs. A malformed
-    /// declaration retains its prior subscription only while its canonical seat is observed alive.
+    /// declaration retains its prior subscription only while its canonical seat is observed alive;
+    /// contained profile failures reach the reconcile report.
+    #[must_use = "resolver diagnostics must be surfaced by the reconcile caller"]
     pub fn refresh(
         &self,
         specs: &[AgentSpec],
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
-    ) {
+    ) -> Vec<String> {
+        let profiles = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_with_registry(
+            &profiles,
+            specs,
+            this_host,
+            sessions,
+            malformed_declarations,
+        )
+    }
+
+    /// Atomically replace the profile definitions and the watch set for one reconcile pass.
+    ///
+    /// Replacement keeps the supervisor's bounded compiled-module cache but gives this pass a
+    /// fresh module-snapshot scope shared by all bindings.
+    #[must_use = "resolver diagnostics must be surfaced by the reconcile caller"]
+    pub fn refresh_with_profiles(
+        &self,
+        profiles: ResourceProfileRegistry,
+        specs: &[AgentSpec],
+        this_host: &str,
+        sessions: &[crate::reconcile::Session],
+        malformed_declarations: &[PathBuf],
+    ) -> Vec<String> {
+        let mut current = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.replace_definitions(profiles);
+        self.refresh_with_registry(
+            &current,
+            specs,
+            this_host,
+            sessions,
+            malformed_declarations,
+        )
+    }
+
+    fn refresh_with_registry(
+        &self,
+        profiles: &ResourceProfileRegistry,
+        specs: &[AgentSpec],
+        this_host: &str,
+        sessions: &[crate::reconcile::Session],
+        malformed_declarations: &[PathBuf],
+    ) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        let refresh_profiles = profiles.begin_refresh();
         let sets = specs
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
-            .map(|spec| watch_set_for(spec, this_host))
+            .map(|spec| {
+                let (set, mut failures) =
+                    resolve_watch_set(spec, this_host, &refresh_profiles);
+                diagnostics.append(&mut failures);
+                set
+            })
             .collect();
         let refresh = WatchRefresh {
             sets,
@@ -290,24 +466,34 @@ impl ResyncSupervisor {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Msg::WatchSet(refresh));
         }
+        diagnostics
     }
 
     /// Synchronously install one newly proven-live canonical seat before reconciliation advances
     /// to another launch target. The acknowledgement closes the gap between a successful spawn and
     /// the worker's silent baseline seed; later full refreshes still own removals and malformed
-    /// declaration retention.
-    pub fn install_live(&self, spec: &AgentSpec, this_host: &str) {
+    /// declaration retention. Profile resolution uses the supervisor's current registry and
+    /// returns contained resolver failures for the reconcile report.
+    pub fn install_live(&self, spec: &AgentSpec, this_host: &str) -> Vec<String> {
         if spec.resolved_host(this_host) != this_host || !spec.desired_state.is_running() {
-            return;
+            return Vec::new();
         }
+        let (set, diagnostics) = {
+            let profiles = self
+                .profiles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            resolve_watch_set(spec, this_host, &profiles.begin_refresh())
+        };
         let (ack_tx, ack_rx) = channel();
         if self
             .tx
             .as_ref()
-            .is_some_and(|tx| tx.send(Msg::Install(watch_set_for(spec, this_host), ack_tx)).is_ok())
+            .is_some_and(|tx| tx.send(Msg::Install(set, ack_tx)).is_ok())
         {
             let _ = ack_rx.recv();
         }
+        diagnostics
     }
 
     /// Synchronously remove a canonical seat's active subscriptions before relaunch work begins.
@@ -378,6 +564,7 @@ struct Entry {
     seat_id: Option<String>,
     label: String,
     class: CarrierClass,
+    containment_root: Option<PathBuf>,
     digest: Option<String>,
     /// Last occurrence sequence reserved by this retained subscription. Sequence zero is the
     /// silent seeded state; only capturing a new immutable transition advances it.
@@ -518,15 +705,16 @@ fn rebuild_carriers(
             // The canonical recipient and binding label identify one subscription across
             // declaration and carrier relocation. Rebuild every retained entry from the current
             // declaration while carrying its baseline and immutable delivery snapshot. Looking
-            // across path buckets also lets a binding's re-resolved path/class metadata become
-            // current. A bus-id change intentionally seeds a new recipient-scoped namespace.
+            // across path buckets also lets a binding's re-resolved path/class/containment
+            // metadata become current. A bus-id change intentionally seeds a new
+            // recipient-scoped namespace.
             let identity = (set.bus_id.clone(), carrier.label.clone());
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
             let (digest, occurrence_sequence, pending_transition, dirty) =
                 retained.map_or_else(
                     || {
                         (
-                            read_digest(&carrier.path),
+                            read_digest(&carrier.path, carrier.containment_root.as_deref()),
                             subscription_sequences.get(&identity).copied().unwrap_or(0),
                             None,
                             false,
@@ -546,6 +734,7 @@ fn rebuild_carriers(
                 seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
                 class: carrier.class,
+                containment_root: carrier.containment_root.clone(),
                 digest,
                 occurrence_sequence,
                 pending_transition,
@@ -718,11 +907,11 @@ impl Worker {
     fn poll_paths(&mut self, paths: Vec<PathBuf>) {
         let now = Instant::now();
         for path in paths {
-            let observed = read_digest(&path);
             let Some(entries) = self.carriers.get_mut(&path) else {
                 continue;
             };
             for entry in entries {
+                let observed = read_digest(&path, entry.containment_root.as_deref());
                 let changed = entry.pending_transition.is_some()
                     || observed
                         .as_deref()
@@ -900,7 +1089,7 @@ impl Worker {
                 continue;
             }
             entry.dirty = false;
-            let observed_digest = read_digest(path);
+            let observed_digest = read_digest(path, entry.containment_root.as_deref());
 
             if let Some(pending) = entry.pending_transition.as_ref() {
                 if emit_resync(&self.root, &self.this_host, &entry.bus_id, pending) {
@@ -1003,8 +1192,11 @@ fn emit_resync(
     }
 }
 
-fn read_digest(path: &Path) -> Option<String> {
-    read_regular(path)
+fn read_digest(path: &Path, containment_root: Option<&Path>) -> Option<String> {
+    match containment_root {
+        Some(root) => read_confined(path, root),
+        None => read_regular(path),
+    }
 }
 
 fn hash_reader(mut file: std::fs::File) -> Option<String> {
@@ -1044,6 +1236,91 @@ fn read_regular(path: &Path) -> Option<String> {
     hash_reader(file)
 }
 
+#[cfg(unix)]
+fn read_confined(path: &Path, root: &Path) -> Option<String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let relative = path.strip_prefix(root).ok()?;
+    let mut components = relative.components().peekable();
+
+    // Open the confinement root component-by-component from the filesystem root. `O_NOFOLLOW`
+    // on one full pathname protects only its final component; descriptor-relative traversal
+    // protects every ancestor from symlink replacement as well.
+    let mut root_components = root.components();
+    if root_components.next()? != std::path::Component::RootDir {
+        return None;
+    }
+    let slash = CString::new("/").ok()?;
+    // SAFETY: `slash` is NUL-terminated and the returned descriptor is checked before ownership.
+    let filesystem_root = unsafe {
+        libc::open(
+            slash.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if filesystem_root < 0 {
+        return None;
+    }
+    // SAFETY: `filesystem_root` is newly owned after the non-negative check.
+    let mut directory = unsafe { OwnedFd::from_raw_fd(filesystem_root) };
+    for component in root_components {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = CString::new(name.as_bytes()).ok()?;
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK;
+        // SAFETY: the live directory descriptor and NUL-terminated component are valid.
+        let opened = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if opened < 0 {
+            return None;
+        }
+        // SAFETY: `opened` is newly owned after the non-negative check.
+        directory = unsafe { OwnedFd::from_raw_fd(opened) };
+    }
+
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let name = CString::new(name.as_bytes()).ok()?;
+        let last = components.peek().is_none();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if last { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: both the live directory descriptor and NUL-terminated component are valid;
+        // `O_NOFOLLOW` makes each lookup fail closed if that component is replaced by a symlink.
+        let opened = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if opened < 0 {
+            return None;
+        }
+        // SAFETY: `opened` is a newly-owned descriptor after the non-negative check above.
+        let opened = unsafe { OwnedFd::from_raw_fd(opened) };
+        if last {
+            let file = std::fs::File::from(opened);
+            if !file.metadata().ok()?.file_type().is_file() {
+                return None;
+            }
+            return hash_reader(file);
+        }
+        directory = opened;
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn read_confined(_path: &Path, _root: &Path) -> Option<String> {
+    // No std API can atomically enforce no-follow traversal. Fail closed on unsupported hosts.
+    None
+}
+
 fn render_body(
     label: &str,
     path: &Path,
@@ -1057,7 +1334,6 @@ fn render_body(
         old.unwrap_or("unknown"),
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,7 +1391,7 @@ mod tests {
         )
         .unwrap();
         let spec = discover(tmp.path());
-        let set = watch_set_for(&spec, "hetz");
+        let set = watch_set_for(&spec, "hetz", &Default::default());
         assert_eq!(set.bus_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
@@ -1147,8 +1423,14 @@ mod tests {
         )
         .unwrap();
         let spec = discover(tmp.path());
-        assert_eq!(watch_set_for(&spec, "alias").bus_id, "alias.worker");
-        assert_eq!(watch_set_for(&spec, "other").bus_id, "other.worker");
+        assert_eq!(
+            watch_set_for(&spec, "alias", &Default::default()).bus_id,
+            "alias.worker"
+        );
+        assert_eq!(
+            watch_set_for(&spec, "other", &Default::default()).bus_id,
+            "other.worker"
+        );
     }
 
     #[test]
@@ -1224,6 +1506,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("alpha-before".to_owned()),
                     occurrence_sequence: 4,
                     pending_transition: None,
@@ -1234,6 +1517,7 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
+                    containment_root: None,
                     digest: Some("beta-before".to_owned()),
                     occurrence_sequence: 9,
                     dirty: true,
@@ -1250,6 +1534,7 @@ mod tests {
                     label: "goal".to_owned(),
                     path: shared.clone(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                 }],
             },
             AgentWatchSet {
@@ -1260,6 +1545,7 @@ mod tests {
                     label: "spec".to_owned(),
                     path: shared.clone(),
                     class: CarrierClass::Coalesced,
+                    containment_root: None,
                 }],
             },
         ];
@@ -1298,7 +1584,11 @@ mod tests {
         std::fs::write(&goal, "current bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
 
-        let mut current = watch_set_for(&discover(root.path()), "alias");
+        let mut current = watch_set_for(
+            &discover(root.path()),
+            "alias",
+            &ResourceProfileRegistry::empty(),
+        );
         current.seat_id = Some("current-seat".to_owned());
         let old_path = agent_dir.join("resources/old-goal.md");
         let previous = BTreeMap::from([(
@@ -1308,6 +1598,7 @@ mod tests {
                 seat_id: Some("stale-seat".to_owned()),
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
+                containment_root: None,
                 digest: Some("old-digest".to_owned()),
                 occurrence_sequence: 3,
                 pending_transition: None,
@@ -1373,6 +1664,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("old-digest".to_owned()),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -1399,7 +1691,8 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let current = watch_set_for(&discover(root.path()), "alias");
+        let current =
+            watch_set_for(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
 
         worker.apply_watch_sets(refresh_for(vec![current]));
         worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -1447,7 +1740,8 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
-                    digest: read_digest(&old_path),
+                    containment_root: None,
+                    digest: read_digest(&old_path, None),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
@@ -1467,6 +1761,7 @@ mod tests {
                 label: "goal".to_owned(),
                 path: new_path.clone(),
                 class: CarrierClass::Immediate,
+                containment_root: None,
             }],
         }]));
 
@@ -1495,7 +1790,8 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Immediate,
-                    digest: read_digest(&carrier),
+                    containment_root: None,
+                    digest: read_digest(&carrier, None),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -1515,6 +1811,7 @@ mod tests {
                     label: "spec".to_owned(),
                     path: carrier.clone(),
                     class,
+                    containment_root: None,
                 }],
             }])
         };
@@ -1547,6 +1844,7 @@ mod tests {
                     seat_id: Some("custom-worker-seat".to_owned()),
                     label: "declaration".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("before".to_owned()),
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
@@ -1616,7 +1914,7 @@ mod tests {
         std::fs::write(&carrier, "newer live bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
 
-        let set = watch_set_for(&discover(root.path()), "hetz");
+        let set = watch_set_for(&discover(root.path()), "hetz", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "hetz".to_owned(),
@@ -1627,6 +1925,7 @@ mod tests {
                     seat_id: set.seat_id.clone(),
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("old-digest".to_owned()),
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
@@ -1675,7 +1974,7 @@ mod tests {
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "before").unwrap();
-        let baseline = read_digest(&carrier);
+        let baseline = read_digest(&carrier, None);
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -1686,6 +1985,7 @@ mod tests {
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
+                    containment_root: None,
                     digest: baseline.clone(),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -1707,6 +2007,7 @@ mod tests {
                 label: "spec".to_owned(),
                 path: carrier.clone(),
                 class: CarrierClass::Coalesced,
+                containment_root: None,
             }],
         }]));
 
@@ -1753,6 +2054,7 @@ mod tests {
         worker.apply_watch_sets(refresh_for(vec![watch_set_for(
             &discover(root.path()),
             "hetz",
+            &Default::default(),
         )]));
         std::fs::write(&goal, "after\n").unwrap();
 
@@ -1784,7 +2086,12 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and points into the live temp directory.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        assert_eq!(read_digest(&fifo), None);
+        assert_eq!(read_digest(&fifo, None), None);
+        assert_eq!(
+            read_digest(&fifo, Some(tmp.path())),
+            None,
+            "confined carrier reads must reject a FIFO without blocking too"
+        );
     }
 
     #[test]
@@ -1792,7 +2099,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "same bytes").unwrap();
-        let digest = read_digest(&carrier);
+        let digest = read_digest(&carrier, None);
         let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
             .into_iter()
             .map(|class| Entry {
@@ -1800,6 +2107,7 @@ mod tests {
                 seat_id: None,
                 label: format!("{class:?}"),
                 class,
+                containment_root: None,
                 digest: digest.clone(),
                 occurrence_sequence: 0,
                 pending_transition: None,
@@ -1823,6 +2131,54 @@ mod tests {
         assert!(entries[1].dirty, "coalesced subscriber must wait for its own deadline");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn confined_read_refuses_a_symlink_created_after_resolution() {
+        let agent_dir = tempfile::tempdir().expect("agent directory");
+        let resources = agent_dir.path().join("resources");
+        std::fs::create_dir(&resources).expect("resources directory");
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "inside").expect("inside carrier");
+        assert!(
+            read_digest(&carrier, Some(agent_dir.path())).is_some(),
+            "ordinary files beneath the admitted root remain readable"
+        );
+
+        std::fs::remove_file(&carrier).expect("remove inside carrier");
+        let outside = tempfile::NamedTempFile::new().expect("outside carrier");
+        std::fs::write(outside.path(), "external").expect("outside bytes");
+        std::os::unix::fs::symlink(outside.path(), &carrier)
+            .expect("replace absent carrier with an external symlink");
+        assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
+
+        std::fs::remove_file(&carrier).expect("remove final symlink");
+        std::fs::remove_dir(&resources).expect("remove resources directory");
+        let outside_dir = tempfile::tempdir().expect("outside directory");
+        std::fs::write(outside_dir.path().join("goal.md"), "external").expect("outside carrier");
+        std::os::unix::fs::symlink(outside_dir.path(), &resources)
+            .expect("replace absent ancestor with an external symlink");
+        assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_read_refuses_a_symlinked_confinement_root_ancestor() {
+        let temp = tempfile::tempdir().expect("outer directory");
+        let real_root = temp.path().join("real/agent");
+        std::fs::create_dir_all(&real_root).expect("real agent directory");
+        std::fs::write(real_root.join("goal.md"), "outside admitted ancestry")
+            .expect("carrier bytes");
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(temp.path().join("real"), &alias)
+            .expect("symlinked root ancestor");
+        let admitted_root = alias.join("agent");
+        assert_eq!(
+            read_digest(&admitted_root.join("goal.md"), Some(&admitted_root)),
+            None,
+            "every component of the confinement root must be opened without following symlinks"
+        );
+    }
+
     #[test]
     fn reinstalled_subscription_keeps_occurrence_identity_without_an_active_watch() {
         let root = tempfile::tempdir().unwrap();
@@ -1841,7 +2197,7 @@ mod tests {
         let carrier = resources.join("goal.md");
         std::fs::write(&carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host");
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
         let seen_subscription_count = set.carriers.len();
         let mut worker = Worker {
             root: root.path().to_path_buf(),
@@ -1918,7 +2274,8 @@ mod tests {
         let relocated_carrier = resources.join("relocated-goal.md");
         std::fs::write(&original_carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host");
+        let set =
+            watch_set_for(&discover(root.path()), "host", &ResourceProfileRegistry::empty());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -1950,7 +2307,10 @@ mod tests {
             .find(|entry| entry.label == "goal")
             .unwrap();
         assert_eq!(rebound.occurrence_sequence, 1);
-        assert_eq!(rebound.digest.as_deref(), read_digest(&original_carrier).as_deref());
+        assert_eq!(
+            rebound.digest.as_deref(),
+            read_digest(&original_carrier, None).as_deref()
+        );
 
         worker.flush_path(&relocated_carrier, None);
         let back_to_a = resync_inbox_event(&agent_dir);
@@ -2002,6 +2362,7 @@ mod tests {
                 seat_id: None,
                 label: "goal".to_owned(),
                 class: CarrierClass::Immediate,
+                containment_root: None,
                 digest: Some("old-digest".to_owned()),
                 occurrence_sequence: 0,
                 pending_transition: None,
@@ -2069,6 +2430,7 @@ mod tests {
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
+                    containment_root: None,
                     digest: Some("old-digest".to_owned()),
                     occurrence_sequence: 0,
                     pending_transition: None,
@@ -2282,6 +2644,93 @@ mod tests {
         assert_eq!(
             classify(agent_dir, "spec", Path::new("/etc/demo/spec.md")),
             Some(CarrierClass::Coalesced)
+        );
+    }
+
+    #[test]
+    fn profile_classes_map_onto_carrier_notification() {
+        assert_eq!(carrier_class(ProfileClass::Immediate), Some(CarrierClass::Immediate));
+        assert_eq!(carrier_class(ProfileClass::Coalesced), Some(CarrierClass::Coalesced));
+        assert_eq!(
+            carrier_class(ProfileClass::Silent),
+            None,
+            "silent profiles are excluded from the watch set like sniffed authored stores"
+        );
+    }
+
+    #[test]
+    fn registered_profile_failures_are_reported_while_other_bindings_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/hetz/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  command "true"
+  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+  resource "issue" uri="worktree://repo/main" reason="Opaque scheme."
+}"#,
+        )
+        .unwrap();
+
+        let broken = tmp.path().join("broken.wasm");
+        std::fs::write(&broken, b"not a module").unwrap();
+        let profiles = ResourceProfileRegistry::empty().with_profile(
+            agent_spec::ResourceProfile::wasm(
+                "dev.schickling.agent-goal",
+                &broken,
+                ProfileClass::Coalesced,
+            ),
+        );
+        let refresh = profiles.begin_refresh();
+        let spec = discover(tmp.path());
+        let (set, diagnostics) = resolve_watch_set(&spec, "hetz", &refresh);
+        assert!(!set.carriers.iter().any(|c| c.label == "goal"));
+        assert!(set.carriers.iter().any(|c| c.label == "declaration"));
+        assert!(!set.carriers.iter().any(|c| c.label == "issue"));
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("resource 'goal'"));
+        assert!(diagnostics[0].contains("unwatchable"));
+        assert_eq!(
+            resource_coverage_with_profiles(&dir, &spec.resources[0], &refresh),
+            ResyncCoverage::Unsupported
+        );
+    }
+
+    #[test]
+    fn silent_profile_skips_its_resolver_entirely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/hetz/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  command "true"
+  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let missing = tmp.path().join("must-not-load.wasm");
+        let profiles = ResourceProfileRegistry::empty().with_profile(
+            agent_spec::ResourceProfile::wasm(
+                "dev.schickling.agent-goal",
+                missing,
+                ProfileClass::Silent,
+            ),
+        );
+        let refresh = profiles.begin_refresh();
+        let spec = discover(tmp.path());
+        let (set, diagnostics) = resolve_watch_set(&spec, "hetz", &refresh);
+        assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
+        assert!(
+            diagnostics.is_empty(),
+            "a silent profile must not execute its missing resolver: {diagnostics:?}"
+        );
+        assert_eq!(
+            resource_coverage_with_profiles(&dir, &spec.resources[0], &refresh),
+            ResyncCoverage::Silent
         );
     }
 }

@@ -269,6 +269,7 @@ struct ProjectedFile {
 #[derive(Debug, Clone)]
 pub(crate) struct DeclarationProjection {
     files: BTreeMap<String, ProjectedFile>,
+    profile_modules: BTreeSet<String>,
     workspace_dirs: BTreeSet<String>,
     root_sha256: String,
 }
@@ -292,6 +293,8 @@ struct ApplyMarker {
     stage_name: String,
     expected_root_sha256: String,
     prepared_root_sha256: String,
+    #[serde(default)]
+    original_profile_modules: Vec<String>,
     original_paths: Vec<String>,
 }
 
@@ -1662,6 +1665,7 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
                 stage_name: stage_name.clone(),
                 expected_root_sha256: expect_sha256.clone(),
                 prepared_root_sha256: desired.root_sha256.clone(),
+                original_profile_modules: current.profile_modules.iter().cloned().collect(),
                 original_paths: original_paths.clone(),
             },
         )?;
@@ -1769,6 +1773,10 @@ fn catalog_is_strictly_valid(root: &Path) -> bool {
 /// catalog. It deliberately has no policy for why those bytes are invalid. Mutable agent state is
 /// excluded by the same structural boundaries as the strict projection; a prospective catalog is
 /// never admitted through this path.
+///
+/// In particular, `catalog.kdl` is captured as raw bytes but its profile module references are not
+/// resolved here. Module presence, kind, and size are prospective admission policy; requiring an
+/// invalid incumbent module to satisfy that policy would make its own repair preimage unreachable.
 fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
     let metadata = fs::symlink_metadata(root)?;
     anyhow::ensure!(
@@ -1795,6 +1803,7 @@ fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
     let root_sha256 = hash_raw_projection(&files, &workspace_dirs);
     Ok(DeclarationProjection {
         files,
+        profile_modules: BTreeSet::new(),
         workspace_dirs,
         root_sha256,
     })
@@ -1845,6 +1854,7 @@ fn project_excluding(
         root.display()
     );
     let mut files = BTreeMap::new();
+    let profile_modules = collect_profile_modules(root, logical_catalog, &mut files)?;
     add_optional_regular(root, &root.join(crate::catalog::CONFIG_FILE), &mut files)?;
     let spec_paths = collect_canonical_specs(root, source, &mut files)?;
     let discovered = crate::discover(root);
@@ -1915,6 +1925,7 @@ fn project_excluding(
     let root_sha256 = hash_projection(&files, &workspace_dirs);
     Ok(DeclarationProjection {
         files,
+        profile_modules,
         workspace_dirs,
         root_sha256,
     })
@@ -2213,6 +2224,84 @@ fn add_optional_regular(
         Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
     }
 }
+pub(crate) fn validate_catalog_profile_modules(root: &Path) -> Result<()> {
+    collect_profile_modules(root, root, &mut BTreeMap::new()).map(|_| ())
+}
+
+fn collect_profile_modules(
+    root: &Path,
+    logical_catalog: &Path,
+    files: &mut BTreeMap<String, ProjectedFile>,
+) -> Result<BTreeSet<String>> {
+    let config = crate::catalog::load(root).context("parse catalog profile modules")?;
+    let mut modules = BTreeSet::new();
+    for profile in config.profiles {
+        let crate::catalog::ResolvedProfileModule::CatalogRelative(relative) =
+            crate::catalog::resolve_profile_module(logical_catalog, &profile.wasm)?
+        else {
+            continue;
+        };
+        let normalized = add_profile_module(root, &relative, files).with_context(|| {
+            format!(
+                "admit catalog-relative profile module '{}' for scheme '{}'",
+                relative.display(),
+                profile.scheme
+            )
+        })?;
+        modules.insert(normalized);
+    }
+    Ok(modules)
+}
+
+fn add_profile_module(
+    root: &Path,
+    relative: &Path,
+    files: &mut BTreeMap<String, ProjectedFile>,
+) -> Result<String> {
+    let normalized = normal_components(relative)?.join("/");
+    anyhow::ensure!(
+        !normalized.is_empty(),
+        "profile module cannot name the catalog root"
+    );
+    if files.contains_key(&normalized) {
+        return Ok(normalized);
+    }
+
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent = open_dir_beneath(root, &root.join(parent_relative))
+        .with_context(|| format!("open profile module parent {}", parent_relative.display()))?;
+    let name = relative
+        .file_name()
+        .context("profile module has no file name")?;
+    let input = openat_nofollow(&parent, name)
+        .with_context(|| format!("open profile module {}", relative.display()))?;
+    let metadata = input.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "profile module is not a no-follow regular file: {}",
+        relative.display()
+    );
+    let limit = agent_spec::profile::DEFAULT_MODULE_LIMIT_BYTES;
+    anyhow::ensure!(
+        metadata.len() <= limit as u64,
+        "profile module exceeds the {limit}-byte limit: {}",
+        relative.display()
+    );
+    let executable = metadata.permissions().mode() & 0o111 != 0;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    input
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read profile module {}", relative.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "profile module exceeds the {limit}-byte limit: {}",
+        relative.display()
+    );
+    files.insert(normalized.clone(), ProjectedFile { bytes, executable });
+    Ok(normalized)
+}
+
 
 fn add_regular(
     root: &Path,
@@ -2475,12 +2564,37 @@ fn apply_projection(
     desired: &DeclarationProjection,
 ) -> Result<()> {
     let atomically_created = create_new_identity_bundles(control, catalog, desired)?;
+    // Publish every referenced input before catalog.kdl. A crash can therefore leave an
+    // unreferenced new module behind, but never a new catalog declaration pointing at a missing
+    // module. Stale inputs are removed only after the declaration stops naming them.
+    for publish_catalog_config in [false, true] {
+        for (path, desired_file) in desired.files.iter().filter(|(path, _)| {
+            (path.as_str() == crate::catalog::CONFIG_FILE) == publish_catalog_config
+        }) {
+            if current.is_some_and(|current| current.files.get(path) == Some(desired_file))
+                || atomically_created
+                    .iter()
+                    .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+            {
+                continue;
+            }
+            atomic_replace_file(control, catalog, path, desired_file)?;
+            test_checkpoint("mid-write");
+        }
+    }
+
     let mut stale = original_paths
         .iter()
         .filter(|path| !desired.files.contains_key(*path))
         .cloned()
         .collect::<Vec<_>>();
-    stale.sort_by_key(|path| (is_canonical_agent_spec(path), path.clone()));
+    stale.sort_by_key(|path| {
+        (
+            path.as_str() != crate::catalog::CONFIG_FILE,
+            is_canonical_agent_spec(path),
+            path.clone(),
+        )
+    });
     for path in stale {
         let target = catalog.join(&path);
         let metadata = match fs::symlink_metadata(&target) {
@@ -2499,17 +2613,6 @@ fn apply_projection(
             test_checkpoint("deleted-spec");
         }
         test_checkpoint("mid-delete");
-    }
-    for (path, desired_file) in &desired.files {
-        if current.is_some_and(|current| current.files.get(path) == Some(desired_file))
-            || atomically_created
-                .iter()
-                .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
-        {
-            continue;
-        }
-        atomic_replace_file(control, catalog, path, desired_file)?;
-        test_checkpoint("mid-write");
     }
     Ok(())
 }
@@ -2697,8 +2800,35 @@ fn validate_marker(marker: &ApplyMarker) -> Result<()> {
             .all(|pair| pair[0] < pair[1]),
         "catalog apply marker originalPaths must be strictly sorted and unique"
     );
+    anyhow::ensure!(
+        marker
+            .original_profile_modules
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "catalog apply marker originalProfileModules must be strictly sorted and unique"
+    );
+    let profile_modules = marker
+        .original_profile_modules
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for path in &marker.original_profile_modules {
+        let components = normal_components(Path::new(path))?;
+        anyhow::ensure!(
+            !components.is_empty() && components.join("/") == *path,
+            "catalog apply marker contains a non-canonical profile module path"
+        );
+        crate::catalog::validate_catalog_relative_profile_module_path(Path::new(path))
+            .context("catalog apply marker contains a reserved profile module path")?;
+        anyhow::ensure!(
+            marker.original_paths.binary_search(path).is_ok(),
+            "catalog apply marker profile module is absent from originalPaths"
+        );
+    }
     for path in &marker.original_paths {
-        validate_declaration_leaf_path(path)?;
+        if !profile_modules.contains(path.as_str()) {
+            validate_declaration_leaf_path(path)?;
+        }
     }
     let components = normal_components(Path::new(&marker.stage_name))?;
     anyhow::ensure!(
