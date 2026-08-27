@@ -727,14 +727,19 @@ fn rebuild_carriers(
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
             let (state, occurrence_sequence, pending_transition, dirty) = retained.map_or_else(
                 || {
-                    let state = read_state(&carrier.path, carrier.containment_root.as_deref())
-                        .map_err(|error| diagnose_read_error(&carrier.path, &error))
-                        .ok();
+                    let (state, dirty) =
+                        match read_state(&carrier.path, carrier.containment_root.as_deref()) {
+                            Ok(state) => (Some(state), false),
+                            Err(error) => {
+                                diagnose_read_error(&carrier.path, &error);
+                                (None, true)
+                            }
+                        };
                     (
                         state,
                         subscription_sequences.get(&identity).copied().unwrap_or(0),
                         None,
-                        false,
+                        dirty,
                     )
                 },
                 |entry| {
@@ -2404,6 +2409,59 @@ mod tests {
         worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let event = resync_inbox_event(&agent_dir);
         assert_ne!(event_field(&event, "new"), "missing");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn initial_transient_read_failure_schedules_a_baseline_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "baseline").unwrap();
+        let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
+        std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::from([(resources.clone(), dir_identity(&resources))]),
+            watcher: None,
+        };
+
+        worker.apply_watch_sets(refresh_for(vec![set]));
+        let entry = worker.carriers[&carrier]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert_eq!(entry.state, None);
+        assert!(entry.dirty);
+        assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
+
+        std::fs::set_permissions(&carrier, original_permissions).unwrap();
+        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        let entry = worker.carriers[&carrier]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert!(matches!(entry.state, Some(CarrierState::Present(_))));
+        assert!(!entry.dirty);
+        assert!(!resources.join("inbox").exists());
     }
 
     #[test]

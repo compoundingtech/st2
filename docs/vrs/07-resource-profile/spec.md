@@ -228,12 +228,14 @@ root with `O_NOFOLLOW` on every ancestor and the final component.
 The bounded 32-entry LRU cache stores both successful modules and compilation
 failures by normalized module path, admission policy, byte digest, and stable
 file metadata. Admission policy distinguishes an external open from
-descriptor-relative traversal under a specific confinement root. Refresh-local
-snapshot outcomes use the same path-and-policy key, so resolving one spelling
-externally can never authorize a contained declaration. Registry clones and
-concurrent subscribers coalesce one compilation attempt only for an unchanged
-identity under the same policy. Byte replacement or metadata identity change
-invalidates that entry and retries compilation.
+descriptor-relative traversal under a specific confinement root. Lexical
+normalization is used only for cache identity; the admission read always opens
+the declared module spelling so filesystem-significant `..` after a symlink or
+missing component cannot be erased. Refresh-local snapshot outcomes use the
+same path-and-policy key, so resolving one spelling externally can never
+authorize a contained declaration. Registry clones and concurrent subscribers
+coalesce one compilation attempt only for an unchanged identity under the same
+policy. Byte replacement or metadata identity change invalidates that entry.
 Each resolution of a successfully compiled module creates a fresh `Store` and
 `Instance`. One fuel allowance
 covers the module start function and the first resolution call; a reused

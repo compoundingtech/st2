@@ -209,7 +209,7 @@ impl ModuleIdentity {
 #[cfg(feature = "wasm-resolver")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ModuleCacheKey {
-    module: PathBuf,
+    normalized_module: PathBuf,
     containment_root: Option<PathBuf>,
 }
 
@@ -217,7 +217,7 @@ struct ModuleCacheKey {
 impl ModuleCacheKey {
     fn new(module: &Path, containment_root: Option<&Path>) -> Self {
         Self {
-            module: normalize_cache_path(module),
+            normalized_module: normalize_cache_path(module),
             containment_root: containment_root.map(normalize_cache_path),
         }
     }
@@ -313,7 +313,9 @@ impl ResourceProfileRefresh<'_> {
                 if let Some(result) = modules.get(&key) {
                     result.clone()
                 } else {
-                    let result = self.registry.compiled(&key);
+                    let result =
+                        self.registry
+                            .compiled(&key, module, containment_root.as_deref());
                     modules.insert(key, result.clone());
                     result
                 }
@@ -490,14 +492,16 @@ impl ResourceProfileRegistry {
     fn compiled(
         &self,
         key: &ModuleCacheKey,
+        module_path: &Path,
+        containment_root: Option<&Path>,
     ) -> Result<Arc<crate::profile_wasm::WasmResolver>, String> {
         #[cfg(test)]
         {
             self.wasm_cache.lock().snapshot_attempts += 1;
         }
         let snapshot = crate::profile_wasm::read_module_snapshot(
-            &key.module,
-            key.containment_root.as_deref(),
+            module_path,
+            containment_root,
             DEFAULT_MODULE_LIMIT_BYTES,
         )
         .map_err(|error| error.to_string())?;
@@ -762,6 +766,36 @@ mod tests {
         assert_eq!(cache.snapshot_attempts, 1);
         assert_eq!(cache.compile_attempts, 1);
     }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn cache_normalization_does_not_change_the_path_used_for_admission() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("child")).unwrap();
+        symlink(outside.path().join("child"), root.path().join("link")).unwrap();
+        write_any_uri_resolver(&root.path().join("resolver.wasm"));
+        let declared = root.path().join("link/../resolver.wasm");
+        let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+            "external",
+            &declared,
+            ProfileClass::Immediate,
+        ));
+
+        assert!(
+            registry
+                .try_resolve(Path::new("/agent"), "external://host/agent")
+                .is_err(),
+            "admission must use the declared path, which resolves through the symlink outside root"
+        );
+        assert_eq!(
+            ModuleCacheKey::new(&declared, None).normalized_module,
+            root.path().join("resolver.wasm")
+        );
+    }
+
     #[test]
     #[cfg(all(feature = "wasm-resolver", unix))]
     fn refresh_cache_cannot_reuse_external_admission_for_a_contained_module() {

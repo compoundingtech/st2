@@ -111,10 +111,11 @@ only after that immutable reservation completes. Per-binding supersession and
 shared-carrier subscriber independence remain unchanged.
 
 `deletion_and_same_byte_recreation_are_distinct_carrier_transitions`,
+`initial_transient_read_failure_schedules_a_baseline_retry`,
 `transient_permission_error_retries_without_emitting_a_tombstone`,
 `fifo_carrier_is_rejected_without_blocking`,
-`failed_tombstone_emit_retains_present_state_and_immutable_retry_snapshot`, and
-the existing shared-subscriber occurrence tests prove the Q21 contract.
+`failed_tombstone_emit_retains_present_state_and_immutable_retry_snapshot`,
+and the existing shared-subscriber occurrence tests prove the Q21 contract.
 
 
 ## Options

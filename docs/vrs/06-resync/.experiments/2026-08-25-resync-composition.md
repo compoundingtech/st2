@@ -54,10 +54,11 @@ Q21 carrier-state semantics are covered by three additional focused tests:
    proves present→missing emits `old: <digest>` / `new: missing`, repeated
    missing stays silent, and same-byte recreation emits missing→present as the
    next occurrence while superseding the tombstone.
-9. `transient_permission_error_retries_without_emitting_a_tombstone` — proves
-   a permission failure retains the prior present state and schedules retry;
-   after access recovers, the real byte transition emits without an
-   intermediate tombstone.
+9. `initial_transient_read_failure_schedules_a_baseline_retry` and
+   `transient_permission_error_retries_without_emitting_a_tombstone` prove an
+   initial or later permission failure retains unknown/prior state and
+   schedules retry; after access recovers, baseline seeding or the real byte
+   transition completes without an intermediate tombstone.
 10. `digesting_a_fifo_fails_without_blocking_the_worker` — proves both native
     and confined readers classify a FIFO as stable missing without blocking.
 
@@ -81,9 +82,9 @@ Three design constraints were discovered by running the code, not by reasoning:
 
 ## Result
 
-The default resync unit slice passed 30 tests, including every Q13/Q21 state,
+The default resync unit slice passed 31 tests, including every Q13/Q21 state,
 retry, shared-subscriber, and confinement case. The default Agent Spec suite
-passed 78 tests, and the `wasm-resolver` Agent Spec suite passed 109 unit,
+passed 78 tests, and the `wasm-resolver` Agent Spec suite passed 110 unit,
 integration, and hostile-module tests. The real resync integration suite passed
 three default and five wasm-enabled filesystem/inbox cases. Pre-existing
 warnings were unchanged.

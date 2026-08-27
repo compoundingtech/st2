@@ -176,12 +176,15 @@ then resolve the same spelling as catalog-relative in one refresh. Separately,
 resolve one regular module under external and contained policies through
 registry clones and replace module bytes between refreshes.
 
-**Result:** `refresh_cache_cannot_reuse_external_admission_for_a_contained_module`
-proves the second resolution re-opens and rejects the symlink.
+**Result:** `cache_normalization_does_not_change_the_path_used_for_admission`
+proves lexical normalization cannot erase filesystem-significant `..` after a
+symlink because admission still opens the declared spelling.
+`refresh_cache_cannot_reuse_external_admission_for_a_contained_module` proves
+the second resolution re-opens and rejects the symlink.
 `registry_clones_share_compilation_only_with_the_same_admission_policy` proves
 clones share one compilation within a policy and retain separate cache entries
 across policies. The existing replacement test proves a changed identity still
-invalidates its entry. The complete `wasm-resolver` Agent Spec suite passed 109
+invalidates its entry. The complete `wasm-resolver` Agent Spec suite passed 110
 tests.
 
 **Conclusion:** Snapshot outcomes and compiled success/failure entries require
