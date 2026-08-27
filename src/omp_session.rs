@@ -260,47 +260,102 @@ fn channel_env(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
+
+    struct FakeExecutable {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl FakeExecutable {
+        fn new(body: &str) -> Self {
+            let directory = tempfile::Builder::new()
+                .prefix("st2-omp-version-")
+                .tempdir()
+                .unwrap();
+            let source = directory.path().join("omp.source");
+            let path = directory.path().join("omp");
+            std::fs::write(&source, body).unwrap();
+            // A writer opened by one libtest thread is inherited by a child forked concurrently
+            // from another, which can make the writer's later exec fail with ETXTBSY even after
+            // the parent closes it. Let `install` create and close the executable in its own child:
+            // the test process never owns a writable descriptor for the file it will execute.
+            let output = std::process::Command::new("install")
+                .args(["-m", "755"])
+                .arg(&source)
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "install failed: {output:?}");
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
 
     #[test]
     fn version_gate_admits_the_verified_major() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("omp");
-        std::fs::write(&fake, "#!/bin/sh\nprintf 'omp v18.0.3\\n18.0.3\\n'\n").unwrap();
-        // Keep the file writable so dropping the shebang bit back is unnecessary; make it
-        // executable in place.
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(verify_supported_version(fake.to_str().unwrap()).is_ok());
+        let fake =
+            FakeExecutable::new("#!/bin/sh\nprintf 'omp v18.0.3\\n18.0.3\\n'\n");
+        verify_supported_version(fake.path().to_str().unwrap()).unwrap();
     }
 
     #[test]
     fn version_gate_refuses_an_unverified_minor() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("omp");
-        std::fs::write(&fake, "#!/bin/sh\nprintf '18.1.0\\n'\n").unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = verify_supported_version(fake.to_str().unwrap()).unwrap_err();
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.1.0\\n'\n");
+        let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
         assert!(error.to_string().contains("unverified"), "{error}");
     }
 
     #[test]
     fn version_gate_refuses_an_unverified_major() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("omp");
-        std::fs::write(&fake, "#!/bin/sh\nprintf '19.0.1\\n'\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = verify_supported_version(fake.to_str().unwrap()).unwrap_err();
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf '19.0.1\\n'\n");
+        let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
         assert!(error.to_string().contains("unverified"), "{error}");
     }
 
     #[test]
     fn version_gate_refuses_garbled_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("omp");
-        std::fs::write(&fake, "#!/bin/sh\nprintf 'not-a-version\\n'\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(verify_supported_version(fake.to_str().unwrap()).is_err());
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'not-a-version\\n'\n");
+        assert!(verify_supported_version(fake.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn version_gate_fixtures_are_parallel_safe() {
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 16;
+
+        let barrier = Barrier::new(WORKERS);
+        let paths = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(WORKERS);
+            for _ in 0..WORKERS {
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    let mut paths = Vec::with_capacity(ROUNDS);
+                    barrier.wait();
+                    for _ in 0..ROUNDS {
+                        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.1.0\\n'\n");
+                        paths.push(fake.path().to_path_buf());
+                        let error =
+                            verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
+                        assert!(error.to_string().contains("unverified"), "{error}");
+                    }
+                    paths
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), paths.len());
     }
 
     #[test]
