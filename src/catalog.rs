@@ -22,10 +22,12 @@
 //! single-file team spec.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use anyhow::Context as _;
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
 use kdl::KdlDocument;
+
 /// The catalog-level declaration, read from the catalog root.
 pub const CONFIG_FILE: &str = "catalog.kdl";
 /// One declared resource profile: `profile "<scheme>" { wasm "<path>" class "..." }`.
@@ -47,6 +49,12 @@ pub struct CatalogConfig {
     pub pty_root: Option<String>,
     /// Resource profiles in declaration order.
     pub profiles: Vec<DeclaredProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedProfileModule {
+    CatalogRelative(PathBuf),
+    External(PathBuf),
 }
 
 /// `<catalog>/catalog.kdl`.
@@ -219,6 +227,59 @@ pub fn load(catalog_root: &Path) -> anyhow::Result<CatalogConfig> {
         Err(e) => Err(e.into()),
     }
 }
+/// Resolve one declared module using the same expansion as runtime registry construction while
+/// preserving whether the module belongs to the catalog transaction.
+pub(crate) fn resolve_profile_module(
+    catalog_root: &Path,
+    declared: &str,
+) -> anyhow::Result<ResolvedProfileModule> {
+    let catalog_root = if catalog_root.is_absolute() {
+        lexical_absolute(catalog_root)?
+    } else {
+        lexical_absolute(&std::env::current_dir()?.join(catalog_root))?
+    };
+    let expanded = PathBuf::from(crate::expand::expand_catalog(declared, &catalog_root));
+    if Path::new(declared).is_absolute() {
+        return Ok(ResolvedProfileModule::External(expanded));
+    }
+
+    let resolved = lexical_absolute(&catalog_root.join(expanded))?;
+    let relative = resolved.strip_prefix(&catalog_root).with_context(|| {
+        format!(
+            "catalog-relative profile module escapes the catalog root: {declared}"
+        )
+    })?;
+    anyhow::ensure!(
+        !relative.as_os_str().is_empty(),
+        "catalog-relative profile module names the catalog root: {declared}"
+    );
+    Ok(ResolvedProfileModule::CatalogRelative(
+        relative.to_path_buf(),
+    ))
+}
+
+fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "catalog root is not absolute: {}",
+        path.display()
+    );
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(name) => normalized.push(name),
+            Component::Prefix(_) => {
+                anyhow::bail!("unsupported profile module path prefix: {}", path.display())
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 
 /// The session registry the CATALOG itself declares: `pty-root` if it declares one, else the native
 /// `<catalog>/pty`. This is what `st2 env`/`st2 pty`/`st2 shell` hand to bus-aware tools, so those
@@ -244,19 +305,20 @@ pub fn pty_root(catalog_root: &Path) -> PathBuf {
 /// behind "nothing fires". `st2 up` surfaces this before spawning; `st2 validate` reports it.
 pub fn declared_profiles(catalog_root: &Path) -> anyhow::Result<ResourceProfileRegistry> {
     let config = load(catalog_root)?;
-    Ok(ResourceProfileRegistry::empty().with_profiles(config.profiles.into_iter().map(
-        |declared| {
-            let expanded =
-                PathBuf::from(crate::expand::expand_catalog(&declared.wasm, catalog_root));
-            let module = if expanded.is_absolute() {
-                expanded
-            } else {
-                // Join, so a relative declaration anchors at the catalog instead of the cwd.
-                catalog_root.join(expanded)
+    config.profiles.into_iter().try_fold(
+        ResourceProfileRegistry::empty(),
+        |registry, declared| -> anyhow::Result<ResourceProfileRegistry> {
+            let module = match resolve_profile_module(catalog_root, &declared.wasm)? {
+                ResolvedProfileModule::CatalogRelative(relative) => catalog_root.join(relative),
+                ResolvedProfileModule::External(module) => module,
             };
-            ResourceProfile::wasm(declared.scheme, module, declared.class)
+            Ok(registry.with_profile(ResourceProfile::wasm(
+                declared.scheme,
+                module,
+                declared.class,
+            )))
         },
-    )))
+    )
 }
 
 #[cfg(test)]

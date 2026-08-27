@@ -1,7 +1,8 @@
 # Resource Profile open questions
 
-The registry/SDK boundary (Q8) and wasm-only foundation (Q10) are accepted and
-therefore are not open questions.
+The registry/SDK boundary (Q8), wasm-only foundation (Q10), and transactional
+ownership of catalog-relative modules (Q14) are accepted and therefore are not
+open questions.
 
 - **DQ-P1 ABI compatibility.** The core-wasm ABI has three exports but no
   version negotiation. Before independently released third-party modules need

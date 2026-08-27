@@ -6,7 +6,9 @@ Johannes selected the registry/SDK shape on 2026-08-26 (decision Q8), explicitly
 amending the prior dotfiles direction that rejected a semantic registry. After
 requesting real prototypes rather than a paper choice (Q9), he selected the
 wasm-only foundation (Q10) and its goal of absorbing userland complexity once
-inside a principled boundary.
+inside a principled boundary. On 2026-08-27 he amended the decision (Q14):
+catalog-relative wasm modules are first-class transactional catalog inputs
+rather than external artifacts that happen to sit below the catalog root.
 
 ## Context
 
@@ -40,6 +42,14 @@ same goal-resolution shape before choosing the runtime boundary.
    runtime cost.
 5. Resolver failure is contained to the binding. It becomes unwatchable, the
    supervisor remains alive, and no alternate mechanism guesses a result.
+6. A non-absolute module declaration is normalized beneath the catalog root,
+   opened no-follow as a bounded regular file, and included by exact path and
+   bytes in the whole-catalog projection, root hash, snapshot, prepared bundle,
+   bootstrap, apply, and recovery. Duplicate normalized references deduplicate.
+   Literal absolute paths remain external inputs and are not copied. Apply
+   publishes new module bytes before the `catalog.kdl` that names them and
+   removes stale module bytes only afterward.
+
 
 ## Options
 
@@ -88,6 +98,14 @@ one deterministic resync event, and kept an equal-byte rewrite silent in two
 fresh runs. The selected boundary therefore composes with real catalog,
 watcher, and event behavior rather than only a microbenchmark.
 
+The Q14 amendment closes a deployment gap revealed in review: the original
+transaction projected `catalog.kdl` but omitted the relative module it named.
+That made a generated snapshot internally incomplete and caused a prepared
+catalog containing the module to fail as unprojected. Targeted transaction
+tests now bind module bytes into the root hash, deduplicate references, exclude
+absolute modules, reject traversal/symlink/FIFO/missing/oversized and
+unprojected inputs, and load a relative module from the applied live catalog.
+
 ## Consequences
 
 - st2 assumes a permanent guest ABI compatibility obligation; versioning is
@@ -102,5 +120,9 @@ watcher, and event behavior rather than only a microbenchmark.
 - Scheme ownership remains federated. The registry maps exact strings supplied
   by the catalog; it does not turn st2 into the authority for private URI
   semantics.
+- Whole-catalog publication is deliberately superset-biased across crashes.
+  A failure can leave an unreferenced new or old module until recovery, but
+  ordered atomic leaf replacement prevents `catalog.kdl` from pointing at a
+  missing newly introduced module.
 - Resolver observability and same-path module-cache invalidation remain explicit
   design questions; neither weakens the containment and feature-gating contract.
