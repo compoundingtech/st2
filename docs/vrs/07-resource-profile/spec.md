@@ -9,12 +9,13 @@ wasm execution contract. It builds on
 ## Scope
 
 This subsystem owns scheme-to-resolver registration, the guest ABI, sandbox
-budgets, host path containment, and the handoff of resolved carriers to
+budgets, host path containment, transactional ownership of catalog-relative
+modules, and the handoff of resolved carriers to
 [`06-resync`](../06-resync/spec.md). It does not own Resource URI semantics,
 remote access, Agent Spec binding grammar, event delivery, or task lifecycle.
 Those remain downstream profile concerns or existing root contracts.
 
-## Architecture (PROFILE-R01..R09)
+## Architecture (PROFILE-R01..R10)
 
 ```text
 Agent Spec resource URI (opaque, byte-preserved)
@@ -22,6 +23,9 @@ Agent Spec resource URI (opaque, byte-preserved)
              v exact RFC 3986 scheme
 <catalog>/catalog.kdl
   profile "<scheme>" { wasm "<module>"; class "<class>"; }
+             |
+             +--> catalog-relative module -- normalized no-follow projection
+             |                              + catalog root hash / transaction
              |
              v ResourceProfileRegistry (injectable; built-ins empty)
       bounded outcome cache keyed by module path + file identity/digest
@@ -102,13 +106,16 @@ lookup remains exact and case-sensitive. The profile
 node takes exactly one quoted positional scheme and no properties. Each child
 takes exactly one quoted positional value. Unknown or extra entries, unknown
 children, duplicate `wasm`, duplicate `class`, a missing `wasm`, unsupported
-class values, and duplicate profile schemes fail parsing. Relative module
-paths anchor at the catalog root after the existing `$CATALOG`/environment
-expansion; absolute paths remain absolute.
+class values, and duplicate profile schemes fail parsing. A literal absolute
+module path remains an external runtime input. Every other declaration expands
+`$CATALOG` and environment variables, resolves lexically against the catalog
+root, and must remain strictly beneath that root; internal `.`/`..` components
+normalize away, while traversal outside the root fails validation.
 
-`st2 validate` reports malformed declarations. `st2 up` loads declared profiles
-before it spawns tasks, so a malformed profile block fails loudly rather than
-silently removing watch coverage.
+`st2 validate` reports malformed declarations and missing or unsafe
+catalog-relative modules. `st2 up` loads declared profiles before it spawns
+tasks, so a malformed profile block fails loudly rather than silently removing
+watch coverage.
 
 The scheme namespace remains downstream-owned. A private profile uses its
 owner's reverse-domain scheme (for example `dev.schickling.agent-goal`); st2
@@ -122,6 +129,51 @@ path. Representative behavior:
 | `resources/goal.md` | no URI scheme | profile registry miss; resync's local-path rule applies |
 | `file:///tmp/x` | none | profile registry miss; resync's `file://` rule applies |
 | `dev.schickling.agent-goal://x` with broken module | exact profile declared | registered-profile failure; no fallback |
+
+## Catalog transaction projection (PROFILE-R10)
+
+```text
+exact root catalog.kdl
+          |
+          v parse + expand each non-absolute wasm path
+lexically normalized path strictly below catalog root
+          |
+          v descriptor-relative O_NOFOLLOW open
+regular module <= 16 MiB
+          |
+          v deduplicate by normalized relative path
+catalog transaction projection + declaration-root hash
+          |
+          v snapshot / digest / diff / bootstrap / apply / recovery
+prepared bundle and live catalog contain the same catalog.kdl + module bytes
+```
+
+The whole-catalog projector parses only the exact `catalog.kdl` at its
+projection root. Each catalog-relative module is opened from a retained root
+capability: every ancestor is a no-follow directory and the final no-follow,
+nonblocking descriptor must be a regular file no larger than the runtime's
+16 MiB module cap. Missing files, symlinked ancestors or leaves, FIFOs and
+other special files, paths escaping the root, and oversized modules reject the
+transaction and `st2 validate`. Two profiles whose paths normalize to the same
+relative path contribute one projected entry. Any file present in a prepared
+catalog but absent from this closed projection remains an unprojected-input
+error.
+
+A literal absolute `wasm` path is external and immutable from the catalog
+transaction's perspective. Its bytes are neither copied nor hashed, even when
+the literal happens to name a file physically below the live catalog. A
+non-absolute declaration that expands through `$CATALOG` or an environment
+variable is catalog-owned and must still normalize beneath the logical catalog
+root; expansion cannot turn a relative declaration into an escape hatch.
+
+Apply publishes new or changed projected inputs before atomically replacing
+`catalog.kdl`, then removes stale projected inputs after the declaration no
+longer names them. The incomplete-apply marker fences cooperating catalog
+readers throughout this sequence. The crash bias is a safe superset: failure
+before the declaration replacement may leave an unreferenced new module, and
+failure after it may leave an unreferenced old module, but the live
+`catalog.kdl` never names a missing newly published module. Durable-stage
+recovery repeats the same ordering and removes the superset.
 
 ## Core wasm ABI (PROFILE-R04..R05)
 
