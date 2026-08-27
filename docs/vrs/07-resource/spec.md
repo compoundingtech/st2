@@ -79,12 +79,16 @@ st2 resource rename <old> <new> [--agent <identity>] [--json]
 ```
 $ st2 resource ls dev3.dotfiles.fb-batch1.docs.worker
 # 5 resources for dev3.dotfiles.fb-batch1.docs.worker
-  goal               dev.schickling.agent-goal://dev3/dotfiles.fb-batch1.docs.worker
-  friction-log       dev.schickling.agent-friction-log://dev3/dotfiles.fb-batch1.docs.worker
   decisions          decision-tree://dev3/dotfiles.fb-batch1.docs.worker
-  private-notes      dev.schickling.agent-private-notes://dev3/dotfiles.fb-batch1.docs.worker
   dotfiles-checkout  worktree://dev3/…/2026-08-26-fb-batch1-docs
+  friction-log       dev.schickling.agent-friction-log://dev3/dotfiles.fb-batch1.docs.worker
+  goal               dev.schickling.agent-goal://dev3/dotfiles.fb-batch1.docs.worker
+  private-notes      dev.schickling.agent-private-notes://dev3/dotfiles.fb-batch1.docs.worker
 ```
+
+Rows are ordered by binding name, not declaration order — declaration order has no
+meaning. The name column pads to the widest name in the listing. The worktree URI
+above is elided at `…`; the command prints it in full.
 
 The name column is aligned to the widest name; the checkout URI is elided in this
 document, not by `ls`, which prints every URI verbatim.
