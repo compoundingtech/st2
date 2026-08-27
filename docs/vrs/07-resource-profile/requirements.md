@@ -9,8 +9,9 @@ that st2 can observe. It refines [`06-resync`](../06-resync/requirements.md)
 without moving scheme ownership into st2 or making successful resolution a
 condition of agent launch.
 
-Johannes selected the registry/SDK shape (decision Q8) and a wasm-only resolver
-foundation after the measured three-way comparison (decision Q10). The
+Johannes selected the registry/SDK shape (decision Q8), a wasm-only resolver
+foundation after the measured three-way comparison (decision Q10), and
+transactional ownership of catalog-relative modules (decision Q14). The
 accepted rationale is recorded in
 [decision 0009](../.decisions/0009-resource-profiles-use-a-feature-gated-wasm-boundary.md).
 
@@ -39,6 +40,13 @@ accepted rationale is recorded in
   compilation failures share a bounded cache, while each successful resolution
   receives a fresh store and instance. The extra instantiation cost is accepted
   for state, fuel, and memory isolation between calls.
+- **PROFILE-T04 Superset-biased leaf publication:** Whole-catalog apply may
+  leave an unreferenced new module after a crash. Ordered atomic leaf
+  publication is preferred over a multi-file swap because catalog readers are
+  already fenced by the transaction marker and recovery can remove the
+  harmless superset; the catalog declaration must never point to a missing new
+  catalog-owned module.
+
 
 ## Requirements
 
@@ -97,6 +105,20 @@ accepted rationale is recorded in
   change task launch targets. Resource-only declaration changes preserve root
   [`R21`](../requirements.md): healthy work is adopted without stop,
   replacement, or relaunch.
+
+### Must transact catalog-owned modules
+
+- **PROFILE-R10 Transactional module ownership:** A resolver module whose
+  declared path is catalog-relative is a first-class declaration input.
+  Snapshot, digest, diff, bootstrap, prepare, apply, and recovery include its
+  exact normalized path and bytes in the catalog projection and root hash.
+  Duplicate references to one normalized path contribute one input. A missing,
+  escaping, symlinked, special, or oversized catalog-owned module and an
+  unprojected prepared module fail validation before publication. Literal
+  absolute module paths remain external immutable inputs and are not copied
+  into catalog bundles. Publication orders new module bytes before the
+  `catalog.kdl` that names them and retires old module bytes only after that
+  declaration stops naming them.
 
 ## Evidence
 

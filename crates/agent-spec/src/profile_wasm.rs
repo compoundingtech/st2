@@ -28,7 +28,7 @@ pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// Default cap on elements in each guest table. The ABI itself requires no table.
 pub const DEFAULT_TABLE_ELEMENT_LIMIT: usize = 10_000;
 /// Maximum resolver module bytes admitted before Wasmtime validation and compilation.
-pub const DEFAULT_MODULE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+pub use crate::profile::DEFAULT_MODULE_LIMIT_BYTES;
 
 /// One resolution result as produced by a wasm resolver module.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

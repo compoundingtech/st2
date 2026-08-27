@@ -31,6 +31,9 @@ use sha2::{Digest as _, Sha256};
 /// denotes on this seat (the demo guest: `<agent_dir>/resources/goal.md`).
 pub const AGENT_GOAL_SCHEME: &str = "dev.schickling.agent-goal";
 
+/// Maximum resolver module bytes admitted by both catalog transactions and the wasm runtime.
+pub const DEFAULT_MODULE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
 /// How carriers resolved through one profile notify (`RESYNC-R04`). Declared alongside the
 /// resolver module instead of sniffed from path basenames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -424,7 +427,7 @@ impl ResourceProfileRegistry {
         }
         let snapshot = crate::profile_wasm::read_module_snapshot(
             module_path,
-            crate::profile_wasm::DEFAULT_MODULE_LIMIT_BYTES,
+            DEFAULT_MODULE_LIMIT_BYTES,
         )
         .map_err(|error| error.to_string())?;
         let identity = ModuleIdentity::of(&snapshot);
