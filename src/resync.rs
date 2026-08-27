@@ -43,6 +43,36 @@ impl CarrierClass {
         }
     }
 }
+/// Catalog-observable resync coverage for one declared Resource binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResyncCoverage {
+    Immediate,
+    Coalesced,
+    Silent,
+    Unsupported,
+    Inactive,
+}
+
+impl ResyncCoverage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Coalesced => "coalesced",
+            Self::Silent => "silent",
+            Self::Unsupported => "unsupported",
+            Self::Inactive => "inactive",
+        }
+    }
+
+    fn carrier_class(self) -> Option<CarrierClass> {
+        match self {
+            Self::Immediate => Some(CarrierClass::Immediate),
+            Self::Coalesced => Some(CarrierClass::Coalesced),
+            Self::Silent | Self::Unsupported | Self::Inactive => None,
+        }
+    }
+}
+
 
 /// One watchable local carrier: binding label, absolute path, notification class.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,15 +103,11 @@ pub fn watch_set_for(spec: &AgentSpec, this_host: &str) -> AgentWatchSet {
         class: CarrierClass::Immediate,
     }];
     for resource in &spec.resources {
-        if resource.inactive_reason().is_some() {
-            continue;
-        }
-        let Some(path) = resolve_local_path(agent_dir, resource.uri()) else {
+        let Some(class) = resource_coverage(agent_dir, resource).carrier_class() else {
             continue;
         };
-        let Some(class) = classify(agent_dir, resource.name(), &path) else {
-            continue;
-        };
+        let path = resolve_local_path(agent_dir, resource.uri())
+            .expect("watchable coverage must have a local path");
         carriers.push(WatchableCarrier {
             label: resource.name().to_owned(),
             path,
@@ -133,6 +159,21 @@ fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     let path = PathBuf::from(decode_percent_path(uri).ok()?);
     Some(lexical_clean(&agent_dir.join(path)))
 }
+/// Resolve the externally visible resync coverage for one Resource binding.
+pub fn resource_coverage(agent_dir: &Path, resource: &agent_spec::spec::Resource) -> ResyncCoverage {
+    if resource.inactive_reason().is_some() {
+        return ResyncCoverage::Inactive;
+    }
+    let Some(path) = resolve_local_path(agent_dir, resource.uri()) else {
+        return ResyncCoverage::Unsupported;
+    };
+    match classify(agent_dir, resource.name(), &path) {
+        Some(CarrierClass::Immediate) => ResyncCoverage::Immediate,
+        Some(CarrierClass::Coalesced) => ResyncCoverage::Coalesced,
+        None => ResyncCoverage::Silent,
+    }
+}
+
 
 /// Remove `.` and `..` components lexically. This deliberately does not inspect the filesystem:
 /// classification follows the authored path structure without resolving symlinks.
@@ -190,6 +231,7 @@ struct WatchRefresh {
 enum Msg {
     WatchSet(WatchRefresh),
     Install(AgentWatchSet, Sender<()>),
+    Deactivate(String, Sender<()>),
     Mutations(Vec<PathBuf>),
     Rescan,
     /// Explicit stop: the worker's own watcher holds the last `Sender`, so `Disconnected`
@@ -263,6 +305,19 @@ impl ResyncSupervisor {
             .tx
             .as_ref()
             .is_some_and(|tx| tx.send(Msg::Install(watch_set_for(spec, this_host), ack_tx)).is_ok())
+        {
+            let _ = ack_rx.recv();
+        }
+    }
+
+    /// Synchronously remove a canonical seat's active subscriptions before relaunch work begins.
+    /// Sequence floors remain retained so a later successful install cannot reuse an occurrence.
+    pub fn deactivate(&self, spec: &AgentSpec, this_host: &str) {
+        let (ack_tx, ack_rx) = channel();
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx)).is_ok())
         {
             let _ = ack_rx.recv();
         }
@@ -420,6 +475,10 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
             Ok(Msg::WatchSet(refresh)) => worker.apply_watch_sets(refresh),
             Ok(Msg::Install(set, ack)) => {
                 worker.install_watch_set(set);
+                let _ = ack.send(());
+            }
+            Ok(Msg::Deactivate(bus_id, ack)) => {
+                worker.deactivate_watch_set(&bus_id);
                 let _ = ack.send(());
             }
             Ok(Msg::Mutations(paths)) => worker.mark_mutated(paths),
@@ -617,6 +676,22 @@ impl Worker {
             unaffected.entry(path).or_default().extend(entries);
         }
         self.carriers = unaffected;
+        self.finish_carrier_update(&previous_paths);
+    }
+
+    fn deactivate_watch_set(&mut self, bus_id: &str) {
+        let previous = std::mem::take(&mut self.carriers);
+        let previous_paths = self.prepare_carrier_update(&previous);
+        self.carriers = previous
+            .into_iter()
+            .filter_map(|(path, entries)| {
+                let retained = entries
+                    .into_iter()
+                    .filter(|entry| entry.bus_id != bus_id)
+                    .collect::<Vec<_>>();
+                (!retained.is_empty()).then_some((path, retained))
+            })
+            .collect();
         self.finish_carrier_update(&previous_paths);
     }
 
@@ -1033,11 +1108,14 @@ mod tests {
   host "hetz"
   command "true"
   resource "goal" uri="resources/goal.md" reason="Mission."
+  resource "journal" uri="resources/context/journal.md" reason="Memory."
   resource "issue" uri="github-issue://org/repo/41" reason="Task."
+  resource "old" uri="resources/old.md" reason="History." inactive-reason="No longer used."
 }"#,
         )
         .unwrap();
-        let set = watch_set_for(&discover(tmp.path()), "hetz");
+        let spec = discover(tmp.path());
+        let set = watch_set_for(&spec, "hetz");
         assert_eq!(set.bus_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
@@ -1045,6 +1123,15 @@ mod tests {
         let goal = set.carriers.iter().find(|c| c.label == "goal").unwrap();
         assert_eq!(goal.class, CarrierClass::Immediate);
         assert_eq!(goal.path, dir.join("resources/goal.md"));
+        let coverage = spec
+            .resources
+            .iter()
+            .map(|resource| (resource.name(), resource_coverage(&dir, resource)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(coverage["goal"], ResyncCoverage::Immediate);
+        assert_eq!(coverage["journal"], ResyncCoverage::Silent);
+        assert_eq!(coverage["issue"], ResyncCoverage::Unsupported);
+        assert_eq!(coverage["old"], ResyncCoverage::Inactive);
     }
 
     #[test]

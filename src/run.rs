@@ -1846,6 +1846,13 @@ fn reconcile_pass(
         }
     };
     report.deferred = debounce.defer_flickers(&mut plan, now);
+    if let Some(resync) = resync {
+        for launch in &plan.launch {
+            if launch.tasks.iter().any(|task| task.name == "agent") {
+                resync.deactivate(launch.spec, this_host);
+            }
+        }
+    }
     gate_harness_launches_on_hooks(&mut plan, root, &mut report, |_| match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
@@ -3698,6 +3705,7 @@ mod tests {
     }
 
     struct BlockingLaunchRunner {
+        sessions: RefCell<Vec<Session>>,
         fail_id: Option<String>,
         block_id: String,
         entered: mpsc::SyncSender<()>,
@@ -3706,7 +3714,7 @@ mod tests {
 
     impl Runner for BlockingLaunchRunner {
         fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
-            Ok(Vec::new())
+            Ok(self.sessions.borrow().clone())
         }
 
         fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
@@ -4057,6 +4065,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::channel();
         let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
             fail_id: None,
             block_id: "hetz.second.agent".to_owned(),
             entered: entered_tx,
@@ -4111,6 +4120,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::channel();
         let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
             fail_id: Some("hetz.first.agent".to_owned()),
             block_id: "hetz.second.agent".to_owned(),
             entered: entered_tx,
@@ -4141,6 +4151,72 @@ mod tests {
     }
 
     #[test]
+    fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(vec![sess("hetz.worker", true)]),
+            fail_id: None,
+            block_id: "hetz.worker".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(Duration::ZERO);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let seeded = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+        );
+        assert!(seeded.adopted.iter().any(|identity| identity == "worker"));
+        *runner.sessions.borrow_mut() = vec![sess("hetz.worker", false)];
+        let blocked_goal = goal.clone();
+
+        let relaunched = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&blocked_goal, "changed while replacement launch blocks\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            reconcile_pass(
+                catalog.path(),
+                "hetz",
+                &task_context,
+                &runner,
+                &mut cap,
+                &mut debounce,
+                &mut presentation_cursor,
+                Some(&resync),
+            )
+        });
+        assert_eq!(relaunched.restarted, ["hetz.worker"]);
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&agent_dir).is_none(),
+            "a carrier mutation while no canonical seat is live must not emit"
+        );
+
+        std::fs::write(&goal, "changed after replacement launch\n").unwrap();
+        let event = wait_for_resync_event(&agent_dir)
+            .expect("the successful replacement must receive a fresh silent baseline");
+        assert!(event.contains("binding: goal"), "{event}");
+    }
+
+    #[test]
     fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
         let catalog = tempfile::tempdir().unwrap();
         let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
@@ -4161,6 +4237,7 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::channel();
         let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
             fail_id: None,
             block_id: "hetz.worker.ding".to_owned(),
             entered: entered_tx,

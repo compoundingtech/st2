@@ -31,6 +31,8 @@ pub struct AgentRow {
     pub desired_state_reason: Option<String>,
     /// Typed Resource bindings declared directly by the agent.
     pub resources: Vec<Resource>,
+    /// Resync coverage derived from the declaration directory and each Resource URI.
+    pub resource_resync: Vec<crate::resync::ResyncCoverage>,
     /// Newest activity time across inbox, archive, and status. Version 1 status uses its embedded
     /// writer timestamp; message files and legacy status use local mtime. `--enrich` only.
     pub last_activity_ms: Option<f64>,
@@ -71,6 +73,11 @@ pub fn roster_from_discovered(
                 desired_state: s.desired_state.as_str().to_owned(),
                 desired_state_reason: s.desired_state.reason().map(str::to_owned),
                 resources: s.resources.clone(),
+                resource_resync: s
+                    .resources
+                    .iter()
+                    .map(|resource| crate::resync::resource_coverage(agent_dir, resource))
+                    .collect(),
                 last_activity_ms: newest_activity_ms(agent_dir),
                 inbox: inbox_count(agent_dir),
                 observed: observed_state(s, agent_dir, &pty_root, this_host),
@@ -137,6 +144,30 @@ impl<'a> ObservedJson<'a> {
     }
 }
 
+#[derive(Serialize)]
+struct ResourceJson<'a> {
+    name: &'a str,
+    uri: &'a str,
+    reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inactive_reason: Option<&'a str>,
+    resync: &'static str,
+}
+
+fn resource_json(row: &AgentRow) -> Vec<ResourceJson<'_>> {
+    row.resources
+        .iter()
+        .zip(&row.resource_resync)
+        .map(|(resource, coverage)| ResourceJson {
+            name: resource.name(),
+            uri: resource.uri(),
+            reason: resource.reason(),
+            inactive_reason: resource.inactive_reason(),
+            resync: coverage.as_str(),
+        })
+        .collect()
+}
+
 /// `st2 agents --json` row. Field order and names are the stable wire contract.
 #[derive(Serialize)]
 struct SummaryJson<'a> {
@@ -145,7 +176,7 @@ struct SummaryJson<'a> {
     name: Option<&'a str>,
     description: Option<&'a str>,
     retired: bool,
-    resources: &'a [Resource],
+    resources: Vec<ResourceJson<'a>>,
     #[serde(rename = "desiredState")]
     desired_state: &'a str,
     #[serde(rename = "desiredStateReason")]
@@ -162,7 +193,7 @@ struct EnrichedJson<'a> {
     name: Option<&'a str>,
     description: Option<&'a str>,
     retired: bool,
-    resources: &'a [Resource],
+    resources: Vec<ResourceJson<'a>>,
     #[serde(rename = "lastActivity")]
     last_activity: Option<f64>,
     inbox: usize,
@@ -185,7 +216,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 name: r.name.as_deref(),
                 description: r.description.as_deref(),
                 retired: r.retired,
-                resources: &r.resources,
+                resources: resource_json(r),
                 desired_state: &r.desired_state,
                 desired_state_reason: r.desired_state_reason.as_deref(),
                 last_activity: r.last_activity_ms,
@@ -203,7 +234,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 name: r.name.as_deref(),
                 description: r.description.as_deref(),
                 retired: r.retired,
-                resources: &r.resources,
+                resources: resource_json(r),
                 desired_state: &r.desired_state,
                 desired_state_reason: r.desired_state_reason.as_deref(),
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
@@ -269,6 +300,7 @@ mod tests {
             desired_state: if retired { "retired" } else { "running" }.to_owned(),
             desired_state_reason: None,
             resources: Vec::new(),
+            resource_resync: Vec::new(),
             last_activity_ms: last,
             inbox,
             observed: None,
@@ -313,10 +345,13 @@ mod tests {
             )
             .unwrap(),
         );
+        resource_row
+            .resource_resync
+            .push(crate::resync::ResyncCoverage::Unsupported);
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task."}],"desiredState":"running","desiredStateReason":null,"observedState":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null}]"#
         );
     }
 
