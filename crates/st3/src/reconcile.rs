@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,8 +10,8 @@ use sha2::Digest as _;
 use tokio::sync::Notify;
 
 use crate::model::{
-    CheckpointSpec, ClaimInput, DesiredSubject, JudgeSpec, LaunchSpec, MemberKind, MemberLifecycle,
-    MemberSpec, RestartIntensity, RestartType,
+    CheckpointSpec, ClaimInput, DependencySpec, DesiredSubject, JudgeSpec, LaunchSpec, MemberKind,
+    MemberLifecycle, MemberSpec, PlanRunView, PlanSpec, RestartIntensity, RestartType, StepSpec,
 };
 use crate::store::Store;
 
@@ -397,6 +397,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.reconcile_schedules(&desired)?;
         self.deliver_messages(&desired)?;
+        self.evaluate_plan_runs()?;
         self.evaluate_checkpoints(&desired)?;
         Ok(())
     }
@@ -1075,6 +1076,470 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .map_err(Into::into)
             .map(|_| ())
+    }
+
+    fn evaluate_plan_runs(&self) -> Result<()> {
+        let runs = self.store.active_plan_runs()?;
+        let mut changed = false;
+        for run in runs {
+            let plan_id = run.plan.strip_prefix("plan/").unwrap_or(&run.plan);
+            let Some(plan) = self.store.plan_spec(plan_id, Some(&run.revision))? else {
+                changed |= self.store.set_plan_run_state(
+                    &run.id,
+                    "blocked",
+                    &run.phase,
+                    Some("the selected plan revision is unavailable"),
+                )?;
+                continue;
+            };
+            changed |= self.evaluate_plan_run(&run, &plan)?;
+        }
+        if changed {
+            self.signal_changed();
+        }
+        Ok(())
+    }
+
+    fn evaluate_plan_run(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
+        let mut changed = false;
+        let flat = flatten_plan_steps(plan);
+        let views = run
+            .steps
+            .iter()
+            .map(|step| (step.step.as_str(), step))
+            .collect::<HashMap<_, _>>();
+        let normal_failed = flat.iter().any(|step| {
+            !step.spec.finally
+                && views
+                    .get(step.spec.path.as_str())
+                    .is_some_and(|view| view.status == "failed")
+        });
+        let normal_complete = flat.iter().filter(|step| !step.spec.finally).all(|step| {
+            views
+                .get(step.spec.path.as_str())
+                .is_some_and(|view| view.status == "completed")
+        });
+        if run.phase == "normal" && (normal_failed || normal_complete) {
+            for step in flat.iter().filter(|step| !step.spec.finally) {
+                let view = views[step.spec.path.as_str()];
+                if !matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
+                    changed |= self.store.set_step_state(
+                        &view.subject,
+                        "cancelled",
+                        Some(if normal_failed {
+                            "another step failed"
+                        } else {
+                            "the normal phase completed"
+                        }),
+                    )?;
+                }
+            }
+            if flat.iter().any(|step| step.spec.finally) {
+                changed |= self.store.set_plan_run_state(
+                    &run.id,
+                    "running",
+                    "final",
+                    normal_failed.then_some("a normal step failed"),
+                )?;
+            } else {
+                changed |= self.store.set_plan_run_state(
+                    &run.id,
+                    if normal_failed { "failed" } else { "completed" },
+                    "terminal",
+                    normal_failed.then_some("a normal step failed"),
+                )?;
+            }
+            return Ok(changed);
+        }
+
+        if run.phase == "final" {
+            let final_terminal = flat.iter().filter(|step| step.spec.finally).all(|step| {
+                views.get(step.spec.path.as_str()).is_some_and(|view| {
+                    matches!(view.status.as_str(), "completed" | "failed" | "cancelled")
+                })
+            });
+            if final_terminal {
+                let failed = run.steps.iter().any(|step| {
+                    !step.step.is_empty() && matches!(step.status.as_str(), "failed" | "cancelled")
+                });
+                changed |= self.store.set_plan_run_state(
+                    &run.id,
+                    if failed { "failed" } else { "completed" },
+                    "terminal",
+                    failed.then_some("one or more plan steps failed"),
+                )?;
+                return Ok(changed);
+            }
+        }
+
+        for step in flat {
+            let Some(view) = views.get(step.spec.path.as_str()).copied() else {
+                continue;
+            };
+            let eligible_phase = (run.phase == "normal" && !step.spec.finally)
+                || (run.phase == "final" && step.spec.finally);
+            if !eligible_phase {
+                continue;
+            }
+            if view.status == "failed" {
+                if view.attempt < step.spec.retry.attempts {
+                    changed |= self.store.retry_step(
+                        &view.subject,
+                        "the step retry policy permits another attempt",
+                        step.spec.retry.backoff_ms,
+                    )?;
+                }
+                continue;
+            }
+            if matches!(view.status.as_str(), "completed" | "cancelled") {
+                continue;
+            }
+            if let Some(expiry) = view.lease_expires_at_unix_ms
+                && expiry <= now_ms()
+                && matches!(view.status.as_str(), "claimed" | "working")
+            {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "ready",
+                    Some("the worker lease expired"),
+                )?;
+                continue;
+            }
+            let assignment_blocked = view.status == "blocked"
+                && view
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("the assigned agent `"));
+            if view.status == "pending" || assignment_blocked {
+                if view
+                    .not_before_unix_ms
+                    .is_some_and(|not_before| not_before > now_ms())
+                {
+                    continue;
+                }
+                if !self.step_dependencies_hold(run, &step, &views)? {
+                    continue;
+                }
+                if let Some(assignee) = &view.assignee
+                    && self.store.selected_desired_revision(assignee)?.is_none()
+                {
+                    changed |= self.store.set_step_state(
+                        &view.subject,
+                        "blocked",
+                        Some(&format!(
+                            "the assigned agent `{assignee}` is not present in the desired graph"
+                        )),
+                    )?;
+                    continue;
+                }
+                changed |= self.store.set_step_state(&view.subject, "ready", None)?;
+                continue;
+            }
+            if !matches!(
+                view.status.as_str(),
+                "ready" | "claimed" | "working" | "verifying" | "blocked"
+            ) {
+                continue;
+            }
+            changed |= self.materialize_step_subgraph(run, &step, view)?;
+            if self.step_timed_out(view, &step)? {
+                changed |= self.store.set_step_state(
+                    &view.subject,
+                    "failed",
+                    Some("the step timeout expired"),
+                )?;
+                continue;
+            }
+            if !self.step_subgraph_holds(&view.subject)? {
+                continue;
+            }
+            if view.assignee.is_some() && !view.worker_reported {
+                continue;
+            }
+            if let Some(nested) = &step.spec.nested_plan {
+                let nested_prefix = format!("{}/{}/", step.spec.path, nested.id);
+                if !views
+                    .iter()
+                    .filter(|(path, _)| path.starts_with(&nested_prefix))
+                    .all(|(_, child)| child.status == "completed")
+                {
+                    continue;
+                }
+            }
+            if !self.products_hold(run, &step, view)? {
+                continue;
+            }
+            let mut judges_pass = true;
+            for judge in &step.spec.judges {
+                match self.evaluate_plan_judge(run, &step, view, judge)? {
+                    JudgeOutcome::Pass => {}
+                    JudgeOutcome::Pending => {
+                        judges_pass = false;
+                        break;
+                    }
+                    JudgeOutcome::Fail(reason) => {
+                        changed |=
+                            self.store
+                                .set_step_state(&view.subject, "failed", Some(&reason))?;
+                        judges_pass = false;
+                        break;
+                    }
+                }
+            }
+            if judges_pass {
+                changed |= self
+                    .store
+                    .set_step_state(&view.subject, "completed", None)?;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn step_dependencies_hold(
+        &self,
+        run: &PlanRunView,
+        step: &RuntimeStep<'_>,
+        views: &HashMap<&str, &crate::model::StepRunView>,
+    ) -> Result<bool> {
+        if let Some(parent) = &step.parent {
+            let Some(parent) = views.get(parent.as_str()) else {
+                return Ok(false);
+            };
+            if !matches!(parent.status.as_str(), "claimed" | "working" | "verifying") {
+                return Ok(false);
+            }
+        }
+        for dependency in &step.spec.dependencies {
+            match dependency {
+                DependencySpec::Step {
+                    step: target,
+                    state,
+                } => {
+                    let path = if step.dependency_prefix.is_empty() {
+                        target.clone()
+                    } else {
+                        format!("{}/{target}", step.dependency_prefix)
+                    };
+                    let Some(target) = views.get(path.as_str()) else {
+                        return Ok(false);
+                    };
+                    let holds = match state.as_str() {
+                        "completed" => target.status == "completed",
+                        "failed" => target.status == "failed",
+                        "terminal" => {
+                            matches!(target.status.as_str(), "completed" | "failed" | "cancelled")
+                        }
+                        _ => false,
+                    };
+                    if !holds {
+                        return Ok(false);
+                    }
+                }
+                DependencySpec::Predicate { judge } => {
+                    let fake = crate::model::StepRunView {
+                        subject: format!("step-run/{}/{}", run.id, step.spec.path),
+                        run: run.subject.clone(),
+                        step: step.spec.path.clone(),
+                        definition_hash: step.spec.definition_hash.clone(),
+                        status: "pending".into(),
+                        attempt: 1,
+                        assignee: None,
+                        title: None,
+                        goal: None,
+                        worker_reported: false,
+                        lease_owner: None,
+                        lease_incarnation: None,
+                        lease_expires_at_unix_ms: None,
+                        blocked_reason: None,
+                        not_before_unix_ms: None,
+                        created_at_unix_ms: run.created_at_unix_ms,
+                        updated_at_unix_ms: run.updated_at_unix_ms,
+                    };
+                    if !matches!(
+                        self.evaluate_plan_judge(run, step, &fake, judge)?,
+                        JudgeOutcome::Pass
+                    ) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn materialize_step_subgraph(
+        &self,
+        run: &PlanRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+    ) -> Result<bool> {
+        let Some(source) = &step.spec.subgraph_kdl else {
+            return Ok(false);
+        };
+        let variables = run_variables(run, step.spec, view);
+        let source = crate::plan::interpolate(source, &variables)?;
+        let mut intent = crate::graph::parse_intent(&source, &self.host)?;
+        let step_scope = format!("scope/{}", view.subject);
+        for subject in intent.subjects.values_mut() {
+            subject.scopes.insert(step_scope.clone());
+            if let Some(scope) = &run.run_scope {
+                subject.scopes.insert(scope.clone());
+            }
+            if let Some(member) = subject.member.as_mut() {
+                let workspace = PathBuf::from(&member.workspace);
+                if workspace.is_relative() {
+                    member.workspace = Path::new(&run.workspace)
+                        .join(&workspace)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                let cwd = PathBuf::from(&member.cwd);
+                if cwd.is_relative() {
+                    member.cwd = Path::new(&run.workspace)
+                        .join(&cwd)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                member
+                    .environment
+                    .insert("ST3_WORKSPACE".into(), run.workspace.clone());
+                member
+                    .environment
+                    .insert("ST3_RUN_DIR".into(), run.workspace.clone());
+                member
+                    .environment
+                    .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
+                member
+                    .environment
+                    .insert("ST_AGENT".into(), member.runtime_id.clone());
+            }
+        }
+        if let Some(scope) = &run.run_scope {
+            intent
+                .subjects
+                .entry(scope.clone())
+                .or_insert_with(|| DesiredSubject {
+                    subject: scope.clone(),
+                    kind: "scope".into(),
+                    desired: serde_json::json!({"scope": scope, "retention": "temporary"}),
+                    member: None,
+                    activation: None,
+                    scopes: BTreeSet::new(),
+                });
+        }
+        let response = self.store.apply_internal(
+            &intent,
+            &format!("materialize:{}:{}", view.subject, view.attempt),
+        )?;
+        Ok(response.changed)
+    }
+
+    fn step_subgraph_holds(&self, step_subject: &str) -> Result<bool> {
+        let scope = format!("scope/{step_subject}");
+        for subject in self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .filter(|subject| subject.scopes.contains(&scope))
+        {
+            let status = self
+                .store
+                .latest_actual_value(&subject.subject)?
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let holds = match subject.kind.as_str() {
+                "scope-stop" | "stop" => {
+                    matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
+                }
+                "message" => matches!(status.as_deref(), Some("delivered" | "accepted" | "closed")),
+                _ => match subject.member.as_ref() {
+                    Some(member) if member.driver.is_some() => {
+                        matches!(status.as_deref(), Some("ready" | "working" | "idle"))
+                    }
+                    Some(_) => matches!(
+                        status.as_deref(),
+                        Some("running" | "ready" | "working" | "idle" | "exited")
+                    ),
+                    None => true,
+                },
+            };
+            if !holds {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn products_hold(
+        &self,
+        run: &PlanRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+    ) -> Result<bool> {
+        let variables = run_variables(run, step.spec, view);
+        for product in &step.spec.products {
+            let subject = crate::plan::interpolate(&product.subject, &variables)?;
+            let Some(actual) = self.store.latest_actual_value(&subject)? else {
+                return Ok(false);
+            };
+            for (field, expected) in &product.fields {
+                if actual_field(&actual, field) != Some(expected) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn evaluate_plan_judge(
+        &self,
+        run: &PlanRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        judge: &JudgeSpec,
+    ) -> Result<JudgeOutcome> {
+        let variables = run_variables(run, step.spec, view);
+        let mut judge = judge.clone();
+        expand_judge(&mut judge, &variables, &run.workspace)?;
+        let stage = CheckpointSpec {
+            subject: view.subject.clone(),
+            sequence: run.subject.clone(),
+            name: step.spec.path.clone(),
+            ordinal: 0,
+            judges: vec![judge.clone()],
+        };
+        self.evaluate_judge(&stage, &judge)
+    }
+
+    fn step_timed_out(
+        &self,
+        view: &crate::model::StepRunView,
+        step: &RuntimeStep<'_>,
+    ) -> Result<bool> {
+        let Some(timeout) = step.spec.timeout_ms else {
+            return Ok(false);
+        };
+        let Some(active) = self
+            .store
+            .latest_claim(&view.subject, Some("step-run.state"))?
+        else {
+            return Ok(false);
+        };
+        let elapsed = now_ms().saturating_sub(active.accepted_at_unix_ms);
+        if elapsed >= timeout as u128 {
+            return Ok(true);
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let notify = self.notify.clone();
+            let remaining = (timeout as u128).saturating_sub(elapsed) as u64;
+            handle.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(remaining)).await;
+                notify.notify_one();
+            });
+        }
+        Ok(false)
     }
 
     fn evaluate_checkpoints(&self, desired: &[DesiredSubject]) -> Result<()> {
@@ -1890,6 +2355,27 @@ impl<R: RuntimeControl> Reconciler<R> {
                 *time_limit_ms,
                 prompt,
             )?,
+            JudgeSpec::Human { reviewer } => {
+                let decision = self
+                    .store
+                    .latest_claim(&stage.subject, Some("review.decision"))?;
+                match decision.as_ref().and_then(|claim| {
+                    (claim.actor.as_deref() == Some(reviewer.as_str()))
+                        .then(|| {
+                            claim
+                                .body
+                                .pointer("/fields/decision")
+                                .and_then(Value::as_str)
+                        })
+                        .flatten()
+                }) {
+                    Some("approved") => JudgeOutcome::Pass,
+                    Some("rejected") => {
+                        JudgeOutcome::Fail("the human reviewer rejected the work".into())
+                    }
+                    _ => JudgeOutcome::Pending,
+                }
+            }
         })
     }
 
@@ -2440,6 +2926,133 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 }
 
+struct RuntimeStep<'a> {
+    spec: &'a StepSpec,
+    dependency_prefix: String,
+    parent: Option<String>,
+}
+
+fn flatten_plan_steps(plan: &PlanSpec) -> Vec<RuntimeStep<'_>> {
+    fn append<'a>(
+        plan: &'a PlanSpec,
+        dependency_prefix: String,
+        parent: Option<String>,
+        output: &mut Vec<RuntimeStep<'a>>,
+    ) {
+        for id in &plan.display_order {
+            let step = &plan.steps[id];
+            output.push(RuntimeStep {
+                spec: step,
+                dependency_prefix: dependency_prefix.clone(),
+                parent: parent.clone(),
+            });
+            if let Some(nested) = &step.nested_plan {
+                append(
+                    nested,
+                    format!("{}/{}", step.path, nested.id),
+                    Some(step.path.clone()),
+                    output,
+                );
+            }
+        }
+    }
+    let mut output = Vec::new();
+    append(plan, String::new(), None, &mut output);
+    output
+}
+
+fn run_variables(
+    run: &PlanRunView,
+    step: &StepSpec,
+    view: &crate::model::StepRunView,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "PLAN".into(),
+            run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
+        ),
+        ("PLAN_REVISION".into(), run.revision.clone()),
+        ("PLAN_RUN".into(), run.id.clone()),
+        (
+            "RUN_SCOPE".into(),
+            run.run_scope.clone().unwrap_or_default(),
+        ),
+        ("WORKSPACE".into(), run.workspace.clone()),
+        ("STEP".into(), step.path.clone()),
+        ("STEP_RUN".into(), view.subject.clone()),
+        ("ATTEMPT".into(), view.attempt.to_string()),
+        ("ASSIGNEE".into(), view.assignee.clone().unwrap_or_default()),
+        ("REQUESTER".into(), run.requester.clone()),
+        ("PARENT_STEP_RUN".into(), String::new()),
+        ("ROOT_PLAN_RUN".into(), run.subject.clone()),
+    ])
+}
+
+fn expand_judge(
+    judge: &mut JudgeSpec,
+    variables: &BTreeMap<String, String>,
+    run_workspace: &str,
+) -> Result<()> {
+    let expand = |value: &mut String| -> Result<()> {
+        *value = crate::plan::interpolate(value, variables)?;
+        Ok(())
+    };
+    match judge {
+        JudgeSpec::Exists { subject }
+        | JudgeSpec::Empty { subject }
+        | JudgeSpec::Field { subject, .. }
+        | JudgeSpec::Has { subject, .. }
+        | JudgeSpec::Lacks { subject, .. } => expand(subject)?,
+        JudgeSpec::Mechanical {
+            command,
+            host,
+            workspace,
+            environment,
+            ..
+        } => {
+            expand(command)?;
+            expand(host)?;
+            expand(workspace)?;
+            if Path::new(workspace).is_relative() {
+                *workspace = Path::new(run_workspace)
+                    .join(&*workspace)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            for value in environment.values_mut() {
+                expand(value)?;
+            }
+            environment.insert("ST3_WORKSPACE".into(), run_workspace.into());
+        }
+        JudgeSpec::Llm {
+            model,
+            host,
+            workspace,
+            environment,
+            prompt,
+            ..
+        } => {
+            expand(model)?;
+            expand(host)?;
+            expand(workspace)?;
+            expand(prompt)?;
+            if Path::new(workspace).is_relative() {
+                *workspace = Path::new(run_workspace)
+                    .join(&*workspace)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            for value in environment.values_mut() {
+                expand(value)?;
+            }
+            environment.insert("ST3_WORKSPACE".into(), run_workspace.into());
+        }
+        JudgeSpec::Human { reviewer } => expand(reviewer)?,
+        JudgeSpec::Deadline { .. } => {}
+    }
+    Ok(())
+}
+
 fn signal_changed(reconcile_notify: &Notify, event_notify: &Notify) {
     reconcile_notify.notify_one();
     event_notify.notify_waiters();
@@ -2729,6 +3342,289 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_run_executes_parallel_roots_and_an_all_of_join() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+subgraph {
+  plan "dag" state="ready" {
+    step "one" { }
+    step "two" { }
+    step "join" {
+      depends-on {
+        step "one" completed
+        step "two" completed
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-dag");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "dag".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-dag".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let run = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.status, "completed");
+        assert!(run.steps.iter().all(|step| step.status == "completed"));
+    }
+
+    #[tokio::test]
+    async fn a_materialized_step_subgraph_wakes_member_reconciliation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+subgraph {
+  plan "wake" state="ready" {
+    step "team" {
+      subgraph {
+        agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-wake");
+        store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "wake".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-wake".into(),
+            })
+            .unwrap();
+        let notify = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            notify.clone(),
+        );
+        reconciler.reconcile_once().unwrap();
+        notify.notified().await;
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+            .await
+            .expect("the materialized subgraph did not request another reconcile pass");
+    }
+
+    #[test]
+    fn a_worker_report_waits_for_the_declared_product() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+subgraph {
+  agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+  plan "product" state="ready" {
+    step "publish" {
+      assigned-to "agent/worker"
+      produces {
+        resource "plan-run/${PLAN_RUN}/change" {
+          kind "vcs.revision"
+          state "published"
+        }
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-product");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "product".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-product".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let step = store.plan_run(&run.id).unwrap().unwrap().steps.remove(0);
+        assert_eq!(step.status, "ready");
+        for action in ["claim", "complete"] {
+            store
+                .work_action(
+                    &step.subject,
+                    action,
+                    &crate::model::WorkRequest {
+                        actor: Some("agent/node.worker".into()),
+                        incarnation: Some("test".into()),
+                        summary: Some("published the change".into()),
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("{action}-product"),
+                    },
+                )
+                .unwrap();
+        }
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "verifying"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: format!("resource/plan-run/{}/change", run.id),
+                kind: "resource.binding".into(),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.revision".into())),
+                    ("state".into(), Value::String("published".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("product-binding".into()),
+            })
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn an_assignment_waits_until_the_agent_is_in_the_desired_graph() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+subgraph {
+  plan "assignment" state="ready" {
+    step "work" { assigned-to "agent/worker" }
+  }
+}
+"#,
+            "assignment-plan",
+        );
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "assignment".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "assignment-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let blocked = store.plan_run(&run.id).unwrap().unwrap().steps.remove(0);
+        assert_eq!(blocked.status, "blocked");
+        assert!(
+            blocked
+                .blocked_reason
+                .unwrap()
+                .contains("is not present in the desired graph")
+        );
+
+        apply_source(
+            &store,
+            r#"subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } }"#,
+            "assignment-agent",
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn a_human_judge_accepts_only_the_bound_step_run_review() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+subgraph {
+  plan "review" state="ready" {
+    step "approval" { judges { human "person/nathan" } }
+  }
+}
+"#,
+            "review-plan",
+        );
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "review".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "review-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: step.clone(),
+                kind: "review.decision".into(),
+                actor: Some("person/someone-else".into()),
+                fields: BTreeMap::from([("decision".into(), Value::String("approved".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("wrong-reviewer".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "ready"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: step,
+                kind: "review.decision".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([("decision".into(), Value::String("approved".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("right-reviewer".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "completed"
+        );
+    }
+
+    #[test]
     fn rejects_an_unstructured_usage_log() {
         assert_eq!(structured_token_usage("the judge finished"), None);
     }
@@ -2775,7 +3671,7 @@ mod tests {
         let source = r#"
             subgraph {
               agent "worker" {
-                codex { prompt "Wait for work." }
+                harness "codex" { prompt "Wait for work." }
               }
             }
         "#;
@@ -2801,15 +3697,16 @@ mod tests {
     }
 
     #[test]
-    fn a_checkpoint_waits_for_native_driver_readiness_before_starting_a_judge() {
+    fn a_plan_step_waits_for_native_driver_readiness_before_starting_a_judge() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             subgraph {
-              checkpoints "proof" {
-                checkpoint "The native agent is ready" {
+              plan "proof" state="ready" {
+                step "native-ready" {
+                  title "The native agent is ready"
                   subgraph {
                     agent "worker" {
-                      codex { prompt "Do the work." }
+                      harness "codex" { prompt "Do the work." }
                     }
                     message "kick" {
                       from "requester"
@@ -2829,7 +3726,17 @@ mod tests {
               }
             }
         "#;
-        apply_source(&store, source, "checkpoint-native-ready");
+        apply_source(&store, source, "plan-native-ready");
+        store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "proof".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-native-ready".into(),
+            })
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -2838,7 +3745,9 @@ mod tests {
             Arc::new(Notify::new()),
         );
 
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
         assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
 
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
@@ -2891,15 +3800,17 @@ mod tests {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             subgraph {
-              checkpoints "eval/simulated-codex" scope="scope/eval/simulated-codex" {
-                checkpoint "The Codex team is ready" {
+              scope "eval/simulated-codex" retention="temporary" change-policy="agent" {
+                plan "eval/simulated-codex" state="ready" {
+                step "team" {
+                  title "The Codex team is ready"
                   subgraph {
                     agent "sup" {
-                      codex { prompt "Coordinate the work." }
+                      harness "codex" { prompt "Coordinate the work." }
                       restart "never"
                     }
                     agent "worker" {
-                      codex { prompt "Do the work." }
+                      harness "codex" { prompt "Do the work." }
                       restart "never"
                     }
                     message "kickoff" {
@@ -2911,10 +3822,11 @@ mod tests {
                   judges {
                     exists "agent/node.sup"
                     exists "agent/node.worker"
-                    deadline "60s"
                   }
                 }
-                checkpoint "The worker report is delivered" {
+                step "worker-report" {
+                  title "The worker report is delivered"
+                  depends-on { step "team" completed }
                   subgraph {
                     message "worker-report" {
                       from "node.worker"
@@ -2922,9 +3834,10 @@ mod tests {
                       content "The work is complete."
                     }
                   }
-                  judges { deadline "60s" }
                 }
-                checkpoint "The supervisor confirmation is delivered" {
+                step "confirmation" {
+                  title "The supervisor confirmation is delivered"
+                  depends-on { step "worker-report" completed }
                   subgraph {
                     message "confirmation" {
                       from "node.sup"
@@ -2932,9 +3845,10 @@ mod tests {
                       content "The result is verified."
                     }
                   }
-                  judges { deadline "60s" }
                 }
-                checkpoint "The mechanical judge passes" {
+                step "mechanical" {
+                  title "The mechanical judge passes"
+                  depends-on { step "confirmation" completed }
                   judges {
                     judge "mechanical" {
                       exec "true"
@@ -2944,7 +3858,9 @@ mod tests {
                     }
                   }
                 }
-                checkpoint "The Codex judge passes" {
+                step "semantic" {
+                  title "The Codex judge passes"
+                  depends-on { step "mechanical" completed }
                   judges {
                     judge "semantic" type="llm" {
                       model "gpt-5.6-sol"
@@ -2957,14 +3873,26 @@ mod tests {
                     }
                   }
                 }
-                checkpoint "The temporary eval scope is empty" {
+                step "cleanup" finally=#true {
+                  title "The temporary eval scope is empty"
                   subgraph { scope "eval/simulated-codex" { stop } }
                   judges { empty "scope/eval/simulated-codex" }
+                }
                 }
               }
             }
         "#;
         apply_source(&store, source, "simulated-codex-graph");
+        let plan_run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "eval/simulated-codex".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                idempotency_key: "run-simulated-codex".into(),
+            })
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -2986,7 +3914,9 @@ mod tests {
                 .unwrap();
         };
 
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
         assert_eq!(runtime.started_members.lock().unwrap().len(), 2);
         runtime.ptys.lock().unwrap().extend([
             RuntimeObservation {
@@ -3022,11 +3952,17 @@ mod tests {
                 .unwrap();
         }
         deliver("message/kickoff", "agent/node.sup");
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
         deliver("message/worker-report", "agent/node.sup");
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
         deliver("message/confirmation", "requester");
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
 
         let mechanical = runtime
             .started_members
@@ -3047,7 +3983,9 @@ mod tests {
                 incarnation_id: Some("mechanical-one".into()),
             },
         );
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
 
         let (llm, judge_subject) = {
             let members = runtime.started_members.lock().unwrap();
@@ -3091,24 +4029,18 @@ mod tests {
             llm,
             r#"{"type":"turn.completed","usage":{"total_tokens":120}}"#.into(),
         );
-        reconciler.reconcile_once().unwrap();
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
         assert_eq!(runtime.stops.lock().unwrap().len(), 2);
 
         runtime.ptys.lock().unwrap().clear();
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
 
-        let verdict = store
-            .latest_claim("scope/eval/simulated-codex", Some("eval.verdict"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            verdict
-                .body
-                .pointer("/fields/verdict")
-                .and_then(Value::as_str),
-            Some("pass")
-        );
+        let completed = store.plan_run(&plan_run.id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed", "{completed:?}");
         assert_eq!(
             store
                 .latest_actual_value("scope/eval/simulated-codex")
@@ -3123,8 +4055,9 @@ mod tests {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             subgraph {
-              checkpoints "proof" {
-                checkpoint "The command passes" {
+              plan "proof" state="ready" {
+                step "verify" {
+                  title "The command passes"
                   judges {
                     judge "verify" {
                       exec "sleep 60"
@@ -3137,7 +4070,17 @@ mod tests {
               }
             }
         "#;
-        apply_source(&store, source, "checkpoint-async-judge");
+        apply_source(&store, source, "plan-async-judge");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "proof".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-async-judge".into(),
+            })
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -3146,14 +4089,11 @@ mod tests {
             Arc::new(Notify::new()),
         );
 
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
         let runtime_id = runtime.starts.lock().unwrap()[0].clone();
-        assert!(
-            store
-                .latest_claim("checkpoint/proof", Some("checkpoint.reached"))
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().status, "running");
         runtime.execs.lock().unwrap().insert(
             runtime_id.clone(),
             RuntimeObservation {
@@ -3165,13 +4105,13 @@ mod tests {
             },
         );
 
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
 
-        assert!(
-            store
-                .latest_claim("checkpoint/proof", Some("checkpoint.reached"))
-                .unwrap()
-                .is_some()
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().status,
+            "completed"
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 1);
@@ -3182,8 +4122,9 @@ mod tests {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             subgraph {
-              checkpoints "proof" {
-                checkpoint "A held-out judge accepts the result" {
+              plan "proof" state="ready" {
+                step "review" {
+                  title "A held-out judge accepts the result"
                   judges {
                     judge "review" type="llm" {
                       model "claude-sonnet"
@@ -3199,7 +4140,17 @@ mod tests {
               }
             }
         "#;
-        apply_source(&store, source, "llm-budget");
+        apply_source(&store, source, "plan-llm-budget");
+        store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "proof".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-llm-budget".into(),
+            })
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -3208,45 +4159,18 @@ mod tests {
             Arc::new(Notify::new()),
         );
         reconciler.reconcile_once().unwrap();
-        let desired = store.desired_subjects().unwrap();
-        let stage = desired
-            .iter()
-            .find(|subject| subject.kind == "checkpoint-stage")
-            .and_then(|subject| {
-                serde_json::from_value::<CheckpointSpec>(subject.desired.clone()).ok()
-            })
-            .unwrap();
-        let JudgeSpec::Llm {
-            name,
-            model,
-            host,
-            workspace,
-            tools,
-            environment,
-            token_budget,
-            time_limit_ms,
-            prompt,
-        } = &stage.judges[0]
-        else {
-            panic!("the parsed judge is not an LLM judge");
+        reconciler.reconcile_once().unwrap();
+        let (runtime_id, result_subject) = {
+            let members = runtime.started_members.lock().unwrap();
+            let judge = members
+                .iter()
+                .find(|member| member.driver.as_deref() == Some("llm-judge"))
+                .unwrap();
+            (
+                judge.runtime_id.clone(),
+                judge.environment["ST3_JUDGE_SUBJECT"].clone(),
+            )
         };
-        let result_subject = judge_operation_subject(
-            &stage,
-            name,
-            &serde_json::json!({
-                "type": "llm",
-                "model": model,
-                "host": host,
-                "workspace": workspace,
-                "tools": tools,
-                "environment": environment,
-                "token_budget": token_budget,
-                "time_limit_ms": time_limit_ms,
-                "prompt": prompt,
-            }),
-        )
-        .unwrap();
-        let runtime_id = result_subject.replace('/', ".");
         store
             .append_claim(&ClaimInput {
                 subject: result_subject.clone(),
@@ -3789,7 +4713,7 @@ mod tests {
               }
               agent "worker" {
                 supervisor "watch"
-                codex { prompt "Do the work." }
+                harness "codex" { prompt "Do the work." }
               }
             }
         "#;
@@ -3829,26 +4753,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_terminal_checkpoint_failure_selects_cleanup() {
+    async fn a_terminal_plan_failure_selects_cleanup() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             subgraph {
-              checkpoints "eval/demo" scope="scope/eval/demo" {
-                checkpoint "The result appears" {
+              scope "eval/demo" retention="temporary" change-policy="agent" {
+                plan "eval/demo" state="ready" {
+                step "result" timeout="1ms" {
+                  title "The result appears"
                   judges {
                     field "status" "resource/result" "is" "ok"
-                    deadline "1ms"
                   }
                 }
-                checkpoint "The temporary eval scope is empty" {
+                step "cleanup" finally=#true {
+                  title "The temporary eval scope is empty"
                   subgraph { scope "eval/demo" { stop } }
                   judges { empty "scope/eval/demo" }
+                }
                 }
               }
               resource "result" { kind "human.review" }
             }
         "#;
-        apply_source(&store, source, "checkpoint-cleanup");
+        apply_source(&store, source, "plan-cleanup");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "eval/demo".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                idempotency_key: "run-cleanup".into(),
+            })
+            .unwrap();
         let reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
@@ -3857,21 +4794,15 @@ mod tests {
         );
 
         reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        reconciler.reconcile_once().unwrap();
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
-        let verdict = store
-            .latest_claim("scope/eval/demo", Some("eval.verdict"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            verdict
-                .body
-                .pointer("/fields/verdict")
-                .and_then(Value::as_str),
-            Some("fail")
-        );
+        let run = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(run.status, "failed");
         assert_eq!(
             store
                 .latest_actual_value("scope/eval/demo")
@@ -3881,30 +4812,44 @@ mod tests {
                 .and_then(Value::as_str),
             Some("stopped")
         );
-        assert!(
-            store
-                .latest_claim("checkpoint/eval/demo/1", Some("checkpoint.active"))
+        assert_eq!(
+            run.steps
+                .iter()
+                .find(|step| step.step == "cleanup")
                 .unwrap()
-                .is_some()
+                .status,
+            "completed"
         );
     }
 
     #[test]
-    fn a_persistent_checkpoint_reopens_when_its_predicate_regresses() {
+    fn a_satisfied_dependency_predicate_stays_latched() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             subgraph {
               resource "approval" { kind "human.review" }
-              checkpoints "release" {
-                checkpoint "A person approves the release" {
-                  judges {
+              agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+              plan "release" state="ready" {
+                step "publish" {
+                  assigned-to "agent/worker"
+                  depends-on {
                     field "decision" "resource/approval" "is" "approved"
                   }
                 }
               }
             }
         "#;
-        apply_source(&store, source, "persistent-checkpoint");
+        apply_source(&store, source, "latched-dependency");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "release".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-latched-dependency".into(),
+            })
+            .unwrap();
         store
             .append_claim(&ClaimInput {
                 subject: "resource/approval".into(),
@@ -3923,12 +4868,9 @@ mod tests {
             Arc::new(Notify::new()),
         );
         reconciler.reconcile_once().unwrap();
-        let desired = store.desired_subjects().unwrap();
         assert_eq!(
-            reconciler
-                .current_checkpoint_reached("checkpoint/release", &desired)
-                .unwrap(),
-            Some(0)
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "ready"
         );
 
         store
@@ -3943,11 +4885,10 @@ mod tests {
             })
             .unwrap();
 
+        reconciler.reconcile_once().unwrap();
         assert_eq!(
-            reconciler
-                .current_checkpoint_reached("checkpoint/release", &desired)
-                .unwrap(),
-            None
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "ready"
         );
     }
 }

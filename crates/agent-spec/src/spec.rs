@@ -505,7 +505,7 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: select one provider-native delivery transport.
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub deliver: Option<Option<String>>,
-    /// Direct `claude {}` or `codex {}` provider block.
+    /// A direct provider block or the equivalent `harness "provider" {}` block.
     #[serde(flatten)]
     pub driver: RawDriver,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.

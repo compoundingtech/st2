@@ -3,34 +3,39 @@ subgraph {
     kind "human.review"
   }
 
-  checkpoints "release" scope="scope/release-example" {
-    checkpoint "The build command passes" {
-      subgraph {
-        exec "release-example/build" {
-          workspace "."
-          command "cargo test --workspace"
-          restart "never"
+  scope "release-example" retention="temporary" change-policy="agent" {
+    plan "release" state="ready" {
+      step "build" timeout="20m" {
+        title "The build command passes"
+        subgraph {
+          exec "release-example/build/${PLAN_RUN}" {
+            workspace "."
+            command "cargo test --workspace"
+            restart "never"
+          }
+        }
+        judges {
+          field "status" "exec/release-example/build/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/release-example/build/${PLAN_RUN}" "is" 0
         }
       }
-      judges {
-        field "status" "exec/release-example/build" "is" "exited"
-        field "exit_code" "exec/release-example/build" "is" 0
-        deadline "20m"
-      }
-    }
 
-    checkpoint "A person approves the release" {
-      judges {
-        field "decision" "resource/release-review" "is" "approved"
+      step "approval" {
+        title "A person approves the release"
+        depends-on { step "build" completed }
+        judges {
+          field "decision" "resource/release-review" "is" "approved"
+        }
       }
-    }
 
-    checkpoint "The temporary release scope is empty" {
-      subgraph {
-        scope "release-example" { stop }
-      }
-      judges {
-        empty "scope/release-example"
+      step "cleanup" finally=#true {
+        title "The temporary release scope is empty"
+        subgraph {
+          scope "release-example" { stop }
+        }
+        judges {
+          empty "scope/release-example"
+        }
       }
     }
   }

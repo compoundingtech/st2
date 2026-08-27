@@ -23,3 +23,27 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
             .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
     }
 }
+
+#[test]
+fn every_native_st3_eval_uses_the_normative_grammar() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals");
+    let mut files = walkdir::WalkDir::new(&root)
+        .max_depth(2)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("walk evals")
+        .into_iter()
+        .filter(|entry| entry.file_name() == "eval.kdl")
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert!(!files.is_empty());
+    for file in files {
+        let source = fs::read_to_string(&file).expect("read eval");
+        st3::parse_intent(&source, "local")
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+    }
+}

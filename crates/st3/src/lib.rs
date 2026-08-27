@@ -7,6 +7,7 @@ pub mod config;
 pub mod graph;
 pub mod model;
 pub mod peer;
+pub mod plan;
 pub mod projection;
 pub mod reconcile;
 pub mod render;

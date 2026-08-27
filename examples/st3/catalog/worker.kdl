@@ -2,7 +2,7 @@ subgraph {
   agent "catalog.worker" {
     workspace "."
     restart "always"
-    codex {
+    harness "codex" {
       prompt "Own the assigned repository and wait for graph messages."
     }
   }

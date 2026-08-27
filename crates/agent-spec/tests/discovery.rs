@@ -588,6 +588,19 @@ args = ["--permission-mode", "bypassPermissions"]
     );
     write(
         tmp.path(),
+        "agents/h/claude-harness/agent.kdl",
+        r#"agent "claude-harness" {
+  harness "claude" {
+    model "opus"
+    effort "xhigh"
+    dev-channels #true
+    prompt "Start the assigned work."
+    args "--permission-mode" "bypassPermissions"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
         "agents/h/claude-json/agent.json",
         r#"{
   "identity": "claude-json",
@@ -623,6 +636,18 @@ effort = "xhigh"
 prompt = "Start the assigned work."
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 "#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/codex-harness/agent.kdl",
+        r#"agent "codex-harness" {
+  harness "codex" {
+    model "gpt-5.6-sol"
+    effort "xhigh"
+    prompt "Start the assigned work."
+    args "--dangerously-bypass-approvals-and-sandbox"
+  }
+}"#,
     );
     write(
         tmp.path(),
@@ -664,6 +689,18 @@ args = ["--tools", "read,bash,edit,write"]
     );
     write(
         tmp.path(),
+        "agents/h/pi-harness/agent.kdl",
+        r#"agent "pi-harness" {
+  harness "pi" {
+    model "anthropic/claude-opus-5"
+    effort "high"
+    prompt "Start the assigned work."
+    args "--tools" "read,bash,edit,write"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
         "agents/h/pi-json/agent.json",
         r#"{
   "identity": "pi-json",
@@ -700,6 +737,17 @@ args = ["--agent", "build"]
     );
     write(
         tmp.path(),
+        "agents/h/opencode-harness/agent.kdl",
+        r#"agent "opencode-harness" {
+  harness "opencode" {
+    model "anthropic/claude-opus-5"
+    prompt "Start the assigned work."
+    args "--agent" "build"
+  }
+}"#,
+    );
+    write(
+        tmp.path(),
         "agents/h/opencode-json/agent.json",
         r#"{
   "identity": "opencode-json",
@@ -720,7 +768,7 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--permission-mode".into(), "bypassPermissions".into()],
     });
-    for identity in ["claude-kdl", "claude-toml", "claude-json"] {
+    for identity in ["claude-kdl", "claude-harness", "claude-toml", "claude-json"] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&claude));
         assert!(!spec.is_runnable());
@@ -731,7 +779,7 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
     });
-    for identity in ["codex-kdl", "codex-toml", "codex-json"] {
+    for identity in ["codex-kdl", "codex-harness", "codex-toml", "codex-json"] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&codex));
         assert!(!spec.is_runnable());
@@ -742,7 +790,7 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--tools".into(), "read,bash,edit,write".into()],
     });
-    for identity in ["pi-kdl", "pi-toml", "pi-json"] {
+    for identity in ["pi-kdl", "pi-harness", "pi-toml", "pi-json"] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&pi));
         assert!(!spec.is_runnable());
@@ -752,7 +800,12 @@ args = ["--agent", "build"]
         prompt: "Start the assigned work.".into(),
         args: vec!["--agent".into(), "build".into()],
     });
-    for identity in ["opencode-kdl", "opencode-toml", "opencode-json"] {
+    for identity in [
+        "opencode-kdl",
+        "opencode-harness",
+        "opencode-toml",
+        "opencode-json",
+    ] {
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&opencode));
         assert!(!spec.is_runnable());

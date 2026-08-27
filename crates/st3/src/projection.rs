@@ -24,7 +24,11 @@ pub fn export_messages(root: &Path, messages: &[MessageView]) -> Result<()> {
             .subject
             .strip_prefix("message/")
             .unwrap_or(&message.subject);
-        let filename = format!("{:020}-{id}.md", message.created_index);
+        let filename = format!(
+            "{:020}-{}.md",
+            message.created_index,
+            urlencoding::encode(id)
+        );
         let path = root.join(recipient).join(folder).join(filename);
         expected.insert(path.clone());
         write_message(&path, message)?;
@@ -140,6 +144,29 @@ mod tests {
             directory
                 .path()
                 .join("receiver/archive/00000000000000000007-abc.md")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn projection_encodes_a_nested_message_id_as_one_file() {
+        let directory = tempdir().unwrap();
+        let message = MessageView {
+            subject: "message/kickoff/run-1".into(),
+            from: "agent/sender".into(),
+            to: "agent/receiver".into(),
+            content: "hello".into(),
+            status: "delivered".into(),
+            title: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            created_index: 8,
+        };
+        export_messages(directory.path(), &[message]).unwrap();
+        assert!(
+            directory
+                .path()
+                .join("receiver/inbox/00000000000000000008-kickoff%2Frun-1.md")
                 .is_file()
         );
     }

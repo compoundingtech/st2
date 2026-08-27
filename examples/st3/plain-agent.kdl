@@ -5,7 +5,7 @@ subgraph {
     workspace "."
     restart "always"
     shutdown-timeout "5s"
-    claude {
+    harness "claude" {
       dev-channels #true
       prompt "Review the current work and wait for graph messages."
     }

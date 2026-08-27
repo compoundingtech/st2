@@ -627,6 +627,30 @@ fn parse_agent(
                     );
                     driver = Some(parse_native_driver(c)?);
                 }
+                "harness" => {
+                    anyhow::ensure!(
+                        driver.is_none(),
+                        "agent '{id}' declares more than one native driver"
+                    );
+                    let provider = arg(c)
+                        .ok_or_else(|| anyhow::anyhow!("agent '{id}' harness needs a provider"))?;
+                    anyhow::ensure!(
+                        matches!(provider.as_str(), "claude" | "codex"),
+                        "agent '{id}' harness '{provider}' is not supported in evals"
+                    );
+                    anyhow::ensure!(
+                        c.entries()
+                            .iter()
+                            .filter(|entry| entry.name().is_none())
+                            .count()
+                            == 1,
+                        "agent '{id}' harness needs exactly one provider"
+                    );
+                    let mut provider_node = c.clone();
+                    provider_node.set_name(provider);
+                    provider_node.entries_mut().clear();
+                    driver = Some(parse_native_driver(&provider_node)?);
+                }
                 // Feature (a): a DEDICATED built-in sidecar node. Bare `ding` expands to the standard
                 // st2 ding command (identity/label auto-derived as this agent's id, `--root $ST_ROOT`).
                 // It is distinct from `exec` on purpose — `exec` never reserves a magic name, so a
@@ -677,7 +701,7 @@ fn parse_agent(
                     });
                 }
                 other => anyhow::bail!(
-                    "agent '{id}': unexpected node '{other}' (expected name|description|workspace|supervisor|env|command|claude|codex|ding|exec)"
+                    "agent '{id}': unexpected node '{other}' (expected name|description|workspace|supervisor|env|command|harness|claude|codex|ding|exec)"
                 ),
             }
         }
@@ -1102,6 +1126,43 @@ eval {
             })) if model == "gpt-5.6-sol"
                 && effort == "medium"
                 && prompt == "Judge the result."
+        ));
+    }
+
+    #[test]
+    fn parses_contextual_harness_eval_agents() {
+        let spec = parse_spec(
+            r#"
+agent "worker" {
+  harness "claude" {
+    model "claude-sonnet-5"
+    effort "medium"
+    prompt "Do the work."
+    args "--permission-mode" "bypassPermissions"
+  }
+}
+eval {
+  message { from "requester"; to "worker"; content "work" }
+  max-timeout "60s"
+  agent "judge" {
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "Judge the work."
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            spec.agents[0].driver.as_ref(),
+            Some(Driver::Claude(ClaudeDriver { prompt, .. })) if prompt == "Do the work."
+        ));
+        assert!(matches!(
+            spec.eval.unwrap().agents[0].driver.as_ref(),
+            Some(Driver::Codex(CodexDriver { prompt, .. })) if prompt == "Judge the work."
         ));
     }
 

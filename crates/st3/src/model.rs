@@ -149,6 +149,81 @@ pub struct DesiredSubject {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanState {
+    Draft,
+    Ready,
+    Retired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChangePolicy {
+    Agent,
+    Supervisor,
+    HumanReview,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "dependency", rename_all = "kebab-case")]
+pub enum DependencySpec {
+    Step { step: String, state: String },
+    Predicate { judge: JudgeSpec },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProductSpec {
+    pub subject: String,
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetrySpec {
+    pub attempts: u32,
+    pub backoff_ms: u64,
+}
+
+impl Default for RetrySpec {
+    fn default() -> Self {
+        Self {
+            attempts: 1,
+            backoff_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StepSpec {
+    pub id: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub goal: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub retry: RetrySpec,
+    pub finally: bool,
+    pub assigned_to: Option<String>,
+    pub dependencies: Vec<DependencySpec>,
+    pub subgraph_kdl: Option<String>,
+    pub products: Vec<ProductSpec>,
+    pub judges: Vec<JudgeSpec>,
+    pub nested_plan: Option<Box<PlanSpec>>,
+    pub definition_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanSpec {
+    pub id: String,
+    pub subject: String,
+    pub state: PlanState,
+    pub revision: String,
+    pub scope_template: Option<String>,
+    pub change_policy: ChangePolicy,
+    pub change_authority: Option<String>,
+    pub steps: BTreeMap<String, StepSpec>,
+    pub display_order: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckpointActivation {
     pub sequence: String,
     pub ordinal: u32,
@@ -245,6 +320,9 @@ pub enum JudgeSpec {
         time_limit_ms: u64,
         prompt: String,
     },
+    Human {
+        reviewer: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -253,6 +331,8 @@ pub struct NormalizedIntent {
     pub source_hash: String,
     pub subjects: BTreeMap<String, DesiredSubject>,
     pub checkpoints: Vec<CheckpointSpec>,
+    #[serde(default)]
+    pub plans: BTreeMap<String, PlanSpec>,
     pub document_refs: BTreeSet<String>,
     pub normalized: Value,
 }
@@ -385,8 +465,10 @@ pub struct ClaimsPage {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalStatus {
     pub scope: String,
+    pub plan_run: String,
     pub lifecycle: String,
-    pub active_checkpoint: Option<String>,
+    pub phase: String,
+    pub active_steps: Vec<String>,
     pub verdict: Option<String>,
     pub cleanup: String,
     pub store_index: u64,
@@ -614,6 +696,84 @@ pub struct EvalStartRequest {
 pub struct EvalStartResponse {
     pub scope: String,
     pub event_cursor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_run: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanRunRequest {
+    pub plan: String,
+    #[serde(default)]
+    pub revision: Option<String>,
+    pub workspace: String,
+    #[serde(default)]
+    pub requester: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanRunView {
+    pub subject: String,
+    pub id: String,
+    pub plan: String,
+    pub revision: String,
+    pub root_revision: String,
+    pub workspace: String,
+    pub requester: String,
+    pub run_scope: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub phase: String,
+    pub created_at_unix_ms: u128,
+    pub updated_at_unix_ms: u128,
+    #[serde(default)]
+    pub steps: Vec<StepRunView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StepRunView {
+    pub subject: String,
+    pub run: String,
+    pub step: String,
+    pub definition_hash: String,
+    pub status: String,
+    pub attempt: u32,
+    pub assignee: Option<String>,
+    pub title: Option<String>,
+    pub goal: Option<String>,
+    pub worker_reported: bool,
+    pub lease_owner: Option<String>,
+    pub lease_incarnation: Option<String>,
+    pub lease_expires_at_unix_ms: Option<u128>,
+    pub blocked_reason: Option<String>,
+    pub not_before_unix_ms: Option<u128>,
+    pub created_at_unix_ms: u128,
+    pub updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanRevisionRequest {
+    pub intent: IntentInput,
+    pub actor: String,
+    pub reason: String,
+    pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

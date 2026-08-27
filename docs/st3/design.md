@@ -1,6 +1,12 @@
 # st3 engineering design
 
-Status: implemented on the st3 engineering branch. This document is the version 1 contract.
+Status: this document records the first engineering design.
+
+The plan runtime superseded its authored checkpoint model on 2026-08-27.
+
+See [plan-graph-runtime.md](./plan-graph-runtime.md) for the implemented plan grammar and commands.
+
+The claims, reconciliation, transport, and safety sections remain useful design history.
 
 ## Outcome
 

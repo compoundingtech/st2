@@ -21,7 +21,7 @@ const ROOT_NODES: &[&str] = &[
     "account",
     "supervisor",
     "link",
-    "checkpoints",
+    "plan",
     "message",
     "schedule",
     "stop",
@@ -71,6 +71,7 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
         ));
     }
 
+    let plans = crate::plan::parse_plans(root, default_host)?;
     let mut context = ParseContext {
         default_host: default_host.to_owned(),
         subjects: BTreeMap::new(),
@@ -97,6 +98,7 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
         source_hash,
         subjects: context.subjects,
         checkpoints: context.checkpoints,
+        plans,
         document_refs: context.document_refs,
         normalized,
     })
@@ -153,7 +155,7 @@ fn parse_desired_node(
         "scope" => parse_scope(node, enclosing_host, context),
         "agent" => parse_agent(node, enclosing_host, context),
         "exec" | "pty" => parse_standalone_member(node, kind, enclosing_host, context),
-        "checkpoints" => parse_checkpoints(node, context),
+        "plan" => Ok(()),
         "stop" => parse_stop(node, context),
         _ => parse_structure(node, kind, context),
     }
@@ -195,6 +197,27 @@ fn parse_scope(
     context: &mut ParseContext,
 ) -> Result<(), St3Error> {
     let name = one_string_with_children(node)?;
+    let plan_only = node.children().is_some_and(|children| {
+        !children.nodes().is_empty()
+            && children
+                .nodes()
+                .iter()
+                .all(|child| child.name().value() == "plan")
+    });
+    if plan_only {
+        return Ok(());
+    }
+    if node.children().is_some_and(|children| {
+        children
+            .nodes()
+            .iter()
+            .any(|child| child.name().value() == "plan")
+    }) {
+        return Err(St3Error::new(
+            "mixed-plan-scope",
+            "a plan scope cannot mix plan definitions with immediate desired state",
+        ));
+    }
     validate_name(&name, false)?;
     ensure_only_properties(node, &["retention"])?;
     let retention = property_string(node, "retention")?.unwrap_or_else(|| "persistent".into());
@@ -239,10 +262,21 @@ fn parse_scope(
             format!("scope `{name}` cannot mix `stop` with members"),
         ));
     }
+    let desired_children = children
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() != "plan")
+        .collect::<Vec<_>>();
+    if desired_children.is_empty() {
+        return Ok(());
+    }
     let prior_scopes = context.scopes.clone();
     context.scopes.insert(subject);
-    for child in children.nodes() {
-        if !matches!(child.name().value(), "agent" | "exec" | "pty") {
+    for child in desired_children {
+        if !matches!(
+            child.name().value(),
+            "agent" | "exec" | "pty" | "resource" | "message" | "stop"
+        ) {
             return Err(St3Error::new(
                 "invalid-scope-child",
                 format!("scope `{name}` cannot contain `{}`", child.name().value()),
@@ -297,7 +331,7 @@ fn parse_agent(
     let driver_nodes = children
         .nodes()
         .iter()
-        .filter(|child| matches!(child.name().value(), "claude" | "codex" | "pi" | "opencode"))
+        .filter(|child| child.name().value() == "harness")
         .collect::<Vec<_>>();
     let command = child_string(children, "command")?;
     let argv = child_strings(children, "argv")?;
@@ -531,6 +565,7 @@ fn parse_stop(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
     )
 }
 
+#[allow(dead_code)]
 fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
     if context.checkpoint.is_some() {
         return Err(St3Error::new(
@@ -679,7 +714,7 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
     Ok(())
 }
 
-fn parse_judges(node: &KdlNode, default_host: &str) -> Result<Vec<JudgeSpec>, St3Error> {
+pub(crate) fn parse_judges(node: &KdlNode, default_host: &str) -> Result<Vec<JudgeSpec>, St3Error> {
     ensure_bare(node)?;
     let children = node.children().ok_or_else(|| {
         St3Error::new(
@@ -801,6 +836,17 @@ fn parse_judges(node: &KdlNode, default_host: &str) -> Result<Vec<JudgeSpec>, St
                     ));
                 }
                 output.push(parse_running_judge(child, name, default_host)?);
+            }
+            "human" => {
+                ensure_no_properties(child)?;
+                let reviewer = one_string(child)?;
+                if !reviewer.starts_with("person/") {
+                    return Err(St3Error::new(
+                        "invalid-human-reviewer",
+                        "a human judge needs a full person subject",
+                    ));
+                }
+                output.push(JudgeSpec::Human { reviewer });
             }
             other => {
                 return Err(St3Error::new(
@@ -930,18 +976,18 @@ fn driver_member(
     shutdown_timeout_ms: u64,
     supervisor: &str,
 ) -> Result<MemberSpec, St3Error> {
-    let name = driver.name().value();
+    let name = one_string_with_children(driver)?;
     let children = driver.children().ok_or_else(|| {
         St3Error::new(
             "missing-driver-body",
-            format!("driver `{name}` has no body"),
+            format!("harness `{name}` has no body"),
         )
     })?;
-    let prompt = required_child_string(children, "prompt", name)?;
+    let prompt = required_child_string(children, "prompt", &name)?;
     let model = child_string(children, "model")?;
     let effort = child_string(children, "effort")?;
     let extra = child_strings(children, "args")?.unwrap_or_default();
-    let mut provider = vec![name.to_owned()];
+    let mut provider = vec![name.clone()];
     if name == "claude" {
         let mcp = serde_json::json!({
             "mcpServers": {
@@ -966,13 +1012,13 @@ fn driver_member(
         }
     }
     if let Some(model) = model {
-        match name {
+        match name.as_str() {
             "codex" => provider.extend(["--model".into(), model]),
             _ => provider.extend(["--model".into(), model]),
         }
     }
     if let Some(effort) = effort {
-        match name {
+        match name.as_str() {
             "codex" => provider.extend(["-c".into(), format!("model_reasoning_effort={effort}")]),
             "pi" => provider.extend(["--thinking".into(), effort]),
             "opencode" => {
@@ -985,14 +1031,14 @@ fn driver_member(
         }
     }
     provider.extend(extra);
-    match name {
+    match name.as_str() {
         "opencode" => provider.extend(["--prompt".into(), prompt]),
         _ => provider.push(prompt),
     }
     let mut wrapper = vec![
         "st3".into(),
         "driver".into(),
-        name.into(),
+        name.clone(),
         "--subject".into(),
         subject.into(),
         "--".into(),
@@ -1013,7 +1059,7 @@ fn driver_member(
         restart,
         restart_intensity,
         shutdown_timeout_ms,
-        driver: Some(name.into()),
+        driver: Some(name),
         supervisor: supervisor.into(),
     })
 }
@@ -1230,10 +1276,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "meta",
         "render",
-        "claude",
-        "codex",
-        "pi",
-        "opencode",
+        "harness",
         "pty",
         "exec",
         "resource",
@@ -1259,10 +1302,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "meta",
         "render",
-        "claude",
-        "codex",
-        "pi",
-        "opencode",
+        "harness",
     ] {
         unique_child(document, child)?;
     }
@@ -1301,12 +1341,11 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
                 format!("invalid delivery transport `{deliver}`"),
             ));
         }
-        if ["claude", "codex", "pi", "opencode"].iter().any(|name| {
-            document
-                .nodes()
-                .iter()
-                .any(|node| node.name().value() == *name)
-        }) {
+        if document
+            .nodes()
+            .iter()
+            .any(|node| node.name().value() == "harness")
+        {
             return Err(St3Error::new(
                 "multiple-agent-launches",
                 "a typed driver cannot occur with `deliver`",
@@ -1335,7 +1374,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
     for driver in document
         .nodes()
         .iter()
-        .filter(|node| matches!(node.name().value(), "claude" | "codex" | "pi" | "opencode"))
+        .filter(|node| node.name().value() == "harness")
     {
         validate_driver(driver)?;
     }
@@ -1478,29 +1517,24 @@ fn validate_restart_forms(document: &KdlDocument) -> Result<(), St3Error> {
 
 fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
-    if !positional_values(node).is_empty() {
-        return Err(St3Error::new(
-            "unexpected-value",
-            format!("driver `{}` cannot have values", node.name().value()),
-        ));
-    }
+    let provider = one_string_with_children(node)?;
     let body = node.children().ok_or_else(|| {
         St3Error::new(
             "missing-driver-body",
-            format!("driver `{}` has no body", node.name().value()),
+            format!("harness `{provider}` has no body"),
         )
     })?;
-    let allowed: &[&str] = match node.name().value() {
+    let allowed: &[&str] = match provider.as_str() {
         "claude" => &["model", "effort", "dev-channels", "prompt", "args"],
         "codex" | "pi" => &["model", "effort", "prompt", "args"],
         "opencode" => &["model", "prompt", "args"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
-    reject_unknown_children(body, allowed, "driver", node.name().value())?;
+    reject_unknown_children(body, allowed, "harness", &provider)?;
     for child in allowed {
         unique_child(body, child)?;
     }
-    required_child_string(body, "prompt", node.name().value())?;
+    required_child_string(body, "prompt", &provider)?;
     if let Some(node) = unique_child(body, "dev-channels")? {
         one_bool(node)?;
     }
@@ -1814,6 +1848,12 @@ fn validate_message(node: &KdlNode) -> Result<(), St3Error> {
     child_string(body, "from")?;
     required_child_string(body, "to", "message")?;
     let content = required_child_string(body, "content", "message")?;
+    if content.trim().is_empty() {
+        return Err(St3Error::new(
+            "empty-message",
+            "a message needs nonempty content",
+        ));
+    }
     if content.len() > 4_096 && !content.starts_with("doc/") {
         return Err(St3Error::new(
             "message-too-large",
@@ -1933,7 +1973,13 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     )?;
     child_string(message_body, "from")?;
     required_child_string(message_body, "to", "schedule message")?;
-    required_child_string(message_body, "content", "schedule message")?;
+    let content = required_child_string(message_body, "content", "schedule message")?;
+    if content.trim().is_empty() {
+        return Err(St3Error::new(
+            "empty-message",
+            "a schedule message needs nonempty content",
+        ));
+    }
     Ok(())
 }
 
@@ -2736,6 +2782,24 @@ fn validate_name(value: &str, full: bool) -> Result<(), St3Error> {
 }
 
 fn validate_full_subject(value: &str) -> Result<(), St3Error> {
+    if value.contains("${") {
+        let mut concrete = String::with_capacity(value.len());
+        let mut rest = value;
+        while let Some(start) = rest.find("${") {
+            concrete.push_str(&rest[..start]);
+            let tail = &rest[start + 2..];
+            let Some(end) = tail.find('}') else {
+                return Err(St3Error::new(
+                    "invalid-variable",
+                    "a variable reference has no closing brace",
+                ));
+            };
+            concrete.push('x');
+            rest = &tail[end + 1..];
+        }
+        concrete.push_str(rest);
+        return validate_full_subject(&concrete);
+    }
     if let Some(rest) = value.strip_prefix("file/") {
         let Some((host, path)) = rest.split_once(':') else {
             return Err(St3Error::new(
@@ -2803,7 +2867,7 @@ subgraph {
   agent "worker" {
     workspace "/work"
     restart "never"
-    claude {
+    harness "claude" {
       prompt "Work on the task."
     }
   }
@@ -2818,17 +2882,20 @@ subgraph {
     }
 
     #[test]
-    fn parses_checkpoint_order() {
+    fn parses_plan_order_and_dependencies() {
         let intent = parse_intent(
             r#"
 subgraph {
-  checkpoints "build" {
-    checkpoint "The first step passes" {
+  plan "build" state="ready" {
+    step "build" {
+      title "The first step passes"
       subgraph { exec "one" { command "true"; restart "never" } }
       judges { field "status" "exec/one" is "exited" }
     }
 
-    checkpoint "The work is reviewed" {
+    step "review" {
+      title "The work is reviewed"
+      depends-on { step "build" completed }
       judges { field "decision" "resource/review" is "approved" }
     }
   }
@@ -2836,16 +2903,14 @@ subgraph {
 "#,
             "node",
         )
-        .expect("checkpoint KDL parses");
-        assert_eq!(intent.checkpoints.len(), 2);
-        assert_eq!(
-            intent.subjects["exec/one"]
-                .activation
-                .as_ref()
-                .expect("activation")
-                .ordinal,
-            0
-        );
+        .expect("plan KDL parses");
+        let plan = &intent.plans["build"];
+        assert_eq!(plan.display_order, ["build", "review"]);
+        assert!(matches!(
+            &plan.steps["review"].dependencies[0],
+            crate::model::DependencySpec::Step { step, state }
+                if step == "build" && state == "completed"
+        ));
     }
 
     #[test]
@@ -2856,8 +2921,9 @@ subgraph {
                 host "local"
                 command "true"
               }
-              checkpoints "proof" {
-                checkpoint "The local judge passes" {
+              plan "proof" state="ready" {
+                step "verify" {
+                  title "The local judge passes"
                   judges {
                     judge "verify" {
                       exec "true"
@@ -2876,7 +2942,8 @@ subgraph {
             intent.subjects["exec/setup"].member.as_ref().unwrap().host,
             "node-a"
         );
-        let JudgeSpec::Mechanical { host, .. } = &intent.checkpoints[0].judges[0] else {
+        let JudgeSpec::Mechanical { host, .. } = &intent.plans["proof"].steps["verify"].judges[0]
+        else {
             panic!("the test judge is not mechanical");
         };
         assert_eq!(host, "node-a");
@@ -2933,6 +3000,16 @@ subgraph {
         )
         .expect_err("unknown property");
         assert_eq!(property.code, "unknown-property");
+    }
+
+    #[test]
+    fn authored_messages_reject_empty_content() {
+        let error = parse_intent(
+            "subgraph { message \"empty\" { to \"worker\"; content \"  \" } }",
+            "node",
+        )
+        .expect_err("an empty message must not enter the delivery FIFO");
+        assert_eq!(error.code, "empty-message");
     }
 
     #[test]

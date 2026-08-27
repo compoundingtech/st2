@@ -2,76 +2,83 @@ subgraph {
   resource "st3-complex-proof-review" { kind "human.review" }
   resource "st3-full-corpus-review" { kind "human.review" }
 
-  checkpoints "build-st3" {
-    checkpoint "The implementation and automated tests pass" {
+  plan "build-st3" state="ready" {
+    step "automated-tests" timeout="30m" {
+      title "The implementation and automated tests pass"
       subgraph {
-        exec "build-st3/automated-tests" {
+        exec "build-st3/automated-tests/${PLAN_RUN}" {
           workspace "."
           command "cargo test --workspace"
           restart "never"
         }
       }
       judges {
-        field "status" "exec/build-st3/automated-tests" "is" "exited"
-        field "exit_code" "exec/build-st3/automated-tests" "is" 0
-        deadline "30m"
+        field "status" "exec/build-st3/automated-tests/${PLAN_RUN}" "is" "exited"
+        field "exit_code" "exec/build-st3/automated-tests/${PLAN_RUN}" "is" 0
       }
     }
 
-    checkpoint "The catalog and eval translations pass parity checks" {
+    step "translation-parity" timeout="30m" {
+      title "The catalog and eval translations pass parity checks"
+      depends-on { step "automated-tests" completed }
       subgraph {
-        exec "build-st3/translation-parity" {
+        exec "build-st3/translation-parity/${PLAN_RUN}" {
           workspace "."
           command "./scripts/prepare-st3-migration && ./scripts/check-st3-migration"
           restart "never"
         }
       }
       judges {
-        field "status" "exec/build-st3/translation-parity" "is" "exited"
-        field "exit_code" "exec/build-st3/translation-parity" "is" 0
-        deadline "30m"
+        field "status" "exec/build-st3/translation-parity/${PLAN_RUN}" "is" "exited"
+        field "exit_code" "exec/build-st3/translation-parity/${PLAN_RUN}" "is" 0
       }
     }
 
-    checkpoint "A person approves one complex paid proof" {
+    step "complex-proof-review" {
+      title "A person approves one complex paid proof"
+      depends-on { step "translation-parity" completed }
       judges {
         field "decision" "resource/st3-complex-proof-review" "is" "approved"
       }
     }
 
-    checkpoint "One complex eval proves the complete path" {
+    step "signal-rename-proof" timeout="45m" {
+      title "One complex eval proves the complete path"
+      depends-on { step "complex-proof-review" completed }
       subgraph {
-        exec "build-st3/signal-rename-proof" {
+        exec "build-st3/signal-rename-proof/${PLAN_RUN}" {
           workspace "."
           command "st3 eval ./target/st3-migration/evals/signal-rename"
           restart "never"
         }
       }
       judges {
-        field "status" "exec/build-st3/signal-rename-proof" "is" "exited"
-        field "exit_code" "exec/build-st3/signal-rename-proof" "is" 0
-        deadline "45m"
+        field "status" "exec/build-st3/signal-rename-proof/${PLAN_RUN}" "is" "exited"
+        field "exit_code" "exec/build-st3/signal-rename-proof/${PLAN_RUN}" "is" 0
       }
     }
 
-    checkpoint "A person approves the full paid eval corpus" {
+    step "full-corpus-review" {
+      title "A person approves the full paid eval corpus"
+      depends-on { step "signal-rename-proof" completed }
       judges {
         field "decision" "resource/st3-full-corpus-review" "is" "approved"
       }
     }
 
-    checkpoint "All translated evals pass" {
+    step "full-eval-corpus" timeout="4h" {
+      title "All translated evals pass"
+      depends-on { step "full-corpus-review" completed }
       subgraph {
-        exec "build-st3/full-eval-corpus" {
+        exec "build-st3/full-eval-corpus/${PLAN_RUN}" {
           workspace "."
           command "./scripts/run-all-st3-evals"
           restart "never"
         }
       }
       judges {
-        field "status" "exec/build-st3/full-eval-corpus" "is" "exited"
-        field "exit_code" "exec/build-st3/full-eval-corpus" "is" 0
-        deadline "4h"
+        field "status" "exec/build-st3/full-eval-corpus/${PLAN_RUN}" "is" "exited"
+        field "exit_code" "exec/build-st3/full-eval-corpus/${PLAN_RUN}" "is" 0
       }
     }
   }

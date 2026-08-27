@@ -1,89 +1,92 @@
 subgraph {
-  checkpoints "eval/signal-rename-codex" scope="scope/eval/signal-rename-codex" {
-    checkpoint "Run step materialize finishes" {
+  scope "eval/signal-rename-codex/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/signal-rename-codex" state="ready" {
+    step "materialize" timeout="1800000ms" {
+      title "Run step materialize finishes"
       subgraph {
         exec "eval/signal-rename-codex/run/0-materialize" {
           host "local"
-          workspace "${EVAL_ROOT}"
-          cwd "${EVAL_ROOT}"
+          workspace "${WORKSPACE}"
+          cwd "${WORKSPACE}"
           command "bash ./materialize.sh"
           restart "never"
           env {
-            CATALOG "${EVAL_ROOT}"
-            ST_ROOT "${EVAL_ROOT}/.st3-messages"
-            ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages"
+            CATALOG "${WORKSPACE}"
+            ST_ROOT "${WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
           }
         }
       }
       judges {
         field "status" "exec/eval/signal-rename-codex/run/0-materialize" "is" "exited"
         field "exit_code" "exec/eval/signal-rename-codex/run/0-materialize" "is" 0
-        deadline "1800000ms"
       }
     }
-    checkpoint "The eval team is running" {
+    step "team" timeout="1800000ms" {
+      title "The eval team is running"
+      depends-on { step "materialize" completed }
       subgraph {
         agent "sig.sup" {
-          workspace "${EVAL_ROOT}/sup"
-          codex {
+          workspace "${WORKSPACE}/sup"
+          harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, stand by for a graph message. After a message arrives, drain the inbox again, act on every message, archive each handled item, and coordinate the rename to a verified finish. Report completion or blockers through st3 messages."
+            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and coordinate the rename to a verified finish. Report completion or blockers through st3 messages."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
           env {
-            CATALOG "${EVAL_ROOT}"
-            ST_ROOT "${EVAL_ROOT}/.st3-messages"
-            ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages"
+            CATALOG "${WORKSPACE}"
+            ST_ROOT "${WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
           }
         }
         agent "sig.base" {
-          workspace "${EVAL_ROOT}/base"
-          codex {
+          workspace "${WORKSPACE}/base"
+          harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, stand by for a graph message. After a message arrives, drain the inbox again, act on every message, archive each handled item, and execute your lane end-to-end. Push, coordinate, and report through st3 messages."
+            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute your lane end-to-end. Push, coordinate, and report through st3 messages."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
           env {
-            CATALOG "${EVAL_ROOT}"
-            ST_ROOT "${EVAL_ROOT}/.st3-messages"
-            ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages"
+            CATALOG "${WORKSPACE}"
+            ST_ROOT "${WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
           }
         }
         agent "sig.relay" {
-          workspace "${EVAL_ROOT}/relay"
-          codex {
+          workspace "${WORKSPACE}/relay"
+          harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, stand by for a graph message. After a message arrives, drain the inbox again, act on every message, archive each handled item, and execute your lane end-to-end. Push, coordinate, and report through st3 messages."
+            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute your lane end-to-end. Push, coordinate, and report through st3 messages."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
           env {
-            CATALOG "${EVAL_ROOT}"
-            ST_ROOT "${EVAL_ROOT}/.st3-messages"
-            ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages"
+            CATALOG "${WORKSPACE}"
+            ST_ROOT "${WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
           }
         }
         agent "sig.hub" {
-          workspace "${EVAL_ROOT}/hub"
-          codex {
+          workspace "${WORKSPACE}/hub"
+          harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, stand by for a graph message. After a message arrives, drain the inbox again, act on every message, archive each handled item, and execute your lane end-to-end. Push, coordinate, and report through st3 messages."
+            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute your lane end-to-end. Push, coordinate, and report through st3 messages."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
           env {
-            CATALOG "${EVAL_ROOT}"
-            ST_ROOT "${EVAL_ROOT}/.st3-messages"
-            ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages"
+            CATALOG "${WORKSPACE}"
+            ST_ROOT "${WORKSPACE}/.st3-messages"
+            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
           }
         }
-        message "kickoff" {
+        message "kickoff/${PLAN_RUN}" {
           from "local.morgan"
           to "sig.sup"
           content "doc/evals/signal-rename-codex/task@f12083c4ec4a7b2d6d9af20a5acdd89663a31532f4a3cee10c43fe283f61f1de"
@@ -94,75 +97,79 @@ subgraph {
         exists "agent/sig.base"
         exists "agent/sig.relay"
         exists "agent/sig.hub"
-        deadline "1800000ms"
       }
     }
-    checkpoint "The team reported completion" {
+    step "team-completion" timeout="1805000ms" {
+      title "The team reported completion"
+      depends-on { step "team" completed }
       judges {
         judge "Every worker reported before the supervisor confirmed" {
-          exec "TIMEOUT_SECONDS=1800 bash ./.st3-migration/wait-team-done.sh local.morgan sig.sup kickoff sig.base sig.relay sig.hub"
+          exec "TIMEOUT_SECONDS=1800 bash ./.st3-migration/wait-team-done.sh local.morgan sig.sup kickoff/${PLAN_RUN} sig.base sig.relay sig.hub"
           host "local"
-          workspace "${EVAL_ROOT}"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          workspace "${WORKSPACE}"
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           time-limit "1805000ms"
         }
       }
     }
-    checkpoint "All held-out judges pass" {
+    step "held-out-judges" timeout="1800000ms" {
+      title "All held-out judges pass"
+      depends-on { step "team-completion" completed }
       judges {
         judge "ISOLATION — every commit stayed in its author's package lane (base/relay/hub/sup); no cross-lane edit" {
-          exec "st3 message export \"${EVAL_ROOT}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"
+          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"
           host "local"
-          workspace "${EVAL_ROOT}"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          workspace "${WORKSPACE}"
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           time-limit "1800000ms"
         }
         judge "SUITE GREEN — node --test passes in every package on integrated main" {
-          exec "st3 message export \"${EVAL_ROOT}/.st3-messages\" >/dev/null && bash ./judges/suite-green.sh"
+          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/suite-green.sh"
           host "local"
-          workspace "${EVAL_ROOT}"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          workspace "${WORKSPACE}"
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           time-limit "1800000ms"
         }
         judge "RENAME — product fully renamed to beacon (package + scheme + protocol), no lingering product signal" {
-          exec "st3 message export \"${EVAL_ROOT}/.st3-messages\" >/dev/null && bash ./judges/rename.sh"
+          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/rename.sh"
           host "local"
-          workspace "${EVAL_ROOT}"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          workspace "${WORKSPACE}"
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           time-limit "1800000ms"
         }
         judge "PRIMITIVE INTACT — AbortSignal / controller.signal / SIGTERM survive undamaged in the relay" {
-          exec "st3 message export \"${EVAL_ROOT}/.st3-messages\" >/dev/null && bash ./judges/primitive.sh"
+          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/primitive.sh"
           host "local"
-          workspace "${EVAL_ROOT}"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          workspace "${WORKSPACE}"
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           time-limit "1800000ms"
         }
         judge "HELD-OUT E2E — a rename-agnostic driver resolves the renamed base+relay+hub end-to-end" {
-          exec "st3 message export \"${EVAL_ROOT}/.st3-messages\" >/dev/null && bash ./judges/e2e.sh"
+          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/e2e.sh"
           host "local"
-          workspace "${EVAL_ROOT}"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          workspace "${WORKSPACE}"
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           time-limit "1800000ms"
         }
         judge "the supervisor proves the sequence and integrated result" type="llm" {
           model "gpt-5.6-sol"
           host "local"
-          workspace "${EVAL_ROOT}"
+          workspace "${WORKSPACE}"
           tools "shell" "git"
-          env { CATALOG "${EVAL_ROOT}"; ST_ROOT "${EVAL_ROOT}/.st3-messages"; ST3_MESSAGE_ROOT "${EVAL_ROOT}/.st3-messages" }
+          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           token-budget 98304
           time-limit "180000ms"
           prompt "Run exactly one evidence command before judgement: bash ./judges/semantic-evidence.sh. Do not run any other evidence command. PASS only if the supervisor explains the base-first sequence, accounts for all three lanes, proves final integration and tests, and preserves AbortSignal, controller.signal, SIGTERM, and other runtime primitives."
         }
-        deadline "1800000ms"
       }
     }
-    checkpoint "The temporary eval scope is empty" {
+    step "cleanup" finally=#true {
+      title "The temporary eval scope is empty"
       subgraph {
-        scope "eval/signal-rename-codex" { stop }
+        scope "eval/signal-rename-codex/${PLAN_RUN}" { stop }
       }
-      judges { empty "scope/eval/signal-rename-codex" }
+      judges { empty "scope/eval/signal-rename-codex/${PLAN_RUN}" }
+    }
     }
   }
 }

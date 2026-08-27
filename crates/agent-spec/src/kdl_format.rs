@@ -173,6 +173,43 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                 );
                 raw.driver.opencode = Some(opencode_driver_node_to_raw(child)?);
             }
+            "harness" => {
+                if child.children.is_empty() {
+                    continue;
+                }
+                let (provider, driver) = harness_driver_node_to_raw(child)?;
+                match driver {
+                    crate::spec::Driver::Claude(driver) => {
+                        anyhow::ensure!(
+                            raw.driver.claude.is_none(),
+                            "agent declares `claude` more than once"
+                        );
+                        raw.driver.claude = Some(driver);
+                    }
+                    crate::spec::Driver::Codex(driver) => {
+                        anyhow::ensure!(
+                            raw.driver.codex.is_none(),
+                            "agent declares `codex` more than once"
+                        );
+                        raw.driver.codex = Some(driver);
+                    }
+                    crate::spec::Driver::Pi(driver) => {
+                        anyhow::ensure!(
+                            raw.driver.pi.is_none(),
+                            "agent declares `pi` more than once"
+                        );
+                        raw.driver.pi = Some(driver);
+                    }
+                    crate::spec::Driver::OpenCode(driver) => {
+                        anyhow::ensure!(
+                            raw.driver.opencode.is_none(),
+                            "agent declares `opencode` more than once"
+                        );
+                        raw.driver.opencode = Some(driver);
+                    }
+                }
+                let _ = provider;
+            }
             "env" => {}
             "pty" => {
                 if let Some(name) = arg_string(child) {
@@ -363,6 +400,28 @@ fn opencode_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<OpenCodeDr
         prompt,
         args,
     })
+}
+
+fn harness_driver_node_to_raw(
+    node: &DeclaredNode,
+) -> anyhow::Result<(String, crate::spec::Driver)> {
+    anyhow::ensure!(
+        node.type_name.is_none() && node.entries.len() == 1 && node.entries[0].name.is_none(),
+        "agent `harness` must contain exactly one positional provider name"
+    );
+    let provider = arg_string(node)
+        .ok_or_else(|| anyhow::anyhow!("agent `harness` provider must be a string"))?;
+    let mut block = node.clone();
+    block.name = provider.clone();
+    block.entries.clear();
+    let driver = match provider.as_str() {
+        "claude" => crate::spec::Driver::Claude(claude_driver_node_to_raw(&block)?),
+        "codex" => crate::spec::Driver::Codex(codex_driver_node_to_raw(&block)?),
+        "pi" => crate::spec::Driver::Pi(pi_driver_node_to_raw(&block)?),
+        "opencode" => crate::spec::Driver::OpenCode(opencode_driver_node_to_raw(&block)?),
+        _ => anyhow::bail!("agent declares unknown harness `{provider}`"),
+    };
+    Ok((provider, driver))
 }
 
 fn parse_presentation(

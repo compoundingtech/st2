@@ -1,7 +1,7 @@
 subgraph {
   agent "native.claude" {
     workspace "."
-    claude {
+    harness "claude" {
       dev-channels #true
       prompt "Wait for a native graph message."
     }
@@ -9,21 +9,21 @@ subgraph {
 
   agent "native.codex" {
     workspace "."
-    codex {
+    harness "codex" {
       prompt "Wait for a native graph message."
     }
   }
 
   agent "native.pi" {
     workspace "."
-    pi {
+    harness "pi" {
       prompt "Wait for a native graph message."
     }
   }
 
   agent "native.opencode" {
     workspace "."
-    opencode {
+    harness "opencode" {
       prompt "Wait for a native graph message."
     }
   }

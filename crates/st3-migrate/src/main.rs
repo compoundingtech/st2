@@ -213,7 +213,9 @@ fn migrate_evals(args: TreeArgs) -> Result<()> {
 }
 
 fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> {
-    let document: KdlDocument = source.parse()?;
+    let document: KdlDocument = source
+        .parse()
+        .with_context(|| format!("parse legacy checkpoint KDL after harness rewrite:\n{source}"))?;
     if document.nodes().len() == 1 && document.nodes()[0].name().value() == "subgraph" {
         st3::parse_intent(source, "local")?;
         return Ok(source.to_owned());
@@ -261,8 +263,9 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
             !matches!(
                 child.name().value(),
                 "retired" | "desired-state" | "suspended"
-            )
+            ) && !(child.name().value() == "harness" && child.children().is_none())
         });
+        rewrite_harness_nodes(body);
         remove_legacy_context_hooks(body);
         let has_restart_type = body.nodes().iter().any(|child| {
             child.name().value() == "restart"
@@ -282,6 +285,21 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
     output.nodes_mut().push(root);
     output.autoformat();
     Ok(rewrite_catalog_text(&output.to_string()))
+}
+
+fn rewrite_harness_nodes(document: &mut KdlDocument) {
+    for node in document.nodes_mut() {
+        let provider = match node.name().value() {
+            "claude" | "codex" | "pi" | "opencode" if node.children().is_some() => {
+                Some(node.name().value().to_owned())
+            }
+            _ => None,
+        };
+        if let Some(provider) = provider {
+            node.set_name("harness");
+            node.entries_mut().insert(0, KdlEntry::new(provider));
+        }
+    }
 }
 
 fn remove_legacy_context_hooks(document: &mut KdlDocument) {
@@ -422,6 +440,41 @@ fn transform_eval(
     output_cell: &Path,
     host: &str,
 ) -> Result<(String, Vec<DocumentReport>)> {
+    let (mut legacy, documents) = transform_eval_checkpoint(spec, cell, output_cell, host)?;
+    let eval = spec.eval.as_ref().context("eval is missing")?;
+    let mut identities = spec
+        .agents
+        .iter()
+        .chain(eval.agents.iter())
+        .map(|agent| eval_agent_identity(&agent.id, host))
+        .filter(|identity| identity != "requester")
+        .collect::<Vec<_>>();
+    identities.sort_by_key(|identity| std::cmp::Reverse(identity.len()));
+    identities.dedup();
+    for identity in identities {
+        let run_identity = format!("{identity}.${{PLAN_RUN}}");
+        legacy = legacy.replace(&identity, &run_identity);
+        for field in ["agent", "identity", "from", "to"] {
+            legacy = legacy.replace(
+                &format!("{field} {run_identity}"),
+                &format!("{field} {run_identity:?}"),
+            );
+        }
+    }
+    legacy = legacy.replace("${EVAL_ROOT}", "${WORKSPACE}");
+    let name = cell
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("eval cell name is not UTF-8")?;
+    Ok((checkpoint_intent_to_plan(&legacy, name)?, documents))
+}
+
+fn transform_eval_checkpoint(
+    spec: &EvalSpec,
+    cell: &Path,
+    output_cell: &Path,
+    host: &str,
+) -> Result<(String, Vec<DocumentReport>)> {
     let eval = spec.eval.as_ref().context("eval is missing")?;
     let name = cell
         .file_name()
@@ -481,7 +534,7 @@ fn transform_eval(
             kick.content.clone()
         };
         team_checkpoint.push_str(&format!(
-            "        message \"kickoff\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
+            "        message \"kickoff/${{PLAN_RUN}}\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
             eval_agent_identity(&kick.from, host),
             eval_agent_identity(&kick.to, host),
             content
@@ -675,9 +728,132 @@ fn transform_eval(
         "      }}\n      judges {{ empty {scope:?} }}\n    }}\n"
     ));
     output.push_str("  }\n}\n");
-    let mut formatted: KdlDocument = output.parse()?;
+    let mut formatted: KdlDocument = output
+        .parse()
+        .with_context(|| format!("parse migrated plan KDL:\n{output}"))?;
     formatted.autoformat();
     Ok((formatted.to_string(), documents))
+}
+
+fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
+    let document: KdlDocument = source
+        .parse()
+        .with_context(|| format!("parse legacy checkpoint KDL after harness rewrite:\n{source}"))?;
+    let root = document
+        .nodes()
+        .first()
+        .context("translated eval has no subgraph root")?;
+    let checkpoints = root
+        .children()
+        .and_then(|children| {
+            children
+                .nodes()
+                .iter()
+                .find(|node| node.name().value() == "checkpoints")
+        })
+        .context("translated eval has no checkpoint sequence")?;
+    let stages = checkpoints
+        .children()
+        .context("translated checkpoint sequence is empty")?;
+    let mut output = format!(
+        "subgraph {{\n  scope {:?} retention=\"temporary\" change-policy=\"agent\" {{\n    plan {:?} state=\"ready\" {{\n",
+        format!("eval/{name}/${{PLAN_RUN}}"),
+        format!("eval/{name}")
+    );
+    let mut prior = None::<String>;
+    for (ordinal, checkpoint) in stages.nodes().iter().enumerate() {
+        let title = checkpoint
+            .entries()
+            .iter()
+            .find(|entry| entry.name().is_none())
+            .and_then(|entry| entry.value().as_string())
+            .context("translated checkpoint has no title")?;
+        let cleanup = title == "The temporary eval scope is empty";
+        let id = if cleanup {
+            "cleanup".into()
+        } else {
+            format!("{:02}-{}", ordinal, slug(title))
+        };
+        let mut timeout = None::<String>;
+        let mut body_nodes = Vec::new();
+        if let Some(body) = checkpoint.children() {
+            for child in body.nodes() {
+                let mut child = child.clone();
+                if child.name().value() == "judges"
+                    && let Some(judges) = child.children_mut()
+                {
+                    for deadline in judges
+                        .nodes()
+                        .iter()
+                        .filter(|node| node.name().value() == "deadline")
+                    {
+                        timeout = deadline
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.name().is_none())
+                            .and_then(|entry| entry.value().as_string())
+                            .map(str::to_owned);
+                    }
+                    judges
+                        .nodes_mut()
+                        .retain(|node| node.name().value() != "deadline");
+                }
+                body_nodes.push(child);
+            }
+        }
+        output.push_str(&format!("      step {id:?}"));
+        if let Some(timeout) = timeout {
+            output.push_str(&format!(" timeout={timeout:?}"));
+        }
+        if cleanup {
+            output.push_str(" finally=#true");
+        }
+        output.push_str(" {\n");
+        output.push_str(&format!("        title {title:?}\n"));
+        if !cleanup && let Some(prior) = &prior {
+            output.push_str(&format!(
+                "        depends-on {{ step {prior:?} completed }}\n"
+            ));
+        }
+        for child in body_nodes {
+            if child.name().value() == "judges"
+                && child
+                    .children()
+                    .is_some_and(|children| children.nodes().is_empty())
+            {
+                continue;
+            }
+            output.push_str(&child.to_string());
+            output.push('\n');
+        }
+        output.push_str("      }\n");
+        if !cleanup {
+            prior = Some(id);
+        }
+    }
+    output.push_str("    }\n  }\n}\n");
+    let mut formatted: KdlDocument = output
+        .parse()
+        .with_context(|| format!("parse checkpoint conversion KDL:\n{output}"))?;
+    formatted.autoformat();
+    Ok(formatted.to_string())
+}
+
+fn slug(value: &str) -> String {
+    let mut output = String::new();
+    let mut dash = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if dash && !output.is_empty() {
+                output.push('-');
+            }
+            output.push(character.to_ascii_lowercase());
+            dash = false;
+        } else {
+            dash = true;
+        }
+    }
+    output.trim_matches('-').chars().take(80).collect()
 }
 
 fn write_eval_agent(
@@ -782,7 +958,7 @@ fn write_eval_driver(output: &mut String, driver: &Driver) {
             unreachable!("the compact eval grammar accepts only Claude and Codex drivers")
         }
     };
-    output.push_str(&format!("      {name} {{\n"));
+    output.push_str(&format!("      harness {name:?} {{\n"));
     if let Some(model) = model {
         output.push_str(&format!("        model {model:?}\n"));
     }
@@ -794,7 +970,7 @@ fn write_eval_driver(output: &mut String, driver: &Driver) {
     }
     output.push_str(&format!(
         "        prompt {:?}\n",
-        rewrite_bus_command(prompt)
+        rewrite_eval_prompt(prompt)
     ));
     if !args.is_empty() {
         output.push_str("        args");
@@ -823,7 +999,7 @@ fn write_team_completion_checkpoint(
     timeout_ms: u64,
 ) {
     let mut command = format!(
-        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff",
+        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff/${{PLAN_RUN}}",
         timeout_ms.div_ceil(1_000),
         shell(requester),
         shell(supervisor)
@@ -940,6 +1116,20 @@ fn rewrite_bus_command(value: &str) -> String {
         .replace("st2 channel message", "st3 graph message notification")
         .replace("st2 bus", "st3 graph message API")
         .replace("hermetic st2 eval", "hermetic st3 eval")
+}
+
+fn rewrite_eval_prompt(value: &str) -> String {
+    let mut output = rewrite_bus_command(value).replace(
+        "wait for an st3 graph message notification",
+        "end the turn and stay idle",
+    );
+    if !output.ends_with(char::is_whitespace) {
+        output.push(' ');
+    }
+    output.push_str(
+        "After an empty inbox drain, end the turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives.",
+    );
+    output
 }
 
 fn clear_generated_assets(output_root: &Path) -> Result<()> {
@@ -1198,6 +1388,33 @@ esac
     }
 
     #[test]
+    fn catalog_translation_rewrites_typed_drivers_to_harness_blocks() {
+        let translated = transform_declaration(
+            r#"
+agent "worker" {
+  host "host-a"
+  harness "claude"
+  codex {
+    model "gpt-5.6-sol"
+    effort "medium"
+    prompt "Do the work."
+  }
+}
+"#,
+            Some(true),
+        )
+        .unwrap();
+        let intent = st3::parse_intent(&translated, "local").unwrap();
+        let member = intent.subjects["agent/host-a.worker"]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(member.driver.as_deref(), Some("codex"));
+        assert!(translated.contains("harness codex"));
+        assert!(!translated.contains("harness claude"));
+    }
+
+    #[test]
     fn retired_catalog_agents_become_explicit_stops() {
         let translated = transform_declaration(
             r#"agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
@@ -1300,36 +1517,25 @@ esac
         let intent = st3::parse_intent(&translated, "local").unwrap();
 
         assert!(documents.is_empty());
-        assert!(translated.contains("claude {"));
-        assert!(translated.contains("codex {"));
+        assert!(translated.contains("harness claude {"));
+        assert!(translated.contains("harness codex {"));
         assert!(!translated.contains("command \"exec claude"));
-        assert_eq!(
-            intent.subjects["agent/mix.sup"]
-                .member
-                .as_ref()
-                .unwrap()
-                .driver
-                .as_deref(),
-            Some("claude")
-        );
-        assert_eq!(
-            intent.subjects["agent/local.judge"]
-                .member
-                .as_ref()
-                .unwrap()
-                .driver
-                .as_deref(),
-            Some("codex")
-        );
+        let plan = intent.plans.values().next().unwrap();
+        let team = &plan.steps["00-the-eval-team-is-running"];
+        let team_graph = team.subgraph_kdl.as_deref().unwrap();
+        assert!(team_graph.contains("agent \"mix.sup.${PLAN_RUN}\""));
+        assert!(team_graph.contains("identity \"local.judge.${PLAN_RUN}\""));
+        assert!(team_graph.contains("message \"kickoff/${PLAN_RUN}\""));
         assert!(translated.contains("model gpt-5.6-sol"));
-        assert!(intent.checkpoints[0].judges.iter().any(|judge| {
+        assert!(team.judges.iter().any(|judge| {
             matches!(
                 judge,
-                st3::model::JudgeSpec::Exists { subject } if subject == "agent/mix.sup"
+                st3::model::JudgeSpec::Exists { subject } if subject == "agent/mix.sup.${PLAN_RUN}"
             )
         }));
-        assert!(translated.contains("checkpoint \"The team reported completion\""));
+        assert!(translated.contains("title \"The team reported completion\""));
         assert!(translated.contains(".st3-migration/wait-team-done.sh"));
+        assert!(translated.contains("kickoff/${PLAN_RUN}"));
         assert!(translated.contains("supervisor eval-"));
         assert!(translated.contains("gate claude-workspace-trust"));
         assert!(
@@ -1362,16 +1568,16 @@ esac
         st3::parse_intent(&translated, "local").unwrap();
 
         let run = translated
-            .find("checkpoint \"Run step setup finishes\"")
+            .find("title \"Run step setup finishes\"")
             .unwrap();
         let team = translated
-            .find("checkpoint \"The eval team is running\"")
+            .find("title \"The eval team is running\"")
             .unwrap();
         let completion = translated
-            .find("checkpoint \"The team reported completion\"")
+            .find("title \"The team reported completion\"")
             .unwrap();
         let judges = translated
-            .find("checkpoint \"All held-out judges pass\"")
+            .find("title \"All held-out judges pass\"")
             .unwrap();
         assert!(run < team && team < completion && completion < judges);
     }
@@ -1406,13 +1612,14 @@ esac
 
     #[test]
     fn eval_prompt_rewrite_removes_st2_channel_language() {
-        let translated = rewrite_bus_command(
+        let translated = rewrite_eval_prompt(
             "In a hermetic st2 eval, use st2 message and wait for an st2 channel message.",
         );
-        assert_eq!(
-            translated,
-            "In a hermetic st3 eval, use st3 message and wait for an st3 graph message notification."
-        );
+        assert!(translated.starts_with(
+            "In a hermetic st3 eval, use st3 message and end the turn and stay idle."
+        ));
+        assert!(translated.contains("Do not run a blocking wait, trace, poll, or sleep command."));
+        assert!(!translated.contains("st2"));
     }
 
     #[test]

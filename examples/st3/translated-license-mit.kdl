@@ -1,62 +1,66 @@
 subgraph {
-  checkpoints "eval/license-mit" scope="scope/eval/license-mit" {
-    checkpoint "The eval team is running" {
-      subgraph {
-        agent "mix.sup" {
-          workspace "${EVAL_ROOT}/sup"
-          claude {
-            prompt "Read CLAUDE.md and handle st3 graph messages."
-            args "--permission-mode" "bypassPermissions"
+  scope "eval/license-mit/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/license-mit" state="ready" {
+      step "team" timeout="20m" {
+        title "The eval team is running"
+        subgraph {
+          agent "mix.sup.${PLAN_RUN}" {
+            workspace "${WORKSPACE}/sup"
+            harness "claude" {
+              prompt "Read CLAUDE.md and handle st3 graph messages."
+              args "--permission-mode" "bypassPermissions"
+            }
+            restart "never"
           }
-          restart "never"
-        }
-        agent "mix.worker" {
-          workspace "${EVAL_ROOT}/worker"
-          claude {
-            prompt "Read CLAUDE.md and handle st3 graph messages."
-            args "--permission-mode" "auto"
+          agent "mix.worker.${PLAN_RUN}" {
+            workspace "${WORKSPACE}/worker"
+            harness "claude" {
+              prompt "Read CLAUDE.md and handle st3 graph messages."
+              args "--permission-mode" "auto"
+            }
+            restart "never"
           }
-          restart "never"
+          message "kickoff/${PLAN_RUN}" {
+            from "requester"
+            to "mix.sup.${PLAN_RUN}"
+            content "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+          }
         }
-        message "kickoff" {
-          from "requester"
-          to "mix.sup"
-          content "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+        judges {
+          exists "agent/mix.sup.${PLAN_RUN}"
+          exists "agent/mix.worker.${PLAN_RUN}"
         }
       }
-      judges {
-        exists "agent/mix.sup"
-        exists "agent/mix.worker"
-        deadline "20m"
-      }
-    }
 
-    checkpoint "All held-out judges pass" {
-      judges {
-        judge "LICENSE is real MIT" {
-          exec "grep -F 'Permission is hereby granted' worker/LICENSE"
-          host "local"
-          workspace "${EVAL_ROOT}"
-          time-limit "120s"
+      step "held-out-judges" timeout="20m" {
+        title "All held-out judges pass"
+        depends-on { step "team" completed }
+        judges {
+          judge "LICENSE is real MIT" {
+            exec "grep -F 'Permission is hereby granted' worker/LICENSE"
+            host "local"
+            workspace "${WORKSPACE}"
+            time-limit "120s"
+          }
+          judge "The confirmation contains evidence" type="llm" {
+            model "gpt-5.6-sol"
+            host "local"
+            workspace "${WORKSPACE}"
+            tools "shell" "git"
+            token-budget 8192
+            time-limit "120s"
+            prompt "Check that the completion message cites the commit and test evidence."
+          }
         }
-        judge "The confirmation contains evidence" type="llm" {
-          model "gpt-5.6-sol"
-          host "local"
-          workspace "${EVAL_ROOT}"
-          tools "shell" "git"
-          token-budget 8192
-          time-limit "120s"
-          prompt "Check that the completion message cites the commit and test evidence."
-        }
-        deadline "20m"
       }
-    }
 
-    checkpoint "The temporary eval scope is empty" {
-      subgraph {
-        scope "eval/license-mit" { stop }
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph {
+          scope "eval/license-mit/${PLAN_RUN}" { stop }
+        }
+        judges { empty "scope/eval/license-mit/${PLAN_RUN}" }
       }
-      judges { empty "scope/eval/license-mit" }
     }
   }
 }

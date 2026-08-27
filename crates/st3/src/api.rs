@@ -32,9 +32,10 @@ use crate::model::{
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
     EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, JudgementRequest,
     MessageLifecycleRequest, MessageSendRequest, MessageView, PlanRequest, PlanResponse,
-    QuickAgentRequest, QuickAgentResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse,
-    ReviewRequest, SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk,
-    SessionScreen, SessionSignalRequest, St3Error, StatusResponse,
+    PlanRevisionRequest, PlanRunRequest, PlanRunView, QuickAgentRequest, QuickAgentResponse,
+    ReplicationBatch, ReplicationQuery, ReplicationResponse, ReviewRequest, SessionControlResponse,
+    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
+    St3Error, StatusResponse, StepRunView, WorkRequest,
 };
 use crate::store::Store;
 
@@ -129,6 +130,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/codex", post(quick_codex))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*scope}", get(get_eval))
+        .route("/v1/plan-runs", post(start_plan_run))
+        .route("/v1/plan-runs/{run}/revision", post(revise_plan_run))
+        .route("/v1/plan-runs/{run}", get(get_plan_run))
+        .route("/v1/work", get(list_work))
+        .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/judgements", post(post_judgement))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
         .route("/v1/sessions/{subject}/signal", post(signal_session))
@@ -651,16 +657,19 @@ async fn post_review(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<ReviewRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    if !matches!(request.decision.as_str(), "approved" | "rejected") {
+    if !matches!(
+        request.decision.as_str(),
+        "approved" | "rejected" | "revise"
+    ) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
-            "a review decision must be approved or rejected",
+            "a review decision must be approved, rejected, or revise",
         )));
     }
-    let subject = if subject.starts_with("resource/") {
+    let subject = if subject.starts_with("resource/") || subject.starts_with("step-run/") {
         subject
     } else {
-        format!("resource/{subject}")
+        format!("step-run/{subject}")
     };
     let actor = request.actor.map(|actor| {
         if actor.contains('/') {
@@ -669,6 +678,7 @@ async fn post_review(
             format!("person/{actor}")
         }
     });
+    let decision = request.decision.clone();
     let fields = BTreeMap::from([
         ("decision".into(), Value::String(request.decision)),
         (
@@ -679,7 +689,7 @@ async fn post_review(
     let response = state
         .store
         .append_claim(&ClaimInput {
-            subject,
+            subject: subject.clone(),
             kind: "review.decision".into(),
             actor,
             fields,
@@ -688,6 +698,16 @@ async fn post_review(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
+    if decision == "revise" && subject.starts_with("step-run/") {
+        state
+            .store
+            .set_step_state(
+                &subject,
+                "blocked",
+                Some("the human reviewer requested a plan revision"),
+            )
+            .map_err(ApiError::internal)?;
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -696,6 +716,12 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
+    if request.content.trim().is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "empty-message",
+            "a message needs nonempty content",
+        )));
+    }
     if request.content.len() > 4096 && !request.content.starts_with("doc/") {
         return Err(ApiError::bad(St3Error::new(
             "message-too-large",
@@ -999,7 +1025,7 @@ async fn quick_agent(
         "prompt \"Assist the user in this worktree. Use st3 message ls, read, reply, and archive for graph messages.\"\n",
     );
     let kdl = format!(
-        "subgraph {{\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    {driver} {{\n{driver_body}    }}\n  }}\n}}\n",
+        "subgraph {{\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
         request.worktree
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
@@ -1045,10 +1071,12 @@ async fn start_eval(
         .store
         .put_blob(&request.bundle)
         .map_err(ApiError::internal)?;
+    let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let workspace = state
         .state_dir
         .join("evals")
-        .join(&request.bundle_hash[..16]);
+        .join(&request.bundle_hash[..16])
+        .join(nonce.to_string());
     hydrate_cell(&request.bundle, &workspace).map_err(ApiError::internal)?;
     let eval_file = workspace.join("eval.kdl");
     let kdl = fs::read_to_string(&eval_file)
@@ -1080,16 +1108,39 @@ async fn start_eval(
             &format!("eval:{}:{}", request.name, request.bundle_hash),
         )
         .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    let scope = intent
-        .subjects
+    let ready = intent
+        .plans
         .values()
-        .find(|subject| subject.kind == "scope")
-        .map(|subject| subject.subject.clone())
-        .unwrap_or_else(|| format!("scope/eval/{}", request.name));
+        .filter(|plan| plan.state == crate::model::PlanState::Ready)
+        .collect::<Vec<_>>();
+    if ready.len() != 1 {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-eval-plan-count",
+            "an eval cell must contain exactly one ready plan",
+        )));
+    }
+    let run = state
+        .store
+        .create_plan_run(&PlanRunRequest {
+            plan: ready[0].id.clone(),
+            revision: Some(ready[0].revision.clone()),
+            workspace: workspace.to_string_lossy().into_owned(),
+            requester: Some("person/eval-requester".into()),
+            mode: Some("eval".into()),
+            idempotency_key: format!("eval:{}:{}:{nonce}", request.name, request.bundle_hash),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    let scope = run
+        .run_scope
+        .clone()
+        .unwrap_or_else(|| format!("scope/eval/{}/{}", request.name, run.id));
     Ok(Json(EvalStartResponse {
         scope,
-        event_cursor: applied.store_index,
+        event_cursor: applied
+            .store_index
+            .max(state.store.index().map_err(ApiError::internal)?),
+        plan_run: Some(run.subject),
     }))
 }
 
@@ -1102,59 +1153,219 @@ async fn get_eval(
     } else {
         format!("scope/{scope}")
     };
-    let status = state
+    let run = state
         .store
-        .status_at(None, Some(&scope), None)
-        .map_err(ApiError::internal)?;
-    if status.subjects.is_empty() {
-        return Err(ApiError::not_found(format!(
-            "eval scope `{scope}` does not exist"
-        )));
-    }
-    let scope_actual = status
-        .subjects
-        .iter()
-        .find(|subject| subject.subject == scope)
-        .and_then(|subject| subject.actual.as_ref());
-    let verdict = scope_actual
-        .and_then(|actual| actual.get("verdict"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let cleanup = if scope_actual
-        .and_then(|actual| actual.get("status"))
-        .and_then(Value::as_str)
-        == Some("stopped")
-    {
-        "complete"
-    } else {
-        "pending"
+        .plan_run_for_scope(&scope)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("eval scope `{scope}` does not exist")))?;
+    let verdict = match run.status.as_str() {
+        "completed" => Some("pass".into()),
+        "failed" => Some("fail".into()),
+        "cancelled" => Some("void".into()),
+        _ => None,
     };
-    let active_checkpoint = status
-        .subjects
+    let cleanup = match run.phase.as_str() {
+        "final" => "cleaning",
+        "terminal" => "complete",
+        _ => "pending",
+    };
+    let active_steps = run
+        .steps
         .iter()
-        .filter(|subject| subject.kind.as_deref() == Some("checkpoint-stage"))
-        .filter_map(|subject| {
-            let ordinal = subject.actual.as_ref()?.get("ordinal")?.as_u64()?;
-            let name = subject.desired.as_ref()?.get("name")?.as_str()?.to_owned();
-            Some((ordinal, name))
+        .filter(|step| {
+            matches!(
+                step.status.as_str(),
+                "ready" | "claimed" | "working" | "verifying" | "blocked"
+            )
         })
-        .max_by_key(|(ordinal, _)| *ordinal)
-        .map(|(_, name)| name);
-    let lifecycle = if verdict.is_none() {
-        "running"
-    } else if cleanup == "complete" {
-        "complete"
-    } else {
-        "cleaning"
-    };
+        .map(|step| step.step.clone())
+        .collect();
     Ok(Json(EvalStatus {
         scope,
-        lifecycle: lifecycle.into(),
-        active_checkpoint,
+        plan_run: run.subject,
+        lifecycle: run.status,
+        phase: run.phase,
+        active_steps,
         verdict,
         cleanup: cleanup.into(),
-        store_index: status.store_index,
+        store_index: state.store.index().map_err(ApiError::internal)?,
     }))
+}
+
+async fn start_plan_run(
+    State(state): State<AppState>,
+    Json(request): Json<PlanRunRequest>,
+) -> Result<Json<PlanRunView>, ApiError> {
+    let response = state
+        .store
+        .create_plan_run(&request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+async fn get_plan_run(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+) -> Result<Json<PlanRunView>, ApiError> {
+    state
+        .store
+        .plan_run(&run)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("plan run `{run}` does not exist")))
+}
+
+async fn revise_plan_run(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+    Json(request): Json<PlanRevisionRequest>,
+) -> Result<Json<PlanRunView>, ApiError> {
+    let current = state
+        .store
+        .plan_run(&run)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("plan run `{run}` does not exist")))?;
+    let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    if initial.plans.len() != 1 {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-plan-revision-intent",
+            "a run revision must contain exactly one plan",
+        )));
+    }
+    let initial_plan = initial.plans.values().next().expect("one plan was checked");
+    let allowed_scope = initial_plan.scope_template.as_deref();
+    if initial.subjects.iter().any(|(subject, desired)| {
+        Some(subject.as_str()) != allowed_scope || desired.kind != "scope"
+    }) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-plan-revision-intent",
+            "a run revision can contain only its plan and its enclosing scope",
+        )));
+    }
+    let bindings = state
+        .store
+        .document_bindings_at(&initial.document_refs, None)
+        .map_err(ApiError::internal)?;
+    let resolved_kdl =
+        resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
+    let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    let replacement = intent.plans.values().next().expect("one plan was checked");
+    let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
+    if replacement.id != plan_id {
+        return Err(ApiError::bad(St3Error::new(
+            "wrong-plan-revision",
+            format!(
+                "revision `{}` does not replace plan `{plan_id}`",
+                replacement.id
+            ),
+        )));
+    }
+    let old = state
+        .store
+        .plan_spec(plan_id, Some(&current.revision))
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-plan-revision",
+                "the current plan revision is unavailable",
+            ))
+        })?;
+    if old.scope_template != replacement.scope_template
+        || old.change_policy != replacement.change_policy
+        || old.change_authority != replacement.change_authority
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "change-policy-mutation",
+            "a run revision cannot change its scope, change policy, or authority",
+        )));
+    }
+    let default_kind = if matches!(old.change_policy, crate::model::ChangePolicy::HumanReview) {
+        "person"
+    } else {
+        "agent"
+    };
+    let actor = if request.actor.contains('/') {
+        request.actor.clone()
+    } else {
+        format!("{default_kind}/{}", request.actor)
+    };
+    crate::store::authorize_plan_revision(
+        &old,
+        replacement,
+        &actor,
+        &crate::store::plan_run_variables(&current, &replacement.revision),
+    )
+    .map_err(ApiError::bad)?;
+    let mut publication = intent.clone();
+    publication.subjects.clear();
+    let planned = state
+        .store
+        .plan(
+            &publication,
+            crate::model::IntentInput {
+                kdl: resolved_kdl,
+                source_name: request.intent.source_name,
+            },
+        )
+        .map_err(ApiError::bad)?;
+    if !planned.blockers.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "plan-revision-blocked",
+            planned.blockers.join("; "),
+        )));
+    }
+    state
+        .store
+        .apply(
+            &publication,
+            &planned.subject_tokens,
+            &format!("{}:publish", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    let revised = state
+        .store
+        .adopt_plan_revision(
+            &run,
+            replacement,
+            &actor,
+            &request.reason,
+            &format!("{}:adopt", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(revised))
+}
+
+#[derive(Deserialize)]
+struct WorkQuery {
+    assignee: Option<String>,
+    #[serde(default)]
+    include_terminal: bool,
+}
+
+async fn list_work(
+    State(state): State<AppState>,
+    Query(query): Query<WorkQuery>,
+) -> Result<Json<Vec<StepRunView>>, ApiError> {
+    state
+        .store
+        .work(query.assignee.as_deref(), query.include_terminal)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn post_work_action(
+    State(state): State<AppState>,
+    AxumPath((action, subject)): AxumPath<(String, String)>,
+    Json(request): Json<WorkRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let response = state
+        .store
+        .work_action(&subject, &action, &request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
 }
 
 fn stage_eval_documents(
@@ -2210,6 +2421,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_ingress_rejects_empty_content_before_it_enters_the_fifo() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, body) = json_request(
+            app,
+            "/v1/messages",
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: "empty-message".into(),
+                from: "agent/sender".into(),
+                to: "agent/receiver".into(),
+                content: " \n".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "empty-message");
+    }
+
+    #[tokio::test]
     async fn eval_upload_posts_its_staged_documents_before_apply() {
         let root = tempfile::tempdir().unwrap();
         let cell = tempfile::tempdir().unwrap();
@@ -2222,17 +2456,19 @@ mod tests {
             format!(
                 r#"
 subgraph {{
-  person "worker"
-  checkpoints "eval/demo" scope="scope/eval/demo" {{
-    checkpoint "The document exists" {{
+  scope "eval/demo/${{PLAN_RUN}}" retention="temporary" change-policy="agent" {{
+    plan "eval/demo" state="ready" {{
+      step "document" {{
+        title "The document exists"
       subgraph {{
         message "task" {{ to "person/worker"; content "doc/evals/demo/task@{hash}" }}
       }}
       judges {{ has "doc/evals/demo/task@{hash}" "hello" }}
-    }}
-    checkpoint "The temporary eval scope is empty" {{
-      subgraph {{ scope "eval/demo" {{ stop }} }}
-      judges {{ empty "scope/eval/demo" }}
+      }}
+      step "cleanup" finally=#true {{
+        subgraph {{ scope "eval/demo/${{PLAN_RUN}}" {{ stop }} }}
+        judges {{ empty "scope/eval/demo/${{PLAN_RUN}}" }}
+      }}
     }}
   }}
 }}
@@ -2257,7 +2493,23 @@ subgraph {{
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["scope"], "scope/eval/demo");
+        assert!(
+            body["scope"]
+                .as_str()
+                .unwrap()
+                .starts_with("scope/eval/demo/")
+        );
+        assert!(body["plan_run"].as_str().unwrap().starts_with("plan-run/"));
+        let eval_scope = body["scope"].as_str().unwrap();
+        let (status, eval_status) = get_request(
+            app,
+            &format!("/v1/evals/{}", urlencoding::encode(eval_scope)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{eval_status}");
+        assert_eq!(eval_status["plan_run"], body["plan_run"]);
+        assert_eq!(eval_status["lifecycle"], "running");
+        assert!(eval_status.get("active_checkpoint").is_none());
         assert_eq!(
             store
                 .get_document("doc/evals/demo/task", &hash)
@@ -2265,10 +2517,84 @@ subgraph {{
                 .unwrap(),
             bytes
         );
-        let (status, eval) = get_request(app, "/v1/evals/eval/demo").await;
-        assert_eq!(status, StatusCode::OK, "{eval}");
-        assert_eq!(eval["scope"], "scope/eval/demo");
-        assert_eq!(eval["lifecycle"], "running");
+    }
+
+    #[tokio::test]
+    async fn a_scoped_plan_revision_publishes_without_reapplying_the_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+subgraph {
+  scope "revision/${PLAN_RUN}" change-policy="supervisor" change-authority="agent/sup" {
+    plan "revision" state="ready" {
+      step "work" { goal "First goal." }
+    }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "revision-plan-one")
+            .unwrap();
+        let run = state
+            .store
+            .create_plan_run(&PlanRunRequest {
+                plan: "revision".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "revision-run".into(),
+            })
+            .unwrap();
+        let app = router(state.clone());
+        let replacement = r#"
+subgraph {
+  scope "revision/${PLAN_RUN}" change-policy="supervisor" change-authority="agent/sup" {
+    plan "revision" state="ready" {
+      step "work" { goal "Corrected goal." }
+    }
+  }
+}
+"#;
+        let (status, revised) = json_request(
+            app,
+            &format!("/v1/plan-runs/{}/revision", run.id),
+            serde_json::to_value(PlanRevisionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: replacement.into(),
+                    source_name: None,
+                },
+                actor: "agent/sup".into(),
+                reason: "the first goal was incomplete".into(),
+                idempotency_key: "revision-two".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{revised}");
+        assert_ne!(revised["revision"], run.revision);
+        assert_eq!(revised["root_revision"], run.root_revision);
+        assert_eq!(revised["steps"][0]["status"], "pending");
+        assert_eq!(
+            state
+                .store
+                .claims_for("scope/revision/${PLAN_RUN}", Some("intent.desired"))
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

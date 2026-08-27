@@ -68,6 +68,7 @@ const TUI_LOADED_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(15);
+const DELIVERY_RECONCILE_AFTER: Duration = Duration::from_secs(5);
 const SOCKET_PATH_BUDGET: usize = 96;
 
 struct WrapperDiagnostics {
@@ -391,6 +392,7 @@ struct CodexInboxDelivery {
     suppressed: bool,
     state: Option<CodexDeliveryState>,
     pending: Option<PendingCodexDelivery>,
+    ambiguous_since: Option<Instant>,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
     harness_writer: harness_state::Writer,
@@ -420,6 +422,10 @@ impl CodexInboxDelivery {
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
         let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
+        let ambiguous_since = state
+            .as_ref()
+            .is_some_and(|state| state.phase == CodexDeliveryPhase::Attempted)
+            .then(Instant::now);
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
@@ -464,6 +470,7 @@ impl CodexInboxDelivery {
             suppressed: false,
             state,
             pending: None,
+            ambiguous_since,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
             harness_writer,
@@ -507,6 +514,10 @@ impl CodexInboxDelivery {
 
     fn write_state(&mut self, state: CodexDeliveryState) -> Result<()> {
         atomic_json(&self.state_path, &state)?;
+        self.ambiguous_since = match state.phase {
+            CodexDeliveryPhase::Attempted => self.ambiguous_since.or_else(|| Some(Instant::now())),
+            CodexDeliveryPhase::Accepted => None,
+        };
         self.state = Some(state);
         Ok(())
     }
@@ -514,7 +525,21 @@ impl CodexInboxDelivery {
     fn clear_state(&mut self) -> Result<()> {
         remove_state_file(&self.state_path)?;
         self.state = None;
+        self.pending = None;
+        self.ambiguous_since = None;
         Ok(())
+    }
+
+    fn reconciliation_due(&self, state: &CodexControlState) -> bool {
+        matches!(
+            state.observed,
+            CodexObservedState::Idle | CodexObservedState::TerminalError { .. }
+        ) && self.state.as_ref().is_some_and(|state| {
+            state.phase == CodexDeliveryPhase::Attempted
+                && self
+                    .ambiguous_since
+                    .is_some_and(|since| since.elapsed() >= DELIVERY_RECONCILE_AFTER)
+        })
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
@@ -711,6 +736,7 @@ impl CodexInboxDelivery {
         {
             return Ok(());
         }
+        self.pending = None;
         let turns = message
             .pointer("/result/thread/turns")
             .and_then(Value::as_array)
@@ -2362,11 +2388,8 @@ fn pump_control(
                     }
                 };
             let Some(message) = message else {
-                if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut())
-                    && let Some(request) = delivery.maybe_request(state)?
-                {
-                    write_json_message(&mut websocket, &request)
-                        .context("sending Codex delivery request")?;
+                if let (Some(state), Some(delivery)) = (control_state.as_ref(), delivery.as_mut()) {
+                    pump_delivery(&mut websocket, state, delivery, &mut subscription_pending)?;
                 }
                 continue;
             };
@@ -2503,17 +2526,42 @@ fn pump_control(
                 .context("sending Codex subscription request")?;
                 subscription_pending = true;
             }
-            if let Some(delivery) = delivery.as_mut()
-                && let Some(request) = delivery.maybe_request(state)?
-            {
-                write_json_message(&mut websocket, &request)
-                    .context("sending Codex delivery request")?;
+            if let Some(delivery) = delivery.as_mut() {
+                pump_delivery(&mut websocket, state, delivery, &mut subscription_pending)?;
             }
         }
     })();
     if let Err(error) = result {
         let _ = events.send(ControlEvent::Failed(format!("{error:#}")));
     }
+}
+
+fn pump_delivery(
+    websocket: &mut WebSocket<UnixStream>,
+    state: &CodexControlState,
+    delivery: &mut CodexInboxDelivery,
+    subscription_pending: &mut bool,
+) -> Result<()> {
+    if *subscription_pending {
+        return Ok(());
+    }
+    if delivery.reconciliation_due(state) {
+        write_json_message(
+            websocket,
+            &json!({
+                "method": "thread/resume",
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "params": { "threadId": state.thread_id }
+            }),
+        )
+        .context("sending Codex delivery reconciliation request")?;
+        *subscription_pending = true;
+        return Ok(());
+    }
+    if let Some(request) = delivery.maybe_request(state)? {
+        write_json_message(websocket, &request).context("sending Codex delivery request")?;
+    }
+    Ok(())
 }
 
 fn subscription_candidate(message: &Value, thread_id: &str) -> bool {
@@ -3844,6 +3892,48 @@ mod tests {
             .unwrap();
         assert!(recovered.state.is_none());
         let retry = recovered.maybe_request(&idle).unwrap().unwrap();
+        assert_eq!(retry["params"]["clientUserMessageId"], client_id);
+    }
+
+    #[test]
+    fn an_orphaned_live_attempt_reconciles_before_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("orphaned response"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let idle = subscribed_state(CodexObservedState::Idle);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let first = delivery.maybe_request(&idle).unwrap().unwrap();
+        let client_id = first["params"]["clientUserMessageId"].clone();
+
+        delivery.ambiguous_since = Some(Instant::now() - DELIVERY_RECONCILE_AFTER);
+        assert!(delivery.reconciliation_due(&idle));
+        delivery
+            .reconcile_resume(
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": {
+                            "id": "thread-main",
+                            "status": { "type": "idle" },
+                            "turns": []
+                        }
+                    }
+                }),
+                &idle,
+            )
+            .unwrap();
+
+        assert!(delivery.pending.is_none());
+        assert!(delivery.state.is_none());
+        let retry = delivery.maybe_request(&idle).unwrap().unwrap();
         assert_eq!(retry["params"]["clientUserMessageId"], client_id);
     }
 

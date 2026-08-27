@@ -20,9 +20,10 @@ use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, IntentInput, JudgementRequest, MessageLifecycleRequest,
-    MessageSendRequest, MessageView, PlanRequest, PlanResponse, QuickAgentRequest,
-    QuickAgentResponse, ReviewRequest, SessionControlResponse, SessionInputMode,
-    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
+    MessageSendRequest, MessageView, PlanRequest, PlanResponse, PlanRevisionRequest,
+    PlanRunRequest, PlanRunView, PlanState, QuickAgentRequest, QuickAgentResponse, ReviewRequest,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -53,7 +54,7 @@ enum Command {
     /// Preview a new-format KDL intent.
     Plan(FileArgs),
     /// Apply a new-format KDL intent.
-    Run(FileArgs),
+    Run(RunArgs),
     /// Apply all new-format KDL files in one directory tree.
     Import(ImportArgs),
     /// Publish one exec member and follow its log.
@@ -106,6 +107,11 @@ enum Command {
         #[command(subcommand)]
         command: ReviewCommand,
     },
+    /// Claim and update durable plan work.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
     /// Send and receive native graph messages.
     Message {
         #[command(subcommand)]
@@ -153,6 +159,21 @@ struct QuickArgs {
 #[derive(Args)]
 struct FileArgs {
     file: Option<PathBuf>,
+    #[arg(long, visible_alias = "at")]
+    at_index: Option<u64>,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    file: Option<PathBuf>,
+    #[arg(long)]
+    plan: Option<String>,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long, env = "ST_AGENT")]
+    requester: Option<String>,
+    #[arg(long)]
+    detach: bool,
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
 }
@@ -392,6 +413,52 @@ struct ClaimArgs {
 enum ReviewCommand {
     Approve(ReviewArgs),
     Reject(ReviewArgs),
+    Revise(ReviewArgs),
+}
+
+#[derive(Subcommand)]
+enum WorkCommand {
+    Ls {
+        #[arg(long = "as", env = "ST_AGENT")]
+        assignee: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    Show {
+        subject: String,
+    },
+    Claim(WorkActionArgs),
+    Renew(WorkActionArgs),
+    Progress(WorkActionArgs),
+    Complete(WorkActionArgs),
+    Fail(WorkActionArgs),
+    Release(WorkActionArgs),
+    Revise(WorkReviseArgs),
+}
+
+#[derive(Args)]
+struct WorkActionArgs {
+    subject: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    summary: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    evidence: Vec<String>,
+}
+
+#[derive(Args)]
+struct WorkReviseArgs {
+    run: String,
+    file: PathBuf,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Subcommand)]
@@ -401,7 +468,7 @@ enum MessageCommand {
     Read(MessageReadArgs),
     Reply(MessageReplyArgs),
     Archive(MessageArchiveArgs),
-    Thread(MessageArchiveArgs),
+    Thread(MessageReferenceArgs),
     /// Write a disposable mailbox tree for translated tools.
     Export {
         directory: PathBuf,
@@ -470,6 +537,14 @@ struct MessageReplyArgs {
 
 #[derive(Args)]
 struct MessageArchiveArgs {
+    #[arg(num_args = 1..)]
+    references: Vec<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct MessageReferenceArgs {
     #[arg(num_args = 1..=2)]
     values: Vec<String>,
     #[arg(long = "as", env = "ST_AGENT")]
@@ -601,6 +676,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Resource { command } => run_resource(&client, command, cli.json).await,
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
         Command::Review { command } => run_review(&client, command, cli.json).await,
+        Command::Work { command } => run_work(&client, command, cli.json).await,
         Command::Message { command } => run_message(&client, command, cli.json).await,
         Command::Judgement(args) => run_judgement(&client, args, cli.json).await,
         Command::Completions(args) => {
@@ -728,8 +804,9 @@ async fn run_plan(client: &Client, args: FileArgs, json_output: bool) -> Result<
     print_plan(&response, json_output)
 }
 
-async fn run_file(client: &Client, args: FileArgs, json_output: bool) -> Result<()> {
-    let (kdl, source_name) = read_intent(args.file.as_deref())?;
+async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<()> {
+    let file = args.file.clone();
+    let (kdl, source_name) = read_intent(file.as_deref())?;
     let intent = IntentInput { kdl, source_name };
     let plan: PlanResponse = client
         .post(
@@ -747,13 +824,146 @@ async fn run_file(client: &Client, args: FileArgs, json_output: bool) -> Result<
         .post(
             "/v1/intent/apply",
             &ApplyRequest {
-                intent: resolved_intent,
+                intent: resolved_intent.clone(),
                 expected_subjects: plan.subject_tokens,
                 idempotency_key,
             },
         )
         .await?;
-    print_value(&response, json_output)
+    let parsed = st3::parse_intent(&resolved_intent.kdl, "local")?;
+    let ready = parsed
+        .plans
+        .values()
+        .filter(|plan| plan.state == PlanState::Ready)
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        return print_value(&response, json_output);
+    }
+    let selected = if let Some(selected) = args.plan.as_deref() {
+        let selected = selected.strip_prefix("plan/").unwrap_or(selected);
+        ready
+            .iter()
+            .find(|plan| plan.id == selected)
+            .copied()
+            .with_context(|| format!("ready plan `{selected}` is not in the file"))?
+    } else {
+        anyhow::ensure!(
+            ready.len() == 1,
+            "the file contains multiple ready plans; select one with --plan"
+        );
+        ready[0]
+    };
+    let workspace = args
+        .workspace
+        .or_else(|| {
+            file.as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()
+        .context("resolve the plan run workspace")?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let started: PlanRunView = client
+        .post(
+            "/v1/plan-runs",
+            &PlanRunRequest {
+                plan: selected.id.clone(),
+                revision: Some(selected.revision.clone()),
+                workspace: workspace.to_string_lossy().into_owned(),
+                requester: args.requester,
+                mode: Some("run".into()),
+                idempotency_key: format!(
+                    "run:{}:{nonce}:{}",
+                    selected.revision,
+                    std::process::id()
+                ),
+            },
+        )
+        .await?;
+    if args.detach {
+        return print_value(&started, json_output);
+    }
+    follow_plan_run(client, started, json_output).await
+}
+
+async fn follow_plan_run(client: &Client, mut run: PlanRunView, json_output: bool) -> Result<()> {
+    let mut prior = String::new();
+    loop {
+        let summary = plan_run_signature(&run)?;
+        if summary != prior && !json_output {
+            print_plan_run_tree(&run);
+            prior = summary;
+        }
+        match run.status.as_str() {
+            "completed" => {
+                return if json_output {
+                    print_value(&run, true)
+                } else {
+                    Ok(())
+                };
+            }
+            "failed" | "cancelled" => anyhow::bail!("plan run {} is {}", run.subject, run.status),
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        run = client
+            .get(&format!(
+                "/v1/plan-runs/{}",
+                urlencoding::encode(&run.subject)
+            ))
+            .await?;
+    }
+}
+
+fn plan_run_signature(run: &PlanRunView) -> Result<String> {
+    serde_json::to_string(&json!({
+        "revision": run.revision,
+        "status": run.status,
+        "phase": run.phase,
+        "steps": run.steps.iter().map(|step| json!({
+            "step": step.step,
+            "status": step.status,
+            "attempt": step.attempt,
+            "reason": step.blocked_reason,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(Into::into)
+}
+
+fn print_plan_run_tree(run: &PlanRunView) {
+    println!(
+        "{} {} ({}, revision {})",
+        run.subject,
+        run.status,
+        run.phase,
+        &run.revision[..run.revision.len().min(12)]
+    );
+    for (index, step) in run.steps.iter().enumerate() {
+        let depth = step.step.matches('/').count();
+        let branch = if index + 1 == run.steps.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        let title = step.title.as_deref().unwrap_or(&step.step);
+        let retry = if step.attempt > 1 {
+            format!("; attempt {}", step.attempt)
+        } else {
+            String::new()
+        };
+        println!(
+            "{}{} [{}{}] {}",
+            "  ".repeat(depth),
+            branch,
+            step.status,
+            retry,
+            title
+        );
+        if let Some(reason) = &step.blocked_reason {
+            println!("{}   {}", "  ".repeat(depth), reason);
+        }
+    }
 }
 
 async fn run_import(client: &Client, args: ImportArgs, json_output: bool) -> Result<()> {
@@ -1241,12 +1451,6 @@ async fn wait_for_condition(client: &Client, subject: &str, condition: &str) -> 
 }
 
 async fn condition_value(client: &Client, subject: &str, condition: &str) -> Result<Option<Value>> {
-    if let Some(expected) = condition.strip_prefix("checkpoint=") {
-        let eval: EvalStatus = client
-            .get(&format!("/v1/evals/{}", urlencoding::encode(subject)))
-            .await?;
-        return Ok((eval.active_checkpoint.as_deref() == Some(expected)).then(|| json!(eval)));
-    }
     if let Some(expected) = condition.strip_prefix("verdict=") {
         let eval: EvalStatus = client
             .get(&format!("/v1/evals/{}", urlencoding::encode(subject)))
@@ -1277,7 +1481,6 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
 fn validate_wait_condition(condition: &str) -> Result<()> {
     anyhow::ensure!(
         matches!(condition, "running" | "ready" | "exited" | "stopped")
-            || condition.starts_with("checkpoint=")
             || matches!(
                 condition.strip_prefix("verdict="),
                 Some("pass" | "fail" | "void")
@@ -1933,6 +2136,7 @@ async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) 
     let (decision, args) = match command {
         ReviewCommand::Approve(args) => ("approved", args),
         ReviewCommand::Reject(args) => ("rejected", args),
+        ReviewCommand::Revise(args) => ("revise", args),
     };
     let path = format!("/v1/reviews/{}", args.resource);
     let response: ClaimRecord = client
@@ -1947,6 +2151,126 @@ async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) 
         )
         .await?;
     print_value(&response, json_output)
+}
+
+async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> Result<()> {
+    match command {
+        WorkCommand::Ls { assignee, all } => {
+            let path = if let Some(assignee) = assignee {
+                format!(
+                    "/v1/work?assignee={}&include_terminal={all}",
+                    urlencoding::encode(&assignee)
+                )
+            } else {
+                format!("/v1/work?include_terminal={all}")
+            };
+            let work: Vec<StepRunView> = client.get(&path).await?;
+            if json_output {
+                return print_value(&work, true);
+            }
+            for step in work {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    step.status,
+                    step.assignee.as_deref().unwrap_or("-"),
+                    step.subject,
+                    step.title.as_deref().unwrap_or(&step.step)
+                );
+            }
+            Ok(())
+        }
+        WorkCommand::Show { subject } => {
+            let work: Vec<StepRunView> = client.get("/v1/work?include_terminal=true").await?;
+            let normalized = if subject.starts_with("step-run/") {
+                subject
+            } else {
+                format!("step-run/{subject}")
+            };
+            let step = work
+                .into_iter()
+                .find(|step| step.subject == normalized)
+                .with_context(|| format!("step run `{normalized}` does not exist"))?;
+            print_value(&step, json_output)
+        }
+        WorkCommand::Claim(args) => post_work(client, "claim", args, json_output).await,
+        WorkCommand::Renew(args) => post_work(client, "renew", args, json_output).await,
+        WorkCommand::Progress(args) => post_work(client, "progress", args, json_output).await,
+        WorkCommand::Complete(args) => post_work(client, "complete", args, json_output).await,
+        WorkCommand::Fail(args) => post_work(client, "fail", args, json_output).await,
+        WorkCommand::Release(args) => post_work(client, "release", args, json_output).await,
+        WorkCommand::Revise(args) => {
+            let actor = args
+                .actor
+                .context("a plan revision needs --as or ST_AGENT")?;
+            let kdl = fs::read_to_string(&args.file)
+                .with_context(|| format!("read KDL {}", args.file.display()))?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: PlanRunView = client
+                .post(
+                    &format!("/v1/plan-runs/{}/revision", urlencoding::encode(&args.run)),
+                    &PlanRevisionRequest {
+                        intent: IntentInput {
+                            kdl,
+                            source_name: Some(args.file.display().to_string()),
+                        },
+                        actor,
+                        reason: args.reason,
+                        idempotency_key: format!("plan-revision:{}:{nonce}", args.run),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+    }
+}
+
+async fn post_work(
+    client: &Client,
+    action: &str,
+    args: WorkActionArgs,
+    json_output: bool,
+) -> Result<()> {
+    let actor = args.actor.context("a work action needs --as or ST_AGENT")?;
+    let incarnation = match args.incarnation {
+        Some(incarnation) => Some(incarnation),
+        None => current_agent_incarnation(client, &actor).await?,
+    };
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let response: StepRunView = client
+        .post(
+            &format!("/v1/work/{action}/{}", urlencoding::encode(&args.subject)),
+            &WorkRequest {
+                actor: Some(actor.clone()),
+                incarnation,
+                summary: args.summary,
+                reason: args.reason,
+                evidence: args.evidence,
+                idempotency_key: format!("work:{action}:{}:{actor}:{nonce}", args.subject),
+            },
+        )
+        .await?;
+    print_value(&response, json_output)
+}
+
+async fn current_agent_incarnation(client: &Client, actor: &str) -> Result<Option<String>> {
+    let subject = if actor.starts_with("agent/") {
+        actor.to_owned()
+    } else {
+        format!("agent/{actor}")
+    };
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(&subject)
+        ))
+        .await?;
+    Ok(status
+        .subjects
+        .first()
+        .and_then(|subject| subject.actual.as_ref())
+        .and_then(|actual| actual.get("fields").unwrap_or(actual).get("incarnation_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 async fn run_message(client: &Client, command: MessageCommand, json_output: bool) -> Result<()> {
@@ -2050,11 +2374,19 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
             }
         }
         MessageCommand::Archive(args) => {
-            let (reference, actor) = positional_identity_and_reference(args.values, args.actor)?;
-            let claim = close_message(client, &reference, actor.as_deref()).await?;
+            let mut claims = Vec::with_capacity(args.references.len());
+            for reference in args.references {
+                let message = read_message(client, &reference).await?;
+                accept_message(client, &message, args.actor.as_deref()).await?;
+                claims.push(close_message(client, &reference, args.actor.as_deref()).await?);
+            }
             sync_message_projection(client).await?;
             if json_output {
-                print_value(&claim, true)
+                if claims.len() == 1 {
+                    print_value(&claims[0], true)
+                } else {
+                    print_value(&claims, true)
+                }
             } else {
                 Ok(())
             }
@@ -2124,7 +2456,12 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<MessageV
 
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
     let reference = normalize_message_reference(reference);
-    client.get(&format!("/v1/messages/read/{reference}")).await
+    client
+        .get(&format!(
+            "/v1/messages/read/{}",
+            urlencoding::encode(&reference)
+        ))
+        .await
 }
 
 async fn accept_message(client: &Client, message: &MessageView, actor: Option<&str>) -> Result<()> {
@@ -2134,7 +2471,7 @@ async fn accept_message(client: &Client, message: &MessageView, actor: Option<&s
     let reference = message.subject.trim_start_matches("message/");
     let _: ClaimRecord = client
         .post(
-            &format!("/v1/messages/{reference}/claims"),
+            &format!("/v1/messages/{}/claims", urlencoding::encode(reference)),
             &MessageLifecycleRequest {
                 lifecycle: "accepted".into(),
                 actor: actor.map(str::to_owned),
@@ -2155,7 +2492,7 @@ async fn close_message(
     let reference = normalize_message_reference(reference);
     client
         .post(
-            &format!("/v1/messages/{reference}/claims"),
+            &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
                 lifecycle: "closed".into(),
                 actor: actor.map(str::to_owned),
@@ -2168,16 +2505,23 @@ async fn close_message(
 }
 
 fn normalize_message_reference(reference: &str) -> String {
-    let reference = Path::new(reference)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(reference)
-        .trim_end_matches(".md")
-        .trim_start_matches("message/");
-    reference
-        .rsplit_once('-')
-        .map_or(reference, |(_, id)| id)
-        .to_owned()
+    let file_reference = reference.ends_with(".md");
+    let reference = if file_reference {
+        Path::new(reference)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(reference)
+            .trim_end_matches(".md")
+    } else {
+        reference
+    };
+    let reference = if file_reference {
+        reference.split_once('-').map_or(reference, |(_, id)| id)
+    } else {
+        reference
+    };
+    let reference = urlencoding::decode(reference).unwrap_or(std::borrow::Cow::Borrowed(reference));
+    reference.trim_start_matches("message/").to_owned()
 }
 
 async fn sync_message_projection(client: &Client) -> Result<()> {
@@ -2251,40 +2595,13 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
     } else {
         println!("started {}", started.scope);
     }
-    let mut cursor = started.event_cursor;
-    let mut verdict = None::<String>;
-    loop {
-        let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after_index={cursor}&scope={}",
-                urlencoding::encode(&started.scope)
-            ))
-            .await?;
-        for event in events {
-            cursor = cursor.max(event.store_index);
-            if !json_output {
-                println!("{} {} {}", event.store_index, event.kind, event.subject);
-            }
-            if event.kind == "eval.verdict" && event.subject == started.scope {
-                verdict = Some(
-                    event
-                        .body
-                        .pointer("/fields/verdict")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                );
-            }
-            if event.kind == "checkpoint.reached"
-                && event.body.pointer("/fields/name").and_then(Value::as_str)
-                    == Some("The temporary eval scope is empty")
-            {
-                let verdict = verdict.as_deref().unwrap_or("unknown");
-                anyhow::ensure!(verdict == "pass", "eval verdict is {verdict}");
-                return Ok(());
-            }
-        }
-    }
+    let subject = started
+        .plan_run
+        .context("the eval API did not return a plan run")?;
+    let run: PlanRunView = client
+        .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
+        .await?;
+    follow_plan_run(client, run, json_output).await
 }
 
 async fn run_quick(
@@ -2507,6 +2824,9 @@ async fn run_st2_native_driver(
     let archive = st2::message::archive_dir(&agent_dir);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut renewed_minute = None;
     let mut ready = false;
     loop {
         tokio::select! {
@@ -2559,6 +2879,14 @@ async fn run_st2_native_driver(
                 }
                 if driver == "opencode" {
                     forward_projected_messages(client, subject, &inbox, &archive, "opencode-server").await?;
+                }
+            }
+            _ = work_interval.tick(), if driver != "claude" => {
+                forward_ready_work(client, subject, &inbox, &archive).await?;
+                let minute = unix_minute()?;
+                if renewed_minute != Some(minute) {
+                    renew_claimed_work(client, subject, minute).await?;
+                    renewed_minute = Some(minute);
                 }
             }
         }
@@ -2693,6 +3021,10 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delivered = BTreeSet::new();
+    let mut delivered_work = BTreeSet::new();
+    let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut renewed_minute = None;
     let mut frame_sequence = 0_u64;
     let session = std::env::var("ST2_PI_CHANNEL_SESSION").unwrap_or_else(|_| "unknown".into());
     loop {
@@ -2770,6 +3102,36 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                     stdout.flush().await?;
                 }
             }
+            _ = work_interval.tick() => {
+                let work: Vec<StepRunView> = client
+                    .get(&format!("/v1/work?assignee={}", urlencoding::encode(subject)))
+                    .await?;
+                for step in work.into_iter().filter(|step| step.status == "ready") {
+                    if !delivered_work.insert(step.subject.clone()) {
+                        continue;
+                    }
+                    let frame = json!({
+                        "type": "message",
+                        "deliverAs": "steer",
+                        "content": work_notification(&step),
+                        "meta": {
+                            "from": "st3/runtime",
+                            "messageId": step.subject,
+                            "threadId": step.run,
+                            "identity": identity,
+                            "kind": "work.available"
+                        }
+                    });
+                    stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
+                let minute = unix_minute()?;
+                if renewed_minute != Some(minute) {
+                    renew_claimed_work(client, subject, minute).await?;
+                    renewed_minute = Some(minute);
+                }
+            }
         }
     }
 }
@@ -2837,6 +3199,9 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     });
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut renewed_minute = None;
     let mut ready = false;
     loop {
         tokio::select! {
@@ -2900,8 +3265,95 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                     }).await?;
                 }
             }
+            _ = work_interval.tick() => {
+                forward_ready_work(client, subject, &inbox, &archive).await?;
+                let minute = unix_minute()?;
+                if renewed_minute != Some(minute) {
+                    renew_claimed_work(client, subject, minute).await?;
+                    renewed_minute = Some(minute);
+                }
+            }
         }
     }
+}
+
+async fn forward_ready_work(
+    client: &Client,
+    subject: &str,
+    inbox: &Path,
+    archive: &Path,
+) -> Result<()> {
+    const TAG_PREFIX: &str = "st3-work:";
+    let present = st2::message::list_dir(inbox)?
+        .into_iter()
+        .chain(st2::message::list_dir(archive)?)
+        .flat_map(|message| message.tags)
+        .filter_map(|tag| tag.strip_prefix(TAG_PREFIX).map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let work: Vec<StepRunView> = client
+        .get(&format!(
+            "/v1/work?assignee={}",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    for step in work.into_iter().filter(|step| step.status == "ready") {
+        if present.contains(&step.subject) {
+            continue;
+        }
+        let content = work_notification(&step);
+        st2::message::send_to_inbox(
+            inbox,
+            "st3/runtime",
+            Some("a plan step is ready"),
+            None,
+            &[format!("{TAG_PREFIX}{}", step.subject)],
+            &content,
+        )?;
+    }
+    Ok(())
+}
+
+fn work_notification(step: &StepRunView) -> String {
+    format!(
+        "A durable st3 plan step is ready. Run `st3 work show {0}`, then `st3 work claim {0}`. Update it with `st3 work progress {0}`. Finish it with `st3 work complete {0}` or `st3 work fail {0}`.\n\nTitle: {1}\nGoal: {2}",
+        step.subject,
+        step.title.as_deref().unwrap_or(&step.step),
+        step.goal
+            .as_deref()
+            .unwrap_or("Follow the step definition and publish its required graph products."),
+    )
+}
+
+async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let work: Vec<StepRunView> = client
+        .get(&format!(
+            "/v1/work?assignee={}",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    for step in work.into_iter().filter(|step| {
+        matches!(step.status.as_str(), "claimed" | "working")
+            && step.lease_owner.as_deref() == Some(subject)
+    }) {
+        let _: StepRunView = client
+            .post(
+                &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
+                &WorkRequest {
+                    actor: Some(subject.into()),
+                    incarnation: step.lease_incarnation,
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: format!("native-renew:{}:{subject}:{minute}", step.subject),
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn unix_minute() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 60)
 }
 
 async fn forward_projected_messages(
@@ -2912,10 +3364,14 @@ async fn forward_projected_messages(
     transport: &str,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
-    let present = projected_message_subjects(inbox, archive)?;
     let messages: Vec<MessageView> = client
-        .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
+        .get(&format!(
+            "/v1/messages?to={}&include_closed=true",
+            urlencoding::encode(subject)
+        ))
         .await?;
+    sync_closed_projected_messages(inbox, archive, &messages)?;
+    let present = projected_message_subjects(inbox, archive)?;
     for message in messages
         .into_iter()
         .filter(|message| message.status == "sent")
@@ -2974,6 +3430,30 @@ async fn forward_projected_messages(
     Ok(())
 }
 
+fn sync_closed_projected_messages(
+    inbox: &Path,
+    archive: &Path,
+    messages: &[MessageView],
+) -> Result<()> {
+    const TAG_PREFIX: &str = "st3-message:";
+    let closed = messages
+        .iter()
+        .filter(|message| message.status == "closed")
+        .map(|message| message.subject.as_str())
+        .collect::<BTreeSet<_>>();
+    for message in st2::message::list_dir(inbox)? {
+        let is_closed = message
+            .tags
+            .iter()
+            .filter_map(|tag| tag.strip_prefix(TAG_PREFIX))
+            .any(|subject| closed.contains(subject));
+        if is_closed {
+            st2::message::archive_msg(inbox, archive, &message.filename)?;
+        }
+    }
+    Ok(())
+}
+
 fn projected_message_subjects(inbox: &Path, archive: &Path) -> Result<BTreeSet<String>> {
     const TAG_PREFIX: &str = "st3-message:";
     Ok(st2::message::list_dir(inbox)?
@@ -2992,6 +3472,10 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
     let mut initialized = false;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut delivered_work = BTreeSet::new();
+    let mut renewed_minute = None;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -3080,6 +3564,38 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                         expected_subject: None,
                         idempotency_key: Some(format!("message-delivered:{}:{subject}", message.subject)),
                     }).await?;
+                }
+            }
+            _ = work_interval.tick(), if initialized => {
+                let work: Vec<StepRunView> = client
+                    .get(&format!("/v1/work?assignee={}", urlencoding::encode(subject)))
+                    .await?;
+                for step in work.into_iter().filter(|step| step.status == "ready") {
+                    if !delivered_work.insert(step.subject.clone()) {
+                        continue;
+                    }
+                    let notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/claude/channel",
+                        "params": {
+                            "content": work_notification(&step),
+                            "meta": {
+                                "from": "st3/runtime",
+                                "messageId": step.subject,
+                                "threadId": step.run,
+                                "identity": subject,
+                                "kind": "work.available"
+                            }
+                        }
+                    });
+                    stdout.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
+                let minute = unix_minute()?;
+                if renewed_minute != Some(minute) {
+                    renew_claimed_work(client, subject, minute).await?;
+                    renewed_minute = Some(minute);
                 }
             }
         }
@@ -3276,6 +3792,45 @@ mod tests {
         assert!(parse_timeout("forever").is_err());
     }
 
+    #[test]
+    fn message_references_round_trip_nested_ids_and_projected_files() {
+        assert_eq!(
+            normalize_message_reference("message/kickoff/run-1"),
+            "kickoff/run-1"
+        );
+        assert_eq!(
+            normalize_message_reference("kickoff%2Frun-1"),
+            "kickoff/run-1"
+        );
+        assert_eq!(
+            normalize_message_reference("/tmp/inbox/00000000000000000008-kickoff%2Frun-1.md"),
+            "kickoff/run-1"
+        );
+    }
+
+    #[test]
+    fn message_archive_accepts_more_than_one_reference() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "message",
+            "archive",
+            "first",
+            "second",
+            "third",
+            "--as",
+            "agent/sup",
+        ])
+        .unwrap();
+        let Command::Message {
+            command: MessageCommand::Archive(args),
+        } = cli.command
+        else {
+            panic!("the archive command did not parse");
+        };
+        assert_eq!(args.references, ["first", "second", "third"]);
+        assert_eq!(args.actor.as_deref(), Some("agent/sup"));
+    }
+
     #[tokio::test]
     async fn pty_ui_refuses_a_remote_endpoint_before_launch() {
         let endpoint = Endpoint::Http("http://example.invalid".into());
@@ -3322,5 +3877,37 @@ mod tests {
             projected_message_subjects(&inbox, &archive).unwrap(),
             BTreeSet::from(["message/kickoff".into()])
         );
+    }
+
+    #[test]
+    fn a_graph_archive_moves_the_private_native_delivery_file() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+        let filename = st2::message::send_to_inbox(
+            &inbox,
+            "requester",
+            Some("Start"),
+            None,
+            &["st3-message:message/kickoff/run-1".into()],
+            "Do the work.",
+        )
+        .unwrap();
+        let messages = vec![MessageView {
+            subject: "message/kickoff/run-1".into(),
+            from: "agent/requester".into(),
+            to: "agent/worker".into(),
+            content: "Do the work.".into(),
+            status: "closed".into(),
+            title: Some("Start".into()),
+            in_reply_to: None,
+            tags: Vec::new(),
+            created_index: 1,
+        }];
+
+        sync_closed_projected_messages(&inbox, &archive, &messages).unwrap();
+
+        assert!(!inbox.join(&filename).exists());
+        assert!(archive.join(filename).is_file());
     }
 }
