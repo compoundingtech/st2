@@ -2297,8 +2297,6 @@ fn up_loop_until(
     install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogDeclarationWatcher>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
-    crate::event::publish_owner_binding(root, this_host)
-        .context("publish machine-local stream owner binding")?;
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
     let mut watcher = install_watcher(root, tx);
@@ -2311,16 +2309,12 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
-    // Validate the initial profile envelope before starting the resident supervisor. Every
-    // reconcile pass reloads it again and atomically replaces the registry with the watch set;
-    // malformed later edits surface in that pass and install an empty, fail-closed profile set.
-    let profiles = crate::catalog::declared_profiles(root)
-        .context("parse resource profiles in catalog.kdl")?;
-    let resync = crate::resync::ResyncSupervisor::with_profiles(
-        root.to_path_buf(),
-        this_host.to_owned(),
-        profiles,
-    );
+    // Profile parsing and stream-owner publication both belong behind the catalog read fence.
+    // Defer them together until the first readable pass: an incomplete catalog apply keeps a
+    // resident supervisor alive and retrying without exposing declarations or starting runtime I/O.
+    // Once initialized, every reconcile pass reloads profiles and atomically replaces the registry
+    // with the watch set; malformed later edits install an empty, fail-closed profile set.
+    let mut resync = None;
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
@@ -2328,6 +2322,33 @@ fn up_loop_until(
     loop {
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
+        if resync.is_none() {
+            let catalog_lock = match crate::CatalogLock::shared(root) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    pre.skipped = true;
+                    pre.errors.push(format!(
+                        "acquire shared catalog-authoring lock for resident initialization (pass skipped): {error:#}"
+                    ));
+                    on_report(&pre);
+                    if stop.load(Ordering::SeqCst)
+                        || wait_for_reconcile(&rx, interval, stop) == ReconcileWake::Stop
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let profiles = crate::catalog::declared_profiles(root)
+                .context("parse resource profiles in catalog.kdl")?;
+            crate::event::publish_owner_binding_under_lock(root, this_host, &catalog_lock)
+                .context("publish machine-local stream owner binding")?;
+            resync = Some(crate::resync::ResyncSupervisor::with_profiles(
+                root.to_path_buf(),
+                this_host.to_owned(),
+                profiles,
+            ));
+        }
         let mut report = reconcile_pass(
             root,
             this_host,
@@ -2336,7 +2357,7 @@ fn up_loop_until(
             &mut cap,
             &mut debounce,
             &mut presentation_cursor,
-            Some(&resync),
+            resync.as_ref(),
         );
         pre.absorb(report);
         report = pre;
@@ -2736,9 +2757,12 @@ mod tests {
         .unwrap();
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let stop = &stop;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(350));
                 stop.store(true, Ordering::SeqCst);
             });
@@ -2749,7 +2773,10 @@ mod tests {
                 Duration::from_millis(100),
                 &stop,
                 |_, _| None, // watcher installation fails, as it did on dev3's oversized catalog
-                |_| passes += 1,
+                |_| {
+                    passes += 1;
+                    let _ = started_tx.try_send(());
+                },
             )
             .unwrap();
         });
@@ -2772,10 +2799,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let passes = std::sync::Arc::new(AtomicUsize::new(0));
         let observed = passes.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let started = Instant::now();
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(200));
                 std::fs::write(
                     &spec,
@@ -2806,6 +2835,7 @@ mod tests {
                 best_effort_catalog_watcher,
                 |_| {
                     passes.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.try_send(());
                 },
             )
             .unwrap();
@@ -3093,9 +3123,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
         let mut warnings_seen = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let stop = &stop;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(300));
                 stop.store(true, Ordering::SeqCst);
             });
@@ -3109,6 +3142,7 @@ mod tests {
                 |report| {
                     passes += 1;
                     warnings_seen += report.warnings.len();
+                    let _ = started_tx.try_send(());
                 },
             )
             .unwrap();
