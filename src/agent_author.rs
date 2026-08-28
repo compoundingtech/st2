@@ -2989,10 +2989,11 @@ mod tests {
             "nix-managed-declaration"
         );
 
-        // Relative references, empty names, and empty explanations never reach the declaration.
+        // A catalog-relative carrier path is admitted since #345, so the refusals worth pinning are
+        // the ones that escape the catalog, plus empty names and empty explanations.
         for (name, uri, reason, inactive_reason) in [
-            ("relative", "./issue/1", "not an absolute identity", None),
-            ("schemeless", "example.com/issue/1", "no scheme", None),
+            ("absolute-path", "/etc/passwd", "escapes the catalog", None),
+            ("parent-escape", "../outside", "escapes the catalog", None),
             ("spaced", "issue://example/a b", "unencoded space", None),
             ("", "issue://example/1", "empty name", None),
             ("blank-reason", "issue://example/1", "", None),
@@ -3023,6 +3024,19 @@ mod tests {
                 .count(),
             1
         );
+
+        // #345 widened the envelope: a catalog-relative carrier path is a valid binding uri.
+        add_resource(
+            root,
+            "h.child",
+            "h",
+            None,
+            "carrier",
+            "carriers/goal.md",
+            "Catalog-relative carrier.",
+            None,
+        )
+        .expect("a catalog-relative carrier path is admitted");
         assert_eq!(fs::read_to_string(&nix_owned).unwrap(), untouched);
     }
 

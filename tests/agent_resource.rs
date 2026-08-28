@@ -324,23 +324,34 @@ fn mutation_refuses_an_invalid_uri_an_empty_reason_and_a_nix_managed_declaration
         &declaration("worker", "catalog", ""),
     );
 
-    let relative = run(
+    // #345 widened the envelope: a binding may name a catalog-relative carrier path as well as
+    // an absolute URI, so `not-absolute` is now a *valid* relative carrier. What stays refused is
+    // a path that escapes the catalog.
+    for escaping in ["/etc/passwd", "../escape"] {
+        let refused = run(
+            root,
+            &[
+                "resource", "add", "bad", "--agent", "worker", "--uri", escaping, "--reason",
+                "Probe.",
+            ],
+        );
+        assert!(
+            !refused.status.success(),
+            "a catalog-relative uri that escapes the catalog must be refused: {escaping}"
+        );
+    }
+
+    // `declaration` is reserved by resync (#345) and may not be taken as a binding name.
+    let reserved = run(
         root,
         &[
-            "resource",
-            "add",
-            "bad",
-            "--agent",
-            "worker",
-            "--uri",
-            "not-absolute",
-            "--reason",
-            "Probe.",
+            "resource", "add", "declaration", "--agent", "worker", "--uri",
+            "https://example.test/x", "--reason", "Probe.",
         ],
     );
     assert!(
-        !relative.status.success(),
-        "a non-absolute URI must be refused"
+        !reserved.status.success(),
+        "the resync-reserved binding name must be refused"
     );
 
     let blank = run(
