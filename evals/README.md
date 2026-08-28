@@ -6,6 +6,8 @@ The initial st2 corpus came from `compoundingtech/evals` commit `3db48ab56d40ce2
 
 Future imports require an explicit eval review before they enter this corpus.
 
+The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 active cells in the old eval repository.
+
 | Eval | st2 | st3 |
 | --- | --- | --- |
 | License MIT | `st2/license-mit` | `st3/license-mit` |
