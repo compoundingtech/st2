@@ -5,7 +5,7 @@ set -euo pipefail
 
 dev_messages="$(st3 message ls rc.dev --archive --json)"
 sup_messages="$(st3 message ls rc.sup --archive --json)"
-requester_messages="$(st3 message ls requester --archive --json)"
+requester_messages="$(st3 message ls person/eval-requester --archive --json)"
 work_tag="plan-run:plan-run/$PLAN_RUN"
 direct_tag="plan-run:$PLAN_RUN"
 injector="exec/eval/restart-continuity/inject/$PLAN_RUN"
