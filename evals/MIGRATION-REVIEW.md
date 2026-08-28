@@ -16,7 +16,7 @@ Do not copy every eval as KDL. Product behavior with strong Rust coverage belong
 
 Use one logical eval for one behavior. A Claude or Codex variant is a harness choice, not a new eval.
 
-The proposed result has 19 logical evals. Fourteen logical evals now have both runtime forms.
+The proposed result has 19 logical evals. Sixteen logical evals now have both runtime forms.
 
 - The review started with three logical evals represented here.
 - Sixteen new logical evals come from 18 source evals.
@@ -74,8 +74,8 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `docs` | Archive | Source history | The cold-reader idea is good, but three paid seats test model writing more than runtime behavior. |
 | `exec-lifecycle-logging` | Rust | `tests/exec_backend.rs` | The Rust suite covers process lifetime, logs, rotation, adoption, and group teardown. |
 | `feature-fit` | Archive | Source history | Ghost bug and Signal rename already cover work in an existing codebase. |
-| `fork-in-the-road` | Keep, wave 1 | `fork-in-the-road` | Merge the provider twins. The scenario tests parallel analysis, synthesis, and a real tradeoff. |
-| `fork-in-the-road-codex` | Keep, wave 1 | `fork-in-the-road` | This is the same logical eval and carries accepted pass evidence. |
+| `fork-in-the-road` | Represented | `fork-in-the-road` | The local Codex pair tests parallel analysis, debate, synthesis, and a real tradeoff. |
+| `fork-in-the-road-codex` | Represented | `fork-in-the-road` | The local Codex pair represents both source provider forms. |
 | `ghost-bug` | Represented | `ghost-bug` | The local Codex pair represents both source provider forms. |
 | `ghost-bug-codex` | Represented | `ghost-bug` | The local Codex pair represents both source provider forms. |
 | `hook-integrity` | Rust | `tests/hooks.rs`, `tests/materialize.rs`, `tests/claude_hooks.rs`, `tests/codex_hooks.rs` | The Rust suite covers receipts, verification, native overlays, and idempotency. |
@@ -85,8 +85,8 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `license-mit` | Represented | `license-mit` | The local Claude pair represents both source provider forms. |
 | `license-mit-codex` | Represented | `license-mit` | The local Claude pair represents both source provider forms. |
 | `migration` | Archive | Source history | Its broad code migration overlaps the stronger Signal rename eval. |
-| `poisoned-pr` | Keep, wave 2 | `poisoned-pr` | Merge the provider twins. This gives the corpus a strong review-only lane. |
-| `poisoned-pr-codex` | Keep, wave 2 | `poisoned-pr` | This is the same logical eval and carries accepted pass evidence. |
+| `poisoned-pr` | Represented | `poisoned-pr` | The local Codex pair gives the corpus a strong review-only lane. |
+| `poisoned-pr-codex` | Represented | `poisoned-pr` | The local Codex pair represents both source provider forms. |
 | `presence-ding-matrix` | Rust | `src/ding/mod.rs` tests | The Rust suite covers busy, away, DND, stale DND, FIFO, and retry behavior. |
 | `pty-attach-machine-stream` | Represented | `pty-attach-machine-stream` | This verifies the installed PTY stream through the boundary that st2 and st3 use. |
 | `pty-attach-only` | Represented | `pty-attach-only` | This verifies that attach never creates or restarts a session. |
@@ -170,11 +170,11 @@ Wave 1 proves the runtime:
 1. Maintain the ten represented model-free lifecycle, PTY, network, resource, and crash pairs.
 2. Add threaded-reply and delegation assertions to License MIT.
 3. Maintain Restart continuity with duplicate delivery and durable graph state.
-4. Merge the fork-in-the-road provider twins and lift its parallel plan into the graph.
+4. Maintain Fork in the road with its parallel drafts, debate, revisions, and synthesis in the graph.
 
 Wave 2 broadens agent work:
 
-1. Import Poisoned PR as the review-only and security eval.
+1. Maintain Poisoned pull request as the review-only and security eval.
 2. Import Test writing as the mutation-scored quality eval.
 3. Import Weird Git setup as the worktree launch eval.
 4. Import Claude skill inheritance as a provider integration eval.

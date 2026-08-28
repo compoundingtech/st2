@@ -1,0 +1,291 @@
+version 2
+
+subgraph {
+  scope "eval/fork-in-the-road/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/fork-in-the-road" state="ready" {
+      step "start-team" timeout="10m" {
+        title "The native Codex design panel is ready"
+        subgraph {
+          agent "fd.sup" {
+            workspace "${WORKSPACE}/sup"
+            harness "codex" {
+              model "gpt-5.6-sol"
+              effort "medium"
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Send only the required final report. End the turn when no message remains."
+              args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            }
+            restart "never"
+            env {
+              CATALOG "${WORKSPACE}"
+              PLAN_RUN "${PLAN_RUN}"
+              ST_ROOT "${WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+            }
+          }
+          agent "fd.a" {
+            workspace "${WORKSPACE}/a"
+            harness "codex" {
+              model "gpt-5.6-sol"
+              effort "medium"
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End the turn when no message remains."
+              args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            }
+            restart "never"
+            env {
+              CATALOG "${WORKSPACE}"
+              PLAN_RUN "${PLAN_RUN}"
+              ST_ROOT "${WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+            }
+          }
+          agent "fd.b" {
+            workspace "${WORKSPACE}/b"
+            harness "codex" {
+              model "gpt-5.6-sol"
+              effort "medium"
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End the turn when no message remains."
+              args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            }
+            restart "never"
+            env {
+              CATALOG "${WORKSPACE}"
+              PLAN_RUN "${PLAN_RUN}"
+              ST_ROOT "${WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+            }
+          }
+          agent "fd.c" {
+            workspace "${WORKSPACE}/c"
+            harness "codex" {
+              model "gpt-5.6-sol"
+              effort "medium"
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End the turn when no message remains."
+              args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            }
+            restart "never"
+            env {
+              CATALOG "${WORKSPACE}"
+              PLAN_RUN "${PLAN_RUN}"
+              ST_ROOT "${WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+            }
+          }
+        }
+      }
+
+      step "draft-per-human" timeout="20m" {
+        title "The per-human chief-of-staff proposal exists"
+        goal "Champion one chief of staff per human. Treat privacy, information isolation, cost, routing, ownership, and coordination as main tradeoffs. Own the design weaknesses."
+        assigned-to "agent/fd.a"
+        depends-on { step "start-team" completed }
+        plan "work" {
+          step "analyze" {
+            title "The per-human design tradeoffs are explicit"
+            goal "Read PROBLEM.md. Analyze the assigned design without reading another proposal. Separate technical recommendations from human policy choices."
+          }
+          step "write-proposal" {
+            title "The per-human proposal is committed"
+            goal "Write a strong and honest PROPOSAL.md. Include the design, advantages, weaknesses, privacy boundary, failure modes, and questions for humans. Commit it with author fd.a."
+            depends-on { step "analyze" completed }
+          }
+          step "publish-draft" {
+            title "The per-human draft revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/proposal-a-draft resource.binding --actor agent/fd.a --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "write-proposal" completed }
+            produces {
+              resource "plan-run/${PLAN_RUN}/proposal-a-draft" { kind "vcs.revision"; state "published" }
+            }
+          }
+        }
+      }
+
+      step "draft-shared" timeout="20m" {
+        title "The shared chief-of-staff proposal exists"
+        goal "Champion one shared chief of staff. Treat privacy, information isolation, cost, routing, ownership, and coordination as main tradeoffs. Own the design weaknesses."
+        assigned-to "agent/fd.b"
+        depends-on { step "start-team" completed }
+        plan "work" {
+          step "analyze" {
+            title "The shared design tradeoffs are explicit"
+            goal "Read PROBLEM.md. Analyze the assigned design without reading another proposal. Separate technical recommendations from human policy choices."
+          }
+          step "write-proposal" {
+            title "The shared proposal is committed"
+            goal "Write a strong and honest PROPOSAL.md. Include the design, advantages, weaknesses, privacy boundary, failure modes, and questions for humans. Commit it with author fd.b."
+            depends-on { step "analyze" completed }
+          }
+          step "publish-draft" {
+            title "The shared draft revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/proposal-b-draft resource.binding --actor agent/fd.b --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "write-proposal" completed }
+            produces {
+              resource "plan-run/${PLAN_RUN}/proposal-b-draft" { kind "vcs.revision"; state "published" }
+            }
+          }
+        }
+      }
+
+      step "draft-federated" timeout="20m" {
+        title "The federated chief-of-staff proposal exists"
+        goal "Champion a federated chief-of-staff mesh. Treat privacy, information isolation, cost, routing, ownership, and coordination as main tradeoffs. Own the design weaknesses."
+        assigned-to "agent/fd.c"
+        depends-on { step "start-team" completed }
+        plan "work" {
+          step "analyze" {
+            title "The federated design tradeoffs are explicit"
+            goal "Read PROBLEM.md. Analyze the assigned design without reading another proposal. Separate technical recommendations from human policy choices."
+          }
+          step "write-proposal" {
+            title "The federated proposal is committed"
+            goal "Write a strong and honest PROPOSAL.md. Include the design, advantages, weaknesses, privacy boundary, failure modes, and questions for humans. Commit it with author fd.c."
+            depends-on { step "analyze" completed }
+          }
+          step "publish-draft" {
+            title "The federated draft revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/proposal-c-draft resource.binding --actor agent/fd.c --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "write-proposal" completed }
+            produces {
+              resource "plan-run/${PLAN_RUN}/proposal-c-draft" { kind "vcs.revision"; state "published" }
+            }
+          }
+        }
+      }
+
+      step "critique-per-human" timeout="15m" {
+        title "The per-human champion critiques both alternatives"
+        goal "Read ../b/PROPOSAL.md and ../c/PROPOSAL.md without editing them. Send fd.b and fd.c one concrete Small Talk critique each. Steelman before disagreement. Use tag plan-run:$PLAN_RUN and tag panel-critique. Complete the step after both messages."
+        assigned-to "agent/fd.a"
+        depends-on {
+          step "draft-per-human" completed
+          step "draft-shared" completed
+          step "draft-federated" completed
+        }
+        plan "work" {
+          step "compare" { title "Both alternative proposals are compared"; goal "Read both alternatives and identify their strongest point, weakest point, and one unresolved human choice." }
+          step "send-critiques" { title "Both peers receive a per-human critique"; goal "Send one direct st3 Small Talk critique to fd.b and one to fd.c. Use tags plan-run:$PLAN_RUN,panel-critique. Do not send routine progress."; depends-on { step "compare" completed } }
+        }
+      }
+
+      step "critique-shared" timeout="15m" {
+        title "The shared champion critiques both alternatives"
+        goal "Read ../a/PROPOSAL.md and ../c/PROPOSAL.md without editing them. Send fd.a and fd.c one concrete Small Talk critique each. Steelman before disagreement. Use tag plan-run:$PLAN_RUN and tag panel-critique. Complete the step after both messages."
+        assigned-to "agent/fd.b"
+        depends-on {
+          step "draft-per-human" completed
+          step "draft-shared" completed
+          step "draft-federated" completed
+        }
+        plan "work" {
+          step "compare" { title "Both alternative proposals are compared"; goal "Read both alternatives and identify their strongest point, weakest point, and one unresolved human choice." }
+          step "send-critiques" { title "Both peers receive a shared-model critique"; goal "Send one direct st3 Small Talk critique to fd.a and one to fd.c. Use tags plan-run:$PLAN_RUN,panel-critique. Do not send routine progress."; depends-on { step "compare" completed } }
+        }
+      }
+
+      step "critique-federated" timeout="15m" {
+        title "The federated champion critiques both alternatives"
+        goal "Read ../a/PROPOSAL.md and ../b/PROPOSAL.md without editing them. Send fd.a and fd.b one concrete Small Talk critique each. Steelman before disagreement. Use tag plan-run:$PLAN_RUN and tag panel-critique. Complete the step after both messages."
+        assigned-to "agent/fd.c"
+        depends-on {
+          step "draft-per-human" completed
+          step "draft-shared" completed
+          step "draft-federated" completed
+        }
+        plan "work" {
+          step "compare" { title "Both alternative proposals are compared"; goal "Read both alternatives and identify their strongest point, weakest point, and one unresolved human choice." }
+          step "send-critiques" { title "Both peers receive a federated critique"; goal "Send one direct st3 Small Talk critique to fd.a and one to fd.b. Use tags plan-run:$PLAN_RUN,panel-critique. Do not send routine progress."; depends-on { step "compare" completed } }
+        }
+      }
+
+      step "revise-per-human" timeout="15m" {
+        title "The per-human proposal responds to the debate"
+        goal "Drain both peer critiques. Update only PROPOSAL.md with answers, concessions, and remaining disagreement. Commit the revision and publish it."
+        assigned-to "agent/fd.a"
+        depends-on { step "critique-per-human" completed; step "critique-shared" completed; step "critique-federated" completed }
+        plan "work" {
+          step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.a." }
+          step "publish-final" {
+            title "The final per-human revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/proposal-a-final resource.binding --actor agent/fd.a --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "respond" completed }
+            produces { resource "plan-run/${PLAN_RUN}/proposal-a-final" { kind "vcs.revision"; state "published" } }
+          }
+        }
+      }
+
+      step "revise-shared" timeout="15m" {
+        title "The shared proposal responds to the debate"
+        goal "Drain both peer critiques. Update only PROPOSAL.md with answers, concessions, and remaining disagreement. Commit the revision and publish it."
+        assigned-to "agent/fd.b"
+        depends-on { step "critique-per-human" completed; step "critique-shared" completed; step "critique-federated" completed }
+        plan "work" {
+          step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.b." }
+          step "publish-final" {
+            title "The final shared revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/proposal-b-final resource.binding --actor agent/fd.b --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "respond" completed }
+            produces { resource "plan-run/${PLAN_RUN}/proposal-b-final" { kind "vcs.revision"; state "published" } }
+          }
+        }
+      }
+
+      step "revise-federated" timeout="15m" {
+        title "The federated proposal responds to the debate"
+        goal "Drain both peer critiques. Update only PROPOSAL.md with answers, concessions, and remaining disagreement. Commit the revision and publish it."
+        assigned-to "agent/fd.c"
+        depends-on { step "critique-per-human" completed; step "critique-shared" completed; step "critique-federated" completed }
+        plan "work" {
+          step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.c." }
+          step "publish-final" {
+            title "The final federated revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/proposal-c-final resource.binding --actor agent/fd.c --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "respond" completed }
+            produces { resource "plan-run/${PLAN_RUN}/proposal-c-final" { kind "vcs.revision"; state "published" } }
+          }
+        }
+      }
+
+      step "synthesize" timeout="20m" {
+        title "The panel produces one justified recommendation"
+        goal "Read the three final proposals and their debate records. Write a justified recommendation. Separate the technical recommendation from human policy choices. Send the requester one final Small Talk message."
+        assigned-to "agent/fd.sup"
+        depends-on { step "revise-per-human" completed; step "revise-shared" completed; step "revise-federated" completed }
+        plan "work" {
+          step "compare-final-proposals" { title "The final option set and tradeoffs are compared"; goal "Read ../a/PROPOSAL.md, ../b/PROPOSAL.md, and ../c/PROPOSAL.md. Confirm that each contains a real design, privacy boundary, weaknesses, and debate response." }
+          step "write-recommendation" { title "The recommendation is committed"; goal "Write RECOMMENDATION.md with the option set, key tradeoffs, a justified recommendation, a prototype sequence, privacy consequences, and explicit human decisions. Commit it with author fd.sup."; depends-on { step "compare-final-proposals" completed } }
+          step "publish-recommendation" {
+            title "The recommendation revision is published"
+            goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/recommendation resource.binding --actor agent/fd.sup --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+            depends-on { step "write-recommendation" completed }
+            produces { resource "plan-run/${PLAN_RUN}/recommendation" { kind "vcs.revision"; state "published" } }
+          }
+          step "confirm-requester" {
+            title "The requester receives one final recommendation"
+            goal "Send person/eval-requester exactly one st3 Small Talk message. Include the option set, main tradeoffs, recommendation, reason, and human decisions. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$PLAN_RUN/final-report resource.binding --actor agent/fd.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            depends-on { step "publish-recommendation" completed }
+            produces { resource "plan-run/${PLAN_RUN}/final-report" { kind "message.receipt"; state "published" } }
+          }
+        }
+      }
+
+      step "held-out-judges" timeout="10m" {
+        title "All design panel judges pass"
+        depends-on { step "synthesize" completed }
+        judges {
+          judge "each repository has only its owner as an author" { exec "bash ./judges/isolation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "at least two proposals and one recommendation exist" { exec "bash ./judges/deliverables.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the proposals contain distinct designs" { exec "bash ./judges/distinct.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the deliverables treat privacy as a main tradeoff" { exec "bash ./judges/privacy.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the six peer critiques and final report use Small Talk" { exec "bash ./judges/coordination.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+          judge "the supervisor sent a recommendation to the requester" { exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && REQUESTER=person/eval-requester bash ./judges/recommendation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+          judge "the graph records every plan stage and product" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
+        }
+      }
+
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph { scope "eval/fork-in-the-road/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/fork-in-the-road/${PLAN_RUN}" }
+      }
+    }
+  }
+}

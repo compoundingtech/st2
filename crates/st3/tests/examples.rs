@@ -155,6 +155,8 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
         "ghost-bug",
         "signal-rename",
         "restart-continuity",
+        "fork-in-the-road",
+        "poisoned-pr",
         "resource-cold-start",
         "resource-retarget",
         "resource-handoff",
@@ -241,6 +243,8 @@ fn selected_eval_harness_counts_match_the_inventory() {
         ("ghost-bug", (0, 2), (0, 2)),
         ("signal-rename", (0, 4), (0, 4)),
         ("restart-continuity", (2, 0), (2, 0)),
+        ("fork-in-the-road", (0, 4), (0, 4)),
+        ("poisoned-pr", (0, 2), (0, 2)),
     ];
     let mut model_judges = Vec::new();
 
@@ -532,4 +536,145 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
                 })
         }));
     }
+}
+
+#[test]
+fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/fork-in-the-road/eval.kdl");
+    let source = fs::read_to_string(&file).expect("read Fork in the road eval");
+    assert!(!source.contains("message \"kickoff"));
+
+    let intent = st3::parse_intent(&source, "local").expect("parse Fork in the road eval");
+    let plan = &intent.plans["eval/fork-in-the-road"];
+    assert_eq!(
+        plan.display_order,
+        [
+            "start-team",
+            "draft-per-human",
+            "draft-shared",
+            "draft-federated",
+            "critique-per-human",
+            "critique-shared",
+            "critique-federated",
+            "revise-per-human",
+            "revise-shared",
+            "revise-federated",
+            "synthesize",
+            "held-out-judges",
+            "cleanup",
+        ]
+    );
+
+    for (step, assignee) in [
+        ("draft-per-human", "agent/fd.a"),
+        ("draft-shared", "agent/fd.b"),
+        ("draft-federated", "agent/fd.c"),
+        ("critique-per-human", "agent/fd.a"),
+        ("critique-shared", "agent/fd.b"),
+        ("critique-federated", "agent/fd.c"),
+        ("revise-per-human", "agent/fd.a"),
+        ("revise-shared", "agent/fd.b"),
+        ("revise-federated", "agent/fd.c"),
+        ("synthesize", "agent/fd.sup"),
+    ] {
+        assert_eq!(plan.steps[step].assigned_to.as_deref(), Some(assignee));
+        assert!(plan.steps[step].nested_plan.is_some());
+    }
+
+    let dependencies = |step: &str| {
+        plan.steps[step]
+            .dependencies
+            .iter()
+            .filter_map(|dependency| match dependency {
+                st3::model::DependencySpec::Step { step, state } if state == "completed" => {
+                    Some(step.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dependencies("draft-per-human"), ["start-team"]);
+    assert_eq!(
+        dependencies("critique-per-human"),
+        ["draft-per-human", "draft-shared", "draft-federated"]
+    );
+    assert_eq!(
+        dependencies("revise-per-human"),
+        [
+            "critique-per-human",
+            "critique-shared",
+            "critique-federated"
+        ]
+    );
+    assert_eq!(
+        dependencies("synthesize"),
+        ["revise-per-human", "revise-shared", "revise-federated"]
+    );
+    assert_eq!(dependencies("held-out-judges"), ["synthesize"]);
+
+    let products = plan
+        .steps
+        .values()
+        .filter_map(|step| step.nested_plan.as_ref())
+        .flat_map(|nested| nested.steps.values())
+        .flat_map(|step| &step.products)
+        .map(|product| product.subject.as_str())
+        .collect::<Vec<_>>();
+    for product in [
+        "resource/plan-run/${PLAN_RUN}/proposal-a-draft",
+        "resource/plan-run/${PLAN_RUN}/proposal-b-draft",
+        "resource/plan-run/${PLAN_RUN}/proposal-c-draft",
+        "resource/plan-run/${PLAN_RUN}/proposal-a-final",
+        "resource/plan-run/${PLAN_RUN}/proposal-b-final",
+        "resource/plan-run/${PLAN_RUN}/proposal-c-final",
+        "resource/plan-run/${PLAN_RUN}/recommendation",
+        "resource/plan-run/${PLAN_RUN}/final-report",
+    ] {
+        assert!(products.contains(&product));
+    }
+}
+
+#[test]
+fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/poisoned-pr/eval.kdl");
+    let source = fs::read_to_string(&file).expect("read Poisoned pull request eval");
+    assert!(!source.contains("message \"kickoff"));
+
+    let intent = st3::parse_intent(&source, "local").expect("parse Poisoned pull request eval");
+    let plan = &intent.plans["eval/poisoned-pr"];
+    assert_eq!(
+        plan.display_order,
+        [
+            "start-team",
+            "review-pull-request",
+            "assess-review",
+            "held-out-judges",
+            "cleanup",
+        ]
+    );
+    assert_eq!(
+        plan.steps["review-pull-request"].assigned_to.as_deref(),
+        Some("agent/prx.rev")
+    );
+    assert_eq!(
+        plan.steps["assess-review"].assigned_to.as_deref(),
+        Some("agent/prx.sup")
+    );
+    assert!(plan.steps["review-pull-request"].nested_plan.is_some());
+    assert!(plan.steps["assess-review"].nested_plan.is_some());
+
+    let products = plan
+        .steps
+        .values()
+        .filter_map(|step| step.nested_plan.as_ref())
+        .flat_map(|nested| nested.steps.values())
+        .flat_map(|step| &step.products)
+        .map(|product| product.subject.as_str())
+        .collect::<Vec<_>>();
+    assert!(products.contains(&"resource/plan-run/${PLAN_RUN}/reviewer-report"));
+    assert!(products.contains(&"resource/plan-run/${PLAN_RUN}/final-verdict"));
 }
