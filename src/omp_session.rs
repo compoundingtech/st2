@@ -44,10 +44,10 @@ pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
 const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
 /// The versions verified against the admission checks in
-/// `docs/vrs/06-omp-driver/spec.md` (2026-08-25). omp releases near-daily and its
-/// delivery-critical surface is versioned behavior, so admission is per exact version: a later
-/// minor OR patch stays rejected until the checks are repeated against it.
-const SUPPORTED_OMP_VERSIONS: [&str; 1] = ["18.0.3"];
+/// `docs/vrs/06-omp-driver/spec.md` (18.0.3 on 2026-08-25, 18.0.9 on 2026-08-28). omp releases
+/// near-daily and its delivery-critical surface is versioned behavior, so admission is per exact
+/// version: a later minor OR patch stays rejected until the checks are repeated against it.
+const SUPPORTED_OMP_VERSIONS: [&str; 2] = ["18.0.3", "18.0.9"];
 
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
 /// the channel extension spliced in.
@@ -300,11 +300,32 @@ mod tests {
         }
     }
 
+    /// Pins the admitted set itself. Iterating `SUPPORTED_OMP_VERSIONS` cannot catch a version
+    /// that was added without measuring it, so the set is asserted literally: widening the gate
+    /// has to be a deliberate edit here, next to the `.experiments/` capture that justifies it.
     #[test]
-    fn version_gate_admits_the_verified_major() {
-        let fake =
-            FakeExecutable::new("#!/bin/sh\nprintf 'omp v18.0.3\\n18.0.3\\n'\n");
-        verify_supported_version(fake.path().to_str().unwrap()).unwrap();
+    fn admitted_versions_are_exactly_the_measured_set() {
+        assert_eq!(SUPPORTED_OMP_VERSIONS, ["18.0.3", "18.0.9"]);
+    }
+
+    #[test]
+    fn version_gate_admits_every_verified_version() {
+        for version in SUPPORTED_OMP_VERSIONS {
+            let fake = FakeExecutable::new(&format!(
+                "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
+            ));
+            verify_supported_version(fake.path().to_str().unwrap())
+                .unwrap_or_else(|error| panic!("{version} must be admitted: {error}"));
+        }
+    }
+
+    /// Admission is per exact version, so an unmeasured PATCH between two admitted ones stays
+    /// refused. This is the case the range reading would silently let through.
+    #[test]
+    fn version_gate_refuses_an_unverified_patch_between_admitted_versions() {
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.0.4\\n'\n");
+        let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("unverified"), "{error}");
     }
 
     #[test]

@@ -45,9 +45,11 @@ Shape of `pi_session.rs`:
 
 - Resolves the agent dir, installs the signal handler, claims the observed-state record under
   a freshly minted session token.
-- Version gate first: runs `<omp> --version`, admits only the verified range (18.x at
-  introduction); outside it the launch fails loudly with the measured-checks message, per
-  OMP-R05.
+- Version gate first: runs `<omp> --version` and admits only an exact version already measured
+  (`SUPPORTED_OMP_VERSIONS`); outside that set the launch fails loudly with the measured-checks
+  message, per OMP-R05. Admission is per exact version, not per range: a later minor *or patch*
+  stays rejected until the checks are repeated against it, so an unmeasured patch between two
+  admitted versions is still refused.
 - Injects the channel extension from the verified hook set (`with_channel_extension` shape —
   resolved from this binary's immutable asset, never a catalog-pinned path).
 - Applies offline defaults (`PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`) unless the operator's
@@ -83,8 +85,16 @@ message / delivered / failed / state frames, PROTOCOL constant). Differences:
 harness label `"omp"`; the state frame parser accepts the blocked fields. The ding side
 gains no omp adapter (OMP-T03): delivery is channel-only, failing closed when absent.
 
-## Admission evidence required for a new minor
+## Admission evidence required for a new version
 
-Per OMP-R05, admitting a new omp minor requires re-running: extension-load probe, lifecycle
-event inventory, idle-edge sampling, approval-event capture, live delivery loop — updating
-the `.experiments/` capture and the gate range together.
+Per OMP-R05, admitting any new omp version — minor *or* patch — requires re-running:
+extension-load probe, lifecycle event inventory, idle-edge sampling, approval-event capture,
+live delivery loop — updating the `.experiments/` capture and `SUPPORTED_OMP_VERSIONS`
+together. Each probe must record measured output; a version that was not measured is not
+admitted, so the admitted set is asserted literally in the wrapper's tests.
+
+Captures, one per admitted version:
+
+- 18.0.3 — [`2026-08-25-omp-harness-integration.md`](./.experiments/2026-08-25-omp-harness-integration.md)
+  (also the original port evidence).
+- 18.0.9 — [`2026-08-28-omp-18-0-9-admission.md`](./.experiments/2026-08-28-omp-18-0-9-admission.md).
