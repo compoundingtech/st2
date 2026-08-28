@@ -171,6 +171,8 @@
             "--test"
             "resync"
             "--test"
+            "resync_ding"
+            "--test"
             "profile_wasm"
           ];
         });
