@@ -65,9 +65,9 @@ At every non-retired ancestor it resolves active bindings with the same profile
 scheme against that ancestor's own declaration directory. Each inherited
 subscription retains the ancestor's binding label qualified by owner bus ID
 (`goal@hetz.root`), so mutations in two layers cannot share a supersession key.
-A suspended ancestor contributes its layer and traversal continues, but receives
-no events unless its own canonical seat is live. A retired ancestor contributes
-no layer, but traversal continues to its ancestors.
+A suspended ancestor contributes its layer and traversal continues, but the
+suspended seat itself owns no active subscription. A retired ancestor
+contributes no layer, but traversal continues to its ancestors.
 
 Chain membership comes only from a profile's trusted opt-in flag and exact URI
 scheme. Binding labels do not define composition, native local bindings never
