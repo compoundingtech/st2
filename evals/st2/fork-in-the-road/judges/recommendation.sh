@@ -10,7 +10,7 @@ mailboxes=()
 [ -d "$owner/archive" ] && mailboxes+=("$owner/archive")
 matches=""
 if [ "${#mailboxes[@]}" -gt 0 ]; then
-  matches="$(grep -lRE "^from:[[:space:]]*(agent/)?$SUP_ID([[:space:]]|\$)" "${mailboxes[@]}" 2>/dev/null || true)"
+  matches="$(grep -lRE "^from:[[:space:]]*((agent/)|([a-z0-9._-]+\.))?$SUP_ID([[:space:]]|\$)" "${mailboxes[@]}" 2>/dev/null || true)"
 fi
 if [ -n "$matches" ]; then
   echo "PASS: fd.sup -> requester recommendation present on the bus"; exit 0
