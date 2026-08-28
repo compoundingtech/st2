@@ -16,9 +16,9 @@ Do not copy every eval as KDL. Product behavior with strong Rust coverage belong
 
 Use one logical eval for one behavior. A Claude or Codex variant is a harness choice, not a new eval.
 
-The proposed result has 19 logical evals:
+The proposed result has 19 logical evals. Fourteen logical evals now have both runtime forms.
 
-- Three logical evals already exist here.
+- The review started with three logical evals represented here.
 - Sixteen new logical evals come from 18 source evals.
 - Three source evals merge into retained evals.
 - Twelve source evals remain as Rust coverage.
@@ -28,7 +28,7 @@ The source catalog lists accepted pass evidence for seven evals. Most evals have
 
 Selection therefore depends on the product contract. It does not depend only on a historic green result.
 
-The final corpus has ten model-free evals and nine paid evals. The nine paid evals include the three existing evals.
+The final corpus has ten model-free evals and nine paid evals. The nine paid evals include the three original evals.
 
 ## Paid eval admission rule
 
@@ -80,7 +80,7 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `ghost-bug-codex` | Represented | `ghost-bug` | The local Codex pair represents both source provider forms. |
 | `hook-integrity` | Rust | `tests/hooks.rs`, `tests/materialize.rs`, `tests/claude_hooks.rs`, `tests/codex_hooks.rs` | The Rust suite covers receipts, verification, native overlays, and idempotency. |
 | `host-lock-health-negatives` | Rust | `tests/doctor.rs` | The Rust suite covers required, stale, foreign, and bounded-failure lock states. |
-| `inbox-hygiene` | Merge | `restart-continuity` | Inject duplicate delivery during the restart eval. One durability eval should cover both failures. |
+| `inbox-hygiene` | Represented | `restart-continuity` | The restart eval injects duplicate delivery. One durability eval covers both failures. |
 | `incident-response` | Archive | Source history | Its core root-cause workflow overlaps Ghost bug and costs two seats. |
 | `license-mit` | Represented | `license-mit` | The local Claude pair represents both source provider forms. |
 | `license-mit-codex` | Represented | `license-mit` | The local Claude pair represents both source provider forms. |
@@ -93,7 +93,7 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `pty-send-peek` | Represented | `pty-send-peek` | This gives a real byte round trip and has accepted pass evidence. |
 | `reconcile-retire-keep` | Rust | `tests/reconcile.rs` | The Rust suite covers missing, dead, keep, retired, and adopt lifecycle rules. |
 | `render-target-safety` | Rust | `tests/materialize.rs` | The Rust suite covers directives, idempotency, tracked targets, and unsafe paths. |
-| `restart-continuity` | Keep, wave 1 | `restart-continuity` | Lift the full work plan and progress into the st3 graph before the injected restart. |
+| `restart-continuity` | Represented | `restart-continuity` | Both runtime forms test cold restart, duplicate delivery, and one result per stable item ID. |
 | `security-audit` | Archive | Source history | Poisoned PR gives a sharper security discriminator with the same two-seat cost. |
 | `shared-workspace-render-ownership` | Rust | `tests/materialize.rs`, `tests/validate.rs` | The Rust suite covers conflicting ownership and identical shared claims. |
 | `signal-rename` | Represented | `signal-rename` | The local Codex pair represents both source provider forms. |
@@ -169,7 +169,7 @@ Wave 1 proves the runtime:
 
 1. Maintain the ten represented model-free lifecycle, PTY, network, resource, and crash pairs.
 2. Add threaded-reply and delegation assertions to License MIT.
-3. Rewrite restart continuity with duplicate delivery and durable graph state.
+3. Maintain Restart continuity with duplicate delivery and durable graph state.
 4. Merge the fork-in-the-road provider twins and lift its parallel plan into the graph.
 
 Wave 2 broadens agent work:

@@ -154,6 +154,7 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
         "license-mit",
         "ghost-bug",
         "signal-rename",
+        "restart-continuity",
         "resource-cold-start",
         "resource-retarget",
         "resource-handoff",
@@ -212,6 +213,15 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
             );
         } else {
             for agent in st2_agents {
+                if name == "restart-continuity" && agent.id == "rc.inj" {
+                    assert!(
+                        agent.command.is_some() && agent.driver.is_none(),
+                        "{} agent {} must remain a mechanical fixture process",
+                        st2_file.display(),
+                        agent.id
+                    );
+                    continue;
+                }
                 assert!(
                     agent.command.is_none() && agent.driver.is_some(),
                     "{} agent {} must use a native harness",
@@ -239,6 +249,7 @@ fn selected_eval_harness_counts_match_the_inventory() {
         ("license-mit", (2, 1), (2, 0)),
         ("ghost-bug", (0, 2), (0, 2)),
         ("signal-rename", (0, 4), (0, 4)),
+        ("restart-continuity", (2, 0), (2, 0)),
     ];
     let mut model_judges = Vec::new();
 
@@ -252,7 +263,13 @@ fn selected_eval_harness_counts_match_the_inventory() {
                 .iter()
                 .flat_map(|evaluation| evaluation.agents.iter()),
         ) {
-            match agent.driver.as_ref().expect("native st2 harness") {
+            let Some(driver) = agent.driver.as_ref() else {
+                assert_eq!(name, "restart-continuity");
+                assert_eq!(agent.id, "rc.inj");
+                assert!(agent.command.is_some());
+                continue;
+            };
+            match driver {
                 Driver::Claude(driver) => {
                     assert_eq!(
                         driver.model.as_deref(),
@@ -294,6 +311,30 @@ fn license_mit_st3_fixture_matches_its_claude_team() {
         assert!(workspace.join("PERSONA.md").is_file());
         assert!(!workspace.join("AGENTS.md").exists());
         assert!(!workspace.join(".codex/hooks.json").exists());
+    }
+}
+
+#[test]
+fn restart_continuity_fixtures_match_their_claude_teams() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals");
+    for runtime in ["st2", "st3"] {
+        for seat in ["sup", "worker"] {
+            let workspace = if runtime == "st2" {
+                root.join(runtime)
+                    .join("restart-continuity/fixture")
+                    .join(seat)
+            } else {
+                root.join(runtime).join("restart-continuity").join(seat)
+            };
+            assert_eq!(
+                fs::read_to_string(workspace.join("CLAUDE.md")).unwrap(),
+                "@PERSONA.md\n"
+            );
+            assert!(workspace.join("PERSONA.md").is_file());
+            assert!(!workspace.join("AGENTS.md").exists());
+        }
     }
 }
 
@@ -409,5 +450,87 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
                 .flat_map(|step| &step.products)
                 .any(|candidate| candidate.subject == product)
         );
+    }
+}
+
+#[test]
+fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/restart-continuity/eval.kdl");
+    let source = fs::read_to_string(&file).expect("read Restart continuity eval");
+    assert!(!source.contains("message \"kickoff"));
+
+    let intent = st3::parse_intent(&source, "local").expect("parse Restart continuity eval");
+    let plan = &intent.plans["eval/restart-continuity"];
+    assert_eq!(
+        plan.display_order,
+        [
+            "start-team",
+            "process-before-restart",
+            "inject-cold-restart",
+            "process-after-restart",
+            "verify-and-confirm",
+            "held-out-judges",
+            "cleanup",
+        ]
+    );
+
+    for (step, assignee) in [
+        ("process-before-restart", "agent/rc.dev"),
+        ("process-after-restart", "agent/rc.dev"),
+        ("verify-and-confirm", "agent/rc.sup"),
+    ] {
+        assert_eq!(plan.steps[step].assigned_to.as_deref(), Some(assignee));
+        assert!(plan.steps[step].nested_plan.is_some());
+    }
+
+    let dependencies = |step: &str| {
+        plan.steps[step]
+            .dependencies
+            .iter()
+            .filter_map(|dependency| match dependency {
+                st3::model::DependencySpec::Step { step, state } if state == "completed" => {
+                    Some(step.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dependencies("process-before-restart"), ["start-team"]);
+    assert_eq!(
+        dependencies("inject-cold-restart"),
+        ["process-before-restart"]
+    );
+    assert_eq!(
+        dependencies("process-after-restart"),
+        ["inject-cold-restart"]
+    );
+    assert_eq!(
+        dependencies("verify-and-confirm"),
+        ["process-after-restart"]
+    );
+    assert_eq!(dependencies("held-out-judges"), ["verify-and-confirm"]);
+
+    let required_products = [
+        "resource/plan-run/${PLAN_RUN}/pre-restart",
+        "resource/plan-run/${PLAN_RUN}/restart",
+        "resource/plan-run/${PLAN_RUN}/batch",
+        "resource/plan-run/${PLAN_RUN}/worker-report",
+        "resource/plan-run/${PLAN_RUN}/verification",
+    ];
+    for product in required_products {
+        assert!(plan.steps.values().any(|step| {
+            step.products
+                .iter()
+                .any(|candidate| candidate.subject == product)
+                || step.nested_plan.as_ref().is_some_and(|nested| {
+                    nested
+                        .steps
+                        .values()
+                        .flat_map(|nested_step| &nested_step.products)
+                        .any(|candidate| candidate.subject == product)
+                })
+        }));
     }
 }

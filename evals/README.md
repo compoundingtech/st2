@@ -13,6 +13,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | License MIT | `st2/license-mit` | `st3/license-mit` |
 | Ghost bug | `st2/ghost-bug` | `st3/ghost-bug` |
 | Signal rename | `st2/signal-rename` | `st3/signal-rename` |
+| Restart continuity | `st2/restart-continuity` | `st3/restart-continuity` |
 | Resource cold start | `st2/resource-cold-start` | `st3/resource-cold-start` |
 | Resource retarget | `st2/resource-retarget` | `st3/resource-retarget` |
 | Resource handoff | `st2/resource-handoff` | `st3/resource-handoff` |
@@ -24,7 +25,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Network smoke | `st2/network-smoke` | `st3/network-smoke` |
 | Network isolation | `st2/network-isolation` | `st3/network-isolation` |
 
-The License MIT pair uses Claude Sonnet teams in both runtimes.
+The License MIT and Restart continuity pairs use Claude Sonnet teams in both runtimes.
 
 The Ghost bug and Signal rename pairs use Codex in both runtimes.
 
@@ -43,11 +44,13 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st2 | License MIT | Claude Sonnet × 2, Codex × 1 | None |
 | st2 | Ghost bug | Codex × 2 | None |
 | st2 | Signal rename | Codex × 4 | None |
+| st2 | Restart continuity | Claude Sonnet × 2 | None |
 | st3 | License MIT | Claude Sonnet × 2 | Codex × 1 |
 | st3 | Ghost bug | Codex × 2 | Codex × 1 |
 | st3 | Signal rename | Codex × 4 | Codex × 1 |
+| st3 | Restart continuity | Claude Sonnet × 2 | None |
 
-The current corpus has four Claude seats and 13 Codex seats. It also has three Codex LLM judges.
+The current corpus has eight Claude seats and 13 Codex seats. It also has three Codex LLM judges.
 
 The ten model-free pairs add no model seats and no LLM judges.
 
