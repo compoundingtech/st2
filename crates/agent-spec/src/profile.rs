@@ -210,6 +210,7 @@ impl ModuleIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ModuleCacheKey {
     normalized_module: PathBuf,
+    declared_module: PathBuf,
     containment_root: Option<PathBuf>,
 }
 
@@ -218,6 +219,7 @@ impl ModuleCacheKey {
     fn new(module: &Path, containment_root: Option<&Path>) -> Self {
         Self {
             normalized_module: normalize_cache_path(module),
+            declared_module: module.to_path_buf(),
             containment_root: containment_root.map(normalize_cache_path),
         }
     }
@@ -268,8 +270,9 @@ struct WasmCache {
 }
 
 /// One resolution pass over a registry. Module snapshots, including read and compile failures, are
-/// shared by every binding using the same normalized path and admission policy in the pass; a
-/// later pass snapshots each used key again so replacement invalidation remains observable.
+/// shared by every binding using the same declared path spelling and admission policy in the
+/// pass; a later pass snapshots each used key again so replacement invalidation remains
+/// observable.
 pub struct ResourceProfileRefresh<'a> {
     registry: &'a ResourceProfileRegistry,
     #[cfg(feature = "wasm-resolver")]
@@ -794,6 +797,40 @@ mod tests {
             ModuleCacheKey::new(&declared, None).normalized_module,
             root.path().join("resolver.wasm")
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn refresh_cache_distinguishes_symlink_sensitive_module_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("child")).unwrap();
+        symlink(outside.path().join("child"), root.path().join("link")).unwrap();
+        std::fs::write(outside.path().join("resolver.wasm"), b"not a wasm module").unwrap();
+        write_any_uri_resolver(&root.path().join("resolver.wasm"));
+        let indirect = root.path().join("link/../resolver.wasm");
+        let direct = root.path().join("resolver.wasm");
+        let registry = ResourceProfileRegistry::empty().with_profiles([
+            ResourceProfile::wasm("indirect", &indirect, ProfileClass::Immediate),
+            ResourceProfile::wasm("direct", &direct, ProfileClass::Immediate),
+        ]);
+
+        let refresh = registry.begin_refresh();
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "indirect://host/agent")
+                .is_err()
+        );
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "direct://host/agent")
+                .unwrap()
+                .is_some(),
+            "the direct module must be opened instead of reusing the indirect failure"
+        );
+        assert_eq!(registry.wasm_cache.lock().snapshot_attempts, 2);
     }
 
     #[test]
