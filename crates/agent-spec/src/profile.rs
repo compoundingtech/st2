@@ -80,8 +80,8 @@ pub struct ResourceProfile {
 pub enum ProfileSource {
     /// A wasm module implementing the `resolve` protocol (see [`crate::profile_wasm`] for the
     /// ABI), plus the notification class every carrier it resolves carries. Compilation results
-    /// (success or failure) are cached by normalized path, admission policy, and file identity;
-    /// instances remain per-resolution.
+    /// (success or failure) are cached by exact declared path spellings, normalized path identity,
+    /// admission policy, and file identity; instances remain per-resolution.
     Wasm {
         module: PathBuf,
         class: ProfileClass,
@@ -211,7 +211,8 @@ impl ModuleIdentity {
 struct ModuleCacheKey {
     normalized_module: PathBuf,
     declared_module: PathBuf,
-    containment_root: Option<PathBuf>,
+    normalized_containment_root: Option<PathBuf>,
+    declared_containment_root: Option<PathBuf>,
 }
 
 #[cfg(feature = "wasm-resolver")]
@@ -220,7 +221,8 @@ impl ModuleCacheKey {
         Self {
             normalized_module: normalize_cache_path(module),
             declared_module: module.to_path_buf(),
-            containment_root: containment_root.map(normalize_cache_path),
+            normalized_containment_root: containment_root.map(normalize_cache_path),
+            declared_containment_root: containment_root.map(Path::to_path_buf),
         }
     }
 }
@@ -829,6 +831,52 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the direct module must be opened instead of reusing the indirect failure"
+        );
+        assert_eq!(registry.wasm_cache.lock().snapshot_attempts, 2);
+    }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn refresh_cache_distinguishes_symlink_sensitive_containment_roots() {
+        use std::os::unix::fs::symlink;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("child")).unwrap();
+        symlink(
+            outside.path().join("child"),
+            catalog.path().join("link"),
+        )
+        .unwrap();
+        write_any_uri_resolver(&outside.path().join("resolver.wasm"));
+        let indirect_root = catalog.path().join("link/..");
+        let registry = ResourceProfileRegistry::empty().with_profiles([
+            ResourceProfile::wasm_contained(
+                "indirect-root",
+                &indirect_root,
+                Path::new("resolver.wasm"),
+                ProfileClass::Immediate,
+            ),
+            ResourceProfile::wasm_contained(
+                "direct-root",
+                catalog.path(),
+                Path::new("link/../resolver.wasm"),
+                ProfileClass::Immediate,
+            ),
+        ]);
+
+        let refresh = registry.begin_refresh();
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "indirect-root://host/agent")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "direct-root://host/agent")
+                .is_err(),
+            "the direct root must enforce its own descriptor-relative admission"
         );
         assert_eq!(registry.wasm_cache.lock().snapshot_attempts, 2);
     }
