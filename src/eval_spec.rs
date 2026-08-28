@@ -37,8 +37,8 @@ pub struct Spec {
 }
 
 /// One agent — the label IS the id (no separate identity/host/type). An agent has one launch source:
-/// a legacy `command`, or one native `claude {}` / `codex {}` driver. Extra processes follow as
-/// `exec` blocks.
+/// a legacy `command`, or one native `harness "claude" {}` / `harness "codex" {}` driver. Extra
+/// processes follow as `exec` blocks. The provider-named driver blocks remain accepted as aliases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecAgent {
     pub id: String,
@@ -709,7 +709,7 @@ fn parse_agent(
         }
         anyhow::ensure!(
             command.is_some() ^ driver.is_some(),
-            "agent '{id}' must declare exactly one of `command`, `claude`, or `codex`"
+            "agent '{id}' must declare exactly one launch source: `command` or a native `harness`"
         );
         anyhow::ensure!(
             driver.is_none() || !has_ding,

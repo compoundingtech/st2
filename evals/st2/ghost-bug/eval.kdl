@@ -1,24 +1,29 @@
 version 1
 
-// ghost-bug-codex.kdl — the whole eval in one file.  `st2 eval ./` runs it; `st2 up ./` just boots the team.
-// The ghost-bug debug loop (labelkit shared-default-mutation bug), run by CODEX seats — proving the
-// folder-eval format handles the codex harness. Each fixture workspace intentionally pre-seeds AGENTS.md,
-// and bare `ding` asks st2 to render the wake sidecar. Same held-out judges as ghost-bug; all are held-out.
+// ghost-bug-codex.kdl — the whole eval in one file. `st2 eval ./` runs it; `st2 up ./` boots the team.
+// The ghost-bug debug loop uses Codex native harness seats. Each fixture workspace pre-seeds AGENTS.md.
+// The native driver owns message delivery. The eval keeps the original held-out judges.
 
 // Harness loaders, personas, and hooks are intentionally baked into fixture workspaces;
 // bin/check-harness-contract.sh verifies every current bus-connected model agent.
 team "gbx" {                             // prefixes the agents it holds -> gbx.sup, gbx.fix
   agent "sup" {
     workspace "./sup"                    // coordinate-only cwd (owns no product repo)
-    env { ST_AGENT "gbx.sup" }
-    command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --model gpt-5.6-sol -c 'model_reasoning_effort="medium"' 'You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for DING. After any DING, drain the inbox once again, act on every message, archive each handled item, then coordinate and verify the whole task end-to-end. Report completion or blockers over the st2 bus.'"#
-    ding
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and coordinate and verify the whole task end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
   }
   agent "fix" {
     workspace "./worker"                 // owns the labelkit repo (this dir)
-    env { ST_AGENT "gbx.fix" }
-    command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --model gpt-5.6-sol -c 'model_reasoning_effort="medium"' 'You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for DING. After any DING, drain the inbox once again, act on every message, archive each handled item, then execute it end-to-end. Report completion or blockers over the st2 bus.'"#
-    ding
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute it end-to-end. Report completion or blockers through st2 messages."
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
   }
 }
 

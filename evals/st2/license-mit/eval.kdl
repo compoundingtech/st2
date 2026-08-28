@@ -10,7 +10,7 @@ version 1
 team "mix" {                             // prefixes the agents it holds -> mix.sup, mix.worker
   agent "sup" {
     workspace "./sup"                    // coordinate-only cwd (owns no product repo)
-    claude {
+    harness "claude" {
       model "claude-sonnet-5"
       effort "medium"
       dev-channels #true
@@ -20,7 +20,7 @@ team "mix" {                             // prefixes the agents it holds -> mix.
   }
   agent "worker" {
     workspace "./worker"                 // owns the widget repo (this dir)
-    claude {
+    harness "claude" {
       model "claude-sonnet-5"
       effort "medium"
       dev-channels #true
@@ -41,7 +41,7 @@ eval {                                   // `st2 eval` = copy the world, boot te
 
   agent "judge" {                        // a real native driver agent, declared in the open
     workspace "./"                       // sees the whole sandbox + bus, so it can inspect
-    codex {
+    harness "codex" {
       model "gpt-5.6-sol"
       effort "medium"
       prompt "You just cold-started as a hermetic eval judge. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no ask, stand by for a message. After a message arrives, drain the inbox again, inspect the sandbox as requested, reply on the existing bus thread in the exact format asked, archive each handled item, and report completion or blockers over the st2 bus."
