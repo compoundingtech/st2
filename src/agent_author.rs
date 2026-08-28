@@ -1580,6 +1580,15 @@ fn atomic_replace_checked(
     Ok(())
 }
 
+/// Crash on demand, so a test can prove a half-written declaration never escapes the
+/// control plane.
+///
+/// RUN THE SUITE WITHOUT `--release`. This hook only exists in a debug build, so a
+/// release build turns the abort into a no-op, the command under test succeeds, and
+/// every test that expects the crash fails on `assert!(!output.status.success())`.
+/// Four tests in `tests/agent_presentation.rs` depend on it. They are green under
+/// `cargo test` and red under `cargo test --release`, and the red looks like a real
+/// defect in catalog locking rather than a missing build flag.
 #[cfg(debug_assertions)]
 fn test_crash_after_temporary_write() {
     if std::env::var_os("ST2_TEST_AGENT_AUTHOR_CRASH_AFTER_TEMP").is_some() {

@@ -1,3 +1,11 @@
+//! Run these with `cargo test`, NOT `cargo test --release`.
+//!
+//! Four tests here drive a deliberate crash through
+//! `ST2_TEST_AGENT_AUTHOR_CRASH_AFTER_TEMP`. The hook that reads it is
+//! `#[cfg(debug_assertions)]`, so a release build has no crash to trigger: the
+//! command succeeds, and the assertion that it failed is what you see break. The
+//! failure reads like broken catalog locking. It is a missing build flag.
+
 use std::fs;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd as _;
