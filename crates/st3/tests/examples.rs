@@ -213,15 +213,6 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
             );
         } else {
             for agent in st2_agents {
-                if name == "restart-continuity" && agent.id == "rc.inj" {
-                    assert!(
-                        agent.command.is_some() && agent.driver.is_none(),
-                        "{} agent {} must remain a mechanical fixture process",
-                        st2_file.display(),
-                        agent.id
-                    );
-                    continue;
-                }
                 assert!(
                     agent.command.is_none() && agent.driver.is_some(),
                     "{} agent {} must use a native harness",
@@ -263,13 +254,7 @@ fn selected_eval_harness_counts_match_the_inventory() {
                 .iter()
                 .flat_map(|evaluation| evaluation.agents.iter()),
         ) {
-            let Some(driver) = agent.driver.as_ref() else {
-                assert_eq!(name, "restart-continuity");
-                assert_eq!(agent.id, "rc.inj");
-                assert!(agent.command.is_some());
-                continue;
-            };
-            match driver {
+            match agent.driver.as_ref().expect("native st2 harness") {
                 Driver::Claude(driver) => {
                     assert_eq!(
                         driver.model.as_deref(),
@@ -336,6 +321,20 @@ fn restart_continuity_fixtures_match_their_claude_teams() {
             assert!(!workspace.join("AGENTS.md").exists());
         }
     }
+
+    let st2_source = fs::read_to_string(root.join("st2/restart-continuity/eval.kdl")).unwrap();
+    let st2_spec = st2::eval_spec::parse_spec(&st2_source).unwrap();
+    let supervisor = st2_spec
+        .agents
+        .iter()
+        .find(|agent| agent.id == "rc.sup")
+        .expect("restart supervisor");
+    assert!(
+        supervisor
+            .execs
+            .iter()
+            .any(|process| process.id == "rc.sup.injector")
+    );
 }
 
 #[test]

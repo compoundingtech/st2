@@ -10,6 +10,9 @@ team "rc" {
       prompt #"You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Delegate the batch to rc.dev. Verify the final repository before you send requester one final confirmation. End the turn when no message remains."#
       args "--permission-mode" "bypassPermissions"
     }
+    exec "injector" {
+      command "exec bash ../inj/restart-injector.sh"
+    }
   }
   agent "dev" {
     workspace "./worker"
@@ -20,10 +23,6 @@ team "rc" {
       prompt #"You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Use PROGRESS.md and git as durable state. Never repeat a completed item. Continue the ordered batch after any restart. End the turn when no message remains."#
       args "--permission-mode" "auto"
     }
-  }
-  agent "inj" {
-    workspace "./inj"
-    command "exec bash ./restart-injector.sh"
   }
 }
 
