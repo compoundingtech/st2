@@ -1025,7 +1025,7 @@ async fn quick_agent(
         "prompt \"Assist the user in this worktree. Use st3 message ls, read, reply, and archive for Small Talk messages.\"\n",
     );
     let kdl = format!(
-        "subgraph {{\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
+        "version 2\nsubgraph {{\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
         request.worktree
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
@@ -2402,7 +2402,8 @@ mod tests {
             "/v1/intent/plan",
             serde_json::to_value(PlanRequest {
                 intent: crate::model::IntentInput {
-                    kdl: r#"subgraph { message "task" { to "worker"; content "doc/task" } }"#
+                    kdl: r#"version 2
+subgraph { message "task" { to "worker"; content "doc/task" } }"#
                         .into(),
                     source_name: None,
                 },
@@ -2455,6 +2456,7 @@ mod tests {
             cell.path().join("eval.kdl"),
             format!(
                 r#"
+version 2
 subgraph {{
   scope "eval/demo/${{PLAN_RUN}}" retention="temporary" change-policy="agent" {{
     plan "eval/demo" state="ready" {{
@@ -2524,6 +2526,7 @@ subgraph {{
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
+version 2
 subgraph {
   scope "revision/${PLAN_RUN}" change-policy="supervisor" change-authority="agent/sup" {
     plan "revision" state="ready" {
@@ -2560,6 +2563,7 @@ subgraph {
             .unwrap();
         let app = router(state.clone());
         let replacement = r#"
+version 2
 subgraph {
   scope "revision/${PLAN_RUN}" change-policy="supervisor" change-authority="agent/sup" {
     plan "revision" state="ready" {

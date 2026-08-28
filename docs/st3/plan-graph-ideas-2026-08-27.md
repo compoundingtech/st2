@@ -429,7 +429,7 @@ step "prove-one-complex-eval" {
   depends-on "implementation-is-ready"
   judges {
     judge "The complex Codex eval passes" {
-      exec "st3 eval ./evals/signal-rename-codex/eval.kdl"
+      exec "st3 eval ./evals/st3/signal-rename/eval.kdl"
     }
   }
 }

@@ -4,6 +4,10 @@ This document describes the implemented st3 plan model on 2026-08-27.
 
 The earlier idea and feedback files remain design snapshots. This file records current behavior.
 
+Every authored st3 KDL document starts with `version 2`. st3 rejects a missing version because it means st2 version zero.
+
+st2 accepts version zero or one. This rule lets tools select the correct runtime before they interpret the document body.
+
 ## Core model
 
 A `plan` is a stored definition. A plan does not start when st3 publishes it.
@@ -21,6 +25,8 @@ The authored st3 grammar does not accept the old `checkpoints` form. Use `st3-mi
 ## Example
 
 ```kdl
+version 2
+
 subgraph {
   scope "signal-rename/${PLAN_RUN}"
     retention="temporary"
@@ -228,9 +234,11 @@ st3 plan plan.kdl
 st3 run plan.kdl
 st3 run plan.kdl --plan signal-rename --workspace ./workspace
 st3 import ./catalog
-st3 eval ./evals/signal-rename-codex
+st3 eval ./evals/st3/signal-rename
 ```
 
 `st3 run` prints a live plan and step tree. `--detach` returns the durable run record instead.
 
-The translated Codex evals are in `evals/license-mit-codex`, `evals/ghost-bug-codex`, and `evals/signal-rename-codex`.
+The st3 evals are in `evals/st3/license-mit`, `evals/st3/ghost-bug`, and `evals/st3/signal-rename`.
+
+Their st2 counterparts use the same names under `evals/st2`.

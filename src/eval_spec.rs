@@ -503,6 +503,7 @@ pub fn ding_exec(agent_id: &str) -> SpecExec {
 /// Parse an st2 spec (`.kdl` text) into the [`Spec`] model.
 pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
     let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("st2 spec KDL parse: {e}"))?;
+    crate::kdl_version::ensure_st2_version(&doc)?;
 
     let mut host = None;
     let mut top_env = BTreeMap::new();
@@ -511,6 +512,7 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
 
     for node in doc.nodes() {
         match node.name().value() {
+            "version" => {}
             "host" => host = arg(node),
             "env" => top_env = parse_env(node),
             "team" => collect_team(node, "", &top_env, &mut agents)?,
@@ -518,7 +520,7 @@ pub fn parse_spec(text: &str) -> anyhow::Result<Spec> {
             "eval" => eval = Some(parse_eval(node, &top_env)?),
             other => {
                 anyhow::bail!(
-                    "st2 spec: unexpected top-level node '{other}' (expected host|env|team|agent|eval)"
+                    "st2 spec: unexpected top-level node '{other}' (expected version|host|env|team|agent|eval)"
                 )
             }
         }
@@ -1466,5 +1468,14 @@ team "mix" {
         .unwrap_err()
         .to_string();
         assert!(err.contains("exactly one"), "got: {err}");
+    }
+
+    #[test]
+    fn st2_accepts_versions_zero_and_one_but_rejects_version_two() {
+        parse_spec("agent \"zero\" { command \"true\" }").unwrap();
+        parse_spec("version 0\nagent \"zero\" { command \"true\" }").unwrap();
+        parse_spec("version 1\nagent \"one\" { command \"true\" }").unwrap();
+        let error = parse_spec("version 2\nagent \"two\" { command \"true\" }").unwrap_err();
+        assert!(error.to_string().contains("st2 accepts KDL version 0 or 1"));
     }
 }

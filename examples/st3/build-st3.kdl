@@ -1,3 +1,5 @@
+version 2
+
 subgraph {
   resource "st3-complex-proof-review" { kind "human.review" }
   resource "st3-full-corpus-review" { kind "human.review" }

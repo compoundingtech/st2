@@ -1,3 +1,5 @@
+version 2
+
 subgraph {
   resource "release-review" {
     kind "human.review"

@@ -46,10 +46,17 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
     let document: KdlDocument = source
         .parse::<KdlDocument>()
         .map_err(|error| St3Error::new("invalid-kdl", error.to_string()))?;
-    let [root] = document.nodes() else {
+    st2::kdl_version::ensure_st3_version(&document)
+        .map_err(|error| St3Error::new("unsupported-kdl-version", error.to_string()))?;
+    let roots = document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() != "version")
+        .collect::<Vec<_>>();
+    let [root] = roots.as_slice() else {
         return Err(St3Error::new(
             "invalid-root",
-            "an st3 intent must contain exactly one root node",
+            "an st3 intent must contain one version declaration and exactly one root node",
         ));
     };
     if root.name().value() != "subgraph" || root.ty().is_some() || !root.entries().is_empty() {
@@ -91,7 +98,7 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
         .iter()
         .map(canonical_node)
         .collect::<Result<Vec<_>, _>>()?;
-    let normalized = json!({ "subgraph": normalized_nodes });
+    let normalized = json!({ "version": 2, "subgraph": normalized_nodes });
     let source_hash = hash_json(&normalized);
     Ok(NormalizedIntent {
         schema: "st3.v1".into(),
@@ -2850,15 +2857,28 @@ mod tests {
 
     #[test]
     fn rejects_old_agent_root() {
-        let error = parse_intent("agent \"worker\" { command \"true\" }", "host")
+        let error = parse_intent("version 2\nagent \"worker\" { command \"true\" }", "host")
             .expect_err("old KDL must fail");
         assert_eq!(error.code, "invalid-root");
+    }
+
+    #[test]
+    fn rejects_st2_document_versions() {
+        for source in [
+            "subgraph { agent \"worker\" { command \"true\" } }",
+            "version 0\nsubgraph { agent \"worker\" { command \"true\" } }",
+            "version 1\nsubgraph { agent \"worker\" { command \"true\" } }",
+        ] {
+            let error = parse_intent(source, "host").expect_err("st2 KDL must fail");
+            assert_eq!(error.code, "unsupported-kdl-version");
+        }
     }
 
     #[test]
     fn parses_plain_agent_and_document_version() {
         let intent = parse_intent(
             r#"
+version 2
 subgraph {
   message "task" {
     to "worker"
@@ -2885,6 +2905,7 @@ subgraph {
     fn parses_plan_order_and_dependencies() {
         let intent = parse_intent(
             r#"
+version 2
 subgraph {
   plan "build" state="ready" {
     step "build" {
@@ -2916,6 +2937,7 @@ subgraph {
     #[test]
     fn local_placement_resolves_to_the_receiving_node() {
         let source = r#"
+            version 2
             subgraph {
               exec "setup" {
                 host "local"
@@ -2953,6 +2975,7 @@ subgraph {
     fn nested_tasks_inherit_lifecycle_and_restart_controls() {
         let intent = parse_intent(
             r#"
+version 2
 subgraph {
   agent "worker" {
     workspace "/work"
@@ -2988,14 +3011,16 @@ subgraph {
     #[test]
     fn strict_grammar_rejects_unknown_children_and_properties() {
         let child = parse_intent(
-            r#"subgraph { agent "worker" { command "true"; retired #true } }"#,
+            r#"version 2
+subgraph { agent "worker" { command "true"; retired #true } }"#,
             "node",
         )
         .expect_err("retired is old syntax");
         assert_eq!(child.code, "unknown-child");
 
         let property = parse_intent(
-            r#"subgraph { exec "work" mystery="value" { command "true" } }"#,
+            r#"version 2
+subgraph { exec "work" mystery="value" { command "true" } }"#,
             "node",
         )
         .expect_err("unknown property");
@@ -3005,7 +3030,7 @@ subgraph {
     #[test]
     fn authored_messages_reject_empty_content() {
         let error = parse_intent(
-            "subgraph { message \"empty\" { to \"worker\"; content \"  \" } }",
+            "version 2\nsubgraph { message \"empty\" { to \"worker\"; content \"  \" } }",
             "node",
         )
         .expect_err("an empty message must not enter the delivery FIFO");
@@ -3015,6 +3040,7 @@ subgraph {
     #[test]
     fn a_plan_can_pin_bare_document_references() {
         let source = r#"
+version 2
 subgraph {
   message "task" {
     to "worker"

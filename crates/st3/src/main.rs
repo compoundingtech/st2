@@ -1101,6 +1101,9 @@ fn subgraph_document(node: KdlNode) -> String {
     let mut root = KdlNode::new("subgraph");
     root.set_children(children);
     let mut document = KdlDocument::new();
+    let mut version = KdlNode::new("version");
+    version.entries_mut().push(KdlEntry::new(2));
+    document.nodes_mut().push(version);
     document.nodes_mut().push(root);
     document.autoformat();
     document.to_string()
@@ -3709,7 +3712,14 @@ fn combine_kdl_tree(root: &Path) -> Result<String> {
         let document: KdlDocument = source
             .parse()
             .with_context(|| format!("parse {}", file.display()))?;
-        let [root] = document.nodes() else {
+        st2::kdl_version::ensure_st3_version(&document)
+            .with_context(|| format!("check KDL version in {}", file.display()))?;
+        let roots = document
+            .nodes()
+            .iter()
+            .filter(|node| node.name().value() != "version")
+            .collect::<Vec<_>>();
+        let [root] = roots.as_slice() else {
             anyhow::bail!("{} does not contain exactly one root", file.display());
         };
         anyhow::ensure!(
@@ -3723,6 +3733,9 @@ fn combine_kdl_tree(root: &Path) -> Result<String> {
     let mut root = KdlNode::new("subgraph");
     root.set_children(children);
     let mut document = KdlDocument::new();
+    let mut version = KdlNode::new("version");
+    version.entries_mut().push(KdlEntry::new(2));
+    document.nodes_mut().push(version);
     document.nodes_mut().push(root);
     document.autoformat();
     Ok(document.to_string())
@@ -3834,6 +3847,7 @@ mod tests {
             &[("MODE".into(), "test".into())],
             &["printf".into(), "%s".into(), "hello".into()],
         );
+        assert!(source.starts_with("version 2\n"));
         let intent = st3::parse_intent(&source, "node").unwrap();
         let member = intent.subjects["exec/cli-test"].member.as_ref().unwrap();
         assert_eq!(member.host, "node");

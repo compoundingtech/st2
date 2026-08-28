@@ -4169,7 +4169,7 @@ mod tests {
 
     fn simple(command: &str) -> NormalizedIntent {
         parse_intent(
-            &format!("subgraph {{ exec \"work\" {{ command {command:?}; restart \"never\" }} }}"),
+            &format!("version 2\nsubgraph {{ exec \"work\" {{ command {command:?}; restart \"never\" }} }}"),
             "node",
         )
         .expect("intent")
@@ -4238,7 +4238,7 @@ mod tests {
         assert_ne!(old.hash, new.hash);
         let intent = parse_intent(
             &format!(
-                "subgraph {{ person \"worker\"; message \"task\" {{ to \"person/worker\"; content \"doc/task@{}\"; }} }}",
+                "version 2\nsubgraph {{ person \"worker\"; message \"task\" {{ to \"person/worker\"; content \"doc/task@{}\"; }} }}",
                 old.hash
             ),
             "node",
@@ -4335,7 +4335,8 @@ mod tests {
     #[test]
     fn replication_carries_runnable_plan_definitions() {
         let source = Store::open_memory("source").unwrap();
-        let kdl = r#"subgraph { plan "remote" state="ready" { step "work" { } } }"#;
+        let kdl = r#"version 2
+subgraph { plan "remote" state="ready" { step "work" { } } }"#;
         let intent = parse_intent(kdl, "source").unwrap();
         let planned = source
             .plan(
@@ -4373,6 +4374,7 @@ mod tests {
     fn replication_carries_plan_runs_and_remote_work_updates() {
         let controller = Store::open_memory("controller").unwrap();
         let kdl = r#"
+version 2
 subgraph {
   plan "remote-work" state="ready" {
     step "work" { assigned-to "agent/worker.one" }
@@ -4717,6 +4719,7 @@ subgraph {
         let store = Store::open_memory("node").unwrap();
         let intent = crate::graph::parse_intent(
             r#"
+version 2
 subgraph {
   agent "mix.sup" {
     workspace "/work"
@@ -4777,6 +4780,7 @@ subgraph {
         let store = Store::open_memory("node").unwrap();
         let intent = crate::graph::parse_intent(
             r#"
+version 2
 subgraph {
   plan "lease" state="ready" {
     step "work" { assigned-to "agent/worker" }
@@ -4877,7 +4881,8 @@ subgraph {
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
         };
         publish(
-            r#"subgraph { plan "retry" state="ready" { step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "retry" state="ready" { step "work" { } } }"#,
             "retry-plan",
         );
         let run = store
@@ -4920,6 +4925,7 @@ subgraph {
         };
         let first = publish(
             r#"
+version 2
 subgraph {
   plan "revision" state="ready" {
     step "owned" { assigned-to "agent/worker"; goal "First goal." }
@@ -4947,6 +4953,7 @@ subgraph {
         }
         let second = publish(
             r#"
+version 2
 subgraph {
   plan "revision" state="ready" {
     step "owned" { assigned-to "agent/worker"; goal "A corrected goal." }

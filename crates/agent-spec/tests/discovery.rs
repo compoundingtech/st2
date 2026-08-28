@@ -17,6 +17,27 @@ use agent_spec::{
 };
 
 #[test]
+fn discovery_accepts_st2_version_one_and_rejects_st3_version_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/one/agent.kdl",
+        "version 1\nagent \"one\" { host \"h\"; command \"true\" }",
+    );
+    write(
+        tmp.path(),
+        "agents/h/two/agent.kdl",
+        "version 2\nagent \"two\" { host \"h\"; command \"true\" }",
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.specs.iter().any(|spec| spec.identity == "one"));
+    assert!(!found.specs.iter().any(|spec| spec.identity == "two"));
+    assert_eq!(found.errors.len(), 1);
+    assert!(found.errors[0].message.contains("version 0 or 1"));
+}
+
+#[test]
 fn desired_state_is_typed_and_legacy_retirement_remains_readable() {
     let tmp = tempfile::tempdir().unwrap();
     write(

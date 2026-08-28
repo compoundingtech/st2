@@ -214,7 +214,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                             format!("step `{path}` has an empty subgraph"),
                         ));
                     }
-                    subgraph_kdl = Some(format!("{child}\n"));
+                    subgraph_kdl = Some(format!("version 2\n{child}\n"));
                 }
                 "produces" => products = parse_products(child)?,
                 "judges" => {
@@ -789,6 +789,7 @@ mod tests {
     #[test]
     fn parses_parallel_steps_nested_work_and_products() {
         let source = r#"
+version 2
 subgraph {
   scope "eval/demo/${PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "demo" state="ready" {
@@ -832,10 +833,11 @@ subgraph {
     #[test]
     fn rejects_checkpoint_and_dependency_cycles() {
         let old =
-            crate::graph::parse_intent("subgraph { checkpoints \"old\" { } }", "node").unwrap_err();
+            crate::graph::parse_intent("version 2\nsubgraph { checkpoints \"old\" { } }", "node")
+                .unwrap_err();
         assert_eq!(old.code, "unknown-node");
         let cycle = crate::graph::parse_intent(
-            "subgraph {\n  plan \"cycle\" state=\"ready\" {\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n}\n",
+            "version 2\nsubgraph {\n  plan \"cycle\" state=\"ready\" {\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n}\n",
             "node",
         )
         .unwrap_err();

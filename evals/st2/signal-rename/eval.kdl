@@ -1,0 +1,69 @@
+version 1
+
+// signal-rename-codex.kdl — the full Codex twin of signal-rename. `st2 eval ./` runs it.
+//
+// A four-agent tree coordinates the product rename `signal` -> `beacon` across a base package, two
+// consumers, and a config sweep without renaming the AbortSignal/controller.signal/SIGTERM primitive.
+// The synthetic git graph is rebuilt on every run. materialize.sh copies each source persona to the
+// matching clone's AGENTS.md; bare `ding` is the native st2 wake declaration. The KDL authors no
+// compatibility bus path or command. All five judges are held out.
+
+// Harness loaders, personas, and hooks are intentionally baked into fixture workspaces;
+// bin/check-harness-contract.sh verifies every current bus-connected model agent.
+team "sig" {
+  agent "sup" {
+    workspace "./sup"
+    env { ST_AGENT "sig.sup" }
+    command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --model gpt-5.6-sol -c 'model_reasoning_effort="medium"' 'You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for DING. After any DING, drain the inbox once again, act on every message, archive each handled item, and drive the coordinated rename to a verified finish. Report completion or blockers over the st2 bus.'"#
+    ding
+  }
+  agent "base" {
+    workspace "./base"
+    env { ST_AGENT "sig.base" }
+    command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --model gpt-5.6-sol -c 'model_reasoning_effort="medium"' 'You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for DING. After any DING, drain the inbox once again, act on every message, archive each handled item, then execute, push, coordinate, and report end-to-end. Report completion or blockers over the st2 bus.'"#
+    ding
+  }
+  agent "relay" {
+    workspace "./relay"
+    env { ST_AGENT "sig.relay" }
+    command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --model gpt-5.6-sol -c 'model_reasoning_effort="medium"' 'You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for DING. After any DING, drain the inbox once again, act on every message, archive each handled item, then execute, push, coordinate, and report end-to-end. Report completion or blockers over the st2 bus.'"#
+    ding
+  }
+  agent "hub" {
+    workspace "./hub"
+    env { ST_AGENT "sig.hub" }
+    command #"exec codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --model gpt-5.6-sol -c 'model_reasoning_effort="medium"' 'You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available; presence is best-effort if this flat eval seat cannot resolve. If the drain contains no work, stand by for DING. After any DING, drain the inbox once again, act on every message, archive each handled item, then execute, push, coordinate, and report end-to-end. Report completion or blockers over the st2 bus.'"#
+    ding
+  }
+}
+
+eval {
+  copy "./fixture"
+  run "materialize" {
+    command #"bash ./materialize.sh"#
+  }
+  message {
+    from "morgan"
+    to "sig.sup"
+    content "./task.md"
+  }
+  max-timeout "1800s"
+
+  judges {
+    judge "ISOLATION — every commit stayed in its author's package lane (base/relay/hub/sup); no cross-lane edit" {
+      exec "bash ./judges/isolation.sh"
+    }
+    judge "SUITE GREEN — node --test passes in every package on integrated main" {
+      exec "bash ./judges/suite-green.sh"
+    }
+    judge "RENAME — product fully renamed to beacon (package + scheme + protocol), no lingering product signal" {
+      exec "bash ./judges/rename.sh"
+    }
+    judge "PRIMITIVE INTACT — AbortSignal / controller.signal / SIGTERM survive undamaged in the relay" {
+      exec "bash ./judges/primitive.sh"
+    }
+    judge "HELD-OUT E2E — a rename-agnostic driver resolves the renamed base+relay+hub end-to-end" {
+      exec "bash ./judges/e2e.sh"
+    }
+  }
+}

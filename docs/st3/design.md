@@ -1794,9 +1794,13 @@ The grammar below is normative for `application/vnd.st3.intent+kdl` version `st3
 
 ### Document rules
 
-An input is UTF-8 KDL 2. One input contains exactly one root `subgraph` node.
+An input is UTF-8 KDL 2. One input contains one `version 2` declaration and exactly one root `subgraph` node.
 
-The root has no argument, property, type annotation, or sibling. Comments do not affect normalization.
+The version declaration contains one integer and no property, type, or child. A missing declaration means st2 version zero.
+
+The root has no argument, property, or type annotation. Its only permitted sibling is the version declaration.
+
+Comments do not affect normalization.
 
 The root must contain at least one named desired-state node. An empty root is invalid.
 

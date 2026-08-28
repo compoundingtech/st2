@@ -28,7 +28,7 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
 fn every_native_st3_eval_uses_the_normative_grammar() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("evals");
+        .join("evals/st3");
     let mut files = walkdir::WalkDir::new(&root)
         .max_depth(2)
         .follow_links(false)
@@ -49,10 +49,40 @@ fn every_native_st3_eval_uses_the_normative_grammar() {
 }
 
 #[test]
+fn every_selected_eval_has_one_st2_and_one_st3_form() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals");
+    for name in ["license-mit", "ghost-bug", "signal-rename"] {
+        let st2_file = root.join("st2").join(name).join("eval.kdl");
+        let st3_file = root.join("st3").join(name).join("eval.kdl");
+        let st2_source = fs::read_to_string(&st2_file).expect("read st2 eval");
+        let st3_source = fs::read_to_string(&st3_file).expect("read st3 eval");
+        let st2_document: kdl::KdlDocument = st2_source.parse().expect("parse st2 KDL");
+        let st3_document: kdl::KdlDocument = st3_source.parse().expect("parse st3 KDL");
+
+        assert_eq!(
+            st2::kdl_version::document_version(&st2_document).unwrap(),
+            1
+        );
+        assert_eq!(
+            st2::kdl_version::document_version(&st3_document).unwrap(),
+            2
+        );
+        st2::eval_spec::parse_spec(&st2_source)
+            .unwrap_or_else(|error| panic!("{}: {error:#}", st2_file.display()));
+        st3::parse_intent(&st3_source, "local")
+            .unwrap_or_else(|error| panic!("{}: {error}", st3_file.display()));
+        assert!(st2::eval_spec::parse_spec(&st3_source).is_err());
+        assert!(st3::parse_intent(&st2_source, "local").is_err());
+    }
+}
+
+#[test]
 fn signal_rename_keeps_work_structure_in_the_plan_graph() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("evals/signal-rename-codex/eval.kdl");
+        .join("evals/st3/signal-rename/eval.kdl");
     let source = fs::read_to_string(&file).expect("read Signal Rename eval");
     assert!(!source.contains("wait-team-done"));
     assert!(!source.contains("message \"kickoff"));

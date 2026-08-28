@@ -216,13 +216,23 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
     let document: KdlDocument = source
         .parse()
         .with_context(|| format!("parse legacy checkpoint KDL after harness rewrite:\n{source}"))?;
-    if document.nodes().len() == 1 && document.nodes()[0].name().value() == "subgraph" {
+    let version = st2::kdl_version::document_version(&document)?;
+    let roots = document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() != "version")
+        .collect::<Vec<_>>();
+    if version == 2 && roots.len() == 1 && roots[0].name().value() == "subgraph" {
         st3::parse_intent(source, "local")?;
         return Ok(source.to_owned());
     }
+    anyhow::ensure!(
+        st2::kdl_version::ST2_KDL_VERSIONS.contains(&version),
+        "the source uses unsupported KDL version {version}"
+    );
     anyhow::ensure!(!document.nodes().is_empty(), "the declaration is empty");
     let mut children = KdlDocument::new();
-    for node in document.nodes() {
+    for node in roots {
         anyhow::ensure!(
             node.name().value() == "agent",
             "old declaration root `{}` is not an agent",
@@ -282,6 +292,9 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
     let mut root = KdlNode::new("subgraph");
     root.set_children(children);
     let mut output = KdlDocument::new();
+    let mut version = KdlNode::new("version");
+    version.entries_mut().push(KdlEntry::new(2));
+    output.nodes_mut().push(version);
     output.nodes_mut().push(root);
     output.autoformat();
     Ok(rewrite_catalog_text(&output.to_string()))
@@ -485,7 +498,7 @@ fn transform_eval_checkpoint(
     let restart = if eval.supervise { "always" } else { "never" };
     let mut documents = Vec::new();
     let mut output = String::new();
-    output.push_str("subgraph {\n");
+    output.push_str("version 2\nsubgraph {\n");
     output.push_str(&format!("  checkpoints {sequence:?} scope={scope:?} {{\n"));
     let mut team_checkpoint = String::new();
     team_checkpoint.push_str("    checkpoint \"The eval team is running\" {\n      subgraph {\n");
@@ -741,7 +754,8 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         .with_context(|| format!("parse legacy checkpoint KDL after harness rewrite:\n{source}"))?;
     let root = document
         .nodes()
-        .first()
+        .iter()
+        .find(|node| node.name().value() == "subgraph")
         .context("translated eval has no subgraph root")?;
     let checkpoints = root
         .children()
@@ -756,7 +770,7 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         .children()
         .context("translated checkpoint sequence is empty")?;
     let mut output = format!(
-        "subgraph {{\n  scope {:?} retention=\"temporary\" change-policy=\"agent\" {{\n    plan {:?} state=\"ready\" {{\n",
+        "version 2\nsubgraph {{\n  scope {:?} retention=\"temporary\" change-policy=\"agent\" {{\n    plan {:?} state=\"ready\" {{\n",
         format!("eval/{name}/${{PLAN_RUN}}"),
         format!("eval/{name}")
     );
@@ -1375,10 +1389,12 @@ esac
     #[test]
     fn catalog_translation_wraps_old_agents_and_adds_restart_policy() {
         let translated = transform_declaration(
-            r#"agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
+            r#"version 1
+agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
             Some(true),
         )
         .unwrap();
+        assert!(translated.starts_with("version 2\n"));
         let intent = st3::parse_intent(&translated, "local").unwrap();
         let worker = &intent.subjects["agent/host-a.worker"];
         assert_eq!(
@@ -1517,6 +1533,7 @@ agent "worker" {
         let intent = st3::parse_intent(&translated, "local").unwrap();
 
         assert!(documents.is_empty());
+        assert!(translated.starts_with("version 2\n"));
         assert!(translated.contains("harness claude {"));
         assert!(translated.contains("harness codex {"));
         assert!(!translated.contains("command \"exec claude"));

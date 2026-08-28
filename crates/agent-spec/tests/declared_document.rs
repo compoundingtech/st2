@@ -145,3 +145,23 @@ fn parsing_is_deterministic_across_a_small_mutation_corpus() {
         assert_eq!(first, second, "non-deterministic parse for {source}");
     }
 }
+
+#[test]
+fn version_one_is_valid_and_version_two_is_rejected() {
+    let version_one = parse_declared_document(
+        Path::new("candidate.kdl"),
+        "version 1\nagent \"worker\" { command \"true\" }",
+    );
+    assert!(version_one.is_valid(), "{:?}", version_one.diagnostics);
+    assert_eq!(version_one.document.unwrap().agents.len(), 1);
+
+    let version_two = parse_declared_document(
+        Path::new("candidate.kdl"),
+        "version 2\nagent \"worker\" { command \"true\" }",
+    );
+    assert!(!version_two.is_valid());
+    assert_eq!(
+        version_two.diagnostics[0].code.as_str(),
+        "unsupported-kdl-version"
+    );
+}

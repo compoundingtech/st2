@@ -1,6 +1,6 @@
 # `license-mit` native-driver design
 
-The authoritative cell is `evals/license-mit` in this repository. The st2 repository owner maintains this cell.
+The authoritative st2 cell is `evals/st2/license-mit` in this repository. The st2 repository owner maintains this cell.
 
 The cell was copied on 2026-08-26 from `compoundingtech/evals` commit
 `3db48ab56d40ce27dfd94f89d2db9b692d93836a`.
@@ -9,8 +9,8 @@ The remaining `compoundingtech/evals` copy is a read-only fossil.
 
 ## Cell changes
 
-The native-driver change affects `evals/license-mit/license-mit.kdl` and
-`evals/license-mit/judges/coordination.sh`.
+The native-driver change affects `evals/st2/license-mit/eval.kdl` and
+`evals/st2/license-mit/judges/coordination.sh`.
 
 Do not add `canonical-agents`. This cell uses the compact eval grammar with native driver blocks.
 
@@ -69,7 +69,7 @@ Keep the autonomy count as a non-gating signal after the loop closes or times ou
 Build the candidate st2 binary. Run only this paid eval from the st2 repository:
 
 ```sh
-st2 eval --json ./evals/license-mit/
+st2 eval --json ./evals/st2/license-mit/
 ```
 
 The command must exit zero. The JSON report must set `done` to `true`.

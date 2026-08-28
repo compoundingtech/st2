@@ -52,6 +52,7 @@ mod watch;
 pub use agent_spec::{discovery, spec};
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
+pub use agent_spec::kdl_version;
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
     OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,

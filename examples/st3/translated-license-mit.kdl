@@ -1,3 +1,5 @@
+version 2
+
 subgraph {
   scope "eval/license-mit/${PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/license-mit" state="ready" {

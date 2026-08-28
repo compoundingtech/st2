@@ -1,3 +1,5 @@
+version 2
+
 subgraph {
   person "reviewer"
   message "import-proof" {

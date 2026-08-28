@@ -1,3 +1,5 @@
+version 2
+
 subgraph {
   agent "catalog.reviewer" {
     workspace "."

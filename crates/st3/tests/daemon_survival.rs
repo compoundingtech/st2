@@ -58,7 +58,8 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
     let intent = temporary.path().join("pty.kdl");
     fs::write(
         &intent,
-        r#"subgraph {
+        r#"version 2
+subgraph {
   pty "operator" {
     argv "sh" "-c" "printf ready; read line; printf ' got:%s' \"$line\"; sleep 1"
     restart "never"

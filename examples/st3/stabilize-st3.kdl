@@ -1,3 +1,5 @@
+version 2
+
 subgraph {
   resource "st3-stabilization-review" {
     kind "human.review"
@@ -41,7 +43,7 @@ subgraph {
       subgraph {
         exec "stabilize-st3/license-mit-codex/${PLAN_RUN}" {
           workspace "."
-          command "st3 eval ./evals/license-mit-codex"
+          command "st3 eval ./evals/st3/license-mit"
           restart "never"
         }
       }
@@ -57,7 +59,7 @@ subgraph {
       subgraph {
         exec "stabilize-st3/ghost-bug-codex/${PLAN_RUN}" {
           workspace "."
-          command "st3 eval ./evals/ghost-bug-codex"
+          command "st3 eval ./evals/st3/ghost-bug"
           restart "never"
         }
       }
@@ -73,7 +75,7 @@ subgraph {
       subgraph {
         exec "stabilize-st3/signal-rename-codex/${PLAN_RUN}" {
           workspace "."
-          command "st3 eval ./evals/signal-rename-codex"
+          command "st3 eval ./evals/st3/signal-rename"
           restart "never"
         }
       }
