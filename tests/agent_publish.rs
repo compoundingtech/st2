@@ -458,11 +458,39 @@ fn incomplete_apply_marker_blocks_declarations_but_not_the_state_plane() {
         String::from_utf8_lossy(&context.stderr)
     );
 
+    let decision = st2()
+        .args([
+            "context",
+            "append",
+            "host.worker",
+            "--decision",
+            "still writable",
+            "--why",
+            "the state plane is not fenced by an incomplete apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        decision.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decision.stderr)
+    );
+
+    // `st2 resource` authors a declaration now, not a link record, so the marker must fence it
+    // exactly like `agent publish` above — it is no longer a state-plane write.
     let resource = st2()
         .args([
             "resource",
             "add",
+            "work",
+            "--uri",
             "https://example.invalid/result",
+            "--reason",
+            "Blocked by the incomplete apply.",
+            "--agent",
+            "worker",
             "--as",
             "host.worker",
             "--catalog",
@@ -471,8 +499,12 @@ fn incomplete_apply_marker_blocks_declarations_but_not_the_state_plane() {
         .output()
         .unwrap();
     assert!(
-        resource.status.success(),
-        "{}",
+        !resource.status.success(),
+        "a binding write is a declaration write and must be fenced"
+    );
+    assert!(
+        String::from_utf8_lossy(&resource.stderr).contains("apply is incomplete"),
+        "stderr: {}",
         String::from_utf8_lossy(&resource.stderr)
     );
 

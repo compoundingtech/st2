@@ -96,9 +96,11 @@ Working state (lossless-restart):
 - `st2 context write [<identity>]` (reads new content from stdin)
 - `st2 context append [<identity>] --decision "<text>" --why "<text>"`
 
-Resources:
-- `st2 resource add <url> [--title T] [--tag T,T] [--relation R]`
-- `st2 resource ls [<identity>]` · `st2 resource read [<identity>] <ref>` · `st2 resource remove [<identity>] <ref>`
+Declared Resource bindings (`resource` nodes in your own declaration; writes republish it under CAS):
+- `st2 resource ls [<identity>] [--json]` · `st2 resource read [<identity>] <name> [--json]`
+- `st2 resource add <name> --uri <uri> --reason <text> [--inactive-reason <text>]`
+- `st2 resource remove <name>` · `st2 resource rename <old> <new>`
+- *writes also take `--agent <identity>` (any declaration you may publish) and `--json`*
 
 Machine lifecycle hooks (explicit; `up` never installs or refreshes them):
 - `st2 hooks install [--allow-downgrade]`

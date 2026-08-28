@@ -14,8 +14,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use agent_spec::spec::{
-    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, StreamLaunch, validate_desired_state_reason,
-    validate_presentation,
+    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, Resource, StreamLaunch,
+    validate_desired_state_reason, validate_presentation,
 };
 use kdl::{KdlDocument, KdlNode};
 use serde::Serialize;
@@ -133,6 +133,34 @@ pub struct StreamRemoveReceipt {
     pub result: AuthorOutcome,
     pub identity: String,
     pub name: String,
+}
+
+/// Stable machine-readable receipt from adding or updating one Resource binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceAddReceipt {
+    pub result: AuthorOutcome,
+    pub identity: String,
+    pub name: String,
+    pub uri: String,
+    pub reason: String,
+    pub inactive_reason: Option<String>,
+}
+
+/// Stable machine-readable receipt from removing one Resource binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceRemoveReceipt {
+    pub result: AuthorOutcome,
+    pub identity: String,
+    pub name: String,
+}
+
+/// Stable machine-readable receipt from relabelling one Resource binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceRenameReceipt {
+    pub result: AuthorOutcome,
+    pub identity: String,
+    pub old: String,
+    pub new: String,
 }
 
 /// A classified authoring refusal. `code` is stable for machine consumers.
@@ -311,6 +339,167 @@ fn author_stream(
         name,
         launch,
         remove,
+        || {},
+    )?;
+    Ok((result, target.identity))
+}
+
+/// Declare one Resource binding, or update the binding that already carries `name`.
+///
+/// st2 preserves the binding for readers; it resolves nothing and grants nothing. `uri` is the
+/// exact absolute identity and is stored byte for byte with no normalization.
+#[allow(clippy::too_many_arguments)]
+pub fn add_resource(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    name: &str,
+    uri: &str,
+    reason: &str,
+    inactive_reason: Option<&str>,
+) -> Result<ResourceAddReceipt, AuthorError> {
+    author_resource(
+        catalog_root,
+        selector,
+        this_host,
+        actor,
+        ResourceIntent::Upsert {
+            name,
+            uri,
+            reason,
+            inactive_reason,
+        },
+    )
+    .map(|(result, identity)| ResourceAddReceipt {
+        result,
+        identity,
+        name: name.to_owned(),
+        uri: uri.to_owned(),
+        reason: reason.to_owned(),
+        inactive_reason: inactive_reason.map(str::to_owned),
+    })
+}
+
+/// Remove one Resource binding. An already absent binding is an idempotent success.
+pub fn remove_resource(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    name: &str,
+) -> Result<ResourceRemoveReceipt, AuthorError> {
+    author_resource(
+        catalog_root,
+        selector,
+        this_host,
+        actor,
+        ResourceIntent::Remove { name },
+    )
+    .map(|(result, identity)| ResourceRemoveReceipt {
+        result,
+        identity,
+        name: name.to_owned(),
+    })
+}
+
+/// Relabel one Resource binding, carrying its `uri`, `reason`, and `inactive-reason` unchanged.
+///
+/// An absent `old` and an already declared `new` both refuse: binding names are unique within one
+/// agent, so neither request has an outcome that preserves the caller's intent.
+pub fn rename_resource(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    old: &str,
+    new: &str,
+) -> Result<ResourceRenameReceipt, AuthorError> {
+    author_resource(
+        catalog_root,
+        selector,
+        this_host,
+        actor,
+        ResourceIntent::Rename { old, new },
+    )
+    .map(|(result, identity)| ResourceRenameReceipt {
+        result,
+        identity,
+        old: old.to_owned(),
+        new: new.to_owned(),
+    })
+}
+
+/// One requested Resource-binding mutation, resolved against the declaration under the lock.
+#[derive(Debug, Clone, Copy)]
+enum ResourceIntent<'a> {
+    Upsert {
+        name: &'a str,
+        uri: &'a str,
+        reason: &'a str,
+        inactive_reason: Option<&'a str>,
+    },
+    Remove {
+        name: &'a str,
+    },
+    Rename {
+        old: &'a str,
+        new: &'a str,
+    },
+}
+
+/// The binding state a candidate must read back as before it may be committed.
+#[derive(Debug)]
+struct ResourceExpectation {
+    absent: Option<String>,
+    present: Option<Resource>,
+}
+
+fn author_resource(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    intent: ResourceIntent<'_>,
+) -> Result<(AuthorOutcome, String), AuthorError> {
+    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
+        AuthorError::new(
+            "catalog-lock-failed",
+            format!("acquire catalog-authoring lock: {error:#}"),
+        )
+    })?;
+    let found = crate::discover_strict(catalog_root);
+    if let Some(error) = found.errors.first() {
+        return Err(AuthorError::new(
+            "catalog-malformed",
+            format!(
+                "cannot prove an exact resource target while {} is malformed: {}",
+                error.path.display(),
+                error.message
+            ),
+        ));
+    }
+    let target = resolve_target(&found.specs, selector, this_host)?;
+    let actor = actor
+        .map(|actor| resolve_target(&found.specs, actor, this_host).map(|target| target.identity))
+        .transpose()?;
+    authorize_actor(
+        &found.specs,
+        &target.identity,
+        this_host,
+        actor.as_deref(),
+        "resource-not-authorized",
+    )?;
+    let result = edit_resource_declaration(
+        &catalog_lock,
+        catalog_root,
+        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
+            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
+        &target.declaration,
+        &target.identity,
+        &target.source_host,
+        &target.source_identity,
+        intent,
         || {},
     )?;
     Ok((result, target.identity))
@@ -855,6 +1044,345 @@ fn verify_stream_candidate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn edit_resource_declaration(
+    catalog_lock: &CatalogLock,
+    catalog: &Path,
+    control: &Path,
+    path: &Path,
+    expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
+    intent: ResourceIntent<'_>,
+    before_commit: impl FnOnce(),
+) -> Result<AuthorOutcome, AuthorError> {
+    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
+        return Err(AuthorError::new(
+            "unsupported-declaration-format",
+            format!(
+                "resource authoring requires canonical KDL, found {}",
+                path.display()
+            ),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AuthorError::new(
+            "declaration-read-failed",
+            format!("reading declaration {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(AuthorError::new(
+            "unsafe-declaration-path",
+            format!("refusing non-regular declaration path {}", path.display()),
+        ));
+    }
+    let original = fs::read(path).map_err(|error| {
+        AuthorError::new(
+            "declaration-read-failed",
+            format!("reading declaration {}: {error}", path.display()),
+        )
+    })?;
+    let original_version = SourceVersion::from_metadata(&metadata);
+    let text = std::str::from_utf8(&original).map_err(|error| {
+        AuthorError::new(
+            "malformed-declaration",
+            format!("declaration {} is not UTF-8: {error}", path.display()),
+        )
+    })?;
+    let document = KdlDocument::parse(text).map_err(|error| {
+        AuthorError::new(
+            "malformed-declaration",
+            format!("parsing declaration {}: {error}", path.display()),
+        )
+    })?;
+    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    if is_nix_managed(target) {
+        return Err(AuthorError::new(
+            "nix-managed-declaration",
+            format!(
+                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
+                path.display()
+            ),
+        ));
+    }
+    let Some((replacement, expectation)) = resource_edit(text, target, intent)? else {
+        return Ok(AuthorOutcome::Unchanged);
+    };
+    verify_resource_candidate(
+        catalog,
+        path,
+        &replacement,
+        expected_identity,
+        expected_host,
+        expected_agent,
+        &expectation,
+    )?;
+    atomic_replace_checked(
+        catalog_lock,
+        catalog,
+        control,
+        path,
+        &original,
+        original_version,
+        replacement.as_bytes(),
+        metadata.permissions().mode() & 0o7777,
+        before_commit,
+    )?;
+    Ok(AuthorOutcome::Changed)
+}
+
+/// Resolve one intent against the declared bindings, preserving every unrelated byte.
+///
+/// `Ok(None)` is the proven no-op: an unchanged upsert, an absent removal, or a self-rename. A
+/// changed upsert rewrites exactly the one binding node in place, so its position, its leading
+/// trivia, and every sibling binding survive.
+fn resource_edit(
+    text: &str,
+    target: &KdlNode,
+    intent: ResourceIntent<'_>,
+) -> Result<Option<(String, ResourceExpectation)>, AuthorError> {
+    let declared = target
+        .children()
+        .into_iter()
+        .flat_map(|children| children.nodes())
+        .filter(|child| child.name().value() == "resource")
+        .collect::<Vec<_>>();
+    let declaring = |name: &str| -> Result<Option<&KdlNode>, AuthorError> {
+        let matches = declared
+            .iter()
+            .copied()
+            .filter(|child| child.get(0).and_then(|entry| entry.as_string()) == Some(name))
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(AuthorError::new(
+                "duplicate-resource",
+                format!("target declares resource {name:?} more than once"),
+            ));
+        }
+        Ok(matches.first().copied())
+    };
+    match intent {
+        ResourceIntent::Upsert {
+            name,
+            uri,
+            reason,
+            inactive_reason,
+        } => {
+            let authored = declared_resource(name, uri, reason, inactive_reason)?;
+            let replacement = match declaring(name)? {
+                Some(node) if parsed_resource(node)? == authored => return Ok(None),
+                Some(node) => replace_node(text, node, &render_resource(&authored)?)?,
+                None => insert_node(text, target, &render_resource(&authored)?)?,
+            };
+            Ok(Some((
+                replacement,
+                ResourceExpectation {
+                    absent: None,
+                    present: Some(authored),
+                },
+            )))
+        }
+        ResourceIntent::Remove { name } => {
+            let Some(node) = declaring(name)? else {
+                return Ok(None);
+            };
+            Ok(Some((
+                remove_field(text, node)?,
+                ResourceExpectation {
+                    absent: Some(name.to_owned()),
+                    present: None,
+                },
+            )))
+        }
+        ResourceIntent::Rename { old, new } => {
+            let Some(node) = declaring(old)? else {
+                return Err(AuthorError::new(
+                    "resource-not-found",
+                    format!("target declares no resource {old:?}"),
+                ));
+            };
+            if old == new {
+                return Ok(None);
+            }
+            if declaring(new)?.is_some() {
+                return Err(AuthorError::new(
+                    "resource-already-exists",
+                    format!(
+                        "target already declares resource {new:?}; binding names are unique within one agent"
+                    ),
+                ));
+            }
+            let carried = parsed_resource(node)?;
+            let renamed = declared_resource(
+                new,
+                carried.uri(),
+                carried.reason(),
+                carried.inactive_reason(),
+            )?;
+            Ok(Some((
+                replace_node(text, node, &render_resource(&renamed)?)?,
+                ResourceExpectation {
+                    absent: Some(old.to_owned()),
+                    present: Some(renamed),
+                },
+            )))
+        }
+    }
+}
+
+/// Enforce the canonical binding invariants — `agent_spec` owns them; this mints no new rule.
+fn declared_resource(
+    name: &str,
+    uri: &str,
+    reason: &str,
+    inactive_reason: Option<&str>,
+) -> Result<Resource, AuthorError> {
+    match inactive_reason {
+        None => Resource::new(name.to_owned(), uri.to_owned(), reason.to_owned()),
+        Some(inactive_reason) => Resource::new_inactive(
+            name.to_owned(),
+            uri.to_owned(),
+            reason.to_owned(),
+            inactive_reason.to_owned(),
+        ),
+    }
+    .map_err(|error| AuthorError::new("invalid-resource", error))
+}
+
+fn parsed_resource(node: &KdlNode) -> Result<Resource, AuthorError> {
+    let malformed =
+        |detail: &str| AuthorError::new("malformed-resource", format!("resource binding {detail}"));
+    if node.children().is_some() {
+        return Err(malformed("cannot have children"));
+    }
+    let mut name = None;
+    let mut uri = None;
+    let mut reason = None;
+    let mut inactive_reason = None;
+    for entry in node.entries() {
+        let value = entry
+            .value()
+            .as_string()
+            .ok_or_else(|| malformed("accepts only string values"))?;
+        let slot = match entry.name().map(|name| name.value()) {
+            None => &mut name,
+            Some("uri") => &mut uri,
+            Some("reason") => &mut reason,
+            Some("inactive-reason") => &mut inactive_reason,
+            Some(other) => return Err(malformed(&format!("has unsupported property `{other}`"))),
+        };
+        if slot.replace(value).is_some() {
+            return Err(malformed("declares one of its fields more than once"));
+        }
+    }
+    let (Some(name), Some(uri), Some(reason)) = (name, uri, reason) else {
+        return Err(malformed("needs a name, a `uri`, and a `reason`"));
+    };
+    declared_resource(name, uri, reason, inactive_reason)
+}
+
+fn render_resource(resource: &Resource) -> Result<String, AuthorError> {
+    let mut authored = format!(
+        "resource {} uri={} reason={}",
+        quoted(resource.name())?,
+        quoted(resource.uri())?,
+        quoted(resource.reason())?
+    );
+    if let Some(inactive_reason) = resource.inactive_reason() {
+        authored.push_str(&format!(" inactive-reason={}", quoted(inactive_reason)?));
+    }
+    Ok(authored)
+}
+
+/// Replace exactly one node's source span. A KDL node span carries neither the leading trivia nor
+/// the trailing terminator, so the surrounding line survives untouched.
+fn replace_node(text: &str, node: &KdlNode, authored: &str) -> Result<String, AuthorError> {
+    let span = node.span();
+    let range = span.offset()..span.offset() + span.len();
+    text.get(range.clone()).ok_or_else(|| {
+        AuthorError::new(
+            "malformed-declaration",
+            "resource binding span falls outside the declaration",
+        )
+    })?;
+    // The span can run to the start of trailing trivia, so replacing it verbatim would glue the
+    // rendered node onto a following `// comment`. Leave that separator in the source.
+    let kept = text[range.clone()].trim_end_matches([' ', '\t']).len();
+    let mut replacement = text.to_owned();
+    replacement.replace_range(range.start..range.start + kept, authored);
+    Ok(replacement)
+}
+
+fn verify_resource_candidate(
+    catalog: &Path,
+    path: &Path,
+    candidate: &str,
+    expected_identity: &str,
+    expected_host: &str,
+    expected_agent: &str,
+    expectation: &ResourceExpectation,
+) -> Result<(), AuthorError> {
+    let temporary = tempfile::tempdir()
+        .map_err(|error| AuthorError::new("unsafe-source-edit", error.to_string()))?;
+    let relative = path.strip_prefix(catalog).map_err(|_| {
+        AuthorError::new(
+            "unsafe-declaration-path",
+            format!(
+                "declaration {} is outside catalog {}",
+                path.display(),
+                catalog.display()
+            ),
+        )
+    })?;
+    let candidate_path = temporary.path().join(relative);
+    fs::create_dir_all(
+        candidate_path
+            .parent()
+            .expect("candidate declaration has a parent"),
+    )
+    .and_then(|()| fs::write(&candidate_path, candidate))
+    .map_err(|error| {
+        AuthorError::new(
+            "unsafe-source-edit",
+            format!("stage resource validation: {error}"),
+        )
+    })?;
+    let (specs, _) = agent_spec::discover_file(temporary.path(), &candidate_path)
+        .map_err(|error| AuthorError::new("invalid-resource", error.to_string()))?;
+    let spec = specs
+        .iter()
+        .find(|spec| {
+            spec.identity == expected_agent && spec.bus_id(expected_host) == expected_identity
+        })
+        .ok_or_else(|| {
+            AuthorError::new(
+                "unsafe-source-edit",
+                "resource candidate lost the authored agent",
+            )
+        })?;
+    let declares = |name: &str| {
+        spec.resources
+            .iter()
+            .find(|resource| resource.name() == name)
+    };
+    if expectation
+        .absent
+        .as_deref()
+        .is_some_and(|name| declares(name).is_some())
+        || expectation
+            .present
+            .as_ref()
+            .is_some_and(|expected| declares(expected.name()) != Some(expected))
+    {
+        return Err(AuthorError::new(
+            "unsafe-source-edit",
+            "resource candidate did not read back as the authored intent",
+        ));
+    }
+    Ok(())
+}
+
 fn edit_declaration(
     catalog_lock: &CatalogLock,
     catalog: &Path,
@@ -1347,6 +1875,15 @@ fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, A
     Ok(replacement)
 }
 
+/// Whether the remainder of a node's own line is removable trivia: blanks, optionally followed by
+/// a `//` line comment. A hand-authored `resource "work" uri="…" reason="…" // why` owns that
+/// comment, so deleting the binding deletes its explanation with it. `/*` is deliberately not
+/// accepted — a block comment can span lines, and this only ever sees one.
+fn is_line_tail_trivia(tail: &str) -> bool {
+    let rest = tail.trim_start_matches([' ', '\t', '\r']);
+    rest.is_empty() || rest.starts_with("//")
+}
+
 fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
     let span = node.span();
     let start = span.offset();
@@ -1364,9 +1901,7 @@ fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
     if text[line_start..start]
         .chars()
         .all(|value| matches!(value, ' ' | '\t'))
-        && text[end..line_end]
-            .chars()
-            .all(|value| matches!(value, ' ' | '\t' | '\r'))
+        && is_line_tail_trivia(&text[end..line_end])
     {
         let mut replacement = text.to_owned();
         let remove_end = usize::min(line_end + usize::from(line_end < text.len()), text.len());
@@ -2083,5 +2618,471 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(declaration_path).unwrap(), original);
+    }
+
+    fn bound(root: &Path, identity: &str, name: &str) -> Resource {
+        crate::discover(root)
+            .specs
+            .into_iter()
+            .find(|spec| spec.identity == identity)
+            .expect("catalog declares the agent")
+            .resources
+            .into_iter()
+            .find(|resource| resource.name() == name)
+            .expect("agent declares the binding")
+    }
+
+    #[test]
+    fn resource_add_declares_updates_in_place_and_is_idempotent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = write(
+            root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+
+        let added = add_resource(
+            root,
+            "h.worker",
+            "h",
+            Some("h.worker"),
+            "work",
+            "github-issue://example/project/123",
+            "release work item",
+            None,
+        )
+        .unwrap();
+        assert_eq!(added.result, AuthorOutcome::Changed);
+        assert_eq!(added.identity, "h.worker");
+        assert_eq!(added.inactive_reason, None);
+
+        add_resource(
+            root,
+            "h.worker",
+            "h",
+            None,
+            "source",
+            "worktree://github.com/example/project/change",
+            "primary checkout",
+            None,
+        )
+        .unwrap();
+        let two_bindings = fs::read_to_string(&path).unwrap();
+
+        // An identical request proves the binding rather than rewriting the declaration.
+        assert_eq!(
+            add_resource(
+                root,
+                "h.worker",
+                "h",
+                None,
+                "work",
+                "github-issue://example/project/123",
+                "release work item",
+                None,
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), two_bindings);
+
+        // Re-declaring an existing name updates it in place, keeping its position and siblings.
+        assert_eq!(
+            add_resource(
+                root,
+                "h.worker",
+                "h",
+                None,
+                "work",
+                "github-issue://example/project/456",
+                "follow-up work item",
+                Some("superseded by the follow-up"),
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Changed
+        );
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches("resource \"work\"").count(), 1);
+        assert!(
+            updated.find("resource \"work\"").unwrap()
+                < updated.find("resource \"source\"").unwrap()
+        );
+        assert!(updated.contains("// keep this comment"));
+        assert!(updated.contains("keep \"exact\""));
+
+        let work = bound(root, "worker", "work");
+        assert_eq!(work.uri(), "github-issue://example/project/456");
+        assert_eq!(work.reason(), "follow-up work item");
+        assert_eq!(work.inactive_reason(), Some("superseded by the follow-up"));
+        assert_eq!(
+            bound(root, "worker", "source").uri(),
+            "worktree://github.com/example/project/change"
+        );
+
+        // The request declares the complete binding, so an omitted inactive-reason clears it.
+        assert_eq!(
+            add_resource(
+                root,
+                "h.worker",
+                "h",
+                None,
+                "work",
+                "github-issue://example/project/456",
+                "follow-up work item",
+                None,
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Changed
+        );
+        assert_eq!(bound(root, "worker", "work").inactive_reason(), None);
+        let cleared = fs::read_to_string(&path).unwrap();
+        assert!(!cleared.contains("inactive-reason"));
+        assert_eq!(cleared.matches("resource \"work\"").count(), 1);
+    }
+
+    #[test]
+    fn resource_add_proves_a_hand_authored_binding_without_rewriting_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = write(
+            root,
+            "h/worker/agent.kdl",
+            "agent \"worker\" {\n  host \"h\"\n  command \"sleep 60\"\n  \
+             resource \"work\" reason=\"release work item\" uri=\"github-issue://example/project/123\"\n}\n",
+        );
+        let original = fs::read_to_string(&path).unwrap();
+
+        // Hand-authored property order and spacing are proven, not re-rendered.
+        assert_eq!(
+            add_resource(
+                root,
+                "h.worker",
+                "h",
+                None,
+                "work",
+                "github-issue://example/project/123",
+                "release work item",
+                None,
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn resource_remove_is_idempotent_and_keeps_unrelated_bindings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = write(
+            root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+        add_resource(
+            root,
+            "h.worker",
+            "h",
+            None,
+            "work",
+            "github-issue://example/project/123",
+            "release work item",
+            None,
+        )
+        .unwrap();
+        add_resource(
+            root,
+            "h.worker",
+            "h",
+            None,
+            "source",
+            "worktree://github.com/example/project/change",
+            "primary checkout",
+            None,
+        )
+        .unwrap();
+
+        let removed = remove_resource(root, "h.worker", "h", Some("h.worker"), "work").unwrap();
+        assert_eq!(removed.result, AuthorOutcome::Changed);
+        assert_eq!(removed.name, "work");
+        let after_remove = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            remove_resource(root, "h.worker", "h", None, "work")
+                .unwrap()
+                .result,
+            AuthorOutcome::Unchanged
+        );
+        assert_eq!(
+            remove_resource(root, "h.worker", "h", None, "never-declared")
+                .unwrap()
+                .result,
+            AuthorOutcome::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), after_remove);
+        assert!(!after_remove.contains("resource \"work\""));
+        assert!(after_remove.contains("resource \"source\""));
+        assert!(after_remove.contains("// keep this comment"));
+        assert_eq!(bound(root, "worker", "source").reason(), "primary checkout");
+    }
+
+    #[test]
+    fn resource_rename_carries_the_binding_and_refuses_absent_or_colliding_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let path = write(
+            root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+        add_resource(
+            root,
+            "h.worker",
+            "h",
+            None,
+            "work",
+            "github-issue://example/project/123",
+            "release work item",
+            Some("merged and retained for traceability"),
+        )
+        .unwrap();
+        add_resource(
+            root,
+            "h.worker",
+            "h",
+            None,
+            "source",
+            "worktree://github.com/example/project/change",
+            "primary checkout",
+            None,
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            rename_resource(root, "h.worker", "h", None, "work", "work")
+                .unwrap()
+                .result,
+            AuthorOutcome::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        let renamed =
+            rename_resource(root, "h.worker", "h", Some("h.worker"), "work", "task").unwrap();
+        assert_eq!(renamed.result, AuthorOutcome::Changed);
+        assert_eq!(renamed.old, "work");
+        assert_eq!(renamed.new, "task");
+
+        let task = bound(root, "worker", "task");
+        assert_eq!(task.uri(), "github-issue://example/project/123");
+        assert_eq!(task.reason(), "release work item");
+        assert_eq!(
+            task.inactive_reason(),
+            Some("merged and retained for traceability")
+        );
+        let authored = fs::read_to_string(&path).unwrap();
+        assert!(!authored.contains("resource \"work\""));
+        assert!(
+            authored.find("resource \"task\"").unwrap()
+                < authored.find("resource \"source\"").unwrap()
+        );
+
+        assert_eq!(
+            rename_resource(root, "h.worker", "h", None, "work", "elsewhere")
+                .unwrap_err()
+                .code(),
+            "resource-not-found"
+        );
+        // An absent `old` refuses even when the rename would otherwise be a self-rename no-op.
+        assert_eq!(
+            rename_resource(root, "h.worker", "h", None, "absent", "absent")
+                .unwrap_err()
+                .code(),
+            "resource-not-found"
+        );
+        assert_eq!(
+            rename_resource(root, "h.worker", "h", None, "task", "source")
+                .unwrap_err()
+                .code(),
+            "resource-already-exists"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), authored);
+    }
+
+    #[test]
+    fn resource_authoring_enforces_validation_authority_and_nix_ownership() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write(
+            root,
+            "h/root/agent.kdl",
+            &declaration("root", "h", None, "catalog"),
+        );
+        let child = write(
+            root,
+            "h/child/agent.kdl",
+            &declaration("child", "h", Some("root"), "catalog"),
+        );
+        write(
+            root,
+            "h/sibling/agent.kdl",
+            &declaration("sibling", "h", Some("root"), "catalog"),
+        );
+        let nix_owned = write(
+            root,
+            "h/nix/agent.kdl",
+            &declaration("nix", "h", Some("root"), "nix"),
+        );
+        let untouched = fs::read_to_string(&nix_owned).unwrap();
+
+        add_resource(
+            root,
+            "h.child",
+            "h",
+            Some("h.root"),
+            "work",
+            "github-issue://example/project/1",
+            "supervised work item",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            add_resource(
+                root,
+                "h.sibling",
+                "h",
+                Some("h.child"),
+                "work",
+                "github-issue://example/project/1",
+                "reaching across the fleet",
+                None,
+            )
+            .unwrap_err()
+            .code(),
+            "resource-not-authorized"
+        );
+        assert_eq!(
+            remove_resource(root, "h.sibling", "h", Some("h.child"), "work")
+                .unwrap_err()
+                .code(),
+            "resource-not-authorized"
+        );
+        assert_eq!(
+            add_resource(
+                root,
+                "h.nix",
+                "h",
+                Some("h.root"),
+                "work",
+                "github-issue://example/project/1",
+                "Nix owns this declaration",
+                None,
+            )
+            .unwrap_err()
+            .code(),
+            "nix-managed-declaration"
+        );
+
+        // A catalog-relative carrier path is admitted since #345, so the refusals worth pinning are
+        // the ones that escape the catalog, plus empty names and empty explanations.
+        for (name, uri, reason, inactive_reason) in [
+            ("absolute-path", "/etc/passwd", "escapes the catalog", None),
+            ("parent-escape", "../outside", "escapes the catalog", None),
+            ("spaced", "issue://example/a b", "unencoded space", None),
+            ("", "issue://example/1", "empty name", None),
+            ("blank-reason", "issue://example/1", "", None),
+            (
+                "blank-inactive",
+                "issue://example/1",
+                "still explained",
+                Some(""),
+            ),
+        ] {
+            let error = add_resource(
+                root,
+                "h.child",
+                "h",
+                None,
+                name,
+                uri,
+                reason,
+                inactive_reason,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "invalid-resource", "{name}: {error}");
+        }
+        assert_eq!(
+            fs::read_to_string(&child)
+                .unwrap()
+                .matches("resource ")
+                .count(),
+            1
+        );
+
+        // #345 widened the envelope: a catalog-relative carrier path is a valid binding uri.
+        add_resource(
+            root,
+            "h.child",
+            "h",
+            None,
+            "carrier",
+            "carriers/goal.md",
+            "Catalog-relative carrier.",
+            None,
+        )
+        .expect("a catalog-relative carrier path is admitted");
+        assert_eq!(fs::read_to_string(&nix_owned).unwrap(), untouched);
+    }
+
+    #[test]
+    fn resource_uri_is_preserved_byte_for_byte() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write(
+            root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+        let exact = "vendor+Thing://Authority.Example/Exact%20Identity?Query=A%2Fb#Frag%20Ment";
+
+        add_resource(
+            root,
+            "h.worker",
+            "h",
+            None,
+            "subject",
+            exact,
+            "exact vendor identity",
+            None,
+        )
+        .unwrap();
+        assert_eq!(bound(root, "worker", "subject").uri(), exact);
+
+        // The rename path carries the identity across without normalizing it either.
+        rename_resource(root, "h.worker", "h", None, "subject", "carried").unwrap();
+        assert_eq!(bound(root, "worker", "carried").uri(), exact);
+
+        // A byte-identical re-declaration is a proven no-op, not a rewrite.
+        assert_eq!(
+            add_resource(
+                root,
+                "h.worker",
+                "h",
+                None,
+                "carried",
+                exact,
+                "exact vendor identity",
+                None,
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Unchanged
+        );
     }
 }

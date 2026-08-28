@@ -158,6 +158,86 @@ observed. The origin timestamp is durable; age is a projection and never file
 mtime.
 
 Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+### Resource
+
+An externally identified thing an agent points at, named by an absolute URI.
+st2 preserves the URI's exact bytes and never normalizes them. The scheme is the
+exact lookup key for an optional, catalog-declared
+[Resource Profile](07-resource-profile/requirements.md); scheme meaning stays
+downstream-owned and st2 ships no built-in profiles, so an unregistered scheme
+stays opaque. Possession of a URI grants no authority, access, or capability.
+
+One concept, one edge: a Resource is reached through a
+[Resource binding](#resource-binding). The [linked record](#linked-record-retired)
+plane that once shared the word is retired.
+
+Authority: [R20 portable Resource bindings](requirements.md#L161-L168);
+[issue #61 resolution](https://github.com/compoundingtech/st2/issues/61)
+
+### Resource binding
+
+A publisher-declared edge from one agent to one Resource, written as a
+`resource` node in the agent declaration and carrying an agent-local unique
+name, the URI, a required `reason`, and an optional `inactive-reason`. Bindings
+are desired state: they change only through compare-and-swap publication of the
+whole declaration, and a binding-only change never stops, replaces, or relaunches
+healthy work.
+
+A binding says what an agent *is for* — the work it reads and the durable state
+carriers it owns. It is not a record of what the agent produced.
+
+Authority: [`Resource`](../../crates/agent-spec/src/spec.rs#L239-L245) — the
+live contract; [R20](requirements.md#L161-L168); [R21](requirements.md#L169-L172).
+The canonical [Agent Spec Resource bindings](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#agent-spec-resource-bindings)
+anchor still describes the pre-#307 envelope of name and `uri` only, and would
+reject the required `reason`; it is pending sync (07-resource DQ-R8).
+
+### linked record (retired)
+
+An agent-owned record of something an agent produced, stored as one markdown
+file with `url`, optional `title`/`tags`/`relation`, and an optional body under
+`<agent-dir>/resources/links/`, written through `st2 resource add`.
+
+**Retired.** The term is kept only so a reader who meets a surviving record
+under `resources/links/` can identify it. Recording produced artifacts is
+`axe work update --artifact <path> --pty <name>`. Nothing in st2 reads a linked
+record, and *resource* now names only the declared plane.
+
+Authority: [07-resource spec](07-resource/spec.md);
+[decision 0011](.decisions/0011-the-linked-record-plane-is-retired.md)
+
+### agent resource directory
+
+The per-agent directory `<agent-dir>/resources/`, canonical for an agent's
+resource files. It holds the message planes (`inbox/`, `archive/`, `sent/`),
+working state and decisions (`context/`), scratch material (`tmp/`), and the
+realized carriers themselves (`goal.md` and siblings).
+
+It is not a separate meaning of *resource*. It is the **realization surface**
+for [Resource bindings](#resource-binding): a binding names a carrier by URI and
+the carrier's bytes live here. `dev.schickling.agent-goal://<host>/<identity>`
+realizes as `resources/goal.md`; `decision-tree://<host>/<identity>` realizes as
+`resources/context/decisions/`. Identity is the URI; the path is realization,
+and st2 does not resolve one into the other ([R20](requirements.md#L161-L168)).
+
+Authority: [`message::with_resolved_state_dir`](../../src/message.rs);
+[07-resource spec](07-resource/spec.md)
+
+### working state
+
+An agent's restored durable context — what it is doing, what it decided, and what
+it ruled out — written through `st2 context` and realized at
+`resources/context/now.md`. Never a liveness or activity term; the observed
+signal is [observed harness state](#observed-harness-state).
+
+Addressed as a [Resource binding](#resource-binding) under the scheme
+`working-state://<host>/<identity>`. st2 writes the carrier through
+`st2 context`; resolving the scheme is a catalog's choice via an optional
+[Resource Profile](07-resource-profile/requirements.md), not something st2 ships.
+
+Authority: [R09 state continuity](requirements.md#L131-L132);
+[`context`](../../src/context.rs);
+[decision 0012](.decisions/0012-working-state-is-a-declared-carrier.md)
 
 ### restart policy
 
@@ -409,6 +489,15 @@ the leitwort for harness activity evidence.
 - Use [agent identity](../../crates/agent-spec/src/spec.rs#L24-L50) for the bare
   value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
   host-qualified address.
+- **Resource** names one concept: a [Resource binding](#resource-binding) and
+  nothing else. The [linked record](#linked-record-retired) plane that once shared the
+  word is retired. Do not reintroduce a second sense.
+- The [agent resource directory](#agent-resource-directory) is not a second
+  sense either — it is where bindings are realized. Say *binding* for the
+  declared edge and *carrier* for the realized bytes when both are in view.
+- Use [working state](#working-state) for R09's restored durable context. The
+  verb is `st2 context` and the directory is `resources/context/`, but the
+  canonical term and its scheme are *working state*, not *context*.
 - Use [message](../../src/message.rs#L26-L46) for the durable record and
   [DING](../../src/ding/mod.rs#L1-L14) for its terminal notification.
 - Qualify **event**: a bare *event* in stream context is the durable

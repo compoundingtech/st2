@@ -260,7 +260,8 @@ The envelope is `name` + `uri` + a required human-facing `reason`, plus an optio
 access, readiness, or lifecycle policy, and URI possession conveys no authority. A Resource URI may
 be referenced by any number of agent declarations. Resource-only declaration edits do not stop,
 replace, or relaunch a live task. Resource profiles and resolvers remain opaque to st2; catalog
-readers use the public `agent-spec` crate to inspect the bindings.
+readers use the public `agent-spec` crate to inspect the bindings, and `st2 resource ls|read`
+projects them for one agent.
 
 The positional agent value is the stable automation identity. Optional `name` and `description`
 fields are presentation only; they never route messages, select tasks, or rename durable state.
@@ -270,6 +271,9 @@ Mutate a catalog-owned KDL declaration through the constrained commands:
 st2 rename <stable-id> "Release worker"
 st2 describe <stable-id> "Owns release preparation and verification."
 st2 rename <stable-id> --clear
+st2 resource add <name> --uri <uri> --reason "<why this agent carries it>"
+st2 resource remove <name>
+st2 resource rename <old> <new>
 ```
 
 These commands preserve unrelated KDL bytes and serialize local writers through the persistent
@@ -468,8 +472,8 @@ so external harness hooks can read its current name and description without pars
 on a duplicate state file.
 
 For a catalog-backed agent, every native bus operation resolves the same agent directory used by
-the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, context, and
-links live under `<agent-dir>/resources/`. The flat `<root>/<identity>` layout remains only as the
+the roster: presence is `<agent-dir>/status`, while unread messages, archive receipts, and context
+live under `<agent-dir>/resources/`. The flat `<root>/<identity>` layout remains only as the
 intentional catalog-less fallback used by isolated folder evals. In a catalog-backed root,
 `st2 message ls` rejects an absent identity; recovery inspection of a deliberately orphaned flat
 box must be explicit with `st2 message ls <identity> --orphan` (and optionally `--archive`).

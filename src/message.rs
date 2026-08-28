@@ -1264,7 +1264,7 @@ fn marker_state_exists(agent_dir: &Path) -> anyhow::Result<bool> {
     }
     let resources = agent_dir.join("resources");
     if resources.is_dir() {
-        for relative in ["inbox", "archive", "context", "context/decisions", "links"] {
+        for relative in ["inbox", "archive", "context", "context/decisions"] {
             match fs::symlink_metadata(resources.join(relative)) {
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
                 Ok(_) => anyhow::bail!("agent resource path is not a real directory"),
