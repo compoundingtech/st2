@@ -2462,6 +2462,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 prompt "Do the work."
                 args "--dangerously-bypass-hook-trust"
               }
+              exec "injector" { command "sleep 60" }
             }
             "#,
         )
@@ -2491,6 +2492,17 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         assert_eq!(Path::new(&argv[0]), executable);
         assert!(argv.iter().any(|value| value == "codex"));
         assert!(specs[0].tasks.iter().all(|task| task.name != "ding"));
+        assert!(specs[0].tasks.iter().any(|task| {
+            task.kind == TaskKind::Exec
+                && task.id.as_deref() == Some("evalhost.worker.injector")
+                && task.command.as_deref() == Some("sleep 60")
+        }));
+
+        let plan = reconcile(&specs, &[], "evalhost").unwrap();
+        assert!(plan.launch.iter().flat_map(|launch| &launch.tasks).any(
+            |target| target.pty_id == "evalhost.worker.injector"
+                && target.kind == TaskKind::Exec
+        ));
     }
 
     #[test]
