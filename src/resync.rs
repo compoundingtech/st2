@@ -491,13 +491,18 @@ impl ResyncSupervisor {
             profiles: std::sync::Mutex::new(profiles),
         }
     }
-    /// Replace the worker's watch set from the pass's already-discovered specs. A malformed
+    /// Replace the worker's active watch set using two deliberately distinct catalog views.
+    ///
+    /// `catalog_specs` contains every valid discovered declaration and is used only to resolve
+    /// topology such as supervisor chains. `live_subscription_specs` contains canonical seats
+    /// proven live by this pass and is the only source of active subscriptions. A malformed
     /// declaration retains its prior subscription only while its canonical seat is observed alive;
     /// contained profile failures reach the reconcile report.
     #[must_use = "resolver diagnostics must be surfaced by the reconcile caller"]
     pub fn refresh(
         &self,
-        specs: &[AgentSpec],
+        catalog_specs: &[AgentSpec],
+        live_subscription_specs: &[AgentSpec],
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
@@ -508,7 +513,8 @@ impl ResyncSupervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.refresh_with_registry(
             &profiles,
-            specs,
+            catalog_specs,
+            live_subscription_specs,
             this_host,
             sessions,
             malformed_declarations,
@@ -523,7 +529,8 @@ impl ResyncSupervisor {
     pub fn refresh_with_profiles(
         &self,
         profiles: ResourceProfileRegistry,
-        specs: &[AgentSpec],
+        catalog_specs: &[AgentSpec],
+        live_subscription_specs: &[AgentSpec],
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
@@ -535,7 +542,8 @@ impl ResyncSupervisor {
         current.replace_definitions(profiles);
         self.refresh_with_registry(
             &current,
-            specs,
+            catalog_specs,
+            live_subscription_specs,
             this_host,
             sessions,
             malformed_declarations,
@@ -545,20 +553,21 @@ impl ResyncSupervisor {
     fn refresh_with_registry(
         &self,
         profiles: &ResourceProfileRegistry,
-        specs: &[AgentSpec],
+        catalog_specs: &[AgentSpec],
+        live_subscription_specs: &[AgentSpec],
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
     ) -> Vec<String> {
         let mut diagnostics = Vec::new();
         let refresh_profiles = profiles.begin_refresh();
-        let sets = specs
+        let sets = live_subscription_specs
             .iter()
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
             .map(|spec| {
                 let (set, mut failures) =
-                    resolve_watch_set(spec, specs, this_host, &refresh_profiles);
+                    resolve_watch_set(spec, catalog_specs, this_host, &refresh_profiles);
                 diagnostics.append(&mut failures);
                 set
             })

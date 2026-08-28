@@ -65,8 +65,9 @@ At every non-retired ancestor it resolves active bindings with the same profile
 scheme against that ancestor's own declaration directory. Each inherited
 subscription retains the ancestor's binding label qualified by owner bus ID
 (`goal@hetz.root`), so mutations in two layers cannot share a supersession key.
-A retired ancestor contributes no layer, but traversal continues to its
-ancestors.
+A suspended ancestor contributes its layer and traversal continues, but receives
+no events unless its own canonical seat is live. A retired ancestor contributes
+no layer, but traversal continues to its ancestors.
 
 Chain membership comes only from a profile's trusted opt-in flag and exact URI
 scheme. Binding labels do not define composition, native local bindings never
@@ -120,10 +121,14 @@ meaningful.
   to any later task. Both paths resolve supervisor-chain carriers against the
   complete discovered spec vector, never a one-spec view.
 - After lifecycle execution, each reconcile pass atomically refreshes the watch
-  set with agents whose canonical seat was observed alive or successfully
-  launched/restarted in that pass. This refresh owns removals, malformed
-  declaration retention, and hot profile replacement. Desired declarations,
-  dead keep-retained seats, and companion-only launches never become watched.
+  set through separate catalog and subscription inputs. The catalog input is
+  every valid discovered declaration, including suspended and retired topology
+  nodes; it is used for chain traversal only. The subscription input is agents
+  whose canonical seat was observed alive or successfully launched/restarted in
+  that pass; only those agents receive own or inherited watches. This refresh
+  owns removals, malformed declaration retention, and hot profile replacement.
+  Desired declarations, dead keep-retained seats, and companion-only launches
+  never become watched.
   If strict discovery temporarily rejects a declaration whose exact canonical
   seat remains observed alive, its prior declaration subscription survives with
   its carrier state and pending transition; it drops as soon as that seat is
