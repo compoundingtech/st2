@@ -843,4 +843,46 @@ subgraph {
         .unwrap_err();
         assert_eq!(cycle.code, "dependency-cycle");
     }
+
+    #[test]
+    fn parses_a_human_review_contract() {
+        let intent = crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  plan "review" state="ready" {
+    step "approval" {
+      judges {
+        human "person/nathan" {
+          question "Is this change ready to merge?"
+          review "resource/plan-run/${PLAN_RUN}/pull-request"
+          review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        let judge = &intent.plans["review"].steps["approval"].judges[0];
+        let crate::model::JudgeSpec::Human {
+            reviewer,
+            question,
+            review_targets,
+        } = judge
+        else {
+            panic!("the judge is not human");
+        };
+        assert_eq!(reviewer, "person/nathan");
+        assert_eq!(question.as_deref(), Some("Is this change ready to merge?"));
+        assert_eq!(
+            review_targets,
+            &[
+                "resource/plan-run/${PLAN_RUN}/pull-request",
+                "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ]
+        );
+    }
 }

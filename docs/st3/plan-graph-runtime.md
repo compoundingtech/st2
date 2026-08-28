@@ -133,6 +133,18 @@ retry {
 }
 ```
 
+st3 does not stop retries because two failures have the same text. A later failure-loop design must cover worker, judge, and timeout failures.
+
+A running judge also keeps one operation identity across step retries. The failure-loop work must first make each judge operation attempt-specific.
+
+## Plan completion checks
+
+Every normal step must complete before the plan completes. A final judges-only step is the current plan-level check.
+
+A plan does not accept `judges` or `depends-on`. Step dependencies remain the only work access rules.
+
+Conditional routing could make a final step avoidable. Add plan-level required judges only when that routing exists.
+
 ## Nested plans
 
 A nested plan is part of the submitted revision. Its first eligible steps start with the parent step.
@@ -198,7 +210,23 @@ An active run adopts an accepted revision. Changed steps and their dependents re
 
 Unchanged independent steps keep their completion. The original root revision remains in the run record.
 
-A human decision binds to the exact step-run subject.
+A human judge can declare its question and the graph subjects that a person must review.
+
+```kdl
+judges {
+  human "person/nathan" {
+    question "Is this pull request ready to merge?"
+    review "resource/plan-run/${PLAN_RUN}/pull-request"
+    review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+```
+
+The reconciler creates one durable `review.requested` claim. The claim contains the reviewer, question, review targets, and allowed decisions.
+
+The standard decisions are `approved`, `rejected`, and `revise`. A step timeout supplies an optional deadline and fails closed.
+
+A human decision binds to the exact review request. That request identifies the plan revision, step definition, and attempt.
 
 ```sh
 st3 review approve step-run/RUN/nathan-approves --actor person/nathan
@@ -207,6 +235,8 @@ st3 review revise step-run/RUN/rename-base --actor person/nathan \
 ```
 
 A `revise` decision blocks only the selected step. The replacement plan uses the normal revision command.
+
+A later UI can list unresolved `review.requested` claims and show their review targets.
 
 These policies are workflow rules. st3 does not authenticate peer identity yet.
 

@@ -678,14 +678,79 @@ async fn post_review(
             format!("person/{actor}")
         }
     });
+    let review_request = if subject.starts_with("step-run/") {
+        let review_request = state
+            .store
+            .latest_claim(&subject, Some("review.requested"))
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "review-not-requested",
+                    format!("step run `{subject}` has no pending human review"),
+                ))
+            })?;
+        let step = state
+            .store
+            .step_run(&subject)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "unknown-step-run",
+                    format!("step run `{subject}` does not exist"),
+                ))
+            })?;
+        let run = state
+            .store
+            .plan_run(&step.run)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal(format!("plan run `{}` does not exist", step.run)))?;
+        let request_is_current = review_request
+            .body
+            .pointer("/fields/plan_revision")
+            .and_then(Value::as_str)
+            == Some(run.revision.as_str())
+            && review_request
+                .body
+                .pointer("/fields/step_definition")
+                .and_then(Value::as_str)
+                == Some(step.definition_hash.as_str())
+            && review_request
+                .body
+                .pointer("/fields/attempt")
+                .and_then(Value::as_u64)
+                == Some(u64::from(step.attempt));
+        if !request_is_current {
+            return Err(ApiError::bad(St3Error::new(
+                "stale-review-request",
+                "the human review request does not match the current step attempt",
+            )));
+        }
+        let reviewer = review_request
+            .body
+            .pointer("/fields/reviewer")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::internal("a human review request has no reviewer"))?;
+        if actor.as_deref() != Some(reviewer) {
+            return Err(ApiError::bad(St3Error::new(
+                "wrong-reviewer",
+                format!("the pending review requires `{reviewer}`"),
+            )));
+        }
+        Some(review_request)
+    } else {
+        None
+    };
     let decision = request.decision.clone();
-    let fields = BTreeMap::from([
+    let mut fields = BTreeMap::from([
         ("decision".into(), Value::String(request.decision)),
         (
             "reason".into(),
             request.reason.map(Value::String).unwrap_or(Value::Null),
         ),
     ]);
+    if let Some(review_request) = &review_request {
+        fields.insert("request".into(), Value::String(review_request.id.clone()));
+    }
     let response = state
         .store
         .append_claim(&ClaimInput {
@@ -693,7 +758,10 @@ async fn post_review(
             kind: "review.decision".into(),
             actor,
             fields,
-            evidence: Vec::new(),
+            evidence: review_request
+                .iter()
+                .map(|request| request.id.clone())
+                .collect(),
             expected_subject: request.expected_subject,
             idempotency_key: None,
         })
@@ -2640,6 +2708,95 @@ subgraph {
             descending["claims"][0]["subject"].as_str(),
             Some("host/two")
         );
+    }
+
+    #[tokio::test]
+    async fn a_step_review_decision_binds_to_its_pending_request() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+subgraph {
+  plan "review-api" state="ready" {
+    step "approval" { judges { human "person/nathan" } }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "review-api-plan")
+            .unwrap();
+        let run = state
+            .store
+            .create_plan_run(&PlanRunRequest {
+                plan: "review-api".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "review-api-run".into(),
+            })
+            .unwrap();
+        let step = &run.steps[0];
+        let request = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: step.subject.clone(),
+                kind: "review.requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("reviewer".into(), Value::String("person/nathan".into())),
+                    ("plan_revision".into(), Value::String(run.revision.clone())),
+                    (
+                        "step_definition".into(),
+                        Value::String(step.definition_hash.clone()),
+                    ),
+                    ("attempt".into(), Value::from(step.attempt)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("review-request".into()),
+            })
+            .unwrap();
+        let app = router(state);
+        let body = |actor: &str| {
+            serde_json::to_value(ReviewRequest {
+                decision: "approved".into(),
+                reason: None,
+                actor: Some(actor.into()),
+                expected_subject: None,
+            })
+            .unwrap()
+        };
+        let (status, rejected) = json_request(
+            app.clone(),
+            &format!("/v1/reviews/{}", step.subject),
+            body("person/someone-else"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(rejected["code"], "wrong-reviewer");
+
+        let (status, accepted) = json_request(
+            app,
+            &format!("/v1/reviews/{}", step.subject),
+            body("person/nathan"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["body"]["fields"]["request"], request.id);
+        assert_eq!(accepted["body"]["evidence"][0], request.id);
     }
 
     #[tokio::test]

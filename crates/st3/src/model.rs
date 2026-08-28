@@ -322,6 +322,10 @@ pub enum JudgeSpec {
     },
     Human {
         reviewer: String,
+        #[serde(default)]
+        question: Option<String>,
+        #[serde(default)]
+        review_targets: Vec<String>,
     },
 }
 

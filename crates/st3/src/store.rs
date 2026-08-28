@@ -2806,6 +2806,7 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "resource.file-observed",
         "resource.session-bound",
         "review.decision",
+        "review.requested",
         "session.signal.requested",
         "session.signal.result",
         "step-run.state",

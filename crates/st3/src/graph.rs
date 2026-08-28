@@ -846,14 +846,54 @@ pub(crate) fn parse_judges(node: &KdlNode, default_host: &str) -> Result<Vec<Jud
             }
             "human" => {
                 ensure_no_properties(child)?;
-                let reviewer = one_string(child)?;
+                let reviewer = one_string_with_children(child)?;
                 if !reviewer.starts_with("person/") {
                     return Err(St3Error::new(
                         "invalid-human-reviewer",
                         "a human judge needs a full person subject",
                     ));
                 }
-                output.push(JudgeSpec::Human { reviewer });
+                let mut question = None;
+                let mut review_targets = Vec::new();
+                let mut seen_targets = HashSet::new();
+                if let Some(contract) = child.children() {
+                    for field in contract.nodes() {
+                        ensure_no_properties(field)?;
+                        match field.name().value() {
+                            "question" => {
+                                if question.is_some() {
+                                    return Err(St3Error::new(
+                                        "duplicate-human-question",
+                                        "a human judge can contain one question",
+                                    ));
+                                }
+                                question = Some(one_string(field)?);
+                            }
+                            "review" => {
+                                let target = one_string(field)?;
+                                validate_full_subject(&target)?;
+                                if !seen_targets.insert(target.clone()) {
+                                    return Err(St3Error::new(
+                                        "duplicate-human-review-target",
+                                        format!("human review target `{target}` repeats"),
+                                    ));
+                                }
+                                review_targets.push(target);
+                            }
+                            other => {
+                                return Err(St3Error::new(
+                                    "unknown-human-review-field",
+                                    format!("a human judge cannot contain `{other}`"),
+                                ));
+                            }
+                        }
+                    }
+                }
+                output.push(JudgeSpec::Human {
+                    reviewer,
+                    question,
+                    review_targets,
+                });
             }
             other => {
                 return Err(St3Error::new(

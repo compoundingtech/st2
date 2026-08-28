@@ -1531,6 +1531,21 @@ impl<R: RuntimeControl> Reconciler<R> {
         let variables = run_variables(run, step.spec, view);
         let mut judge = judge.clone();
         expand_judge(&mut judge, &variables, &run.workspace)?;
+        if let JudgeSpec::Human {
+            reviewer,
+            question,
+            review_targets,
+        } = &judge
+        {
+            return self.evaluate_plan_human_judge(
+                run,
+                step,
+                view,
+                reviewer,
+                question.as_deref(),
+                review_targets,
+            );
+        }
         let stage = CheckpointSpec {
             subject: view.subject.clone(),
             sequence: run.subject.clone(),
@@ -1539,6 +1554,84 @@ impl<R: RuntimeControl> Reconciler<R> {
             judges: vec![judge.clone()],
         };
         self.evaluate_judge(&stage, &judge)
+    }
+
+    fn evaluate_plan_human_judge(
+        &self,
+        run: &PlanRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        reviewer: &str,
+        question: Option<&str>,
+        review_targets: &[String],
+    ) -> Result<JudgeOutcome> {
+        let question = question.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "Approve {}?",
+                step.spec.title.as_deref().unwrap_or(&step.spec.path)
+            )
+        });
+        let fields = BTreeMap::from([
+            ("reviewer".into(), Value::String(reviewer.into())),
+            ("question".into(), Value::String(question)),
+            (
+                "review_targets".into(),
+                Value::Array(review_targets.iter().cloned().map(Value::String).collect()),
+            ),
+            (
+                "decisions".into(),
+                Value::Array(
+                    ["approved", "rejected", "revise"]
+                        .into_iter()
+                        .map(|value| Value::String(value.into()))
+                        .collect(),
+                ),
+            ),
+            ("plan_revision".into(), Value::String(run.revision.clone())),
+            (
+                "step_definition".into(),
+                Value::String(view.definition_hash.clone()),
+            ),
+            ("attempt".into(), Value::from(view.attempt)),
+        ]);
+        let request_hash = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&fields)?));
+        let request = self.store.append_claim(&ClaimInput {
+            subject: view.subject.clone(),
+            kind: "review.requested".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "review-request:{}:{}",
+                view.subject,
+                &request_hash[..24]
+            )),
+        })?;
+        let decision = self
+            .store
+            .latest_claim(&view.subject, Some("review.decision"))?;
+        match decision.as_ref().and_then(|claim| {
+            (claim.actor.as_deref() == Some(reviewer)
+                && claim
+                    .body
+                    .pointer("/fields/request")
+                    .and_then(Value::as_str)
+                    == Some(request.id.as_str()))
+            .then(|| {
+                claim
+                    .body
+                    .pointer("/fields/decision")
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+        }) {
+            Some("approved") => Ok(JudgeOutcome::Pass),
+            Some("rejected") => Ok(JudgeOutcome::Fail(
+                "the human reviewer rejected the work".into(),
+            )),
+            _ => Ok(JudgeOutcome::Pending),
+        }
     }
 
     fn step_timed_out(
@@ -2383,7 +2476,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 *time_limit_ms,
                 prompt,
             )?,
-            JudgeSpec::Human { reviewer } => {
+            JudgeSpec::Human { reviewer, .. } => {
                 let decision = self
                     .store
                     .latest_claim(&stage.subject, Some("review.decision"))?;
@@ -3075,7 +3168,19 @@ fn expand_judge(
             }
             environment.insert("ST3_WORKSPACE".into(), run_workspace.into());
         }
-        JudgeSpec::Human { reviewer } => expand(reviewer)?,
+        JudgeSpec::Human {
+            reviewer,
+            question,
+            review_targets,
+        } => {
+            expand(reviewer)?;
+            if let Some(question) = question {
+                expand(question)?;
+            }
+            for target in review_targets {
+                expand(target)?;
+            }
+        }
         JudgeSpec::Deadline { .. } => {}
     }
     Ok(())
@@ -3600,7 +3705,15 @@ subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } 
 version 2
 subgraph {
   plan "review" state="ready" {
-    step "approval" { judges { human "person/nathan" } }
+    step "approval" {
+      title "The candidate change"
+      judges {
+        human "person/nathan" {
+          question "Is the candidate ready?"
+          review "resource/plan-run/${PLAN_RUN}/candidate"
+        }
+      }
+    }
   }
 }
 "#,
@@ -3624,15 +3737,53 @@ subgraph {
             Arc::new(Notify::new()),
         );
         reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .latest_claim(&step, Some("review.requested"))
+            .unwrap()
+            .expect("the human review was not requested");
+        assert_eq!(
+            request
+                .body
+                .pointer("/fields/question")
+                .and_then(Value::as_str),
+            Some("Is the candidate ready?")
+        );
+        assert_eq!(
+            request
+                .body
+                .pointer("/fields/review_targets/0")
+                .and_then(Value::as_str),
+            Some(format!("resource/plan-run/{}/candidate", run.id).as_str())
+        );
         store
             .append_claim(&ClaimInput {
                 subject: step.clone(),
                 kind: "review.decision".into(),
                 actor: Some("person/someone-else".into()),
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("approved".into())),
+                    ("request".into(), Value::String(request.id.clone())),
+                ]),
+                evidence: vec![request.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some("wrong-reviewer".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            "ready"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: step.clone(),
+                kind: "review.decision".into(),
+                actor: Some("person/nathan".into()),
                 fields: BTreeMap::from([("decision".into(), Value::String("approved".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
-                idempotency_key: Some("wrong-reviewer".into()),
+                idempotency_key: Some("unbound-review".into()),
             })
             .unwrap();
         reconciler.reconcile_once().unwrap();
@@ -3645,8 +3796,11 @@ subgraph {
                 subject: step,
                 kind: "review.decision".into(),
                 actor: Some("person/nathan".into()),
-                fields: BTreeMap::from([("decision".into(), Value::String("approved".into()))]),
-                evidence: Vec::new(),
+                fields: BTreeMap::from([
+                    ("decision".into(), Value::String("approved".into())),
+                    ("request".into(), Value::String(request.id.clone())),
+                ]),
+                evidence: vec![request.id],
                 expected_subject: None,
                 idempotency_key: Some("right-reviewer".into()),
             })
