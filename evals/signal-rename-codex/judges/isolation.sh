@@ -10,9 +10,9 @@ while read -r sha; do
   ae=$(git -C "$W" show -s --format='%ae' "$sha")
   files=$(git -C "$W" show --name-only --format='' "$sha" | grep -v '^$' || true)
   case "$ae" in
-    *sig-base@*)  bad=$(echo "$files" | grep -vE '^(signal|beacon)/'            || true) ;;
-    *sig-relay@*) bad=$(echo "$files" | grep -vE '^(signal-relay|beacon-relay)/' || true) ;;
-    *sig-hub@*)   bad=$(echo "$files" | grep -vE '^(signal-hub|beacon-hub)/'    || true) ;;
+    *sig-base@*)  bad=$(echo "$files" | grep -vE '^(signal|beacon)(/|$)'             || true) ;;
+    *sig-relay@*) bad=$(echo "$files" | grep -vE '^(signal-relay|beacon-relay)(/|$)' || true) ;;
+    *sig-hub@*)   bad=$(echo "$files" | grep -vE '^(signal-hub|beacon-hub)(/|$)'     || true) ;;
     *sig-sup@*)   bad=$(echo "$files" | grep -vE '^(config/|package\.json|README\.md|\.gitignore)' || true) ;;
     *) echo "  FAIL: commit $sha by UNEXPECTED author $ae (not a pinned lane owner)"; lane_ok=0; bad="" ;;
   esac

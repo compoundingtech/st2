@@ -6,7 +6,7 @@ The st3 plan owns decomposition, assignment, sequence, nested progress, required
 
 The agents rename the Signal product to Beacon across a base package, two consumers, and the root configuration.
 
-The agents preserve `AbortSignal`, `controller.signal`, signal cancellation options, `SIGTERM`, and other OS signal primitives.
+The agents preserve `AbortSignal`, `controller.signal`, signal cancellation options, `SIGTERM`, and `SIGINT`.
 
 ## Work graph
 
@@ -33,7 +33,11 @@ sig.relay                  sig.hub
 cleanup runs after every terminal result
 ```
 
-Each assigned parent step contains an up-front nested plan. The native driver sends a notification when each durable step becomes ready.
+Each assigned parent step contains an up-front nested plan. st3 publishes one Small Talk message when the parent becomes ready.
+
+Inherited nested steps use that parent message. An explicit nested reassignment publishes a new Small Talk message.
+
+The native driver only transports Small Talk graph messages. It does not create a separate message type or source of truth.
 
 Each lane publishes a `vcs.revision` resource claim. The plan does not infer completion from prose or exported messages.
 

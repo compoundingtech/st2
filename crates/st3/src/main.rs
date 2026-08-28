@@ -112,7 +112,7 @@ enum Command {
         #[command(subcommand)]
         command: WorkCommand,
     },
-    /// Send and receive native graph messages.
+    /// Send and receive Small Talk graph messages.
     Message {
         #[command(subcommand)]
         command: MessageCommand,
@@ -2129,7 +2129,12 @@ async fn run_claim(client: &Client, args: ClaimArgs, json_output: bool) -> Resul
             },
         )
         .await?;
-    print_value(&response, json_output)
+    if json_output {
+        print_value(&response, true)
+    } else {
+        println!("{}", response.id);
+        Ok(())
+    }
 }
 
 async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) -> Result<()> {
@@ -2190,7 +2195,23 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 .into_iter()
                 .find(|step| step.subject == normalized)
                 .with_context(|| format!("step run `{normalized}` does not exist"))?;
-            print_value(&step, json_output)
+            if json_output {
+                print_value(&step, true)
+            } else {
+                println!(
+                    "{}\t{}\t{}",
+                    step.status,
+                    step.assignee.as_deref().unwrap_or("-"),
+                    step.subject
+                );
+                if let Some(title) = step.title {
+                    println!("Title: {title}");
+                }
+                if let Some(goal) = step.goal {
+                    println!("Goal: {goal}");
+                }
+                Ok(())
+            }
         }
         WorkCommand::Claim(args) => post_work(client, "claim", args, json_output).await,
         WorkCommand::Renew(args) => post_work(client, "renew", args, json_output).await,
@@ -2249,7 +2270,20 @@ async fn post_work(
             },
         )
         .await?;
-    print_value(&response, json_output)
+    if json_output {
+        print_value(&response, true)
+    } else {
+        println!("{}\t{}", response.status, response.subject);
+        if action == "claim" {
+            if let Some(title) = response.title {
+                println!("Title: {title}");
+            }
+            if let Some(goal) = response.goal {
+                println!("Goal: {goal}");
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn current_agent_incarnation(client: &Client, actor: &str) -> Result<Option<String>> {
@@ -2715,7 +2749,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .identity
             .as_deref()
             .context("the Pi channel has no identity")?;
-        let _ = catalog.context("the Pi channel has no private driver catalog")?;
+        let _ = catalog.context("the Pi channel has no native driver catalog")?;
         anyhow::ensure!(
             args.argv.is_empty(),
             "the Pi channel takes no provider argv"
@@ -2877,12 +2911,12 @@ async fn run_st2_native_driver(
                     }
                     publish_harness_activity(client, subject, driver, &observed).await?;
                 }
-                if driver == "opencode" {
-                    forward_projected_messages(client, subject, &inbox, &archive, "opencode-server").await?;
+                if driver != "claude" {
+                    forward_projected_messages(client, subject, &inbox, &archive, "native").await?;
                 }
             }
             _ = work_interval.tick(), if driver != "claude" => {
-                forward_ready_work(client, subject, &inbox, &archive).await?;
+                sync_work_messages(client, subject).await?;
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
                     renew_claimed_work(client, subject, minute).await?;
@@ -3021,7 +3055,6 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut delivered = BTreeSet::new();
-    let mut delivered_work = BTreeSet::new();
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
@@ -3103,29 +3136,7 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                 }
             }
             _ = work_interval.tick() => {
-                let work: Vec<StepRunView> = client
-                    .get(&format!("/v1/work?assignee={}", urlencoding::encode(subject)))
-                    .await?;
-                for step in work.into_iter().filter(|step| step.status == "ready") {
-                    if !delivered_work.insert(step.subject.clone()) {
-                        continue;
-                    }
-                    let frame = json!({
-                        "type": "message",
-                        "deliverAs": "steer",
-                        "content": work_notification(&step),
-                        "meta": {
-                            "from": "st3/runtime",
-                            "messageId": step.subject,
-                            "threadId": step.run,
-                            "identity": identity,
-                            "kind": "work.available"
-                        }
-                    });
-                    stdout.write_all(serde_json::to_string(&frame)?.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                }
+                sync_work_messages(client, subject).await?;
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
                     renew_claimed_work(client, subject, minute).await?;
@@ -3266,7 +3277,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                 }
             }
             _ = work_interval.tick() => {
-                forward_ready_work(client, subject, &inbox, &archive).await?;
+                sync_work_messages(client, subject).await?;
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
                     renew_claimed_work(client, subject, minute).await?;
@@ -3277,45 +3288,117 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     }
 }
 
-async fn forward_ready_work(
-    client: &Client,
-    subject: &str,
-    inbox: &Path,
-    archive: &Path,
-) -> Result<()> {
+async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
     const TAG_PREFIX: &str = "st3-work:";
-    let present = st2::message::list_dir(inbox)?
-        .into_iter()
-        .chain(st2::message::list_dir(archive)?)
+    let messages: Vec<MessageView> = client
+        .get(&format!(
+            "/v1/messages?to={}&include_closed=true",
+            urlencoding::encode(subject)
+        ))
+        .await?;
+    let present = messages
+        .iter()
+        .cloned()
         .flat_map(|message| message.tags)
         .filter_map(|tag| tag.strip_prefix(TAG_PREFIX).map(str::to_owned))
         .collect::<BTreeSet<_>>();
     let work: Vec<StepRunView> = client
         .get(&format!(
-            "/v1/work?assignee={}",
+            "/v1/work?assignee={}&include_terminal=true",
             urlencoding::encode(subject)
         ))
         .await?;
-    for step in work.into_iter().filter(|step| step.status == "ready") {
-        if present.contains(&step.subject) {
+    for message in messages
+        .iter()
+        .filter(|message| matches!(message.status.as_str(), "delivered" | "accepted"))
+    {
+        let Some((step_subject, attempt)) = work_message_target(message) else {
+            continue;
+        };
+        if !work_message_was_acknowledged(&work, step_subject, attempt) {
             continue;
         }
-        let content = work_notification(&step);
-        st2::message::send_to_inbox(
-            inbox,
-            "st3/runtime",
-            Some("a plan step is ready"),
-            None,
-            &[format!("{TAG_PREFIX}{}", step.subject)],
-            &content,
-        )?;
+        if message.status == "delivered" {
+            accept_message(client, message, Some(subject)).await?;
+        }
+        close_message(client, &message.subject, Some(subject)).await?;
+    }
+    for step in work
+        .iter()
+        .filter(|step| step.status == "ready" && should_notify_work_message(step, &work))
+    {
+        let tag_value = format!("{}@{}", step.subject, step.attempt);
+        if present.contains(&tag_value) {
+            continue;
+        }
+        let _: MessageView = client
+            .post(
+                "/v1/messages",
+                &work_message_request(subject, step, tag_value),
+            )
+            .await?;
     }
     Ok(())
 }
 
+fn should_notify_work_message(step: &StepRunView, work: &[StepRunView]) -> bool {
+    !work.iter().any(|candidate| {
+        candidate.run == step.run
+            && candidate.assignee == step.assignee
+            && candidate.step.len() < step.step.len()
+            && step.step.starts_with(&format!("{}/", candidate.step))
+    })
+}
+
+fn work_message_target(message: &MessageView) -> Option<(&str, u32)> {
+    message.tags.iter().find_map(|tag| {
+        tag.strip_prefix("st3-work:")
+            .and_then(|value| value.rsplit_once('@'))
+            .and_then(|(step_subject, attempt)| {
+                attempt
+                    .parse::<u32>()
+                    .ok()
+                    .map(|attempt| (step_subject, attempt))
+            })
+    })
+}
+
+fn work_message_was_acknowledged(work: &[StepRunView], step_subject: &str, attempt: u32) -> bool {
+    work.iter().any(|step| {
+        step.subject == step_subject
+            && step.attempt == attempt
+            && matches!(
+                step.status.as_str(),
+                "claimed" | "working" | "completed" | "failed" | "cancelled"
+            )
+    })
+}
+
+fn work_message_request(
+    subject: &str,
+    step: &StepRunView,
+    tag_value: String,
+) -> MessageSendRequest {
+    MessageSendRequest {
+        idempotency_key: format!("work-message:{}:{}", step.subject, step.attempt),
+        from: "st3/runtime".into(),
+        to: subject.into(),
+        content: work_notification(step),
+        title: Some(format!(
+            "Plan step ready: {}",
+            step.title.as_deref().unwrap_or(&step.step)
+        )),
+        in_reply_to: None,
+        tags: vec![
+            format!("st3-work:{tag_value}"),
+            format!("plan-run:{}", step.run),
+        ],
+    }
+}
+
 fn work_notification(step: &StepRunView) -> String {
     format!(
-        "A durable st3 plan step is ready. Run `st3 work show {0}`, then `st3 work claim {0}`. Update it with `st3 work progress {0}`. Finish it with `st3 work complete {0}` or `st3 work fail {0}`.\n\nTitle: {1}\nGoal: {2}",
+        "A durable st3 plan step is ready. This Small Talk message contains the full assignment. Run `st3 work claim {0}` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goal. Use `st3 work progress {0}` only for a material update. Finish with `st3 work complete {0}` or `st3 work fail {0}`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: {1}\nGoal: {2}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
         step.goal
@@ -3474,7 +3557,7 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut delivered_work = BTreeSet::new();
+    let mut delivered = BTreeSet::new();
     let mut renewed_minute = None;
     loop {
         tokio::select! {
@@ -3526,6 +3609,9 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                     .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
                     .await?;
                 for message in messages.into_iter().filter(|message| message.status == "sent") {
+                    if !delivered.insert(message.subject.clone()) {
+                        continue;
+                    }
                     let content = if message.content.starts_with("doc/") {
                         let value: Value = client
                             .get(&format!("/v1/documents/content?reference={}", urlencoding::encode(&message.content)))
@@ -3567,31 +3653,7 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                 }
             }
             _ = work_interval.tick(), if initialized => {
-                let work: Vec<StepRunView> = client
-                    .get(&format!("/v1/work?assignee={}", urlencoding::encode(subject)))
-                    .await?;
-                for step in work.into_iter().filter(|step| step.status == "ready") {
-                    if !delivered_work.insert(step.subject.clone()) {
-                        continue;
-                    }
-                    let notification = json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/claude/channel",
-                        "params": {
-                            "content": work_notification(&step),
-                            "meta": {
-                                "from": "st3/runtime",
-                                "messageId": step.subject,
-                                "threadId": step.run,
-                                "identity": subject,
-                                "kind": "work.available"
-                            }
-                        }
-                    });
-                    stdout.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                }
+                sync_work_messages(client, subject).await?;
                 let minute = unix_minute()?;
                 if renewed_minute != Some(minute) {
                     renew_claimed_work(client, subject, minute).await?;
@@ -3842,7 +3904,7 @@ mod tests {
     }
 
     #[test]
-    fn a_native_driver_gets_one_private_st2_projection() {
+    fn a_native_driver_gets_one_graph_message_projection() {
         let root = tempfile::tempdir().unwrap();
         let (catalog, agent_dir, identity, runtime_id) =
             prepare_native_driver_in("agent/node.worker", root.path()).unwrap();
@@ -3880,7 +3942,7 @@ mod tests {
     }
 
     #[test]
-    fn a_graph_archive_moves_the_private_native_delivery_file() {
+    fn a_graph_archive_moves_the_native_delivery_file() {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
@@ -3909,5 +3971,118 @@ mod tests {
 
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
+    }
+
+    #[test]
+    fn ready_work_is_an_idempotent_graph_message() {
+        let mut step = StepRunView {
+            subject: "step-run/run-1/build".into(),
+            run: "plan-run/run-1".into(),
+            step: "build".into(),
+            definition_hash: "definition".into(),
+            status: "ready".into(),
+            attempt: 2,
+            assignee: Some("agent/worker".into()),
+            title: Some("Build the change".into()),
+            goal: Some("Implement and test the requested change.".into()),
+            worker_reported: false,
+            lease_owner: None,
+            lease_incarnation: None,
+            lease_expires_at_unix_ms: None,
+            blocked_reason: None,
+            not_before_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+
+        let request = work_message_request("agent/worker", &step, "step-run/run-1/build@2".into());
+
+        assert_eq!(request.from, "st3/runtime");
+        assert_eq!(request.to, "agent/worker");
+        assert_eq!(
+            request.idempotency_key,
+            "work-message:step-run/run-1/build:2"
+        );
+        assert_eq!(
+            request.tags,
+            ["st3-work:step-run/run-1/build@2", "plan-run:plan-run/run-1"]
+        );
+        assert!(
+            request
+                .content
+                .contains("st3 work claim step-run/run-1/build")
+        );
+        assert!(
+            request
+                .content
+                .contains("Implement and test the requested change.")
+        );
+        assert!(request.content.contains("Do not use `--json`"));
+
+        let message = MessageView {
+            subject: "message/work".into(),
+            from: request.from,
+            to: request.to,
+            content: request.content,
+            status: "delivered".into(),
+            title: request.title,
+            in_reply_to: request.in_reply_to,
+            tags: request.tags,
+            created_index: 1,
+        };
+        assert_eq!(
+            work_message_target(&message),
+            Some(("step-run/run-1/build", 2))
+        );
+        assert!(!work_message_was_acknowledged(
+            std::slice::from_ref(&step),
+            "step-run/run-1/build",
+            2
+        ));
+        step.status = "claimed".into();
+        assert!(work_message_was_acknowledged(
+            &[step],
+            "step-run/run-1/build",
+            2
+        ));
+    }
+
+    #[test]
+    fn inherited_nested_work_uses_the_parent_message() {
+        let step = |subject: &str, path: &str, assignee: &str| StepRunView {
+            subject: subject.into(),
+            run: "plan-run/run-1".into(),
+            step: path.into(),
+            definition_hash: "definition".into(),
+            status: "ready".into(),
+            attempt: 1,
+            assignee: Some(assignee.into()),
+            title: None,
+            goal: None,
+            worker_reported: false,
+            lease_owner: None,
+            lease_incarnation: None,
+            lease_expires_at_unix_ms: None,
+            blocked_reason: None,
+            not_before_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        let parent = step("step-run/run-1/build", "build", "agent/builder");
+        let inherited = step(
+            "step-run/run-1/build/work/inspect",
+            "build/work/inspect",
+            "agent/builder",
+        );
+        let reassigned = step(
+            "step-run/run-1/build/work/review",
+            "build/work/review",
+            "agent/reviewer",
+        );
+        let work = vec![parent.clone(), inherited.clone(), reassigned.clone()];
+
+        assert!(should_notify_work_message(&parent, &work));
+        assert!(!should_notify_work_message(&inherited, &work));
+        assert!(should_notify_work_message(&reassigned, &work));
     }
 }

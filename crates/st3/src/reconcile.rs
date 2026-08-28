@@ -331,6 +331,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if matches!(observation.status.as_str(), "exited" | "vanished") =>
                 {
                     self.record_member(subject, &observation, false)?;
+                    if !self.member_was_launched_for_selected_desired(&subject.subject)? {
+                        self.perform_start(subject, member, "the desired member revision changed")?;
+                        continue;
+                    }
                     let restart = match member.restart {
                         RestartType::Always => true,
                         RestartType::OnFailure => observation.exit_code != Some(0),
@@ -352,6 +356,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 None => {
                     let prior = self.store.latest_actual_value(&subject.subject)?;
+                    if prior.is_some()
+                        && !self.member_was_launched_for_selected_desired(&subject.subject)?
+                    {
+                        self.perform_start(subject, member, "the desired member revision changed")?;
+                        continue;
+                    }
                     if prior.as_ref().is_some_and(|actual| {
                         matches!(
                             actual_field(actual, "status").and_then(Value::as_str),
@@ -400,6 +410,24 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.evaluate_plan_runs()?;
         self.evaluate_checkpoints(&desired)?;
         Ok(())
+    }
+
+    fn member_was_launched_for_selected_desired(&self, subject: &str) -> Result<bool> {
+        let Some(desired_token) = self.store.selected_desired_token(subject)? else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .claims_for(subject, Some("member.launch"))?
+            .into_iter()
+            .rev()
+            .any(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/desired_token")
+                    .and_then(Value::as_str)
+                    == Some(desired_token.as_str())
+            }))
     }
 
     pub fn attach(&self, runtime_id: &str) -> Result<()> {
@@ -4307,6 +4335,64 @@ subgraph {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn restart_never_starts_a_new_desired_revision() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+                subgraph {
+                  agent "worker" {
+                    workspace "/tmp/one"
+                    command "true"
+                    restart "never"
+                  }
+                }
+            "#,
+            "member-one",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "exited".into(),
+            exit_code: Some(0),
+            incarnation_id: Some("worker-one".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+
+        apply_source(
+            &store,
+            r#"
+                subgraph {
+                  agent "worker" {
+                    workspace "/tmp/two"
+                    command "true"
+                    restart "never"
+                  }
+                }
+            "#,
+            "member-two",
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+
+        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
+        assert_eq!(
+            runtime.started_members.lock().unwrap()[1].workspace,
+            "/tmp/two"
+        );
     }
 
     #[test]

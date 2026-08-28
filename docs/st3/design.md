@@ -2,6 +2,8 @@
 
 Status: this document records the first engineering design.
 
+The letters `ST` in `st3` mean Small Talk.
+
 The plan runtime superseded its authored checkpoint model on 2026-08-27.
 
 See [plan-graph-runtime.md](./plan-graph-runtime.md) for the implemented plan grammar and commands.

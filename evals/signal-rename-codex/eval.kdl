@@ -32,7 +32,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md and follow its boot ritual. The st3 plan owns decomposition, assignment, and sequence. Handle each st3-work notification as durable assigned work. Claim the exact step, publish progress, complete its nested steps, publish each required graph product, and then complete the parent step. Use messages only for exceptions and the required final report. Do not run a blocking wait, trace, poll, or sleep command. End the turn when no assigned work is ready."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Use messages only for blockers and the required final report. End the turn when no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -48,7 +48,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md and follow its boot ritual. The st3 plan owns decomposition, assignment, and sequence. Handle each st3-work notification as durable assigned work. Claim the exact step, publish progress, complete its nested steps, publish each required graph product, and then complete the parent step. Do not start work that st3 has not assigned. Do not run a blocking wait, trace, poll, or sleep command. End the turn when no assigned work is ready."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -64,7 +64,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md and follow its boot ritual. The st3 plan owns decomposition, assignment, and sequence. Handle each st3-work notification as durable assigned work. Claim the exact step, publish progress, complete its nested steps, publish each required graph product, and then complete the parent step. Do not start work that st3 has not assigned. Do not run a blocking wait, trace, poll, or sleep command. End the turn when no assigned work is ready."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -80,7 +80,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md and follow its boot ritual. The st3 plan owns decomposition, assignment, and sequence. Handle each st3-work notification as durable assigned work. Claim the exact step, publish progress, complete its nested steps, publish each required graph product, and then complete the parent step. Do not start work that st3 has not assigned. Do not run a blocking wait, trace, poll, or sleep command. End the turn when no assigned work is ready."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -117,7 +117,7 @@ subgraph {
           }
           step "publish-base-compatibility" {
             title "The base compatibility revision is published"
-            goal "Commit and push the base-only change. Publish resource/plan-run/$PLAN_RUN/base-compatibility with a resource.binding claim. Set kind=vcs.revision, state=published, and revision to git rev-parse HEAD. Cite that revision as evidence."
+            goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/base-compatibility resource.binding --actor agent/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-base-compatibility" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/base-compatibility" {
@@ -157,7 +157,7 @@ subgraph {
           }
           step "publish-relay-revision" {
             title "The relay revision is published"
-            goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Publish resource/plan-run/$PLAN_RUN/relay-revision with kind=vcs.revision, state=published, and revision set to git rev-parse HEAD. Cite that revision as evidence."
+            goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/relay-revision resource.binding --actor agent/sig.relay --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-relay" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/relay-revision" {
@@ -197,7 +197,7 @@ subgraph {
           }
           step "publish-hub-revision" {
             title "The hub revision is published"
-            goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Publish resource/plan-run/$PLAN_RUN/hub-revision with kind=vcs.revision, state=published, and revision set to git rev-parse HEAD. Cite that revision as evidence."
+            goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/hub-revision resource.binding --actor agent/sig.hub --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-hub" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/hub-revision" {
@@ -230,7 +230,7 @@ subgraph {
           }
           step "publish-config-revision" {
             title "The root and config revision is published"
-            goal "Commit and push the supervisor-owned change. Publish resource/plan-run/$PLAN_RUN/config-revision with kind=vcs.revision, state=published, and revision set to git rev-parse HEAD. Cite that revision as evidence."
+            goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/config-revision resource.binding --actor agent/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "rename-root-and-config" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/config-revision" {
@@ -265,7 +265,7 @@ subgraph {
           }
           step "publish-final-base-revision" {
             title "The alias-free base revision is published"
-            goal "Commit and push the base-only cleanup. Publish resource/plan-run/$PLAN_RUN/base-final-revision with kind=vcs.revision, state=published, and revision set to git rev-parse HEAD. Cite that revision as evidence."
+            goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/base-final-revision resource.binding --actor agent/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-final-base" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/base-final-revision" {
@@ -300,7 +300,7 @@ subgraph {
           }
           step "publish-integrated-revision" {
             title "The integrated revision is published"
-            goal "Confirm a clean worktree. Publish resource/plan-run/$PLAN_RUN/integrated-revision with kind=vcs.revision, state=published, and revision set to git rev-parse HEAD. Cite that revision as evidence."
+            goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/integrated-revision resource.binding --actor agent/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "verify-clean-product-cutover" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/integrated-revision" {
@@ -359,7 +359,7 @@ subgraph {
             env { PLAN_RUN "${PLAN_RUN}" }
             token-budget 98304
             time-limit "3m"
-            prompt "Run exactly one evidence command before judgement: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the plan claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and other OS signal primitives."
+            prompt "Run exactly one evidence command before judgement: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the plan claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and SIGINT."
           }
         }
       }
@@ -373,11 +373,11 @@ subgraph {
         plan "work" {
           step "send-final-report" {
             title "Morgan receives the final result"
-            goal "Send exactly one st3 message from sig.sup to local.morgan. Use the tag plan-run:$PLAN_RUN. Do not send an acknowledgement or an interim message. Include the integrated commit and the plan result."
+            goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); st3 message send local.morgan --from sig.sup --subject='Signal rename complete' --tags=plan-run:$PLAN_RUN -m=\"Plan $PLAN_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
           }
           step "publish-report-receipt" {
             title "The final report receipt is published"
-            goal "Publish resource/plan-run/$PLAN_RUN/final-report with kind=coordination.report, state=published, recipient=agent/local.morgan, and message set to the graph message subject. Cite that message subject as evidence."
+            goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/plan-run/$PLAN_RUN/final-report resource.binding --actor agent/sig.sup --field kind=coordination.report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
             depends-on { step "send-final-report" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/final-report" {

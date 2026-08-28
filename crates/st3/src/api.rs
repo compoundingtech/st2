@@ -1022,7 +1022,7 @@ async fn quick_agent(
         driver_body.push_str("dev-channels #true\n");
     }
     driver_body.push_str(
-        "prompt \"Assist the user in this worktree. Use st3 message ls, read, reply, and archive for graph messages.\"\n",
+        "prompt \"Assist the user in this worktree. Use st3 message ls, read, reply, and archive for Small Talk messages.\"\n",
     );
     let kdl = format!(
         "subgraph {{\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",

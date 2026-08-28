@@ -29,7 +29,7 @@ Claim only work that st3 assigns to you. A parent step exposes its nested steps 
 
 Claim and complete each nested step in order. Publish the required resource claim before you complete its publish step.
 
-Use `st3 work progress` for durable status. Use messages only for a blocker, an exception, or the required final report.
+Use `st3 work progress` only for a material status change. Use messages only for a blocker, an exception, or the final report.
 
 ## Product boundary
 
@@ -45,9 +45,13 @@ The final report must go to `local.morgan` after every held-out judge passes. Se
 
 ## Boot ritual
 
-1. Set your status to available.
-2. Drain your inbox.
-3. Read each `st3-work` notification.
-4. Run `st3 work show` for its exact step-run subject.
-5. Claim the work and archive the notification.
-6. End the turn when no assigned work is ready.
+1. Run `st3 message ls`.
+2. Read each message with `st3 message read ID --archive`.
+3. Claim the message's exact step with plain `st3 work claim SUBJECT`.
+4. Run plain `st3 work ls` after a parent claim to find its ready nested step.
+5. Claim, execute, and complete each nested step in order. The claim prints the step goal.
+6. Inherited nested steps do not send separate Small Talk messages.
+7. Do not use `--json` or request help unless a command fails.
+8. The `--evidence` option accepts stored claim IDs only. Omit it for ordinary work.
+9. Publish each required graph product before you complete its publish step.
+10. Complete the parent, drain messages once, and end the turn when no message remains.

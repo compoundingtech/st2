@@ -104,7 +104,13 @@ Predicate dependencies latch after they pass. A later graph change does not move
 
 `assigned-to` makes the step durable work for one declared agent. The step blocks when the agent is not in the desired graph.
 
-The native harness polls the durable work queue. A terminal prompt notification is a hint, not the source of truth.
+The native harness polls the durable work queue. st3 creates one idempotent Small Talk message when an assigned parent becomes ready.
+
+Inherited nested steps use the parent message. A nested step with a different assignee gets its own message.
+
+The native driver transports graph messages to the harness. It does not create a second message source.
+
+A work claim acknowledges and closes its Small Talk message. The durable work state remains the source of truth.
 
 `produces` declares a required graph shape. A worker report enters `verifying` until each product and judge passes.
 

@@ -4,11 +4,13 @@ set -euo pipefail
 : "${PLAN_RUN:?PLAN_RUN must identify the judged plan run}"
 
 printf '\n### plan run claim\n'
-st3 inspect "plan-run/$PLAN_RUN" --json
+st3 inspect "plan-run/$PLAN_RUN" --json \
+  | jq -c '{status: (.status.subjects[0].actual.fields.status // .status.subjects[0].actual.status)}'
 
 printf '\n### durable work state\n'
-st3 work ls --all --json \
-  | jq --arg run "plan-run/$PLAN_RUN" '[.[] | select(.run == $run)]'
+env -u ST_AGENT st3 work ls --all --json \
+  | jq -c --arg run "plan-run/$PLAN_RUN" \
+      '[.[] | select(.run == $run) | {step, status, assignee, updated_at_unix_ms}]'
 
 for product in \
   base-compatibility \
@@ -19,12 +21,17 @@ for product in \
   integrated-revision
 do
   printf '\n### product: %s\n' "$product"
-  st3 inspect "resource/plan-run/$PLAN_RUN/$product" --json
+  st3 inspect "resource/plan-run/$PLAN_RUN/$product" --json \
+    | jq -c '[.recent_claims[] | select(.kind == "resource.binding")][0] | {store_index, actor, fields: (.body.fields // .body)}'
 done
 
-for lane in base relay hub; do
-  printf '\n### %s: last three commits and changed files\n' "$lane"
-  git -C "$lane" log -3 \
-    --format='commit %H%nAuthor: %an <%ae>%nDate: %aI%nSubject: %s' \
-    --name-status
+printf '\n### integrated commits and changed files\n'
+. "$(dirname "$0")/_integrate.sh"
+git -C "$W" log --reverse \
+  --format='commit %H%nAuthor: %an <%ae>%nSubject: %s' \
+  --name-only "$BASE"..HEAD
+
+printf '\n### mechanical results\n'
+for judge in isolation suite-green rename primitive e2e; do
+  bash "$(dirname "$0")/$judge.sh"
 done
