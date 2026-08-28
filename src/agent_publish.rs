@@ -95,6 +95,24 @@ pub struct SourceDigest {
     pub sha256: String,
 }
 
+/// The staging name `axe agent check` requires in place at
+/// `<catalog>/agents/<host>/<identity>/agent.kdl.candidate`.
+const CANDIDATE_SPEC_FILE_NAME: &str = "agent.kdl.candidate";
+
+/// Whether `path` names a canonical KDL declaration source.
+///
+/// The gate exists to keep legacy TOML/JSON declarations out of publication, so it reads the
+/// file name rather than the bytes. `agent.kdl.candidate` is accepted because the prescribed
+/// authoring workflow validates a candidate under exactly that name; rejecting it forced a
+/// second copy of the same bytes to exist during publication.
+fn is_canonical_kdl_spec_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == CANDIDATE_SPEC_FILE_NAME
+        || path.extension().and_then(|value| value.to_str()) == Some("kdl")
+}
+
 impl Candidate {
     fn stage_in(parent: &Path, source: PublishSource) -> Result<Self> {
         let stage = tempfile::Builder::new()
@@ -124,14 +142,13 @@ impl Candidate {
             }
         };
         let spec_path = stage.path().join("agent.kdl");
-        anyhow::ensure!(
-            match &source {
-                PublishSource::Spec(path) =>
-                    path.extension().and_then(|value| value.to_str()) == Some("kdl"),
-                PublishSource::Bundle(_) => true,
-            },
-            "published spec must be canonical KDL"
-        );
+        if let PublishSource::Spec(path) = &source {
+            anyhow::ensure!(
+                is_canonical_kdl_spec_name(path),
+                "spec source must be named `*.kdl` or `{CANDIDATE_SPEC_FILE_NAME}`, found {}",
+                path.display()
+            );
+        }
         let metadata = fs::symlink_metadata(&spec_path)
             .with_context(|| format!("read candidate spec {}", spec_path.display()))?;
         anyhow::ensure!(
