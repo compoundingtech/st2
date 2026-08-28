@@ -1,6 +1,7 @@
 //! Resync end-to-end: carrier change → classified digest-keyed superseded emit → inbox record
-//! ([`06-resync`](../docs/vrs/06-resync/spec.md)). The DING wake past the inbox record is owned by
-//! the existing delivery suite; this proves the resync-specific half against the real ingress.
+//! ([`06-resync`](../docs/vrs/06-resync/spec.md)). This proves the resync-specific ingress half
+//! against the real supervisor; the DING wake past the inbox record is proven by
+//! [`tests/resync_ding.rs`], and the generic delivery transport by the existing delivery suite.
 
 use std::fs;
 use std::path::{Path, PathBuf};
