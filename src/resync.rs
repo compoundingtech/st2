@@ -105,12 +105,25 @@ pub fn watch_set_for(
     this_host: &str,
     profiles: &ResourceProfileRegistry,
 ) -> AgentWatchSet {
+    watch_set_for_in_catalog(spec, std::slice::from_ref(spec), this_host, profiles)
+}
+
+/// [`watch_set_for`] with the catalog view a `notify-chain` profile needs to reach the carriers
+/// this agent's `supervisor` ancestors declare. Without the other specs, chain carriers cannot be
+/// resolved and only the agent's own carriers are produced.
+pub fn watch_set_for_in_catalog(
+    spec: &AgentSpec,
+    specs: &[AgentSpec],
+    this_host: &str,
+    profiles: &ResourceProfileRegistry,
+) -> AgentWatchSet {
     let refresh = profiles.begin_refresh();
-    resolve_watch_set(spec, this_host, &refresh).0
+    resolve_watch_set(spec, specs, this_host, &refresh).0
 }
 
 fn resolve_watch_set(
     spec: &AgentSpec,
+    specs: &[AgentSpec],
     this_host: &str,
     profiles: &ResourceProfileRefresh<'_>,
 ) -> (AgentWatchSet, Vec<String>) {
@@ -173,6 +186,14 @@ fn resolve_watch_set(
             containment_root: None,
         });
     }
+    append_chain_carriers(
+        spec,
+        specs,
+        this_host,
+        profiles,
+        &mut carriers,
+        &mut diagnostics,
+    );
     // The supervisor's resolved logical host — not the OS hostname — decides the bus id, so an
     // agent supervised under `st2 up --host <alias>` without an explicit declaration host still
     // produces a recipient `resolve_stream` can resolve.
@@ -197,6 +218,97 @@ fn resolve_watch_set(
 /// 3986. Unsupported file URI authorities, query/fragment components,
 /// malformed escapes, encoded path separators, and encoded parent components have no local
 /// denotation.
+/// Carriers this agent's `supervisor` ancestors declare through a `notify-chain` profile.
+///
+/// A profile whose layers compose along the supervisor edge leaves every descendant's effective
+/// view dependent on carriers the descendant does not own. Resync notifies a carrier's owner, so
+/// without this the descendant is never told its view changed.
+///
+/// The walk deliberately reuses each ancestor's OWN declared URI rather than synthesizing one:
+/// st2 does not own any profile's URI grammar, and a resolver is free to ignore the authority
+/// component entirely, so a synthesized subject would be a guess. Resolving the ancestor's
+/// declaration against the ancestor's directory is the identical call the ancestor's own
+/// subscription makes, which is what keeps containment unchanged — the guest is still only ever
+/// asked to resolve one agent's URI against that agent's own directory.
+///
+/// Matching is by profile scheme, never by binding label: labels are agent-local and replaceable,
+/// so keying on them would silently drop a layer whose owner renamed its binding.
+fn append_chain_carriers(
+    spec: &AgentSpec,
+    specs: &[AgentSpec],
+    this_host: &str,
+    profiles: &ResourceProfileRefresh<'_>,
+    carriers: &mut Vec<WatchableCarrier>,
+    diagnostics: &mut Vec<String>,
+) {
+    let chain_schemes: Vec<&str> = spec
+        .resources
+        .iter()
+        .filter(|resource| resource.inactive_reason().is_none())
+        .filter_map(|resource| resource.uri().split_once(':').map(|(scheme, _)| scheme))
+        .filter(|scheme| profiles.get(scheme).is_some_and(|p| p.notify_chain()))
+        .collect();
+    if chain_schemes.is_empty() {
+        return;
+    }
+
+    let ancestors = match crate::supervisor_chain::ancestors(specs, spec, this_host) {
+        Ok(ancestors) => ancestors,
+        Err(error) => {
+            diagnostics.push(format!(
+                "resync notify-chain for {}: supervisor chain is unwalkable ({error:?}); \
+                 ancestor carriers are unwatchable",
+                spec.bus_id(this_host)
+            ));
+            return;
+        }
+    };
+
+    for ancestor in ancestors {
+        // Skip and continue, never sever: a retired ancestor contributes no layer, but its own
+        // ancestors still do. `is_retired` normalizes both declaration spellings.
+        if ancestor.desired_state.is_retired() {
+            continue;
+        }
+        let ancestor_declaration = lexical_clean(&ancestor.path);
+        let ancestor_dir = ancestor_declaration.parent().unwrap_or(Path::new("."));
+        let ancestor_bus_id = ancestor.bus_id(this_host);
+        for resource in &ancestor.resources {
+            if resource.inactive_reason().is_some() {
+                continue;
+            }
+            let Some((scheme, _)) = resource.uri().split_once(':') else {
+                continue;
+            };
+            if !chain_schemes.contains(&scheme) {
+                continue;
+            }
+            match profiles.try_resolve(ancestor_dir, resource.uri()) {
+                Ok(Some(resolution)) => {
+                    let Some(class) = carrier_class(resolution.class) else {
+                        continue;
+                    };
+                    carriers.push(WatchableCarrier {
+                        // Qualifying by owner keeps each ancestor's layer on its own supersession
+                        // key, so a burst on one ancestor cannot collapse another's event.
+                        label: format!("{}@{ancestor_bus_id}", resource.name()),
+                        path: resolution.path,
+                        class,
+                        containment_root: Some(resolution.containment_root),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => diagnostics.push(format!(
+                    "resync notify-chain for {}: ancestor {ancestor_bus_id} resource '{}': \
+                     {error}; that ancestor layer is unwatchable",
+                    spec.bus_id(this_host),
+                    resource.name()
+                )),
+            }
+        }
+    }
+}
+
 fn resolve_local_path(agent_dir: &Path, uri: &str) -> Option<PathBuf> {
     if let Some((scheme, scheme_specific)) = uri.split_once(':').filter(|(scheme, _)| {
         !scheme.is_empty()
@@ -446,7 +558,7 @@ impl ResyncSupervisor {
             .filter(|spec| spec.desired_state.is_running())
             .map(|spec| {
                 let (set, mut failures) =
-                    resolve_watch_set(spec, this_host, &refresh_profiles);
+                    resolve_watch_set(spec, specs, this_host, &refresh_profiles);
                 diagnostics.append(&mut failures);
                 set
             })
@@ -483,7 +595,15 @@ impl ResyncSupervisor {
                 .profiles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            resolve_watch_set(spec, this_host, &profiles.begin_refresh())
+            // Only this spec is in hand, so a `notify-chain` binding resolves no ancestor
+            // carriers here; the next full refresh adds them. Those subscriptions seed silently,
+            // so an ancestor carrier change inside that window is not announced at all.
+            resolve_watch_set(
+                spec,
+                std::slice::from_ref(spec),
+                this_host,
+                &profiles.begin_refresh(),
+            )
         };
         let (ack_tx, ack_rx) = channel();
         if self
@@ -2989,7 +3109,8 @@ mod tests {
         );
         let refresh = profiles.begin_refresh();
         let spec = discover(tmp.path());
-        let (set, diagnostics) = resolve_watch_set(&spec, "hetz", &refresh);
+        let (set, diagnostics) =
+            resolve_watch_set(&spec, std::slice::from_ref(&spec), "hetz", &refresh);
         assert!(!set.carriers.iter().any(|c| c.label == "goal"));
         assert!(set.carriers.iter().any(|c| c.label == "declaration"));
         assert!(!set.carriers.iter().any(|c| c.label == "issue"));
@@ -3026,7 +3147,8 @@ mod tests {
         );
         let refresh = profiles.begin_refresh();
         let spec = discover(tmp.path());
-        let (set, diagnostics) = resolve_watch_set(&spec, "hetz", &refresh);
+        let (set, diagnostics) =
+            resolve_watch_set(&spec, std::slice::from_ref(&spec), "hetz", &refresh);
         assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
         assert!(
             diagnostics.is_empty(),
