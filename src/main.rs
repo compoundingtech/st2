@@ -192,7 +192,7 @@ enum Command {
         dirs: Vec<PathBuf>,
     },
     /// Run an st2-spec eval end to end: copy the fixture, boot the team + judges, deliver the
-    /// kickoff, wait for the sup's confirmation, run the judges → verdict. `st2 eval ./cells/<name>/`.
+    /// kickoff, wait for the sup's confirmation, run the judges → verdict. `st2 eval ./evals/<name>/`.
     Eval {
         /// The eval folder (or its `.kdl` spec file).
         folder: PathBuf,

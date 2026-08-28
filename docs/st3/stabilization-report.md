@@ -6,19 +6,19 @@ This report records the Codex-only stabilization work from 2026-08-27.
 
 The generated migration tree contains 58 eval KDL files.
 
-Opaque Codex cells: 16.
+Opaque Codex evals: 16.
 
-Opaque Claude cells: 26.
+Opaque Claude evals: 26.
 
-Native Codex cells: 0.
+Native Codex evals: 0.
 
-Native Claude cells: 0.
+Native Claude evals: 0.
 
 The migrator preserves typed source driver blocks. It does not infer a driver from an opaque command.
 
-The source owners must rewrite the 42 affected cells before the final migration.
+The source owners must rewrite the 42 affected evals before the final migration.
 
-The three local practice cells use native Codex drivers. They do not use a provider command string.
+The three local practice evals use native Codex drivers. They do not use a provider command string.
 
 ## Deterministic verification
 

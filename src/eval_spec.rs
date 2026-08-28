@@ -90,7 +90,7 @@ pub struct Eval {
     /// set, a dead team seat is respawned FROM THE SPEC (full env re-applied → it rejoins the bus cold),
     /// so a fault-injector can restart/crash a seat mid-run and the recovery is exercised. Absent →
     /// boot-once (the default; the seats are booted once and not respawned) — unchanged for every other
-    /// cell. Recovery remains respawn-from-spec rather than `pty restart`, so eval supervision stays
+    /// eval. Recovery remains respawn-from-spec rather than `pty restart`, so eval supervision stays
     /// owned by st2 even though PTY metadata can now restore the managed environment manually.
     pub supervise: bool,
     /// Opt-in: after `copy` and `run` finish, discover the eval team from canonical Agent Specs in
@@ -352,7 +352,7 @@ fn parse_native_driver(node: &KdlNode) -> anyhow::Result<Driver> {
 /// Parse a flat `run "label" { … }` node into one [`RunStep`], appended in order. The `run` node IS
 /// one step: its arg is the label, its body holds the command directly. Multiple `run "label"` nodes in
 /// the eval block run in file order. (The old nested `run { step … }` wrapper was retired once every
-/// cell moved to the flat form — a `run` with no label is now an error.)
+/// eval moved to the flat form — a `run` with no label is now an error.)
 fn parse_run_stage(node: &KdlNode, out: &mut Vec<RunStep>) -> anyhow::Result<()> {
     let label = arg(node).ok_or_else(|| {
         anyhow::anyhow!("run needs a label: write `run \"label\" {{ command … }}`")
@@ -1419,7 +1419,7 @@ team "mix" {
     #[test]
     fn nested_run_step_form_is_rejected() {
         // The old `run { step … }` wrapper was retired: a `run` with no label is now an error
-        // (every cell uses the flat `run "label" { … }` form).
+        // (every eval uses the flat `run "label" { … }` form).
         let err = parse_spec(
             "eval {\n  max-timeout \"2m\"\n  run {\n    step \"render\" { command \"x\" }\n  }\n  \
              judges { judge \"ok\" { exec \"true\" } }\n}\n",

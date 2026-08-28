@@ -4,27 +4,41 @@ Date: 2026-08-28
 
 Source: `compoundingtech/evals` at `3db48ab56d40ce27dfd94f89d2db9b692d93836a`.
 
-This review covers all 58 active source cells. It also considers the four cells that the source already retired.
+This review covers all 58 active source evals. It also considers the four evals that the source already retired.
+
+The source repository calls these units cells. This repository calls each unit an eval.
 
 ## Recommendation
 
-Archive the source repository after the selected cells and evidence enter this repository.
+Archive the source repository after the selected evals and evidence enter this repository.
 
-Do not copy every cell as a KDL eval. Product behavior with strong Rust coverage belongs in the Rust suite.
+Do not copy every eval as KDL. Product behavior with strong Rust coverage belongs in the Rust suite.
 
 Use one logical eval for one behavior. A Claude or Codex variant is a harness choice, not a new eval.
 
-The proposed result has 26 logical evals:
+The proposed result has 19 logical evals:
 
 - Three logical evals already exist here.
-- Twenty-three new logical evals come from 25 source cells.
-- One source cell merges into an existing eval.
-- Twelve source cells remain as Rust coverage.
-- Fourteen research or rejected-control cells do not enter the active corpus.
+- Sixteen new logical evals come from 18 source evals.
+- Three source evals merge into retained evals.
+- Twelve source evals remain as Rust coverage.
+- Nineteen research, overlapping, or rejected-control evals do not enter the active corpus.
 
-The source catalog lists accepted pass evidence for seven cells. Most cells have no structured run record.
+The source catalog lists accepted pass evidence for seven evals. Most evals have no structured run record.
 
 Selection therefore depends on the product contract. It does not depend only on a historic green result.
+
+The final corpus has ten model-free evals and nine paid evals. The nine paid evals include the three existing evals.
+
+## Paid eval admission rule
+
+A paid eval must expose a unique product failure. A cheaper Rust or model-free test must not cover the same failure.
+
+The eval must have a strong held-out judge. A vague model-quality score does not earn a place in the active corpus.
+
+The eval must also have a named run trigger. We do not run every paid eval after every change.
+
+A candidate remains outside the active corpus until one baseline run proves that its judge works.
 
 ## Decision terms
 
@@ -36,41 +50,41 @@ Selection therefore depends on the product contract. It does not depend only on 
 
 `Rust` means that we should not keep a second KDL copy. The named Rust tests own the contract.
 
-`Archive` means that the source Git history remains the record. The active corpus does not copy the cell.
+`Archive` means that the source Git history remains the record. The active corpus does not copy the eval.
 
 ## Complete classification
 
-| Source cell | Decision | Target or owner | Reason |
+| Source eval | Decision | Target or owner | Reason |
 | --- | --- | --- | --- |
 | `adopt-only-migration` | Rust | `tests/reconcile.rs`, `tests/run.rs` | The Rust suite covers live adoption, absent hold, dead hold, and explicit replacement. |
 | `agent-spec-resource-bindings` | Rust | `crates/agent-spec/tests/discovery.rs`, `tests/validate.rs`, `tests/reconcile.rs` | The Rust suite covers parsing, stable projection, and no-restart resource edits. |
 | `assignment-contract-cold-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
 | `assignment-contract-cold-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
-| `assignment-contract-cold-resources` | Keep, wave 1 | `resource-cold-start` | Preserve cold discovery from one named work resource. Add an explicit st3 plan assignment. |
+| `assignment-contract-cold-resources` | Keep, wave 1 | Model-free `resource-cold-start` | Test graph assignment and resource readiness without paying a model. |
 | `assignment-contract-handoff-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
 | `assignment-contract-handoff-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
-| `assignment-contract-handoff-resources` | Keep, wave 1 | `resource-handoff` | Preserve revoke-before-grant handoff and post-revocation safety. |
+| `assignment-contract-handoff-resources` | Keep, wave 1 | Model-free `resource-handoff` | Test revoke-before-grant handoff and post-revocation safety without paying a model. |
 | `assignment-contract-hot-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
 | `assignment-contract-hot-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
-| `assignment-contract-hot-resources` | Keep, wave 1 | `resource-retarget` | Preserve live retarget, removal, and idle behavior. |
-| `context-resource-continuity` | Keep, wave 1 | `context-resource-continuity` | This fast cell crosses the real lifecycle boundary and checks durable state together. |
-| `crash-ding` | Keep, wave 1 | `crash-escalation` | Keep a free synthetic core. Add a rare native-harness probe for provider exit behavior. |
+| `assignment-contract-hot-resources` | Keep, wave 1 | Model-free `resource-retarget` | Test retarget, removal, and idle graph states without paying a model. |
+| `context-resource-continuity` | Keep, wave 1 | `context-resource-continuity` | This fast eval crosses the real lifecycle boundary and checks durable state together. |
+| `crash-ding` | Keep, wave 1 | Model-free `crash-escalation` | Crash classification and escalation are mechanical runtime behavior. |
 | `ding-mode` | Merge | `license-mit` | License MIT already covers delegated work over Small Talk. Keep only missing message assertions. |
-| `ding-reply` | Keep, wave 1 | `small-talk-reply` | Preserve the requirement that an agent replies on the original thread. Remove the obsolete no-MCP claim. |
-| `docs` | Keep, wave 2 | `docs-cold-reader` | The cold-reader judge tests usable documentation, not keyword coverage. |
+| `ding-reply` | Merge | `license-mit` | Add a threaded-reply assertion to License MIT. A separate paid agent does not earn its cost. |
+| `docs` | Archive | Source history | The cold-reader idea is good, but three paid seats test model writing more than runtime behavior. |
 | `exec-lifecycle-logging` | Rust | `tests/exec_backend.rs` | The Rust suite covers process lifetime, logs, rotation, adoption, and group teardown. |
-| `feature-fit` | Keep, wave 2 | `feature-fit` | This tests convention discovery in an existing codebase. |
+| `feature-fit` | Archive | Source history | Ghost bug and Signal rename already cover work in an existing codebase. |
 | `fork-in-the-road` | Keep, wave 1 | `fork-in-the-road` | Merge the provider twins. The scenario tests parallel analysis, synthesis, and a real tradeoff. |
 | `fork-in-the-road-codex` | Keep, wave 1 | `fork-in-the-road` | This is the same logical eval and carries accepted pass evidence. |
 | `ghost-bug` | Represented | `ghost-bug` | The local Codex pair represents both source provider forms. |
 | `ghost-bug-codex` | Represented | `ghost-bug` | The local Codex pair represents both source provider forms. |
 | `hook-integrity` | Rust | `tests/hooks.rs`, `tests/materialize.rs`, `tests/claude_hooks.rs`, `tests/codex_hooks.rs` | The Rust suite covers receipts, verification, native overlays, and idempotency. |
 | `host-lock-health-negatives` | Rust | `tests/doctor.rs` | The Rust suite covers required, stale, foreign, and bounded-failure lock states. |
-| `inbox-hygiene` | Keep, wave 1 | `small-talk-redelivery` | Rewrite it around graph work IDs and idempotent claims. Do not use an agent-private ledger as truth. |
-| `incident-response` | Keep, wave 2 | `incident-response` | It tests mitigation, root cause, and a mutation-valid regression. |
+| `inbox-hygiene` | Merge | `restart-continuity` | Inject duplicate delivery during the restart eval. One durability eval should cover both failures. |
+| `incident-response` | Archive | Source history | Its core root-cause workflow overlaps Ghost bug and costs two seats. |
 | `license-mit` | Represented | `license-mit` | The local Claude pair represents both source provider forms. |
 | `license-mit-codex` | Represented | `license-mit` | The local Claude pair represents both source provider forms. |
-| `migration` | Keep, wave 2 | `dependency-migration` | It tests migration breadth and preservation of a removed capability. |
+| `migration` | Archive | Source history | Its broad code migration overlaps the stronger Signal rename eval. |
 | `poisoned-pr` | Keep, wave 2 | `poisoned-pr` | Merge the provider twins. This gives the corpus a strong review-only lane. |
 | `poisoned-pr-codex` | Keep, wave 2 | `poisoned-pr` | This is the same logical eval and carries accepted pass evidence. |
 | `presence-ding-matrix` | Rust | `src/ding/mod.rs` tests | The Rust suite covers busy, away, DND, stale DND, FIFO, and retry behavior. |
@@ -80,11 +94,11 @@ Selection therefore depends on the product contract. It does not depend only on 
 | `reconcile-retire-keep` | Rust | `tests/reconcile.rs` | The Rust suite covers missing, dead, keep, retired, and adopt lifecycle rules. |
 | `render-target-safety` | Rust | `tests/materialize.rs` | The Rust suite covers directives, idempotency, tracked targets, and unsafe paths. |
 | `restart-continuity` | Keep, wave 1 | `restart-continuity` | Lift the full work plan and progress into the st3 graph before the injected restart. |
-| `security-audit` | Keep, wave 2 | `security-audit` | This tests whole-repository analysis, severity, and false-positive discipline. |
+| `security-audit` | Archive | Source history | Poisoned PR gives a sharper security discriminator with the same two-seat cost. |
 | `shared-workspace-render-ownership` | Rust | `tests/materialize.rs`, `tests/validate.rs` | The Rust suite covers conflicting ownership and identical shared claims. |
 | `signal-rename` | Represented | `signal-rename` | The local Codex pair represents both source provider forms. |
 | `signal-rename-codex` | Represented | `signal-rename` | The local Codex pair represents both source provider forms. |
-| `skill-inheritance` | Keep, wave 2 | `claude-skill-inheritance` | This is a useful Claude package and project-skill integration check. |
+| `skill-inheritance` | Keep, wave 2 | `claude-skill-inheritance` | This is a useful Claude package and project-skill integration eval. |
 | `st2-doctor-structure` | Rust | `tests/doctor.rs` | The Rust suite checks healthy and broken catalogs with mutation-valid failures. |
 | `st2-network` | Keep, wave 1 | Model-free network smoke | Keep one black-box proof that hosting and message delivery work together. |
 | `strict-validation-json` | Rust | `tests/validate.rs` | The Rust suite covers stable issue data and strict warning promotion. |
@@ -101,25 +115,25 @@ Selection therefore depends on the product contract. It does not depend only on 
 | `vrs-scope-pressure-present` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
 | `weird-git-setup` | Keep, wave 2 | `weird-git-setup` | This is a real launch environment edge case and has accepted pass evidence. |
 
-## Why the selected resource cells survive
+## Why the selected resource evals survive
 
-The nine assignment cells form a three-by-three experiment. The source project selected direct named resources.
+The nine assignment evals form a three-by-three experiment. The source project selected direct named resources.
 
 The Focus and old Assignment forms remain controls. They should not become new st3 product layers.
 
 This decision does not remove plan assignment from st3. An st3 plan step still has an explicit agent assignment.
 
-The new cells should test three different events:
+The new model-free evals should test three different events:
 
-- A cold agent discovers ready work.
-- A live agent receives a new resource target and later becomes idle.
-- One agent loses authority before another agent receives authority.
+- A cold assignment becomes ready and creates one delivery action.
+- A live assignment receives a new resource target and later becomes idle.
+- One subject loses authority before another subject receives authority.
 
-The st3 forms should use plans, steps, resources, claims, and Small Talk. They should not copy the old controller tricks.
+The evals should inspect plans, resources, claims, and Small Talk actions directly. They should not pay models to confirm mechanical state.
 
 ## Why the VRS pairs do not enter the active corpus
 
-The eight VRS cells form four matched prompt experiments. They test the effect of governance documents on model behavior.
+The eight VRS evals form four matched prompt experiments. They test the effect of governance documents on model behavior.
 
 That research can remain useful. It is not a runtime acceptance contract, and none of the pairs has structured run evidence.
 
@@ -139,6 +153,8 @@ The st3 form must lift the work plan, step state, assignment, products, and judg
 
 The graph must hold durable work state. Agent prose and a private todo file must not be the only state.
 
+The combined restart eval distinguishes at-least-once execution from one accepted product for each stable work ID.
+
 The st3 form must use Small Talk for direct coordination. It must not add a private message channel.
 
 Codex `gpt-5.6-sol` is the default model judge. A specific eval can choose a Claude judge and record the reason.
@@ -151,19 +167,33 @@ Every paid run must add a dated report. The report records duration, token use, 
 
 Wave 1 proves the runtime:
 
-1. Import the six model-free lifecycle, PTY, and network contracts.
-2. Rewrite restart continuity and Small Talk redelivery around durable graph state.
-3. Rewrite the three selected resource scenarios.
-4. Add crash escalation and threaded reply.
-5. Merge the fork-in-the-road provider twins and lift its parallel plan into the graph.
+1. Import ten model-free lifecycle, PTY, network, resource, and crash contracts.
+2. Add threaded-reply and delegation assertions to License MIT.
+3. Rewrite restart continuity with duplicate delivery and durable graph state.
+4. Merge the fork-in-the-road provider twins and lift its parallel plan into the graph.
 
 Wave 2 broadens agent work:
 
-1. Import poisoned PR, docs, test writing, and weird Git setup.
-2. Import feature fit, incident response, dependency migration, and security audit.
-3. Import Claude skill inheritance as a provider integration cell.
+1. Import Poisoned PR as the review-only and security eval.
+2. Import Test writing as the mutation-scored quality eval.
+3. Import Weird Git setup as the worktree launch eval.
+4. Import Claude skill inheritance as a provider integration eval.
 
-Rust-owned cells do not wait for these waves. Before source archival, run their named suites and close any missing assertion.
+Rust-owned evals do not wait for these waves. Before source archival, run their named suites and close any missing assertion.
+
+## Paid run triggers
+
+| Eval | Unique paid value | Run trigger |
+| --- | --- | --- |
+| `license-mit` | Claude team startup, delegation, threaded Small Talk, and confirmation | Claude harness, Small Talk, or delegation changes |
+| `ghost-bug` | The cheapest Codex multi-agent debugging path | Routine Codex team smoke testing |
+| `signal-rename` | A complex plan with parallel code work, products, integration, and a green review state | Plan graph, dependency, product, or multi-agent changes |
+| `fork-in-the-road` | Parallel independent analysis followed by synthesis of a real tradeoff | Concurrency and synthesis milestones only |
+| `restart-continuity` | Cold restart, duplicate delivery, and durable graph progress in one scenario | Restart, redelivery, lease, or durable work-state changes |
+| `poisoned-pr` | A review-only lane with a hard security finding and request-changes verdict | Review judgement or review-only lane changes |
+| `test-writing` | Mutation scoring detects coverage theater | Judge execution, fixture isolation, or result-report changes |
+| `weird-git-setup` | A real linked-worktree launch and commit boundary | Workspace, worktree, or launch-path changes |
+| `claude-skill-inheritance` | Actual project and plugin skill loading in the Claude harness | Claude package, plugin, or project-skill changes |
 
 ## Archive gate
 
@@ -175,6 +205,6 @@ The source repository can become read-only when all items below are true:
 - The local inventory generates from the embedded corpus.
 - The old overnight runner has no unique production duty.
 - The source repository README points to this repository and its exact corpus location.
-- One final script proves that all 58 active source cells have one decision in this review.
+- One final script proves that all 58 active source evals have one decision in this review.
 
-The four source-retired cells remain retired: `clean-compose`, `compose-config-load`, `compose-global-skill`, and `team-standup`.
+The four source-retired evals remain retired: `clean-compose`, `compose-config-load`, `compose-global-skill`, and `team-standup`.

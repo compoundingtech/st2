@@ -6,12 +6,8 @@ use anyhow::{Context as _, Result};
 use tar::{Archive, Builder, EntryType, Header};
 use walkdir::WalkDir;
 
-pub fn archive_cell(root: &Path) -> Result<Vec<u8>> {
-    anyhow::ensure!(
-        root.is_dir(),
-        "eval cell {} is not a directory",
-        root.display()
-    );
+pub fn archive_eval(root: &Path) -> Result<Vec<u8>> {
+    anyhow::ensure!(root.is_dir(), "eval {} is not a directory", root.display());
     let mut files = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
@@ -21,12 +17,12 @@ pub fn archive_cell(root: &Path) -> Result<Vec<u8>> {
         let metadata = fs::symlink_metadata(entry.path())?;
         anyhow::ensure!(
             !metadata.file_type().is_symlink(),
-            "eval cell contains symbolic link {}",
+            "eval contains symbolic link {}",
             entry.path().display()
         );
         anyhow::ensure!(
             metadata.is_dir() || metadata.is_file(),
-            "eval cell contains special file {}",
+            "eval contains special file {}",
             entry.path().display()
         );
         if metadata.is_file() {
@@ -56,7 +52,7 @@ pub fn archive_cell(root: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn hydrate_cell(bytes: &[u8], destination: &Path) -> Result<()> {
+pub fn hydrate_eval(bytes: &[u8], destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     let mut archive = Archive::new(Cursor::new(bytes));
     for entry in archive.entries()? {
@@ -134,11 +130,11 @@ mod tests {
         fs::create_dir(source.path().join("_git")).unwrap();
         fs::write(source.path().join("_git/config"), "test").unwrap();
         fs::write(source.path().join("eval.kdl"), "subgraph {}").unwrap();
-        let one = archive_cell(source.path()).unwrap();
-        let two = archive_cell(source.path()).unwrap();
+        let one = archive_eval(source.path()).unwrap();
+        let two = archive_eval(source.path()).unwrap();
         assert_eq!(one, two);
         let output = tempfile::tempdir().unwrap();
-        hydrate_cell(&one, output.path()).unwrap();
+        hydrate_eval(&one, output.path()).unwrap();
         assert_eq!(
             fs::read_to_string(output.path().join(".git/config")).unwrap(),
             "test"

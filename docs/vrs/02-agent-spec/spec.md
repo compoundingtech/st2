@@ -592,7 +592,7 @@ replacement of drifted work.
   published view under the lock and bind the policy profile in its receipt.
 - **G11, F19 canonical ownership:** st2 admits, lowers, authors, and runs the
   `stream` field, but the canonical evals `AGENT-SPEC.md` and its maintained
-  acceptance cells do not yet define or prove that capability. Until the
+  acceptance evals do not yet define or prove that capability. Until the
   matching evals change lands, st2's stream implementation is ahead of the
   authoring authority rather than conformant to it.
 

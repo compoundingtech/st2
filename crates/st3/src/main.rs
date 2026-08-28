@@ -13,7 +13,7 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use st3::api::{AppState, router, serve_tcp, serve_unix};
-use st3::archive::archive_cell;
+use st3::archive::archive_eval;
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
 use st3::model::{
@@ -84,7 +84,7 @@ enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
-    /// Run one explicit eval cell.
+    /// Run one explicit eval.
     Eval(EvalArgs),
     /// Show the current claims view.
     Status(StatusArgs),
@@ -306,7 +306,7 @@ enum DocCommand {
 
 #[derive(Args)]
 struct EvalArgs {
-    cell: PathBuf,
+    eval: PathBuf,
 }
 
 #[derive(Args)]
@@ -2609,13 +2609,13 @@ async fn run_judgement(client: &Client, args: JudgementArgs, json_output: bool) 
 }
 
 async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<()> {
-    let bundle = archive_cell(&args.cell)?;
+    let bundle = archive_eval(&args.eval)?;
     let bundle_hash = hex::encode(Sha256::digest(&bundle));
     let name = args
-        .cell
+        .eval
         .file_name()
         .and_then(|name| name.to_str())
-        .context("the eval cell name is not UTF-8")?
+        .context("the eval name is not UTF-8")?
         .to_owned();
     let started: EvalStartResponse = client
         .post(

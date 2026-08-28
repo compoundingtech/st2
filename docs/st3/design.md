@@ -103,7 +103,7 @@ The first node is checkpoint zero and describes the initial graph. The last node
 
 Position defines both roles. The format has no separate `initial`, `transition`, or `final` node type.
 
-This shape matches the source intent and keeps an eval cell and a plan structurally equal.
+This shape matches the source intent and keeps an eval and a plan structurally equal.
 
 ## Required interpretations
 
@@ -134,7 +134,7 @@ The reconciler does not poll the clock or wake itself to search for work.
 
 ### Explicit filesystem input
 
-`st3 import ./catalog` reads the named catalog. `st3 eval ./cell` reads the named eval cell.
+`st3 import ./catalog` reads the named catalog. `st3 eval ./eval` reads the named eval.
 
 The CLI makes a deterministic input from that explicit path. It does not read paths named by `doc/` references or discover other files.
 
@@ -287,7 +287,7 @@ The API uses these common failures:
 | `POST /v1/messages` | Sender, recipient, content, close judges, subject tokens, and an idempotency key | The message claim, token, and delivery action ID |
 | `POST /v1/messages/{message_id}/claims` | An agent lifecycle claim or a judge close verdict | The lifecycle claim and current message token |
 | `POST /v1/judgements` | A running judge verdict, its operation capability, reason, and evidence claim IDs | The durable judge result claim and store index |
-| `POST /v1/evals` | A deterministic cell bundle, expected subject tokens, and an idempotency key | The eval scope, subject tokens, reconcile subjects, and event cursor |
+| `POST /v1/evals` | A deterministic eval bundle, expected subject tokens, and an idempotency key | The eval scope, subject tokens, reconcile subjects, and event cursor |
 | `GET /v1/evals/{scope}` | An eval scope | Its lifecycle, active checkpoint, verdict, and cleanup state |
 | `POST /v1/claude` | A subject, worktree, driver options, expected subject token, and idempotency key | The agent subject, token, reconcile subject, and event cursor |
 | `POST /v1/sessions/{subject}/context/clear` | An expected incarnation and idempotency key | The recorded control action and result cursor |
@@ -736,11 +736,11 @@ The daemon supplies the recorded origin. The command cannot select another origi
 
 The server records acceptance time. It validates the optional actor and every claim body field against the selected kind schema.
 
-`st3 eval CELL` builds a deterministic archive from the explicitly named cell. It does not discover sibling cells.
+`st3 eval EVAL` builds a deterministic archive from the explicitly named eval. It does not discover sibling evals.
 
 ```text
-eval(cell, json):
-    bundle = archive_explicit_cell(cell)
+eval(eval_dir, json):
+    bundle = archive_explicit_eval(eval_dir)
     started = POST /v1/evals {
         bundle,
         expected_subjects: empty_tokens_for_generated_subjects(bundle)
@@ -2753,9 +2753,9 @@ The coordination checkpoint only observes work. The final checkpoint publishes a
 
 ## One-shot migration rewrite
 
-The server accepts only the new declaration format. It has no compatibility adapter for st2 catalogs or eval cells.
+The server accepts only the new declaration format. It has no compatibility adapter for st2 catalogs or evals.
 
-A temporary repository script rewrites the current catalog declarations and eval cells before cutover.
+A temporary repository script rewrites the current catalog declarations and evals before cutover.
 
 The script preserves `host`, `workspace`, `supervisor`, `render`, `env`, `meta`, every driver field, tasks, `ding`, and restart intensity.
 
@@ -2797,7 +2797,7 @@ The parity check compares normalized subjects, render output, commands, environm
 
 After parity passes, delete the rewrite script. The committed new-format files become the only import and eval input.
 
-`st3 import ./catalog` and `st3 eval ./cell` then read those explicit new-format folders.
+`st3 import ./catalog` and `st3 eval ./eval` then read those explicit new-format folders.
 
 During a no-downtime cutover, `st3 up --pty-root PATH` observes the existing PTY registry. A matching desired member adopts that exact runtime incarnation.
 

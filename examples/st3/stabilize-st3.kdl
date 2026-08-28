@@ -27,7 +27,7 @@ subgraph {
       subgraph {
         exec "stabilize-st3/migration-audit/${PLAN_RUN}" {
           workspace "."
-          command "test -f docs/st3/stabilization-report.md && rg 'Opaque Codex cells: 16|Opaque Claude cells: 26' docs/st3/stabilization-report.md"
+          command "test -f docs/st3/stabilization-report.md && rg 'Opaque Codex evals: 16|Opaque Claude evals: 26' docs/st3/stabilization-report.md"
           restart "never"
         }
       }

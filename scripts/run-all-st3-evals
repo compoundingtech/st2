@@ -8,13 +8,13 @@ if [ -z "$root" ] || [ ! -d "$root" ]; then
   exit 2
 fi
 
-mapfile -t cells < <(find "$root" -mindepth 2 -maxdepth 2 -name eval.kdl -printf '%h\n' | sort)
-if [ "${#cells[@]}" -eq 0 ]; then
-  echo "no translated eval cells exist under $root" >&2
+mapfile -t evals < <(find "$root" -mindepth 2 -maxdepth 2 -name eval.kdl -printf '%h\n' | sort)
+if [ "${#evals[@]}" -eq 0 ]; then
+  echo "no translated evals exist under $root" >&2
   exit 2
 fi
 
-for cell in "${cells[@]}"; do
-  echo "running $(basename "$cell")"
-  st3 eval "$cell"
+for eval_dir in "${evals[@]}"; do
+  echo "running $(basename "$eval_dir")"
+  st3 eval "$eval_dir"
 done

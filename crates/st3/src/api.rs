@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Notify;
 use tower::ServiceExt as _;
 
-use crate::archive::hydrate_cell;
+use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
@@ -1077,7 +1077,7 @@ async fn start_eval(
         .join("evals")
         .join(&request.bundle_hash[..16])
         .join(nonce.to_string());
-    hydrate_cell(&request.bundle, &workspace).map_err(ApiError::internal)?;
+    hydrate_eval(&request.bundle, &workspace).map_err(ApiError::internal)?;
     let eval_file = workspace.join("eval.kdl");
     let kdl = fs::read_to_string(&eval_file)
         .map_err(|error| ApiError::internal(format!("read {}: {error}", eval_file.display())))?;
@@ -1116,7 +1116,7 @@ async fn start_eval(
     if ready.len() != 1 {
         return Err(ApiError::bad(St3Error::new(
             "invalid-eval-plan-count",
-            "an eval cell must contain exactly one ready plan",
+            "an eval must contain exactly one ready plan",
         )));
     }
     let run = state
@@ -2447,13 +2447,13 @@ subgraph { message "task" { to "worker"; content "doc/task" } }"#
     #[tokio::test]
     async fn eval_upload_posts_its_staged_documents_before_apply() {
         let root = tempfile::tempdir().unwrap();
-        let cell = tempfile::tempdir().unwrap();
+        let eval_dir = tempfile::tempdir().unwrap();
         let bytes = b"hello from the eval";
         let hash = hex::encode(Sha256::digest(bytes));
-        fs::create_dir_all(cell.path().join(".st3-documents")).unwrap();
-        fs::write(cell.path().join(".st3-documents").join(&hash), bytes).unwrap();
+        fs::create_dir_all(eval_dir.path().join(".st3-documents")).unwrap();
+        fs::write(eval_dir.path().join(".st3-documents").join(&hash), bytes).unwrap();
         fs::write(
-            cell.path().join("eval.kdl"),
+            eval_dir.path().join("eval.kdl"),
             format!(
                 r#"
 version 2
@@ -2478,7 +2478,7 @@ subgraph {{
             ),
         )
         .unwrap();
-        let bundle = crate::archive::archive_cell(cell.path()).unwrap();
+        let bundle = crate::archive::archive_eval(eval_dir.path()).unwrap();
         let bundle_hash = hex::encode(Sha256::digest(&bundle));
         let state = state(root.path());
         let store = state.store.clone();

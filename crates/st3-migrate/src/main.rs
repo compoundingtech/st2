@@ -478,7 +478,7 @@ fn transform_eval(
     let name = cell
         .file_name()
         .and_then(|value| value.to_str())
-        .context("eval cell name is not UTF-8")?;
+        .context("eval name is not UTF-8")?;
     Ok((checkpoint_intent_to_plan(&legacy, name)?, documents))
 }
 
@@ -492,7 +492,7 @@ fn transform_eval_checkpoint(
     let name = cell
         .file_name()
         .and_then(|value| value.to_str())
-        .context("eval cell name is not UTF-8")?;
+        .context("eval name is not UTF-8")?;
     let scope = format!("scope/eval/{name}");
     let sequence = format!("eval/{name}");
     let restart = if eval.supervise { "always" } else { "never" };
@@ -1197,7 +1197,7 @@ fn copy_eval_assets(
                 match component {
                     std::path::Component::CurDir => {}
                     std::path::Component::Normal(component) => relative.push(component),
-                    _ => anyhow::bail!("eval copy path must stay inside its cell"),
+                    _ => anyhow::bail!("eval copy path must stay inside its eval directory"),
                 }
             }
             anyhow::ensure!(!relative.as_os_str().is_empty(), "eval copy path is empty");
@@ -1318,7 +1318,7 @@ fn eval_definition_files(root: &Path) -> Result<Vec<PathBuf>> {
         candidates.sort();
         anyhow::ensure!(
             candidates.len() == 1,
-            "eval cell {} must contain exactly one top-level KDL file",
+            "eval {} must contain exactly one top-level KDL file",
             cell.path().display()
         );
         files.push(candidates.remove(0));

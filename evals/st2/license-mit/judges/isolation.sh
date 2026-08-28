@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # JUDGE: isolation — the supervisor owns no product repo, and the change stays on the license surface.
 #
-# Why this is the honest isolation proxy for THIS cell (not git-author): the worker repo's git identity is
+# Why this is the honest isolation proxy for THIS eval (not git-author): the worker repo's git identity is
 # PINNED to the worker in the fixture, so ANY process that commits there is attributed to the worker —
 # git-author alone cannot catch a "supervisor did it itself" violation. So isolation here is STRUCTURAL:
 # the supervisor's directory is not a git repo (it cannot commit), corroborated by the coordination judge
