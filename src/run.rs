@@ -382,9 +382,26 @@ impl PtyCli {
     /// tags, `cwd`, and direct argv — because `pty` passes them through verbatim. The st2-owned
     /// presentation snapshot remains literal so initial spawn and later metadata patches agree.
     /// Shell source is left unexpanded: `sh -c` expands it at spawn from the same env.
+    /// The `pty` binary that HOSTS one task's terminal.
+    ///
+    /// A task may name its own with `ST2_PTY_BIN`, which is how a single agent opts into a
+    /// different pty implementation while the rest of the fleet stays on the default. Only
+    /// the spawn uses it. Observation and teardown keep using [`Self::bin`], because they
+    /// read the shared on-disk session registry rather than talk to a specific daemon.
+    ///
+    /// This is an experiment hook. It is deliberately an env key on the task rather than a
+    /// field in Agent Spec: nothing outside the experiment should have to learn about it,
+    /// and removing it later costs one declaration edit.
+    fn run_bin(&self, target: &TaskTarget) -> String {
+        match target.env.get("ST2_PTY_BIN") {
+            Some(bin) if !bin.is_empty() => self.expand(bin),
+            _ => self.bin.clone(),
+        }
+    }
+
     fn build_run_command(&self, target: &TaskTarget, spec_dir: &Path) -> Command {
         let cwd = self.resolve_cwd(target, spec_dir);
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = Command::new(self.run_bin(target));
         cmd.arg("run")
             .arg("-d") // detached: leave it running in the background
             .arg("--force") // st2 itself may run inside a pty session; allow nesting
@@ -3075,6 +3092,42 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("stale receipt"));
         assert!(report.errors[0].contains("launch suppressed"));
+    }
+
+    /// One task can host its terminal on a different pty build. This is the whole
+    /// mechanism behind running a single agent on an alternative implementation while
+    /// every other agent keeps the default.
+    #[test]
+    fn a_task_can_name_the_pty_binary_that_hosts_it() {
+        let cli = PtyCli::new(PathBuf::from("/my/catalog"));
+        let mut t = target("hetz.demo.agent", "true");
+        t.env.insert(
+            "ST2_PTY_BIN".to_string(),
+            "$CATALOG/bin/other-pty".to_string(),
+        );
+        let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+        assert_eq!(cmd.get_program(), OsStr::new("/my/catalog/bin/other-pty"));
+    }
+
+    /// Teardown and observation stay on the default binary. They read the shared session
+    /// registry on disk, so they must not follow one task's choice of daemon.
+    #[test]
+    fn only_the_spawn_follows_the_task_owned_pty_binary() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo.agent", "true");
+        t.env
+            .insert("ST2_PTY_BIN".to_string(), "/opt/other-pty".to_string());
+        assert_eq!(cli.run_bin(&t), "/opt/other-pty");
+        assert_eq!(cli.bin, "pty");
+    }
+
+    /// An empty value is the same as not asking for an override.
+    #[test]
+    fn an_empty_pty_binary_falls_back_to_the_default() {
+        let cli = PtyCli::default();
+        let mut t = target("hetz.demo.agent", "true");
+        t.env.insert("ST2_PTY_BIN".to_string(), String::new());
+        assert_eq!(cli.run_bin(&t), "pty");
     }
 
     /// The built `pty run` argv runs the command verbatim under `sh -c`, detached, with the pinned id
