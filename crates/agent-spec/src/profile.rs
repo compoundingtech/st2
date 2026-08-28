@@ -73,6 +73,10 @@ impl std::fmt::Display for ProfileClass {
 pub struct ResourceProfile {
     pub scheme: String,
     pub source: ProfileSource,
+    /// When set, a binding through this profile also subscribes to the same-scheme carriers its
+    /// declared `supervisor` ancestors bind. Off by default: only a profile whose layers compose
+    /// along that edge has any reason to widen a subscription past the binding agent.
+    pub notify_chain: bool,
 }
 
 /// Where one profile's denotation comes from. Wasm-only per Q10.
@@ -103,6 +107,7 @@ impl ResourceProfile {
                 class,
                 containment_root: None,
             },
+            notify_chain: false,
         }
     }
 
@@ -122,7 +127,20 @@ impl ResourceProfile {
                 class,
                 containment_root: Some(containment_root),
             },
+            notify_chain: false,
         }
+    }
+
+    /// Declare that carriers of this profile notify along the `supervisor` chain.
+    #[must_use]
+    pub fn with_notify_chain(mut self, notify_chain: bool) -> Self {
+        self.notify_chain = notify_chain;
+        self
+    }
+
+    /// Whether this profile's bindings subscribe to their ancestors' same-scheme carriers.
+    pub fn notify_chain(&self) -> bool {
+        self.notify_chain
     }
 
     /// The declared class for carriers this profile resolves.

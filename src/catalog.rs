@@ -39,6 +39,9 @@ pub struct DeclaredProfile {
     pub wasm: String,
     /// How carriers resolved through this profile notify; defaults to coalesced.
     pub class: ProfileClass,
+    /// Whether a binding through this profile also subscribes to its ancestors' same-scheme
+    /// carriers; defaults to off.
+    pub notify_chain: bool,
 }
 
 /// What `<catalog>/catalog.kdl` declares. An absent file leaves every field empty.
@@ -159,6 +162,8 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
     let mut wasm: Option<String> = None;
     let mut class = ProfileClass::Coalesced;
     let mut seen_class = false;
+    let mut notify_chain = false;
+    let mut seen_notify_chain = false;
     for child in children.nodes() {
         if child.children().is_some() {
             anyhow::bail!(
@@ -204,8 +209,20 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                     )
                 })?;
             }
+            "notify-chain" => {
+                if seen_notify_chain {
+                    anyhow::bail!("profile '{scheme}' declares notify-chain more than once");
+                }
+                seen_notify_chain = true;
+                notify_chain = child.get(0).and_then(|v| v.as_bool()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "profile '{scheme}': notify-chain takes a boolean, e.g. notify-chain #true"
+                    )
+                })?;
+            }
             other => anyhow::bail!(
-                "unknown profile field '{other}' in profile '{scheme}' (expected wasm or class)"
+                "unknown profile field '{other}' in profile '{scheme}' \
+                 (expected wasm, class, or notify-chain)"
             ),
         }
     }
@@ -216,6 +233,7 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
         scheme: scheme.to_owned(),
         wasm,
         class,
+        notify_chain,
     })
 }
 
@@ -383,9 +401,11 @@ pub fn declared_profiles(catalog_root: &Path) -> anyhow::Result<ResourceProfileR
                         relative,
                         declared.class,
                     )
+                    .with_notify_chain(declared.notify_chain)
                 }
                 ResolvedProfileModule::External(module) => {
                     ResourceProfile::wasm(declared.scheme, module, declared.class)
+                        .with_notify_chain(declared.notify_chain)
                 }
             };
             Ok(registry.with_profile(profile))
@@ -497,11 +517,13 @@ mod tests {
                     scheme: "dev.example.goal".into(),
                     wasm: "resolvers/goal.wasm".into(),
                     class: ProfileClass::Coalesced,
+                    notify_chain: false,
                 },
                 DeclaredProfile {
                     scheme: "dev.example.tree".into(),
                     wasm: "/abs/resolvers/tree.wasm".into(),
                     class: ProfileClass::Silent,
+                    notify_chain: false,
                 },
             ]
         );

@@ -43,6 +43,7 @@ pub mod resync;
 pub mod run;
 pub mod service;
 pub mod status;
+pub mod supervisor_chain;
 pub mod task_inventory;
 pub mod telemetry;
 pub mod validate;

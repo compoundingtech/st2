@@ -28,6 +28,7 @@ mod harness;
 use crate::message::{self, Message};
 use crate::run::{CAPTURE_CAP_BYTES, read_bounded_tail, reap_detached};
 use crate::status;
+use crate::supervisor_chain::{SUPERVISOR_CHAIN_LIMIT, chain_bus_ids, resolve_spec};
 
 use composer::{ComposerState, classify_composer, classify_receipt};
 use harness::ReceiptState;
@@ -36,7 +37,6 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
-const SUPERVISOR_CHAIN_LIMIT: usize = 64;
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
 const SOURCE_MARKER: &str = "»";
@@ -97,51 +97,6 @@ fn normalize_field(value: Option<&str>, fallback: &str, max_chars: usize) -> Str
     }
 }
 
-fn resolve_spec<'a>(
-    specs: &'a [crate::AgentSpec],
-    identity: &str,
-    local_host: &str,
-) -> Option<&'a crate::AgentSpec> {
-    let mut matches = specs.iter().filter(|spec| {
-        spec.bus_id(local_host) == identity
-            || (spec.resolved_host(local_host) == local_host && spec.identity == identity)
-    });
-    let resolved = matches.next()?;
-    matches.next().is_none().then_some(resolved)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SupervisorChainError {
-    Cycle,
-    MissingSupervisor,
-    DepthLimit,
-}
-
-fn supervisor_chain(
-    specs: &[crate::AgentSpec],
-    start: &crate::AgentSpec,
-    this_host: &str,
-) -> Result<Vec<String>, SupervisorChainError> {
-    let mut chain = Vec::new();
-    let mut visited = HashSet::new();
-    let mut current = start;
-
-    for _ in 0..SUPERVISOR_CHAIN_LIMIT {
-        let bus_id = current.bus_id(this_host);
-        if !visited.insert(bus_id.clone()) {
-            return Err(SupervisorChainError::Cycle);
-        }
-        chain.push(bus_id);
-        let Some(supervisor) = current.supervisor.as_deref() else {
-            return Ok(chain);
-        };
-        current = resolve_spec(specs, supervisor, current.resolved_host(this_host))
-            .ok_or(SupervisorChainError::MissingSupervisor)?;
-    }
-
-    Err(SupervisorChainError::DepthLimit)
-}
-
 struct RelationshipResolver {
     specs: Vec<crate::AgentSpec>,
     valid: bool,
@@ -178,10 +133,10 @@ fn relationship_marker(
     if sender_id == recipient_id {
         return "↺".to_string();
     }
-    let Ok(recipient_chain) = supervisor_chain(&resolver.specs, recipient, this_host) else {
+    let Ok(recipient_chain) = chain_bus_ids(&resolver.specs, recipient, this_host) else {
         return "?".to_string();
     };
-    let Ok(sender_chain) = supervisor_chain(&resolver.specs, sender, this_host) else {
+    let Ok(sender_chain) = chain_bus_ids(&resolver.specs, sender, this_host) else {
         return "?".to_string();
     };
 
@@ -1509,8 +1464,8 @@ mod tests {
         let recipient = resolve_spec(&resolver.specs, "h.recipient", "h").unwrap();
 
         assert_eq!(
-            supervisor_chain(&resolver.specs, recipient, "h"),
-            Err(SupervisorChainError::Cycle),
+            chain_bus_ids(&resolver.specs, recipient, "h"),
+            Err(crate::supervisor_chain::SupervisorChainError::Cycle),
             "cycle detection must be distinct from the independent depth limit"
         );
 
