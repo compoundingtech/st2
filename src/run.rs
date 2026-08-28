@@ -1858,19 +1858,20 @@ fn reconcile_pass(
         None => Ok(()),
     });
     if let Some(resync) = resync {
-        // Existing canonical seats from successfully compiled declarations are established by this
-        // pass's observation. Install them before executing unrelated repairs; targeted upserts
-        // preserve every retained baseline and pending transition.
+        // Existing canonical seats are established by this pass's observation. Reinstall their
+        // complete catalog-aware sets synchronously before unrelated repairs can block. The
+        // targeted upsert retains unchanged baselines and pending transitions, so this is
+        // idempotent across steady-state passes.
         for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
             report
                 .warnings
-                .extend(resync.install_live(&spec, this_host));
+                .extend(resync.install_live(&spec, &found.specs, this_host));
         }
     }
     let mut boundary_warnings = Vec::new();
     let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
         if let Some(resync) = resync {
-            boundary_warnings.extend(resync.install_live(spec, this_host));
+            boundary_warnings.extend(resync.install_live(spec, &found.specs, this_host));
         }
     };
     execute_reconcile(
@@ -3933,6 +3934,49 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    struct SteadyChainRunner {
+        sessions: std::sync::Mutex<Vec<Session>>,
+        block_id: String,
+        entered: mpsc::SyncSender<()>,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    impl Runner for SteadyChainRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            if target.pty_id == self.block_id {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv()
+                    .unwrap();
+            }
+            self.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(sess(&target.pty_id, true));
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     fn write_resync_agent(catalog: &Path, identity: &str) -> (PathBuf, PathBuf) {
         let agent_dir = catalog.join("agents/hetz").join(identity);
         let resources = agent_dir.join("resources");
@@ -3951,6 +3995,110 @@ mod tests {
         let goal = resources.join("goal.md");
         std::fs::write(&goal, "before\n").unwrap();
         (agent_dir, goal)
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn write_notify_chain_profile(catalog: &Path) {
+        let resolver_dir = catalog.join("resolvers");
+        std::fs::create_dir_all(&resolver_dir).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/agent-spec/tests/fixtures/demo_resolver.wasm"),
+            resolver_dir.join("goal.wasm"),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::catalog::config_path(catalog),
+            r#"profile "dev.schickling.agent-goal" {
+  wasm "resolvers/goal.wasm"
+  class "immediate"
+  notify-chain #true
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn write_notify_chain_agent(
+        catalog: &Path,
+        identity: &str,
+        supervisor: Option<&str>,
+        later_task: bool,
+    ) -> (PathBuf, PathBuf) {
+        let agent_dir = catalog.join("agents/hetz").join(identity);
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        let supervisor = supervisor
+            .map(|supervisor| format!("  supervisor {supervisor:?}\n"))
+            .unwrap_or_default();
+        let later_task = if later_task {
+            "  exec \"later\" { command \"true\" }\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(
+                r#"agent "{identity}" {{
+  host "hetz"
+{supervisor}  command "agent"
+{later_task}  resource "goal" uri="dev.schickling.agent-goal://hetz/{identity}" reason="Layer."
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let goal = resources.join("goal.md");
+        std::fs::write(&goal, "before\n").unwrap();
+        (agent_dir, goal)
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn current_resync_event_for_key(agent_dir: &Path, key: &str) -> Option<String> {
+        let expected = format!("key: {key}");
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|body| {
+                body.lines().any(|line| line == "stream: resync")
+                    && body.lines().any(|line| line == expected)
+            })
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn wait_for_resync_event_for_key(agent_dir: &Path, key: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event_for_key(agent_dir, key) {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn wait_for_resync_event_key_change(
+        agent_dir: &Path,
+        key: &str,
+        prior: &str,
+    ) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event_for_key(agent_dir, key)
+                && body != prior
+            {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn current_resync_event(agent_dir: &Path) -> Option<String> {
@@ -3987,6 +4135,121 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(feature = "wasm-resolver")]
+    #[test]
+    fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
+        let catalog = tempfile::tempdir().unwrap();
+        write_notify_chain_profile(catalog.path());
+        let (root_dir, root_goal) =
+            write_notify_chain_agent(catalog.path(), "root", None, false);
+        let (lead_dir, lead_goal) =
+            write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
+        let (worker_dir, _worker_goal) =
+            write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let task_id = |spec: &AgentSpec, task: &Task| {
+            task.id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name))
+        };
+        let mut sessions = Vec::new();
+        for spec in &specs {
+            for task in &spec.tasks {
+                sessions.push(sess(&task_id(spec, task), true));
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = SteadyChainRunner {
+            sessions: std::sync::Mutex::new(sessions),
+            block_id: "hetz.worker.later".to_owned(),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        };
+        let stop = AtomicBool::new(false);
+        let (first_report_tx, first_report_rx) = mpsc::sync_channel(1);
+        let observer_catalog = catalog.path().to_path_buf();
+
+        let evidence = std::thread::scope(|scope| {
+            let observer_stop = &stop;
+            let observer = scope.spawn(move || {
+                first_report_rx.recv().unwrap();
+
+                std::fs::write(&root_goal, "steady baseline transition\n").unwrap();
+                let root_initial = wait_for_resync_event_for_key(&root_dir, "goal");
+                let lead_initial =
+                    wait_for_resync_event_for_key(&lead_dir, "goal@hetz.root");
+                let worker_initial =
+                    wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+
+                write_notify_chain_agent(
+                    &observer_catalog,
+                    "worker",
+                    Some("hetz.lead"),
+                    true,
+                );
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                let root_after_reconcile = root_initial.as_deref().and_then(|prior| {
+                    std::fs::write(&root_goal, "transition during steady reconcile\n").unwrap();
+                    wait_for_resync_event_key_change(&root_dir, "goal", prior)
+                });
+                let lead_after_reconcile = lead_initial.as_deref().and_then(|prior| {
+                    wait_for_resync_event_key_change(&lead_dir, "goal@hetz.root", prior)
+                });
+                let worker_after_reconcile = worker_initial.as_deref().and_then(|prior| {
+                    wait_for_resync_event_key_change(&worker_dir, "goal@hetz.root", prior)
+                });
+
+                std::fs::write(&lead_goal, "lead transition during steady reconcile\n").unwrap();
+                let lead_own = wait_for_resync_event_for_key(&lead_dir, "goal");
+                let worker_from_lead =
+                    wait_for_resync_event_for_key(&worker_dir, "goal@hetz.lead");
+
+                let _ = release_tx.send(());
+                observer_stop.store(true, Ordering::SeqCst);
+                (
+                    entered,
+                    root_initial,
+                    lead_initial,
+                    worker_initial,
+                    root_after_reconcile,
+                    lead_after_reconcile,
+                    worker_after_reconcile,
+                    lead_own,
+                    worker_from_lead,
+                )
+            });
+            up_loop_until(
+                catalog.path(),
+                "hetz",
+                &runner,
+                Duration::from_millis(25),
+                &stop,
+                |_, _| None,
+                |_| {
+                    let _ = first_report_tx.try_send(());
+                },
+            )
+            .unwrap();
+            observer.join().unwrap()
+        });
+
+        assert!(evidence.0, "the steady-state reconcile must reach its later task");
+        assert!(evidence.1.is_some(), "root must receive its own transition");
+        assert!(
+            evidence.2.is_some() && evidence.3.is_some(),
+            "root transition must fan out through lead and worker"
+        );
+        assert!(
+            evidence.4.is_some() && evidence.5.is_some() && evidence.6.is_some(),
+            "a steady reconcile must not replace chain sets with self-only sets"
+        );
+        assert!(
+            evidence.7.is_some() && evidence.8.is_some(),
+            "lead transition must reach lead and worker"
+        );
     }
 
     #[test]
@@ -4221,7 +4484,7 @@ mod tests {
             &mut report,
             &mut |spec| {
                 install_count += 1;
-                assert!(resync.install_live(spec, "hetz").is_empty());
+                assert!(resync.install_live(spec, specs, "hetz").is_empty());
             },
         );
         assert!(
@@ -4236,6 +4499,68 @@ mod tests {
         );
         assert!(install_count > 0 || report.launched.is_empty());
         report
+    }
+
+    #[cfg(feature = "wasm-resolver")]
+    #[test]
+    fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes() {
+        let catalog = tempfile::tempdir().unwrap();
+        write_notify_chain_profile(catalog.path());
+        let (_root_dir, root_goal) =
+            write_notify_chain_agent(catalog.path(), "root", None, false);
+        write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
+        let (worker_dir, _worker_goal) =
+            write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let worker = specs
+            .iter()
+            .find(|spec| spec.identity == "worker")
+            .unwrap();
+        let mut later = target("hetz.worker.later", "later");
+        later.name = "later".into();
+        later.derived = true;
+        let plan = ReconcilePlan {
+            launch: vec![Launch {
+                spec: worker,
+                tasks: vec![target("hetz.worker.agent", "agent"), later],
+                live_derived: Vec::new(),
+            }],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: None,
+            block_id: "hetz.worker.later".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync = crate::resync::ResyncSupervisor::with_profiles(
+            catalog.path().to_path_buf(),
+            "hetz".into(),
+            crate::catalog::declared_profiles(catalog.path()).unwrap(),
+        );
+
+        let event = std::thread::scope(|scope| {
+            let observer = scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&root_goal, "changed while later task launches\n").unwrap();
+                let event =
+                    wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+                release_tx.send(()).unwrap();
+                event
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(
+                report.launched,
+                ["hetz.worker.agent", "hetz.worker.later"]
+            );
+            observer.join().unwrap()
+        })
+        .expect("the fresh worker must receive its ancestor transition before full refresh");
+        assert!(event.contains("key: goal@hetz.root"), "{event}");
     }
 
     #[test]
@@ -4463,7 +4788,7 @@ mod tests {
                 &mut report,
                 &mut |spec| {
                     installs.fetch_add(1, AtomicOrdering::SeqCst);
-                    assert!(resync.install_live(spec, "hetz").is_empty());
+                    assert!(resync.install_live(spec, &specs, "hetz").is_empty());
                 },
             );
         });

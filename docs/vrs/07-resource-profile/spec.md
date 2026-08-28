@@ -15,14 +15,14 @@ modules, and the handoff of resolved carriers to
 remote access, Agent Spec binding grammar, event delivery, or task lifecycle.
 Those remain downstream profile concerns or existing root contracts.
 
-## Architecture (PROFILE-R01..R10)
+## Architecture (PROFILE-R01..R11)
 
 ```text
 Agent Spec resource URI (opaque, byte-preserved)
              |
              v exact RFC 3986 scheme
 <catalog>/catalog.kdl
-  profile "<scheme>" { wasm "<module>"; class "<class>"; }
+  profile "<scheme>" { wasm "<module>"; class "<class>"; notify-chain #true; }
              |
              +--> catalog-relative module -- normalized no-follow projection
              |                              + catalog root hash / transaction
@@ -92,6 +92,7 @@ catalog {
 profile "dev.schickling.agent-goal" {
   wasm "resolvers/agent-goal.wasm"
   class "immediate"
+  notify-chain #true
 }
 ```
 
@@ -101,20 +102,22 @@ Grammar:
 profile <non-empty-scheme> {        # exactly one positional value; no properties
   wasm <non-empty-path>              # exactly once
   class immediate|coalesced|silent  # zero or one; default coalesced
+  notify-chain <boolean>             # zero or one; default false
 }
 ```
 
 The profile scheme follows RFC 3986: it begins with an ASCII letter, then
 accepts ASCII alphanumeric characters plus `+`, `-`, and `.`, and rejects `/`;
 lookup remains exact and case-sensitive. The profile
-node takes exactly one quoted positional scheme and no properties. Each child
-takes exactly one quoted positional value. Unknown or extra entries, unknown
-children, duplicate `wasm`, duplicate `class`, a missing `wasm`, unsupported
-class values, and duplicate profile schemes fail parsing. A literal absolute
-module path remains an external runtime input. Every other declaration expands
-`$CATALOG` and environment variables, resolves lexically against the catalog
-root, and must remain strictly beneath that root; internal `.`/`..` components
-normalize away, while traversal outside the root fails validation.
+node takes exactly one quoted positional scheme and no properties. `wasm` and
+`class` each take one quoted positional value; `notify-chain` takes one boolean.
+Unknown or extra entries, unknown children, duplicate children, a missing
+`wasm`, unsupported class values, and duplicate profile schemes fail parsing.
+A literal absolute module path remains an external runtime input. Every other
+declaration expands `$CATALOG` and environment variables, resolves lexically
+against the catalog root, and must remain strictly beneath that root; internal
+`.`/`..` components normalize away, while traversal outside the root fails
+validation.
 
 `st2 validate` reports malformed declarations and missing or unsafe
 catalog-relative modules. `st2 up` loads declared profiles before it spawns
@@ -271,7 +274,7 @@ feature. Default binaries therefore retain the baseline dependency surface.
 Building a Rust guest for `wasm32-unknown-unknown` requires `lld`, which the
 repository dev shell supplies.
 
-## Resync composition (PROFILE-R08..R09)
+## Resync composition (PROFILE-R08..R09, PROFILE-R11)
 
 For each active Resource binding, resync applies this precedence:
 
@@ -288,6 +291,17 @@ After a path enters the watch set, Resource Profiles add no event semantics.
 Parent-directory observation, rename replacement, digest seeding, equal-byte
 deduplication, deterministic transition identity, bounded windows, and built-in
 `resync` delivery remain the [`06-resync`](../06-resync/spec.md) pipeline.
+
+`notify-chain #true` extends only subscription selection. For each active
+binding through that profile, resync validates the bound agent's supervisor
+chain against the complete catalog and adds every active same-scheme carrier
+declared by non-retired ancestors. Each ancestor URI is resolved unchanged
+against that ancestor's own directory and remains inside that directory's host
+containment root. Retired ancestors are skipped without severing traversal.
+Owner-qualified event keys keep layers independent. An invalid chain or failed
+ancestor resolution produces a reconcile warning; st2 never synthesizes a URI
+or silently claims complete chain coverage. The default `false` preserves the
+agent-local behavior above.
 Profile resolution is observation metadata only and never enters task launch
 targets.
 

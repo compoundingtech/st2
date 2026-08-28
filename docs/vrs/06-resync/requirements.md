@@ -62,20 +62,22 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 
 - **RESYNC-R01 Watch set:** While an agent is running on this host, the
   supervisor watches exactly the local files denoted by that agent's active
-  resource bindings plus its own declaration file. The watch attaches to each
-  carrier's parent directory non-recursively and tracks directory identity so
-  whole-file replacement by rename keeps working. Nothing outside this set is
-  watched; installation failure degrades to timer-based digest polling rather
-  than losing the capability.
+  resource bindings, the opt-in ancestor carriers required by `RESYNC-R09`,
+  plus its own declaration file. The watch attaches to each carrier's parent
+  directory non-recursively and tracks directory identity so whole-file
+  replacement by rename keeps working. Nothing outside this set is watched;
+  installation failure degrades to timer-based digest polling rather than
+  losing the capability.
 - **RESYNC-R02 Explicit watch contract:** The resync watcher states what it
   watches and why, denies everything else by default, ignores read/open
   access events, and never traverses payload trees — refining [`R14`](../requirements.md)
   and the mutation-only wakeup invariant.
-- **RESYNC-R03 Seeded baseline:** On supervisor start every watchable carrier
-  is recorded as either `present(<content-digest>)` or `missing` without
-  emitting. Only a transition between proven states produces an event; a
-  restart alone wakes nobody. Permission and transient I/O failures establish
-  neither state and are retried rather than interpreted as absence.
+- **RESYNC-R03 Seeded baseline:** On supervisor start and at every live-seat
+  transition, every watchable carrier is recorded as either
+  `present(<content-digest>)` or `missing` without emitting. Only a transition
+  between proven states produces an event; a restart alone wakes nobody.
+  Permission and transient I/O failures establish neither state and are retried
+  rather than interpreted as absence.
 
 ### Must classify before notifying
 
@@ -121,6 +123,22 @@ root [`R05`](../requirements.md); Resource bindings are defined by
   retired agents. Carrier-state seeding happens when a seat launches or
   resumes, so resume re-observes current state silently and only later
   transitions notify.
+
+### Must compose and install complete live views
+
+- **RESYNC-R09 Opt-in supervisor-chain coverage:** When a profile declares
+  `notify-chain`, a live agent's watch set also contains every active
+  same-profile-scheme carrier declared by each non-retired supervisor ancestor.
+  Traversal continues through a retired middle ancestor without including that
+  ancestor's carrier. Profiles without the flag and native bindings retain
+  agent-local coverage. A missing, cyclic, ambiguous, or otherwise unwalkable
+  supervisor chain is diagnosed; it never becomes a silent guessed chain.
+- **RESYNC-R10 Launch-boundary completeness:** A canonical seat's complete
+  catalog-aware watch set is installed synchronously when reconciliation first
+  proves the seat live and before any later launch target may block. Reinstalling
+  an already-live seat is idempotent: unchanged own and ancestor subscriptions
+  retain their baselines and pending transitions. Full refresh remains the final
+  authority for lifecycle removal and hot profile reload.
 
 ## Evidence
 

@@ -218,3 +218,27 @@ fn a_retired_ancestor_is_skipped_and_the_walk_continues_past_it() {
         );
     }
 }
+
+#[test]
+fn live_install_reports_an_unwalkable_notify_chain() {
+    let catalog = tempfile::tempdir().unwrap();
+    catalog_with_profile(catalog.path(), true);
+    write_agent(catalog.path(), "worker", Some("hetz.missing"), None);
+    st2::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    let specs = st2::discover_strict(catalog.path()).specs;
+    let registry = st2::catalog::declared_profiles(catalog.path()).unwrap();
+    let supervisor = st2::resync::ResyncSupervisor::with_profiles(
+        catalog.path().to_path_buf(),
+        "hetz".to_owned(),
+        registry,
+    );
+
+    let diagnostics = supervisor.install_live(&specs[0], &specs, "hetz");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("supervisor chain is unwalkable")
+                && diagnostic.contains("MissingSupervisor")
+        }),
+        "a chain-aware live install must not silently degrade to a one-spec view: {diagnostics:?}"
+    );
+}

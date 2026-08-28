@@ -48,6 +48,40 @@ falls back to a guessed local rule or stops the supervisor. Watchability of
 every active binding is projected into `st2 agents --json` as part of the
 declared Resource projection so absence of coverage is observable.
 
+## Supervisor-chain composition (RESYNC-R09..R10)
+
+```text
+root goal carrier ───────────────┐
+                                 v
+root seat <- supervisor - lead seat <- supervisor - worker seat
+                    goal carrier ────────────────> worker watch set
+worker goal carrier ────────────────────────────> worker watch set
+```
+
+For each active binding whose registered profile declares `notify-chain`, watch
+resolution first resolves the binding's own carrier, then validates and walks
+the seat's supervisor chain against the pass's complete discovered spec vector.
+At every non-retired ancestor it resolves active bindings with the same profile
+scheme against that ancestor's own declaration directory. Each inherited
+subscription retains the ancestor's binding label qualified by owner bus ID
+(`goal@hetz.root`), so mutations in two layers cannot share a supersession key.
+A retired ancestor contributes no layer, but traversal continues to its
+ancestors.
+
+Chain membership comes only from a profile's trusted opt-in flag and exact URI
+scheme. Binding labels do not define composition, native local bindings never
+gain it implicitly, and profiles without the flag remain agent-local. A
+missing, ambiguous, cyclic, cross-host, or otherwise unwalkable supervisor edge
+produces a reconcile diagnostic and no invented ancestor subscription. Profile
+resolution failures remain contained to the failed carrier.
+
+The live-install API takes both the canonical seat and the complete discovered
+spec vector. It resolves the complete own-plus-ancestor set under the
+supervisor's current profile registry, sends one targeted watch-set replacement,
+and waits for the worker acknowledgement. Reinstalling the same identity and
+paths preserves carrier baselines, occurrence sequences, dirty state, and
+pending transitions.
+
 ## Classification
 
 Classification is decided before a path enters the watch set:
@@ -79,18 +113,25 @@ meaningful.
   same-path replacement, mirroring `CatalogDeclarationWatcher`.
 - The watcher owns no reconcile authority: a resync mutation does not wake a
   full-catalog pass. It shares only the observation primitives.
-- After lifecycle execution, each reconcile pass atomically replaces the watch
+- Before lifecycle execution, each pass synchronously upserts the complete
+  catalog-aware watch set for every successfully compiled canonical seat it
+  observed alive. A successful canonical launch or restart performs the same
+  acknowledged upsert at the exact live transition before execution advances
+  to any later task. Both paths resolve supervisor-chain carriers against the
+  complete discovered spec vector, never a one-spec view.
+- After lifecycle execution, each reconcile pass atomically refreshes the watch
   set with agents whose canonical seat was observed alive or successfully
-  launched/restarted in that pass. Desired declarations, dead keep-retained
-  seats, and companion-only launches never become watched. If strict discovery
-  temporarily rejects a declaration whose exact canonical seat remains
-  observed alive, its prior declaration subscription survives with its carrier
-  state and pending transition; it drops as soon as that seat is not live.
-  Existing valid subscriptions are matched by declaration path and binding
-  label. Each refresh takes bus id, canonical seat id, carrier path, label, and
-  class from the current declaration while retaining carrier state, the
-  per-subscription occurrence sequence, any immutable pending transition, and
-  dirty state; only new subscriptions seed silently with sequence zero.
+  launched/restarted in that pass. This refresh owns removals, malformed
+  declaration retention, and hot profile replacement. Desired declarations,
+  dead keep-retained seats, and companion-only launches never become watched.
+  If strict discovery temporarily rejects a declaration whose exact canonical
+  seat remains observed alive, its prior declaration subscription survives with
+  its carrier state and pending transition; it drops as soon as that seat is
+  not live. Existing valid subscriptions are matched by declaration path and
+  binding label. Each refresh takes bus id, canonical seat id, carrier path,
+  label, and class from the current declaration while retaining carrier state,
+  the per-subscription occurrence sequence, any immutable pending transition,
+  and dirty state; only new subscriptions seed silently with sequence zero.
 - A previously blind path is state-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
 - Installation failure degrades to timer-based carrier polling over the watch
@@ -149,3 +190,5 @@ ring.
 - No remote/non-local carrier watching.
 - No write attribution beyond static classes (RESYNC-T01).
 - No catch-up replay of missed changes (RESYNC-T03).
+- No implicit supervisor-chain inference for native bindings or profiles that
+  do not declare `notify-chain`.
