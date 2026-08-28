@@ -45,11 +45,14 @@ Shape of `pi_session.rs`:
 
 - Resolves the agent dir, installs the signal handler, claims the observed-state record under
   a freshly minted session token.
-- Version gate first: runs `<omp> --version` and admits only an exact version already measured
-  (`SUPPORTED_OMP_VERSIONS`); outside that set the launch fails loudly with the measured-checks
-  message, per OMP-R05. Admission is per exact version, not per range: a later minor *or patch*
-  stays rejected until the checks are repeated against it, so an unmeasured patch between two
-  admitted versions is still refused.
+- Version gate first: runs `<omp> --version`, parses a strict `MAJOR.MINOR.PATCH` release, and
+  admits only a MINOR already measured (`SUPPORTED_OMP_MINORS`); outside that set the launch
+  fails loudly with the measured-checks message, per OMP-R05 and decision 0007. Admission is per
+  minor: a patch inside an admitted minor launches without new evidence, and a later *minor*
+  stays rejected until the checks are repeated against it. The parse is what keeps "per minor"
+  from decaying into "starts with 18" — minors are compared numerically (`18.10` is not `18.1`),
+  exactly three components are required, and a pre-release or build-metadata suffix
+  (`18.0.9-rc1`) does not parse at all, so it is never admitted as its base release.
 - Injects the channel extension from the verified hook set (`with_channel_extension` shape —
   resolved from this binary's immutable asset, never a catalog-pinned path).
 - Applies offline defaults (`PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`) unless the operator's
@@ -85,15 +88,22 @@ message / delivered / failed / state frames, PROTOCOL constant). Differences:
 harness label `"omp"`; the state frame parser accepts the blocked fields. The ding side
 gains no omp adapter (OMP-T03): delivery is channel-only, failing closed when absent.
 
-## Admission evidence required for a new version
+## Admission evidence required for a new minor
 
-Per OMP-R05, admitting any new omp version — minor *or* patch — requires re-running:
-extension-load probe, lifecycle event inventory, idle-edge sampling, approval-event capture,
-live delivery loop — updating the `.experiments/` capture and `SUPPORTED_OMP_VERSIONS`
-together. Each probe must record measured output; a version that was not measured is not
-admitted, so the admitted set is asserted literally in the wrapper's tests.
+Per OMP-R05 and decision 0007, admitting a new omp MINOR requires re-running: extension-load
+probe, lifecycle event inventory, idle-edge sampling, approval-event capture, live delivery
+loop — updating the `.experiments/` capture and `SUPPORTED_OMP_MINORS` together. Each probe must
+record measured output; a minor that was not measured is not admitted, so the admitted set is
+asserted literally in the wrapper's tests.
 
-Captures, one per admitted version:
+Patches inside an admitted minor cost nothing: omp releases near-daily, and gating them blocked
+the fleet on changes the capture already covered — 18.0.10 shipped within hours of 18.0.9 being
+admitted. The evidence a minor is admitted on is a measurement of *some* release in that minor,
+and the risk accepted is that a patch could move delivery-critical behavior within it. That has
+been observed once and absorbed: between 18.0.3 and 18.0.9 the idle edge moved from ~251 ms to
+~25 ms, which the bounded polling rule (OMP-R03) handles without change.
+
+Captures, per measured release:
 
 - 18.0.3 — [`2026-08-25-omp-harness-integration.md`](./.experiments/2026-08-25-omp-harness-integration.md)
   (also the original port evidence).
