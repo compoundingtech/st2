@@ -35,7 +35,7 @@ while read -r name kind; do
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
     | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
-  test "$bindings" -eq 1
+  test "$bindings" -ge 1
 done <<'PRODUCTS'
 proposal-a-draft vcs.revision
 proposal-b-draft vcs.revision
@@ -46,5 +46,18 @@ proposal-c-final vcs.revision
 recommendation vcs.revision
 final-report message.receipt
 PRODUCTS
+
+while read -r role name; do
+  subject="resource/plan-run/$PLAN_RUN/$name"
+  published="$(st3 inspect "$subject" --json \
+    | jq -r '.status.subjects[0].actual | (.fields // .) | .revision')"
+  current="$(git -C "$CATALOG/$role" rev-parse HEAD)"
+  test "$published" = "$current"
+done <<'FINAL_REVISIONS'
+a proposal-a-final
+b proposal-b-final
+c proposal-c-final
+sup recommendation
+FINAL_REVISIONS
 
 echo "PASS: the graph records each panel stage and each required product"

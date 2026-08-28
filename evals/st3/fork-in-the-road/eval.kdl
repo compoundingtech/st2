@@ -277,7 +277,7 @@ subgraph {
           judge "the deliverables treat privacy as a main tradeoff" { exec "bash ./judges/privacy.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
           judge "the six peer critiques and final report use Small Talk" { exec "bash ./judges/coordination.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
           judge "the supervisor sent a recommendation to the requester" { exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && REQUESTER=person/eval-requester bash ./judges/recommendation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
-          judge "the graph records every plan stage and product" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
+          judge "the graph records every plan stage and product" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
         }
       }
 

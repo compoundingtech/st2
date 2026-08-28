@@ -8,7 +8,7 @@ latest_critique=0
 for recipient in fd.a fd.b fd.c; do
   inbox="$(st3 message ls "$recipient" --json)"
   archive="$(st3 message ls "$recipient" --archive --json)"
-  messages="$(jq -s 'add' <(printf '%s' "$inbox") <(printf '%s' "$archive"))"
+  messages="$(jq -s 'add | unique_by(.subject)' <(printf '%s' "$inbox") <(printf '%s' "$archive"))"
   critiques="$(jq --arg recipient "$recipient" --arg run_tag "$run_tag" '
     [.[] | select(
       (.from | startswith("agent/fd."))
@@ -25,7 +25,7 @@ done
 
 requester_inbox="$(st3 message ls person/eval-requester --json)"
 requester_archive="$(st3 message ls person/eval-requester --archive --json)"
-requester_messages="$(jq -s 'add' <(printf '%s' "$requester_inbox") <(printf '%s' "$requester_archive"))"
+requester_messages="$(jq -s 'add | unique_by(.subject)' <(printf '%s' "$requester_inbox") <(printf '%s' "$requester_archive"))"
 recommendations="$(jq --arg run_tag "$run_tag" '
   [.[] | select(.from == "agent/fd.sup" and (.tags | index($run_tag)))]' <<<"$requester_messages")"
 
