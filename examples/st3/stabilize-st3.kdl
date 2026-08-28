@@ -37,25 +37,25 @@ subgraph {
       }
     }
 
-    step "license-mit-codex" timeout="25m" {
-      title "The license MIT Codex eval passes"
+    step "license-mit" timeout="25m" {
+      title "The license MIT Claude eval passes"
       depends-on { step "migration-audit" completed }
       subgraph {
-        exec "stabilize-st3/license-mit-codex/${PLAN_RUN}" {
+        exec "stabilize-st3/license-mit/${PLAN_RUN}" {
           workspace "."
           command "st3 eval ./evals/st3/license-mit"
           restart "never"
         }
       }
       judges {
-        field "status" "exec/stabilize-st3/license-mit-codex/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/stabilize-st3/license-mit-codex/${PLAN_RUN}" "is" 0
+        field "status" "exec/stabilize-st3/license-mit/${PLAN_RUN}" "is" "exited"
+        field "exit_code" "exec/stabilize-st3/license-mit/${PLAN_RUN}" "is" 0
       }
     }
 
     step "ghost-bug-codex" timeout="25m" {
       title "The ghost bug Codex eval passes"
-      depends-on { step "license-mit-codex" completed }
+      depends-on { step "license-mit" completed }
       subgraph {
         exec "stabilize-st3/ghost-bug-codex/${PLAN_RUN}" {
           workspace "."

@@ -28,7 +28,19 @@ fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
                     .and_then(|entry| entry.value().as_string())
                     .expect("a harness must name its provider");
                 match provider {
-                    "claude" => counts.0 += 1,
+                    "claude" => {
+                        let model = harnesses[0]
+                            .children()
+                            .and_then(|body| body.get("model"))
+                            .and_then(|model| model.entries().first())
+                            .and_then(|entry| entry.value().as_string());
+                        assert_eq!(
+                            model,
+                            Some("claude-sonnet-5"),
+                            "{source_name} Claude seats must use Sonnet"
+                        );
+                        counts.0 += 1;
+                    }
                     "codex" => counts.1 += 1,
                     provider => panic!("{source_name} uses unexpected harness {provider}"),
                 }
@@ -43,6 +55,35 @@ fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
     let mut counts = (0, 0);
     visit(&document, source_name, &mut counts);
     counts
+}
+
+fn authored_model_judges(source: &str) -> Vec<String> {
+    fn visit(document: &kdl::KdlDocument, models: &mut Vec<String>) {
+        for node in document.nodes() {
+            let is_llm_judge = node.name().value() == "judge"
+                && node.entries().iter().any(|entry| {
+                    entry.name().map(|name| name.value()) == Some("type")
+                        && entry.value().as_string() == Some("llm")
+                });
+            if is_llm_judge {
+                let model = node
+                    .children()
+                    .and_then(|body| body.get("model"))
+                    .and_then(|model| model.entries().first())
+                    .and_then(|entry| entry.value().as_string())
+                    .expect("a model judge must declare its model");
+                models.push(model.to_owned());
+            }
+            if let Some(children) = node.children() {
+                visit(children, models);
+            }
+        }
+    }
+
+    let document: kdl::KdlDocument = source.parse().expect("parse model judge KDL");
+    let mut models = Vec::new();
+    visit(&document, &mut models);
+    models
 }
 
 #[test]
@@ -146,10 +187,11 @@ fn selected_eval_harness_counts_match_the_inventory() {
         .join("../..")
         .join("evals");
     let expected = [
-        ("license-mit", (2, 1), (0, 2)),
+        ("license-mit", (2, 1), (2, 0)),
         ("ghost-bug", (0, 2), (0, 2)),
         ("signal-rename", (0, 4), (0, 4)),
     ];
+    let mut model_judges = Vec::new();
 
     for (name, st2_expected, st3_expected) in expected {
         let st2_source = fs::read_to_string(root.join("st2").join(name).join("eval.kdl")).unwrap();
@@ -179,6 +221,30 @@ fn selected_eval_harness_counts_match_the_inventory() {
         let st3_source = fs::read_to_string(root.join("st3").join(name).join("eval.kdl")).unwrap();
         let st3_counts = authored_harness_counts(&st3_source, &format!("st3 {name}"));
         assert_eq!(st3_counts, st3_expected, "st3 {name}");
+        model_judges.extend(authored_model_judges(&st3_source));
+    }
+    model_judges.sort();
+    assert_eq!(
+        model_judges,
+        ["gpt-5.6-sol", "gpt-5.6-sol", "gpt-5.6-sol"],
+        "the model judge inventory changed; update evals/README.md"
+    );
+}
+
+#[test]
+fn license_mit_st3_fixture_matches_its_claude_team() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/license-mit");
+    for seat in ["sup", "worker"] {
+        let workspace = root.join(seat);
+        assert_eq!(
+            fs::read_to_string(workspace.join("CLAUDE.md")).unwrap(),
+            "@PERSONA.md\n"
+        );
+        assert!(workspace.join("PERSONA.md").is_file());
+        assert!(!workspace.join("AGENTS.md").exists());
+        assert!(!workspace.join(".codex/hooks.json").exists());
     }
 }
 

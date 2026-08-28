@@ -12,7 +12,7 @@ Future imports require an explicit eval review before they enter this corpus.
 | Ghost bug | `st2/ghost-bug` | `st3/ghost-bug` |
 | Signal rename | `st2/signal-rename` | `st3/signal-rename` |
 
-The License MIT pair preserves the paid st2 Claude baseline. Its st3 form uses Codex.
+The License MIT pair uses Claude Sonnet teams in both runtimes.
 
 The Ghost bug and Signal rename pairs use Codex in both runtimes.
 
@@ -29,15 +29,19 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st2 | License MIT | Claude Sonnet × 2, Codex × 1 | None |
 | st2 | Ghost bug | Codex × 2 | None |
 | st2 | Signal rename | Codex × 4 | None |
-| st3 | License MIT | Codex × 2 | Codex × 1 |
+| st3 | License MIT | Claude Sonnet × 2 | Codex × 1 |
 | st3 | Ghost bug | Codex × 2 | Codex × 1 |
 | st3 | Signal rename | Codex × 4 | Codex × 1 |
 
-The current corpus has two Claude seats and 15 Codex seats. It also has three Codex LLM judges.
+The current corpus has four Claude seats and 13 Codex seats. It also has three Codex LLM judges.
 
 All Claude seats use `claude-sonnet-5`.
 
 Model agents must use a native `harness` block. A setup or fixture process can use `command`.
+
+Codex `gpt-5.6-sol` is the default model judge.
+
+An eval can use a Claude judge for a specific reason. Record the choice in this inventory and the run report.
 
 ## Small Talk message discipline
 

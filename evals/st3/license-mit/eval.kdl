@@ -1,18 +1,19 @@
 version 2
 
 subgraph {
-  scope "eval/license-mit-codex/${PLAN_RUN}" retention="temporary" change-policy="agent" {
-    plan "eval/license-mit-codex" state="ready" {
+  scope "eval/license-mit/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/license-mit" state="ready" {
     step "team" timeout="1200000ms" {
       title "The eval team is running"
       subgraph {
         agent "lmc.sup" {
           workspace "${WORKSPACE}/sup"
-          harness "codex" {
-            model "gpt-5.6-sol"
+          harness "claude" {
+            model "claude-sonnet-5"
             effort "medium"
-            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and coordinate the whole task end-to-end. Report completion or blockers through st3 messages."
-            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            dev-channels #true
+            prompt "You just cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and coordinate the whole task end-to-end. Report completion or blockers through st3 messages."
+            args "--permission-mode" "bypassPermissions"
           }
           restart "never"
           env {
@@ -23,11 +24,12 @@ subgraph {
         }
         agent "lmc.worker" {
           workspace "${WORKSPACE}/worker"
-          harness "codex" {
-            model "gpt-5.6-sol"
+          harness "claude" {
+            model "claude-sonnet-5"
             effort "medium"
-            prompt "You just cold-started in a hermetic st3 eval. Read AGENTS.md. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute it end-to-end. Report completion or blockers through st3 messages."
-            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            dev-channels #true
+            prompt "You just cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute it end-to-end. Report completion or blockers through st3 messages."
+            args "--permission-mode" "auto"
           }
           restart "never"
           env {
@@ -39,7 +41,7 @@ subgraph {
         message "kickoff/${PLAN_RUN}" {
           from "requester"
           to "lmc.sup"
-          content "doc/evals/license-mit-codex/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+          content "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
         }
       }
       judges {
@@ -114,9 +116,9 @@ subgraph {
     step "cleanup" finally=#true {
       title "The temporary eval scope is empty"
       subgraph {
-        scope "eval/license-mit-codex/${PLAN_RUN}" { stop }
+        scope "eval/license-mit/${PLAN_RUN}" { stop }
       }
-      judges { empty "scope/eval/license-mit-codex/${PLAN_RUN}" }
+      judges { empty "scope/eval/license-mit/${PLAN_RUN}" }
     }
     }
   }

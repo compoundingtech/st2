@@ -17,7 +17,7 @@ Do not add `canonical-agents`. This cell uses the compact eval grammar with nati
 Replace each Claude `command` and `ding` pair with this shape:
 
 ```kdl
-claude {
+harness "claude" {
   model "claude-sonnet-5"
   effort "medium"
   prompt "THE EXISTING BOOT PROMPT"
@@ -30,7 +30,7 @@ Use `bypassPermissions` for `mix.sup`. Use `auto` for `mix.worker`.
 Replace the judge `command` and `ding` pair with this shape:
 
 ```kdl
-codex {
+harness "codex" {
   model "gpt-5.6-sol"
   effort "medium"
   prompt "THE EXISTING JUDGE BOOT PROMPT"
@@ -86,7 +86,9 @@ Archive the JSON report, the candidate revision, and the provider versions as th
 
 Run `st3-migrate evals` after the st2 baseline passes.
 
-The translated KDL must retain two `claude {}` blocks and one `codex {}` block.
+The translated KDL must retain two `harness "claude" {}` blocks.
+
+This cell uses the default Codex `gpt-5.6-sol` model judge.
 
 The first checkpoint waits for native readiness and kickoff delivery before it starts non-deadline judges.
 
