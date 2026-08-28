@@ -1,0 +1,39 @@
+version 2
+
+subgraph {
+  scope "eval/context-resource-continuity/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/context-resource-continuity" state="ready" {
+      step "contract" timeout="2m" {
+        title "Context and resources survive two daemon restarts"
+        subgraph {
+          exec "eval/context-resource-continuity/contract/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash ./run.sh"
+            restart "never"
+          }
+        }
+        judges {
+          field "status" "exec/eval/context-resource-continuity/contract/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/context-resource-continuity/contract/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "the exact context decision and resource remain readable" {
+            exec "bash ./judge.sh"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            time-limit "1m"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/context-resource-continuity/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/context-resource-continuity/${PLAN_RUN}" }
+      }
+    }
+  }
+}

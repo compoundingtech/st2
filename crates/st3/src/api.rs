@@ -1820,7 +1820,7 @@ async fn clear_context(
             kind: "context.clear.requested".into(),
             actor: Some("requester".into()),
             fields: BTreeMap::from([
-                ("status".into(), Value::String("requested".into())),
+                ("operation_status".into(), Value::String("requested".into())),
                 (
                     "runtime_id".into(),
                     Value::String(session.runtime_id.clone()),
@@ -1890,7 +1890,7 @@ async fn signal_session(
             kind: "session.signal.requested".into(),
             actor: Some("requester".into()),
             fields: BTreeMap::from([
-                ("status".into(), Value::String("requested".into())),
+                ("operation_status".into(), Value::String("requested".into())),
                 ("signal".into(), Value::String(request.signal)),
                 (
                     "runtime_id".into(),
@@ -1952,7 +1952,7 @@ fn finish_session_control(
             kind: kind.into(),
             actor: Some("requester".into()),
             fields: BTreeMap::from([
-                ("status".into(), Value::String(status.into())),
+                ("operation_status".into(), Value::String(status.into())),
                 (
                     "runtime_id".into(),
                     Value::String(session.runtime_id.clone()),
@@ -2214,7 +2214,7 @@ async fn terminal_proxy(
                 actor: None,
                 fields: BTreeMap::from([
                     ("sequence".into(), Value::from(sequence)),
-                    ("status".into(), Value::String("written".into())),
+                    ("operation_status".into(), Value::String("written".into())),
                 ]),
                 evidence: vec![request.id],
                 expected_subject: None,

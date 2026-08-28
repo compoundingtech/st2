@@ -605,6 +605,8 @@ The claim records the user, target incarnation, frame sequence, byte hash, and e
 
 The driver appends `terminal.input.result` after it writes the frame. A crash resumes or rejects the same frame by its sequence.
 
+Control claims use `operation_status`. They do not replace the member lifecycle `status` in the graph view.
+
 Graph control does not use terminal text. Context clearing, lifecycle control, and agent messages use typed API requests.
 
 Each harness driver filters its versioned control sequences from the data channel. It returns a typed API instruction instead of forwarding them.

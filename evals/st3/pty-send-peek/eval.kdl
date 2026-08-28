@@ -1,0 +1,45 @@
+version 2
+
+subgraph {
+  scope "eval/pty-send-peek/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/pty-send-peek" state="ready" {
+      step "contract" timeout="1m" {
+        title "PTY send and peek make a real byte round trip"
+        subgraph {
+          pty "psp/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}"
+            command "bash -c 'echo READY; while IFS= read -r line; do echo ACK:$line; done'"
+            restart "never"
+          }
+          exec "eval/pty-send-peek/probe/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash ./run.sh"
+            restart "never"
+            env { PLAN_RUN "${PLAN_RUN}" }
+          }
+        }
+        judges {
+          field "status" "exec/eval/pty-send-peek/probe/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/pty-send-peek/probe/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "the acknowledgement appears only after send" {
+            exec "grep -Fq READY pre.txt && ! grep -Fq ACK:PSP-9f3a7c2e pre.txt && grep -Fq ACK:PSP-9f3a7c2e post.txt"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/pty-send-peek/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/pty-send-peek/${PLAN_RUN}" }
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+version 2
+
+subgraph {
+  scope "eval/pty-attach-machine-stream/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/pty-attach-machine-stream" state="ready" {
+      step "contract" timeout="2m" {
+        title "The installed PTY machine stream reconnects without framing loss"
+        subgraph {
+          exec "eval/pty-attach-machine-stream/probe/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash -o pipefail -c 'bash ./stream.sh | tee proof.txt'"
+            restart "never"
+            env { CATALOG "${WORKSPACE}/fixture" }
+          }
+        }
+        judges {
+          field "status" "exec/eval/pty-attach-machine-stream/probe/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/pty-attach-machine-stream/probe/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "all machine-stream markers are present" {
+            exec "bash ./judge.sh"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/pty-attach-machine-stream/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/pty-attach-machine-stream/${PLAN_RUN}" }
+      }
+    }
+  }
+}

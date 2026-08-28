@@ -44,7 +44,7 @@ A candidate remains outside the active corpus until one baseline run proves that
 
 `Represented` means that the behavior already has an st2 and an st3 form in this repository.
 
-`Keep` means that we should import the fixture and rewrite its KDL for the current design.
+`Keep` means that the fixture enters this repository with rewritten KDL for the current design.
 
 `Merge` means that another logical eval should absorb the unique assertions.
 
@@ -60,15 +60,15 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `agent-spec-resource-bindings` | Rust | `crates/agent-spec/tests/discovery.rs`, `tests/validate.rs`, `tests/reconcile.rs` | The Rust suite covers parsing, stable projection, and no-restart resource edits. |
 | `assignment-contract-cold-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
 | `assignment-contract-cold-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
-| `assignment-contract-cold-resources` | Keep, wave 1 | Model-free `resource-cold-start` | Test graph assignment and resource readiness without paying a model. |
+| `assignment-contract-cold-resources` | Represented | Model-free `resource-cold-start` | Test resource readiness and one delivery action without paying a model. |
 | `assignment-contract-handoff-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
 | `assignment-contract-handoff-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
-| `assignment-contract-handoff-resources` | Keep, wave 1 | Model-free `resource-handoff` | Test revoke-before-grant handoff and post-revocation safety without paying a model. |
+| `assignment-contract-handoff-resources` | Represented | Model-free `resource-handoff` | Test revoke-before-grant handoff without paying a model. |
 | `assignment-contract-hot-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
 | `assignment-contract-hot-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
-| `assignment-contract-hot-resources` | Keep, wave 1 | Model-free `resource-retarget` | Test retarget, removal, and idle graph states without paying a model. |
-| `context-resource-continuity` | Keep, wave 1 | `context-resource-continuity` | This fast eval crosses the real lifecycle boundary and checks durable state together. |
-| `crash-ding` | Keep, wave 1 | Model-free `crash-escalation` | Crash classification and escalation are mechanical runtime behavior. |
+| `assignment-contract-hot-resources` | Represented | Model-free `resource-retarget` | Test retarget, removal, and idle graph states without paying a model. |
+| `context-resource-continuity` | Represented | `context-resource-continuity` | This fast eval crosses the real lifecycle boundary and checks durable state together. |
+| `crash-ding` | Represented | Model-free `crash-escalation` | Crash classification and escalation are mechanical runtime behavior. |
 | `ding-mode` | Merge | `license-mit` | License MIT already covers delegated work over Small Talk. Keep only missing message assertions. |
 | `ding-reply` | Merge | `license-mit` | Add a threaded-reply assertion to License MIT. A separate paid agent does not earn its cost. |
 | `docs` | Archive | Source history | The cold-reader idea is good, but three paid seats test model writing more than runtime behavior. |
@@ -88,9 +88,9 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `poisoned-pr` | Keep, wave 2 | `poisoned-pr` | Merge the provider twins. This gives the corpus a strong review-only lane. |
 | `poisoned-pr-codex` | Keep, wave 2 | `poisoned-pr` | This is the same logical eval and carries accepted pass evidence. |
 | `presence-ding-matrix` | Rust | `src/ding/mod.rs` tests | The Rust suite covers busy, away, DND, stale DND, FIFO, and retry behavior. |
-| `pty-attach-machine-stream` | Keep, wave 1 | Model-free PTY contract | This verifies the installed PTY stream through the boundary that st2 and st3 use. |
-| `pty-attach-only` | Keep, wave 1 | Model-free PTY contract | This verifies that attach never creates or restarts a session. |
-| `pty-send-peek` | Keep, wave 1 | Model-free PTY contract | This gives a real byte round trip and has accepted pass evidence. |
+| `pty-attach-machine-stream` | Represented | `pty-attach-machine-stream` | This verifies the installed PTY stream through the boundary that st2 and st3 use. |
+| `pty-attach-only` | Represented | `pty-attach-only` | This verifies that attach never creates or restarts a session. |
+| `pty-send-peek` | Represented | `pty-send-peek` | This gives a real byte round trip and has accepted pass evidence. |
 | `reconcile-retire-keep` | Rust | `tests/reconcile.rs` | The Rust suite covers missing, dead, keep, retired, and adopt lifecycle rules. |
 | `render-target-safety` | Rust | `tests/materialize.rs` | The Rust suite covers directives, idempotency, tracked targets, and unsafe paths. |
 | `restart-continuity` | Keep, wave 1 | `restart-continuity` | Lift the full work plan and progress into the st3 graph before the injected restart. |
@@ -100,11 +100,11 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `signal-rename-codex` | Represented | `signal-rename` | The local Codex pair represents both source provider forms. |
 | `skill-inheritance` | Keep, wave 2 | `claude-skill-inheritance` | This is a useful Claude package and project-skill integration eval. |
 | `st2-doctor-structure` | Rust | `tests/doctor.rs` | The Rust suite checks healthy and broken catalogs with mutation-valid failures. |
-| `st2-network` | Keep, wave 1 | Model-free network smoke | Keep one black-box proof that hosting and message delivery work together. |
+| `st2-network` | Represented | Model-free `network-smoke` | Keep one black-box proof that hosting and message delivery work together. |
 | `strict-validation-json` | Rust | `tests/validate.rs` | The Rust suite covers stable issue data and strict warning promotion. |
 | `targeted-reconcile-isolation` | Rust | `tests/targeted_reconcile.rs` | The Rust suite covers exact selection and sibling isolation. |
 | `test-writing` | Keep, wave 2 | `test-writing` | Mutation scoring makes this stronger than a test-count eval. |
-| `two-networks-coexist` | Keep, wave 1 | Model-free network isolation | Keep the concurrent catalog, message, and PTY partition proof. |
+| `two-networks-coexist` | Represented | Model-free `network-isolation` | Keep the concurrent catalog, message, and PTY partition proof. |
 | `vrs-cross-file-absent` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
 | `vrs-cross-file-present` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
 | `vrs-definition-of-done-absent` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
@@ -145,9 +145,9 @@ We can also reuse an individual task after we define a clear runtime question. W
 
 Each selected agent eval must use a native `harness` block. A fixture process can still use `command`.
 
-Each logical agent eval gets an st2 and an st3 form when both runtimes can express the same outcome.
+Each selected logical eval gets an st2 form and an st3 form.
 
-A runtime-independent model-free contract needs one form. Its report must name the tested binary versions.
+A model-free pair uses native runtime records to prove the same outcome. Its report names all tested binary versions.
 
 The st3 form must lift the work plan, step state, assignment, products, and judges into the graph.
 
@@ -167,7 +167,7 @@ Every paid run must add a dated report. The report records duration, token use, 
 
 Wave 1 proves the runtime:
 
-1. Import ten model-free lifecycle, PTY, network, resource, and crash contracts.
+1. Maintain the ten represented model-free lifecycle, PTY, network, resource, and crash pairs.
 2. Add threaded-reply and delegation assertions to License MIT.
 3. Rewrite restart continuity with duplicate delivery and durable graph state.
 4. Merge the fork-in-the-road provider twins and lift its parallel plan into the graph.

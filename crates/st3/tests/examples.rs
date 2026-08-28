@@ -138,7 +138,33 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals");
-    for name in ["license-mit", "ghost-bug", "signal-rename"] {
+    let model_free = [
+        "resource-cold-start",
+        "resource-retarget",
+        "resource-handoff",
+        "context-resource-continuity",
+        "crash-escalation",
+        "pty-attach-machine-stream",
+        "pty-attach-only",
+        "pty-send-peek",
+        "network-smoke",
+        "network-isolation",
+    ];
+    for name in [
+        "license-mit",
+        "ghost-bug",
+        "signal-rename",
+        "resource-cold-start",
+        "resource-retarget",
+        "resource-handoff",
+        "context-resource-continuity",
+        "crash-escalation",
+        "pty-attach-machine-stream",
+        "pty-attach-only",
+        "pty-send-peek",
+        "network-smoke",
+        "network-isolation",
+    ] {
         let st2_file = root.join("st2").join(name).join("eval.kdl");
         let st3_file = root.join("st3").join(name).join("eval.kdl");
         let st2_source = fs::read_to_string(&st2_file).expect("read st2 eval");
@@ -158,24 +184,47 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
             .unwrap_or_else(|error| panic!("{}: {error:#}", st2_file.display()));
         st3::parse_intent(&st3_source, "local")
             .unwrap_or_else(|error| panic!("{}: {error}", st3_file.display()));
-        for agent in st2_spec.agents.iter().chain(
+        let st2_agents = st2_spec.agents.iter().chain(
             st2_spec
                 .eval
                 .iter()
                 .flat_map(|evaluation| evaluation.agents.iter()),
-        ) {
+        );
+        if model_free.contains(&name) {
+            for agent in st2_agents {
+                assert!(
+                    agent.driver.is_none(),
+                    "{} model-free agent {} must not use a harness",
+                    st2_file.display(),
+                    agent.id
+                );
+            }
+            assert_eq!(
+                authored_harness_counts(&st3_source, &st3_file.display().to_string()),
+                (0, 0),
+                "{} must remain model-free",
+                st3_file.display()
+            );
             assert!(
-                agent.command.is_none() && agent.driver.is_some(),
-                "{} agent {} must use a native harness",
-                st2_file.display(),
-                agent.id
+                authored_model_judges(&st3_source).is_empty(),
+                "{} must not use an LLM judge",
+                st3_file.display()
+            );
+        } else {
+            for agent in st2_agents {
+                assert!(
+                    agent.command.is_none() && agent.driver.is_some(),
+                    "{} agent {} must use a native harness",
+                    st2_file.display(),
+                    agent.id
+                );
+            }
+            assert!(
+                authored_harness_counts(&st3_source, &st3_file.display().to_string()) != (0, 0),
+                "{} must contain native agent harnesses",
+                st3_file.display()
             );
         }
-        assert!(
-            authored_harness_counts(&st3_source, &st3_file.display().to_string()) != (0, 0),
-            "{} must contain native agent harnesses",
-            st3_file.display()
-        );
         assert!(st2::eval_spec::parse_spec(&st3_source).is_err());
         assert!(st3::parse_intent(&st2_source, "local").is_err());
     }

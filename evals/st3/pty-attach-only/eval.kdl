@@ -1,0 +1,39 @@
+version 2
+
+subgraph {
+  scope "eval/pty-attach-only/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/pty-attach-only" state="ready" {
+      step "contract" timeout="2m" {
+        title "Attach-only never restarts a dead PTY session"
+        subgraph {
+          exec "eval/pty-attach-only/probe/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash -o pipefail -c 'bash ./probe.sh | tee proof.txt'"
+            restart "never"
+            env { CATALOG "${WORKSPACE}/fixture" }
+          }
+        }
+        judges {
+          field "status" "exec/eval/pty-attach-only/probe/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/pty-attach-only/probe/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "all attach-only markers are present" {
+            exec "bash ./judge.sh"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/pty-attach-only/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/pty-attach-only/${PLAN_RUN}" }
+      }
+    }
+  }
+}

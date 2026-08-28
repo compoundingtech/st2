@@ -1,0 +1,39 @@
+version 2
+
+subgraph {
+  scope "eval/resource-handoff/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/resource-handoff" state="ready" {
+      step "contract" timeout="1m" {
+        title "The resource moves from A to B without overlap"
+        subgraph {
+          exec "eval/resource-handoff/contract/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash ./run.sh"
+            restart "never"
+          }
+        }
+        judges {
+          field "status" "exec/eval/resource-handoff/contract/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/resource-handoff/contract/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "the resource history revokes A before granting B" {
+            exec "bash ./judge.sh"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            time-limit "1m"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/resource-handoff/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/resource-handoff/${PLAN_RUN}" }
+      }
+    }
+  }
+}

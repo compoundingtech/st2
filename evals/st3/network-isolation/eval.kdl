@@ -1,0 +1,38 @@
+version 2
+
+subgraph {
+  scope "eval/network-isolation/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/network-isolation" state="ready" {
+      step "contract" timeout="2m" {
+        title "Two nested st3 networks remain isolated"
+        subgraph {
+          exec "eval/network-isolation/contract/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash ./run.sh"
+            restart "never"
+          }
+        }
+        judges {
+          field "status" "exec/eval/network-isolation/contract/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/network-isolation/contract/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "both endpoint and state partitions hold" {
+            exec "grep -Fq NETWORK-A-ISOLATED result.txt && grep -Fq NETWORK-B-ISOLATED result.txt"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/network-isolation/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/network-isolation/${PLAN_RUN}" }
+      }
+    }
+  }
+}

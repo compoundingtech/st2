@@ -1,0 +1,45 @@
+version 2
+
+subgraph {
+  scope "eval/resource-cold-start/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/resource-cold-start" state="ready" {
+      step "contract" timeout="1m" {
+        title "The cold resource becomes ready before delivery"
+        subgraph {
+          exec "eval/resource-cold-start/contract/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash ./run.sh"
+            restart "never"
+            env { PLAN_RUN "${PLAN_RUN}" }
+          }
+        }
+        judges {
+          field "status" "exec/eval/resource-cold-start/contract/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/resource-cold-start/contract/${PLAN_RUN}" "is" 0
+        }
+      }
+
+      step "judge" timeout="1m" {
+        title "The cold-start transition is valid"
+        depends-on { step "contract" completed }
+        judges {
+          judge "the resource claim precedes one Small Talk action" {
+            exec "bash ./judge.sh"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            env { PLAN_RUN "${PLAN_RUN}" }
+            time-limit "1m"
+          }
+        }
+      }
+
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph { scope "eval/resource-cold-start/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/resource-cold-start/${PLAN_RUN}" }
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+version 2
+
+subgraph {
+  scope "eval/network-smoke/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/network-smoke" state="ready" {
+      step "contract" timeout="2m" {
+        title "An isolated st3 daemon hosts a subject and delivers Small Talk"
+        subgraph {
+          exec "eval/network-smoke/contract/${PLAN_RUN}" {
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+            cwd "${WORKSPACE}/fixture"
+            command "bash ./run.sh"
+            restart "never"
+          }
+        }
+        judges {
+          field "status" "exec/eval/network-smoke/contract/${PLAN_RUN}" "is" "exited"
+          field "exit_code" "exec/eval/network-smoke/contract/${PLAN_RUN}" "is" 0
+        }
+      }
+      step "judge" timeout="1m" {
+        depends-on { step "contract" completed }
+        judges {
+          judge "the nested daemon recorded health and delivery" {
+            exec "grep -Fq NETWORK-SMOKE-HEALTH-GREEN result.txt && grep -Fq NETWORK-SMOKE-DELIVERY-GREEN result.txt"
+            host "local"
+            workspace "${WORKSPACE}/fixture"
+          }
+        }
+      }
+      step "cleanup" finally=#true {
+        subgraph { scope "eval/network-smoke/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/network-smoke/${PLAN_RUN}" }
+      }
+    }
+  }
+}

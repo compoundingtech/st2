@@ -2733,10 +2733,13 @@ fn validate_claim_fields(input: &ClaimInput) -> Result<(), St3Error> {
     };
     match input.kind.as_str() {
         "context.clear.requested" | "session.signal.requested" => {
-            enum_field("status", &["requested"])?
+            enum_field("operation_status", &["requested"])?
         }
         "context.clear.result" | "session.signal.result" => {
-            enum_field("status", &["succeeded", "failed"])?
+            enum_field("operation_status", &["succeeded", "failed"])?
+        }
+        "terminal.input.result" => {
+            enum_field("operation_status", &["succeeded", "failed", "written"])?
         }
         "account.quota" => enum_field("quota", &["available", "limited", "exhausted", "unknown"])?,
         "eval.verdict" => enum_field("verdict", &["pass", "fail", "void"])?,
@@ -4220,6 +4223,44 @@ mod tests {
         assert_eq!(error.details["subject"], "exec/work");
         assert_eq!(error.details["expected_heads"], json!([]));
         assert_eq!(error.details["current_heads"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_operations_do_not_replace_member_status() {
+        let store = Store::open_memory("node").expect("store");
+        let subject = "pty/demo";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "member.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .expect("member observation");
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "terminal.input.result".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "operation_status".into(),
+                    Value::String("written".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .expect("input result");
+
+        let actual = store
+            .latest_actual_value(subject)
+            .expect("actual state")
+            .expect("subject state");
+        assert_eq!(actual["status"], "running");
+        assert_eq!(actual["operation_status"], "written");
     }
 
     #[test]

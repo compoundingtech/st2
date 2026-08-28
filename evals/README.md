@@ -13,10 +13,22 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | License MIT | `st2/license-mit` | `st3/license-mit` |
 | Ghost bug | `st2/ghost-bug` | `st3/ghost-bug` |
 | Signal rename | `st2/signal-rename` | `st3/signal-rename` |
+| Resource cold start | `st2/resource-cold-start` | `st3/resource-cold-start` |
+| Resource retarget | `st2/resource-retarget` | `st3/resource-retarget` |
+| Resource handoff | `st2/resource-handoff` | `st3/resource-handoff` |
+| Context and resource continuity | `st2/context-resource-continuity` | `st3/context-resource-continuity` |
+| Crash escalation | `st2/crash-escalation` | `st3/crash-escalation` |
+| PTY attach machine stream | `st2/pty-attach-machine-stream` | `st3/pty-attach-machine-stream` |
+| PTY attach only | `st2/pty-attach-only` | `st3/pty-attach-only` |
+| PTY send and peek | `st2/pty-send-peek` | `st3/pty-send-peek` |
+| Network smoke | `st2/network-smoke` | `st3/network-smoke` |
+| Network isolation | `st2/network-isolation` | `st3/network-isolation` |
 
 The License MIT pair uses Claude Sonnet teams in both runtimes.
 
 The Ghost bug and Signal rename pairs use Codex in both runtimes.
+
+The other ten pairs are model-free. They use deterministic processes and mechanical judges.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -36,6 +48,8 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Signal rename | Codex × 4 | Codex × 1 |
 
 The current corpus has four Claude seats and 13 Codex seats. It also has three Codex LLM judges.
+
+The ten model-free pairs add no model seats and no LLM judges.
 
 All Claude seats use `claude-sonnet-5`.
 
@@ -65,7 +79,7 @@ An eval must keep enough work state in the graph to survive an agent or daemon r
 
 ## Run reports
 
-Each model eval run gets one concise Markdown report in its eval folder.
+Each eval run gets one concise Markdown report in its eval folder.
 
 Use `reports/YYYY-MM-DD-<run-id>.md`. Copy [run-report-template.md](./run-report-template.md) as the starting form.
 
@@ -78,6 +92,8 @@ Commit the report with the run evidence. Do not leave the only report in termina
 ```sh
 st2 eval ./evals/st2/license-mit
 st3 eval ./evals/st3/license-mit
+st2 eval ./evals/st2/network-smoke
+st3 eval ./evals/st3/network-smoke
 ```
 
 Use the matching command for the selected runtime directory.
