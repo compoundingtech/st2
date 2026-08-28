@@ -120,6 +120,15 @@ accepted rationale is recorded in
   `catalog.kdl` that names them and retires old module bytes only after that
   declaration stops naming them.
 
+### Must opt into chain notification
+
+- **PROFILE-R11 Explicit chain notification:** A profile may opt into
+  supervisor-chain notification. For a binding through that profile, resync
+  includes active same-scheme carriers from every non-retired supervisor
+  ancestor in the descendant's watch set. The flag is false by default, does
+  not change path containment or task launch, and an invalid supervisor chain
+  is reported rather than silently approximated.
+
 ## Evidence
 
 The mechanism choice and sandbox bounds are supported by the

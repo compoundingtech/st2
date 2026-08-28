@@ -584,9 +584,15 @@ impl ResyncSupervisor {
     /// Synchronously install one newly proven-live canonical seat before reconciliation advances
     /// to another launch target. The acknowledgement closes the gap between a successful spawn and
     /// the worker's silent baseline seed; later full refreshes still own removals and malformed
-    /// declaration retention. Profile resolution uses the supervisor's current registry and
-    /// returns contained resolver failures for the reconcile report.
-    pub fn install_live(&self, spec: &AgentSpec, this_host: &str) -> Vec<String> {
+    /// declaration retention. Profile and supervisor-chain resolution use the supervisor's current
+    /// registry and the pass's complete catalog view, and return contained resolver failures for the
+    /// reconcile report.
+    pub fn install_live(
+        &self,
+        spec: &AgentSpec,
+        specs: &[AgentSpec],
+        this_host: &str,
+    ) -> Vec<String> {
         if spec.resolved_host(this_host) != this_host || !spec.desired_state.is_running() {
             return Vec::new();
         }
@@ -595,15 +601,7 @@ impl ResyncSupervisor {
                 .profiles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Only this spec is in hand, so a `notify-chain` binding resolves no ancestor
-            // carriers here; the next full refresh adds them. Those subscriptions seed silently,
-            // so an ancestor carrier change inside that window is not announced at all.
-            resolve_watch_set(
-                spec,
-                std::slice::from_ref(spec),
-                this_host,
-                &profiles.begin_refresh(),
-            )
+            resolve_watch_set(spec, specs, this_host, &profiles.begin_refresh())
         };
         let (ack_tx, ack_rx) = channel();
         if self
