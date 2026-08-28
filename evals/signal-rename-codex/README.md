@@ -1,27 +1,54 @@
-# signal-rename-codex — coordinated cross-package rename
+# signal-rename-codex — a graph-owned cross-package rename
 
-This st3 cell uses four native Codex agents. They rename the product `signal` to `beacon` across three packages and configuration.
+This st3 eval uses four native Codex agents.
 
-The agents preserve the unrelated `AbortSignal`, `controller.signal`, and `SIGTERM` runtime primitives.
+The st3 plan owns decomposition, assignment, sequence, nested progress, required revisions, final verification, and cleanup.
 
-What it teaches:
+The agents rename the Signal product to Beacon across a base package, two consumers, and the root configuration.
 
-- decomposition: each specialist commits only its owned package lane;
-- sequencing: the base rename lands before consumers adopt the new package and protocol;
-- judgment: product references change, runtime primitives do not;
-- integration: the supervisor closes the temporary alias window and verifies the assembled graph.
+The agents preserve `AbortSignal`, `controller.signal`, signal cancellation options, `SIGTERM`, and other OS signal primitives.
 
-Run it:
+## Work graph
+
+```text
+materialize
+    |
+start-team
+    |
+open-base-compatibility           sig.base
+    +--------------------+
+migrate-relay              migrate-hub
+sig.relay                  sig.hub
+    +----------+-----------+
+       update-root-and-config     sig.sup
+                 |
+       close-base-compatibility   sig.base
+                 |
+       integrate-and-verify       sig.sup
+                 |
+         held-out-judges
+                 |
+        publish-final-report      sig.sup
+
+cleanup runs after every terminal result
+```
+
+Each assigned parent step contains an up-front nested plan. The native driver sends a notification when each durable step becomes ready.
+
+Each lane publishes a `vcs.revision` resource claim. The plan does not infer completion from prose or exported messages.
+
+The final report remains a message because communication is its product. A resource claim records its publication.
+
+## Run
 
 ```sh
 st3 eval ./evals/signal-rename-codex
 ```
 
-The fixture is deterministic. `materialize.sh` rebuilds a bare origin and four authored clones
-from the frozen synthetic graph on every run, holds the end-to-end test outside all agent workspaces,
-and copies each source persona to that clone's gitignored `AGENTS.md`. Codex loads those files directly.
-The KDL uses native `codex {}` blocks and graph messages.
+`materialize.sh` creates a bare origin and four authored clones from the frozen synthetic graph.
 
-Five mechanical judges grade the integrated `sig.sup` clone. A bounded Codex judge checks the sequence and result.
+The script holds the end-to-end test outside every agent workspace. It also copies each persona to its clone as `AGENTS.md`.
 
-The `receipts/` directory contains the attempts and the passing proof.
+Five mechanical judges grade the integrated clone. A bounded Codex judge inspects the plan claims, work state, revision products, and Git history.
+
+The `receipts/` directory contains historical runs. Each receipt records the exact KDL hash that produced it.
