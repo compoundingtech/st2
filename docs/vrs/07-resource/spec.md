@@ -208,6 +208,13 @@ entry so a reader who meets one can identify it.
 
 ## Boundaries
 
-No Resource registry, no generic resolution, no mutation authority over the
-thing a URI names, and no rule that makes possessing a URI mean something. A
-mediated write changes a declaration; it does not touch the referent.
+Nothing here claims mutation authority over the thing a URI names, and nothing
+makes possessing a URI mean something. A mediated write changes a declaration;
+it does not touch the referent.
+
+Resolution is deliberately out of scope for this document, not absent from st2:
+[#351](https://github.com/compoundingtech/st2/pull/351) owns the scheme-keyed
+Resource Profile registry under
+[`07-resource-profile`](../07-resource-profile/requirements.md). The two are
+orthogonal — a binding names a Resource whether or not any profile resolves its
+scheme, and `st2 resource` neither reads nor requires one.
