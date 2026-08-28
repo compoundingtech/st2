@@ -89,8 +89,10 @@ bindings, and remains canonical for an agent's resource files.
   `linked record` (retired), `agent resource directory`, `working state`.
 - [open-questions.md](../open-questions.md): DQ-R4 (write-cost, unresolved),
   DQ-R7 (placeholder cleanup), DQ-R8 (upstream sync).
-- Requirements delta proposed for the working-state carrier; protected, awaiting
-  confirmation.
+- No requirements change. A delta was drafted for the working-state carrier and
+  withdrawn once [#351](https://github.com/compoundingtech/st2/pull/351) rewrote
+  R20; see [decision 0012](../../.decisions/0012-working-state-is-a-declared-carrier.md)
+  Amendment 1.
 
 ## Limits
 

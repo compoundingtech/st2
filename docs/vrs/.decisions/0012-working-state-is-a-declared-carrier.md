@@ -46,22 +46,28 @@ scheme inherits that guard.
 - The ontology gains a `working state` entry naming the term, the verb, the
   realization path, and the scheme.
 - Declaring it across the fleet is a bulk binding write, which is why it
-  sequences after the mediated write surface (decision 0010).
-- This required a requirements delta, confirmed in the same interview and
-  written as **R35 st2-owned Resource profiles**. `working-state` is the first
-  scheme st2 itself owns and resolves, which R20 ("st2 does not register
-  schemes") otherwise forbids; R35 names that as an enumerated exception rather
-  than leaving R20 contradicted.
+  sequences after the mediated write surface (decision 0013).
+- This needed no requirements change. It was first drafted as a new requirement
+  (**R35 st2-owned Resource profiles**) because R20 then read "st2 does not
+  register schemes", which a scheme st2 resolves would have contradicted.
+  [#351](https://github.com/compoundingtech/st2/pull/351) landed first and
+  rewrote R20: a scheme is now the exact lookup key for an optional,
+  catalog-declared Resource Profile. That removes the barrier R35 existed to lift,
+  and R35's own text — an exemption from a clause R20 no longer contains — became
+  incoherent, so it was dropped rather than rebased.
 
-  Three delta shapes were weighed. Amending R09 in place was smaller but would
-  bury an envelope-level exception inside a continuity requirement, where a
-  reader of R20 would never find it. Writing no delta at all was cheapest and was
-  rejected because R20 does not merely omit the case — it asserts the opposite,
-  so an authoritative sentence would have been left standing and false. A
-  separate enumerated requirement was chosen because the set will grow: st2
-  already writes more than one carrier's bytes, and R20 should be qualified once
-  rather than per carrier. The ID is R35, not the R22 first drafted; R22 is taken
-  by "Quiet coordination after events".
+  `working-state` is therefore an ordinary scheme under the merged R20. st2's
+  `st2 context` writes the carrier at `resources/context/now.md`; whether any
+  catalog registers a Resource Profile that resolves the scheme is a downstream
+  choice this decision does not make, and R20's "st2 ships no built-in profiles"
+  stands untouched.
+
+## Amendment 1 — 2026-08-28
+
+The requirements delta this decision originally carried is withdrawn. Nothing
+about the carrier, its scheme name, or its realization changes; only the
+justification does, because #351 made the exemption unnecessary. See the bullet
+above.
 
 ## Options
 

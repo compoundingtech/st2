@@ -9,9 +9,9 @@ Terms are defined in [ontology.md](../ontology.md): [Resource](../ontology.md#re
 [agent resource directory](../ontology.md#agent-resource-directory),
 [working state](../ontology.md#working-state).
 
-Decisions: [0008](../.decisions/0008-the-linked-record-plane-is-retired.md),
-[0009](../.decisions/0009-working-state-is-a-declared-carrier.md),
-[0010](../.decisions/0010-resource-is-a-mediated-write-surface.md).
+Decisions: [0011](../.decisions/0011-the-linked-record-plane-is-retired.md),
+[0012](../.decisions/0012-working-state-is-a-declared-carrier.md),
+[0013](../.decisions/0013-resource-is-a-mediated-write-surface.md).
 
 ## The edge
 
@@ -28,10 +28,14 @@ Resource's identity. `reason` is required prose saying why this agent carries
 it. `inactive-reason`, when present, retains a reference that is no longer
 current and explains why.
 
-The URI scheme selects an open, downstream-owned profile. st2 does not register
-schemes, normalize URIs, resolve them, or reject unknown ones
-([R20](../requirements.md)). Possession of a URI grants no authority, access, or
-capability ([#61](https://github.com/compoundingtech/st2/issues/61)).
+The URI is never normalized, and its scheme is the exact lookup key for an
+optional, catalog-declared Resource Profile
+([`07-resource-profile`](../07-resource-profile/requirements.md), landed in
+[#351](https://github.com/compoundingtech/st2/pull/351)). Scheme meaning stays
+downstream-owned, st2 ships no built-in profiles, and an unregistered scheme
+stays opaque ([R20](../requirements.md)). Possession of a URI grants no
+authority, access, or capability
+([#61](https://github.com/compoundingtech/st2/issues/61)).
 
 Bindings are desired state. They change through publication under
 compare-and-swap, and a binding-only change never stops, replaces, or relaunches
@@ -60,7 +64,7 @@ also holds the message planes (`inbox/`, `archive/`, `sent/`) and scratch
 material (`tmp/`), which are not carriers.
 
 `working-state` is the sixth self-state carrier
-([decision 0009](../.decisions/0009-working-state-is-a-declared-carrier.md)).
+([decision 0012](../.decisions/0012-working-state-is-a-declared-carrier.md)).
 Before it, 605 of 655 declarations on one live catalog had a
 `resources/context/now.md` and none declared it.
 
@@ -105,8 +109,8 @@ binding-only change does not stop, replace, or relaunch healthy work
 ([R21](../requirements.md)). This is the fourth instance of the pattern in
 [`src/agent_author.rs`](../../../src/agent_author.rs), after streams, desired
 state, and presentation
-([decision 0010](../.decisions/0010-resource-is-a-mediated-write-surface.md)).
-Decisions [0008](../.decisions/0008-the-linked-record-plane-is-retired.md) and
+([decision 0013](../.decisions/0013-resource-is-a-mediated-write-surface.md)).
+Decisions [0011](../.decisions/0011-the-linked-record-plane-is-retired.md) and
 0010 carry "merge and acceptance approval required: upstream maintainers".
 
 Each write is idempotent on its outcome rather than its attempt: `add` upserts
@@ -127,7 +131,7 @@ optional body, under `<agent-dir>/resources/links/`. An agent wrote them itself,
 without publication or CAS, to record what it produced.
 
 That plane is retired
-([decision 0008](../.decisions/0008-the-linked-record-plane-is-retired.md)).
+([decision 0011](../.decisions/0011-the-linked-record-plane-is-retired.md)).
 Recording produced artifacts is `axe work update --artifact <path> --pty <name>`.
 
 `templates/bus.st2.md` advertised `st2 resource add|ls|read|remove` to every
@@ -172,7 +176,7 @@ wrote a linked record, because that was the plane it was permitted to write.
 
 **The drift was caused by write-cost asymmetry, not by two relations.** Retiring
 the plane removes the escape hatch; the mediated write verbs
-([decision 0010](../.decisions/0010-resource-is-a-mediated-write-surface.md))
+([decision 0013](../.decisions/0013-resource-is-a-mediated-write-surface.md))
 remove the pressure that produced it.
 
 ### Reported friction

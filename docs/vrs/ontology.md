@@ -204,7 +204,7 @@ under `resources/links/` can identify it. Recording produced artifacts is
 record, and *resource* now names only the declared plane.
 
 Authority: [07-resource spec](07-resource/spec.md);
-[decision 0008](.decisions/0008-the-linked-record-plane-is-retired.md)
+[decision 0011](.decisions/0011-the-linked-record-plane-is-retired.md)
 
 ### agent resource directory
 
@@ -230,12 +230,14 @@ it ruled out — written through `st2 context` and realized at
 `resources/context/now.md`. Never a liveness or activity term; the observed
 signal is [observed harness state](#observed-harness-state).
 
-Addressed as a [Resource binding](#resource-binding) under the st2-owned scheme
-`working-state://<host>/<identity>`.
+Addressed as a [Resource binding](#resource-binding) under the scheme
+`working-state://<host>/<identity>`. st2 writes the carrier through
+`st2 context`; resolving the scheme is a catalog's choice via an optional
+[Resource Profile](07-resource-profile/requirements.md), not something st2 ships.
 
 Authority: [R09 state continuity](requirements.md#L131-L132);
 [`context`](../../src/context.rs);
-[decision 0009](.decisions/0009-working-state-is-a-declared-carrier.md)
+[decision 0012](.decisions/0012-working-state-is-a-declared-carrier.md)
 
 ### restart policy
 

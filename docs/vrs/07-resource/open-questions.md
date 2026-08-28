@@ -4,7 +4,7 @@ Each entry links a spec `DQ-R*`. Questions leave this file when resolved — int
 [spec.md](./spec.md) as decisions or `.experiments/` as tested hypotheses.
 
 - **DQ-R4 Runtime bindings on a generated declaration.**
-  [Decision 0010](../.decisions/0010-resource-is-a-mediated-write-surface.md)
+  [Decision 0013](../.decisions/0013-resource-is-a-mediated-write-surface.md)
   gives `st2 resource add|remove|rename` mediated read-modify-CAS-publish, which
   covers a declaration st2 owns. It does not cover a declaration generated
   read-only by configuration management, where the next activation overwrites the
@@ -24,7 +24,7 @@ Each entry links a spec `DQ-R*`. Questions leave this file when resolved — int
   required. Declarations authored since carry real prose — 26 of 27 touched on
   2026-08-26 and 2026-08-27 are placeholder-free — so the field works and this is
   cleanup, not redesign.
-  [Decision 0010](../.decisions/0010-resource-is-a-mediated-write-surface.md)
+  [Decision 0013](../.decisions/0013-resource-is-a-mediated-write-surface.md)
   makes the rewrite cheap. `inactive-reason` is used once fleet-wide, too little
   evidence to judge. Resolves by: a cleanup pass, or a decision to let the
   placeholders age out through ordinary republication.
@@ -40,7 +40,7 @@ Each entry links a spec `DQ-R*`. Questions leave this file when resolved — int
   the live contract.
 
 - **DQ-R10 Do the 241 orphaned linked-record files get removed?**
-  [Decision 0008](../.decisions/0008-the-linked-record-plane-is-retired.md)
+  [Decision 0011](../.decisions/0011-the-linked-record-plane-is-retired.md)
   leaves them in place: most belong to retired declarations, and migrating them
   into `axe work` is blocked because it writes to a gitignored per-worktree path
   those declarations no longer have. They are unreferenced once the verb is gone.

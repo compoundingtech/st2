@@ -19,7 +19,7 @@ were not products at all but dependency and reference edges — `current-work`
 the plane they were permitted to write cheaply. **The drift between the two
 planes was caused by write-cost asymmetry, not by two different relations.**
 
-Retiring the linked-record plane (decision 0008) removes the escape hatch. It
+Retiring the linked-record plane (decision 0011) removes the escape hatch. It
 does not remove the pressure that produced it.
 
 ## Decision
@@ -45,7 +45,7 @@ This is the fourth instance of an existing pattern, not new machinery:
 ## Consequences
 
 - The reason agents reached for the cheap plane is removed, not just the plane.
-- Declaring the working-state carrier (decision 0009) across a fleet becomes one
+- Declaring the working-state carrier (decision 0012) across a fleet becomes one
   command per declaration instead of a rendered-and-published candidate each.
 - URI possession still grants nothing. A mediated write changes a declaration;
   it does not touch the thing the URI names, and confers no access to it
@@ -68,7 +68,7 @@ the mediated write applies there. The generated-declaration case stays open in
 | Option | Result | Reason |
 | --- | --- | --- |
 | Read plus mediated `add`/`remove`/`rename` | Selected | Removes the cause of the drift, not just its symptom. The machinery is the fourth instance of an existing pattern in `src/agent_author.rs`, so the marginal risk is small. |
-| Read-only `ls`/`read` | Rejected | Smallest change and a literal reading of #61's read-oriented boundary, but it leaves the write-cost asymmetry intact while decision 0008 removes the escape hatch — pressure with nowhere to go. |
+| Read-only `ls`/`read` | Rejected | Smallest change and a literal reading of #61's read-oriented boundary, but it leaves the write-cost asymmetry intact while decision 0011 removes the escape hatch — pressure with nowhere to go. |
 | Ship read-only now, add writes as a follow-up | Rejected | Sequences a breaking rename away from a new write path, which is genuinely safer, but leaves the same interval in which agents have an expensive plane and no cheap one. |
 
 ## Evidence and Argument

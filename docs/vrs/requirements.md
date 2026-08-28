@@ -173,14 +173,6 @@ accepted.
   inspection exposes every Resource binding without interpreting its profile or URI.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
-- **R35 st2-owned Resource profiles:** st2 may own a small, enumerated set of
-  Resource profiles for state it already writes. An st2-owned profile declares
-  its scheme, its resolver, and its realization, and is exempt from R20's rule
-  that st2 does not register schemes, only for the schemes named here. The
-  initial set is `working-state`, resolved by `st2 context` and realized at the
-  agent's working-state document. An st2-owned binding grants no authority, and
-  its absence is not an error, a launch gate, a readiness gate, or a restart
-  trigger.
 - **R27 Transactional catalog authoring:** One st2 publication operation admits
   exactly one canonical KDL Agent Spec, with explicit host and identity, against
   the complete prospective catalog. Publication is compare-and-swap, durable,
