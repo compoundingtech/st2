@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -112,12 +113,24 @@ impl PtyRuntime {
             .iter()
             .map(OsString::as_os_str)
             .collect::<Vec<_>>();
-        let mut command =
-            crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
-        command.env("PTY_ROOT", &self.root);
-        let output = command.output()?;
-        require_success("spawn PTY", output)?;
-        Ok(())
+        const ATTEMPTS: u32 = 4;
+        let mut last_error = String::new();
+        for attempt in 0..ATTEMPTS {
+            let mut command =
+                crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
+            command.env("PTY_ROOT", &self.root);
+            let output = command.output()?;
+            if output.status.success() {
+                return Ok(());
+            }
+            last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
+                break;
+            }
+            let _ = self.remove(id);
+            std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
+        }
+        anyhow::bail!("spawn PTY failed: {last_error}")
     }
 
     pub fn stop(&self, id: &str) -> Result<()> {
@@ -374,5 +387,53 @@ exit 0
         if crate::isolation_mode() == crate::Isolation::Scope {
             assert!(arguments.contains("st3.scope-unit=st3-work-"));
         }
+    }
+
+    #[test]
+    fn spawn_reaps_a_recent_session_id_and_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("fake-pty-retry");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = run ]; then
+  count=0
+  test ! -f "$0.count" || count="$(cat "$0.count")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$0.count"
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' 'Session id "work" is already in use.' >&2
+    exit 1
+  fi
+fi
+if [ "$1" = remove ]; then
+  touch "$0.removed"
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(binary.with_extension("count"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        assert!(binary.with_extension("removed").is_file());
     }
 }

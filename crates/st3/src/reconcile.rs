@@ -953,12 +953,30 @@ impl<R: RuntimeControl> Reconciler<R> {
 
         let mut wait_until = now;
         let mut reasons = Vec::new();
-        if member.restart_intensity.delay_ms > 0
-            && let Some(last) = launches.last()
-        {
-            let delayed = last
-                .accepted_at_unix_ms
-                .saturating_add(member.restart_intensity.delay_ms as u128);
+        if member.restart_intensity.delay_ms > 0 {
+            let observed_at = self
+                .store
+                .claims_for(&subject.subject, Some("member.observed"))?
+                .into_iter()
+                .rev()
+                .find(|claim| {
+                    matches!(
+                        claim.body.pointer("/fields/status").and_then(Value::as_str),
+                        Some("exited" | "vanished")
+                    ) && observation
+                        .incarnation_id
+                        .as_deref()
+                        .is_none_or(|incarnation| {
+                            claim
+                                .body
+                                .pointer("/fields/incarnation_id")
+                                .and_then(Value::as_str)
+                                == Some(incarnation)
+                        })
+                })
+                .map(|claim| claim.accepted_at_unix_ms)
+                .unwrap_or(now);
+            let delayed = observed_at.saturating_add(member.restart_intensity.delay_ms as u128);
             if delayed > wait_until {
                 wait_until = delayed;
                 reasons.push(format!(
@@ -4718,6 +4736,50 @@ subgraph {
                 .and_then(Value::as_str),
             Some("wait")
         );
+    }
+
+    #[test]
+    fn restart_delay_starts_at_the_exit_observation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+            subgraph {
+              agent "worker" {
+                command "true"
+                restart "always"
+                restart {
+                  attempts 3
+                  interval "60s"
+                  delay "20ms"
+                  mode "delay"
+                }
+              }
+            }
+        "#;
+        apply_source(&store, source, "restart-delay-from-exit");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: "node.worker".into(),
+            terminal: true,
+            status: "exited".into(),
+            exit_code: Some(1),
+            incarnation_id: Some("first".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+
+        std::thread::sleep(Duration::from_millis(25));
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
     }
 
     #[test]

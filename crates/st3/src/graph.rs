@@ -1036,26 +1036,12 @@ fn driver_member(
     let extra = child_strings(children, "args")?.unwrap_or_default();
     let mut provider = vec![name.clone()];
     if name == "claude" {
-        let mcp = serde_json::json!({
-            "mcpServers": {
-                "st3": {
-                    "type": "stdio",
-                    "command": "st3",
-                    "args": ["driver", "claude-mcp", "--subject", subject]
-                }
-            }
-        });
-        provider.extend([
-            "--mcp-config".into(),
-            mcp.to_string(),
-            "--strict-mcp-config".into(),
-        ]);
         let dev_channels = unique_child(children, "dev-channels")?
             .map(one_bool)
             .transpose()?
             .unwrap_or(false);
         if dev_channels {
-            provider.push("--dangerously-load-development-channels=server:st3".into());
+            provider.extend(["--channels".into(), st2::claude_channel::ST3_CHANNEL.into()]);
         }
     }
     if let Some(model) = model {
@@ -2939,6 +2925,43 @@ subgraph {
         assert!(intent.subjects.contains_key("agent/node.worker"));
         assert!(intent.subjects.contains_key("message/task"));
         assert_eq!(intent.document_refs.len(), 1);
+    }
+
+    #[test]
+    fn claude_uses_the_approved_st3_channel_identity() {
+        let intent = parse_intent(
+            r#"
+version 2
+subgraph {
+  agent "worker" {
+    workspace "/work"
+    harness "claude" {
+      dev-channels #true
+      prompt "Work on the task."
+    }
+  }
+}
+"#,
+            "node",
+        )
+        .expect("new KDL parses");
+        let launch = &intent.subjects["agent/node.worker"]
+            .member
+            .as_ref()
+            .unwrap()
+            .launch;
+        let crate::model::LaunchSpec::Argv(argv) = launch else {
+            panic!("the native driver needs argv");
+        };
+        assert!(
+            argv.windows(2)
+                .any(|pair| { pair == ["--channels", st2::claude_channel::ST3_CHANNEL] })
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| { arg.starts_with("--dangerously-load-development-channels") })
+        );
     }
 
     #[test]

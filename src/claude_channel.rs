@@ -15,12 +15,18 @@ use serde_json::{Value, json};
 pub const MARKETPLACE: &str = "st2";
 pub const PLUGIN: &str = "st2-channel";
 pub const CHANNEL: &str = "plugin:st2-channel@st2";
+pub const ST3_PLUGIN: &str = "st3-channel";
+pub const ST3_CHANNEL: &str = "plugin:st3-channel@st2";
+const PLUGINS: [&str; 2] = [PLUGIN, ST3_PLUGIN];
 
 const MARKETPLACE_MANIFEST: &[u8] =
     include_bytes!("../claude-channel/.claude-plugin/marketplace.json");
 const PLUGIN_MANIFEST: &[u8] =
     include_bytes!("../claude-channel/plugins/st2-channel/.claude-plugin/plugin.json");
 const MCP_CONFIG: &[u8] = include_bytes!("../claude-channel/plugins/st2-channel/.mcp.json");
+const ST3_PLUGIN_MANIFEST: &[u8] =
+    include_bytes!("../claude-channel/plugins/st3-channel/.claude-plugin/plugin.json");
+const ST3_MCP_CONFIG: &[u8] = include_bytes!("../claude-channel/plugins/st3-channel/.mcp.json");
 const POLICY_FILE: &str = "50-st2-channel.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +44,9 @@ pub fn install(no_policy: bool) -> Result<InstallPaths> {
         ensure_policy_with_elevation(&policy)?;
     }
     println!("marketplace\t{}", marketplace.display());
-    println!("plugin\t{PLUGIN}@{MARKETPLACE}");
+    for plugin in PLUGINS {
+        println!("plugin\t{plugin}@{MARKETPLACE}");
+    }
     if no_policy {
         println!("policy\tskipped");
     } else {
@@ -59,12 +67,15 @@ pub fn status() -> Result<()> {
         .ok()
         .flatten()
         .is_some_and(|entry| marketplace_entry_matches(&entry, &marketplace));
-    let plugin_ready = claude_json(["plugin", "list", "--json"])
-        .map(|value| json_contains(&value, &format!("{PLUGIN}@{MARKETPLACE}")))
-        .unwrap_or(false);
+    let installed = claude_json(["plugin", "list", "--json"]).ok();
+    let plugin_ready = installed.as_ref().is_some_and(|value| {
+        PLUGINS
+            .iter()
+            .all(|plugin| json_contains(value, &format!("{plugin}@{MARKETPLACE}")))
+    });
     println!("assets\t{}", state(assets));
     println!("marketplace\t{}", state(marketplace_ready));
-    println!("plugin\t{}", state(plugin_ready));
+    println!("plugins\t{}", state(plugin_ready));
     println!("policy\t{}", state(policy_ready));
     if assets && marketplace_ready && plugin_ready && policy_ready {
         Ok(())
@@ -77,19 +88,21 @@ pub fn uninstall(keep_policy: bool) -> Result<()> {
     let marketplace = marketplace_root()?;
     let owns_marketplace = marketplace_registration()?
         .is_some_and(|entry| marketplace_entry_matches(&entry, &marketplace));
-    if plugin_is_installed()? {
-        anyhow::ensure!(
-            owns_marketplace,
-            "refusing to uninstall {PLUGIN}@{MARKETPLACE} from another marketplace source"
-        );
-        run_claude(&[
-            "plugin",
-            "uninstall",
-            &format!("{PLUGIN}@{MARKETPLACE}"),
-            "--scope",
-            "user",
-            "--yes",
-        ])?;
+    for plugin in PLUGINS {
+        if plugin_is_installed(plugin)? {
+            anyhow::ensure!(
+                owns_marketplace,
+                "refusing to uninstall {plugin}@{MARKETPLACE} from another marketplace source"
+            );
+            run_claude(&[
+                "plugin",
+                "uninstall",
+                &format!("{plugin}@{MARKETPLACE}"),
+                "--scope",
+                "user",
+                "--yes",
+            ])?;
+        }
     }
     if owns_marketplace {
         run_claude(&["plugin", "marketplace", "remove", MARKETPLACE])?;
@@ -128,12 +141,28 @@ pub fn verify_installed() -> Result<()> {
     if !marketplace_is_registered_at(&marketplace)? {
         bail!("the st2 Claude marketplace is not registered; run `st2 claude-channel install`");
     }
-    if !plugin_is_installed()? {
+    if !plugin_is_installed(PLUGIN)? {
         bail!("the st2 Claude channel plugin is not installed; run `st2 claude-channel install`");
     }
     let policy = policy_path()?;
     if !policy_is_current_at(&policy) {
         bail!("the st2 Claude channel policy is not installed; run `st2 claude-channel install`");
+    }
+    Ok(())
+}
+
+pub fn verify_st3_installed() -> Result<()> {
+    let marketplace = marketplace_root()?;
+    verify_marketplace_at(&marketplace)?;
+    if !marketplace_is_registered_at(&marketplace)? {
+        bail!("the st2 Claude marketplace is not registered; run `st2 claude-channel install`");
+    }
+    if !plugin_is_installed(ST3_PLUGIN)? {
+        bail!("the st3 Claude channel plugin is not installed; run `st2 claude-channel install`");
+    }
+    let policy = policy_path()?;
+    if !policy_is_current_at(&policy) {
+        bail!("the Claude channel policy is not installed; run `st2 claude-channel install`");
     }
     Ok(())
 }
@@ -172,7 +201,7 @@ fn policy_path() -> Result<PathBuf> {
     bail!("the Claude channel policy installer supports Linux and macOS")
 }
 
-fn embedded_files() -> [(&'static str, &'static [u8]); 3] {
+fn embedded_files() -> [(&'static str, &'static [u8]); 5] {
     [
         (".claude-plugin/marketplace.json", MARKETPLACE_MANIFEST),
         (
@@ -180,6 +209,11 @@ fn embedded_files() -> [(&'static str, &'static [u8]); 3] {
             PLUGIN_MANIFEST,
         ),
         ("plugins/st2-channel/.mcp.json", MCP_CONFIG),
+        (
+            "plugins/st3-channel/.claude-plugin/plugin.json",
+            ST3_PLUGIN_MANIFEST,
+        ),
+        ("plugins/st3-channel/.mcp.json", ST3_MCP_CONFIG),
     ]
 }
 
@@ -207,7 +241,10 @@ pub fn verify_marketplace_at(root: &Path) -> Result<()> {
 fn policy_value() -> Value {
     json!({
         "channelsEnabled": true,
-        "allowedChannelPlugins": [{"marketplace": MARKETPLACE, "plugin": PLUGIN}]
+        "allowedChannelPlugins": [
+            {"marketplace": MARKETPLACE, "plugin": PLUGIN},
+            {"marketplace": MARKETPLACE, "plugin": ST3_PLUGIN}
+        ]
     })
 }
 
@@ -302,25 +339,28 @@ fn install_with_claude(marketplace: &Path) -> Result<()> {
             run_claude(&["plugin", "marketplace", "add", path, "--scope", "user"])?;
         }
     }
-    if plugin_is_installed()? {
+    for plugin in PLUGINS {
+        if plugin_is_installed(plugin)? {
+            run_claude(&[
+                "plugin",
+                "uninstall",
+                &format!("{plugin}@{MARKETPLACE}"),
+                "--scope",
+                "user",
+                "--yes",
+                "--keep-data",
+            ])?;
+        }
         run_claude(&[
             "plugin",
-            "uninstall",
-            &format!("{PLUGIN}@{MARKETPLACE}"),
+            "install",
+            &format!("{plugin}@{MARKETPLACE}"),
             "--scope",
             "user",
             "--yes",
-            "--keep-data",
         ])?;
     }
-    run_claude(&[
-        "plugin",
-        "install",
-        &format!("{PLUGIN}@{MARKETPLACE}"),
-        "--scope",
-        "user",
-        "--yes",
-    ])
+    Ok(())
 }
 
 fn marketplace_registration() -> Result<Option<Value>> {
@@ -342,9 +382,9 @@ fn marketplace_entry_matches(entry: &Value, root: &Path) -> bool {
         && entry.get("path").and_then(Value::as_str) == root.to_str()
 }
 
-fn plugin_is_installed() -> Result<bool> {
+fn plugin_is_installed(plugin: &str) -> Result<bool> {
     let value = claude_json(["plugin", "list", "--json"])?;
-    Ok(json_contains(&value, &format!("{PLUGIN}@{MARKETPLACE}")))
+    Ok(json_contains(&value, &format!("{plugin}@{MARKETPLACE}")))
 }
 
 fn json_contains(value: &Value, needle: &str) -> bool {
@@ -407,6 +447,7 @@ mod tests {
         .unwrap();
         assert_eq!(marketplace["name"], MARKETPLACE);
         assert_eq!(marketplace["plugins"][0]["name"], PLUGIN);
+        assert_eq!(marketplace["plugins"][1]["name"], ST3_PLUGIN);
 
         let mcp: Value = serde_json::from_slice(
             &fs::read(temp.path().join("plugins/st2-channel/.mcp.json")).unwrap(),
@@ -426,10 +467,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"));
+
+        let st3_mcp: Value = serde_json::from_slice(
+            &fs::read(temp.path().join("plugins/st3-channel/.mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(st3_mcp["mcpServers"]["st3"]["command"], "st3");
+        assert_eq!(
+            st3_mcp["mcpServers"]["st3"]["args"],
+            json!(["driver", "claude-mcp"])
+        );
+        let st3_plugin: Value = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("plugins/st3-channel/.claude-plugin/plugin.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(st3_plugin["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
-    fn policy_fragment_approves_only_the_stable_plugin_identity() {
+    fn policy_fragment_approves_only_the_stable_plugin_identities() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(POLICY_FILE);
         install_policy_at(&path).unwrap();

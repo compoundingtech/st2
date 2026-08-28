@@ -578,7 +578,7 @@ struct JudgementArgs {
 struct DriverArgs {
     #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "opencode", "exec"])]
     driver: String,
-    #[arg(long)]
+    #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
     #[arg(long)]
     identity: Option<String>,
@@ -2768,7 +2768,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             args.argv.is_empty(),
             "the Claude MCP driver takes no provider argv"
         );
-        return run_claude_mcp(client, subject).await;
+        return run_claude_mcp(client, &normalize_agent_subject(subject)).await;
     }
     if args.driver == "codex" {
         return run_codex_native(client, subject, args.argv).await;
@@ -2847,6 +2847,11 @@ async fn run_st2_native_driver(
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
     let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+    let argv = if driver == "claude" {
+        prepare_st3_claude_channel_argv(subject, argv)?
+    } else {
+        argv
+    };
     let task_catalog = catalog.clone();
     let task_identity = identity.clone();
     let task_runtime = runtime_id.clone();
@@ -2928,6 +2933,70 @@ async fn run_st2_native_driver(
             }
         }
     }
+}
+
+fn prepare_st3_claude_channel_argv(subject: &str, argv: Vec<String>) -> Result<Vec<String>> {
+    let uses_channel = argv
+        .windows(2)
+        .any(|pair| pair[0] == "--channels" && pair[1] == st2::claude_channel::ST3_CHANNEL);
+    if !uses_channel {
+        return Ok(argv);
+    }
+    match st2::claude_channel::verify_st3_installed() {
+        Ok(()) => Ok(argv),
+        Err(error) => {
+            eprintln!(
+                "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
+                 warning: using Claude's interactive development channel; Claude can ask for confirmation\n\
+                 warning: run `st2 claude-channel install` for unattended startup"
+            );
+            let executable = std::env::current_exe()
+                .context("resolving the st3 executable for the Claude development channel")?;
+            st3_development_channel_argv(argv, &executable, subject)
+        }
+    }
+}
+
+fn st3_development_channel_argv(
+    argv: Vec<String>,
+    executable: &Path,
+    subject: &str,
+) -> Result<Vec<String>> {
+    let mcp = serde_json::json!({
+        "mcpServers": {
+            "st3": {
+                "type": "stdio",
+                "command": executable,
+                "args": ["driver", "claude-mcp", "--subject", subject]
+            }
+        }
+    });
+    let mut output = Vec::with_capacity(argv.len() + 2);
+    let mut index = 0;
+    let mut replaced = false;
+    while index < argv.len() {
+        if !replaced
+            && argv[index] == "--channels"
+            && argv.get(index + 1).map(String::as_str) == Some(st2::claude_channel::ST3_CHANNEL)
+        {
+            output.extend([
+                "--mcp-config".to_string(),
+                mcp.to_string(),
+                "--strict-mcp-config".to_string(),
+                "--dangerously-load-development-channels=server:st3".to_string(),
+            ]);
+            replaced = true;
+            index += 2;
+            continue;
+        }
+        output.push(argv[index].clone());
+        index += 1;
+    }
+    anyhow::ensure!(
+        replaced,
+        "the st3 Claude plugin channel selector is missing"
+    );
+    Ok(output)
 }
 
 fn prepare_native_driver(subject: &str) -> Result<(PathBuf, PathBuf, String, String)> {
@@ -3932,6 +4001,39 @@ mod tests {
         );
         assert_eq!(identity, "node.worker");
         assert_eq!(runtime_id, "node.worker");
+    }
+
+    #[test]
+    fn the_st3_development_channel_is_an_explicit_fallback() {
+        let argv = vec![
+            "claude".into(),
+            "--channels".into(),
+            st2::claude_channel::ST3_CHANNEL.into(),
+            "Do the work.".into(),
+        ];
+        let output =
+            st3_development_channel_argv(argv, Path::new("/opt/st3/bin/st3"), "agent/node.worker")
+                .unwrap();
+        assert!(
+            !output
+                .iter()
+                .any(|arg| arg == st2::claude_channel::ST3_CHANNEL)
+        );
+        assert!(
+            output
+                .iter()
+                .any(|arg| { arg == "--dangerously-load-development-channels=server:st3" })
+        );
+        let config = output
+            .windows(2)
+            .find(|pair| pair[0] == "--mcp-config")
+            .map(|pair| &pair[1])
+            .expect("the fallback has an MCP config");
+        let config: Value = serde_json::from_str(config).unwrap();
+        assert_eq!(
+            config["mcpServers"]["st3"]["args"],
+            json!(["driver", "claude-mcp", "--subject", "agent/node.worker"])
+        );
     }
 
     #[test]

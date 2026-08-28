@@ -2499,10 +2499,13 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         }));
 
         let plan = reconcile(&specs, &[], "evalhost").unwrap();
-        assert!(plan.launch.iter().flat_map(|launch| &launch.tasks).any(
-            |target| target.pty_id == "evalhost.worker.injector"
-                && target.kind == TaskKind::Exec
-        ));
+        assert!(
+            plan.launch
+                .iter()
+                .flat_map(|launch| &launch.tasks)
+                .any(|target| target.pty_id == "evalhost.worker.injector"
+                    && target.kind == TaskKind::Exec)
+        );
     }
 
     #[test]
