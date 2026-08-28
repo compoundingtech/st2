@@ -80,7 +80,8 @@ pub struct ResourceProfile {
 pub enum ProfileSource {
     /// A wasm module implementing the `resolve` protocol (see [`crate::profile_wasm`] for the
     /// ABI), plus the notification class every carrier it resolves carries. Compilation results
-    /// (success or failure) are cached by path and file identity; instances remain per-resolution.
+    /// (success or failure) are cached by exact declared path spellings, normalized path identity,
+    /// admission policy, and file identity; instances remain per-resolution.
     Wasm {
         module: PathBuf,
         class: ProfileClass,
@@ -205,6 +206,51 @@ impl ModuleIdentity {
         }
     }
 }
+#[cfg(feature = "wasm-resolver")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModuleCacheKey {
+    normalized_module: PathBuf,
+    declared_module: PathBuf,
+    normalized_containment_root: Option<PathBuf>,
+    declared_containment_root: Option<PathBuf>,
+}
+
+#[cfg(feature = "wasm-resolver")]
+impl ModuleCacheKey {
+    fn new(module: &Path, containment_root: Option<&Path>) -> Self {
+        Self {
+            normalized_module: normalize_cache_path(module),
+            declared_module: module.to_path_buf(),
+            normalized_containment_root: containment_root.map(normalize_cache_path),
+            declared_containment_root: containment_root.map(Path::to_path_buf),
+        }
+    }
+}
+
+#[cfg(feature = "wasm-resolver")]
+fn normalize_cache_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !path.is_absolute() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
 
 #[cfg(feature = "wasm-resolver")]
 #[derive(Clone)]
@@ -217,7 +263,7 @@ struct CachedModule {
 #[cfg(feature = "wasm-resolver")]
 #[derive(Default)]
 struct WasmCache {
-    modules: HashMap<PathBuf, CachedModule>,
+    modules: HashMap<ModuleCacheKey, CachedModule>,
     clock: u64,
     #[cfg(test)]
     compile_attempts: u64,
@@ -226,13 +272,13 @@ struct WasmCache {
 }
 
 /// One resolution pass over a registry. Module snapshots, including read and compile failures, are
-/// shared by every binding in the pass; a later pass snapshots each used path again so replacement
-/// invalidation remains observable.
+/// shared by every binding using the same declared path spelling and admission policy in the
+/// pass; a later pass snapshots each used key again so replacement invalidation remains
+/// observable.
 pub struct ResourceProfileRefresh<'a> {
     registry: &'a ResourceProfileRegistry,
     #[cfg(feature = "wasm-resolver")]
-    modules:
-        Mutex<HashMap<PathBuf, Result<Arc<crate::profile_wasm::WasmResolver>, String>>>,
+    modules: Mutex<HashMap<ModuleCacheKey, Result<Arc<crate::profile_wasm::WasmResolver>, String>>>,
 }
 
 impl ResourceProfileRefresh<'_> {
@@ -266,13 +312,16 @@ impl ResourceProfileRefresh<'_> {
         }
         #[cfg(feature = "wasm-resolver")]
         {
+            let key = ModuleCacheKey::new(module, containment_root.as_deref());
             let resolver = {
                 let mut modules = self.modules.lock();
-                if let Some(result) = modules.get(module) {
+                if let Some(result) = modules.get(&key) {
                     result.clone()
                 } else {
-                    let result = self.registry.compiled(module, containment_root.as_deref());
-                    modules.insert(module.clone(), result.clone());
+                    let result =
+                        self.registry
+                            .compiled(&key, module, containment_root.as_deref());
+                    modules.insert(key, result.clone());
                     result
                 }
             }?;
@@ -297,11 +346,11 @@ impl WasmCache {
 
     fn get(
         &mut self,
-        path: &Path,
+        key: &ModuleCacheKey,
         identity: &ModuleIdentity,
     ) -> Option<Result<Arc<crate::profile_wasm::WasmResolver>, String>> {
         let now = self.next_clock();
-        let cached = self.modules.get_mut(path)?;
+        let cached = self.modules.get_mut(key)?;
         if cached.identity != *identity {
             return None;
         }
@@ -311,23 +360,23 @@ impl WasmCache {
 
     fn insert(
         &mut self,
-        path: PathBuf,
+        key: ModuleCacheKey,
         identity: ModuleIdentity,
         result: Result<Arc<crate::profile_wasm::WasmResolver>, String>,
     ) {
-        if !self.modules.contains_key(&path) && self.modules.len() >= WASM_CACHE_CAPACITY {
+        if !self.modules.contains_key(&key) && self.modules.len() >= WASM_CACHE_CAPACITY {
             if let Some(oldest) = self
                 .modules
                 .iter()
                 .min_by_key(|(_, cached)| cached.last_used)
-                .map(|(path, _)| path.clone())
+                .map(|(key, _)| key.clone())
             {
                 self.modules.remove(&oldest);
             }
         }
         let last_used = self.next_clock();
         self.modules.insert(
-            path,
+            key,
             CachedModule {
                 identity,
                 result,
@@ -410,8 +459,8 @@ impl ResourceProfileRegistry {
         self.profiles = registry.profiles;
     }
 
-    /// Start one resolution pass. Every unique module path is read and fingerprinted at most once
-    /// in the pass, even when many bindings or schemes share it.
+    /// Start one resolution pass. Every unique normalized module path and admission policy is read
+    /// and fingerprinted at most once in the pass, even when many bindings or schemes share it.
     pub fn begin_refresh(&self) -> ResourceProfileRefresh<'_> {
         ResourceProfileRefresh {
             registry: self,
@@ -447,6 +496,7 @@ impl ResourceProfileRegistry {
     #[cfg(feature = "wasm-resolver")]
     fn compiled(
         &self,
+        key: &ModuleCacheKey,
         module_path: &Path,
         containment_root: Option<&Path>,
     ) -> Result<Arc<crate::profile_wasm::WasmResolver>, String> {
@@ -462,7 +512,7 @@ impl ResourceProfileRegistry {
         .map_err(|error| error.to_string())?;
         let identity = ModuleIdentity::of(&snapshot);
         let mut cache = self.wasm_cache.lock();
-        if let Some(cached) = cache.get(module_path, &identity) {
+        if let Some(cached) = cache.get(key, &identity) {
             return cached;
         }
         #[cfg(test)]
@@ -474,7 +524,7 @@ impl ResourceProfileRegistry {
         let result = crate::profile_wasm::WasmResolver::from_bytes(&snapshot.bytes)
             .map(Arc::new)
             .map_err(|error| error.to_string());
-        cache.insert(module_path.to_path_buf(), identity, result.clone());
+        cache.insert(key.clone(), identity, result.clone());
         result
     }
 }
@@ -502,6 +552,22 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/demo_resolver.wasm"),
             class,
         )
+    }
+    #[cfg(feature = "wasm-resolver")]
+    fn write_any_uri_resolver(path: &Path) {
+        std::fs::write(
+            path,
+            r#"(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+  (data (i32.const 8) "{\22path\22:\22resources/goal.md\22,\22class\22:\22goal\22}")
+  (func (export "resolve") (param i32 i32 i32 i32) (result i64)
+    (i64.or
+      (i64.shl (i64.extend_i32_u (i32.const 8)) (i64.const 32))
+      (i64.extend_i32_u (i32.const 43))))
+)"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -616,7 +682,8 @@ mod tests {
                 "concurrent subscribers compile one unchanged bad identity once"
             );
             assert_eq!(cache.modules.len(), 1);
-            assert!(cache.modules[&module].result.is_err());
+            let key = ModuleCacheKey::new(&module, None);
+            assert!(cache.modules[&key].result.is_err());
         }
         assert!(
             registry
@@ -703,6 +770,198 @@ mod tests {
         let cache = registry.wasm_cache.lock();
         assert_eq!(cache.snapshot_attempts, 1);
         assert_eq!(cache.compile_attempts, 1);
+    }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn cache_normalization_does_not_change_the_path_used_for_admission() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("child")).unwrap();
+        symlink(outside.path().join("child"), root.path().join("link")).unwrap();
+        write_any_uri_resolver(&root.path().join("resolver.wasm"));
+        let declared = root.path().join("link/../resolver.wasm");
+        let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+            "external",
+            &declared,
+            ProfileClass::Immediate,
+        ));
+
+        assert!(
+            registry
+                .try_resolve(Path::new("/agent"), "external://host/agent")
+                .is_err(),
+            "admission must use the declared path, which resolves through the symlink outside root"
+        );
+        assert_eq!(
+            ModuleCacheKey::new(&declared, None).normalized_module,
+            root.path().join("resolver.wasm")
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn refresh_cache_distinguishes_symlink_sensitive_module_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("child")).unwrap();
+        symlink(outside.path().join("child"), root.path().join("link")).unwrap();
+        std::fs::write(outside.path().join("resolver.wasm"), b"not a wasm module").unwrap();
+        write_any_uri_resolver(&root.path().join("resolver.wasm"));
+        let indirect = root.path().join("link/../resolver.wasm");
+        let direct = root.path().join("resolver.wasm");
+        let registry = ResourceProfileRegistry::empty().with_profiles([
+            ResourceProfile::wasm("indirect", &indirect, ProfileClass::Immediate),
+            ResourceProfile::wasm("direct", &direct, ProfileClass::Immediate),
+        ]);
+
+        let refresh = registry.begin_refresh();
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "indirect://host/agent")
+                .is_err()
+        );
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "direct://host/agent")
+                .unwrap()
+                .is_some(),
+            "the direct module must be opened instead of reusing the indirect failure"
+        );
+        assert_eq!(registry.wasm_cache.lock().snapshot_attempts, 2);
+    }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn refresh_cache_distinguishes_symlink_sensitive_containment_roots() {
+        use std::os::unix::fs::symlink;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("child")).unwrap();
+        symlink(
+            outside.path().join("child"),
+            catalog.path().join("link"),
+        )
+        .unwrap();
+        write_any_uri_resolver(&outside.path().join("resolver.wasm"));
+        let indirect_root = catalog.path().join("link/..");
+        let registry = ResourceProfileRegistry::empty().with_profiles([
+            ResourceProfile::wasm_contained(
+                "indirect-root",
+                &indirect_root,
+                Path::new("resolver.wasm"),
+                ProfileClass::Immediate,
+            ),
+            ResourceProfile::wasm_contained(
+                "direct-root",
+                catalog.path(),
+                Path::new("link/../resolver.wasm"),
+                ProfileClass::Immediate,
+            ),
+        ]);
+
+        let refresh = registry.begin_refresh();
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "indirect-root://host/agent")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "direct-root://host/agent")
+                .is_err(),
+            "the direct root must enforce its own descriptor-relative admission"
+        );
+        assert_eq!(registry.wasm_cache.lock().snapshot_attempts, 2);
+    }
+
+    #[test]
+    #[cfg(all(feature = "wasm-resolver", unix))]
+    fn refresh_cache_cannot_reuse_external_admission_for_a_contained_module() {
+        use std::os::unix::fs::symlink;
+
+        let catalog = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let linked_directory = catalog.path().join("link");
+        symlink(external.path(), &linked_directory).unwrap();
+        let module = external.path().join("resolver.wasm");
+        write_any_uri_resolver(&module);
+        let shared_spelling = linked_directory.join("resolver.wasm");
+        let registry = ResourceProfileRegistry::empty().with_profiles([
+            ResourceProfile::wasm("external", &shared_spelling, ProfileClass::Immediate),
+            ResourceProfile::wasm_contained(
+                "contained",
+                catalog.path(),
+                Path::new("link/resolver.wasm"),
+                ProfileClass::Immediate,
+            ),
+        ]);
+
+        let refresh = registry.begin_refresh();
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "external://host/agent")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            refresh
+                .try_resolve(Path::new("/agent"), "contained://host/agent")
+                .is_err(),
+            "contained admission must re-open the descriptor-relative path and reject the symlink"
+        );
+        let cache = registry.wasm_cache.lock();
+        assert_eq!(cache.snapshot_attempts, 2);
+        assert_eq!(cache.compile_attempts, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "wasm-resolver")]
+    fn registry_clones_share_compilation_only_with_the_same_admission_policy() {
+        let catalog = tempfile::tempdir().unwrap();
+        let module = catalog.path().join("resolver.wasm");
+        write_any_uri_resolver(&module);
+        let registry = ResourceProfileRegistry::empty().with_profiles([
+            ResourceProfile::wasm("external", &module, ProfileClass::Immediate),
+            ResourceProfile::wasm_contained(
+                "contained",
+                catalog.path(),
+                Path::new("resolver.wasm"),
+                ProfileClass::Immediate,
+            ),
+        ]);
+        let clone = registry.clone();
+
+        for current in [&registry, &clone] {
+            assert!(
+                current
+                    .try_resolve(Path::new("/agent"), "external://host/agent")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(registry.wasm_cache.lock().compile_attempts, 1);
+
+        for current in [&registry, &clone] {
+            assert!(
+                current
+                    .try_resolve(Path::new("/agent"), "contained://host/agent")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let cache = registry.wasm_cache.lock();
+        assert_eq!(
+            cache.compile_attempts, 2,
+            "external and descriptor-relative admission retain distinct cache entries"
+        );
+        assert_eq!(cache.modules.len(), 2);
     }
 
     #[test]

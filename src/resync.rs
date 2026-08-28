@@ -527,11 +527,26 @@ impl Drop for ResyncSupervisor {
 // ---- Worker side --------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum CarrierState {
+    Present(String),
+    Missing,
+}
+
+impl CarrierState {
+    fn render(&self) -> &str {
+        match self {
+            Self::Present(digest) => digest,
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTransition {
     binding: String,
     path: PathBuf,
-    old_digest: Option<String>,
-    new_digest: String,
+    old_state: CarrierState,
+    new_state: CarrierState,
     body: String,
     event_id: String,
 }
@@ -540,19 +555,19 @@ impl PendingTransition {
     fn new(
         binding: &str,
         path: &Path,
-        old_digest: Option<&str>,
-        new_digest: &str,
+        old_state: &CarrierState,
+        new_state: &CarrierState,
         incarnation: crate::event::StreamOwnerIncarnation,
         sequence: u64,
     ) -> Self {
         let occurrence = incarnation.occurrence_token(sequence);
-        let body = render_body(binding, path, old_digest, new_digest, &occurrence);
+        let body = render_body(binding, path, old_state, new_state, &occurrence);
         let event_id = transition_identity(&body);
         Self {
             binding: binding.to_owned(),
             path: path.to_path_buf(),
-            old_digest: old_digest.map(str::to_owned),
-            new_digest: new_digest.to_owned(),
+            old_state: old_state.clone(),
+            new_state: new_state.clone(),
             body,
             event_id,
         }
@@ -565,7 +580,7 @@ struct Entry {
     label: String,
     class: CarrierClass,
     containment_root: Option<PathBuf>,
-    digest: Option<String>,
+    state: Option<CarrierState>,
     /// Last occurrence sequence reserved by this retained subscription. Sequence zero is the
     /// silent seeded state; only capturing a new immutable transition advances it.
     occurrence_sequence: u64,
@@ -710,32 +725,39 @@ fn rebuild_carriers(
             // recipient-scoped namespace.
             let identity = (set.bus_id.clone(), carrier.label.clone());
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
-            let (digest, occurrence_sequence, pending_transition, dirty) =
-                retained.map_or_else(
-                    || {
-                        (
-                            read_digest(&carrier.path, carrier.containment_root.as_deref()),
-                            subscription_sequences.get(&identity).copied().unwrap_or(0),
-                            None,
-                            false,
-                        )
-                    },
-                    |entry| {
-                        (
-                            entry.digest,
-                            entry.occurrence_sequence,
-                            entry.pending_transition,
-                            entry.dirty,
-                        )
-                    },
-                );
+            let (state, occurrence_sequence, pending_transition, dirty) = retained.map_or_else(
+                || {
+                    let (state, dirty) =
+                        match read_state(&carrier.path, carrier.containment_root.as_deref()) {
+                            Ok(state) => (Some(state), false),
+                            Err(error) => {
+                                diagnose_read_error(&carrier.path, &error);
+                                (None, true)
+                            }
+                        };
+                    (
+                        state,
+                        subscription_sequences.get(&identity).copied().unwrap_or(0),
+                        None,
+                        dirty,
+                    )
+                },
+                |entry| {
+                    (
+                        entry.state,
+                        entry.occurrence_sequence,
+                        entry.pending_transition,
+                        entry.dirty,
+                    )
+                },
+            );
             let entry = Entry {
                 bus_id: set.bus_id.clone(),
                 seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
                 class: carrier.class,
                 containment_root: carrier.containment_root.clone(),
-                digest,
+                state,
                 occurrence_sequence,
                 pending_transition,
                 dirty,
@@ -903,7 +925,7 @@ impl Worker {
 
     /// Polling observes transitions through the same class deadlines as filesystem events. It
     /// never emits directly: this preserves coalescing and lets `flush_path` replay pending
-    /// transitions before considering newer bytes.
+    /// transitions before considering newer carrier state.
     fn poll_paths(&mut self, paths: Vec<PathBuf>) {
         let now = Instant::now();
         for path in paths {
@@ -911,11 +933,14 @@ impl Worker {
                 continue;
             };
             for entry in entries {
-                let observed = read_digest(&path, entry.containment_root.as_deref());
                 let changed = entry.pending_transition.is_some()
-                    || observed
-                        .as_deref()
-                        .is_some_and(|digest| entry.digest.as_deref() != Some(digest));
+                    || match read_state(&path, entry.containment_root.as_deref()) {
+                        Ok(observed) => entry.state.as_ref() != Some(&observed),
+                        Err(error) => {
+                            diagnose_read_error(&path, &error);
+                            true
+                        }
+                    };
                 if !changed {
                     continue;
                 }
@@ -1075,8 +1100,8 @@ impl Worker {
     }
 
     /// Flush subscribers of one path whose class is due, or every subscriber for fallback polls:
-    /// diff digests, emit transitions, and retain failed publications for retry with the same
-    /// event identity.
+    /// diff carrier states, emit transitions, and retain failed publications for retry with the
+    /// same event identity.
     fn flush_path(&mut self, path: &Path, due_class: Option<CarrierClass>) {
         let occurrence_incarnation =
             crate::event::current_stream_owner_incarnation(&self.root, &self.this_host).ok();
@@ -1089,7 +1114,7 @@ impl Worker {
                 continue;
             }
             entry.dirty = false;
-            let observed_digest = read_digest(path, entry.containment_root.as_deref());
+            let observed = read_state(path, entry.containment_root.as_deref());
 
             if let Some(pending) = entry.pending_transition.as_ref() {
                 if emit_resync(&self.root, &self.this_host, &entry.bus_id, pending) {
@@ -1097,26 +1122,47 @@ impl Worker {
                         .pending_transition
                         .take()
                         .expect("pending transition was just observed");
-                    entry.digest = Some(completed.new_digest);
+                    entry.state = Some(completed.new_state);
                     // The current carrier may have advanced or rebound while the immutable
-                    // transition was pending. Complete it first, then schedule current bytes.
-                    if observed_digest.as_deref() != entry.digest.as_deref() {
-                        entry.dirty = true;
-                        retries.push(entry.class);
+                    // transition was pending. Complete it first, then schedule current state.
+                    match observed {
+                        Ok(observed) if entry.state.as_ref() != Some(&observed) => {
+                            entry.dirty = true;
+                            retries.push(entry.class);
+                        }
+                        Err(error) => {
+                            diagnose_read_error(path, &error);
+                            entry.dirty = true;
+                            retries.push(entry.class);
+                        }
+                        Ok(_) => {}
                     }
                 } else {
+                    if let Err(error) = observed {
+                        diagnose_read_error(path, &error);
+                    }
                     entry.dirty = true;
                     retries.push(entry.class);
                 }
                 continue;
             }
 
-            let Some(target_digest) = observed_digest else {
-                // Unreadable right now (deleted mid-window): stay quiet and keep the previous
-                // digest, so a later reappearance still counts as a change.
+            let target_state = match observed {
+                Ok(state) => state,
+                Err(error) => {
+                    diagnose_read_error(path, &error);
+                    entry.dirty = true;
+                    retries.push(entry.class);
+                    continue;
+                }
+            };
+            let Some(old_state) = entry.state.as_ref() else {
+                // A subscription first observed during a transient read failure has no proven
+                // baseline. Seed the first successful observation silently.
+                entry.state = Some(target_state);
                 continue;
             };
-            if entry.digest.as_deref() == Some(target_digest.as_str()) {
+            if old_state == &target_state {
                 continue;
             }
             let (Some(incarnation), Some(sequence)) = (
@@ -1132,14 +1178,14 @@ impl Worker {
             let transition = PendingTransition::new(
                 &entry.label,
                 path,
-                entry.digest.as_deref(),
-                &target_digest,
+                old_state,
+                &target_state,
                 incarnation,
                 sequence,
             );
             entry.occurrence_sequence = sequence;
             if emit_resync(&self.root, &self.this_host, &entry.bus_id, &transition) {
-                entry.digest = Some(target_digest);
+                entry.state = Some(target_state);
             } else {
                 entry.pending_transition = Some(transition);
                 entry.dirty = true;
@@ -1192,67 +1238,106 @@ fn emit_resync(
     }
 }
 
-fn read_digest(path: &Path, containment_root: Option<&Path>) -> Option<String> {
+fn read_state(path: &Path, containment_root: Option<&Path>) -> std::io::Result<CarrierState> {
     match containment_root {
         Some(root) => read_confined(path, root),
         None => read_regular(path),
     }
 }
 
-fn hash_reader(mut file: std::fs::File) -> Option<String> {
+fn diagnose_read_error(path: &Path, error: &std::io::Error) {
+    eprintln!(
+        "st2: resync read for '{}' failed transiently; retrying: {error}",
+        path.display()
+    );
+}
+
+fn hash_reader(mut file: std::fs::File) -> std::io::Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = std::io::Read::read(&mut file, &mut buffer).ok()?;
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
         if read == 0 {
             break;
         }
         digest.update(&buffer[..read]);
     }
-    Some(format!("{:x}", digest.finalize()))
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(unix)]
-fn read_regular(path: &Path) -> Option<String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.file_type().is_file() {
-        return None;
+fn classify_open_error(error: std::io::Error) -> std::io::Result<CarrierState> {
+    match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => Ok(CarrierState::Missing),
+        _ => Err(error),
     }
-    hash_reader(file)
 }
 
 #[cfg(not(unix))]
-fn read_regular(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    if !file.metadata().ok()?.file_type().is_file() {
-        return None;
+fn classify_open_error(error: std::io::Error) -> std::io::Result<CarrierState> {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(CarrierState::Missing)
+    } else {
+        Err(error)
     }
-    hash_reader(file)
 }
 
 #[cfg(unix)]
-fn read_confined(path: &Path, root: &Path) -> Option<String> {
+fn read_regular(path: &Path) -> std::io::Result<CarrierState> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => return classify_open_error(error),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(CarrierState::Missing);
+    }
+    hash_reader(file).map(CarrierState::Present)
+}
+
+#[cfg(not(unix))]
+fn read_regular(path: &Path) -> std::io::Result<CarrierState> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return classify_open_error(error),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(CarrierState::Missing);
+    }
+    hash_reader(file).map(CarrierState::Present)
+}
+
+#[cfg(unix)]
+fn read_confined(path: &Path, root: &Path) -> std::io::Result<CarrierState> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
 
-    let relative = path.strip_prefix(root).ok()?;
+    let invalid_path = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "carrier path is outside its confinement root or has an unsafe component",
+        )
+    };
+    let relative = path.strip_prefix(root).map_err(|_| invalid_path())?;
     let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Ok(CarrierState::Missing);
+    }
 
     // Open the confinement root component-by-component from the filesystem root. `O_NOFOLLOW`
     // on one full pathname protects only its final component; descriptor-relative traversal
     // protects every ancestor from symlink replacement as well.
     let mut root_components = root.components();
-    if root_components.next()? != std::path::Component::RootDir {
-        return None;
+    if root_components.next() != Some(std::path::Component::RootDir) {
+        return Err(invalid_path());
     }
-    let slash = CString::new("/").ok()?;
+    let slash = CString::new("/").map_err(|_| invalid_path())?;
     // SAFETY: `slash` is NUL-terminated and the returned descriptor is checked before ownership.
     let filesystem_root = unsafe {
         libc::open(
@@ -1261,15 +1346,15 @@ fn read_confined(path: &Path, root: &Path) -> Option<String> {
         )
     };
     if filesystem_root < 0 {
-        return None;
+        return classify_open_error(std::io::Error::last_os_error());
     }
     // SAFETY: `filesystem_root` is newly owned after the non-negative check.
     let mut directory = unsafe { OwnedFd::from_raw_fd(filesystem_root) };
     for component in root_components {
         let std::path::Component::Normal(name) = component else {
-            return None;
+            return Err(invalid_path());
         };
-        let name = CString::new(name.as_bytes()).ok()?;
+        let name = CString::new(name.as_bytes()).map_err(|_| invalid_path())?;
         let flags = libc::O_RDONLY
             | libc::O_DIRECTORY
             | libc::O_CLOEXEC
@@ -1278,7 +1363,7 @@ fn read_confined(path: &Path, root: &Path) -> Option<String> {
         // SAFETY: the live directory descriptor and NUL-terminated component are valid.
         let opened = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         if opened < 0 {
-            return None;
+            return classify_open_error(std::io::Error::last_os_error());
         }
         // SAFETY: `opened` is newly owned after the non-negative check.
         directory = unsafe { OwnedFd::from_raw_fd(opened) };
@@ -1286,9 +1371,9 @@ fn read_confined(path: &Path, root: &Path) -> Option<String> {
 
     while let Some(component) = components.next() {
         let std::path::Component::Normal(name) = component else {
-            return None;
+            return Err(invalid_path());
         };
-        let name = CString::new(name.as_bytes()).ok()?;
+        let name = CString::new(name.as_bytes()).map_err(|_| invalid_path())?;
         let last = components.peek().is_none();
         let flags = libc::O_RDONLY
             | libc::O_CLOEXEC
@@ -1299,39 +1384,43 @@ fn read_confined(path: &Path, root: &Path) -> Option<String> {
         // `O_NOFOLLOW` makes each lookup fail closed if that component is replaced by a symlink.
         let opened = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         if opened < 0 {
-            return None;
+            return classify_open_error(std::io::Error::last_os_error());
         }
         // SAFETY: `opened` is a newly-owned descriptor after the non-negative check above.
         let opened = unsafe { OwnedFd::from_raw_fd(opened) };
         if last {
             let file = std::fs::File::from(opened);
-            if !file.metadata().ok()?.file_type().is_file() {
-                return None;
+            if !file.metadata()?.file_type().is_file() {
+                return Ok(CarrierState::Missing);
             }
-            return hash_reader(file);
+            return hash_reader(file).map(CarrierState::Present);
         }
         directory = opened;
     }
-    None
+    Ok(CarrierState::Missing)
 }
 
 #[cfg(not(unix))]
-fn read_confined(_path: &Path, _root: &Path) -> Option<String> {
+fn read_confined(_path: &Path, _root: &Path) -> std::io::Result<CarrierState> {
     // No std API can atomically enforce no-follow traversal. Fail closed on unsupported hosts.
-    None
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative no-follow reads are unavailable",
+    ))
 }
 
 fn render_body(
     label: &str,
     path: &Path,
-    old: Option<&str>,
-    new: &str,
+    old: &CarrierState,
+    new: &CarrierState,
     occurrence: &str,
 ) -> String {
     format!(
-        "resource `{label}` changed\n\nbinding: {label}\npath: {}\nold: {}\nnew: {new}\noccurrence: {occurrence}\n",
+        "resource `{label}` changed\n\nbinding: {label}\npath: {}\nold: {}\nnew: {}\noccurrence: {occurrence}\n",
         path.display(),
-        old.unwrap_or("unknown"),
+        old.render(),
+        new.render(),
     )
 }
 #[cfg(test)]
@@ -1363,6 +1452,14 @@ mod tests {
             .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
             .find(|event| event.lines().any(|line| line == "stream: resync"))
             .expect("current resync inbox event")
+    }
+    fn resync_inbox_events(agent_dir: &Path) -> Vec<String> {
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter(|event| event.lines().any(|line| line == "stream: resync"))
+            .collect()
     }
 
     fn event_field(event: &str, field: &str) -> String {
@@ -1507,7 +1604,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: Some("alpha-before".to_owned()),
+                    state: Some(CarrierState::Present("alpha-before".to_owned())),
                     occurrence_sequence: 4,
                     pending_transition: None,
                     dirty: true,
@@ -1518,7 +1615,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
                     containment_root: None,
-                    digest: Some("beta-before".to_owned()),
+                    state: Some(CarrierState::Present("beta-before".to_owned())),
                     occurrence_sequence: 9,
                     dirty: true,
                     pending_transition: None,
@@ -1561,7 +1658,10 @@ mod tests {
                 .iter()
                 .find(|entry| entry.bus_id == bus_id)
                 .expect("subscriber remains present");
-            assert_eq!(entry.digest.as_deref(), Some(digest));
+            assert_eq!(
+                entry.state,
+                Some(CarrierState::Present(digest.to_owned()))
+            );
             assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
         }
     }
@@ -1599,7 +1699,7 @@ mod tests {
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
                 containment_root: None,
-                digest: Some("old-digest".to_owned()),
+                state: Some(CarrierState::Present("old-digest".to_owned())),
                 occurrence_sequence: 3,
                 pending_transition: None,
                 dirty: true,
@@ -1615,7 +1715,10 @@ mod tests {
         assert_eq!(entry.bus_id, "alias.worker");
         assert_eq!(entry.seat_id.as_deref(), Some("current-seat"));
         assert_eq!(entry.class, CarrierClass::Immediate);
-        assert_eq!(entry.digest.as_deref(), Some("old-digest"));
+        assert_eq!(
+            entry.state,
+            Some(CarrierState::Present("old-digest".to_owned()))
+        );
         assert!(entry.dirty);
 
         let mut worker = Worker {
@@ -1665,7 +1768,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: Some("old-digest".to_owned()),
+                    state: Some(CarrierState::Present("old-digest".to_owned())),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -1712,7 +1815,7 @@ mod tests {
             "rebinding must not rewrite bytes reserved under the pending event identity"
         );
         let entry = &worker.carriers[&current_path][0];
-        assert_eq!(entry.digest.as_deref(), Some(pending.new_digest.as_str()));
+        assert_eq!(entry.state.as_ref(), Some(&pending.new_state));
         assert!(entry.pending_transition.is_none());
         assert!(
             entry.dirty,
@@ -1741,7 +1844,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: read_digest(&old_path, None),
+                    state: read_state(&old_path, None).ok(),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
@@ -1791,7 +1894,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: read_digest(&carrier, None),
+                    state: read_state(&carrier, None).ok(),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -1845,13 +1948,13 @@ mod tests {
                     label: "declaration".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: Some("before".to_owned()),
+                    state: Some(CarrierState::Present("before".to_owned())),
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
                         "declaration",
                         &declaration,
-                        Some("before"),
-                        "corrected",
+                        &CarrierState::Present("before".to_owned()),
+                        &CarrierState::Present("corrected".to_owned()),
                         owner_incarnation(1),
                         1,
                     )),
@@ -1871,13 +1974,16 @@ mod tests {
             &BTreeMap::new(),
         );
         let entry = &retained[&declaration][0];
-        assert_eq!(entry.digest.as_deref(), Some("before"));
+        assert_eq!(
+            entry.state,
+            Some(CarrierState::Present("before".to_owned()))
+        );
         assert_eq!(
             entry
                 .pending_transition
                 .as_ref()
-                .map(|pending| pending.new_digest.as_str()),
-            Some("corrected")
+                .map(|pending| pending.new_state.clone()),
+            Some(CarrierState::Present("corrected".to_owned()))
         );
 
         let dropped = rebuild_carriers(
@@ -1926,13 +2032,13 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: Some("old-digest".to_owned()),
+                    state: Some(CarrierState::Present("old-digest".to_owned())),
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
                         "goal",
                         &carrier,
-                        Some("old-digest"),
-                        "pending-target",
+                        &CarrierState::Present("old-digest".to_owned()),
+                        &CarrierState::Present("pending-target".to_owned()),
                         owner_incarnation(1),
                         1,
                     )),
@@ -1960,7 +2066,10 @@ mod tests {
         assert!(event.contains("old: old-digest"), "{event}");
         assert!(event.contains("new: pending-target"), "{event}");
         let entry = &worker.carriers[&carrier][0];
-        assert_eq!(entry.digest.as_deref(), Some("pending-target"));
+        assert_eq!(
+            entry.state,
+            Some(CarrierState::Present("pending-target".to_owned()))
+        );
         assert!(entry.pending_transition.is_none());
         assert!(
             entry.dirty,
@@ -1974,7 +2083,7 @@ mod tests {
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "before").unwrap();
-        let baseline = read_digest(&carrier, None);
+        let baseline = read_state(&carrier, None).ok();
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -1986,7 +2095,7 @@ mod tests {
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
                     containment_root: None,
-                    digest: baseline.clone(),
+                    state: baseline.clone(),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
@@ -2013,7 +2122,7 @@ mod tests {
 
         worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let entry = &worker.carriers[&carrier][0];
-        assert_eq!(entry.digest, baseline);
+        assert_eq!(entry.state, baseline);
         assert!(entry.pending_transition.is_none(), "coalesced emit ran too early");
 
         worker.flush_due(now + COALESCED_WINDOW + Duration::from_secs(1));
@@ -2086,10 +2195,10 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and points into the live temp directory.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        assert_eq!(read_digest(&fifo, None), None);
+        assert_eq!(read_state(&fifo, None).unwrap(), CarrierState::Missing);
         assert_eq!(
-            read_digest(&fifo, Some(tmp.path())),
-            None,
+            read_state(&fifo, Some(tmp.path())).unwrap(),
+            CarrierState::Missing,
             "confined carrier reads must reject a FIFO without blocking too"
         );
     }
@@ -2099,7 +2208,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let carrier = root.path().join("carrier.md");
         std::fs::write(&carrier, "same bytes").unwrap();
-        let digest = read_digest(&carrier, None);
+        let state = read_state(&carrier, None).ok();
         let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
             .into_iter()
             .map(|class| Entry {
@@ -2108,7 +2217,7 @@ mod tests {
                 label: format!("{class:?}"),
                 class,
                 containment_root: None,
-                digest: digest.clone(),
+                state: state.clone(),
                 occurrence_sequence: 0,
                 pending_transition: None,
                 dirty: true,
@@ -2140,7 +2249,10 @@ mod tests {
         let carrier = resources.join("goal.md");
         std::fs::write(&carrier, "inside").expect("inside carrier");
         assert!(
-            read_digest(&carrier, Some(agent_dir.path())).is_some(),
+            matches!(
+                read_state(&carrier, Some(agent_dir.path())),
+                Ok(CarrierState::Present(_))
+            ),
             "ordinary files beneath the admitted root remain readable"
         );
 
@@ -2149,7 +2261,10 @@ mod tests {
         std::fs::write(outside.path(), "external").expect("outside bytes");
         std::os::unix::fs::symlink(outside.path(), &carrier)
             .expect("replace absent carrier with an external symlink");
-        assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
+        assert_eq!(
+            read_state(&carrier, Some(agent_dir.path())).unwrap(),
+            CarrierState::Missing
+        );
 
         std::fs::remove_file(&carrier).expect("remove final symlink");
         std::fs::remove_dir(&resources).expect("remove resources directory");
@@ -2157,7 +2272,10 @@ mod tests {
         std::fs::write(outside_dir.path().join("goal.md"), "external").expect("outside carrier");
         std::os::unix::fs::symlink(outside_dir.path(), &resources)
             .expect("replace absent ancestor with an external symlink");
-        assert_eq!(read_digest(&carrier, Some(agent_dir.path())), None);
+        assert_eq!(
+            read_state(&carrier, Some(agent_dir.path())).unwrap(),
+            CarrierState::Missing
+        );
     }
 
     #[cfg(unix)]
@@ -2173,10 +2291,177 @@ mod tests {
             .expect("symlinked root ancestor");
         let admitted_root = alias.join("agent");
         assert_eq!(
-            read_digest(&admitted_root.join("goal.md"), Some(&admitted_root)),
-            None,
+            read_state(&admitted_root.join("goal.md"), Some(&admitted_root)).unwrap(),
+            CarrierState::Missing,
             "every component of the confinement root must be opened without following symlinks"
         );
+    }
+    #[test]
+    fn deletion_and_same_byte_recreation_are_distinct_carrier_transitions() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "same bytes").unwrap();
+        let CarrierState::Present(original_digest) = read_state(&carrier, None).unwrap() else {
+            panic!("regular carrier has a digest");
+        };
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.apply_watch_sets(refresh_for(vec![set]));
+
+        std::fs::remove_file(&carrier).unwrap();
+        worker.flush_path(&carrier, None);
+        let deletion = resync_inbox_events(&agent_dir);
+        assert_eq!(deletion.len(), 1);
+        assert_eq!(event_field(&deletion[0], "old"), original_digest);
+        assert_eq!(event_field(&deletion[0], "new"), "missing");
+        assert!(event_field(&deletion[0], "occurrence").ends_with(":1"));
+        assert_eq!(
+            worker.carriers[&carrier][0].state,
+            Some(CarrierState::Missing)
+        );
+
+        worker.flush_path(&carrier, None);
+        assert_eq!(
+            resync_inbox_events(&agent_dir).len(),
+            1,
+            "repeated missing observations are silent"
+        );
+
+        std::fs::write(&carrier, "same bytes").unwrap();
+        worker.flush_path(&carrier, None);
+        let events = resync_inbox_events(&agent_dir);
+        assert_eq!(
+            events.len(),
+            1,
+            "creation supersedes the tombstone under the binding key"
+        );
+        let creation = &events[0];
+        assert_eq!(event_field(creation, "old"), "missing");
+        assert!(event_field(creation, "occurrence").ends_with(":2"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transient_permission_error_retries_without_emitting_a_tombstone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "before").unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.apply_watch_sets(refresh_for(vec![set]));
+        let baseline = worker.carriers[&carrier][0].state.clone();
+
+        let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
+        std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+        worker.flush_path(&carrier, None);
+        let entry = &worker.carriers[&carrier][0];
+        assert_eq!(entry.state, baseline);
+        assert!(entry.pending_transition.is_none());
+        assert!(entry.dirty);
+        assert!(!resources.join("inbox").exists());
+
+        std::fs::set_permissions(&carrier, original_permissions).unwrap();
+        std::fs::write(&carrier, "after").unwrap();
+        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        let event = resync_inbox_event(&agent_dir);
+        assert_ne!(event_field(&event, "new"), "missing");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn initial_transient_read_failure_schedules_a_baseline_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "host"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let carrier = resources.join("goal.md");
+        std::fs::write(&carrier, "baseline").unwrap();
+        let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
+        std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::from([(resources.clone(), dir_identity(&resources))]),
+            watcher: None,
+        };
+
+        worker.apply_watch_sets(refresh_for(vec![set]));
+        let entry = worker.carriers[&carrier]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert_eq!(entry.state, None);
+        assert!(entry.dirty);
+        assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
+
+        std::fs::set_permissions(&carrier, original_permissions).unwrap();
+        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        let entry = worker.carriers[&carrier]
+            .iter()
+            .find(|entry| entry.label == "goal")
+            .unwrap();
+        assert!(matches!(entry.state, Some(CarrierState::Present(_))));
+        assert!(!entry.dirty);
+        assert!(!resources.join("inbox").exists());
     }
 
     #[test]
@@ -2308,8 +2593,8 @@ mod tests {
             .unwrap();
         assert_eq!(rebound.occurrence_sequence, 1);
         assert_eq!(
-            rebound.digest.as_deref(),
-            read_digest(&original_carrier, None).as_deref()
+            rebound.state,
+            read_state(&original_carrier, None).ok()
         );
 
         worker.flush_path(&relocated_carrier, None);
@@ -2363,7 +2648,7 @@ mod tests {
                 label: "goal".to_owned(),
                 class: CarrierClass::Immediate,
                 containment_root: None,
-                digest: Some("old-digest".to_owned()),
+                state: Some(CarrierState::Present("old-digest".to_owned())),
                 occurrence_sequence: 0,
                 pending_transition: None,
                 dirty: true,
@@ -2396,16 +2681,16 @@ mod tests {
         let first = PendingTransition::new(
             "goal",
             Path::new("/agent/goal.md"),
-            Some("old"),
-            "new",
+            &CarrierState::Present("old".to_owned()),
+            &CarrierState::Present("new".to_owned()),
             owner_incarnation(1),
             1,
         );
         let restarted = PendingTransition::new(
             "goal",
             Path::new("/agent/goal.md"),
-            Some("old"),
-            "new",
+            &CarrierState::Present("old".to_owned()),
+            &CarrierState::Present("new".to_owned()),
             owner_incarnation(2),
             1,
         );
@@ -2415,11 +2700,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_emit_retains_digest_and_schedules_the_same_transition_for_retry() {
+    fn failed_tombstone_emit_retains_present_state_and_immutable_retry_snapshot() {
         let root = tempfile::tempdir().unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let carrier = root.path().join("carrier.md");
-        std::fs::write(&carrier, "new bytes").unwrap();
+        std::fs::write(&carrier, "old bytes").unwrap();
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -2431,7 +2716,7 @@ mod tests {
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
                     containment_root: None,
-                    digest: Some("old-digest".to_owned()),
+                    state: Some(CarrierState::Present("old-digest".to_owned())),
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -2442,22 +2727,29 @@ mod tests {
             watched: BTreeMap::new(),
             watcher: None,
         };
+        std::fs::remove_file(&carrier).unwrap();
 
         worker.flush_path(&carrier, None);
         let pending_transition = worker.carriers[&carrier][0]
             .pending_transition
             .clone()
             .expect("failed transition snapshot is retained");
+        assert_eq!(pending_transition.new_state, CarrierState::Missing);
+        assert!(pending_transition.body.contains("old: old-digest"));
+        assert!(pending_transition.body.contains("new: missing"));
         assert_eq!(worker.carriers[&carrier][0].occurrence_sequence, 1);
-        std::fs::write(&carrier, "newer bytes").unwrap();
+        std::fs::write(&carrier, "old bytes").unwrap();
         worker.flush_path(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.occurrence_sequence, 1);
-        assert_eq!(entry.digest.as_deref(), Some("old-digest"));
+        assert_eq!(
+            entry.state,
+            Some(CarrierState::Present("old-digest".to_owned()))
+        );
         assert_eq!(
             entry.pending_transition.as_ref(),
             Some(&pending_transition),
-            "a retry must replay the original snapshot even after the carrier advances"
+            "a retry must replay the tombstone snapshot even after the carrier is recreated"
         );
         assert!(entry.dirty);
         assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
@@ -2465,11 +2757,13 @@ mod tests {
 
     #[test]
     fn transition_identity_covers_every_rendered_transition_dimension() {
+        let old = CarrierState::Present("old-digest".to_owned());
+        let new = CarrierState::Present("new-digest".to_owned());
         let baseline = render_body(
             "goal",
             Path::new("/agent/goal.md"),
-            Some("old-digest"),
-            "new-digest",
+            &old,
+            &new,
             "v1:1:2:42:3:1",
         );
         assert_eq!(
@@ -2484,8 +2778,8 @@ mod tests {
                 render_body(
                     "spec",
                     Path::new("/agent/goal.md"),
-                    Some("old-digest"),
-                    "new-digest",
+                    &old,
+                    &new,
                     "v1:1:2:42:3:1",
                 ),
             ),
@@ -2494,38 +2788,48 @@ mod tests {
                 render_body(
                     "goal",
                     Path::new("/other/goal.md"),
-                    Some("old-digest"),
-                    "new-digest",
+                    &old,
+                    &new,
                     "v1:1:2:42:3:1",
                 ),
             ),
             (
-                "old digest",
+                "old state",
                 render_body(
                     "goal",
                     Path::new("/agent/goal.md"),
-                    Some("other-old"),
-                    "new-digest",
+                    &CarrierState::Present("other-old".to_owned()),
+                    &new,
                     "v1:1:2:42:3:1",
                 ),
             ),
             (
-                "seeded old state",
+                "missing old state",
                 render_body(
                     "goal",
                     Path::new("/agent/goal.md"),
-                    None,
-                    "new-digest",
+                    &CarrierState::Missing,
+                    &new,
                     "v1:1:2:42:3:1",
                 ),
             ),
             (
-                "new digest",
+                "new state",
                 render_body(
                     "goal",
                     Path::new("/agent/goal.md"),
-                    Some("old-digest"),
-                    "other-new",
+                    &old,
+                    &CarrierState::Present("other-new".to_owned()),
+                    "v1:1:2:42:3:1",
+                ),
+            ),
+            (
+                "missing new state",
+                render_body(
+                    "goal",
+                    Path::new("/agent/goal.md"),
+                    &old,
+                    &CarrierState::Missing,
                     "v1:1:2:42:3:1",
                 ),
             ),
@@ -2534,8 +2838,8 @@ mod tests {
                 render_body(
                     "goal",
                     Path::new("/agent/goal.md"),
-                    Some("old-digest"),
-                    "new-digest",
+                    &old,
+                    &new,
                     "v1:1:2:42:3:2",
                 ),
             ),

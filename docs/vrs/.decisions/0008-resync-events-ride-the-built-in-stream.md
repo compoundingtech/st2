@@ -1,4 +1,4 @@
-# Resync events ride the built-in stream with occurrence-scoped digest identity
+# Resync events ride the built-in stream with occurrence-scoped carrier-state identity
 
 Status: accepted
 
@@ -93,6 +93,30 @@ occurrence store.
 `supervisor_restart_incarnation_changes_the_occurrence_namespace` prove the
 Q13 contract. The composition experiment records these tests as the direct
 evidence.
+
+## Amendment — 2026-08-27 (Q21)
+
+Johannes approved decision request Q21 to make carrier absence an observable
+state rather than an unreadable digest. A subscription now records
+`present(<digest>)` or `missing`. A proven present→missing transition emits a
+canonical tombstone (`old: <digest>`, `new: missing`), and missing→present
+emits a creation even if the recreated bytes have the same digest as before
+deletion. Repeated missing observations remain silent.
+
+Only `ENOENT` and a stable non-regular replacement establish `missing`.
+Permission and transient I/O failures retain the last proven state, emit a
+diagnostic, and retry. Failed delivery retains the exact carrier-state
+transition body, occurrence, and identity; a newer observation is considered
+only after that immutable reservation completes. Per-binding supersession and
+shared-carrier subscriber independence remain unchanged.
+
+`deletion_and_same_byte_recreation_are_distinct_carrier_transitions`,
+`initial_transient_read_failure_schedules_a_baseline_retry`,
+`transient_permission_error_retries_without_emitting_a_tombstone`,
+`fifo_carrier_is_rejected_without_blocking`,
+`failed_tombstone_emit_retains_present_state_and_immutable_retry_snapshot`,
+and the existing shared-subscriber occurrence tests prove the Q21 contract.
+
 
 ## Options
 

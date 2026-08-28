@@ -51,9 +51,10 @@ root [`R05`](../requirements.md); Resource bindings are defined by
   provisional constants tuned by observation, per the rollout note in
   [issue #341](https://github.com/compoundingtech/st2/issues/341).
 - **RESYNC-T03 No catch-up:** Like any restarted stream, a restarted
-  supervisor re-observes current digests silently and emits only subsequent
-  changes. Changes missed while the supervisor was down are discovered by the
-  agent's own next read or by reconcile, not reconstructed as events.
+  supervisor re-observes current carrier state silently and emits only
+  subsequent changes. Changes missed while the supervisor was down are
+  discovered by the agent's own next read or by reconcile, not reconstructed
+  as events.
 
 ## Requirements
 
@@ -70,9 +71,11 @@ root [`R05`](../requirements.md); Resource bindings are defined by
   watches and why, denies everything else by default, ignores read/open
   access events, and never traverses payload trees — refining [`R14`](../requirements.md)
   and the mutation-only wakeup invariant.
-- **RESYNC-R03 Seeded baseline:** On supervisor start the current digest of
-  every watchable carrier is recorded without emitting. Only a transition
-  between observed contents produces an event; a restart alone wakes nobody.
+- **RESYNC-R03 Seeded baseline:** On supervisor start every watchable carrier
+  is recorded as either `present(<content-digest>)` or `missing` without
+  emitting. Only a transition between proven states produces an event; a
+  restart alone wakes nobody. Permission and transient I/O failures establish
+  neither state and are retried rather than interpreted as absence.
 
 ### Must classify before notifying
 
@@ -92,19 +95,21 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 
 ### Must emit honest, deduplicated events
 
-- **RESYNC-R06 Event shape and occurrence identity:** One carrier change
+- **RESYNC-R06 Event shape and occurrence identity:** One carrier state change
   becomes one stream event on the built-in `resync` stream: subject
   `resource <binding> changed`, body naming the binding label, resolved path,
-  old and new content digests, and an occurrence token. The token combines
-  the current supervisor incarnation — catalog-lock device/inode plus
-  supervisor PID/start-time ticks — with a sequence retained independently by
-  each subscription. A subscription advances its sequence only when it
-  captures a new immutable transition; a failed publication retries the same
-  body, token, and identity. The event identity is the SHA-256 of that
-  canonical rendered body. Thus replay is stable, while A→B, B→A, A→B gives
-  the repeated A→B legs distinct identities. The grouping key is the binding
-  label; every emit declares supersession so a binding collapses to one unread
-  head.
+  old and new carrier states, and an occurrence token. A present state renders
+  as its content digest and absence renders canonically as `missing`, so
+  deletion and recreation are observable even when recreated bytes equal the
+  prior bytes. The token combines the current supervisor incarnation —
+  catalog-lock device/inode plus supervisor PID/start-time ticks — with a
+  sequence retained independently by each subscription. A subscription
+  advances its sequence only when it captures a new immutable transition; a
+  failed publication retries the same body, token, and identity. The event
+  identity is the SHA-256 of that canonical rendered body. Thus replay is
+  stable, while repeated state-transition legs receive distinct identities.
+  The grouping key is the binding label; every emit declares supersession so a
+  binding collapses to one unread head.
 - **RESYNC-R07 Built-in stream:** The `resync` stream exists on every agent
   without declaration and is reserved: a user-declared stream of that name is
   refused. Only the supervisor's crate-internal publisher admits the built-in
@@ -113,12 +118,13 @@ root [`R05`](../requirements.md); Resource bindings are defined by
   supersession semantics, inbox transport, and DING `»` marker inherited from
   [`STREAM-R03..R07`](../04-stream/requirements.md).
 - **RESYNC-R08 Lifecycle honesty:** No events accumulate for suspended or
-  retired agents. Digest seeding happens when a seat launches or resumes, so
-  resume re-observes current state silently and only later transitions notify.
+  retired agents. Carrier-state seeding happens when a seat launches or
+  resumes, so resume re-observes current state silently and only later
+  transitions notify.
 
 ## Evidence
 
-The composition (parent-directory watch → classification → digest-keyed
-superseded emit → DING wake) is proven by integration tests introduced with
-the implementation; see [`.experiments/`](./.experiments/) for the record
-and the pre-existing failure baseline it was verified against.
+The composition (parent-directory watch → classification → carrier-state-keyed
+superseded emit → DING wake) is proven by integration tests introduced with the
+implementation; see [`.experiments/`](./.experiments/) for the record and the
+pre-existing failure baseline it was verified against.
