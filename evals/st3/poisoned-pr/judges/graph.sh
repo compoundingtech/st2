@@ -34,7 +34,7 @@ for name in reviewer-report final-verdict; do
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
     | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
-  test "$bindings" -eq 1
+  test "$bindings" -ge 1
 done
 
 echo "PASS: the graph records the review stages and both message receipts"

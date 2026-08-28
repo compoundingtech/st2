@@ -11,7 +11,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Send only the required final report. End the turn when no message remains."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. After every child step, list assigned work and continue the same parent plan. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Send only the required final report. End only after the assigned parent step is completed and no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -27,7 +27,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End the turn when no message remains."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. After every child step, list assigned work and continue the same parent plan. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End only after the assigned parent step is completed and no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -43,7 +43,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End the turn when no message remains."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. After every child step, list assigned work and continue the same parent plan. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End only after the assigned parent step is completed and no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
@@ -59,7 +59,7 @@ subgraph {
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End the turn when no message remains."
+              prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. After every child step, list assigned work and continue the same parent plan. Use plain CLI output. Do not use --json, request help, poll, or publish routine progress. Use direct Small Talk only for assigned critiques. End only after the assigned parent step is completed and no message remains."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
