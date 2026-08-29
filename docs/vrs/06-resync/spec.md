@@ -147,6 +147,17 @@ meaningful.
 - A runtime watcher-backend error may mean mutation events were dropped, so it
   schedules every changed carrier through the same pending-aware classified
   path. Equal states remain silent.
+- A change to the registration set is read as the same kind of drop, for the
+  whole watch set and not only the directories that changed. A backend is not
+  obliged to leave its other subscriptions undisturbed while it registers or
+  drops one: `notify`'s macOS FSEvents backend stops the single shared stream
+  on every watch and unwatch, purges the device's pending events, and restarts
+  at `kFSEventStreamEventIdSinceNow`, so a mutation already queued for a
+  directory that never left the set is destroyed. Linux inotify keeps its queue
+  across descriptor changes. Every subscribed carrier is therefore re-diffed
+  whenever a registration actually changed, through the same classified path;
+  equal states remain silent, so the recovered mutation is the only thing that
+  emits.
 - Reads open carriers nonblocking and without following the final symlink
   (every component for confined carriers). A proven regular file becomes
   `present(<sha256>)`; `ENOENT` or a stable non-regular replacement becomes
