@@ -15,7 +15,7 @@ replicated-record names — `src/harness_context.rs`, with the invariant rows
 *Harness context discipline* and *Replicated-path discipline* naming their
 proofs.
 
-**Four of the five producers ship: claude, codex, pi, and omp.** The
+**All five producers ship: claude, codex, pi, omp, and opencode.** The
 status-line tee (HC-R18), the Claude fill arithmetic, and its compaction
 accounting are in the tree as of 2026-08-29 — `hooks/claude-statusline.sh`,
 `st2 driver claude-statusline`, and the `PreCompact`/`PostCompact`
@@ -24,12 +24,12 @@ proofs. The codex app-server pump writes the record from
 `thread/tokenUsage/updated` and counts compactions off the `contextCompaction`
 thread item — `src/codex_app_server.rs`. The pi and omp rows share one extension
 path in `hooks/pi-channel.ts` and `hooks/omp-channel.ts`, consumed by
-`src/pi_channel.rs`, which writes through a harness-context `Writer` beside the
-harness-state writer it already owned and with the same incarnation. All four
-rows are fixture-pinned (HC-R13). The opencode row of the producer table below
-is unimplemented, so an OpenCode declaration still reads `context: null`. That
-is the honest state, not a defect of the envelope. HC-R11 is therefore partially
-satisfied; it is not met until all five ship.
+`src/pi_channel.rs`. The opencode row joins SSE `message.updated` with
+`GET /config/providers` in `src/opencode_session.rs`. Each producer writes
+beside the harness-state writer its wrapper already owned and under the same
+incarnation, and every row is version-pinned by an HC-R13 fixture over a
+verbatim capture, so HC-R11 is met: a declaration on any of the five harnesses
+publishes a non-`null` `context`.
 
 The placement, guard, and Claude producer were first built as a throwaway spike
 ([`.experiments/2026-08-29-context-signals-and-write-placement.md`](./.experiments/2026-08-29-context-signals-and-write-placement.md)),
@@ -410,7 +410,7 @@ listed is `null`, and no producer computes a fact its channel does not carry:
 | codex | `null` — the thread carries `modelProvider` only | `null` — Codex reports no cost | `account/rateLimits/updated`, `sevenDay` only — see below | `tokenUsage.total.totalTokens` |
 | pi | `ctx.model.id` | per-message `usage.cost.total` | `null` | `null` in v1 — only obtainable by summing every message's usage, which is a producer-side accumulator, not a free reading |
 | omp | `ctx.model.id` | per-message `usage.cost.total` | `null` | `null` in v1 — same reason as pi |
-| opencode | `session.info.model` | `session.info.cost` | `null` | `session.info.tokens` (cumulative, no `total` key — summed by the producer) |
+| opencode | `session.info.model`, written `providerID/modelID` | `session.info.cost` | `null` | `session.info.tokens` (cumulative, no `total` key — summed by the producer) |
 
 `sessionTotalTokens` is carried only where the channel already computes it. A
 producer that would have to accumulate it itself writes `null` rather than
@@ -817,15 +817,42 @@ are measured and both silently produce a wrong number:
   key. It grows without bound and is `sessionTotalTokens`, never occupancy.
 
 `tokens.total` appears only on the final `message.updated` for a message; the
-first carries zeros and no `total`. Which session's reading this is when one
-server holds several — the categorical producer aggregates across them, but two
-live sessions have two windows and one record — is unsettled: `DQ-C10`. `session.compacted` carries `{sessionID}`
+first carries zeros and no `total`, so the producer requires the KEY and never
+reads a missing one as zero. Which session's reading this is when one server
+holds several — the categorical producer aggregates across them, but two live
+sessions have two windows and one record — is unsettled: `DQ-C10`. v1 is
+last-writer-wins over every session on the stream, which matches the categorical
+producer's aggregate rather than inventing the seat-session rule `DQ-C10` exists
+to defer. `session.compacted` carries `{sessionID}`
 and nothing else — no reason, no timestamp, no sizes — so the trigger is
-`unknown` and the count is derived by counting assistant messages with
-`summary === true`. The richer v2 events (`session.next.compaction.started` /
+`unknown` and the count is st2's own, scoped to this incarnation. The richer v2
+events (`session.next.compaction.started` /
 `ended`, which do carry a reason) exist in the OpenAPI document but did not fire
 once on the legacy path in the measured runs; they are schema-only and no
 producer depends on them.
+
+The producer publishes on one condition only: a `message.updated` that carried a
+fresh `tokens.total`. The adjacent facts arrive a frame later on
+`session.updated` and are folded into producer state, then ride out with the next
+numerator; publishing on them directly would stamp `observedAtMs` on a numerator
+that may be hours old. For the same reason this producer has no heartbeat — its
+numerator is pushed and not pullable, so it never holds a re-taken reading to
+publish, and a quiet seat's record ages visibly instead (HC-R06). A window that
+takes no turn does not fill, so the aging number stays true.
+
+`model` is written in OpenCode's own `providerID/modelID` spelling
+(`opencode/hy3-free`): `modelID` alone is ambiguous across providers, and this is
+the key the window is cached under, so the record always pairs a numerator with
+its own denominator. `usedPercent` is st2's unrounded, unclamped
+`usedTokens / windowTokens × 100`. Rounding it would move the written value into
+a different 1% bucket than the truth and make `HARNESS_CONTEXT_WARN_PERCENT` fire
+below the threshold it names.
+
+Measured on a live 1.18.25 lab run (two turns plus a forced summarize, 571 SSE
+frames): exactly **one** landed write, the compaction counted once with trigger
+`unknown`, and the summarizer's own message — `summary: true`, `tokens.total`
+1,462, and a *different* model id from the turns' — correctly skipped, where
+taking it would have published 0.7% of the window instead of 4.3%.
 
 ## Compaction accounting (HC-R12)
 
@@ -835,7 +862,7 @@ producer depends on them.
 | codex | `contextCompaction` thread item | none | `unknown` | st2 counts | incarnation |
 | pi | `session_compact` | `reason` | `manual`, `threshold`, `overflow` | `sessionManager.getEntries()` type `compaction` | harness-durable |
 | omp | `session_compact` | none | `unknown` | `sessionManager.getEntries()` type `compaction` | harness-durable |
-| opencode | `session.compacted` | none | `unknown` | assistant messages with `summary === true` | incarnation |
+| opencode | `session.compacted` | none | `unknown` | st2 counts the edge (one per compaction, corroborated 1:1 by the assistant message with `summary === true`) | incarnation |
 
 The vocabulary `manual | auto | threshold | overflow | idle | unknown` is closed
 and additive-tolerant. `idle` is in v1 because omp's internal auto-compaction
@@ -1018,9 +1045,18 @@ each only once a real test proves it (per `CLAUDE.md`):
   both wrong numerators against the same capture (`total` reads 100, a
   baseline-free `last.totalTokens / window` reads 36, the truth is 33). It must
   fail if the 12,000 baseline moves; the omp fixture must fail if
-  `tokens` stops meaning prompt-only input; the OpenCode fixture must include a
-  post-compaction message list so a producer that stops skipping summary
+  `tokens` stops meaning prompt-only input; the OpenCode fixture must carry the
+  post-compaction summarizer frame so a producer that stops skipping summary
   messages fails it.
+  Shipped for OpenCode, over verbatim 1.18.25 SSE frames whose own
+  `session.updated.info.version` is the asserted version:
+  `src/opencode_session.rs::captured_opencode_turns_publish_the_assistant_total_over_the_providers_window`
+  (the join, the unrounded percent, and one landed write for a duplicated frame),
+  `src/opencode_session.rs::cumulative_session_tokens_are_the_session_total_and_never_the_occupancy`,
+  `src/opencode_session.rs::neither_summary_shape_is_ever_the_reading`,
+  `src/opencode_session.rs::a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp`,
+  `src/opencode_session.rs::an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands`,
+  `src/opencode_session.rs::a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading`.
 
   **Claude's two fixtures and what each proves.**
   `tests/fixtures/harness-context/claude-statusline-pre-turn.json` is the
