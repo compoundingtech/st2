@@ -1150,11 +1150,14 @@ impl Worker {
                 // Degraded mode: apply_watch_sets diffs digests at refresh cadence instead.
                 break;
             };
+            // The purge is in the attempt, not the outcome: FSEvents' `watch_inner` stops and
+            // restarts the stream before `append_path` can reject a directory that has since
+            // gone missing. Count the attempt, exactly as the unwatch above does.
+            changed = true;
             if watcher
                 .watch(&dir, notify::RecursiveMode::NonRecursive)
                 .is_ok()
             {
-                changed = true;
                 self.watched.insert(dir, identity);
             }
         }
